@@ -1430,9 +1430,13 @@ impl Interpreter {
                         Box::new(chars.into_iter())
                     }
                     other => {
-                        return Err(RuntimeError::Type(format!(
-                            "`for` requires a Range or collection, got {other:?}"
-                        )))
+                        // §7.2.3 fallback: drive the receiver as an iterable
+                        // via overloadable `iterator()` / `hasNext()` / `next()`
+                        // operator functions. Items are eagerly materialized
+                        // into a Vec so the host iterator does not need to
+                        // borrow `self` across the body evaluation.
+                        let items = self.materialize_user_iterable(&other, env, out)?;
+                        Box::new(items.into_iter())
                     }
                 };
                 let pushed_here = if self.label_already_pushed_for_loop {
@@ -2933,6 +2937,76 @@ impl Interpreter {
             }
             let mut ctx = CallCtx { args: &arg_vals, out };
             return Ok(Some(func(&mut ctx)?));
+        }
+        Ok(None)
+    }
+
+    /// §7.2.3 user-defined iterator dispatch. Given a receiver that fell out
+    /// of every built-in `for`-loop iterable arm, look up an `iterator()`
+    /// member or extension function, then drive the returned iterator via
+    /// `hasNext()` / `next()` until exhaustion. Items are eagerly collected
+    /// into a `Vec` so the outer loop can iterate them without borrowing
+    /// `self`. A receiver with no `iterator()` produces the same type error
+    /// the previous catch-all emitted.
+    fn materialize_user_iterable(
+        &mut self,
+        recv: &Value,
+        env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let iter = self.call_zero_arg_member(recv, "iterator", env, out)?
+            .ok_or_else(|| RuntimeError::Type(format!(
+                "`for` requires a Range or collection or a value with an `iterator()` method, got {recv:?}"
+            )))?;
+        let mut items = Vec::new();
+        loop {
+            let has = self.call_zero_arg_member(&iter, "hasNext", env, out)?
+                .ok_or_else(|| RuntimeError::Type(
+                    "iterator returned by `iterator()` has no `hasNext()` method".into(),
+                ))?;
+            let Value::Bool(b) = has else {
+                return Err(RuntimeError::Type(
+                    "`Iterator.hasNext()` must return Boolean".into(),
+                ));
+            };
+            if !b {
+                break;
+            }
+            let next = self.call_zero_arg_member(&iter, "next", env, out)?
+                .ok_or_else(|| RuntimeError::Type(
+                    "iterator returned by `iterator()` has no `next()` method".into(),
+                ))?;
+            items.push(next);
+            // Guard against runaway iterators in pathological user code.
+            if items.len() > 100_000_000 {
+                return Err(RuntimeError::Type(
+                    "`for` iterator exceeded 100,000,000 items".into(),
+                ));
+            }
+        }
+        Ok(items)
+    }
+
+    /// Helper for the user-iterator path: invoke a zero-argument member on
+    /// `recv` via the class's method table first, falling back to a matching
+    /// extension function in scope. Returns `Ok(None)` when no candidate is
+    /// found so the caller can produce a tailored diagnostic.
+    fn call_zero_arg_member(
+        &mut self,
+        recv: &Value,
+        name: &str,
+        env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
+    ) -> Result<Option<Value>, RuntimeError> {
+        if let Value::Instance(inst) = recv {
+            let class = Rc::clone(&inst.borrow().class);
+            if let Some((m, _)) = class.find_method(name) {
+                let v = self.call_method(inst, &m, &[], &[], out)?;
+                return Ok(Some(v));
+            }
+        }
+        if let Some(v) = self.try_extension_call(recv, name, &[], &[], env, out)? {
+            return Ok(Some(v));
         }
         Ok(None)
     }
