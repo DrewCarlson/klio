@@ -4143,6 +4143,7 @@ impl<'r> Checker<'r> {
         let arg_tys: Vec<Type> = args.iter().map(|a| self.check_expr(a, None)).collect();
         let mut chosen: Option<&FnSig> = None;
         let mut arity_match: Option<&FnSig> = None;
+        let mut fitting: Vec<&FnSig> = Vec::new();
         for s in sigs {
             let min = s.has_default.iter().filter(|h| !**h).count();
             let max = s.params.len();
@@ -4157,9 +4158,21 @@ impl<'r> Checker<'r> {
                 .zip(s.params.iter())
                 .all(|(a, p)| a.is_subtype_of(p));
             if fits {
-                chosen = Some(s);
-                break;
+                fitting.push(s);
             }
+        }
+        if !fitting.is_empty() {
+            // Spec §3.5.1: when an integer literal fits multiple overloads,
+            // prefer the one whose parameter has the narrower `Widen()` set.
+            // Widen(Int) covers Short/Byte/Long, so a candidate taking `Int`
+            // wins over one taking `Short` / `Byte` / `Long` for the same
+            // literal. Apply per-parameter then sum to a score.
+            let best = fitting
+                .iter()
+                .copied()
+                .min_by_key(|s| widen_score(&s.params))
+                .unwrap();
+            chosen = Some(best);
         }
         let sig = chosen.or(arity_match).unwrap_or(&sigs[0]).clone();
         let min = sig.has_default.iter().filter(|h| !**h).count();
@@ -4804,6 +4817,23 @@ fn lub(a: &Type, b: &Type) -> Type {
     Type::Any
 }
 
+/// Score a parameter list by Widen-rank — lower is more specific. Spec
+/// §3.5.1: prefer `Int` over `Short`/`Byte`/`Long` and `Short` over `Byte`
+/// when the same literal applies to both overloads. Non-integer types score
+/// zero so overloads that don't mix integer parameters are unaffected.
+fn widen_score(params: &[Type]) -> u32 {
+    fn one(t: &Type) -> u32 {
+        match t {
+            Type::Int => 0,
+            Type::Short => 1,
+            Type::Long => 2,
+            Type::Byte => 3,
+            _ => 0,
+        }
+    }
+    params.iter().map(one).sum()
+}
+
 // === Phase K tailrec analysis helpers ===
 
 fn tailrec_is_self_call(callee: &Expr, fn_name: &str) -> bool {
@@ -5426,6 +5456,37 @@ mod tests {
             fun main() {
                 val a: Int = f(1)
                 val b: String = f("hi")
+            }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn overload_picks_int_over_short_per_widen() {
+        // Spec §3.5.1: integer literal `2` fits both `Int` and `Short`,
+        // but Widen() makes Int the preferred candidate. The variable type
+        // annotation forces the chosen return type to be observable.
+        let tc = check_src(
+            r#"
+            fun f(x: Int): Int = x
+            fun f(x: Short): Short = x
+            fun main() {
+                val a: Int = f(2)
+            }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn overload_picks_int_over_long_per_widen() {
+        let tc = check_src(
+            r#"
+            fun f(x: Int): Int = x
+            fun f(x: Long): Long = x
+            fun main() {
+                val a: Int = f(2)
             }
             "#,
         );
