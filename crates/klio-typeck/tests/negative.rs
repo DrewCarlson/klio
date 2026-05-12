@@ -457,6 +457,13 @@ fn neg_annotation_class_cycle_array() {
 }
 
 #[test]
+fn neg_opt_in_missing() {
+    assert!(type_codes_for("neg_opt_in_missing.kt")
+        .iter()
+        .any(|c| c == "T0112"));
+}
+
+#[test]
 fn neg_deprecated_error_used() {
     assert!(type_codes_for("neg_deprecated_error_used.kt")
         .iter()

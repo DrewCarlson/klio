@@ -796,6 +796,9 @@ impl<'a> Checker<'a> {
         // §17.5.5: emit deprecation warning/error at every reference to a
         // declaration marked `@Deprecated`.
         self.check_deprecated_references(file);
+        // §17.5.4: opt-in propagation for declarations marked with an
+        // annotation that itself carries `@RequiresOptIn`.
+        self.check_opt_in_references(file);
         // Phase K: `tailrec` tail-call analysis.
         for d in &file.decls {
             self.check_phase_k_decl(d);
@@ -2490,6 +2493,31 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Spec §17.5.4: a declaration marked with an annotation that itself
+    /// carries `@RequiresOptIn(message, level)` requires every reference
+    /// site to opt in via `@OptIn(MarkerClass::class)` on an enclosing
+    /// declaration. Reference sites without an active opt-in get a
+    /// warning (default) or error (level = Level.ERROR).
+    fn check_opt_in_references(&mut self, file: &KotlinFile) {
+        let mut markers: HashMap<String, OptInMarker> = HashMap::new();
+        let mut classes: Vec<&Class> = Vec::new();
+        collect_annotation_classes(&file.decls, &mut classes);
+        for c in classes {
+            if let Some(info) = parse_requires_opt_in(&c.annotations) {
+                markers.insert(c.name.name.clone(), info);
+            }
+        }
+        if markers.is_empty() {
+            return;
+        }
+        let mut required: HashMap<String, Vec<String>> = HashMap::new();
+        collect_required_opt_ins(&file.decls, &markers, &mut required);
+        let diags = collect_opt_in_diagnostics(file, &markers, &required);
+        for d in diags {
+            self.diagnostics.emit(d);
         }
     }
 
@@ -8572,6 +8600,485 @@ fn expr_uses_field(e: &Expr) -> bool {
     }
 }
 
+/// Severity of an opt-in requirement; parallels DeprecationLevel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptInLevel {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct OptInMarker {
+    level: OptInLevel,
+    message: Option<String>,
+}
+
+fn parse_requires_opt_in(anns: &[klio_ast::Annotation]) -> Option<OptInMarker> {
+    for a in anns {
+        let leaf = a.path.last().map(|s| s.name.as_str()).unwrap_or("");
+        if leaf != "RequiresOptIn" {
+            continue;
+        }
+        let mut info = OptInMarker { level: OptInLevel::Error, message: None };
+        let mut positional = 0usize;
+        for (i, arg) in a.args.iter().enumerate() {
+            let name = a.arg_names.get(i).cloned().flatten();
+            let slot = match name.as_deref() {
+                Some("message") => "message",
+                Some("level") => "level",
+                Some(_) => continue,
+                None => match positional {
+                    0 => {
+                        positional += 1;
+                        "message"
+                    }
+                    1 => {
+                        positional += 1;
+                        "level"
+                    }
+                    _ => continue,
+                },
+            };
+            match slot {
+                "message" => info.message = extract_string_literal(arg),
+                "level" => {
+                    if let Some(lv) = extract_opt_in_level(arg) {
+                        info.level = lv;
+                    }
+                }
+                _ => {}
+            }
+        }
+        return Some(info);
+    }
+    None
+}
+
+fn extract_opt_in_level(e: &Expr) -> Option<OptInLevel> {
+    let name = match e {
+        Expr::Path { segments, .. } => segments.last().map(|s| s.name.as_str()),
+        Expr::Member { name, .. } => Some(name.name.as_str()),
+        _ => None,
+    }?;
+    match name {
+        "WARNING" => Some(OptInLevel::Warning),
+        "ERROR" => Some(OptInLevel::Error),
+        _ => None,
+    }
+}
+
+/// Build the per-declaration map of opt-in markers applied at the
+/// declaration site. Only markers known in `markers` count.
+fn collect_required_opt_ins(
+    decls: &[Decl],
+    markers: &HashMap<String, OptInMarker>,
+    out: &mut HashMap<String, Vec<String>>,
+) {
+    for d in decls {
+        match d {
+            Decl::Function(f) => {
+                let m = marker_names_in(&f.annotations, markers);
+                if !m.is_empty() {
+                    out.insert(f.name.name.clone(), m);
+                }
+            }
+            Decl::Property(p) => {
+                let m = marker_names_in(&p.annotations, markers);
+                if !m.is_empty() {
+                    out.insert(p.name.name.clone(), m);
+                }
+            }
+            Decl::Class(c) => {
+                let m = marker_names_in(&c.annotations, markers);
+                if !m.is_empty() {
+                    out.insert(c.name.name.clone(), m);
+                }
+                collect_required_opt_ins(&c.members, markers, out);
+            }
+            Decl::Object(o) => {
+                collect_required_opt_ins(&o.members, markers, out);
+            }
+            Decl::TypeAlias(a) => {
+                let m = marker_names_in(&a.annotations, markers);
+                if !m.is_empty() {
+                    out.insert(a.name.name.clone(), m);
+                }
+            }
+        }
+    }
+}
+
+fn marker_names_in(
+    anns: &[klio_ast::Annotation],
+    markers: &HashMap<String, OptInMarker>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in anns {
+        if let Some(leaf) = a.path.last() {
+            if markers.contains_key(&leaf.name) {
+                out.push(leaf.name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Read marker classes named in `@OptIn(M1::class, M2::class)` on the
+/// given annotation set. Returns the set of marker simple names.
+fn opt_in_markers_in(anns: &[klio_ast::Annotation]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in anns {
+        let leaf = a.path.last().map(|s| s.name.as_str()).unwrap_or("");
+        if leaf != "OptIn" {
+            continue;
+        }
+        for arg in &a.args {
+            if let Expr::MemberRef { receiver, name, .. } = arg {
+                if name.name == "class" {
+                    if let Expr::Path { segments, .. } = receiver.as_ref() {
+                        if let Some(seg) = segments.last() {
+                            out.push(seg.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_opt_in_diagnostics(
+    file: &KotlinFile,
+    markers: &HashMap<String, OptInMarker>,
+    required: &HashMap<String, Vec<String>>,
+) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = Vec::new();
+    let mut scope: Vec<String> = Vec::new();
+    for d in &file.decls {
+        walk_decl_for_opt_in(d, markers, required, &mut scope, &mut out);
+    }
+    out
+}
+
+fn walk_decl_for_opt_in(
+    d: &Decl,
+    markers: &HashMap<String, OptInMarker>,
+    required: &HashMap<String, Vec<String>>,
+    scope: &mut Vec<String>,
+    out: &mut Vec<Diagnostic>,
+) {
+    match d {
+        Decl::Function(f) => {
+            let added = push_scope(scope, &f.annotations);
+            // A function annotated with the marker itself also "opts
+            // in" to the marker for its own body.
+            let self_markers = marker_names_in(&f.annotations, markers);
+            for m in &self_markers {
+                scope.push(m.clone());
+            }
+            if let Some(body) = &f.body {
+                match body {
+                    FunctionBody::Expr(e) => {
+                        walk_expr_for_opt_in(e, markers, required, scope, out)
+                    }
+                    FunctionBody::Block(b) => {
+                        walk_block_for_opt_in(b, markers, required, scope, out)
+                    }
+                }
+            }
+            for p in &f.params {
+                if let Some(def) = &p.default {
+                    walk_expr_for_opt_in(def, markers, required, scope, out);
+                }
+            }
+            for _ in 0..self_markers.len() {
+                scope.pop();
+            }
+            for _ in 0..added {
+                scope.pop();
+            }
+        }
+        Decl::Property(p) => {
+            let added = push_scope(scope, &p.annotations);
+            let self_markers = marker_names_in(&p.annotations, markers);
+            for m in &self_markers {
+                scope.push(m.clone());
+            }
+            if let Some(init) = &p.init {
+                walk_expr_for_opt_in(init, markers, required, scope, out);
+            }
+            for acc in [p.getter.as_ref(), p.setter.as_ref()].into_iter().flatten() {
+                match &acc.body {
+                    FunctionBody::Expr(e) => {
+                        walk_expr_for_opt_in(e, markers, required, scope, out)
+                    }
+                    FunctionBody::Block(b) => {
+                        walk_block_for_opt_in(b, markers, required, scope, out)
+                    }
+                }
+            }
+            for _ in 0..self_markers.len() {
+                scope.pop();
+            }
+            for _ in 0..added {
+                scope.pop();
+            }
+        }
+        Decl::Class(c) => {
+            let added = push_scope(scope, &c.annotations);
+            let self_markers = marker_names_in(&c.annotations, markers);
+            for m in &self_markers {
+                scope.push(m.clone());
+            }
+            for ib in &c.init_blocks {
+                walk_block_for_opt_in(ib, markers, required, scope, out);
+            }
+            for p in &c.primary_params {
+                if let Some(def) = &p.default {
+                    walk_expr_for_opt_in(def, markers, required, scope, out);
+                }
+            }
+            for sc in &c.secondary_ctors {
+                if let Some(body) = &sc.body {
+                    walk_block_for_opt_in(body, markers, required, scope, out);
+                }
+            }
+            for ee in &c.enum_entries {
+                for a in &ee.args {
+                    walk_expr_for_opt_in(a, markers, required, scope, out);
+                }
+                for m in &ee.body_members {
+                    walk_decl_for_opt_in(m, markers, required, scope, out);
+                }
+            }
+            for m in &c.members {
+                walk_decl_for_opt_in(m, markers, required, scope, out);
+            }
+            for _ in 0..self_markers.len() {
+                scope.pop();
+            }
+            for _ in 0..added {
+                scope.pop();
+            }
+        }
+        Decl::Object(o) => {
+            for m in &o.members {
+                walk_decl_for_opt_in(m, markers, required, scope, out);
+            }
+        }
+        Decl::TypeAlias(_) => {}
+    }
+}
+
+fn push_scope(scope: &mut Vec<String>, anns: &[klio_ast::Annotation]) -> usize {
+    let added = opt_in_markers_in(anns);
+    let n = added.len();
+    for a in added {
+        scope.push(a);
+    }
+    n
+}
+
+fn walk_block_for_opt_in(
+    b: &Block,
+    markers: &HashMap<String, OptInMarker>,
+    required: &HashMap<String, Vec<String>>,
+    scope: &mut Vec<String>,
+    out: &mut Vec<Diagnostic>,
+) {
+    for s in &b.stmts {
+        match s {
+            Stmt::Expr(e) => walk_expr_for_opt_in(e, markers, required, scope, out),
+            Stmt::Decl(d) => walk_decl_for_opt_in(d, markers, required, scope, out),
+            Stmt::Assign { target, value, .. } => {
+                walk_expr_for_opt_in(target, markers, required, scope, out);
+                walk_expr_for_opt_in(value, markers, required, scope, out);
+            }
+            Stmt::DestructuringDecl { init, .. } => {
+                walk_expr_for_opt_in(init, markers, required, scope, out);
+            }
+        }
+    }
+}
+
+fn walk_expr_for_opt_in(
+    e: &Expr,
+    markers: &HashMap<String, OptInMarker>,
+    required: &HashMap<String, Vec<String>>,
+    scope: &mut Vec<String>,
+    out: &mut Vec<Diagnostic>,
+) {
+    match e {
+        Expr::Path { segments, span } => {
+            if segments.len() == 1 {
+                emit_opt_in_at(&segments[0].name, *span, markers, required, scope, out);
+            }
+        }
+        Expr::Call { callee, args, span, .. } => {
+            let mut emitted = false;
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1 {
+                    emitted = emit_opt_in_at(
+                        &segments[0].name,
+                        *span,
+                        markers,
+                        required,
+                        scope,
+                        out,
+                    );
+                }
+            }
+            if !emitted {
+                walk_expr_for_opt_in(callee, markers, required, scope, out);
+            }
+            for a in args {
+                walk_expr_for_opt_in(a, markers, required, scope, out);
+            }
+        }
+        Expr::Member { receiver, .. } => walk_expr_for_opt_in(receiver, markers, required, scope, out),
+        Expr::MemberRef { receiver, .. } => walk_expr_for_opt_in(receiver, markers, required, scope, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_expr_for_opt_in(lhs, markers, required, scope, out);
+            walk_expr_for_opt_in(rhs, markers, required, scope, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => {
+            walk_expr_for_opt_in(expr, markers, required, scope, out)
+        }
+        Expr::Index { receiver, args, .. } => {
+            walk_expr_for_opt_in(receiver, markers, required, scope, out);
+            for a in args {
+                walk_expr_for_opt_in(a, markers, required, scope, out);
+            }
+        }
+        Expr::Return { value, .. } => {
+            if let Some(v) = value {
+                walk_expr_for_opt_in(v, markers, required, scope, out);
+            }
+        }
+        Expr::As { expr, .. } | Expr::IsCheck { expr, .. } => {
+            walk_expr_for_opt_in(expr, markers, required, scope, out)
+        }
+        Expr::Spread { expr, .. } | Expr::Labeled { expr, .. } => {
+            walk_expr_for_opt_in(expr, markers, required, scope, out)
+        }
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            walk_expr_for_opt_in(cond, markers, required, scope, out);
+            walk_expr_for_opt_in(then_branch, markers, required, scope, out);
+            if let Some(eb) = else_branch {
+                walk_expr_for_opt_in(eb, markers, required, scope, out);
+            }
+        }
+        Expr::While { cond, body, .. } | Expr::DoWhile { cond, body: Some(body), .. } => {
+            walk_expr_for_opt_in(cond, markers, required, scope, out);
+            walk_expr_for_opt_in(body, markers, required, scope, out);
+        }
+        Expr::DoWhile { cond, body: None, .. } => {
+            walk_expr_for_opt_in(cond, markers, required, scope, out)
+        }
+        Expr::For { iter, body, .. } => {
+            walk_expr_for_opt_in(iter, markers, required, scope, out);
+            walk_expr_for_opt_in(body, markers, required, scope, out);
+        }
+        Expr::When { subject, branches, .. } => {
+            if let Some(s) = subject {
+                walk_expr_for_opt_in(s, markers, required, scope, out);
+            }
+            for br in branches {
+                for p in &br.patterns {
+                    match &p.kind {
+                        WhenPatternKind::Value(e)
+                        | WhenPatternKind::InRange(e)
+                        | WhenPatternKind::NotInRange(e) => {
+                            walk_expr_for_opt_in(e, markers, required, scope, out)
+                        }
+                        _ => {}
+                    }
+                }
+                walk_expr_for_opt_in(&br.body, markers, required, scope, out);
+            }
+        }
+        Expr::Try { body, catches, finally, .. } => {
+            walk_block_for_opt_in(body, markers, required, scope, out);
+            for c in catches {
+                walk_block_for_opt_in(&c.body, markers, required, scope, out);
+            }
+            if let Some(f) = finally {
+                walk_block_for_opt_in(f, markers, required, scope, out);
+            }
+        }
+        Expr::Throw { value, .. } => walk_expr_for_opt_in(value, markers, required, scope, out),
+        Expr::Block(b) => walk_block_for_opt_in(b, markers, required, scope, out),
+        Expr::Lambda { body, .. } => walk_block_for_opt_in(body, markers, required, scope, out),
+        Expr::AnonFun { body, .. } => {
+            if let Some(b) = body {
+                match b.as_ref() {
+                    FunctionBody::Expr(e) => walk_expr_for_opt_in(e, markers, required, scope, out),
+                    FunctionBody::Block(blk) => walk_block_for_opt_in(blk, markers, required, scope, out),
+                }
+            }
+        }
+        Expr::ObjectExpr { members, supertype_args, supertype_delegates, .. } => {
+            for m in members {
+                walk_decl_for_opt_in(m, markers, required, scope, out);
+            }
+            for args in supertype_args.iter().flatten() {
+                for a in args {
+                    walk_expr_for_opt_in(a, markers, required, scope, out);
+                }
+            }
+            for d in supertype_delegates.iter().flatten() {
+                walk_expr_for_opt_in(d, markers, required, scope, out);
+            }
+        }
+        Expr::StringTemplate { parts, .. } => {
+            for p in parts {
+                if let StringPart::Interp(inner) = p {
+                    walk_expr_for_opt_in(inner, markers, required, scope, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn emit_opt_in_at(
+    name: &str,
+    span: Span,
+    markers: &HashMap<String, OptInMarker>,
+    required: &HashMap<String, Vec<String>>,
+    scope: &[String],
+    out: &mut Vec<Diagnostic>,
+) -> bool {
+    let Some(needed) = required.get(name) else { return false };
+    let mut emitted = false;
+    for marker in needed {
+        if scope.iter().any(|m| m == marker) {
+            continue;
+        }
+        let info = match markers.get(marker) {
+            Some(i) => i,
+            None => continue,
+        };
+        let suffix = match &info.message {
+            Some(m) if !m.is_empty() => format!(": {m}"),
+            _ => String::new(),
+        };
+        let body = format!(
+            "`{name}` requires opt-in via `@OptIn({marker}::class)`{suffix}"
+        );
+        match info.level {
+            OptInLevel::Warning => out.push(
+                Diagnostic::warning(body, span).with_code(codes::WARN_OPT_IN),
+            ),
+            OptInLevel::Error => {
+                out.push(Diagnostic::error(body, span).with_code(codes::TYPE_OPT_IN_REQUIRED))
+            }
+        }
+        emitted = true;
+    }
+    emitted
+}
+
 /// Spec §17.5.6: a `@Suppress("code", ...)` annotation on a declaration
 /// silences each named diagnostic emitted anywhere inside that
 /// declaration's span. Scope is lexical: an inner `@Suppress` adds to
@@ -11043,6 +11550,26 @@ mod tests {
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn opt_in_marker_propagates() {
+        let src = r#"
+            @RequiresOptIn
+            annotation class Experimental
+
+            @Experimental
+            fun risky(): Int = 1
+
+            fun unsafe(): Int = risky()
+
+            @OptIn(Experimental::class)
+            fun safe(): Int = risky()
+        "#;
+        let tc = check_src(src);
+        let cs = codes(&tc);
+        let opt_in_errors = cs.iter().filter(|c| **c == codes::TYPE_OPT_IN_REQUIRED).count();
+        assert_eq!(opt_in_errors, 1, "expected one T0112 for `unsafe`, got: {:?}", cs);
     }
 
     #[test]
