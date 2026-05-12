@@ -3003,8 +3003,7 @@ impl<'r> Checker<'r> {
                     self.diagnostics.emit(
                         Diagnostic::error(
                             format!(
-                                "data class `{}` cannot declare a `vararg` property parameter \
-                                ",
+                                "data class `{}` cannot declare a `vararg` property parameter",
                                 c.name.name
                             ),
                             p.span,
