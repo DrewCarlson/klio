@@ -548,6 +548,20 @@ fn neg_secondary_ctor_cycle() {
 }
 
 #[test]
+fn neg_data_class_no_property() {
+    assert!(type_codes_for("neg_data_class_no_property.kt")
+        .iter()
+        .any(|c| c == "T0061"));
+}
+
+#[test]
+fn neg_data_class_vararg_property() {
+    assert!(type_codes_for("neg_data_class_vararg_property.kt")
+        .iter()
+        .any(|c| c == "T0062"));
+}
+
+#[test]
 fn neg_published_api_missing() {
     assert!(type_codes_for("neg_published_api_missing.kt")
         .iter()

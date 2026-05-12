@@ -994,6 +994,15 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             if matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Eof) {
                 break;
             }
+            // Optional `vararg` modifier on a primary-ctor parameter.
+            let mut is_vararg = false;
+            if matches!(self.peek_kind(), TokenKind::Ident)
+                && self.text(self.current_span()) == "vararg"
+            {
+                self.bump();
+                self.skip_nl();
+                is_vararg = true;
+            }
             let property = match self.peek_kind() {
                 TokenKind::Keyword(Keyword::Val) => {
                     self.bump();
@@ -1034,6 +1043,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 ty,
                 default,
                 visibility,
+                is_vararg,
                 annotations,
                 span: start.join(end),
             });

@@ -357,6 +357,9 @@ pub struct ClassParam {
     pub ty: TypeRef,
     pub default: Option<Expr>,
     pub visibility: Visibility,
+    /// `vararg` modifier on a primary-constructor parameter. Forbidden when
+    /// the enclosing class is a `data class` (spec §4.1.2).
+    pub is_vararg: bool,
     pub annotations: Vec<Annotation>,
     pub span: Span,
 }

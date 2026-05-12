@@ -202,6 +202,12 @@ pub mod codes {
     /// Two or more secondary constructors form a delegation cycle through
     /// `this(...)` calls. Spec §4.1.1 forbids this.
     pub const TYPE_CONSTRUCTOR_DELEGATION_CYCLE: &str = "T0060";
+    /// A `data class` declares no `val`/`var` primary-constructor property.
+    /// Spec §4.1.2 requires at least one data property.
+    pub const TYPE_DATA_CLASS_NO_PROPERTIES: &str = "T0061";
+    /// A `data class` primary-constructor property is `vararg`. Spec §4.1.2
+    /// forbids this.
+    pub const TYPE_DATA_CLASS_VARARG_PROPERTY: &str = "T0062";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -2165,6 +2171,39 @@ impl<'r> Checker<'r> {
                             c.secondary_ctors[start].span,
                         )
                         .with_code(codes::TYPE_CONSTRUCTOR_DELEGATION_CYCLE),
+                    );
+                }
+            }
+        }
+        // Spec §4.1.2: `data class` shape — must have ≥1 property param,
+        // and no vararg property param.
+        if c.is_data {
+            let n_props = c.primary_params.iter().filter(|p| p.property.is_some()).count();
+            if n_props == 0 {
+                self.diagnostics.emit(
+                    Diagnostic::error(
+                        format!(
+                            "data class `{}` must declare at least one primary-constructor \
+                             property (spec §4.1.2)",
+                            c.name.name
+                        ),
+                        c.name.span,
+                    )
+                    .with_code(codes::TYPE_DATA_CLASS_NO_PROPERTIES),
+                );
+            }
+            for p in &c.primary_params {
+                if p.is_vararg && p.property.is_some() {
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "data class `{}` cannot declare a `vararg` property parameter \
+                                 (spec §4.1.2)",
+                                c.name.name
+                            ),
+                            p.span,
+                        )
+                        .with_code(codes::TYPE_DATA_CLASS_VARARG_PROPERTY),
                     );
                 }
             }
