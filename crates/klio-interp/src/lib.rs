@@ -1288,6 +1288,22 @@ impl Interpreter {
                     let result = if matches!(op, BinOp::NotIn) { !inside } else { inside };
                     return Ok(Value::Bool(result));
                 }
+                // Spec §8.9.2: when an `==` operand is "boxed" through `as Any`
+                // / `as Any?`, equality follows `Any.equals` (which on JVM is
+                // bit-equality for floats: NaN equals NaN, 0.0 != -0.0).
+                // Detect the boxed form syntactically; the precise spec rule
+                // requires static type info we don't thread here.
+                if matches!(op, BinOp::Eq | BinOp::Neq)
+                    && (is_boxed_to_any_form(lhs) || is_boxed_to_any_form(rhs))
+                {
+                    let eq = match (&l, &r) {
+                        (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
+                        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+                        _ => Value::structural_eq(&l, &r),
+                    };
+                    let res = if matches!(op, BinOp::Eq) { eq } else { !eq };
+                    return Ok(Value::Bool(res));
+                }
                 // Spec §4.1.2: a data class inheriting equals from a base
                 // (final or open) defers to the inherited body. Eq/Neq on
                 // instances first checks for a user-declared `equals` method
@@ -7126,6 +7142,19 @@ impl Default for Interpreter {
 /// uninitialized `lateinit var` slot. Reads see this and throw the proper
 /// `kotlin.UninitializedPropertyAccessException` with a message naming the
 /// property. Writes overwrite the slot, clearing the sentinel.
+/// Detect whether an expression is a syntactic "box-to-Any" form. Used
+/// at `==` sites to switch Float/Double equality to bit-equality per
+/// spec §8.9.2 (the `Any.equals` path matches JVM `Float.equals`).
+fn is_boxed_to_any_form(expr: &Expr) -> bool {
+    match expr {
+        Expr::As { ty, .. } => {
+            let name = &ty.name.name;
+            matches!(name.as_str(), "Any" | "Number" | "kotlin.Any" | "kotlin.Number")
+        }
+        _ => false,
+    }
+}
+
 const LATEINIT_SENTINEL_FQN: &str = "__klio_lateinit_uninitialized__";
 
 /// Bind `this@<ClassName>` for the instance's own class name and every
