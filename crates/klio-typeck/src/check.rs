@@ -2114,6 +2114,61 @@ impl<'r> Checker<'r> {
 
     fn check_class(&mut self, c: &Class) {
         self.class_stack.push(c.name.name.clone());
+        // Spec §4.1.1: secondary constructor delegation must not form a
+        // cycle. Match `this(args)` to a secondary constructor by argument
+        // arity (a permissive over-approximation; primary-ctor delegation
+        // terminates the chain since the primary cannot delegate further).
+        if !c.secondary_ctors.is_empty() {
+            let n = c.secondary_ctors.len();
+            // Outgoing edges: for each ctor, indices of ctors it might
+            // delegate to via `this(args)` of matching arity.
+            let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+            for (i, sc) in c.secondary_ctors.iter().enumerate() {
+                if let CtorDelegation::This(args) = &sc.delegation {
+                    let arity = args.len();
+                    for (j, other) in c.secondary_ctors.iter().enumerate() {
+                        if other.params.len() == arity {
+                            edges[i].push(j);
+                        }
+                    }
+                }
+            }
+            // DFS from each ctor; flag if it reaches itself through a
+            // chain composed entirely of secondary-to-secondary edges.
+            for start in 0..n {
+                let mut stack = vec![start];
+                let mut seen = vec![false; n];
+                let mut hit_self = false;
+                while let Some(cur) = stack.pop() {
+                    for &nx in &edges[cur] {
+                        if nx == start {
+                            hit_self = true;
+                            break;
+                        }
+                        if !seen[nx] {
+                            seen[nx] = true;
+                            stack.push(nx);
+                        }
+                    }
+                    if hit_self {
+                        break;
+                    }
+                }
+                if hit_self {
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "secondary constructor of `{}` participates in a delegation \
+                                 cycle (spec §4.1.1)",
+                                c.name.name
+                            ),
+                            c.secondary_ctors[start].span,
+                        )
+                        .with_code(codes::TYPE_CONSTRUCTOR_DELEGATION_CYCLE),
+                    );
+                }
+            }
+        }
         // Spec §4.1.2: `data class` cannot explicify `copy` or `componentN`.
         if c.is_data {
             let n_props = c.primary_params.iter().filter(|p| p.property.is_some()).count();

@@ -541,6 +541,13 @@ fn neg_data_class_component_override() {
 }
 
 #[test]
+fn neg_secondary_ctor_cycle() {
+    assert!(type_codes_for("neg_secondary_ctor_cycle.kt")
+        .iter()
+        .any(|c| c == "T0060"));
+}
+
+#[test]
 fn neg_published_api_missing() {
     assert!(type_codes_for("neg_published_api_missing.kt")
         .iter()
