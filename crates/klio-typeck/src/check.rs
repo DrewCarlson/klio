@@ -522,6 +522,14 @@ struct Checker<'a> {
     /// references to `internal` declarations are forbidden unless the
     /// target carries `@PublishedApi`.
     public_inline_stack: Vec<bool>,
+    /// Stack of reified type-parameter name sets for each enclosing
+    /// function. Used at `as?` / `as` sites to decide whether the target
+    /// type is runtime-available.
+    reified_type_params: Vec<std::collections::HashSet<String>>,
+    /// Stack of all type-parameter names in scope (reified + non-reified)
+    /// for each enclosing function / class. Parallel to
+    /// `reified_type_params`.
+    type_params_in_scope: Vec<std::collections::HashSet<String>>,
     /// Annotations of each top-level function overload, parallel to
     /// `fns`. Used by J6 to look up `@PublishedApi`.
     fn_annotations: HashMap<String, Vec<Vec<klio_ast::Annotation>>>,
@@ -564,6 +572,8 @@ impl<'a> Checker<'a> {
             setter_visibility: HashMap::new(),
             aliases: HashMap::new(),
             public_inline_stack: Vec::new(),
+            reified_type_params: Vec::new(),
+            type_params_in_scope: Vec::new(),
             fn_annotations: HashMap::new(),
             prop_annotations: HashMap::new(),
         }
@@ -2931,6 +2941,19 @@ impl<'r> Checker<'r> {
         self.label_stack.push(f.name.name.clone());
         let is_public_inline = f.is_inline && matches!(f.visibility, Visibility::Public);
         self.public_inline_stack.push(is_public_inline);
+        let reified = f
+            .type_params
+            .iter()
+            .filter(|tp| tp.is_reified)
+            .map(|tp| tp.name.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.reified_type_params.push(reified);
+        let all_tps = f
+            .type_params
+            .iter()
+            .map(|tp| tp.name.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.type_params_in_scope.push(all_tps);
         if let Some(body) = &f.body {
             match body {
                 FunctionBody::Block(b) => {
@@ -2947,6 +2970,8 @@ impl<'r> Checker<'r> {
         self.fn_return_stack.pop();
         self.label_stack.pop();
         self.public_inline_stack.pop();
+        self.reified_type_params.pop();
+        self.type_params_in_scope.pop();
         self.pop_frame();
         self.assigned = saved_assigned;
     }
@@ -4821,6 +4846,30 @@ impl<'r> Checker<'r> {
                         )
                         .with_code(codes::TYPE_UNCHECKED_CAST),
                     );
+                }
+                // Spec §8.16: `as?` against a non-reified type parameter T cannot be checked
+                // at runtime — the cast may succeed even when the value is not a T.
+                if *safe {
+                    let target_name = &ty.name.name;
+                    let is_type_param = self
+                        .type_params_in_scope
+                        .iter()
+                        .any(|s| s.contains(target_name));
+                    let is_reified = self
+                        .reified_type_params
+                        .iter()
+                        .any(|s| s.contains(target_name));
+                    if is_type_param && !is_reified {
+                        self.diagnostics.emit(
+                            Diagnostic::warning(
+                                format!(
+                                    "Safe cast `as? {target_name}` cannot be checked at runtime — type parameter is not `reified`"
+                                ),
+                                ty.span,
+                            )
+                            .with_code(codes::TYPE_CAST_TO_NON_REIFIED_TYPE_PARAMETER),
+                        );
+                    }
                 }
                 let target = convert_type_ref_lossy(ty);
                 if let Some(cn) = class_name_from_typeref(ty) {

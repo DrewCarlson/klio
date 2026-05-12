@@ -777,6 +777,15 @@ fn neg_reference_equality_distinct() {
 }
 
 #[test]
+fn neg_as_safe_type_param() {
+    assert!(
+        type_codes_for("neg_as_safe_type_param.kt")
+            .iter()
+            .any(|c| c == "T0083")
+    );
+}
+
+#[test]
 fn neg_value_equality_distinct() {
     assert!(
         type_codes_for("neg_value_equality_distinct.kt")
