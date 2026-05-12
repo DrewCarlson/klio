@@ -3470,6 +3470,18 @@ impl<'r> Checker<'r> {
 
     fn check_class(&mut self, c: &Class) {
         self.class_stack.push(c.name.name.clone());
+        // Track class type parameters in the same scope as function type
+        // params so spec §15 checks (`is T`, `T::class`, etc.) can see
+        // them. Class type params are never `reified` per spec §13, so we
+        // only push into `type_params_in_scope`; the `reified_type_params`
+        // stack receives an empty set to keep depth in lock-step.
+        let class_tps = c
+            .type_params
+            .iter()
+            .map(|tp| tp.name.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        self.type_params_in_scope.push(class_tps);
+        self.reified_type_params.push(std::collections::HashSet::new());
         self.check_circular_bounds(&c.type_params, &c.where_bounds);
         // Spec §5.1: data, enum, and annotation classes are always closed
         // and cannot be declared `open`, `abstract`, or `sealed`.
@@ -4149,6 +4161,8 @@ impl<'r> Checker<'r> {
         self.pop_frame();
         self.assigned = class_saved_assigned;
         self.class_stack.pop();
+        self.type_params_in_scope.pop();
+        self.reified_type_params.pop();
     }
 
     /// Walk every declared supertype (transitively) and gather member
@@ -5441,7 +5455,54 @@ impl<'r> Checker<'r> {
             }
             Expr::Super { .. } => Type::Unresolved,
             Expr::PropertyRef { .. } => Type::Unresolved,
-            Expr::MemberRef { receiver, .. } => {
+            Expr::MemberRef { receiver, name, .. } => {
+                // Class-literal LHS validation per spec §15 / §15.1: only
+                // non-nullable runtime-available types may appear on the
+                // LHS of `::class`. Type parameters are permitted only
+                // when `reified`.
+                if name.name == "class" {
+                    if let Expr::Path { segments, .. } = receiver.as_ref() {
+                        if segments.len() == 1 {
+                            let tname = &segments[0].name;
+                            let is_type_param = self
+                                .type_params_in_scope
+                                .iter()
+                                .any(|s| s.contains(tname));
+                            if is_type_param {
+                                let is_reified = self
+                                    .reified_type_params
+                                    .iter()
+                                    .any(|s| s.contains(tname));
+                                if !is_reified {
+                                    self.diagnostics.emit(
+                                        Diagnostic::error(
+                                            format!(
+                                                "`{tname}::class` is not allowed — type parameter is erased at runtime. Mark it as `reified` on an `inline fun` to make the class literal available."
+                                            ),
+                                            receiver.span(),
+                                        )
+                                        .with_code(codes::TYPE_NON_REIFIED_CLASS_LITERAL),
+                                    );
+                                }
+                                // Skip the receiver pass — Path[T] would
+                                // otherwise emit a misleading
+                                // UNRESOLVED_REFERENCE.
+                                return Type::Unresolved;
+                            }
+                        }
+                    }
+                    let rty = self.check_expr(receiver, None);
+                    if matches!(rty, Type::Nullable(_)) {
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                "LHS of `::class` cannot have a nullable type — class literals require a non-nullable runtime type.".to_string(),
+                                receiver.span(),
+                            )
+                            .with_code(codes::TYPE_NULLABLE_CLASS_LITERAL_LHS),
+                        );
+                    }
+                    return Type::Unresolved;
+                }
                 self.check_expr(receiver, None);
                 Type::Unresolved
             }
