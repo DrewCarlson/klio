@@ -389,3 +389,4 @@ corpus_test!(expression_body_fun, "expr_body.kt");
 corpus_test!(member_and_calls, "members.kt");
 corpus_test!(diag_missing_paren, "diag_missing_paren.kt");
 corpus_test!(diag_top_level_garbage, "diag_top_level_garbage.kt");
+corpus_test!(diag_import_wildcard_alias, "diag_import_wildcard_alias.kt");

@@ -192,8 +192,17 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 }
             }
             let alias = if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::As)) {
-                self.bump();
-                self.parse_ident("import alias")
+                let as_tok = self.bump();
+                let alias_ident = self.parse_ident("import alias");
+                if wildcard {
+                    let span = alias_ident.as_ref().map_or(as_tok.span, |i| as_tok.span.join(i.span));
+                    self.error(
+                        "P0044",
+                        "wildcard import cannot be renamed; remove `as` or replace `*` with a name",
+                        span,
+                    );
+                }
+                alias_ident
             } else {
                 None
             };
@@ -3733,14 +3742,21 @@ mod tests {
     #[test]
     fn package_and_imports() {
         let (file, diags) = parse(
-            "package a.b.c\nimport kotlin.math.PI\nimport kotlin.collections.* as col\n"
+            "package a.b.c\nimport kotlin.math.PI\nimport kotlin.collections.*\n"
         );
         assert!(!diags.has_errors());
         let pkg = file.package.expect("package");
         assert_eq!(pkg.path.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["a", "b", "c"]);
         assert_eq!(file.imports.len(), 2);
         assert!(file.imports[1].wildcard);
-        assert_eq!(file.imports[1].alias.as_ref().unwrap().name, "col");
+        assert!(file.imports[1].alias.is_none());
+    }
+
+    #[test]
+    fn import_wildcard_with_alias_is_rejected() {
+        let (_file, diags) = parse("import kotlin.collections.* as col\n");
+        let codes: Vec<_> = diags.diagnostics().iter().filter_map(|d| d.code()).collect();
+        assert!(codes.contains(&"P0044"), "expected P0044, got {codes:?}");
     }
 
     #[test]

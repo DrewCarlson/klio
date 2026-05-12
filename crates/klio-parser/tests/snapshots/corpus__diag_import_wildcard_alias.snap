@@ -1,0 +1,12 @@
+---
+source: crates/klio-parser/tests/corpus.rs
+assertion_line: 392
+expression: "import kotlin.collections.* as col\n\nfun main() {}\n"
+---
+# ast
+import kotlin.collections.* as col
+fun main()
+  body=block
+
+# diagnostics
+[P0044] Error wildcard import cannot be renamed; remove `as` or replace `*` with a name @28..34
