@@ -438,6 +438,22 @@ impl Resolver {
         } else {
             parent
         };
+        // Spec §6: local functions in a statement scope are visible to
+        // sibling statements regardless of declaration order, so mutual
+        // recursion works. Pre-declare every local `fun` name into the
+        // block scope before walking statement bodies. `val` / `var` keep
+        // their strict order-of-appearance binding.
+        for s in &block.stmts {
+            if let Stmt::Decl(Decl::Function(f)) = s {
+                let _ = self.declare(
+                    scope,
+                    f.name.name.clone(),
+                    SymbolKind::LocalFunction,
+                    f.name.span,
+                    true,
+                );
+            }
+        }
         for s in &block.stmts {
             self.resolve_stmt(scope, s);
         }
@@ -448,13 +464,7 @@ impl Resolver {
             Stmt::Expr(e) => self.resolve_expr(scope, e),
             Stmt::Decl(d) => match d {
                 Decl::Function(f) => {
-                    self.declare(
-                        scope,
-                        f.name.name.clone(),
-                        SymbolKind::LocalFunction,
-                        f.name.span,
-                        true,
-                    );
+                    // Name is pre-declared by `resolve_block`; resolve body.
                     self.resolve_function(scope, f);
                 }
                 Decl::Property(p) => {
