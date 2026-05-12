@@ -746,6 +746,126 @@ impl Interpreter {
         Ok(Some(v))
     }
 
+    /// Value-based variant of `try_extension_call`: arguments are already
+    /// evaluated. Operator-overloading dispatch sites use this so they don't
+    /// have to synthesize fresh AST nodes for already-computed operand values.
+    fn try_extension_call_with_values(
+        &mut self,
+        receiver: &Value,
+        name: &str,
+        arg_vals: &[Value],
+        out: &mut dyn Output,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let keys = Self::receiver_type_names(receiver);
+        let mut chosen: Option<ExtensionFn> = None;
+        'outer: for key in &keys {
+            if let Some(list) = self.extensions.get(key) {
+                for ext in list {
+                    if ext.decl.name.name == name && arg_vals.len() <= ext.decl.params.len() {
+                        chosen = Some(ext.clone());
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        let Some(ext) = chosen else { return Ok(None) };
+        let arg_names: Vec<Option<String>> = vec![None; arg_vals.len()];
+        let v = self.call_extension(&ext.decl, &ext.env, receiver.clone(), arg_vals, &arg_names, out)?;
+        Ok(Some(v))
+    }
+
+    /// Dispatch a binary arithmetic / range operator to a user `operator fun`
+    /// (member or extension) on the LHS. Returns `Some` if a suitable operator
+    /// function was invoked, `None` to defer to the built-in numeric rules.
+    fn try_user_binop_dispatch(
+        &mut self,
+        op: BinOp,
+        l: &Value,
+        r: &Value,
+        out: &mut dyn Output,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let name = match op {
+            BinOp::Add => "plus",
+            BinOp::Sub => "minus",
+            BinOp::Mul => "times",
+            BinOp::Div => "div",
+            BinOp::Rem => "rem",
+            BinOp::Range => "rangeTo",
+            BinOp::RangeUntil => "rangeUntil",
+            _ => return Ok(None),
+        };
+        if let Value::Instance(inst) = l {
+            let class = Rc::clone(&inst.borrow().class);
+            if let Some((m, _)) = class.find_method(name) {
+                if m.decl.body.is_some() {
+                    let inst = Rc::clone(inst);
+                    let v = self.call_method(&inst, &m, &[r.clone()], &[None], out)?;
+                    return Ok(Some(v));
+                }
+            }
+        }
+        self.try_extension_call_with_values(l, name, &[r.clone()], out)
+    }
+
+    /// Dispatch a unary operator (`+a`, `-a`, `!a`) to a user `operator fun`.
+    fn try_user_unop_dispatch(
+        &mut self,
+        op: UnOp,
+        v: &Value,
+        out: &mut dyn Output,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let name = match op {
+            UnOp::Pos => "unaryPlus",
+            UnOp::Neg => "unaryMinus",
+            UnOp::Not => "not",
+            _ => return Ok(None),
+        };
+        if let Value::Instance(inst) = v {
+            let class = Rc::clone(&inst.borrow().class);
+            if let Some((m, _)) = class.find_method(name) {
+                if m.decl.body.is_some() {
+                    let inst = Rc::clone(inst);
+                    let r = self.call_method(&inst, &m, &[], &[], out)?;
+                    return Ok(Some(r));
+                }
+            }
+        }
+        self.try_extension_call_with_values(v, name, &[], out)
+    }
+
+    /// Spec ch.9 `contains` convention: `x in c` lowers to `c.contains(x)`.
+    /// Returns `Some(bool)` when the haystack provides a user `operator fun
+    /// contains`, `None` to defer to the built-in `value_in` rules.
+    fn try_user_contains_dispatch(
+        &mut self,
+        needle: &Value,
+        haystack: &Value,
+        out: &mut dyn Output,
+    ) -> Result<Option<bool>, RuntimeError> {
+        let check_bool = |v: Value| -> Result<bool, RuntimeError> {
+            match v {
+                Value::Bool(b) => Ok(b),
+                other => Err(RuntimeError::Type(format!(
+                    "`contains` must return Boolean, got {other:?}"
+                ))),
+            }
+        };
+        if let Value::Instance(inst) = haystack {
+            let class = Rc::clone(&inst.borrow().class);
+            if let Some((m, _)) = class.find_method("contains") {
+                if m.decl.body.is_some() {
+                    let inst = Rc::clone(inst);
+                    let v = self.call_method(&inst, &m, &[needle.clone()], &[None], out)?;
+                    return Ok(Some(check_bool(v)?));
+                }
+            }
+        }
+        if let Some(v) = self.try_extension_call_with_values(haystack, "contains", &[needle.clone()], out)? {
+            return Ok(Some(check_bool(v)?));
+        }
+        Ok(None)
+    }
+
     fn call_extension(
         &mut self,
         decl: &klio_ast::Function,
@@ -1316,7 +1436,11 @@ impl Interpreter {
                 let r = self.eval_expr(rhs, env, out)?;
                 // `x in y` / `x !in y` — membership / range tests outside `when`.
                 if matches!(op, BinOp::In | BinOp::NotIn) {
-                    let inside = value_in(&l, &r)?;
+                    let inside = if let Some(b) = self.try_user_contains_dispatch(&l, &r, out)? {
+                        b
+                    } else {
+                        value_in(&l, &r)?
+                    };
                     let result = if matches!(op, BinOp::NotIn) { !inside } else { inside };
                     return Ok(Value::Bool(result));
                 }
@@ -1371,13 +1495,37 @@ impl Interpreter {
                     };
                     return Ok(Value::Bool(res));
                 }
+                // Spec ch.9: arithmetic / range operators on user types lower
+                // to `operator fun plus / minus / times / div / rem / rangeTo
+                // / rangeUntil` calls on the LHS. Tried before the built-in
+                // numeric rules so a `plus(Int)` overload on a user type wins
+                // when the primitive arms can't apply.
+                if matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+                        | BinOp::Range | BinOp::RangeUntil
+                ) && matches!(l, Value::Instance(_))
+                {
+                    if let Some(v) = self.try_user_binop_dispatch(*op, &l, &r, out)? {
+                        return Ok(v);
+                    }
+                }
                 eval_binop(*op, l, r)
             }
             Expr::Unary { op, expr, .. } => {
                 if matches!(op, UnOp::PreInc | UnOp::PreDec) {
-                    return self.eval_prefix_incdec(*op, expr, env);
+                    return self.eval_prefix_incdec(*op, expr, env, out);
                 }
                 let v = self.eval_expr(expr, env, out)?;
+                // Spec ch.9: unary operators on user types lower to
+                // `unaryPlus` / `unaryMinus` / `not`.
+                if matches!(op, UnOp::Pos | UnOp::Neg | UnOp::Not)
+                    && matches!(v, Value::Instance(_))
+                {
+                    if let Some(r) = self.try_user_unop_dispatch(*op, &v, out)? {
+                        return Ok(r);
+                    }
+                }
                 eval_unop(*op, v)
             }
             Expr::Postfix { op, expr, .. } => self.eval_postfix(*op, expr, env, out),
@@ -7071,7 +7219,9 @@ impl Interpreter {
         op: UnOp,
         target: &Expr,
         env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
+        let _ = out;
         let name = ident_target(target, "prefix ++ / --")?;
         let cur = self.read_ident_live(&name, env)?;
         let Value::Int(n) = cur else {
@@ -9594,5 +9744,113 @@ mod tests {
             run(src).lines,
             vec!["3", "A", "C2", "[A, B, C2]"]
         );
+    }
+
+    #[test]
+    fn operator_plus_user_class_member() {
+        let src = r#"
+            class Vec2(val x: Int, val y: Int) {
+                operator fun plus(o: Vec2): Vec2 = Vec2(x + o.x, y + o.y)
+                override fun toString(): String = "($x,$y)"
+            }
+            fun main() {
+                val a = Vec2(1, 2)
+                val b = Vec2(3, 4)
+                println(a + b)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["(4,6)"]);
+    }
+
+    #[test]
+    fn operator_minus_times_div_rem_user_class() {
+        let src = r#"
+            class N(val v: Int) {
+                operator fun minus(o: N): N = N(v - o.v)
+                operator fun times(o: N): N = N(v * o.v)
+                operator fun div(o: N): N = N(v / o.v)
+                operator fun rem(o: N): N = N(v % o.v)
+                override fun toString(): String = "N($v)"
+            }
+            fun main() {
+                val a = N(20)
+                val b = N(6)
+                println(a - b)
+                println(a * b)
+                println(a / b)
+                println(a % b)
+            }
+        "#;
+        assert_eq!(
+            run(src).lines,
+            vec!["N(14)", "N(120)", "N(3)", "N(2)"]
+        );
+    }
+
+    #[test]
+    fn operator_plus_extension() {
+        let src = r#"
+            class Box(val n: Int) {
+                override fun toString(): String = "Box($n)"
+            }
+            operator fun Box.plus(other: Box): Box = Box(n + other.n)
+            fun main() {
+                println(Box(2) + Box(3))
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["Box(5)"]);
+    }
+
+    #[test]
+    fn operator_unary_minus_plus_not_user_class() {
+        let src = r#"
+            class Vec(val x: Int) {
+                operator fun unaryMinus(): Vec = Vec(-x)
+                operator fun unaryPlus(): Vec = Vec(+x)
+                override fun toString(): String = "Vec($x)"
+            }
+            class Flag(val on: Boolean) {
+                operator fun not(): Flag = Flag(!on)
+                override fun toString(): String = "Flag($on)"
+            }
+            fun main() {
+                println(-Vec(5))
+                println(+Vec(-3))
+                println(!Flag(true))
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["Vec(-5)", "Vec(-3)", "Flag(false)"]);
+    }
+
+    #[test]
+    fn operator_range_to_user_class() {
+        let src = r#"
+            class Day(val n: Int) {
+                operator fun rangeTo(end: Day): String = "Day($n..${end.n})"
+            }
+            fun main() {
+                println(Day(1)..Day(5))
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["Day(1..5)"]);
+    }
+
+    #[test]
+    fn operator_contains_user_class() {
+        let src = r#"
+            class Bag(val items: List<Int>) {
+                operator fun contains(x: Int): Boolean {
+                    for (i in items) if (i == x) return true
+                    return false
+                }
+            }
+            fun main() {
+                val b = Bag(listOf(1, 2, 3))
+                println(2 in b)
+                println(7 in b)
+                println(7 !in b)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["true", "false", "true"]);
     }
 }
