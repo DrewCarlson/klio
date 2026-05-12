@@ -1228,7 +1228,16 @@ impl Value {
             | Value::Lambda { .. }
             | Value::Intrinsic { .. }
             | Value::BoundMethod { .. } => {
-                if name == "Function" || name == "Any" || name == "kotlin.Function" {
+                if matches!(
+                    name,
+                    "Function"
+                        | "Any"
+                        | "kotlin.Function"
+                        | "KFunction"
+                        | "KCallable"
+                        | "kotlin.reflect.KFunction"
+                        | "kotlin.reflect.KCallable"
+                ) {
                     return true;
                 }
                 // Match the arity-tagged `FunctionN` form when the value
@@ -1253,7 +1262,10 @@ impl Value {
                     || matches!(name, "Throwable" | "Exception" | "Any")
                     || fqn.as_str() == name
             }
-            Value::Class(_) | Value::BoundInnerClass { .. } => name == "KClass" || name == "Any",
+            Value::Class(_) | Value::BoundInnerClass { .. } => matches!(
+                name,
+                "KClass" | "kotlin.reflect.KClass" | "Any"
+            ),
             Value::Instance(i) => {
                 let inst = i.borrow();
                 if name == "Any" {
@@ -1262,7 +1274,18 @@ impl Value {
                 inst.class.is_subtype_of(name)
             }
             Value::Delegate(_) => matches!(name, "Any"),
-            Value::PropertyRef { .. } => matches!(name, "KProperty" | "KProperty0" | "KProperty1" | "Any"),
+            Value::PropertyRef { .. } => matches!(
+                name,
+                "KProperty"
+                    | "KProperty0"
+                    | "KProperty1"
+                    | "KCallable"
+                    | "kotlin.reflect.KProperty"
+                    | "kotlin.reflect.KProperty0"
+                    | "kotlin.reflect.KProperty1"
+                    | "kotlin.reflect.KCallable"
+                    | "Any"
+            ),
             Value::Array { prim, .. } => {
                 if name == "Any" {
                     return true;
