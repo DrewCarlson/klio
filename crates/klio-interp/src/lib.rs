@@ -8,7 +8,7 @@
 
 use klio_ast::{
     AssignOp, BinOp, Block, Decl, Expr, FunctionBody, KotlinFile, PostfixOp, Stmt, StringPart,
-    UnOp,
+    TypeRef, UnOp,
 };
 pub use klio_runtime::{
     CallCtx, CaptureOutput, ClassDef, ClassParamDef, Env, InstanceData, MethodDef, Output,
@@ -6199,9 +6199,10 @@ impl Interpreter {
         }
 
         // `super.method(args...)` — step exactly one class up the chain
-        // from the body's owning class and dispatch.
+        // from the body's owning class and dispatch. With `super<Klazz>`
+        // dispatch through the named supertype instead of the parent.
         if let Expr::Member { receiver, name, safe: false, .. } = callee {
-            if matches!(receiver.as_ref(), Expr::Super { .. }) {
+            if let Expr::Super { qualifier, .. } = receiver.as_ref() {
                 let inst = match env.borrow().lookup("this") {
                     Some(Value::Instance(i)) => i,
                     _ => {
@@ -6214,13 +6215,8 @@ impl Interpreter {
                     Some(Value::Class(c)) => c,
                     _ => Rc::clone(&inst.borrow().class),
                 };
-                let parent = owner.parent.borrow().clone().ok_or_else(|| {
-                    RuntimeError::Type(format!(
-                        "class `{}` has no parent for `super` dispatch",
-                        owner.name
-                    ))
-                })?;
-                let Some((m, found_in)) = parent.find_method(&name.name) else {
+                let root = resolve_super_root(&owner, qualifier.as_ref())?;
+                let Some((m, found_in)) = root.find_method(&name.name) else {
                     return Err(RuntimeError::Unimplemented(format!(
                         "super.{}",
                         name.name
@@ -7562,6 +7558,39 @@ fn exception_matches(thrown: &Value, type_name: &str) -> bool {
 /// Try to flatten a `Path` / `Member` chain into a dotted-name string. Used
 /// to detect static FQN references like `kotlin.math.PI` before we
 /// otherwise evaluate the chain as a receiver-method access.
+/// Resolve the dispatch root for a `super` call. With no qualifier this is
+/// the parent class. With `super<Klazz>` it's the named direct supertype
+/// (parent or one of the declared interfaces). Errors when the named type
+/// is not actually a direct supertype.
+fn resolve_super_root(
+    owner: &Rc<ClassDef>,
+    qualifier: Option<&TypeRef>,
+) -> Result<Rc<ClassDef>, RuntimeError> {
+    let Some(q) = qualifier else {
+        return owner.parent.borrow().clone().ok_or_else(|| {
+            RuntimeError::Type(format!(
+                "class `{}` has no parent for `super` dispatch",
+                owner.name
+            ))
+        });
+    };
+    let qname = &q.name.name;
+    if let Some(p) = owner.parent.borrow().clone() {
+        if &p.name == qname || &p.fqn == qname {
+            return Ok(p);
+        }
+    }
+    for iface in owner.interfaces.borrow().iter() {
+        if &iface.name == qname || &iface.fqn == qname {
+            return Ok(Rc::clone(iface));
+        }
+    }
+    Err(RuntimeError::Type(format!(
+        "`super<{qname}>` is not a direct supertype of `{}`",
+        owner.name
+    )))
+}
+
 fn try_qualified_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Path { segments, .. } => Some(

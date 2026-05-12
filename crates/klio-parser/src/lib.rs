@@ -2816,7 +2816,25 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             }
             TokenKind::Keyword(Keyword::Super) => {
                 let tok = self.bump();
-                Some(Expr::Super { span: tok.span })
+                let qualifier = if matches!(self.peek_kind(), TokenKind::Lt) {
+                    self.bump();
+                    let ty = self.parse_type();
+                    if matches!(self.peek_kind(), TokenKind::Gt) {
+                        self.bump();
+                    }
+                    ty
+                } else {
+                    None
+                };
+                let label = self.consume_jump_label();
+                let mut end = tok.span;
+                if let Some(q) = &qualifier {
+                    end = end.join(q.span);
+                }
+                if let Some(l) = &label {
+                    end = end.join(l.span);
+                }
+                Some(Expr::Super { qualifier, label, span: tok.span.join(end) })
             }
             TokenKind::Keyword(Keyword::Break) => {
                 let tok = self.bump();

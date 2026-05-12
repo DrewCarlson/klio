@@ -565,8 +565,14 @@ pub enum Expr {
     This { qualifier: Option<Ident>, span: Span },
     /// `super` — only meaningful as the receiver of `super.foo` /
     /// `super.foo(...)`. Evaluation resolves the member against the
-    /// owning class's parent class.
-    Super { span: Span },
+    /// owning class's parent class. `qualifier` carries the `<Klazz>`
+    /// type argument (`super<Base>.foo()`) — required when the receiver
+    /// has multiple supertypes that supply a matching member. `label`
+    /// carries the `@Outer` selector (`super@Outer.foo()`) — used from
+    /// inside an inner class to dispatch through the outer class's
+    /// parent rather than the inner class's. Both are `None` for a
+    /// bare `super`.
+    Super { qualifier: Option<TypeRef>, label: Option<Ident>, span: Span },
     /// `::foo` — callable/property reference to a top-level or in-scope
     /// name. Today the runtime treats it as a lightweight property
     /// metadata value with `.name` and `.get()` — enough for delegates.
@@ -741,7 +747,7 @@ impl Expr {
             | Self::Try { span, .. }
             | Self::Lambda { span, .. }
             | Self::This { span, .. }
-            | Self::Super { span }
+            | Self::Super { span, .. }
             | Self::PropertyRef { span, .. }
             | Self::MemberRef { span, .. }
             | Self::When { span, .. }
