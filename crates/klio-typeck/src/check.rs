@@ -208,6 +208,9 @@ pub mod codes {
     /// A `data class` primary-constructor property is `vararg`. Spec §4.1.2
     /// forbids this.
     pub const TYPE_DATA_CLASS_VARARG_PROPERTY: &str = "T0062";
+    /// An `inline val/var` property has a backing field. Spec §4.3.4 forbids
+    /// this — inline properties must have explicit accessors with no `field`.
+    pub const TYPE_INLINE_PROPERTY_HAS_BACKING_FIELD: &str = "T0053";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -575,6 +578,9 @@ impl<'a> Checker<'a> {
             Decl::Property(p) => {
                 if p.is_const {
                     self.check_const_val(p, scope);
+                }
+                if p.is_inline {
+                    self.check_inline_property(p);
                 }
             }
             Decl::Class(c) => {
@@ -1048,6 +1054,36 @@ impl<'a> Checker<'a> {
             }
         }
         false
+    }
+
+    fn check_inline_property(&mut self, p: &Property) {
+        // Spec §4.3.4: an inline property has no backing field. That means
+        // no initializer, no `lateinit`, no `by` delegate, and any custom
+        // accessor must avoid the `field` identifier (already enforced by
+        // T0046 outside an accessor with a backing field — here we reject
+        // initializer / lateinit / delegate up front).
+        let mut bad = false;
+        if p.init.is_some() || p.is_lateinit || p.delegate.is_some() {
+            bad = true;
+        }
+        // An inline property must declare at least one accessor (otherwise
+        // it would need a backing field to store its value).
+        if p.getter.is_none() && p.setter.is_none() {
+            bad = true;
+        }
+        if bad {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "`inline` property `{}` must not have a backing field; declare \
+                         explicit accessors that do not reference `field` (spec §4.3.4)",
+                        p.name.name
+                    ),
+                    p.name.span,
+                )
+                .with_code(codes::TYPE_INLINE_PROPERTY_HAS_BACKING_FIELD),
+            );
+        }
     }
 
     fn check_const_val(&mut self, p: &Property, scope: PhaseFScope) {

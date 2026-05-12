@@ -1645,6 +1645,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             is_override: flags.is_override,
             is_lateinit: flags.is_lateinit,
             is_const: flags.is_const,
+            is_inline: flags.is_inline,
             visibility: flags.visibility,
             annotations: flags.annotations,
             span: kw_tok.span.join(end),

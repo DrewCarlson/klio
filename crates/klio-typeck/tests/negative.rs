@@ -569,6 +569,13 @@ fn neg_annotation_array_bad_element() {
 }
 
 #[test]
+fn neg_inline_property_initializer() {
+    assert!(type_codes_for("neg_inline_property_initializer.kt")
+        .iter()
+        .any(|c| c == "T0053"));
+}
+
+#[test]
 fn neg_published_api_missing() {
     assert!(type_codes_for("neg_published_api_missing.kt")
         .iter()

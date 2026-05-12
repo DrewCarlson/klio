@@ -241,6 +241,10 @@ pub struct Property {
     /// initializer must be a compile-time-evaluable expression over
     /// primitive / `String` operands.
     pub is_const: bool,
+    /// `inline val/var foo` — both accessors are inline; the property is not
+    /// allowed to have a backing field (no initializer, no `field`-using
+    /// accessor). Spec §4.3.4.
+    pub is_inline: bool,
     pub visibility: Visibility,
     pub annotations: Vec<Annotation>,
     pub span: Span,
