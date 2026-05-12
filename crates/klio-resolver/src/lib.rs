@@ -77,6 +77,11 @@ pub enum ScopeKind {
     File,
     Function,
     Block,
+    /// Class / object body. Spec §6.1: a declaration scope holding all
+    /// member names. Names inside member bodies that don't resolve here
+    /// or in an enclosing scope are *not* an R0001 error — they may be
+    /// inherited from a supertype or resolved against `this` at runtime.
+    ClassBody,
 }
 
 /// Output of name resolution.
@@ -246,14 +251,64 @@ impl Resolver {
         match decl {
             Decl::Function(f) => self.resolve_function(scope, f),
             Decl::Property(p) => self.resolve_property(scope, p, is_top_level),
-            Decl::Class(_) | Decl::Object(_) => {
-                // Class/object bodies are resolved later by the interpreter.
-            }
+            Decl::Class(c) => self.resolve_class_body(scope, &c.primary_params, &c.init_blocks, &c.members),
+            Decl::Object(o) => self.resolve_class_body(scope, &[], &[], &o.members),
             Decl::TypeAlias(_) => {
                 // The aliased type is resolved by the type checker; no
                 // name-use sites inside a typealias target need symbol
                 // bindings here.
             }
+        }
+    }
+
+    /// Walk a class / object body. Spec §6.1: the body is a declaration
+    /// scope — every member is visible to every other member regardless
+    /// of source order. We pre-declare members into a fresh class scope,
+    /// then walk each body. Unresolved bare names inside this scope are
+    /// *not* errors: they may be inherited members or `this.x` lookups
+    /// that the runtime resolves dynamically.
+    fn resolve_class_body(
+        &mut self,
+        parent: ScopeId,
+        primary_params: &[klio_ast::ClassParam],
+        init_blocks: &[Block],
+        members: &[Decl],
+    ) {
+        let body_scope = self.push_scope(Some(parent), ScopeKind::ClassBody);
+        for p in primary_params {
+            let sym = self.add_symbol(
+                p.name.name.clone(),
+                if p.property.is_some() { SymbolKind::LocalProperty } else { SymbolKind::Parameter },
+                Some(p.name.span),
+            );
+            self.scopes[body_scope.0 as usize].bindings.insert(p.name.name.clone(), sym);
+        }
+        for m in members {
+            let (name, kind, span) = match m {
+                Decl::Function(f) => {
+                    if f.receiver_type.is_some() {
+                        continue;
+                    }
+                    (f.name.name.clone(), SymbolKind::LocalFunction, f.name.span)
+                }
+                Decl::Property(p) => {
+                    if p.receiver_type.is_some() {
+                        continue;
+                    }
+                    (p.name.name.clone(), SymbolKind::LocalProperty, p.name.span)
+                }
+                Decl::Class(c) => (c.name.name.clone(), SymbolKind::Class, c.name.span),
+                Decl::Object(o) => (o.name.name.clone(), SymbolKind::Class, o.name.span),
+                Decl::TypeAlias(a) => (a.name.name.clone(), SymbolKind::TypeAlias, a.name.span),
+            };
+            let sym = self.add_symbol(name.clone(), kind, Some(span));
+            self.scopes[body_scope.0 as usize].bindings.insert(name, sym);
+        }
+        for b in init_blocks {
+            self.resolve_block(body_scope, b, /*new_scope=*/ false);
+        }
+        for m in members {
+            self.resolve_decl(body_scope, m, /*is_top_level=*/ false);
         }
     }
 
@@ -642,12 +697,29 @@ impl Resolver {
     fn resolve_name_use(&mut self, scope: ScopeId, name: &str, span: Span) {
         if let Some(sym) = self.lookup(scope, name) {
             self.uses.insert(span, sym);
+        } else if self.is_inside_class_body(scope) {
+            // Inside a class / object body the name may be an inherited
+            // member or a dynamic `this`-receiver lookup; defer to the
+            // interpreter instead of false-positiving R0001.
         } else {
             self.diagnostics.emit(
                 Diagnostic::error(format!("Unresolved reference `{name}`"), span)
                     .with_code("R0001")
                     .with_factory(&klio_diagnostics::generated::factories::UNRESOLVED_REFERENCE),
             );
+        }
+    }
+
+    fn is_inside_class_body(&self, mut scope: ScopeId) -> bool {
+        loop {
+            let s = &self.scopes[scope.0 as usize];
+            if matches!(s.kind, ScopeKind::ClassBody) {
+                return true;
+            }
+            match s.parent {
+                Some(p) => scope = p,
+                None => return false,
+            }
         }
     }
 
@@ -872,6 +944,25 @@ mod tests {
             .filter(|d| d.code() == Some("UNNECESSARY_SAFE_CALL"))
             .collect();
         assert!(warns.is_empty(), "expected no R0005, got {:?}", warns);
+    }
+
+    #[test]
+    fn class_member_sibling_reference_resolves() {
+        // Spec §6.1: class body is a declaration scope; sibling members
+        // see each other regardless of source order.
+        let ast = parse(r#"
+            class C {
+                fun a(): Int = b() + 1
+                fun b(): Int = 10
+            }
+            fun main() { println(C().a()) }
+        "#);
+        let r = resolve(&ast);
+        assert!(
+            !r.diagnostics.has_errors(),
+            "unexpected diags: {:?}",
+            r.diagnostics.diagnostics()
+        );
     }
 
     #[test]
