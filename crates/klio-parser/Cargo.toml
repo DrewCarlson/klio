@@ -1,0 +1,18 @@
+[package]
+name = "klio-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+klio-span        = { workspace = true }
+klio-diagnostics = { workspace = true }
+klio-lexer       = { workspace = true }
+klio-ast         = { workspace = true }
+
+[dev-dependencies]
+insta           = { workspace = true }
+
+[lints]
+workspace = true

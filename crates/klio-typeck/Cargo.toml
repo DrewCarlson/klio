@@ -1,0 +1,22 @@
+[package]
+name = "klio-typeck"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+klio-span        = { workspace = true }
+klio-ast         = { workspace = true }
+klio-diagnostics = { workspace = true }
+klio-resolver    = { workspace = true }
+klio-types       = { workspace = true }
+
+[dev-dependencies]
+klio-lexer       = { workspace = true }
+klio-parser      = { workspace = true }
+klio-diagnostics = { workspace = true }
+klio-resolver    = { workspace = true }
+
+[lints]
+workspace = true

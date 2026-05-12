@@ -1,13 +1,13 @@
 # Examples
 
 Runnable `.kt` programs that exercise the interpreter through the real
-`ktc` binary. The set grows monotonically — every new language feature
+`klio` binary. The set grows monotonically — every new language feature
 lands with at least one example here demonstrating it end-to-end.
 
 Run any program with:
 
 ```sh
-cargo run -p ktc-cli -- run examples/<name>.kt
+cargo run -p klio-cli -- run examples/<name>.kt
 ```
 
 ## Index
@@ -17,7 +17,7 @@ cargo run -p ktc-cli -- run examples/<name>.kt
 | `hello.kt`      | Smallest end-to-end slice: `println(1 + 1)`.                             |
 | `showcase.kt`   | Everything currently wired through the interpreter: literals, full arithmetic/comparison/logical precedence, unary + prefix/postfix `++`/`--`, `val`/`var` with compound assignment, `if` as an expression, string templates, `while` and `for` loops with `break`/`continue`, user-defined functions and recursion, `println`. |
 | `functions.kt`  | Focused tour of user functions: default args, recursion, mutual recursion, top-level properties, and a local function closing over its enclosing scope. |
-| `stdlib_taste.kt` | First slice of native Rust stdlib intrinsics: `kotlin.math.*` (abs/min/max/sqrt/pow, `PI`/`E`), `kotlin.String.*` members (length, uppercase, lowercase, isEmpty/isNotEmpty), `kotlin.Int.*` conversions, all dispatched through `ktc-stdlib::implementation`. |
+| `stdlib_taste.kt` | First slice of native Rust stdlib intrinsics: `kotlin.math.*` (abs/min/max/sqrt/pow, `PI`/`E`), `kotlin.String.*` members (length, uppercase, lowercase, isEmpty/isNotEmpty), `kotlin.Int.*` conversions, all dispatched through `klio-stdlib::implementation`. |
 | `m6b_taste.kt` | M6b additions: `throw` / `try` / `catch` / `finally` with the standard exception hierarchy; lambdas with explicit params and implicit `it`; scoping fns (`let`, `also`, `apply`, `run`, `takeIf`, `takeUnless`, `with`) with correct `it` / `this` receiver binding; String indexing; the expanded numeric / string / char / math intrinsic surface. Passes parity against `kotlinc-native 2.3.21`. |
 | `classes.kt`    | M10 classes & objects: plain class with primary-ctor properties and methods, `data class` with `equals` / `toString` / `copy` / `componentN`, `companion object`, standalone `object` singleton, user `operator fun compareTo` used by `sortedWith` and natural-order `sorted()`. Passes parity. |
 | `enums.kt`      | M11 enum classes: bare entries, entries with ctor args, member functions, per-entry method overrides via `abstract fun`, `name` / `ordinal`, `Color.values()` / `entries` / `valueOf(...)`, ordinal-based comparison, iteration. Passes parity. |
@@ -34,8 +34,8 @@ cargo run -p ktc-cli -- run examples/<name>.kt
 | `scoping_fns_top_level.kt` | M22 top-level scoping fns: bare `run { ... }` (no-receiver form) returning a value, returning `Unit`, nested `run`s composing through a `val` initializer, and `with(receiver) { ... }` for contrast. Passes parity. |
 | `accessor_return_type.kt` | M22 accessor return-type annotations: `val area: Int get(): Int = …` and `val label: String get(): String = …` — the type checker enforces the explicit accessor return type against the property's declared type and rejects mismatches with T0018. Passes parity. |
 | `function_types.kt` | M22 function types as type annotations: `val f: (Int) -> Int = { x -> x * 2 }`, multi-parameter forms `(Int, Int) -> Int`, function-returning-function `(Int) -> (Int) -> Int` (right-associative), function-typed parameters, nullable function types `((Int) -> Int)?`, and a function returning a function. Lambdas assigned to these annotations dispatch through the existing invocation path. Passes parity. |
-| `plain_class_tostring.kt` | M22 default `Any.toString` for plain classes: renders as `ClassName@<hex>` with a per-instance identity, asserted structurally (prefix / `@` / hex tail / per-instance distinctness) so parity holds byte-identical despite the hex value differing between kotlinc-native (heap address) and ktc (monotonic counter). Passes parity. |
-| `anon_object_tostring.kt` | M22 default `toString` for anonymous-object instances: structural assertions about the synthesized name plus `@<hex>` form, plus an explicit `override fun toString` case. kotlinc-native synthesizes `main$<name>$<n>`; ktc uses `<no name provided>@<hex>`. Passes parity. |
+| `plain_class_tostring.kt` | M22 default `Any.toString` for plain classes: renders as `ClassName@<hex>` with a per-instance identity, asserted structurally (prefix / `@` / hex tail / per-instance distinctness) so parity holds byte-identical despite the hex value differing between kotlinc-native (heap address) and klio (monotonic counter). Passes parity. |
+| `anon_object_tostring.kt` | M22 default `toString` for anonymous-object instances: structural assertions about the synthesized name plus `@<hex>` form, plus an explicit `override fun toString` case. kotlinc-native synthesizes `main$<name>$<n>`; klio uses `<no name provided>@<hex>`. Passes parity. |
 | `enum_entries_interface.kt` | M22 `EnumEntries` interface: `EnumName.entries` reports `true` for both `is List<*>` and `is EnumEntries<*>`, while a plain `listOf(...)` reports `false` for the latter. All existing List ops (`size`, indexing, iteration, `map`) continue to work on the entries. Passes parity. |
 | `delegated_inheritance.kt` | M22 inherited delegated properties: a `val ... by lazy { ... }` declared on an `open class` resolves through the parent's delegate when accessed via a subclass instance or an upcast `Parent` reference. Passes parity. |
 | `interface_companion_state.kt` | M22 interface companion-object state: `companion object { var n }` on an `interface` holds shared mutable state; an interface default method reaches the companion's `var` by simple name, and writes from every implementor land on the same companion instance. Passes parity. |
@@ -71,7 +71,7 @@ cargo run -p ktc-cli -- run examples/<name>.kt
 | `vararg_spread.kt` | Phase J `vararg` call-site spread `*arr` mixed with positional arguments. The interpreter splices the array elements into the vararg slot in source order. T0047 fires when `*` is supplied to a non-vararg parameter. |
 | `tailrec.kt` | Phase K `tailrec` modifier: the interpreter trampolines every tail-position self-call so deeply recursive accumulator-style functions don't grow the host stack. `factorial(20L)` with a default-arg accumulator, a `when`-driven loop, and a 100 000-deep counter all run to completion. Typeck emits T0048 for a self-call left in non-tail position and T0049 when `tailrec` is declared but no tail call is present. |
 
-All examples are gated by `cargo test -p ktc-parity --test parity` — every entry here produces byte-identical output to `kotlinc-native`. New examples must include a passing parity check before they ship.
+All examples are gated by `cargo test -p klio-parity --test parity` — every entry here produces byte-identical output to `kotlinc-native`. New examples must include a passing parity check before they ship.
 
 When you add support for new functionality (strings, `val`/`var`, control
 flow, classes, lambdas, …), add a new example here and extend the table.

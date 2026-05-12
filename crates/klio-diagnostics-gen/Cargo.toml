@@ -1,0 +1,15 @@
+[package]
+name = "klio-diagnostics-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "klio-diagnostics-gen"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

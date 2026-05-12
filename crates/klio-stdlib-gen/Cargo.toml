@@ -1,0 +1,20 @@
+[package]
+name = "klio-stdlib-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "klio-stdlib-gen"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+clap = { workspace = true }
+klio-stdlib = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "klio-lexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+klio-span        = { workspace = true }
+klio-diagnostics = { workspace = true }
+unicode-xid     = { workspace = true }
+
+[dev-dependencies]
+insta           = { workspace = true }
+
+[lints]
+workspace = true

@@ -294,150 +294,150 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "ktc-ast"
+name = "klio-ast"
 version = "0.1.0"
 dependencies = [
- "ktc-span",
+ "klio-span",
 ]
 
 [[package]]
-name = "ktc-cli"
+name = "klio-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "ktc-diagnostics",
- "ktc-interp",
- "ktc-lexer",
- "ktc-parser",
- "ktc-resolver",
- "ktc-span",
- "ktc-typeck",
+ "klio-diagnostics",
+ "klio-interp",
+ "klio-lexer",
+ "klio-parser",
+ "klio-resolver",
+ "klio-span",
+ "klio-typeck",
  "rustyline",
 ]
 
 [[package]]
-name = "ktc-diagnostics"
+name = "klio-diagnostics"
 version = "0.1.0"
 dependencies = [
  "ariadne",
- "ktc-span",
+ "klio-span",
  "thiserror",
 ]
 
 [[package]]
-name = "ktc-diagnostics-gen"
+name = "klio-diagnostics-gen"
 version = "0.1.0"
 
 [[package]]
-name = "ktc-interp"
+name = "klio-interp"
 version = "0.1.0"
 dependencies = [
- "ktc-ast",
- "ktc-diagnostics",
- "ktc-lexer",
- "ktc-parser",
- "ktc-runtime",
- "ktc-span",
- "ktc-stdlib",
+ "klio-ast",
+ "klio-diagnostics",
+ "klio-lexer",
+ "klio-parser",
+ "klio-runtime",
+ "klio-span",
+ "klio-stdlib",
 ]
 
 [[package]]
-name = "ktc-lexer"
+name = "klio-lexer"
 version = "0.1.0"
 dependencies = [
  "insta",
- "ktc-diagnostics",
- "ktc-span",
+ "klio-diagnostics",
+ "klio-span",
  "unicode-xid",
 ]
 
 [[package]]
-name = "ktc-parity"
+name = "klio-parity"
 version = "0.1.0"
 dependencies = [
- "ktc-interp",
- "ktc-lexer",
- "ktc-parser",
- "ktc-runtime",
- "ktc-span",
+ "klio-interp",
+ "klio-lexer",
+ "klio-parser",
+ "klio-runtime",
+ "klio-span",
 ]
 
 [[package]]
-name = "ktc-parser"
+name = "klio-parser"
 version = "0.1.0"
 dependencies = [
  "insta",
- "ktc-ast",
- "ktc-diagnostics",
- "ktc-lexer",
- "ktc-span",
+ "klio-ast",
+ "klio-diagnostics",
+ "klio-lexer",
+ "klio-span",
 ]
 
 [[package]]
-name = "ktc-resolver"
+name = "klio-resolver"
 version = "0.1.0"
 dependencies = [
  "insta",
- "ktc-ast",
- "ktc-diagnostics",
- "ktc-lexer",
- "ktc-parser",
- "ktc-span",
- "ktc-types",
+ "klio-ast",
+ "klio-diagnostics",
+ "klio-lexer",
+ "klio-parser",
+ "klio-span",
+ "klio-types",
  "thiserror",
 ]
 
 [[package]]
-name = "ktc-runtime"
+name = "klio-runtime"
 version = "0.1.0"
 dependencies = [
- "ktc-ast",
- "ktc-span",
+ "klio-ast",
+ "klio-span",
  "regex",
  "thiserror",
 ]
 
 [[package]]
-name = "ktc-span"
+name = "klio-span"
 version = "0.1.0"
 
 [[package]]
-name = "ktc-stdlib"
+name = "klio-stdlib"
 version = "0.1.0"
 dependencies = [
- "ktc-runtime",
+ "klio-runtime",
  "regex",
  "unicode-general-category",
 ]
 
 [[package]]
-name = "ktc-stdlib-gen"
+name = "klio-stdlib-gen"
 version = "0.1.0"
 dependencies = [
  "clap",
- "ktc-stdlib",
+ "klio-stdlib",
 ]
 
 [[package]]
-name = "ktc-typeck"
+name = "klio-typeck"
 version = "0.1.0"
 dependencies = [
- "ktc-ast",
- "ktc-diagnostics",
- "ktc-lexer",
- "ktc-parser",
- "ktc-resolver",
- "ktc-span",
- "ktc-types",
+ "klio-ast",
+ "klio-diagnostics",
+ "klio-lexer",
+ "klio-parser",
+ "klio-resolver",
+ "klio-span",
+ "klio-types",
 ]
 
 [[package]]
-name = "ktc-types"
+name = "klio-types"
 version = "0.1.0"
 dependencies = [
- "ktc-ast",
- "ktc-diagnostics",
- "ktc-span",
+ "klio-ast",
+ "klio-diagnostics",
+ "klio-span",
  "thiserror",
 ]
 

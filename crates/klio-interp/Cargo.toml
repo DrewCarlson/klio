@@ -1,0 +1,20 @@
+[package]
+name = "klio-interp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+klio-span        = { workspace = true }
+klio-diagnostics = { workspace = true }
+klio-ast         = { workspace = true }
+klio-runtime     = { workspace = true }
+klio-stdlib      = { workspace = true }
+
+[dev-dependencies]
+klio-lexer       = { workspace = true }
+klio-parser      = { workspace = true }
+
+[lints]
+workspace = true

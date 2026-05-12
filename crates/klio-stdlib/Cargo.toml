@@ -1,0 +1,14 @@
+[package]
+name = "klio-stdlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+klio-runtime = { workspace = true }
+unicode-general-category = "1"
+regex = "1"
+
+[lints]
+workspace = true

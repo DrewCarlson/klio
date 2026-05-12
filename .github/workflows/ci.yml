@@ -36,7 +36,7 @@ jobs:
 
       - name: install kotlin-native (if not cached)
         if: steps.konan-cache.outputs.cache-hit != 'true'
-        run: cargo run -q -p ktc-parity --bin ktc-parity -- --install
+        run: cargo run -q -p klio-parity --bin klio-parity -- --install
 
       - name: cargo test
         run: cargo test --workspace
@@ -44,7 +44,7 @@ jobs:
       - name: stdlib coverage non-regression gate
         run: |
           set -euo pipefail
-          output=$(cargo run -q -p ktc-stdlib-gen -- coverage)
+          output=$(cargo run -q -p klio-stdlib-gen -- coverage)
           echo "$output"
           current=$(printf '%s\n' "$output" | grep -oE 'implemented [0-9]+' | awk '{print $2}')
           if [ -z "${current:-}" ]; then

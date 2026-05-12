@@ -1,21 +1,21 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/ktc-span",
-    "crates/ktc-diagnostics",
-    "crates/ktc-lexer",
-    "crates/ktc-ast",
-    "crates/ktc-parser",
-    "crates/ktc-runtime",
-    "crates/ktc-types",
-    "crates/ktc-resolver",
-    "crates/ktc-typeck",
-    "crates/ktc-stdlib",
-    "crates/ktc-stdlib-gen",
-    "crates/ktc-interp",
-    "crates/ktc-cli",
-    "crates/ktc-parity",
-    "crates/ktc-diagnostics-gen",
+    "crates/klio-span",
+    "crates/klio-diagnostics",
+    "crates/klio-lexer",
+    "crates/klio-ast",
+    "crates/klio-parser",
+    "crates/klio-runtime",
+    "crates/klio-types",
+    "crates/klio-resolver",
+    "crates/klio-typeck",
+    "crates/klio-stdlib",
+    "crates/klio-stdlib-gen",
+    "crates/klio-interp",
+    "crates/klio-cli",
+    "crates/klio-parity",
+    "crates/klio-diagnostics-gen",
 ]
 
 [workspace.package]
@@ -26,17 +26,17 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/DrewCarlson/kt-exp"
 
 [workspace.dependencies]
-ktc-span        = { path = "crates/ktc-span" }
-ktc-diagnostics = { path = "crates/ktc-diagnostics" }
-ktc-lexer       = { path = "crates/ktc-lexer" }
-ktc-ast         = { path = "crates/ktc-ast" }
-ktc-parser      = { path = "crates/ktc-parser" }
-ktc-runtime     = { path = "crates/ktc-runtime" }
-ktc-types       = { path = "crates/ktc-types" }
-ktc-resolver    = { path = "crates/ktc-resolver" }
-ktc-typeck      = { path = "crates/ktc-typeck" }
-ktc-stdlib      = { path = "crates/ktc-stdlib" }
-ktc-interp      = { path = "crates/ktc-interp" }
+klio-span        = { path = "crates/klio-span" }
+klio-diagnostics = { path = "crates/klio-diagnostics" }
+klio-lexer       = { path = "crates/klio-lexer" }
+klio-ast         = { path = "crates/klio-ast" }
+klio-parser      = { path = "crates/klio-parser" }
+klio-runtime     = { path = "crates/klio-runtime" }
+klio-types       = { path = "crates/klio-types" }
+klio-resolver    = { path = "crates/klio-resolver" }
+klio-typeck      = { path = "crates/klio-typeck" }
+klio-stdlib      = { path = "crates/klio-stdlib" }
+klio-interp      = { path = "crates/klio-interp" }
 
 thiserror      = "2"
 ariadne        = "0.6.0"
