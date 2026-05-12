@@ -1,12 +1,15 @@
 ---
 source: crates/klio-resolver/tests/corpus.rs
-assertion_line: 81
 expression: "import kotlin.foo.*\n\nfun main() {}\n"
 ---
 # symbols
   [0] Builtin println @builtin
   [1] Builtin print @builtin
-  [2] TopLevelFunction main @25..29
+  [2] Builtin run @builtin
+  [3] Builtin with @builtin
+  [4] Builtin check @builtin
+  [5] Builtin require @builtin
+  [6] TopLevelFunction main @25..29
 
 # uses
 

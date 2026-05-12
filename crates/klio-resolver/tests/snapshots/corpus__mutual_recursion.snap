@@ -1,22 +1,26 @@
 ---
-source: crates/ktc-resolver/tests/corpus.rs
+source: crates/klio-resolver/tests/corpus.rs
 expression: "fun even(n: Int): Boolean = if (n == 0) true else odd(n - 1)\nfun odd(n: Int): Boolean = if (n == 0) false else even(n - 1)\n\nfun main() {\n    println(even(10))\n}\n"
 ---
 # symbols
   [0] Builtin println @builtin
   [1] Builtin print @builtin
-  [2] TopLevelFunction even @4..8
-  [3] TopLevelFunction odd @65..68
-  [4] TopLevelFunction main @128..132
-  [5] Parameter n @9..10
-  [6] Parameter n @69..70
+  [2] Builtin run @builtin
+  [3] Builtin with @builtin
+  [4] Builtin check @builtin
+  [5] Builtin require @builtin
+  [6] TopLevelFunction even @4..8
+  [7] TopLevelFunction odd @65..68
+  [8] TopLevelFunction main @128..132
+  [9] Parameter n @9..10
+  [10] Parameter n @69..70
 
 # uses
-  @32..33 -> [5] n (Parameter)
-  @50..53 -> [3] odd (TopLevelFunction)
-  @54..55 -> [5] n (Parameter)
-  @92..93 -> [6] n (Parameter)
-  @111..115 -> [2] even (TopLevelFunction)
-  @116..117 -> [6] n (Parameter)
+  @32..33 -> [9] n (Parameter)
+  @50..53 -> [7] odd (TopLevelFunction)
+  @54..55 -> [9] n (Parameter)
+  @92..93 -> [10] n (Parameter)
+  @111..115 -> [6] even (TopLevelFunction)
+  @116..117 -> [10] n (Parameter)
   @141..148 -> [0] println (Builtin)
-  @149..153 -> [2] even (TopLevelFunction)
+  @149..153 -> [6] even (TopLevelFunction)

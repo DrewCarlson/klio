@@ -5907,6 +5907,11 @@ impl<'r> Checker<'r> {
         if let Expr::Path { segments, span: callee_span } = callee {
             if segments.len() == 1 {
                 let name = &segments[0].name;
+                if !self.fns.contains_key(name) && !self.classes.contains_key(name) {
+                    if let Some(ty) = self.check_toplevel_contract_call(name, args, call_span) {
+                        return ty;
+                    }
+                }
                 if let Some(sigs) = self.fns.get(name).cloned() {
                     if let Some(entries) = self.fn_visibility.get(name).cloned() {
                         for (v, f) in entries {
@@ -5969,6 +5974,11 @@ impl<'r> Checker<'r> {
         // `fold` / `forEach` so the lambdas they take get a concrete
         // expected parameter type.
         if let Expr::Member { receiver, name, .. } = callee {
+            if matches!(name.name.as_str(), "let" | "run" | "apply" | "also") {
+                if let Some(ty) = self.check_member_contract_call(receiver, &name.name, args) {
+                    return ty;
+                }
+            }
             let recv_ty = self.check_expr(receiver, None);
             let _ = recv_ty;
             if let Some(elem) = self.list_elem.get(&receiver.span()).cloned() {
@@ -6472,6 +6482,196 @@ impl<'r> Checker<'r> {
                 lub(&lhs_non_null, &r)
             }
             BinOp::Assign => Type::Unit,
+        }
+    }
+
+    /// Type-check a stdlib top-level contract call like `run { ... }`,
+    /// `with(x) { ... }`, `check(c)`, `require(c)`. Returns `None` if the
+    /// shape does not match any known contract; the caller falls back to
+    /// normal call dispatch in that case.
+    fn check_toplevel_contract_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        call_span: Span,
+    ) -> Option<Type> {
+        let _ = call_span;
+        match name {
+            "run" if args.len() == 1 => {
+                if let Expr::Lambda { params, body, .. } = &args[0] {
+                    let ty = self.check_lambda_in_place(params, body, None, None);
+                    return Some(match ty {
+                        Type::Function { return_type, .. } => *return_type,
+                        _ => Type::Unresolved,
+                    });
+                }
+                None
+            }
+            "with" if args.len() == 2 => {
+                let recv = self.check_expr(&args[0], None);
+                let recv_cls = self.expr_class.get(&args[0].span()).cloned();
+                if let Expr::Lambda { params, body, .. } = &args[1] {
+                    let ty = self.check_lambda_in_place(
+                        params,
+                        body,
+                        None,
+                        Some((recv.clone(), recv_cls)),
+                    );
+                    return Some(match ty {
+                        Type::Function { return_type, .. } => *return_type,
+                        _ => Type::Unresolved,
+                    });
+                }
+                None
+            }
+            "check" | "require" if (1..=2).contains(&args.len()) => {
+                let cond = &args[0];
+                let nar = self.check_condition(cond);
+                for a in &args[1..] {
+                    self.check_expr(a, None);
+                }
+                for (n, t) in &nar.true_branch {
+                    self.current_frame().narrowings.insert(n.clone(), t.clone());
+                }
+                for (n, cn) in &nar.true_class {
+                    self.current_frame().narrowing_class.insert(n.clone(), cn.clone());
+                }
+                Some(Type::Unit)
+            }
+            _ => None,
+        }
+    }
+
+    /// Type-check a member-form scope-function call: `recv.let { ... }`,
+    /// `recv.run { ... }`, `recv.apply { ... }`, `recv.also { ... }`.
+    /// Returns `None` if `name` is not a recognized scope function.
+    fn check_member_contract_call(
+        &mut self,
+        recv: &Expr,
+        name: &str,
+        args: &[Expr],
+    ) -> Option<Type> {
+        if args.len() != 1 {
+            return None;
+        }
+        let Expr::Lambda { params, body, .. } = &args[0] else { return None };
+        let recv_ty = self.check_expr(recv, None);
+        let recv_cls = self.expr_class.get(&recv.span()).cloned();
+        match name {
+            "let" => {
+                let ty = self.check_lambda_in_place(
+                    params,
+                    body,
+                    Some((recv_ty.clone(), recv_cls.clone())),
+                    None,
+                );
+                Some(match ty {
+                    Type::Function { return_type, .. } => *return_type,
+                    _ => Type::Unresolved,
+                })
+            }
+            "run" => {
+                let ty = self.check_lambda_in_place(
+                    params,
+                    body,
+                    None,
+                    Some((recv_ty.clone(), recv_cls.clone())),
+                );
+                Some(match ty {
+                    Type::Function { return_type, .. } => *return_type,
+                    _ => Type::Unresolved,
+                })
+            }
+            "apply" => {
+                self.check_lambda_in_place(
+                    params,
+                    body,
+                    None,
+                    Some((recv_ty.clone(), recv_cls.clone())),
+                );
+                Some(recv_ty)
+            }
+            "also" => {
+                self.check_lambda_in_place(
+                    params,
+                    body,
+                    Some((recv_ty.clone(), recv_cls.clone())),
+                    None,
+                );
+                Some(recv_ty)
+            }
+            _ => None,
+        }
+    }
+
+    /// Type-check a lambda body without saving/restoring `assigned`. Per
+    /// the spec §12.2.5 calls-in-place exactly-once contract, assignments
+    /// performed inside the body must propagate to the enclosing CFG.
+    /// `it_binding` and `this_binding` supply implicit `it` / `this` from
+    /// scope-function receivers.
+    fn check_lambda_in_place(
+        &mut self,
+        params: &[klio_ast::Ident],
+        body: &Block,
+        it_binding: Option<(Type, Option<String>)>,
+        this_binding: Option<(Type, Option<String>)>,
+        ) -> Type {
+        self.push_frame();
+        if params.is_empty() {
+            let (it_ty, it_cls) = it_binding.unwrap_or((Type::Unresolved, None));
+            self.current_frame().bindings.insert(
+                "it".to_string(),
+                Binding {
+                    ty: it_ty,
+                    mutable: false,
+                    decl_span: None,
+                    class_name: it_cls,
+                    needs_init: false,
+                },
+            );
+            self.assigned.insert("it".to_string());
+        } else {
+            for p in params {
+                self.current_frame().bindings.insert(
+                    p.name.clone(),
+                    Binding {
+                        ty: Type::Unresolved,
+                        mutable: false,
+                        decl_span: Some(p.span),
+                        class_name: None,
+                        needs_init: false,
+                    },
+                );
+                self.assigned.insert(p.name.clone());
+            }
+        }
+        if let Some((this_ty, this_cls)) = this_binding {
+            self.current_frame().bindings.insert(
+                "this".to_string(),
+                Binding {
+                    ty: this_ty,
+                    mutable: false,
+                    decl_span: None,
+                    class_name: this_cls.clone(),
+                    needs_init: false,
+                },
+            );
+            if let Some(cn) = this_cls {
+                self.class_stack.push(cn);
+                let actual_ret = self.check_block(body, None);
+                self.class_stack.pop();
+                self.pop_frame();
+                return Type::Function {
+                    params: vec![],
+                    return_type: Box::new(actual_ret),
+                };
+            }
+        }
+        let actual_ret = self.check_block(body, None);
+        self.pop_frame();
+        Type::Function {
+            params: vec![],
+            return_type: Box::new(actual_ret),
         }
     }
 

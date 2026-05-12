@@ -113,7 +113,11 @@ impl Resolution {
     }
 }
 
-const BUILTINS: &[&str] = &["println", "print"];
+const BUILTINS: &[&str] = &[
+    "println", "print",
+    // Stdlib scope functions with contracts (§12.2.5).
+    "run", "with", "check", "require",
+];
 
 /// Resolve a parsed file. The returned `Resolution` always contains a
 /// builtins scope and a file scope, even if the input has no declarations.

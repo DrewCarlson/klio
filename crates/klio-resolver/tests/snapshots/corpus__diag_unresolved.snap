@@ -1,11 +1,15 @@
 ---
-source: crates/ktc-resolver/tests/corpus.rs
+source: crates/klio-resolver/tests/corpus.rs
 expression: "fun main() {\n    println(banana)\n}\n"
 ---
 # symbols
   [0] Builtin println @builtin
   [1] Builtin print @builtin
-  [2] TopLevelFunction main @4..8
+  [2] Builtin run @builtin
+  [3] Builtin with @builtin
+  [4] Builtin check @builtin
+  [5] Builtin require @builtin
+  [6] TopLevelFunction main @4..8
 
 # uses
   @17..24 -> [0] println (Builtin)
