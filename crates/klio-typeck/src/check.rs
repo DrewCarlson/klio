@@ -4828,10 +4828,18 @@ impl<'r> Checker<'r> {
                 }
                 match op {
                     PostfixOp::Inc | PostfixOp::Dec => t,
-                    PostfixOp::NotNull => match t {
-                        Type::Nullable(inner) => *inner,
-                        other => other,
-                    },
+                    PostfixOp::NotNull => {
+                        let narrowed = match t {
+                            Type::Nullable(inner) => *inner,
+                            other => other,
+                        };
+                        if let Some(key) = dot_path_key(expr) {
+                            self.current_frame()
+                                .narrowings
+                                .insert(key, narrowed.clone());
+                        }
+                        narrowed
+                    }
                 }
             }
             Expr::If { cond, then_branch, else_branch, .. } => {
@@ -5220,6 +5228,16 @@ impl<'r> Checker<'r> {
                 let target = convert_type_ref_lossy(ty);
                 if let Some(cn) = class_name_from_typeref(ty) {
                     self.expr_class.insert(*span, cn);
+                }
+                if !*safe {
+                    if let Some(key) = dot_path_key(expr) {
+                        self.current_frame()
+                            .narrowings
+                            .insert(key.clone(), target.clone());
+                        if let Some(cn) = class_name_from_typeref(ty) {
+                            self.current_frame().narrowing_class.insert(key, cn);
+                        }
+                    }
                 }
                 if *safe {
                     target.as_nullable()
@@ -8701,6 +8719,37 @@ mod tests {
             "#,
         );
         assert!(codes(&tc).contains(&codes::WARN_USELESS_ELVIS));
+    }
+
+    #[test]
+    fn notnull_narrows_subject() {
+        let tc = check_src(
+            r#"
+            fun main() {
+                val s: String? = "hi"
+                s!!
+                val n: Int = s.length
+                println(n)
+            }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn as_cast_narrows_subject() {
+        let tc = check_src(
+            r#"
+            fun main() {
+                val a: Any = "hi"
+                val s = a as String
+                val n: Int = a.length
+                println(s)
+                println(n)
+            }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
