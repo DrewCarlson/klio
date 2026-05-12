@@ -1,0 +1,32 @@
+---
+source: crates/klio-parser/tests/corpus.rs
+expression: "fun main() {\n    var x = 0\n    val y = (x = 1)\n    if (x = 2) {\n        println(\"a\")\n    }\n}\n"
+---
+# ast
+fun main()
+  body=block
+    stmt-decl
+      var x
+        init=
+          int 0
+    stmt-decl
+      val y
+        init=
+          path x
+    stmt-expr
+      if
+        cond=
+          path x
+        then=
+          block
+            stmt-expr
+              call (#args=1)
+                callee=
+                  path println
+                arg[0]=
+                  string-template
+                    text "a"
+
+# diagnostics
+[T0117] Error assignments are not expressions, and only expressions are allowed in this context @42..43
+[T0117] Error assignments are not expressions, and only expressions are allowed in this context @57..58

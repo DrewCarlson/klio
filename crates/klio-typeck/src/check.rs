@@ -414,6 +414,11 @@ pub mod codes {
     /// Spec §18.1 cross §4.1: assignment / argument-passing between a
     /// `suspend (…) -> R` and a non-suspending `(…) -> R` function type.
     pub const TYPE_SUSPEND_FUNCTION_TYPE_MISMATCH: &str = "T0116";
+    /// Spec §7.1 note: assignments are statements, not expressions, and may
+    /// not appear in expression contexts (`val y = (x = 1)`, `if (x = 1)`,
+    /// `f(x = 1)` positional). Matches kotlinc-native
+    /// `ASSIGNMENT_IN_EXPRESSION_CONTEXT`.
+    pub const TYPE_ASSIGNMENT_IN_EXPRESSION_CONTEXT: &str = "T0117";
     /// Spec §17.5.5: WARNING level deprecation.
     pub const WARN_DEPRECATED: &str = "W0006";
     /// Spec §17.5.4: WARNING level opt-in.

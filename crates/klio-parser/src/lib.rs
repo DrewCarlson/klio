@@ -85,6 +85,34 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         }
     }
 
+    /// Spec §7.1: assignments are statements, not expressions. After parsing
+    /// an expression in a value-context (paren, `if`/`while`/`do-while`/`when`
+    /// condition, `for` range, value-argument), reject a trailing assignment
+    /// operator with a clear diagnostic and consume the RHS to recover.
+    fn reject_trailing_assignment(&mut self) {
+        let is_assign = matches!(
+            self.peek_kind(),
+            TokenKind::Eq
+                | TokenKind::PlusEq
+                | TokenKind::MinusEq
+                | TokenKind::StarEq
+                | TokenKind::SlashEq
+                | TokenKind::PercentEq
+        );
+        if !is_assign {
+            return;
+        }
+        let span = self.current_span();
+        self.error(
+            "T0117",
+            "assignments are not expressions, and only expressions are allowed in this context",
+            span,
+        );
+        self.bump();
+        self.skip_nl();
+        let _ = self.parse_expr();
+    }
+
     fn at_newline_or_semi_or_close(&self) -> bool {
         matches!(
             self.peek_kind(),
@@ -2760,10 +2788,13 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             let star = self.bump();
             self.skip_nl();
             let e = self.parse_expr()?;
+            self.reject_trailing_assignment();
             let span = star.span.join(e.span());
             return Some(Expr::Spread { expr: Box::new(e), span });
         }
-        self.parse_expr()
+        let e = self.parse_expr()?;
+        self.reject_trailing_assignment();
+        Some(e)
     }
 
     fn try_consume_named_arg_name(&mut self) -> Option<String> {
@@ -2829,6 +2860,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 self.bump();
                 self.skip_nl();
                 let inner = self.parse_expr()?;
+                self.skip_nl();
+                self.reject_trailing_assignment();
                 self.skip_nl();
                 self.expect(&TokenKind::RParen, "`)`")?;
                 Some(inner)
@@ -3021,6 +3054,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.skip_nl();
         let cond = self.parse_expr()?;
         self.skip_nl();
+        self.reject_trailing_assignment();
+        self.skip_nl();
         self.expect(&TokenKind::RParen, "`)`")?;
         self.skip_nl();
         // Spec §8.5: the then-branch may be omitted (`;` or `else`
@@ -3068,6 +3103,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.skip_nl();
         let cond = self.parse_expr()?;
         self.skip_nl();
+        self.reject_trailing_assignment();
+        self.skip_nl();
         self.expect(&TokenKind::RParen, "`)`")?;
         self.skip_nl();
         let body = self.parse_expr()?;
@@ -3094,6 +3131,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.expect(&TokenKind::LParen, "`(`")?;
         self.skip_nl();
         let cond = self.parse_expr()?;
+        self.skip_nl();
+        self.reject_trailing_assignment();
         self.skip_nl();
         let rp = self.expect(&TokenKind::RParen, "`)`")?;
         Some(Expr::DoWhile {
@@ -3155,6 +3194,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.expect(&TokenKind::Keyword(Keyword::In), "`in`")?;
         self.skip_nl();
         let iter = self.parse_expr()?;
+        self.skip_nl();
+        self.reject_trailing_assignment();
         self.skip_nl();
         self.expect(&TokenKind::RParen, "`)`")?;
         self.skip_nl();
@@ -3294,6 +3335,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 let e = self.parse_expr()?;
                 subject = Some(Box::new(e));
             }
+            self.skip_nl();
+            self.reject_trailing_assignment();
             self.skip_nl();
             self.expect(&TokenKind::RParen, "`)`")?;
         }

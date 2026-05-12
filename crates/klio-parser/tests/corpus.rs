@@ -395,3 +395,4 @@ corpus_test!(diag_import_trailing_dot, "diag_import_trailing_dot.kt");
 corpus_test!(diag_package_after_imports, "diag_package_after_imports.kt");
 corpus_test!(diag_duplicate_package, "diag_duplicate_package.kt");
 corpus_test!(diag_import_after_decl, "diag_import_after_decl.kt");
+corpus_test!(diag_assignment_in_expression, "diag_assignment_in_expression.kt");
