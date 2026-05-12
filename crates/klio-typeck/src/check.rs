@@ -5174,6 +5174,25 @@ impl<'r> Checker<'r> {
                     (None, None) => {}
                 }
                 self.assigned = merged;
+                // Spec §14.1: when exactly one branch diverges (Type::Nothing),
+                // control flows past the `if` only through the surviving branch.
+                // Push the condition narrowings from that surviving side into
+                // the enclosing frame so subsequent statements see them.
+                if then_diverges && !else_diverges {
+                    for (n, t) in &cond_narrow.false_branch {
+                        self.current_frame().narrowings.insert(n.clone(), t.clone());
+                    }
+                    for (n, cn) in &cond_narrow.false_class {
+                        self.current_frame().narrowing_class.insert(n.clone(), cn.clone());
+                    }
+                } else if else_present && else_diverges && !then_diverges {
+                    for (n, t) in &cond_narrow.true_branch {
+                        self.current_frame().narrowings.insert(n.clone(), t.clone());
+                    }
+                    for (n, cn) in &cond_narrow.true_class {
+                        self.current_frame().narrowing_class.insert(n.clone(), cn.clone());
+                    }
+                }
                 lub(&then_ty, &else_ty)
             }
             Expr::While { cond, body, .. } => {
@@ -6924,9 +6943,22 @@ impl<'r> Checker<'r> {
                     );
                 }
                 let lhs_non_null = match l {
-                    Type::Nullable(inner) => *inner,
-                    other => other,
+                    Type::Nullable(inner) => (*inner).clone(),
+                    other => other.clone(),
                 };
+                // Spec §14.1: when the rhs diverges (return / throw / continue /
+                // break, all typed as `Nothing`), control falls through only when
+                // the lhs was non-null. Narrow the lhs in the enclosing frame.
+                if matches!(r, Type::Nothing) {
+                    if let Some(key) = dot_path_key(lhs) {
+                        self.current_frame()
+                            .narrowings
+                            .insert(key.clone(), lhs_non_null.clone());
+                        if let Some(cn) = self.expr_class.get(&lhs.span()).cloned() {
+                            self.current_frame().narrowing_class.insert(key, cn);
+                        }
+                    }
+                }
                 lub(&lhs_non_null, &r)
             }
             BinOp::Assign => Type::Unit,
@@ -7203,10 +7235,13 @@ impl<'r> Checker<'r> {
                             Type::Nullable(i) => (**i).clone(),
                             other => other.clone(),
                         };
+                        // `e != null`: true iff e non-null. In a negated
+                        // context the if's true/false-branch meaning swaps.
+                        let _ = cur;
                         if positive {
                             out.true_branch.insert(name, nn);
                         } else {
-                            out.false_branch.insert(name, cur);
+                            out.false_branch.insert(name, nn);
                         }
                     }
                 }
@@ -7223,11 +7258,12 @@ impl<'r> Checker<'r> {
                             Type::Nullable(i) => (**i).clone(),
                             other => other.clone(),
                         };
+                        // `e == null`: useful refinement lives on the opposite
+                        // arm — `e` is non-null where the equality is false.
                         if positive {
-                            // `x == null` true: x is null; no useful refinement.
-                            let _ = nn;
-                        } else {
                             out.false_branch.insert(name, nn);
+                        } else {
+                            out.true_branch.insert(name, nn);
                         }
                     }
                 }
@@ -8500,6 +8536,39 @@ mod tests {
         // `a as? String` yields String? but does NOT narrow a — a may still be the original Any.
         let tc = check_src(
             "fun main() { val a: Any = \"hi\"; val s = a as? String; val x: Any = a }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_after_elvis_return() {
+        let tc = check_src(
+            "fun greet(name: String?) { val n = name ?: return; println(name.length) }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_after_elvis_throw() {
+        let tc = check_src(
+            "fun greet(name: String?) { name ?: throw RuntimeException(\"x\"); println(name.length) }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_after_if_null_return() {
+        let tc = check_src(
+            "fun greet(name: String?) { if (name == null) return; println(name.length) }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_after_if_nonnull_else_return() {
+        // when the else diverges, the true-branch narrowings survive past the if.
+        let tc = check_src(
+            "fun greet(name: String?) { if (name != null) {} else return; println(name.length) }",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
