@@ -1,0 +1,22 @@
+---
+source: crates/ktc-lexer/tests/corpus.rs
+expression: "val bad = \"what is \\q here?\"\nval also = '\\z'\n"
+---
+# tokens
+KW[Val]                 0..3    val
+IDENT                   4..7    bad
+Eq                      8..9    =
+QUOTE["]               10..11   \"
+STR_TEXT["what is � here?"]   11..27   what is \\q here?
+QUOTE["]               27..28   \"
+NL                     28..29   \n
+KW[Val]                29..32   val
+IDENT                  33..37   also
+Eq                     38..39   =
+CHAR['�']              40..44   \'\\z\'
+NL                     44..45   \n
+EOF                    45..45   
+
+# diagnostics
+[ILLEGAL_ESCAPE] Error invalid escape sequence `\q` @19..21
+[ILLEGAL_ESCAPE] Error invalid escape sequence `\z` @41..43

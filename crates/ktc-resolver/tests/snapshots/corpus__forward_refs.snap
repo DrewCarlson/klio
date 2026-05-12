@@ -1,0 +1,19 @@
+---
+source: crates/ktc-resolver/tests/corpus.rs
+expression: "fun main() {\n    greet()\n    println(square(4))\n}\n\nfun greet() {\n    println(\"hello\")\n}\n\nfun square(x: Int): Int = x * x\n"
+---
+# symbols
+  [0] Builtin println @builtin
+  [1] Builtin print @builtin
+  [2] TopLevelFunction main @4..8
+  [3] TopLevelFunction greet @55..60
+  [4] TopLevelFunction square @93..99
+  [5] Parameter x @100..101
+
+# uses
+  @17..22 -> [3] greet (TopLevelFunction)
+  @29..36 -> [0] println (Builtin)
+  @37..43 -> [4] square (TopLevelFunction)
+  @69..76 -> [0] println (Builtin)
+  @115..116 -> [5] x (Parameter)
+  @119..120 -> [5] x (Parameter)

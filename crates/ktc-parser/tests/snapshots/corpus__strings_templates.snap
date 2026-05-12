@@ -1,0 +1,42 @@
+---
+source: crates/ktc-parser/tests/corpus.rs
+expression: "fun main() {\n    val name = \"world\"\n    val greeting = \"hello $name, today is ${1 + 1}\"\n    val raw = \"\"\"multi\nline $name end\"\"\"\n    println(greeting)\n    println(raw)\n}\n"
+---
+# ast
+fun main()
+  body=block
+    stmt-decl
+      val name
+        init=
+          string-template
+            text "world"
+    stmt-decl
+      val greeting
+        init=
+          string-template
+            text "hello "
+            short-interp $name
+            text ", today is "
+            interp
+              binop +
+                int 1
+                int 1
+    stmt-decl
+      val raw
+        init=
+          string-template
+            text "multi\nline "
+            short-interp $name
+            text " end"
+    stmt-expr
+      call (#args=1)
+        callee=
+          path println
+        arg[0]=
+          path greeting
+    stmt-expr
+      call (#args=1)
+        callee=
+          path println
+        arg[0]=
+          path raw

@@ -1,0 +1,56 @@
+---
+source: crates/ktc-parser/tests/corpus.rs
+expression: "fun main() {\n    val s = \"hello\"\n    val n = s.length\n    val u = s?.length\n    val first = s[0]\n    val x = obj.method(1, 2, 3)\n    val y = a.b.c.d\n    val z = a!!.b\n}\n"
+---
+# ast
+fun main()
+  body=block
+    stmt-decl
+      val s
+        init=
+          string-template
+            text "hello"
+    stmt-decl
+      val n
+        init=
+          member .length
+            path s
+    stmt-decl
+      val u
+        init=
+          member? .length
+            path s
+    stmt-decl
+      val first
+        init=
+          index (#args=1)
+            recv=
+              path s
+            arg[0]=
+              int 0
+    stmt-decl
+      val x
+        init=
+          call (#args=3)
+            callee=
+              member .method
+                path obj
+            arg[0]=
+              int 1
+            arg[1]=
+              int 2
+            arg[2]=
+              int 3
+    stmt-decl
+      val y
+        init=
+          member .d
+            member .c
+              member .b
+                path a
+    stmt-decl
+      val z
+        init=
+          member .b
+            postfix !!
+              path a

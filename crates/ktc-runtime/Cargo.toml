@@ -1,0 +1,15 @@
+[package]
+name = "ktc-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ktc-span  = { workspace = true }
+ktc-ast   = { workspace = true }
+thiserror = { workspace = true }
+regex     = "1"
+
+[lints]
+workspace = true

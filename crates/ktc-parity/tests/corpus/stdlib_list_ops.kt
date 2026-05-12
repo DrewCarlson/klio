@@ -1,0 +1,27 @@
+fun main() {
+    val xs = listOf(1, 2, 3, 4, 5, 6)
+    println(xs.first())
+    println(xs.last())
+    println(xs.firstOrNull())
+    println(xs.lastOrNull())
+    println(listOf<Int>().firstOrNull())
+    println(listOf<Int>().lastOrNull())
+    println(listOf(42).single())
+    println(listOf<Int>().singleOrNull())
+    println(listOf(1, 2).singleOrNull())
+    println(xs.count())
+    println(xs.toList())
+    println(xs.toSet())
+    println(xs.toMutableList())
+    for ((i, v) in xs.withIndex()) {
+        println("$i->$v")
+    }
+    val pairs = listOf(1 to "a", 2 to "b", 3 to "c")
+    val unzipped = pairs.unzip()
+    println(unzipped.first)
+    println(unzipped.second)
+    val nested = listOf(listOf(1, 2), listOf(3, 4), listOf(5))
+    println(nested.flatten())
+    println(xs.containsAll(listOf(2, 4)))
+    println(xs.containsAll(listOf(2, 99)))
+}

@@ -1,0 +1,21 @@
+[package]
+name = "ktc-resolver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ktc-span        = { workspace = true }
+ktc-ast         = { workspace = true }
+ktc-diagnostics = { workspace = true }
+ktc-types       = { workspace = true }
+thiserror       = { workspace = true }
+
+[dev-dependencies]
+ktc-lexer       = { workspace = true }
+ktc-parser      = { workspace = true }
+insta           = { workspace = true }
+
+[lints]
+workspace = true

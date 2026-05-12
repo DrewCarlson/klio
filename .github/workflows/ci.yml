@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # ktc-parity tests auto-skip when kotlinc-native is absent (see
+      # crates/ktc-parity/tests/parity.rs), so the full workspace test run
+      # is safe on CI runners without Kotlin/Native installed.
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: stdlib coverage non-regression gate
+        run: |
+          set -euo pipefail
+          output=$(cargo run -q -p ktc-stdlib-gen -- coverage)
+          echo "$output"
+          current=$(printf '%s\n' "$output" | grep -oE 'implemented [0-9]+' | awk '{print $2}')
+          if [ -z "${current:-}" ]; then
+            echo "failed to parse implemented count from coverage output" >&2
+            exit 1
+          fi
+          baseline=$(tr -d '[:space:]' < coverage-baseline.txt)
+          echo "current=$current baseline=$baseline"
+          if [ "$current" -lt "$baseline" ]; then
+            echo "stdlib coverage regressed: $current < $baseline (see coverage-baseline.txt)" >&2
+            exit 1
+          fi

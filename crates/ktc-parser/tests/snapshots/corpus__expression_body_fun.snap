@@ -1,0 +1,22 @@
+---
+source: crates/ktc-parser/tests/corpus.rs
+expression: "fun square(x: Int): Int = x * x\n\nfun double(x: Int) = x + x\n\nval computed = 1 + 2 * 3\n"
+---
+# ast
+fun square(x:Int):Int
+  body=expr
+    binop *
+      path x
+      path x
+fun double(x:Int)
+  body=expr
+    binop +
+      path x
+      path x
+val computed
+  init=
+    binop +
+      int 1
+      binop *
+        int 2
+        int 3

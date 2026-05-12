@@ -1,0 +1,16 @@
+---
+source: crates/ktc-parser/tests/corpus.rs
+expression: "+ + +\nfun main() { println(1) }\n"
+---
+# ast
+fun main()
+  body=block
+    stmt-expr
+      call (#args=1)
+        callee=
+          path println
+        arg[0]=
+          int 1
+
+# diagnostics
+[E0002] Error expected top-level declaration @0..1

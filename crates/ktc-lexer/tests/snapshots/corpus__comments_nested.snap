@@ -1,0 +1,21 @@
+---
+source: crates/ktc-lexer/tests/corpus.rs
+expression: "// leading comment\nfun f() /* inline */ {\n    /* outer /* inner /* triple */ inner-end */ outer-end */\n    val x = 1 // trailing\n}\n"
+---
+# tokens
+NL                     18..19   \n
+KW[Fun]                19..22   fun
+IDENT                  23..24   f
+LParen                 24..25   (
+RParen                 25..26   )
+LBrace                 40..41   {
+NL                     41..42   \n
+NL                    102..103  \n
+KW[Val]               107..110  val
+IDENT                 111..112  x
+Eq                    113..114  =
+INT[Decimal,None]     115..116  1
+NL                    128..129  \n
+RBrace                129..130  }
+NL                    130..131  \n
+EOF                   131..131

@@ -1,0 +1,15 @@
+fun main() {
+    val xs = listOf(1, 2, 3, 4, 5, 6, 7, 8)
+    println(xs.take(3))
+    println(xs.drop(3))
+    println(xs.takeLast(3))
+    println(xs.dropLast(3))
+    println(xs.takeWhile { it < 5 })
+    println(xs.dropWhile { it < 5 })
+    println(xs.slice(2..4))
+    println(xs.subList(1, 4))
+    println(xs.plus(99))
+    println(xs.plus(listOf(100, 200)))
+    println(xs.minus(3))
+    println(xs.minus(listOf(2, 4, 6)))
+}

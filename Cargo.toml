@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ktc-span",
+    "crates/ktc-diagnostics",
+    "crates/ktc-lexer",
+    "crates/ktc-ast",
+    "crates/ktc-parser",
+    "crates/ktc-runtime",
+    "crates/ktc-types",
+    "crates/ktc-resolver",
+    "crates/ktc-typeck",
+    "crates/ktc-stdlib",
+    "crates/ktc-stdlib-gen",
+    "crates/ktc-interp",
+    "crates/ktc-cli",
+    "crates/ktc-parity",
+    "crates/ktc-diagnostics-gen",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DrewCarlson/kt-exp"
+
+[workspace.dependencies]
+ktc-span        = { path = "crates/ktc-span" }
+ktc-diagnostics = { path = "crates/ktc-diagnostics" }
+ktc-lexer       = { path = "crates/ktc-lexer" }
+ktc-ast         = { path = "crates/ktc-ast" }
+ktc-parser      = { path = "crates/ktc-parser" }
+ktc-runtime     = { path = "crates/ktc-runtime" }
+ktc-types       = { path = "crates/ktc-types" }
+ktc-resolver    = { path = "crates/ktc-resolver" }
+ktc-typeck      = { path = "crates/ktc-typeck" }
+ktc-stdlib      = { path = "crates/ktc-stdlib" }
+ktc-interp      = { path = "crates/ktc-interp" }
+
+thiserror      = "2"
+ariadne        = "0.6.0"
+unicode-ident  = "1"
+unicode-xid    = "0.2"
+clap           = { version = "4", features = ["derive"] }
+rustyline      = "18.0.0"
+insta          = { version = "1", features = ["yaml"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
