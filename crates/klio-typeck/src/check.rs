@@ -3762,7 +3762,27 @@ impl<'r> Checker<'r> {
         if let Some(body) = &f.body {
             match body {
                 FunctionBody::Block(b) => {
-                    self.check_block(b, Some(&declared_return));
+                    let body_ty = self.check_block(b, Some(&declared_return));
+                    // Block-body functions with a declared non-`Unit` /
+                    // non-`Nothing` return require every path to terminate
+                    // in `return` / `throw` / equivalent divergence. We
+                    // approximate the rule by checking that the block's
+                    // tail type diverges (`Nothing`) when the declared
+                    // return is value-bearing.
+                    if !f.is_abstract
+                        && f.return_type.is_some()
+                        && !matches!(declared_return, Type::Unit | Type::Nothing | Type::Unresolved)
+                        && !matches!(body_ty, Type::Nothing)
+                    {
+                        let span = b.stmts.last().map(stmt_span).unwrap_or(f.name.span);
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                "a 'return' expression is required in a function with a block body and a non-`Unit` return type".to_string(),
+                                span,
+                            )
+                            .with_code(codes::TYPE_MISSING_RETURN),
+                        );
+                    }
                 }
                 FunctionBody::Expr(e) => {
                     let ety = self.check_expr(e, Some(&declared_return));

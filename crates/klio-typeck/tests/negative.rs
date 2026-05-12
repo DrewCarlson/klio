@@ -1029,6 +1029,15 @@ fn neg_super_qualifier_not_supertype() {
 }
 
 #[test]
+fn neg_missing_return() {
+    assert!(
+        type_codes_for("neg_missing_return.kt")
+            .iter()
+            .any(|c| c == "T0005")
+    );
+}
+
+#[test]
 fn neg_suspend_delegate_get_value() {
     assert!(
         type_codes_for("neg_suspend_delegate_get_value.kt")
