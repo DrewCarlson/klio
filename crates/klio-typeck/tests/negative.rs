@@ -520,6 +520,13 @@ fn neg_throwable_type_params() {
 }
 
 #[test]
+fn neg_tailrec_on_open() {
+    assert!(type_codes_for("neg_tailrec_on_open.kt")
+        .iter()
+        .any(|c| c == "T0057"));
+}
+
+#[test]
 fn neg_published_api_missing() {
     assert!(type_codes_for("neg_published_api_missing.kt")
         .iter()

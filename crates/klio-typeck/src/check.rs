@@ -188,6 +188,10 @@ pub mod codes {
     /// A subtype of `kotlin.Throwable` declares type parameters. Spec §3.12
     /// makes this a compile-time error.
     pub const TYPE_THROWABLE_TYPE_PARAMS: &str = "T0051";
+    /// A function is declared `tailrec` together with `open` or `override`.
+    /// Virtual dispatch defeats the trampoline rewrite, so kotlinc emits a
+    /// warning. Matches `TAILREC_ON_VIRTUAL_MEMBER`.
+    pub const TYPE_TAILREC_ON_OPEN: &str = "T0057";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -497,6 +501,16 @@ impl<'a> Checker<'a> {
     fn check_tailrec_function(&mut self, f: &Function) {
         if !f.is_tailrec {
             return;
+        }
+        if f.is_open || f.is_override {
+            self.diagnostics.emit(
+                Diagnostic::warning(
+                    "tailrec is redundant on an open or override function — virtual dispatch defeats the rewrite"
+                        .to_string(),
+                    f.name.span,
+                )
+                .with_code(codes::TYPE_TAILREC_ON_OPEN),
+            );
         }
         let Some(body) = &f.body else {
             return;
