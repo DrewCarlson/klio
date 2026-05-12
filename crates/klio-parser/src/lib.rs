@@ -175,19 +175,26 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             let kw = self.bump();
             let mut path = Vec::new();
             let mut wildcard = false;
-            if let Some(first) = self.parse_ident("import path") {
-                path.push(first);
+            self.skip_nl();
+            if matches!(self.peek_kind(), TokenKind::Ident) {
+                let tok = self.bump();
+                path.push(Ident { name: self.text(tok.span).to_string(), span: tok.span });
+            } else {
+                self.error("P0047", "malformed import: missing path", kw.span);
             }
             while matches!(self.peek_kind(), TokenKind::Dot) {
-                self.bump();
+                let dot = self.bump();
                 if matches!(self.peek_kind(), TokenKind::Star) {
                     self.bump();
                     wildcard = true;
                     break;
                 }
-                if let Some(part) = self.parse_ident("import segment") {
-                    path.push(part);
+                self.skip_nl();
+                if matches!(self.peek_kind(), TokenKind::Ident) {
+                    let tok = self.bump();
+                    path.push(Ident { name: self.text(tok.span).to_string(), span: tok.span });
                 } else {
+                    self.error("P0047", "malformed import: trailing `.` with no segment", dot.span);
                     break;
                 }
             }

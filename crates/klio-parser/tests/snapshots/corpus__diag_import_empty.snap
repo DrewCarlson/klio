@@ -1,0 +1,12 @@
+---
+source: crates/klio-parser/tests/corpus.rs
+assertion_line: 393
+expression: "import\nfun main() {}\n"
+---
+# ast
+import 
+fun main()
+  body=block
+
+# diagnostics
+[P0047] Error malformed import: missing path @0..6
