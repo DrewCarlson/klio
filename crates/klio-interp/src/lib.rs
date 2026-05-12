@@ -2037,6 +2037,7 @@ impl Interpreter {
                 params: Rc::new(params.iter().map(|p| p.name.clone()).collect()),
                 body: Rc::new(body.clone()),
                 env: Rc::clone(env),
+                absorb_return: false,
             }),
             Expr::This { qualifier: Some(label), .. } => {
                 let qname = format!("this@{}", label.name);
@@ -2149,6 +2150,7 @@ impl Interpreter {
                     params: Rc::new(params.iter().map(|p| p.name.name.clone()).collect()),
                     body: Rc::new(block),
                     env: Rc::clone(env),
+                    absorb_return: true,
                 })
             }
             Expr::When { subject, subject_binding, branches, span } => {
@@ -2426,7 +2428,7 @@ impl Interpreter {
         args: &[Value],
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
-        self.call_lambda_with_this(params, body, captured_env, args, None, out)
+        self.call_lambda_with_this(params, body, captured_env, args, None, false, out)
     }
 
     fn call_lambda_with_this(
@@ -2436,6 +2438,7 @@ impl Interpreter {
         captured_env: &Rc<RefCell<Env>>,
         args: &[Value],
         this_binding: Option<Value>,
+        absorb_return: bool,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
         if args.len() > params.len() {
@@ -2457,7 +2460,12 @@ impl Interpreter {
         let implicit_label = self.implicit_lambda_label_stack.last().cloned();
         match result {
             Ok(v) => Ok(v),
-            Err(RuntimeError::Return(v)) => Ok(v),
+            // Anonymous-function bodies (`fun (...) { return v }`) catch
+            // their own `return` — the value becomes the call's result.
+            Err(RuntimeError::Return(v)) if absorb_return => Ok(v),
+            // For lambda literals, a bare `return` is a non-local return
+            // out of the enclosing function (the lambda is inline at the
+            // dispatch site). Propagate the signal upward.
             Err(RuntimeError::LabeledReturn(l, v))
                 if implicit_label.as_deref() == Some(l.as_str()) =>
             {
@@ -2524,12 +2532,12 @@ impl Interpreter {
         args: &[Value],
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
-        let Value::Lambda { params, body, env } = lambda else {
+        let Value::Lambda { params, body, env, absorb_return } = lambda else {
             return Err(RuntimeError::Type(format!(
                 "expected a lambda, got {lambda:?}"
             )));
         };
-        self.call_lambda(params, body, env, args, out)
+        self.call_lambda_with_this(params, body, env, args, None, *absorb_return, out)
     }
 
     /// Invoke a lambda whose body may contain `return@<label>` where
@@ -2570,7 +2578,7 @@ impl Interpreter {
         match name {
             "run" if args.len() == 1 => {
                 let lam = self.eval_expr(&args[0], env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type(
                         "`run` requires a lambda argument".into(),
                     ));
@@ -2583,7 +2591,7 @@ impl Interpreter {
                 let Value::Int(n) = n else {
                     return Err(RuntimeError::Type("repeat requires an Int count".into()));
                 };
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type("repeat requires a lambda".into()));
                 };
                 for i in 0..n {
@@ -2600,7 +2608,7 @@ impl Interpreter {
                     let msg = if let Some(a) = args.get(1) {
                         let v = self.eval_expr(a, env, out)?;
                         match v {
-                            Value::Lambda { params, body, env: captured } => {
+                            Value::Lambda { params, body, env: captured, .. } => {
                                 let r = self.call_lambda(&params, &body, &captured, &[], out)?;
                                 Some(format!("{r}"))
                             }
@@ -2626,7 +2634,7 @@ impl Interpreter {
                     let msg = if let Some(a) = args.get(1) {
                         let v = self.eval_expr(a, env, out)?;
                         match v {
-                            Value::Lambda { params, body, env: captured } => {
+                            Value::Lambda { params, body, env: captured, .. } => {
                                 let r = self.call_lambda(&params, &body, &captured, &[], out)?;
                                 Some(format!("{r}"))
                             }
@@ -2661,7 +2669,7 @@ impl Interpreter {
                     let msg = if let Some(a) = args.get(1) {
                         let lv = self.eval_expr(a, env, out)?;
                         match lv {
-                            Value::Lambda { params, body, env: captured } => {
+                            Value::Lambda { params, body, env: captured, .. } => {
                                 let r = self.call_lambda(&params, &body, &captured, &[], out)?;
                                 Some(format!("{r}"))
                             }
@@ -2684,7 +2692,7 @@ impl Interpreter {
                     let msg = if let Some(a) = args.get(1) {
                         let lv = self.eval_expr(a, env, out)?;
                         match lv {
-                            Value::Lambda { params, body, env: captured } => {
+                            Value::Lambda { params, body, env: captured, .. } => {
                                 let r = self.call_lambda(&params, &body, &captured, &[], out)?;
                                 Some(format!("{r}"))
                             }
@@ -2740,7 +2748,7 @@ impl Interpreter {
             )));
         }
         let lam = self.eval_expr(&args[0], env, out)?;
-        let Value::Lambda { params, body, env: captured } = &lam else {
+        let Value::Lambda { params, body, env: captured, .. } = &lam else {
             return Err(RuntimeError::Type(format!(
                 "`.{kind}` requires a lambda argument, got {lam:?}"
             )));
@@ -2754,7 +2762,7 @@ impl Interpreter {
         } else {
             (std::slice::from_ref(receiver), None)
         };
-        let result = self.call_lambda_with_this(params, body, captured, lam_args, this_binding, out)?;
+        let result = self.call_lambda_with_this(params, body, captured, lam_args, this_binding, false, out)?;
         Ok(Some(match kind {
             "let" | "run" => result,
             "also" | "apply" => receiver.clone(),
@@ -2859,7 +2867,7 @@ impl Interpreter {
                 s.push_str(&separator);
             }
             let piece = if let Some(t) = &transform {
-                let Value::Lambda { params, body, env: captured } = t else { unreachable!() };
+                let Value::Lambda { params, body, env: captured, .. } = t else { unreachable!() };
                 let r = self.call_lambda(params, body, captured, std::slice::from_ref(&v), out)?;
                 format_string_like(&r)
             } else {
@@ -3775,7 +3783,7 @@ impl Interpreter {
                         return Ok(Some((**s).clone()));
                     }
                     // Nullary lambda: first call.
-                    let Value::Lambda { params, body, env: captured } = &**next else {
+                    let Value::Lambda { params, body, env: captured, .. } = &**next else {
                         return Err(RuntimeError::Type(
                             "generateSequence requires a lambda".into(),
                         ));
@@ -3788,7 +3796,7 @@ impl Interpreter {
                     return Ok(Some(v));
                 }
                 // Already started.
-                let Value::Lambda { params, body, env: captured } = &**next else {
+                let Value::Lambda { params, body, env: captured, .. } = &**next else {
                     return Err(RuntimeError::Type(
                         "generateSequence requires a lambda".into(),
                     ));
@@ -3960,7 +3968,7 @@ impl Interpreter {
         args: &[Value],
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
-        let Value::Lambda { params, body, env: captured } = lam else {
+        let Value::Lambda { params, body, env: captured, .. } = lam else {
             return Err(RuntimeError::Type("expected a lambda".into()));
         };
         self.call_lambda(params, body, captured, args, out)
@@ -3996,7 +4004,7 @@ impl Interpreter {
         for v in items.drain(..) {
             let mut keys = Vec::with_capacity(steps.len());
             for (sel, _) in steps.iter() {
-                let Value::Lambda { params, body, env: captured } = sel else {
+                let Value::Lambda { params, body, env: captured, .. } = sel else {
                     return Err(RuntimeError::Type("comparator selector must be a lambda".into()));
                 };
                 let k = self.call_lambda(params, body, captured, std::slice::from_ref(&v), out)?;
@@ -4101,7 +4109,7 @@ impl Interpreter {
                 let on_success = self.eval_expr(&args[0], env, out)?;
                 let on_failure = self.eval_expr(&args[1], env, out)?;
                 let lam = if *ok { &on_success } else { &on_failure };
-                let Value::Lambda { params, body, env: captured } = lam else {
+                let Value::Lambda { params, body, env: captured, .. } = lam else {
                     return Err(RuntimeError::Type(
                         "Result.fold expects two lambdas".into(),
                     ));
@@ -4114,7 +4122,7 @@ impl Interpreter {
                     return Ok(Some(receiver.clone()));
                 }
                 let lam = self.eval_expr(&args[0], env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type("Result.map expects a lambda".into()));
                 };
                 let arg_slice = [(**payload).clone()];
@@ -4126,7 +4134,7 @@ impl Interpreter {
                     return Ok(Some(receiver.clone()));
                 }
                 let lam = self.eval_expr(&args[0], env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type(
                         "Result.mapCatching expects a lambda".into(),
                     ));
@@ -4143,7 +4151,7 @@ impl Interpreter {
             }
             "onSuccess" if args.len() == 1 => {
                 let lam = self.eval_expr(&args[0], env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type(
                         "Result.onSuccess expects a lambda".into(),
                     ));
@@ -4156,7 +4164,7 @@ impl Interpreter {
             }
             "onFailure" if args.len() == 1 => {
                 let lam = self.eval_expr(&args[0], env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type(
                         "Result.onFailure expects a lambda".into(),
                     ));
@@ -4172,7 +4180,7 @@ impl Interpreter {
                     return Ok(Some((**payload).clone()));
                 }
                 let lam = self.eval_expr(&args[0], env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type(
                         "Result.getOrElse expects a lambda".into(),
                     ));
@@ -4194,12 +4202,12 @@ impl Interpreter {
         receiver: Option<Value>,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
-        let Value::Lambda { params, body, env: captured } = lam else {
+        let Value::Lambda { params, body, env: captured, .. } = lam else {
             return Err(RuntimeError::Type(
                 "runCatching expects a lambda".into(),
             ));
         };
-        let res = self.call_lambda_with_this(params, body, captured, &[], receiver, out);
+        let res = self.call_lambda_with_this(params, body, captured, &[], receiver, false, out);
         match res {
             Ok(v) => Ok(Value::Result { ok: true, payload: Box::new(v) }),
             Err(RuntimeError::Thrown(e)) => Ok(Value::Result {
@@ -4232,7 +4240,7 @@ impl Interpreter {
             RuntimeError::Arity(format!("{name} requires a lambda argument"))
         })?;
         let lam = self.eval_expr(lam_expr, env, out)?;
-        let Value::Lambda { params, body, env: captured } = &lam else {
+        let Value::Lambda { params, body, env: captured, .. } = &lam else {
             return Err(RuntimeError::Type(format!("{name} requires a lambda argument")));
         };
         match name {
@@ -4293,7 +4301,7 @@ impl Interpreter {
                     RuntimeError::Arity(format!("{name} requires a lambda"))
                 })?;
                 let lam = self.eval_expr(lam_expr, env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type(format!("{name} requires a lambda")));
                 };
                 let entries = entries_rc.borrow().clone();
@@ -4344,7 +4352,7 @@ impl Interpreter {
                 }
                 drop(entries);
                 let lam = self.eval_expr(&args[1], env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type("getOrElse requires a lambda".into()));
                 };
                 let r = self.call_lambda(params, body, captured, &[], out)?;
@@ -4356,7 +4364,7 @@ impl Interpreter {
                     return Ok(Some(v.clone()));
                 }
                 let lam = self.eval_expr(&args[1], env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type("getOrPut requires a lambda".into()));
                 };
                 let new_v = self.call_lambda(params, body, captured, &[], out)?;
@@ -4365,7 +4373,7 @@ impl Interpreter {
             }
             "forEach" if args.len() == 1 => {
                 let lam = self.eval_expr(&args[0], env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type("forEach requires a lambda".into()));
                 };
                 let entries = entries_rc.borrow().clone();
@@ -4451,7 +4459,7 @@ impl Interpreter {
         };
         let _ = initial; // keep clippy quiet — fold reads its initial below
         let lam = self.eval_expr(lam_expr, env, out)?;
-        let Value::Lambda { params, body, env: captured } = &lam else {
+        let Value::Lambda { params, body, env: captured, .. } = &lam else {
             return Err(RuntimeError::Type(format!(
                 "`.{name}` requires a lambda argument"
             )));
@@ -6004,8 +6012,8 @@ impl Interpreter {
             Value::Function { decl, env } => {
                 self.call_function(decl, env, args, out)
             }
-            Value::Lambda { params, body, env } => {
-                self.call_lambda_with_this(params, body, env, args, None, out)
+            Value::Lambda { params, body, env, absorb_return } => {
+                self.call_lambda_with_this(params, body, env, args, None, *absorb_return, out)
             }
             Value::Intrinsic { func, .. } => {
                 let mut ctx = CallCtx { args, out };
@@ -6111,7 +6119,7 @@ impl Interpreter {
             method_env.borrow_mut().define(n.clone(), val);
         }
         if let Some(lam) = method.sam_lambda.clone() {
-            if let Value::Lambda { params, body, env: captured } = lam {
+            if let Value::Lambda { params, body, env: captured, .. } = lam {
                 return self.call_lambda(&params, &body, &captured, args, out);
             }
         }
@@ -6224,11 +6232,11 @@ impl Interpreter {
         // If the lambda was written without an explicit header (no `->`)
         // and the SAM has exactly one parameter, inject `it` as the lone
         // parameter so the body's `it` reference resolves.
-        let lambda = if let Value::Lambda { params, body, env } = lambda {
+        let lambda = if let Value::Lambda { params, body, env, absorb_return } = lambda {
             if params.is_empty() && sam.decl.params.len() == 1 {
-                Value::Lambda { params: Rc::new(vec!["it".into()]), body, env }
+                Value::Lambda { params: Rc::new(vec!["it".into()]), body, env, absorb_return }
             } else {
-                Value::Lambda { params, body, env }
+                Value::Lambda { params, body, env, absorb_return }
             }
         } else {
             lambda
@@ -6986,12 +6994,12 @@ impl Interpreter {
             if name == "with" && args.len() == 2 {
                 let recv = self.eval_expr(&args[0], env, out)?;
                 let lam = self.eval_expr(&args[1], env, out)?;
-                let Value::Lambda { params, body, env: captured } = &lam else {
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type(
                         "`with` requires a lambda as its second argument".into(),
                     ));
                 };
-                return self.call_lambda_with_this(params, body, captured, &[], Some(recv), out);
+                return self.call_lambda_with_this(params, body, captured, &[], Some(recv), false, out);
             }
             // Implicit-this method dispatch: bare `name(args)` resolves to a
             // method on `this` when `name` isn't otherwise bound. This is
@@ -7263,7 +7271,7 @@ impl Interpreter {
                 // A function-typed value in scope (e.g. a parameter of type
                 // `T.(...) -> R`) may be invoked as `recv.name(args)`. The
                 // receiver binds as `this` inside the lambda.
-                if let Some(Value::Lambda { params, body, env: captured }) =
+                if let Some(Value::Lambda { params, body, env: captured, .. }) =
                     env.borrow().lookup(&name.name)
                 {
                     let mut arg_vals: Vec<Value> = Vec::with_capacity(args.len());
@@ -7276,6 +7284,7 @@ impl Interpreter {
                         &captured,
                         &arg_vals,
                         Some(recv.clone()),
+                        false,
                         out,
                     );
                 }
@@ -7483,7 +7492,7 @@ impl Interpreter {
             // `Function.invoke(...)` — explicit invocation of a callable
             // value. Mirrors what `recv(...)` would dispatch.
             if name.name == "invoke" {
-                if let Value::Lambda { params, body, env: captured } = &recv {
+                if let Value::Lambda { params, body, env: captured, .. } = &recv {
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
                         arg_vals.push(self.eval_expr(a, env, out)?);
@@ -7547,8 +7556,8 @@ impl Interpreter {
                 }
                 r
             }
-            Value::Lambda { params, body, env: captured } => {
-                self.call_lambda(&params, &body, &captured, &arg_vals, out)
+            Value::Lambda { params, body, env: captured, absorb_return } => {
+                self.call_lambda_with_this(&params, &body, &captured, &arg_vals, None, absorb_return, out)
             }
             Value::Class(class) => {
                 if class.is_fun_interface

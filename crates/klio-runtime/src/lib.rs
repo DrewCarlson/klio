@@ -46,7 +46,17 @@ pub enum Value {
     /// `Value::Int`) from `LongRange` (values widen to `Value::Long`).
     Range { start: i64, end: i64, step: i64, kind: RangeKind },
     Function { decl: Rc<klio_ast::Function>, env: Rc<RefCell<Env>> },
-    Lambda { params: Rc<Vec<String>>, body: Rc<klio_ast::Block>, env: Rc<RefCell<Env>> },
+    Lambda {
+        params: Rc<Vec<String>>,
+        body: Rc<klio_ast::Block>,
+        env: Rc<RefCell<Env>>,
+        /// `true` when produced by an anonymous-function expression
+        /// (`fun (x: Int): R = ...`). A bare `return` inside the body is
+        /// a local return and is absorbed at the call boundary. `false`
+        /// for lambda literals — bare `return` propagates out of the
+        /// enclosing function (the inline-lambda case).
+        absorb_return: bool,
+    },
     Intrinsic { fqn: &'static str, func: StdlibFn },
     /// A method intrinsic bound to a specific receiver — produced by member
     /// access like `s.uppercase`. Calling it invokes `func` with the receiver
