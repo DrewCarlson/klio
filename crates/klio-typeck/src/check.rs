@@ -403,6 +403,9 @@ struct ClassInfo {
     /// `object` singleton — registered in `classes` so member lookup works
     /// but never inheritable and never instantiable.
     is_object: bool,
+    /// `enum class` flag. Drives const-expression evaluation of
+    /// enum-entry access at `const val` initializer sites (spec §8.2).
+    is_enum: bool,
     /// Declared inside a function body (local class) or via `object { … }`
     /// (anonymous object). Used to enforce the sealed-inheritor §5.1.2
     /// rule that disallows local / anonymous inheritors.
@@ -1966,7 +1969,21 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Member { receiver, name, safe, .. } => {
-                !*safe && self.is_const_initializer(receiver) && self.is_const_ref(&name.name)
+                if *safe {
+                    return false;
+                }
+                // Spec §8.2: access expressions to enum entries are
+                // constant expressions. Recognize `EnumClass.ENTRY`.
+                if let Expr::Path { segments, .. } = receiver.as_ref() {
+                    if segments.len() == 1 {
+                        if let Some(info) = self.classes.get(&segments[0].name) {
+                            if info.is_enum {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                self.is_const_initializer(receiver) && self.is_const_ref(&name.name)
             }
             Expr::Unary { op, expr, .. } => {
                 matches!(op, UnOp::Neg | UnOp::Pos | UnOp::Not)
@@ -2787,6 +2804,7 @@ impl<'r> Checker<'r> {
             is_abstract: c.is_abstract,
             is_interface: c.is_interface,
             is_sealed: c.is_sealed,
+            is_enum: c.is_enum,
             is_open: c.is_open || c.is_abstract || c.is_sealed,
             has_secondary_ctors: !c.secondary_ctors.is_empty(),
             decl_visibility: c.visibility,
