@@ -3018,6 +3018,10 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         let kw = self.bump();
         self.expect(&TokenKind::LParen, "`(`")?;
         self.skip_nl();
+        // §7.2.3: `{annotation} (variableDeclaration | multiVariableDeclaration)`.
+        // Annotations on the iteration variable are accepted and consumed
+        // syntactically; no semantics yet.
+        let _ann = self.parse_annotations();
         // Destructuring: `for ((a, b) in iter)`. Plain: `for (x in iter)`.
         let vars = if matches!(self.peek_kind(), TokenKind::LParen) {
             self.bump();
@@ -3027,9 +3031,18 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 if matches!(self.peek_kind(), TokenKind::RParen) {
                     break;
                 }
+                // Per-component annotations + optional type ascription.
+                let _comp_ann = self.parse_annotations();
                 let Some(id) = self.parse_ident("destructured loop variable") else {
                     break;
                 };
+                // Type ascription on individual component is consumed and
+                // discarded — the AST currently models one type slot for
+                // the whole destructuring binding.
+                if matches!(self.peek_kind(), TokenKind::Colon) {
+                    self.bump();
+                    let _ = self.parse_type();
+                }
                 names.push(id);
                 self.skip_nl();
                 if matches!(self.peek_kind(), TokenKind::Comma) {
