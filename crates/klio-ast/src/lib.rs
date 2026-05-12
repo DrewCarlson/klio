@@ -245,6 +245,10 @@ pub struct Property {
     /// allowed to have a backing field (no initializer, no `field`-using
     /// accessor). Spec §4.3.4.
     pub is_inline: bool,
+    /// Per-setter visibility recorded when the source uses bodyless
+    /// `private set` / `protected set` etc. on a `var`. None means the
+    /// setter inherits the property visibility. Spec §4.6.
+    pub setter_visibility: Option<Visibility>,
     pub visibility: Visibility,
     pub annotations: Vec<Annotation>,
     pub span: Span,
@@ -260,6 +264,9 @@ pub struct Accessor {
     /// the property's declared type.
     pub return_type: Option<TypeRef>,
     pub body: FunctionBody,
+    /// Per-accessor visibility — typically used as `var x; private set` to
+    /// keep the getter public while restricting writes. Spec §4.6 / §4.3.4.
+    pub visibility: Option<Visibility>,
     pub annotations: Vec<Annotation>,
     pub span: Span,
 }

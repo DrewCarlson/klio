@@ -583,6 +583,34 @@ fn neg_no_backing_field_initializer() {
 }
 
 #[test]
+fn neg_private_setter_cross_file() {
+    use klio_span::SourceMap;
+    let src_a = "var counter: Int = 0\n    private set\n";
+    let src_b = "fun main() { counter = 5 }\n";
+    let mut map = SourceMap::new();
+    let id_a = map.add("a.kt", src_a.to_string());
+    let id_b = map.add("b.kt", src_b.to_string());
+    let src_a_owned = map.get(id_a).source.clone();
+    let src_b_owned = map.get(id_b).source.clone();
+    let toks_a = Lexer::new(id_a, &src_a_owned).tokenize();
+    let toks_b = Lexer::new(id_b, &src_b_owned).tokenize();
+    let (ast_a, _) = Parser::new(id_a, &src_a_owned, &toks_a.tokens).parse_file();
+    let (ast_b, _) = Parser::new(id_b, &src_b_owned, &toks_b.tokens).parse_file();
+    let mut merged = ast_a.clone();
+    merged.decls.extend(ast_b.decls.iter().cloned());
+    let r = klio_resolver::resolve(&merged);
+    let tc = klio_typeck::typecheck(&merged, &r);
+    let codes: Vec<_> = tc
+        .diagnostics
+        .diagnostics()
+        .iter()
+        .filter_map(|d| d.legacy_code.map(String::from))
+        .collect();
+    assert!(codes.iter().any(|c| c == "T0032"),
+        "expected T0032 on private-setter cross-file write: {codes:?}");
+}
+
+#[test]
 fn neg_published_api_missing() {
     assert!(type_codes_for("neg_published_api_missing.kt")
         .iter()

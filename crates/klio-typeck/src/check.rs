@@ -407,6 +407,10 @@ struct Checker<'a> {
     fn_visibility: HashMap<String, Vec<(Visibility, klio_span::FileId)>>,
     /// Visibility + declaring file for each top-level property.
     prop_visibility: HashMap<String, (Visibility, klio_span::FileId)>,
+    /// Per-setter visibility for top-level `var` properties whose setter is
+    /// more restrictive than the property itself (`var x; private set`).
+    /// Spec §4.6: gates writes from outside the declaring scope.
+    setter_visibility: HashMap<String, (Visibility, klio_span::FileId)>,
     /// Top-level type aliases keyed by simple name. Phase G unfolds these at
     /// every type-reference site through `unfold_typeref` so the downstream
     /// type machinery never sees an alias name.
@@ -455,6 +459,7 @@ impl<'a> Checker<'a> {
             label_stack: Vec::new(),
             fn_visibility: HashMap::new(),
             prop_visibility: HashMap::new(),
+            setter_visibility: HashMap::new(),
             aliases: HashMap::new(),
             public_inline_stack: Vec::new(),
             fn_annotations: HashMap::new(),
@@ -1970,6 +1975,15 @@ impl<'r> Checker<'r> {
                     );
                     self.prop_visibility
                         .insert(p.name.name.clone(), (p.visibility, p.name.span.file));
+                    if let Some(sv) = p.setter_visibility {
+                        self.setter_visibility
+                            .insert(p.name.name.clone(), (sv, p.name.span.file));
+                    } else if let Some(setter) = &p.setter {
+                        if let Some(sv) = setter.visibility {
+                            self.setter_visibility
+                                .insert(p.name.name.clone(), (sv, p.name.span.file));
+                        }
+                    }
                     self.prop_annotations
                         .insert(p.name.name.clone(), p.annotations.clone());
                 }
@@ -3155,6 +3169,23 @@ impl<'r> Checker<'r> {
         if let Expr::Path { segments, span } = target {
             if segments.len() == 1 {
                 let name = &segments[0].name;
+                // Spec §4.6: per-accessor visibility on `var x; private set`.
+                // Reject the write when use site is outside the setter's
+                // declared scope.
+                if let Some((sv, decl_file)) = self.setter_visibility.get(name).copied() {
+                    if matches!(sv, Visibility::Private) && span.file != decl_file {
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                format!(
+                                    "Cannot assign to `{name}`: setter is `private` in its \
+                                     declaring file"
+                                ),
+                                *span,
+                            )
+                            .with_code(codes::TYPE_INVISIBLE_REFERENCE),
+                        );
+                    }
+                }
                 let info = self
                     .lookup(name)
                     .map(|b| (b.ty.clone(), b.mutable, b.needs_init));

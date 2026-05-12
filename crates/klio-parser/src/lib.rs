@@ -1560,12 +1560,35 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         // line or after newlines. Both can appear in either order.
         let mut getter: Option<Accessor> = None;
         let mut setter: Option<Accessor> = None;
+        let mut setter_visibility: Option<Visibility> = None;
         loop {
             let save = self.pos;
-            // Peek across newlines for `get` / `set` followed by `(`.
+            // Peek across newlines for an optional visibility modifier
+            // followed by `get` / `set`. Accepts forms like `private set`
+            // (no body) and `private get() = ...`.
             let mut i = self.pos;
             while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
                 i += 1;
+            }
+            let mut acc_visibility: Option<Visibility> = None;
+            if let Some(tok) = self.tokens.get(i) {
+                if matches!(tok.kind, TokenKind::Ident) {
+                    let txt = self.text(tok.span);
+                    let v = match txt {
+                        "public" => Some(Visibility::Public),
+                        "private" => Some(Visibility::Private),
+                        "protected" => Some(Visibility::Protected),
+                        "internal" => Some(Visibility::Internal),
+                        _ => None,
+                    };
+                    if v.is_some() {
+                        acc_visibility = v;
+                        i += 1;
+                        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+                            i += 1;
+                        }
+                    }
+                }
             }
             let Some(tok) = self.tokens.get(i) else { break };
             if !matches!(tok.kind, TokenKind::Ident) {
@@ -1578,26 +1601,39 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 break;
             }
             let next = self.tokens.get(i + 1).map(|t| &t.kind);
-            if !matches!(next, Some(TokenKind::LParen)) {
+            // Bare `private set` (no parens) is valid: it leaves the default
+            // accessor in place but restricts visibility. We synthesize a
+            // bodyless accessor whose presence carries only the visibility.
+            let is_bodyless = !matches!(next, Some(TokenKind::LParen));
+            if is_bodyless && acc_visibility.is_none() {
+                // No modifier and no `(` — not an accessor, bail.
                 break;
             }
-            // Commit — consume the newlines and the accessor.
+            // Commit — consume the newlines, optional vis, and accessor.
             self.pos = i;
             let start_span = self.bump().span; // get / set
+            if is_bodyless {
+                // `private set` (no `(...)`): record visibility on the
+                // Property itself; do NOT synthesize a custom accessor —
+                // the default one stays in effect.
+                if is_set {
+                    if let Some(v) = acc_visibility {
+                        setter_visibility = Some(v);
+                    }
+                }
+                continue;
+            }
             self.expect(&TokenKind::LParen, "`(`")?;
             let mut params: Vec<Ident> = Vec::new();
             if !matches!(self.peek_kind(), TokenKind::RParen) {
                 let p = self.parse_ident("setter parameter")?;
                 params.push(p);
-                // optional `: Type` — consume and ignore.
                 if matches!(self.peek_kind(), TokenKind::Colon) {
                     self.bump();
                     let _ = self.parse_type();
                 }
             }
             self.expect(&TokenKind::RParen, "`)`")?;
-            // Optional return type annotation — stored on the Accessor so
-            // the type checker can enforce it matches the property's type.
             let return_type = if matches!(self.peek_kind(), TokenKind::Colon) {
                 self.bump();
                 self.parse_type()
@@ -1622,6 +1658,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 params,
                 return_type,
                 body,
+                visibility: acc_visibility,
                 annotations: Vec::new(),
                 span: start_span.join(end),
             };
@@ -1646,6 +1683,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             is_lateinit: flags.is_lateinit,
             is_const: flags.is_const,
             is_inline: flags.is_inline,
+            setter_visibility,
             visibility: flags.visibility,
             annotations: flags.annotations,
             span: kw_tok.span.join(end),
