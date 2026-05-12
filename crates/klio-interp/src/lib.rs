@@ -1245,6 +1245,25 @@ impl Interpreter {
                     let result = if matches!(op, BinOp::NotIn) { !inside } else { inside };
                     return Ok(Value::Bool(result));
                 }
+                // Spec §4.1.2: a data class inheriting equals from a base
+                // (final or open) defers to the inherited body. Eq/Neq on
+                // instances first checks for a user-declared `equals` method
+                // body in the chain via `find_method`. Found → call it.
+                // Not found → fall through to `structural_eq` as before.
+                if matches!(op, BinOp::Eq | BinOp::Neq) {
+                    if let Value::Instance(inst) = &l {
+                        let class = Rc::clone(&inst.borrow().class);
+                        if let Some((m, owner)) = class.find_method("equals") {
+                            if m.decl.body.is_some() {
+                                let v = self.call_method_with_owner(
+                                    inst, &owner, &m, &[r.clone()], &[None], out,
+                                )?;
+                                let b = matches!(v, Value::Bool(true));
+                                return Ok(Value::Bool(if matches!(op, BinOp::Eq) { b } else { !b }));
+                            }
+                        }
+                    }
+                }
                 // Ordered comparisons against user instances (incl. enum
                 // entries) dispatch through `compare_with_user` so user
                 // `compareTo` and enum-ordinal ordering both work.
