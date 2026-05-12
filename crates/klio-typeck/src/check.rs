@@ -414,6 +414,10 @@ pub mod codes {
     /// Spec §18.1 cross §4.1: assignment / argument-passing between a
     /// `suspend (…) -> R` and a non-suspending `(…) -> R` function type.
     pub const TYPE_SUSPEND_FUNCTION_TYPE_MISMATCH: &str = "T0116";
+    /// Spec §7.1.2: a compound assignment `A op= B` resolves both
+    /// `A.opAssign(B)` and `A = A.op(B)` — ambiguity. Kotlin requires the
+    /// receiver type to provide at most one of the two for a given operator.
+    pub const TYPE_ASSIGN_OPERATOR_AMBIGUITY: &str = "T0079";
     /// Spec §11.2.2: `super<Q>.member` where `Q` is not an immediate
     /// supertype of the enclosing class.
     pub const TYPE_SUPER_QUALIFIER_NOT_SUPERTYPE: &str = "T0073";
@@ -5301,7 +5305,13 @@ impl<'r> Checker<'r> {
         }
     }
 
-    fn check_assign(&mut self, target: &Expr, op: AssignOp, value: &Expr, _span: Span) {
+    fn check_assign(&mut self, target: &Expr, op: AssignOp, value: &Expr, span: Span) {
+        // Spec §7.1.2: for a compound assignment, both the `*Assign` form
+        // and the `*` binary form may resolve. When both apply on the LHS
+        // receiver class, the call is ambiguous.
+        if !matches!(op, AssignOp::Assign) {
+            self.check_compound_assign_ambiguity(target, op, span);
+        }
         // Reassignment-of-val check for the simple identifier case.
         if let Expr::Path { segments, span } = target {
             if segments.len() == 1 {
@@ -6886,10 +6896,45 @@ impl<'r> Checker<'r> {
         }
     }
 
-    /// Spec §11.2.2 basic super-form: walk the enclosing class's direct
-    /// supertypes and emit T0093 when two or more contribute a member
-    /// named `name`. The diagnostic encourages disambiguation via
-    /// `super<TypeName>.name(...)`.
+    /// Spec §7.1.2: a compound assignment `A op= B` is ambiguous when the
+    /// LHS receiver's class declares *both* the `op` binary operator
+    /// (`plus` / `minus` / `times` / `div` / `rem`) and the matching
+    /// `opAssign` form (`plusAssign` / …). Emits T0079.
+    fn check_compound_assign_ambiguity(&mut self, target: &Expr, op: AssignOp, span: Span) {
+        let (op_name, assign_name): (&str, &str) = match op {
+            AssignOp::Add => ("plus", "plusAssign"),
+            AssignOp::Sub => ("minus", "minusAssign"),
+            AssignOp::Mul => ("times", "timesAssign"),
+            AssignOp::Div => ("div", "divAssign"),
+            AssignOp::Rem => ("rem", "remAssign"),
+            AssignOp::Assign => return,
+        };
+        let class_name = match target {
+            Expr::Path { segments, .. } if segments.len() == 1 => self
+                .lookup(&segments[0].name)
+                .and_then(|b| b.class_name.clone()),
+            Expr::Member { receiver, .. } | Expr::Index { receiver, .. } => {
+                self.expr_class.get(&receiver.span()).cloned()
+            }
+            _ => self.expr_class.get(&target.span()).cloned(),
+        };
+        let Some(class_name) = class_name else { return };
+        let Some(info) = self.classes.get(&class_name) else { return };
+        let has_op = info.members.contains_key(op_name);
+        let has_assign = info.members.contains_key(assign_name);
+        if has_op && has_assign {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "Compound assignment `{op_name}=` is ambiguous: `{class_name}` declares both `{op_name}` and `{assign_name}`",
+                    ),
+                    span,
+                )
+                .with_code(codes::TYPE_ASSIGN_OPERATOR_AMBIGUITY),
+            );
+        }
+    }
+
     /// Spec §11.2.2: `super<Q>.f(...)` requires `Q` to be an immediate
     /// supertype of the enclosing class. Emits T0073 otherwise.
     fn check_super_qualifier(&mut self, qualifier: &TypeRef, super_span: Span) {
@@ -6909,6 +6954,10 @@ impl<'r> Checker<'r> {
         }
     }
 
+    /// Spec §11.2.2 basic super-form: walk the enclosing class's direct
+    /// supertypes and emit T0093 when two or more contribute a member
+    /// named `name`. The diagnostic encourages disambiguation via
+    /// `super<TypeName>.name(...)`.
     fn check_ambiguous_super(&mut self, name: &str, super_span: Span) {
         let Some(enclosing) = self.class_stack.last().cloned() else { return };
         let Some(info) = self.classes.get(&enclosing).cloned() else { return };

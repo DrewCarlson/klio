@@ -1011,6 +1011,15 @@ fn neg_circular_type_bound_self() {
 }
 
 #[test]
+fn neg_compound_assign_ambiguity() {
+    assert!(
+        type_codes_for("neg_compound_assign_ambiguity.kt")
+            .iter()
+            .any(|c| c == "T0079")
+    );
+}
+
+#[test]
 fn neg_super_qualifier_not_supertype() {
     assert!(
         type_codes_for("neg_super_qualifier_not_supertype.kt")
