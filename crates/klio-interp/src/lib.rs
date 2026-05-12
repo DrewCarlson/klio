@@ -402,6 +402,12 @@ impl Interpreter {
                 };
                 if let Some(delegate_expr) = &pdef.delegate {
                     let dval = self.eval_expr(delegate_expr, &file_env, out)?;
+                    // Spec ch.9: when the delegate value's class declares
+                    // `operator fun provideDelegate(thisRef, property)`, the
+                    // stored delegate is the call's result, not the raw
+                    // initializer. Top-level properties have no `thisRef`,
+                    // so pass `null`.
+                    let dval = self.maybe_provide_delegate(dval, &Value::Null, &p.name.name, &file_env, out)?;
                     file_env
                         .borrow_mut()
                         .define(format!("__delegate${}", p.name.name), dval);
@@ -5337,6 +5343,11 @@ impl Interpreter {
             }
             if let Some(delegate_expr) = &p.delegate {
                 let dval = self.eval_expr(delegate_expr, ctor_env, out)?;
+                // Spec ch.9: if the delegate value's class declares
+                // `operator fun provideDelegate(thisRef, property)`, call
+                // it once at property-init time and store the result.
+                let this_ref = Value::Instance(Rc::clone(inst));
+                let dval = self.maybe_provide_delegate(dval, &this_ref, &p.name, ctor_env, out)?;
                 inst.borrow_mut()
                     .define(&format!("__delegate${}", p.name), dval);
                 continue;
@@ -7446,6 +7457,45 @@ impl Interpreter {
         Err(RuntimeError::Type(format!(
             "cannot assign to `.{name}` on non-instance receiver"
         )))
+    }
+
+    /// Spec ch.9 / delegated properties: if the delegate value's class
+    /// declares `operator fun provideDelegate(thisRef, property)`, invoke
+    /// it once at init time and return the call's result; otherwise pass
+    /// the original through.
+    fn maybe_provide_delegate(
+        &mut self,
+        dval: Value,
+        this_ref: &Value,
+        prop_name: &str,
+        _env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        let prop = Value::PropertyRef { name: Rc::new(prop_name.to_string()) };
+        if let Value::Instance(inst) = &dval {
+            let class = Rc::clone(&inst.borrow().class);
+            if let Some((m, _)) = class.find_method("provideDelegate") {
+                if m.decl.body.is_some() {
+                    let inst = Rc::clone(inst);
+                    return self.call_method(
+                        &inst,
+                        &m,
+                        &[this_ref.clone(), prop],
+                        &[None, None],
+                        out,
+                    );
+                }
+            }
+        }
+        if let Some(v) = self.try_extension_call_with_values(
+            &dval,
+            "provideDelegate",
+            &[this_ref.clone(), prop],
+            out,
+        )? {
+            return Ok(v);
+        }
+        Ok(dval)
     }
 
     /// Apply `inc()` or `dec()`. Spec ch.9: user `operator fun inc / dec`
@@ -10040,6 +10090,30 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["7", "11", "2"]);
+    }
+
+    #[test]
+    fn delegate_provide_delegate_member() {
+        // Spec ch.9: `provideDelegate` rewrites the stored delegate at
+        // property-init time. Here the initializer is a `Factory`; after
+        // `provideDelegate` the stored delegate is the `Holder`, whose
+        // `getValue` returns the embedded constant.
+        let src = r#"
+            import kotlin.reflect.KProperty
+            class Holder(val v: Int) {
+                operator fun getValue(thisRef: Any?, prop: KProperty<*>): Int = v
+            }
+            class Factory(val base: Int) {
+                operator fun provideDelegate(thisRef: Any?, prop: KProperty<*>): Holder = Holder(base + 1)
+            }
+            class Owner {
+                val x: Int by Factory(10)
+            }
+            fun main() {
+                println(Owner().x)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["11"]);
     }
 
     #[test]
