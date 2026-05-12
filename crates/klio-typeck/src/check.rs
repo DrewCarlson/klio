@@ -5060,10 +5060,6 @@ impl<'r> Checker<'r> {
                 let body_ty = self.check_block(body, expected);
                 let after_body = self.assigned.clone();
                 let mut acc = body_ty;
-                // Each `catch` could fire at any point in the body — be
-                // conservative and start its frame from `before`, not
-                // `after_body`. The join keeps only assignments common to
-                // body and every catch.
                 let mut common: HashSet<String> = after_body.clone();
                 for c in catches {
                     self.assigned = before.clone();
@@ -5083,8 +5079,15 @@ impl<'r> Checker<'r> {
                     acc = lub(&acc, &cty);
                 }
                 self.assigned = common;
+                // Spec §12.1.1 finally(1): evaluated after body+catch
+                // along the normal continuation. If finally diverges
+                // (return / throw inside), the try expression itself
+                // diverges — the body's normal-exit path is suppressed.
                 if let Some(fb) = finally {
-                    self.check_block(fb, None);
+                    let fty = self.check_block(fb, None);
+                    if matches!(fty, Type::Nothing) {
+                        acc = Type::Nothing;
+                    }
                 }
                 acc
             }
@@ -8770,6 +8773,23 @@ mod tests {
             "#,
         );
         assert!(codes(&tc).contains(&codes::WARN_USELESS_ELVIS));
+    }
+
+    #[test]
+    fn finally_return_makes_continuation_unreachable() {
+        let tc = check_src(
+            r#"
+            fun main() {
+                try {
+                    println("try")
+                } finally {
+                    return
+                }
+                println("dead")
+            }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::WARN_UNREACHABLE_CODE));
     }
 
     #[test]
