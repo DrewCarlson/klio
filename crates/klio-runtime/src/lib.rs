@@ -1167,7 +1167,26 @@ impl Value {
             Value::Function { .. }
             | Value::Lambda { .. }
             | Value::Intrinsic { .. }
-            | Value::BoundMethod { .. } => name == "Function" || name == "Any",
+            | Value::BoundMethod { .. } => {
+                if name == "Function" || name == "Any" || name == "kotlin.Function" {
+                    return true;
+                }
+                // Match the arity-tagged `FunctionN` form when the value
+                // carries explicit parameter info. Intrinsics / bound methods
+                // hide arity, so they only match the base `Function`.
+                if let Some(stripped) =
+                    name.strip_prefix("Function").or_else(|| name.strip_prefix("kotlin.Function"))
+                {
+                    if let Ok(n) = stripped.parse::<usize>() {
+                        return match self {
+                            Value::Lambda { params, .. } => params.len() == n,
+                            Value::Function { decl, .. } => decl.params.len() == n,
+                            _ => false,
+                        };
+                    }
+                }
+                false
+            }
             Value::Exception { fqn, .. } => {
                 let tail = fqn.rsplit('.').next().unwrap_or(fqn);
                 tail == name
