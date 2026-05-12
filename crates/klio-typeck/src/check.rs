@@ -414,6 +414,9 @@ pub mod codes {
     /// Spec §18.1 cross §4.1: assignment / argument-passing between a
     /// `suspend (…) -> R` and a non-suspending `(…) -> R` function type.
     pub const TYPE_SUSPEND_FUNCTION_TYPE_MISMATCH: &str = "T0116";
+    /// Spec §11.2.2: `super<Q>.member` where `Q` is not an immediate
+    /// supertype of the enclosing class.
+    pub const TYPE_SUPER_QUALIFIER_NOT_SUPERTYPE: &str = "T0073";
     /// Spec §7.1 note: assignments are statements, not expressions, and may
     /// not appear in expression contexts (`val y = (x = 1)`, `if (x = 1)`,
     /// `f(x = 1)` positional). Matches kotlinc-native
@@ -5499,10 +5502,17 @@ impl<'r> Checker<'r> {
                 // Two or more contributing supertypes require the caller
                 // to disambiguate via `super<Type>.f(...)`.
                 if let Expr::Member { receiver, name, .. } = callee.as_ref() {
-                    if let Expr::Super { qualifier: None, span: super_span, .. } =
+                    if let Expr::Super { qualifier, span: super_span, .. } =
                         receiver.as_ref()
                     {
-                        self.check_ambiguous_super(name.name.as_str(), *super_span);
+                        match qualifier {
+                            None => {
+                                self.check_ambiguous_super(name.name.as_str(), *super_span);
+                            }
+                            Some(q) => {
+                                self.check_super_qualifier(q, *super_span);
+                            }
+                        }
                     }
                 }
                 // Spec §4.2: implicit lambda label — bind the call's
@@ -6880,6 +6890,25 @@ impl<'r> Checker<'r> {
     /// supertypes and emit T0093 when two or more contribute a member
     /// named `name`. The diagnostic encourages disambiguation via
     /// `super<TypeName>.name(...)`.
+    /// Spec §11.2.2: `super<Q>.f(...)` requires `Q` to be an immediate
+    /// supertype of the enclosing class. Emits T0073 otherwise.
+    fn check_super_qualifier(&mut self, qualifier: &TypeRef, super_span: Span) {
+        let Some(enclosing) = self.class_stack.last().cloned() else { return };
+        let Some(info) = self.classes.get(&enclosing).cloned() else { return };
+        let q_name = qualifier.name.name.as_str();
+        if !info.supertypes.iter().any(|s| s == q_name) {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "`super<{q_name}>` is not allowed: `{q_name}` is not an immediate supertype of `{enclosing}`",
+                    ),
+                    super_span,
+                )
+                .with_code(codes::TYPE_SUPER_QUALIFIER_NOT_SUPERTYPE),
+            );
+        }
+    }
+
     fn check_ambiguous_super(&mut self, name: &str, super_span: Span) {
         let Some(enclosing) = self.class_stack.last().cloned() else { return };
         let Some(info) = self.classes.get(&enclosing).cloned() else { return };

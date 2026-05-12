@@ -1009,3 +1009,12 @@ fn neg_circular_type_bound_self() {
             .any(|c| c == "T0096")
     );
 }
+
+#[test]
+fn neg_super_qualifier_not_supertype() {
+    assert!(
+        type_codes_for("neg_super_qualifier_not_supertype.kt")
+            .iter()
+            .any(|c| c == "T0073")
+    );
+}
