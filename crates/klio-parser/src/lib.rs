@@ -1571,6 +1571,20 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             return false;
         }
         let mut j = self.pos + 1;
+        // Skip a balanced generic-argument list (`<T>` / `<A, B<C>>`).
+        if matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Lt)) {
+            let mut depth = 1;
+            j += 1;
+            while depth > 0 {
+                match self.tokens.get(j).map(|t| &t.kind) {
+                    Some(TokenKind::Lt) => depth += 1,
+                    Some(TokenKind::Gt) => depth -= 1,
+                    None | Some(TokenKind::Eof) => return false,
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
         if self.tokens.get(j).map(|t| t.kind.is_question()).unwrap_or(false) {
             j += 1;
         }
