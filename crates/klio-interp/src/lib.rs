@@ -143,6 +143,16 @@ struct TailrecFrame {
 }
 
 #[derive(Clone)]
+/// Resolved LHS handle for `++` / `--`. Captures the receiver / index
+/// values of a chained target so the spine is evaluated exactly once
+/// across the read-then-write cycle (spec ch.9 hygienic / call-by-need).
+enum IncDecLValue {
+    Ident(String),
+    Index { recv: Value, idxs: Vec<Value> },
+    Member { recv: Value, name: String },
+}
+
+#[derive(Clone)]
 struct ExtensionFn {
     decl: Rc<klio_ast::Function>,
     env: Rc<RefCell<Env>>,
@@ -7237,19 +7247,12 @@ impl Interpreter {
         env: &Rc<RefCell<Env>>,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
-        let _ = out;
-        let name = ident_target(target, "prefix ++ / --")?;
-        let cur = self.read_ident_live(&name, env)?;
-        let Value::Int(n) = cur else {
-            return Err(RuntimeError::Type(format!("prefix {op:?} requires Int")));
-        };
-        let next = match op {
-            UnOp::PreInc => n.wrapping_add(1),
-            UnOp::PreDec => n.wrapping_sub(1),
-            _ => unreachable!(),
-        };
-        self.write_ident_live(&name, Value::Int(next), env)?;
-        Ok(Value::Int(next))
+        let is_inc = matches!(op, UnOp::PreInc);
+        let lvalue = self.lower_inc_dec_lvalue(target, env, out)?;
+        let cur = self.read_inc_dec_lvalue(&lvalue, env, out)?;
+        let next = self.apply_inc_dec(cur, is_inc, out)?;
+        self.write_inc_dec_lvalue(&lvalue, next.clone(), env, out)?;
+        Ok(next)
     }
 
     fn eval_postfix(
@@ -7261,18 +7264,12 @@ impl Interpreter {
     ) -> Result<Value, RuntimeError> {
         match op {
             PostfixOp::Inc | PostfixOp::Dec => {
-                let name = ident_target(target, "postfix ++ / --")?;
-                let cur = self.read_ident_live(&name, env)?;
-                let Value::Int(n) = cur else {
-                    return Err(RuntimeError::Type("postfix ++ / -- requires Int".into()));
-                };
-                let next = match op {
-                    PostfixOp::Inc => n.wrapping_add(1),
-                    PostfixOp::Dec => n.wrapping_sub(1),
-                    PostfixOp::NotNull => unreachable!(),
-                };
-                self.write_ident_live(&name, Value::Int(next), env)?;
-                Ok(Value::Int(n))
+                let is_inc = matches!(op, PostfixOp::Inc);
+                let lvalue = self.lower_inc_dec_lvalue(target, env, out)?;
+                let cur = self.read_inc_dec_lvalue(&lvalue, env, out)?;
+                let next = self.apply_inc_dec(cur.clone(), is_inc, out)?;
+                self.write_inc_dec_lvalue(&lvalue, next, env, out)?;
+                Ok(cur)
             }
             PostfixOp::NotNull => {
                 let v = self.eval_expr(target, env, out)?;
@@ -7286,6 +7283,204 @@ impl Interpreter {
                     Ok(v)
                 }
             }
+        }
+    }
+
+    /// Spec ch.9: `x++` / `++x` / `x--` / `--x` evaluate the LHS spine
+    /// once. For `xs[i][j]++`, both `xs[i]` and the inner index `j` are
+    /// captured before the read/inc/write cycle runs. This helper resolves
+    /// the LHS to a handle pinning those captures.
+    fn lower_inc_dec_lvalue(
+        &mut self,
+        target: &Expr,
+        env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
+    ) -> Result<IncDecLValue, RuntimeError> {
+        match target {
+            Expr::Path { segments, .. } if segments.len() == 1 => {
+                Ok(IncDecLValue::Ident(segments[0].name.clone()))
+            }
+            Expr::Index { receiver, args, .. } => {
+                let recv = self.eval_expr(receiver, env, out)?;
+                let mut idxs = Vec::with_capacity(args.len());
+                for a in args {
+                    idxs.push(self.eval_expr(a, env, out)?);
+                }
+                Ok(IncDecLValue::Index { recv, idxs })
+            }
+            Expr::Member { receiver, name, safe: false, .. } => {
+                let recv = self.eval_expr(receiver, env, out)?;
+                Ok(IncDecLValue::Member { recv, name: name.name.clone() })
+            }
+            _ => Err(RuntimeError::Type(
+                "++ / -- requires an identifier, indexed, or member target".into(),
+            )),
+        }
+    }
+
+    fn read_inc_dec_lvalue(
+        &mut self,
+        l: &IncDecLValue,
+        env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        match l {
+            IncDecLValue::Ident(name) => self.read_ident_live(name, env),
+            IncDecLValue::Index { recv, idxs } => {
+                self.index_read_with_values(recv.clone(), idxs.clone(), out)
+            }
+            IncDecLValue::Member { recv, name } => {
+                self.eval_property_access(recv.clone(), name, out)
+            }
+        }
+    }
+
+    fn write_inc_dec_lvalue(
+        &mut self,
+        l: &IncDecLValue,
+        value: Value,
+        env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
+    ) -> Result<(), RuntimeError> {
+        match l {
+            IncDecLValue::Ident(name) => self.write_ident_live(name, value, env),
+            IncDecLValue::Index { recv, idxs } => {
+                self.assign_index(recv.clone(), idxs, AssignOp::Assign, value)?;
+                Ok(())
+            }
+            IncDecLValue::Member { recv, name } => {
+                self.write_member_value(recv.clone(), name, value, out)
+            }
+        }
+    }
+
+    /// Mirror of the index-read arm of `Expr::Index`, but starting from
+    /// pre-evaluated receiver / index values. Used by inc/dec eval-once
+    /// so the LHS spine is not re-evaluated.
+    fn index_read_with_values(
+        &mut self,
+        recv: Value,
+        idxs: Vec<Value>,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        if let Value::Array { items, .. } = &recv {
+            if idxs.len() != 1 {
+                return Err(RuntimeError::Type(
+                    "Array indexing takes one Int argument".into(),
+                ));
+            }
+            let Some(i) = idxs[0].as_i64() else {
+                return Err(RuntimeError::Type(
+                    "Array indexing requires an Int".into(),
+                ));
+            };
+            let items_ref = items.borrow();
+            let n = items_ref.len() as i64;
+            if i < 0 || i >= n {
+                return Err(RuntimeError::Thrown(Value::Exception {
+                    fqn: Rc::new("kotlin.IndexOutOfBoundsException".to_string()),
+                    message: Some(Rc::new(format!(
+                        "Index {i} out of bounds for length {n}"
+                    ))),
+                    cause: None,
+                }));
+            }
+            return Ok(items_ref[i as usize].clone());
+        }
+        let mut arg_vals = Vec::with_capacity(idxs.len() + 1);
+        arg_vals.push(recv);
+        arg_vals.extend(idxs);
+        let fqn = format!("{}.get", arg_vals[0].type_fqn());
+        if let Some(func) = klio_stdlib::implementation(&fqn) {
+            let mut ctx = CallCtx { args: &arg_vals, out };
+            return func(&mut ctx);
+        }
+        // User-class `operator fun get(...)` dispatch.
+        if let Value::Instance(inst) = &arg_vals[0] {
+            let class = Rc::clone(&inst.borrow().class);
+            if let Some((m, _)) = class.find_method("get") {
+                if m.decl.body.is_some() {
+                    let inst = Rc::clone(inst);
+                    let args: Vec<Value> = arg_vals[1..].to_vec();
+                    let names: Vec<Option<String>> = vec![None; args.len()];
+                    return self.call_method(&inst, &m, &args, &names, out);
+                }
+            }
+        }
+        Err(RuntimeError::Unimplemented(fqn))
+    }
+
+    /// Mirror of the member-write arm of `Stmt::Assign`, but starting from
+    /// a pre-evaluated receiver. Routes through delegated / extension
+    /// property setters when applicable, falling back to direct field write.
+    fn write_member_value(
+        &mut self,
+        recv: Value,
+        name: &str,
+        value: Value,
+        out: &mut dyn Output,
+    ) -> Result<(), RuntimeError> {
+        if let Value::Instance(inst) = &recv {
+            let class = Rc::clone(&inst.borrow().class);
+            let pdef = class.find_body_property(name).map(|(p, _)| p);
+            if let Some(pd) = &pdef {
+                if pd.delegate.is_some() || pd.setter.is_some() {
+                    self.write_instance_property(inst, pd, value, out)?;
+                    return Ok(());
+                }
+            } else if self.find_extension_property(&recv, name).is_some() {
+                self.try_extension_property_set(&recv, name, value, out)?;
+                return Ok(());
+            }
+            inst.borrow_mut().define(name, value);
+            return Ok(());
+        }
+        if self.find_extension_property(&recv, name).is_some() {
+            self.try_extension_property_set(&recv, name, value, out)?;
+            return Ok(());
+        }
+        Err(RuntimeError::Type(format!(
+            "cannot assign to `.{name}` on non-instance receiver"
+        )))
+    }
+
+    /// Apply `inc()` or `dec()`. Spec ch.9: user `operator fun inc / dec`
+    /// (member or extension) wins over the built-in primitive arithmetic.
+    fn apply_inc_dec(
+        &mut self,
+        v: Value,
+        is_inc: bool,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        let op_name = if is_inc { "inc" } else { "dec" };
+        if let Value::Instance(inst) = &v {
+            let class = Rc::clone(&inst.borrow().class);
+            if let Some((m, _)) = class.find_method(op_name) {
+                if m.decl.body.is_some() {
+                    let inst = Rc::clone(inst);
+                    return self.call_method(&inst, &m, &[], &[], out);
+                }
+            }
+        }
+        if let Some(r) = self.try_extension_call_with_values(&v, op_name, &[], out)? {
+            return Ok(r);
+        }
+        match v {
+            Value::Int(n) => Ok(Value::Int(if is_inc { n.wrapping_add(1) } else { n.wrapping_sub(1) })),
+            Value::Long(n) => Ok(Value::Long(if is_inc { n.wrapping_add(1) } else { n.wrapping_sub(1) })),
+            Value::Byte(n) => Ok(Value::Byte(if is_inc { n.wrapping_add(1) } else { n.wrapping_sub(1) })),
+            Value::Short(n) => Ok(Value::Short(if is_inc { n.wrapping_add(1) } else { n.wrapping_sub(1) })),
+            Value::Float(f) => Ok(Value::Float(if is_inc { f + 1.0 } else { f - 1.0 })),
+            Value::Double(f) => Ok(Value::Double(if is_inc { f + 1.0 } else { f - 1.0 })),
+            Value::Char(c) => {
+                let code = c as u32;
+                let next = if is_inc { code.wrapping_add(1) } else { code.wrapping_sub(1) };
+                let nc = char::from_u32(next).ok_or_else(|| {
+                    RuntimeError::Type("Char ++ / -- out of valid range".into())
+                })?;
+                Ok(Value::Char(nc))
+            }
+            other => Err(RuntimeError::Type(format!("`{op_name}` on {other:?}"))),
         }
     }
 
@@ -7938,17 +8133,6 @@ fn compound_to_binop(op: AssignOp) -> BinOp {
     }
 }
 
-fn ident_target(target: &Expr, what: &'static str) -> Result<String, RuntimeError> {
-    let Expr::Path { segments, .. } = target else {
-        return Err(RuntimeError::Type(format!("{what} requires an identifier target")));
-    };
-    if segments.len() != 1 {
-        return Err(RuntimeError::Unimplemented(
-            "qualified target for ++/--".into(),
-        ));
-    }
-    Ok(segments[0].name.clone())
-}
 
 /// Intern a runtime-built FQN so we can hand back a `&'static str` to
 /// callers that expect it. Used sparingly — most FQNs are static literals
@@ -9849,6 +10033,75 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["Day(1..5)"]);
+    }
+
+    #[test]
+    fn operator_inc_user_class() {
+        let src = r#"
+            class Counter(val n: Int) {
+                operator fun inc(): Counter = Counter(n + 1)
+                override fun toString(): String = "C($n)"
+            }
+            fun main() {
+                var c = Counter(0)
+                println(c++)
+                println(c)
+                println(++c)
+                println(c)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["C(0)", "C(1)", "C(2)", "C(2)"]);
+    }
+
+    #[test]
+    fn operator_inc_indexed() {
+        let src = r#"
+            fun main() {
+                val xs = intArrayOf(10, 20, 30)
+                xs[1]++
+                println(xs[1])
+                ++xs[2]
+                println(xs[2])
+                println(xs[1]++)
+                println(xs[1])
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["21", "31", "21", "22"]);
+    }
+
+    #[test]
+    fn operator_inc_member() {
+        let src = r#"
+            class Box(var n: Int)
+            fun main() {
+                val b = Box(5)
+                b.n++
+                println(b.n)
+                ++b.n
+                println(b.n)
+                println(b.n--)
+                println(b.n)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["6", "7", "7", "6"]);
+    }
+
+    #[test]
+    fn operator_inc_indexed_chained_eval_once() {
+        // Spec ch.9: in `xs[idx()]++` the index expression evaluates once
+        // (call-by-need), so a side-effecting `idx()` increments only once
+        // even though the lowering reads-then-writes the slot.
+        let src = r#"
+            var calls = 0
+            fun idx(): Int { calls = calls + 1; return 0 }
+            fun main() {
+                val xs = intArrayOf(100, 200)
+                xs[idx()]++
+                println(xs[0])
+                println(calls)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["101", "1"]);
     }
 
     #[test]
