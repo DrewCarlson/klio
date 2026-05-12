@@ -6138,6 +6138,22 @@ impl Interpreter {
                     return Ok(Value::String(Rc::new(decl.name.name.clone())));
                 }
             }
+            // Any-level methods on a class literal (`Foo::class`).
+            if let Value::Class(c) = &recv {
+                match name.name.as_str() {
+                    "equals" if args.len() == 1 => {
+                        let other = self.eval_expr(&args[0], env, out)?;
+                        return Ok(Value::Bool(Value::structural_eq(&recv, &other)));
+                    }
+                    "hashCode" if args.is_empty() => {
+                        return Ok(Value::new_int(value_hash(&Value::Class(Rc::clone(c)))));
+                    }
+                    "toString" if args.is_empty() => {
+                        return Ok(Value::String(Rc::new(format!("class {}", c.name))));
+                    }
+                    _ => {}
+                }
+            }
             // Built-in Array methods kept local — they bridge to a List
             // (for `toList`) or echo a property (for `isEmpty`).
             if let Value::Array { items, .. } = &recv {
@@ -6982,6 +6998,13 @@ fn value_hash(v: &Value) -> i64 {
         }
         Value::Char(c) => *c as i64,
         Value::Double(d) => d.to_bits() as i64,
+        Value::Class(c) => {
+            let mut h: i64 = 0;
+            for ch in c.fqn.chars() {
+                h = h.wrapping_mul(31).wrapping_add(ch as i64);
+            }
+            h
+        }
         _ => 0,
     }
 }

@@ -1281,6 +1281,7 @@ impl Value {
             (Result { ok: o1, payload: p1 }, Result { ok: o2, payload: p2 }) => {
                 o1 == o2 && Value::structural_eq(p1, p2)
             }
+            (Class(a), Class(b)) => a.fqn == b.fqn,
             (Instance(a), Instance(b)) => {
                 if Rc::ptr_eq(a, b) {
                     return true;
