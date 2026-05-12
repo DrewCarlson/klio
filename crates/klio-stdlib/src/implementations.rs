@@ -2177,18 +2177,42 @@ fn coll_list_last_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.joinToString")?;
-    let sep = match ctx.args.get(1) {
-        None => ", ".to_string(),
-        Some(Value::String(s)) => (**s).clone(),
-        Some(other) => format!("{other}"),
+    // Slot map (after the receiver):
+    //   1 separator, 2 prefix, 3 postfix, 4 limit, 5 truncated.
+    // Named-arg reordering populates missing slots with `Value::Null`.
+    fn opt_str<'a>(args: &'a [Value], idx: usize, default: &'a str) -> String {
+        match args.get(idx) {
+            None | Some(Value::Null) => default.to_string(),
+            Some(Value::String(s)) => (**s).clone(),
+            Some(other) => format!("{other}"),
+        }
+    }
+    let sep = opt_str(ctx.args, 1, ", ");
+    let prefix = opt_str(ctx.args, 2, "");
+    let postfix = opt_str(ctx.args, 3, "");
+    let limit: i64 = match ctx.args.get(4) {
+        None | Some(Value::Null) => -1,
+        Some(v) => v.as_i64().unwrap_or(-1),
     };
+    let truncated = opt_str(ctx.args, 5, "...");
     let mut out = String::new();
-    for (i, v) in it.borrow().iter().enumerate() {
+    out.push_str(&prefix);
+    let items = it.borrow();
+    let n = items.len();
+    let take = if limit < 0 { n } else { (limit as usize).min(n) };
+    for (i, v) in items.iter().enumerate().take(take) {
         if i > 0 {
             out.push_str(&sep);
         }
         out.push_str(&format!("{v}"));
     }
+    if limit >= 0 && n > take {
+        if take > 0 {
+            out.push_str(&sep);
+        }
+        out.push_str(&truncated);
+    }
+    out.push_str(&postfix);
     Ok(Value::String(Rc::new(out)))
 }
 fn coll_list_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

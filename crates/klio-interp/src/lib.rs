@@ -2829,17 +2829,23 @@ impl Interpreter {
         if transform.is_none() && vals.is_empty() {
             return Ok(None);
         }
-        let separator = vals
-            .first()
-            .map(|v| format_string_like(v))
-            .unwrap_or_else(|| ", ".to_string());
-        let prefix = vals.get(1).map(format_string_like).unwrap_or_default();
-        let postfix = vals.get(2).map(format_string_like).unwrap_or_default();
-        let limit: i64 = vals.get(3).and_then(Value::as_i64).unwrap_or(-1);
-        let truncated = vals
-            .get(4)
-            .map(format_string_like)
-            .unwrap_or_else(|| "...".to_string());
+        // `Value::Null` here means "named-arg reordering left this slot
+        // unset" — use the spec default rather than the literal string
+        // "null".
+        let opt_str = |v: Option<&Value>, default: &str| -> String {
+            match v {
+                None | Some(Value::Null) => default.to_string(),
+                Some(other) => format_string_like(other),
+            }
+        };
+        let separator = opt_str(vals.first(), ", ");
+        let prefix = opt_str(vals.get(1), "");
+        let postfix = opt_str(vals.get(2), "");
+        let limit: i64 = match vals.get(3) {
+            None | Some(Value::Null) => -1,
+            Some(v) => v.as_i64().unwrap_or(-1),
+        };
+        let truncated = opt_str(vals.get(4), "...");
         let mut s = String::new();
         s.push_str(&prefix);
         let mut count = 0i64;
