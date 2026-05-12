@@ -2971,15 +2971,28 @@ impl<'r> Checker<'r> {
                 // Filter out suppliers shadowed by another supplier that is
                 // a (transitive) subtype — a subclass's override hides the
                 // parent's default, so only "leaf" suppliers conflict.
-                let leaves: Vec<&String> = supplying
+                let leaves: Vec<&(String, bool)> = supplying
                     .iter()
-                    .filter(|s| {
+                    .filter(|(s, _)| {
                         !supplying
                             .iter()
-                            .any(|other| other != *s && self.is_subtype_of(other, s))
+                            .any(|(other, _)| other != s && self.is_subtype_of(other, s))
                     })
                     .collect();
-                if leaves.len() < 2 {
+                if leaves.is_empty() {
+                    continue;
+                }
+                let concrete_leaves: Vec<&String> =
+                    leaves.iter().filter(|(_, c)| *c).map(|(s, _)| s).collect();
+                let abstract_leaves: Vec<&String> =
+                    leaves.iter().filter(|(_, c)| !*c).map(|(s, _)| s).collect();
+                // Spec §5.3 cases that require explicit override:
+                //   - 2+ concrete leaves (classic diamond);
+                //   - ≥1 concrete and ≥1 abstract leaf from distinct ancestors.
+                // Pure-abstract conflicts are covered by T0007 elsewhere.
+                let needs_override = concrete_leaves.len() >= 2
+                    || (!concrete_leaves.is_empty() && !abstract_leaves.is_empty());
+                if !needs_override {
                     continue;
                 }
                 if class_overrides.contains(member.as_str()) {
@@ -2987,7 +3000,7 @@ impl<'r> Checker<'r> {
                 }
                 let names = leaves
                     .iter()
-                    .map(|s| s.as_str())
+                    .map(|(s, _)| s.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.diagnostics.emit(
@@ -3518,14 +3531,16 @@ impl<'r> Checker<'r> {
         false
     }
 
-    /// For diamond detection: for every member name supplied with a
-    /// default body by some supertype, list the supertypes that supply
-    /// one. Walks the transitive supertype set.
+    /// For diamond detection: for every member name supplied by some
+    /// supertype, list `(supertype, has_default_body)` pairs. Walks the
+    /// transitive supertype set. A `has_default_body == false` entry is
+    /// an abstract slot and triggers the spec §5.3 abstract-and-concrete
+    /// rule.
     fn collect_default_providers(
         &self,
         c: &Class,
-    ) -> HashMap<String, Vec<String>> {
-        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    ) -> HashMap<String, Vec<(String, bool)>> {
+        let mut out: HashMap<String, Vec<(String, bool)>> = HashMap::new();
         let mut frontier: Vec<String> =
             c.supertypes.iter().map(|s| s.name.name.clone()).collect();
         let mut seen: Vec<String> = vec![c.name.name.clone()];
@@ -3541,10 +3556,17 @@ impl<'r> Checker<'r> {
             seen.push(parent_name.clone());
             let Some(parent) = self.classes.get(&parent_name) else { continue };
             for (n, flags) in &parent.member_flags {
-                if flags.has_default_body {
+                // A supplier is either concrete (has_default_body) or
+                // abstract. Body-less interface methods don't carry an
+                // explicit `abstract` modifier but are abstract slots for
+                // inheritance purposes; the same goes for body-less
+                // interface / abstract-class properties.
+                let is_abstract_slot = flags.is_abstract
+                    || (parent.is_interface && !flags.has_default_body);
+                if flags.has_default_body || is_abstract_slot {
                     let entry = out.entry(n.clone()).or_default();
-                    if !entry.iter().any(|s| s == &parent_name) {
-                        entry.push(parent_name.clone());
+                    if !entry.iter().any(|(s, _)| s == &parent_name) {
+                        entry.push((parent_name.clone(), flags.has_default_body));
                     }
                 }
             }

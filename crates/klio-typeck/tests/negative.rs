@@ -660,6 +660,16 @@ fn neg_published_api_missing() {
 }
 
 #[test]
+fn neg_diamond_class_interface() {
+    assert!(type_codes_for("neg_diamond_class_interface.kt").iter().any(|c| c == "T0013"));
+}
+
+#[test]
+fn neg_diamond_abstract_concrete() {
+    assert!(type_codes_for("neg_diamond_abstract_concrete.kt").iter().any(|c| c == "T0013"));
+}
+
+#[test]
 fn neg_override_return_type() {
     assert!(type_codes_for("neg_override_return_type.kt").iter().any(|c| c == "T0065"));
 }
