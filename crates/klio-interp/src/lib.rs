@@ -248,6 +248,15 @@ impl Interpreter {
             | "Unit" | "String" | "Any" | "Nothing" | "Number" | "CharSequence" => {
                 format!("kotlin.{name}")
             }
+            "List" | "MutableList" | "Set" | "MutableSet" | "Map" | "MutableMap"
+            | "Collection" | "MutableCollection" | "Iterable" | "MutableIterable"
+            | "Iterator" | "MutableIterator" | "Array" | "IntArray" | "LongArray"
+            | "DoubleArray" | "FloatArray" | "ShortArray" | "ByteArray" | "BooleanArray"
+            | "CharArray" => format!("kotlin.collections.{name}"),
+            "IntRange" | "LongRange" | "CharRange" => {
+                format!("kotlin.ranges.{name}")
+            }
+            "Pair" | "Triple" => format!("kotlin.{name}"),
             _ => return None,
         };
         Some(Value::Class(Rc::new(ClassDef {
