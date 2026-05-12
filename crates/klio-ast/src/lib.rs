@@ -543,6 +543,9 @@ pub enum Expr {
     Postfix { op: PostfixOp, expr: Box<Expr>, span: Span },
     If { cond: Box<Expr>, then_branch: Box<Expr>, else_branch: Option<Box<Expr>>, span: Span },
     While { cond: Box<Expr>, body: Box<Expr>, span: Span },
+    /// `do body while (cond)` — post-tested loop. Body is always evaluated at
+    /// least once (§7.2.2). Optional body covers the spec form `do; while(c)`.
+    DoWhile { body: Option<Box<Expr>>, cond: Box<Expr>, span: Span },
     /// `for (vars in iter) body`. `vars` has length 1 for the normal case
     /// `for (x in xs)`; length 2+ when the source used destructuring like
     /// `for ((k, v) in m)`. The interpreter pulls the matching component
@@ -738,6 +741,7 @@ impl Expr {
             | Self::Postfix { span, .. }
             | Self::If { span, .. }
             | Self::While { span, .. }
+            | Self::DoWhile { span, .. }
             | Self::For { span, .. }
             | Self::Return { span, .. }
             | Self::Break { span, .. }

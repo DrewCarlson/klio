@@ -1303,6 +1303,49 @@ impl Interpreter {
                     Ok(Value::Unit)
                 }
             }
+            Expr::DoWhile { body, cond, .. } => {
+                let pushed_here = if self.label_already_pushed_for_loop {
+                    self.label_already_pushed_for_loop = false;
+                    false
+                } else {
+                    self.loop_label_stack.push(None);
+                    true
+                };
+                let result = (|| -> Result<Value, RuntimeError> {
+                    loop {
+                        if let Some(body) = body {
+                            match self.eval_expr(body, env, out) {
+                                Ok(_) => {}
+                                Err(RuntimeError::Break) => break,
+                                Err(RuntimeError::Continue) => {}
+                                Err(RuntimeError::LabeledBreak(ref l))
+                                    if matches!(self.loop_label_stack.last(), Some(Some(top)) if top == l) =>
+                                {
+                                    break
+                                }
+                                Err(RuntimeError::LabeledContinue(ref l))
+                                    if matches!(self.loop_label_stack.last(), Some(Some(top)) if top == l) =>
+                                {
+                                    // fall through to condition check
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        let c = self.eval_expr(cond, env, out)?;
+                        let Value::Bool(b) = c else {
+                            return Err(RuntimeError::Type("`do-while` condition must be Bool".into()));
+                        };
+                        if !b {
+                            break;
+                        }
+                    }
+                    Ok(Value::Unit)
+                })();
+                if pushed_here {
+                    self.loop_label_stack.pop();
+                }
+                result
+            }
             Expr::While { cond, body, .. } => {
                 let pushed_here = if self.label_already_pushed_for_loop {
                     self.label_already_pushed_for_loop = false;
@@ -1902,7 +1945,7 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
         match inner {
-            Expr::For { .. } | Expr::While { .. } => {
+            Expr::For { .. } | Expr::While { .. } | Expr::DoWhile { .. } => {
                 self.loop_label_stack.push(Some(label.to_string()));
                 self.label_already_pushed_for_loop = true;
                 let result = self.eval_expr(inner, env, out);
@@ -7521,6 +7564,12 @@ fn walk_expr_tail(
         Expr::While { cond, body, .. } => {
             walk_expr_tail(cond, false, fn_name, sites);
             walk_expr_tail(body, false, fn_name, sites);
+        }
+        Expr::DoWhile { body, cond, .. } => {
+            if let Some(b) = body {
+                walk_expr_tail(b, false, fn_name, sites);
+            }
+            walk_expr_tail(cond, false, fn_name, sites);
         }
         Expr::For { iter, body, .. } => {
             walk_expr_tail(iter, false, fn_name, sites);

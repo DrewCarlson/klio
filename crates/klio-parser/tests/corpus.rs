@@ -198,6 +198,14 @@ impl<'a> Printer<'a> {
                 self.nest(|p| { p.line("cond="); p.nest(|p| p.expr(cond));
                                 p.line("body="); p.nest(|p| p.expr(body)); });
             }
+            Expr::DoWhile { body, cond, .. } => {
+                self.line("do-while");
+                self.nest(|p| {
+                    p.line("body=");
+                    p.nest(|p| { if let Some(b) = body { p.expr(b); } });
+                    p.line("cond="); p.nest(|p| p.expr(cond));
+                });
+            }
             Expr::For { vars, var_ty, iter, body, .. } => {
                 let ty = var_ty.as_ref().map(|t| format!(":{}", render_type(t))).unwrap_or_default();
                 let names: Vec<_> = vars.iter().map(|v| v.name.as_str()).collect();

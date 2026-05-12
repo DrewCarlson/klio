@@ -2772,6 +2772,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             TokenKind::Keyword(Keyword::Fun) => self.parse_anon_fun(),
             TokenKind::Keyword(Keyword::If) => self.parse_if(),
             TokenKind::Keyword(Keyword::While) => self.parse_while(),
+            TokenKind::Keyword(Keyword::Do) => self.parse_do_while(),
             TokenKind::Keyword(Keyword::For) => self.parse_for(),
             TokenKind::Keyword(Keyword::Return) => self.parse_return(),
             TokenKind::Keyword(Keyword::Throw) => self.parse_throw(),
@@ -2985,6 +2986,31 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             cond: Box::new(cond),
             body: Box::new(body.clone()),
             span: kw.span.join(body.span()),
+        })
+    }
+
+    fn parse_do_while(&mut self) -> Option<Expr> {
+        let kw = self.bump();
+        self.skip_nl();
+        // Body is optional per spec: `do { ... } while(c)` or `do; while(c)`.
+        let body = if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::While)) {
+            None
+        } else {
+            let b = self.parse_expr()?;
+            Some(Box::new(b))
+        };
+        self.skip_nl();
+        self.expect(&TokenKind::Keyword(Keyword::While), "`while`")?;
+        self.skip_nl();
+        self.expect(&TokenKind::LParen, "`(`")?;
+        self.skip_nl();
+        let cond = self.parse_expr()?;
+        self.skip_nl();
+        let rp = self.expect(&TokenKind::RParen, "`)`")?;
+        Some(Expr::DoWhile {
+            body,
+            cond: Box::new(cond),
+            span: kw.span.join(rp.span),
         })
     }
 

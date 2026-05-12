@@ -790,6 +790,12 @@ impl<'a> Checker<'a> {
                 self.check_ctor_param_in_expr(cond, non_prop, local);
                 self.check_ctor_param_in_expr(body, non_prop, local);
             }
+            Expr::DoWhile { body, cond, .. } => {
+                if let Some(b) = body {
+                    self.check_ctor_param_in_expr(b, non_prop, local);
+                }
+                self.check_ctor_param_in_expr(cond, non_prop, local);
+            }
             Expr::For { iter, body, vars, .. } => {
                 self.check_ctor_param_in_expr(iter, non_prop, local);
                 let mut inner = local.clone();
@@ -1326,6 +1332,12 @@ impl<'a> Checker<'a> {
                 self.walk_expr_for_phase_j(cond, in_accessor, has_backing_field, prop_name);
                 self.walk_expr_for_phase_j(body, in_accessor, has_backing_field, prop_name);
             }
+            Expr::DoWhile { body, cond, .. } => {
+                if let Some(b) = body {
+                    self.walk_expr_for_phase_j(b, in_accessor, has_backing_field, prop_name);
+                }
+                self.walk_expr_for_phase_j(cond, in_accessor, has_backing_field, prop_name);
+            }
             Expr::For { iter, body, .. } => {
                 self.walk_expr_for_phase_j(iter, in_accessor, has_backing_field, prop_name);
                 self.walk_expr_for_phase_j(body, in_accessor, has_backing_field, prop_name);
@@ -1479,6 +1491,12 @@ impl<'a> Checker<'a> {
             Expr::While { cond, body, .. } => {
                 self.walk_expr_for_phase_g(cond);
                 self.walk_expr_for_phase_g(body);
+            }
+            Expr::DoWhile { body, cond, .. } => {
+                if let Some(b) = body {
+                    self.walk_expr_for_phase_g(b);
+                }
+                self.walk_expr_for_phase_g(cond);
             }
             Expr::For { iter, body, .. } => {
                 self.walk_expr_for_phase_g(iter);
@@ -2270,6 +2288,12 @@ impl<'a> Checker<'a> {
                 self.walk_expr_for_dnn(cond, tp_scope);
                 self.walk_expr_for_dnn(body, tp_scope);
             }
+            Expr::DoWhile { body, cond, .. } => {
+                if let Some(b) = body {
+                    self.walk_expr_for_dnn(b, tp_scope);
+                }
+                self.walk_expr_for_dnn(cond, tp_scope);
+            }
             Expr::For { iter, body, .. } => {
                 self.walk_expr_for_dnn(iter, tp_scope);
                 self.walk_expr_for_dnn(body, tp_scope);
@@ -2491,6 +2515,12 @@ impl<'a> Checker<'a> {
             Expr::While { cond, body, .. } => {
                 self.walk_expr_for_m28(cond);
                 self.walk_expr_for_m28(body);
+            }
+            Expr::DoWhile { body, cond, .. } => {
+                if let Some(b) = body {
+                    self.walk_expr_for_m28(b);
+                }
+                self.walk_expr_for_m28(cond);
             }
             Expr::For { iter, body, .. } => {
                 self.walk_expr_for_m28(iter);
@@ -4525,6 +4555,18 @@ impl<'r> Checker<'r> {
                 self.assigned = before;
                 Type::Unit
             }
+            Expr::DoWhile { body, cond, .. } => {
+                // Body always runs at least once, but we still don't promote
+                // body-internal definite assignments to the join state because
+                // a `break` from the body skips the rest.
+                let before = self.assigned.clone();
+                if let Some(b) = body {
+                    self.check_expr(b, None);
+                }
+                self.check_expr(cond, Some(&Type::Boolean));
+                self.assigned = before;
+                Type::Unit
+            }
             Expr::For { vars, iter, body, .. } => {
                 let _ = self.check_expr(iter, None);
                 let before = self.assigned.clone();
@@ -6248,7 +6290,7 @@ fn collect_property_reads(
 fn is_labelable_target(e: &Expr) -> bool {
     match e {
         Expr::Lambda { .. } => true,
-        Expr::For { .. } | Expr::While { .. } => true,
+        Expr::For { .. } | Expr::While { .. } | Expr::DoWhile { .. } => true,
         Expr::Call { args, .. } => matches!(args.last(), Some(Expr::Lambda { .. })),
         _ => false,
     }
@@ -6522,6 +6564,12 @@ fn tailrec_walk_expr(
             tailrec_walk_expr(cond, false, fn_name, sites);
             tailrec_walk_expr(body, false, fn_name, sites);
         }
+        Expr::DoWhile { body, cond, .. } => {
+            if let Some(b) = body {
+                tailrec_walk_expr(b, false, fn_name, sites);
+            }
+            tailrec_walk_expr(cond, false, fn_name, sites);
+        }
         Expr::For { iter, body, .. } => {
             tailrec_walk_expr(iter, false, fn_name, sites);
             tailrec_walk_expr(body, false, fn_name, sites);
@@ -6621,6 +6669,12 @@ fn tailrec_collect_all_expr(e: &Expr, fn_name: &str, out: &mut Vec<Span>) {
         Expr::While { cond, body, .. } => {
             tailrec_collect_all_expr(cond, fn_name, out);
             tailrec_collect_all_expr(body, fn_name, out);
+        }
+        Expr::DoWhile { body, cond, .. } => {
+            if let Some(b) = body {
+                tailrec_collect_all_expr(b, fn_name, out);
+            }
+            tailrec_collect_all_expr(cond, fn_name, out);
         }
         Expr::For { iter, body, .. } => {
             tailrec_collect_all_expr(iter, fn_name, out);

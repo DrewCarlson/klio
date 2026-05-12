@@ -497,6 +497,12 @@ impl Resolver {
                 self.resolve_expr(scope, cond);
                 self.resolve_expr(scope, body);
             }
+            Expr::DoWhile { body, cond, .. } => {
+                if let Some(b) = body {
+                    self.resolve_expr(scope, b);
+                }
+                self.resolve_expr(scope, cond);
+            }
             Expr::For { vars, iter, body, .. } => {
                 self.resolve_expr(scope, iter);
                 let for_scope = self.push_scope(Some(scope), ScopeKind::Block);
