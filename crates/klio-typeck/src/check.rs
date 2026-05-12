@@ -6834,10 +6834,9 @@ impl<'r> Checker<'r> {
             let cls = self.expr_class.get(&rhs.span()).cloned();
             self.check_user_operator_keyword(cls.as_deref(), "contains", span);
         }
-        // Spec §8.9.1 / §8.9.2: an equality between two definitely-distinct
-        // types unrelated by subtyping is a compile-time error. Skip when
-        // either side is `null` (the spec routes the null arm separately) or
-        // when either side typed to `Unresolved` (we have no information).
+        // Spec §12: comparing `x == null` / `x != null` where `x` has a
+        // statically known non-nullable type always yields the same value;
+        // surface it as W0003 so the user can drop the dead branch.
         if matches!(op, BinOp::Eq | BinOp::Neq | BinOp::IdentEq | BinOp::IdentNeq) {
             let null_other = if matches!(lhs, Expr::NullLit { .. }) {
                 Some(&r)
@@ -6862,6 +6861,10 @@ impl<'r> Checker<'r> {
                 }
             }
         }
+        // Spec §8.9.1 / §8.9.2: an equality between two definitely-distinct
+        // types unrelated by subtyping is a compile-time error. Skip when
+        // either side is `null` (the spec routes the null arm separately) or
+        // when either side typed to `Unresolved` (we have no information).
         if matches!(op, BinOp::Eq | BinOp::Neq | BinOp::IdentEq | BinOp::IdentNeq)
             && !matches!(lhs, Expr::NullLit { .. })
             && !matches!(rhs, Expr::NullLit { .. })
