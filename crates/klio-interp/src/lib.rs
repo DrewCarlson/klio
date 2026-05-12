@@ -7254,6 +7254,25 @@ impl Interpreter {
                 {
                     return Ok(v);
                 }
+                // A function-typed value in scope (e.g. a parameter of type
+                // `T.(...) -> R`) may be invoked as `recv.name(args)`. The
+                // receiver binds as `this` inside the lambda.
+                if let Some(Value::Lambda { params, body, env: captured }) =
+                    env.borrow().lookup(&name.name)
+                {
+                    let mut arg_vals: Vec<Value> = Vec::with_capacity(args.len());
+                    for a in args {
+                        arg_vals.push(self.eval_expr(a, env, out)?);
+                    }
+                    return self.call_lambda_with_this(
+                        &params,
+                        &body,
+                        &captured,
+                        &arg_vals,
+                        Some(recv.clone()),
+                        out,
+                    );
+                }
                 return Err(RuntimeError::Unimplemented(format!(
                     "{}.{}",
                     class.fqn, name.name
@@ -9113,6 +9132,12 @@ fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value, RuntimeError> {
         (Le, String(a), String(b)) => Ok(Bool(klio_stdlib::compare_utf16(a, b).is_le())),
         (Gt, String(a), String(b)) => Ok(Bool(klio_stdlib::compare_utf16(a, b).is_gt())),
         (Ge, String(a), String(b)) => Ok(Bool(klio_stdlib::compare_utf16(a, b).is_ge())),
+        // String concatenation: spec §8.5.5. The LHS must be a String;
+        // the RHS coerces through `Display`/`toString`. Concrete user
+        // values (`Instance`) format via the auto-generated toString.
+        (Add, String(a), r) => {
+            Ok(String(Rc::new(format!("{}{}", a, r))))
+        }
 
         (Eq, a, b) => Ok(Bool(Value::structural_eq(a, b))),
         (Neq, a, b) => Ok(Bool(!Value::structural_eq(a, b))),
