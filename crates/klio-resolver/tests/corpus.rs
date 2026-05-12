@@ -77,3 +77,5 @@ corpus_test!(diag_unresolved, "diag_unresolved.kt");
 corpus_test!(diag_non_kotlin_import, "diag_non_kotlin_import.kt");
 corpus_test!(diag_unknown_kotlin_package, "diag_unknown_kotlin_package.kt");
 corpus_test!(import_own_package, "import_own_package.kt");
+corpus_test!(import_star_kotlin_text, "import_star_kotlin_text.kt");
+corpus_test!(diag_import_star_unknown, "diag_import_star_unknown.kt");

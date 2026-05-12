@@ -1,0 +1,12 @@
+---
+source: crates/klio-resolver/tests/corpus.rs
+assertion_line: 80
+expression: "import kotlin.text.*\n\nfun main() {\n    println(\"hi\")\n}\n"
+---
+# symbols
+  [0] Builtin println @builtin
+  [1] Builtin print @builtin
+  [2] TopLevelFunction main @26..30
+
+# uses
+  @39..46 -> [0] println (Builtin)
