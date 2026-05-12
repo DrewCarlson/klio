@@ -1291,6 +1291,23 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     definitely_non_null: false,
                     annotations: Vec::new(),
                 });
+            } else if matches!(self.peek_kind(), TokenKind::Ident)
+                && self.text(self.current_span()) == "_"
+            {
+                // Spec §4.5.3 underscore type argument — placeholder for
+                // partial inference. Recorded as a TypeRef whose name is
+                // `_`; downstream typeck treats this as Type::Unresolved
+                // and lets the surrounding inference flow set it.
+                let s = self.bump();
+                args.push(TypeRef {
+                    name: Ident { name: "_".into(), span: s.span },
+                    nullable: false,
+                    span: s.span,
+                    type_args: Vec::new(),
+                    function: None,
+                    definitely_non_null: false,
+                    annotations: Vec::new(),
+                });
             } else {
                 if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::In)) {
                     self.bump();
