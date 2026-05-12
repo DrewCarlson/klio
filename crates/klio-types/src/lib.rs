@@ -62,6 +62,10 @@ pub enum Type {
     Function {
         params: Vec<Type>,
         return_type: Box<Type>,
+        /// Distinguishes `suspend (T) -> R` from `(T) -> R`. Per spec §18.1
+        /// these are distinct function types; one is not assignable to
+        /// the other.
+        is_suspend: bool,
     },
     Range(Box<Type>),
     /// Reference to a generic type parameter declared on an enclosing
@@ -104,7 +108,10 @@ impl fmt::Display for Type {
             Self::Any => f.write_str("Any"),
             Self::Nothing => f.write_str("Nothing"),
             Self::Nullable(inner) => write!(f, "{inner}?"),
-            Self::Function { params, return_type } => {
+            Self::Function { params, return_type, is_suspend } => {
+                if *is_suspend {
+                    f.write_str("suspend ")?;
+                }
                 f.write_str("(")?;
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 {
@@ -252,10 +259,11 @@ impl Type {
             (Self::Nullable(_), _) => false,
             (_, Self::Any) => !self.is_nullable(),
             (
-                Self::Function { params: lp, return_type: lr },
-                Self::Function { params: rp, return_type: rr },
+                Self::Function { params: lp, return_type: lr, is_suspend: ls },
+                Self::Function { params: rp, return_type: rr, is_suspend: rs },
             ) => {
-                lp.len() == rp.len()
+                ls == rs
+                    && lp.len() == rp.len()
                     && lp.iter().zip(rp.iter()).all(|(l, r)| r.is_subtype_of(l))
                     && lr.is_subtype_of(rr)
             }
@@ -338,6 +346,16 @@ pub fn convert_type_ref_lossy(t: &TypeRef) -> Type {
     if t.name.name == "*" {
         return Type::Any;
     }
+    if let Some(ft) = &t.function {
+        let params: Vec<Type> = ft.params.iter().map(convert_type_ref_lossy).collect();
+        let ret = convert_type_ref_lossy(&ft.ret);
+        let func = Type::Function {
+            params,
+            return_type: Box::new(ret),
+            is_suspend: ft.is_suspend,
+        };
+        return if t.nullable { func.as_nullable() } else { func };
+    }
     let base = match builtin_by_name(&t.name.name) {
         Some(ty) => ty,
         None => Type::Unresolved,
@@ -363,15 +381,15 @@ pub fn unify(lhs: &Type, rhs: &Type) -> Result<Type, TypeError> {
         (a, b) if a == b => Ok(a.clone()),
         (Type::Nullable(a), Type::Nullable(b)) => Ok(Type::Nullable(Box::new(unify(a, b)?))),
         (
-            Type::Function { params: lp, return_type: lr },
-            Type::Function { params: rp, return_type: rr },
-        ) if lp.len() == rp.len() => {
+            Type::Function { params: lp, return_type: lr, is_suspend: ls },
+            Type::Function { params: rp, return_type: rr, is_suspend: rs },
+        ) if lp.len() == rp.len() && ls == rs => {
             let mut params = Vec::with_capacity(lp.len());
             for (a, b) in lp.iter().zip(rp.iter()) {
                 params.push(unify(a, b)?);
             }
             let return_type = Box::new(unify(lr, rr)?);
-            Ok(Type::Function { params, return_type })
+            Ok(Type::Function { params, return_type, is_suspend: *ls })
         }
         (Type::Range(a), Type::Range(b)) => Ok(Type::Range(Box::new(unify(a, b)?))),
         (a, b) => Err(TypeError::Mismatch { lhs: a.clone(), rhs: b.clone() }),
@@ -439,8 +457,15 @@ mod tests {
         let f = Type::Function {
             params: vec![Type::Int, Type::String],
             return_type: Box::new(Type::Boolean),
+            is_suspend: false,
         };
         assert_eq!(f.to_string(), "(Int, String) -> Boolean");
+        let s = Type::Function {
+            params: vec![Type::Int],
+            return_type: Box::new(Type::Boolean),
+            is_suspend: true,
+        };
+        assert_eq!(s.to_string(), "suspend (Int) -> Boolean");
         assert_eq!(Type::Range(Box::new(Type::Int)).to_string(), "Range<Int>");
     }
 
@@ -477,13 +502,24 @@ mod tests {
         let id_int = Type::Function {
             params: vec![Type::Int],
             return_type: Box::new(Type::Int),
+            is_suspend: false,
         };
         let id_any_in_int_out = Type::Function {
             params: vec![Type::Any],
             return_type: Box::new(Type::Int),
+            is_suspend: false,
         };
         assert!(id_any_in_int_out.is_subtype_of(&id_int));
         assert!(!id_int.is_subtype_of(&id_any_in_int_out));
+        // Spec §18.1: suspending and non-suspending function types are
+        // distinct; neither is a subtype of the other.
+        let id_int_susp = Type::Function {
+            params: vec![Type::Int],
+            return_type: Box::new(Type::Int),
+            is_suspend: true,
+        };
+        assert!(!id_int.is_subtype_of(&id_int_susp));
+        assert!(!id_int_susp.is_subtype_of(&id_int));
     }
 
     #[test]
@@ -514,10 +550,12 @@ mod tests {
         let a = Type::Function {
             params: vec![Type::Int],
             return_type: Box::new(Type::Unresolved),
+            is_suspend: false,
         };
         let b = Type::Function {
             params: vec![Type::Int],
             return_type: Box::new(Type::String),
+            is_suspend: false,
         };
         let merged = unify(&a, &b).unwrap();
         assert_eq!(
@@ -525,6 +563,7 @@ mod tests {
             Type::Function {
                 params: vec![Type::Int],
                 return_type: Box::new(Type::String),
+                is_suspend: false,
             }
         );
     }

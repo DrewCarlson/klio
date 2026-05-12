@@ -3327,6 +3327,7 @@ impl<'r> Checker<'r> {
                     let ty = Type::Function {
                         params: sig.params,
                         return_type: Box::new(sig.return_ty),
+                        is_suspend: f.is_suspend,
                     };
                     info.members.insert(f.name.name.clone(), ty);
                     if let Some(cn) = f.return_type.as_ref().and_then(class_name_from_typeref) {
@@ -3413,8 +3414,9 @@ impl<'r> Checker<'r> {
 
     fn check_top_level_property(&mut self, p: &Property) {
         if let Some(init) = &p.init {
-            let init_ty = self.check_expr(init, None);
-            if let Some(annot) = p.ty.as_ref().map(convert_type_ref_lossy) {
+            let annot = p.ty.as_ref().map(convert_type_ref_lossy);
+            let init_ty = self.check_expr(init, annot.as_ref());
+            if let Some(annot) = annot {
                 self.check_assignable(&init_ty, &annot, init.span());
             } else {
                 // Infer from initializer.
@@ -5262,6 +5264,7 @@ impl<'r> Checker<'r> {
                 let fn_ty = Type::Function {
                     params: sig.params.clone(),
                     return_type: Box::new(sig.return_ty.clone()),
+                    is_suspend: f.is_suspend,
                 };
                 self.current_frame().bindings.insert(
                     f.name.name.clone(),
@@ -5441,6 +5444,7 @@ impl<'r> Checker<'r> {
                             return Type::Function {
                                 params: sig.params,
                                 return_type: Box::new(sig.return_ty),
+                                is_suspend: sig.is_suspend,
                             };
                         }
                     }
@@ -6179,7 +6183,7 @@ impl<'r> Checker<'r> {
                     target
                 }
             }
-            Expr::AnonFun { params, return_ty, body, .. } => {
+            Expr::AnonFun { params, return_ty, body, is_suspend, .. } => {
                 let saved = self.assigned.clone();
                 self.push_frame();
                 for p in params {
@@ -6221,7 +6225,11 @@ impl<'r> Checker<'r> {
                 } else {
                     ret_expected
                 };
-                Type::Function { params: params_out, return_type: Box::new(r) }
+                Type::Function {
+                    params: params_out,
+                    return_type: Box::new(r),
+                    is_suspend: *is_suspend,
+                }
             }
             Expr::Spread { expr, .. } => {
                 // A bare `*expr` outside a call-arg position is invalid;
@@ -6984,6 +6992,7 @@ impl<'r> Checker<'r> {
                             let expect = Type::Function {
                                 params: vec![elem.clone()],
                                 return_type: Box::new(Type::Unresolved),
+                                is_suspend: false,
                             };
                             let ty = self.check_expr(arg0, Some(&expect));
                             let new_elem = match ty {
@@ -6999,6 +7008,7 @@ impl<'r> Checker<'r> {
                             let expect = Type::Function {
                                 params: vec![elem.clone()],
                                 return_type: Box::new(Type::Boolean),
+                                is_suspend: false,
                             };
                             let _ = self.check_expr(arg0, Some(&expect));
                             self.list_elem.insert(call_span, elem);
@@ -7010,6 +7020,7 @@ impl<'r> Checker<'r> {
                             let expect = Type::Function {
                                 params: vec![elem.clone()],
                                 return_type: Box::new(Type::Unit),
+                                is_suspend: false,
                             };
                             let _ = self.check_expr(arg0, Some(&expect));
                             return Type::Unit;
@@ -7020,6 +7031,7 @@ impl<'r> Checker<'r> {
                         let expect = Type::Function {
                             params: vec![init_ty.clone(), elem.clone()],
                             return_type: Box::new(init_ty.clone()),
+                            is_suspend: false,
                         };
                         let _ = self.check_expr(&args[1], Some(&expect));
                         return init_ty;
@@ -7063,7 +7075,7 @@ impl<'r> Checker<'r> {
         }
         // Lambda value call: if callee has Function type, check params.
         let callee_ty = self.check_expr(callee, None);
-        if let Type::Function { params, return_type } = callee_ty {
+        if let Type::Function { params, return_type, is_suspend } = callee_ty {
             if params.len() == args.len() {
                 for (a, p) in args.iter().zip(params.iter()) {
                     let at = self.check_expr(a, Some(p));
@@ -7074,6 +7086,7 @@ impl<'r> Checker<'r> {
                     self.check_expr(a, None);
                 }
             }
+            self.enforce_suspend_coloring(is_suspend, "lambda", call_span);
             return *return_type;
         }
         for a in args {
@@ -7856,6 +7869,7 @@ impl<'r> Checker<'r> {
                 return Type::Function {
                     params: vec![],
                     return_type: Box::new(actual_ret),
+                    is_suspend: false,
                 };
             }
         }
@@ -7864,24 +7878,30 @@ impl<'r> Checker<'r> {
         Type::Function {
             params: vec![],
             return_type: Box::new(actual_ret),
+            is_suspend: false,
         }
     }
 
     fn check_lambda(&mut self, params: &[klio_ast::Ident], body: &Block, expected: Option<&Type>) -> Type {
         // Pull param types from expected function type, if it's one.
-        let (param_tys, ret_expected): (Vec<Type>, Type) = match expected.map(Type::non_null) {
-            Some(Type::Function { params: ps, return_type }) => {
+        let (param_tys, ret_expected, is_suspend): (Vec<Type>, Type, bool) = match expected.map(Type::non_null) {
+            Some(Type::Function { params: ps, return_type, is_suspend }) => {
                 let ps = ps.clone();
                 let r = (**return_type).clone();
-                (ps, r)
+                (ps, r, *is_suspend)
             }
             _ => (
                 std::iter::repeat(Type::Unresolved).take(params.len().max(1)).collect(),
                 Type::Unresolved,
+                false,
             ),
         };
         let saved = self.assigned.clone();
         self.push_frame();
+        // Spec §18.1: a lambda assigned to a `suspend (…) -> R` slot
+        // becomes a suspending lambda. Push the bit so calls inside the
+        // body can target suspending functions.
+        self.suspend_context_stack.push(is_suspend);
         // Spec §14.3.2 step 3: pick zero vs one phantom `it` based on the
         // expected callable shape. The parser preemptively pushes a synthetic
         // `it` for any zero-`->` lambda body, so when the expected callable
@@ -7918,6 +7938,7 @@ impl<'r> Checker<'r> {
             }
         }
         let actual_ret = self.check_block(body, Some(&ret_expected));
+        self.suspend_context_stack.pop();
         self.pop_frame();
         self.assigned = saved;
         let return_type = if matches!(ret_expected, Type::Unresolved) {
@@ -7938,7 +7959,11 @@ impl<'r> Checker<'r> {
                 .map(|(i, _)| param_tys.get(i).cloned().unwrap_or(Type::Unresolved))
                 .collect::<Vec<_>>()
         };
-        Type::Function { params: params_out, return_type: Box::new(return_type) }
+        Type::Function {
+            params: params_out,
+            return_type: Box::new(return_type),
+            is_suspend,
+        }
     }
 
     // ---- smart casts -----------------------------------------------------
@@ -8329,9 +8354,10 @@ fn substitute_type_params(t: &Type, subst: &std::collections::HashMap<String, Ty
         Type::Nullable(inner) => {
             substitute_type_params(inner, subst).as_nullable()
         }
-        Type::Function { params, return_type } => Type::Function {
+        Type::Function { params, return_type, is_suspend } => Type::Function {
             params: params.iter().map(|p| substitute_type_params(p, subst)).collect(),
             return_type: Box::new(substitute_type_params(return_type, subst)),
+            is_suspend: *is_suspend,
         },
         Type::Range(inner) => Type::Range(Box::new(substitute_type_params(inner, subst))),
         Type::Generic { name, args } => Type::Generic {
@@ -8374,7 +8400,11 @@ fn convert_type_ref_with_tparams(t: &TypeRef, tparams: &std::collections::HashSe
             .map(|p| convert_type_ref_with_tparams(p, tparams))
             .collect();
         let ret = convert_type_ref_with_tparams(&ft.ret, tparams);
-        let func = Type::Function { params, return_type: Box::new(ret) };
+        let func = Type::Function {
+            params,
+            return_type: Box::new(ret),
+            is_suspend: ft.is_suspend,
+        };
         return if t.nullable { func.as_nullable() } else { func };
     }
     if !t.type_args.is_empty() {
@@ -11700,6 +11730,26 @@ mod tests {
             r#"
             suspend fun a() {}
             fun main() { a() }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND));
+    }
+
+    #[test]
+    fn suspend_call_inside_anon_fun_marked_suspend() {
+        // Spec §18.1: an anonymous-function expression with a `suspend`
+        // function type still has no syntactic way to be marked suspending
+        // today; ensure a non-suspending anon-fun body can NOT call
+        // suspending functions. (Lambda-target carve-out for
+        // `suspend (…) -> R` slots requires the `{…}` initializer to be
+        // parsed as a lambda — tracked separately.)
+        let tc = check_src(
+            r#"
+            suspend fun a() {}
+            fun outer() {
+                val f = fun() { a() }
+                f()
+            }
             "#,
         );
         assert!(codes(&tc).contains(&codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND));
