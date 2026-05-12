@@ -6201,19 +6201,33 @@ impl Interpreter {
         // `super.method(args...)` — step exactly one class up the chain
         // from the body's owning class and dispatch. With `super<Klazz>`
         // dispatch through the named supertype instead of the parent.
+        // With `super@Outer` dispatch through the outer instance's class.
         if let Expr::Member { receiver, name, safe: false, .. } = callee {
-            if let Expr::Super { qualifier, .. } = receiver.as_ref() {
-                let inst = match env.borrow().lookup("this") {
-                    Some(Value::Instance(i)) => i,
-                    _ => {
-                        return Err(RuntimeError::Type(
-                            "`super` is only valid inside an instance method".into(),
-                        ));
-                    }
-                };
-                let owner = match env.borrow().lookup("__owner_class__") {
-                    Some(Value::Class(c)) => c,
-                    _ => Rc::clone(&inst.borrow().class),
+            if let Expr::Super { qualifier, label, .. } = receiver.as_ref() {
+                let (inst, owner) = if let Some(l) = label {
+                    let qname = format!("this@{}", l.name);
+                    let Some(Value::Instance(i)) = env.borrow().lookup(&qname) else {
+                        return Err(RuntimeError::Type(format!(
+                            "`super@{}` does not denote an enclosing receiver",
+                            l.name
+                        )));
+                    };
+                    let cls = Rc::clone(&i.borrow().class);
+                    (i, cls)
+                } else {
+                    let i = match env.borrow().lookup("this") {
+                        Some(Value::Instance(i)) => i,
+                        _ => {
+                            return Err(RuntimeError::Type(
+                                "`super` is only valid inside an instance method".into(),
+                            ));
+                        }
+                    };
+                    let owner = match env.borrow().lookup("__owner_class__") {
+                        Some(Value::Class(c)) => c,
+                        _ => Rc::clone(&i.borrow().class),
+                    };
+                    (i, owner)
                 };
                 let root = resolve_super_root(&owner, qualifier.as_ref())?;
                 let Some((m, found_in)) = root.find_method(&name.name) else {
