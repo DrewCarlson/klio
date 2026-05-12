@@ -7282,8 +7282,21 @@ impl<'r> Checker<'r> {
         };
         let saved = self.assigned.clone();
         self.push_frame();
-        // `it` for zero-explicit-param lambdas.
-        if params.is_empty() {
+        // Spec §14.3.2 step 3: pick zero vs one phantom `it` based on the
+        // expected callable shape. The parser preemptively pushes a synthetic
+        // `it` for any zero-`->` lambda body, so when the expected callable
+        // is zero-arity we strip that synthetic param. Treat
+        // `params == [{ name: "it" }]` with expected arity 0 as a zero-param
+        // lambda — `it` is not bound and the lambda type carries no params.
+        let expected_arity = match expected.map(Type::non_null) {
+            Some(Type::Function { params: ps, .. }) => Some(ps.len()),
+            _ => None,
+        };
+        let synthetic_it =
+            params.len() == 1 && params[0].name == "it" && expected_arity == Some(0);
+        let effective_empty = params.is_empty() || synthetic_it;
+        let bind_it = effective_empty && expected_arity != Some(0);
+        if bind_it {
             self.current_frame().bindings.insert(
                 "it".to_string(),
                 Binding {
@@ -7292,7 +7305,7 @@ impl<'r> Checker<'r> {
                     decl_span: None, class_name: None, needs_init: false },
             );
             self.assigned.insert("it".to_string());
-        } else {
+        } else if !effective_empty {
             for (i, p) in params.iter().enumerate() {
                 self.current_frame().bindings.insert(
                     p.name.clone(),
@@ -7312,8 +7325,12 @@ impl<'r> Checker<'r> {
         } else {
             ret_expected
         };
-        let params_out = if params.is_empty() {
-            vec![param_tys.into_iter().next().unwrap_or(Type::Unresolved)]
+        let params_out = if effective_empty {
+            if expected_arity == Some(0) {
+                vec![]
+            } else {
+                vec![param_tys.into_iter().next().unwrap_or(Type::Unresolved)]
+            }
         } else {
             params
                 .iter()
@@ -8769,6 +8786,26 @@ mod tests {
     fn smart_cast_after_do_while() {
         let tc = check_src(
             "fun f(a: String?): Int { do { if (a == null) return -1 } while (false); return a.length }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn lambda_zero_arity_against_unit_callable() {
+        // Spec §14.3.2 step 3: when the expected callable has zero params,
+        // a zero-`->` lambda is treated as zero-arity (no phantom `it`),
+        // and its body's non-Unit final expression is accepted under the
+        // Unit-fallback rule (bullet 2 of step 5).
+        let tc = check_src(
+            "fun foreach(action: () -> Unit) {}; fun main() { foreach { 1 + 2 } }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn lambda_one_arity_with_it_against_one_arity_callable() {
+        let tc = check_src(
+            "fun action(a: (Int) -> Int): Int { return a(1) }; fun main() { action { it + 1 } }",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
