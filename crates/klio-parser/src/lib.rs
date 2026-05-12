@@ -2952,14 +2952,32 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.skip_nl();
         self.expect(&TokenKind::RParen, "`)`")?;
         self.skip_nl();
-        let then_branch = self.parse_expr()?;
+        // Spec §8.5: the then-branch may be omitted (`;` or `else`
+        // immediately following the closing paren). The branchless form
+        // `if (c) else ;` is valid and evaluates to Unit.
+        let cond_span = cond.span();
+        let then_branch = match self.peek_kind() {
+            TokenKind::Semicolon => {
+                let semi = self.bump();
+                Expr::Block(Block { stmts: Vec::new(), span: semi.span })
+            }
+            TokenKind::Keyword(Keyword::Else) => {
+                Expr::Block(Block { stmts: Vec::new(), span: cond_span })
+            }
+            _ => self.parse_expr()?,
+        };
         // `else` may follow on the next line.
         let save = self.pos;
         self.skip_nl();
         let else_branch = if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Else)) {
             self.bump();
             self.skip_nl();
-            self.parse_expr().map(Box::new)
+            if matches!(self.peek_kind(), TokenKind::Semicolon) {
+                let semi = self.bump();
+                Some(Box::new(Expr::Block(Block { stmts: Vec::new(), span: semi.span })))
+            } else {
+                self.parse_expr().map(Box::new)
+            }
         } else {
             self.pos = save;
             None
