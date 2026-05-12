@@ -4872,8 +4872,34 @@ impl<'r> Checker<'r> {
                 }
                 acc.unwrap_or(Type::Unit)
             }
-            Expr::IsCheck { expr, .. } => {
-                self.check_expr(expr, None);
+            Expr::IsCheck { expr, ty, negated, span } => {
+                let lhs_ty = self.check_expr(expr, None);
+                // Spec §8.11.1 note: `null is T?` is always `true`; `null is
+                // T` (non-nullable) is always `false`. Surface the
+                // observation by recording the folded value into the
+                // checker types map so downstream reachability passes can
+                // pick it up. The literal `null` case fires the strongest
+                // narrowing; we also handle the symmetric null-typed value
+                // (Nothing? or a `val n: T? = null` after smart-cast).
+                let lhs_is_null = matches!(expr.as_ref(), Expr::NullLit { .. })
+                    || matches!(&lhs_ty, Type::Nullable(inner) if matches!(**inner, Type::Nothing));
+                if lhs_is_null {
+                    let always = if ty.nullable { !*negated } else { *negated };
+                    let label = if always { "true" } else { "false" };
+                    self.diagnostics.emit(
+                        Diagnostic::warning(
+                            format!(
+                                "`{}` is always `{}` — `null` {} `{}` per spec §8.11.1",
+                                if *negated { "!is" } else { "is" },
+                                label,
+                                if always { "is" } else { "is not" },
+                                ty.name.name
+                            ),
+                            *span,
+                        )
+                        .with_code(codes::TYPE_UNCHECKED_CAST),
+                    );
+                }
                 Type::Boolean
             }
             Expr::As { expr, ty, safe, span } => {
