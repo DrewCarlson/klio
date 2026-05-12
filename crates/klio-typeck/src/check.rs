@@ -2090,6 +2090,30 @@ impl<'r> Checker<'r> {
 
     fn check_class(&mut self, c: &Class) {
         self.class_stack.push(c.name.name.clone());
+        // Spec §3.9: `kotlin.Enum<T>` declares `equals`, `hashCode`, and
+        // `compareTo` as `final`. User-declared enum entries cannot override
+        // them. `toString` remains overridable.
+        if c.is_enum {
+            for m in &c.members {
+                if let Decl::Function(f) = m {
+                    let n = f.name.name.as_str();
+                    if (n == "equals" || n == "hashCode" || n == "compareTo") && f.is_override
+                    {
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                format!(
+                                    "`{}` is `final` on `kotlin.Enum` and cannot be overridden \
+                                     (enum class `{}`, spec §3.9)",
+                                    n, c.name.name
+                                ),
+                                f.name.span,
+                            )
+                            .with_code(codes::TYPE_ENUM_FORBIDS_FINAL_OVERRIDE),
+                        );
+                    }
+                }
+            }
+        }
         // Spec §3.12: subtypes of `kotlin.Throwable` cannot have type
         // parameters. Walk the transitive supertype chain looking for any
         // built-in or user-declared Throwable ancestor.

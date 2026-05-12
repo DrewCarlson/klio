@@ -506,6 +506,13 @@ fn neg_tailrec_no_calls() {
 }
 
 #[test]
+fn neg_enum_final_override() {
+    assert!(type_codes_for("neg_enum_final_override.kt")
+        .iter()
+        .any(|c| c == "T0050"));
+}
+
+#[test]
 fn neg_throwable_type_params() {
     assert!(type_codes_for("neg_throwable_type_params.kt")
         .iter()
