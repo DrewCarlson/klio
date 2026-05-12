@@ -9,18 +9,23 @@ expression: "fun even(n: Int): Boolean = if (n == 0) true else odd(n - 1)\nfun o
   [3] Builtin with @builtin
   [4] Builtin check @builtin
   [5] Builtin require @builtin
-  [6] TopLevelFunction even @4..8
-  [7] TopLevelFunction odd @65..68
-  [8] TopLevelFunction main @128..132
-  [9] Parameter n @9..10
-  [10] Parameter n @69..70
+  [6] Builtin buildList @builtin
+  [7] Builtin buildMap @builtin
+  [8] Builtin buildSet @builtin
+  [9] Builtin sequence @builtin
+  [10] Builtin iterator @builtin
+  [11] TopLevelFunction even @4..8
+  [12] TopLevelFunction odd @65..68
+  [13] TopLevelFunction main @128..132
+  [14] Parameter n @9..10
+  [15] Parameter n @69..70
 
 # uses
-  @32..33 -> [9] n (Parameter)
-  @50..53 -> [7] odd (TopLevelFunction)
-  @54..55 -> [9] n (Parameter)
-  @92..93 -> [10] n (Parameter)
-  @111..115 -> [6] even (TopLevelFunction)
-  @116..117 -> [10] n (Parameter)
+  @32..33 -> [14] n (Parameter)
+  @50..53 -> [12] odd (TopLevelFunction)
+  @54..55 -> [14] n (Parameter)
+  @92..93 -> [15] n (Parameter)
+  @111..115 -> [11] even (TopLevelFunction)
+  @116..117 -> [15] n (Parameter)
   @141..148 -> [0] println (Builtin)
-  @149..153 -> [6] even (TopLevelFunction)
+  @149..153 -> [11] even (TopLevelFunction)

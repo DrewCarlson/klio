@@ -9,7 +9,12 @@ expression: "import kotlin.text.*\n\nfun main() {\n    println(\"hi\")\n}\n"
   [3] Builtin with @builtin
   [4] Builtin check @builtin
   [5] Builtin require @builtin
-  [6] TopLevelFunction main @26..30
+  [6] Builtin buildList @builtin
+  [7] Builtin buildMap @builtin
+  [8] Builtin buildSet @builtin
+  [9] Builtin sequence @builtin
+  [10] Builtin iterator @builtin
+  [11] TopLevelFunction main @26..30
 
 # uses
   @39..46 -> [0] println (Builtin)

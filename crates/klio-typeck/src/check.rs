@@ -7116,6 +7116,50 @@ impl<'r> Checker<'r> {
                 }
                 None
             }
+            // Spec §14.5 builder-style inference. We accept the call shape
+            // (one trailing lambda, optional initial capacity for the list
+            // / set / map variants) without solving a postponed type
+            // variable for the element / key-value types — those would
+            // require collecting `add` / `put` argument types from inside
+            // the lambda body and unifying them. For now, type the body
+            // permissively (lambda receiver is left Unresolved so member
+            // references inside don't false-positive) and return the
+            // appropriate result type.
+            "buildList" | "buildSet" if (1..=2).contains(&args.len()) => {
+                let lambda = args.last().unwrap();
+                if let Expr::Lambda { params, body, .. } = lambda {
+                    self.check_lambda_in_place(
+                        params,
+                        body,
+                        None,
+                        Some((Type::Unresolved, None)),
+                    );
+                }
+                Some(Type::Unresolved)
+            }
+            "buildMap" if (1..=2).contains(&args.len()) => {
+                let lambda = args.last().unwrap();
+                if let Expr::Lambda { params, body, .. } = lambda {
+                    self.check_lambda_in_place(
+                        params,
+                        body,
+                        None,
+                        Some((Type::Unresolved, None)),
+                    );
+                }
+                Some(Type::Unresolved)
+            }
+            "sequence" | "iterator" if args.len() == 1 => {
+                if let Expr::Lambda { params, body, .. } = &args[0] {
+                    self.check_lambda_in_place(
+                        params,
+                        body,
+                        None,
+                        Some((Type::Unresolved, None)),
+                    );
+                }
+                Some(Type::Unresolved)
+            }
             "check" | "require" if (1..=2).contains(&args.len()) => {
                 let cond = &args[0];
                 let nar = self.check_condition(cond);
@@ -8787,6 +8831,17 @@ mod tests {
         let tc = check_src(
             "fun f(a: String?): Int { do { if (a == null) return -1 } while (false); return a.length }",
         );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn builder_call_typechecks() {
+        // Spec §14.5: builder-style entry points typecheck through. Real
+        // postponed-type-variable inference is not implemented; we just
+        // ensure the surface call shape isn't a hard error.
+        let tc = check_src("fun main() { val xs = buildList<Int> {} }");
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        let tc = check_src("fun main() { val m = buildMap<String, Int> {} }");
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 

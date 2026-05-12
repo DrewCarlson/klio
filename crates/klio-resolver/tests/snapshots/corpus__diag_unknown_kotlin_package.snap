@@ -9,7 +9,12 @@ expression: "import kotlin.reflect.KClass\n\nfun main() {\n    println(\"hi\")\n
   [3] Builtin with @builtin
   [4] Builtin check @builtin
   [5] Builtin require @builtin
-  [6] TopLevelFunction main @34..38
+  [6] Builtin buildList @builtin
+  [7] Builtin buildMap @builtin
+  [8] Builtin buildSet @builtin
+  [9] Builtin sequence @builtin
+  [10] Builtin iterator @builtin
+  [11] TopLevelFunction main @34..38
 
 # uses
   @47..54 -> [0] println (Builtin)
