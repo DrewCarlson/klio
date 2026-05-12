@@ -1,0 +1,12 @@
+---
+source: crates/klio-parser/tests/corpus.rs
+assertion_line: 396
+expression: "package foo\npackage bar\n\nfun main() {}\n"
+---
+# ast
+package foo
+fun main()
+  body=block
+
+# diagnostics
+[P0045] Error duplicate `package` header; a file may declare at most one package @12..19

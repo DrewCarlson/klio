@@ -130,6 +130,30 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             if matches!(self.peek_kind(), TokenKind::Eof) {
                 break;
             }
+            if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Package)) {
+                let kw_span = self.current_span();
+                let code = if package.is_some() { "P0045" } else { "P0045" };
+                let msg = if package.is_some() {
+                    "duplicate `package` header; a file may declare at most one package"
+                } else {
+                    "`package` header must come before any import or declaration"
+                };
+                self.error(code, msg, kw_span);
+                // Consume the stray header so parsing can continue.
+                let _ = self.parse_package_header();
+                continue;
+            }
+            if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Import)) {
+                let kw_span = self.current_span();
+                self.error(
+                    "P0046",
+                    "`import` directives must appear before any declaration",
+                    kw_span,
+                );
+                // Consume the stray import header(s) so parsing can continue.
+                let _ = self.parse_imports();
+                continue;
+            }
             if let Some(d) = self.parse_top_decl() {
                 decls.push(d);
             } else {

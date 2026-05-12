@@ -392,3 +392,6 @@ corpus_test!(diag_top_level_garbage, "diag_top_level_garbage.kt");
 corpus_test!(diag_import_wildcard_alias, "diag_import_wildcard_alias.kt");
 corpus_test!(diag_import_empty, "diag_import_empty.kt");
 corpus_test!(diag_import_trailing_dot, "diag_import_trailing_dot.kt");
+corpus_test!(diag_package_after_imports, "diag_package_after_imports.kt");
+corpus_test!(diag_duplicate_package, "diag_duplicate_package.kt");
+corpus_test!(diag_import_after_decl, "diag_import_after_decl.kt");
