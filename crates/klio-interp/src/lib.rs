@@ -5490,6 +5490,18 @@ impl Interpreter {
                 let me = Value::Instance(Rc::clone(recv));
                 Ok(Some(Value::Bool(Value::structural_eq(&me, &other))))
             }
+            "clone" if args.is_empty() && class.is_enum => {
+                // Spec §3.9: enum entries cannot be cloned. The synthesized
+                // `protected final fun clone(): Any` throws.
+                Err(RuntimeError::Thrown(Value::Exception {
+                    fqn: Rc::new("kotlin.CloneNotSupportedException".into()),
+                    message: Some(Rc::new(format!(
+                        "Enum entry of `{}` cannot be cloned",
+                        class.name
+                    ))),
+                    cause: None,
+                }))
+            }
             "copy" if class.is_data && !class.is_object => {
                 let mut arg_vals = Vec::with_capacity(args.len());
                 for a in args {
