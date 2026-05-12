@@ -1971,7 +1971,14 @@ impl Interpreter {
                             let raw = &segments[0].name;
                             let resolved = self.resolve_reified(raw);
                             if &resolved != raw {
-                                let lookup = self.globals.borrow().lookup(&resolved);
+                                // Look up the resolved class name through
+                                // the active env first (so file-scope
+                                // classes are reachable), then fall back to
+                                // globals.
+                                let lookup = env
+                                    .borrow()
+                                    .lookup(&resolved)
+                                    .or_else(|| self.globals.borrow().lookup(&resolved));
                                 if let Some(v) = lookup {
                                     return self.eval_member_ref(&v, &name.name);
                                 }
