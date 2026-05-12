@@ -3787,6 +3787,7 @@ impl<'r> Checker<'r> {
             }
         }
         // Body properties bind in declaration order.
+        let mut needs_init_props: Vec<(String, Span, bool, Span)> = Vec::new();
         for m in &c.members {
             match m {
                 Decl::Property(p) => {
@@ -3796,6 +3797,27 @@ impl<'r> Checker<'r> {
                         if let Some(a) = want {
                             self.check_assignable(&ity, &a, init.span());
                         }
+                    }
+                    let has_init = p.init.is_some()
+                        || p.delegate.is_some()
+                        || p.is_lateinit
+                        || p.is_abstract
+                        || p.getter.is_some()
+                        || c.is_interface
+                        || c.is_abstract;
+                    if !has_init {
+                        let pty = p.ty.as_ref().map(convert_type_ref_lossy).unwrap_or(Type::Unresolved);
+                        self.current_frame().bindings.insert(
+                            p.name.name.clone(),
+                            Binding {
+                                ty: pty,
+                                mutable: p.mutable,
+                                decl_span: Some(p.name.span),
+                                class_name: p.ty.as_ref().and_then(class_name_from_typeref),
+                                needs_init: true,
+                            },
+                        );
+                        needs_init_props.push((p.name.name.clone(), p.name.span, p.mutable, p.name.span));
                     }
                     let _ = self.handle_accessors(p);
                 }
@@ -3844,6 +3866,27 @@ impl<'r> Checker<'r> {
         }
         for b in &c.init_blocks {
             self.check_block(b, None);
+        }
+        // VIA §12.2.3: every uninitialized `val` / `var` property must be
+        // definitely assigned by the time all init blocks (and the primary
+        // ctor path) complete. Secondary ctors run a separate flow and
+        // are checked below.
+        if !c.secondary_ctors.is_empty() {
+            // Secondary-ctor flow may assign properties along its own path;
+            // be conservative and skip the post-init check to avoid false
+            // positives until that flow is modeled.
+        } else {
+            for (name, span, _mutable, _decl_span) in &needs_init_props {
+                if !self.assigned.contains(name) {
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!("Property `{name}` must be initialized"),
+                            *span,
+                        )
+                        .with_code(codes::TYPE_VAR_NOT_DEFINITELY_ASSIGNED),
+                    );
+                }
+            }
         }
         // Secondary ctors.
         for sc in &c.secondary_ctors {
@@ -8719,6 +8762,38 @@ mod tests {
             "#,
         );
         assert!(codes(&tc).contains(&codes::WARN_USELESS_ELVIS));
+    }
+
+    #[test]
+    fn class_val_property_uninit_in_init_block() {
+        let tc = check_src(
+            r#"
+            class Foo(b: Boolean) {
+                val x: Int
+                init {
+                    if (b) { x = 1 }
+                }
+            }
+            fun main() { println(Foo(true).x) }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::TYPE_VAR_NOT_DEFINITELY_ASSIGNED));
+    }
+
+    #[test]
+    fn class_val_property_initialized_in_all_init_branches() {
+        let tc = check_src(
+            r#"
+            class Foo(b: Boolean) {
+                val x: Int
+                init {
+                    if (b) { x = 1 } else { x = 2 }
+                }
+            }
+            fun main() { println(Foo(true).x) }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
