@@ -2186,6 +2186,46 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Spec §17.1: annotation-class primary-ctor parameter default values
+    /// must be compile-time constant. Extends `is_const_initializer` with
+    /// the forms specific to annotation arguments: `T::class` literals,
+    /// `arrayOf(...)` of constants, and bare enum-entry references.
+    fn is_annotation_param_default_const(&self, e: &Expr) -> bool {
+        if self.is_const_initializer(e) {
+            return true;
+        }
+        match e {
+            // `T::class` class literal.
+            Expr::MemberRef { name, .. } if name.name == "class" => true,
+            // `arrayOf(...)` / `intArrayOf` / similar primitive-array builders.
+            Expr::Call { callee, args, .. } => {
+                if let Expr::Path { segments, .. } = callee.as_ref() {
+                    let leaf = &segments.last().unwrap().name;
+                    let is_array_builder = matches!(
+                        leaf.as_str(),
+                        "arrayOf"
+                            | "intArrayOf"
+                            | "longArrayOf"
+                            | "shortArrayOf"
+                            | "byteArrayOf"
+                            | "floatArrayOf"
+                            | "doubleArrayOf"
+                            | "booleanArrayOf"
+                            | "charArrayOf"
+                            | "emptyArray"
+                    );
+                    if is_array_builder {
+                        return args
+                            .iter()
+                            .all(|a| self.is_annotation_param_default_const(a));
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn is_const_ref(&self, name: &str) -> bool {
         if let Some(b) = self.frames[0].bindings.get(name) {
             if !b.mutable {
@@ -2389,6 +2429,20 @@ impl<'a> Checker<'a> {
             );
         }
         for p in &c.primary_params {
+            if let Some(default) = &p.default {
+                if !self.is_annotation_param_default_const(default) {
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "annotation-class parameter `{}` default value must be a compile-time constant",
+                                p.name.name
+                            ),
+                            default.span(),
+                        )
+                        .with_code(codes::TYPE_ANNOTATION_PARAM_DEFAULT_NOT_CONST),
+                    );
+                }
+            }
             let head = &p.ty.name.name;
             let allowed_head = is_annotation_param_type(head)
                 || self.annotation_class_names.contains(head)

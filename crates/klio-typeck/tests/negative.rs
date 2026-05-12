@@ -457,6 +457,13 @@ fn neg_annotation_class_cycle_array() {
 }
 
 #[test]
+fn neg_annotation_class_param_default_non_const() {
+    assert!(type_codes_for("neg_annotation_class_param_default_non_const.kt")
+        .iter()
+        .any(|c| c == "T0108"));
+}
+
+#[test]
 fn neg_annotation_class_unsupported_user_param() {
     assert!(type_codes_for("neg_annotation_class_unsupported_user_param.kt")
         .iter()
