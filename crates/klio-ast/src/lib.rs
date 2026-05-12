@@ -131,6 +131,11 @@ pub struct Function {
     /// detection and rewrite; for now the flag is round-tripped through the
     /// AST without enforcement.
     pub is_tailrec: bool,
+    /// Declared with the `suspend` modifier. The function colours every
+    /// call inside its body as a suspension-allowed context, and every
+    /// call site to this function is required to be inside a suspending
+    /// context.
+    pub is_suspend: bool,
     pub visibility: Visibility,
     pub annotations: Vec<Annotation>,
     pub span: Span,

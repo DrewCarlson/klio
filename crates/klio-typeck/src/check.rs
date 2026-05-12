@@ -401,6 +401,19 @@ pub mod codes {
     /// Spec §17.5.9: member call resolves through a shadowed implicit
     /// receiver that belongs to the same DSL.
     pub const TYPE_DSL_SCOPE_VIOLATION: &str = "T0113";
+    /// Spec §18.1: `suspend` modifier on a function shape that cannot be
+    /// suspending — constructor, property accessor, anonymous function,
+    /// or delegation operator (`getValue` / `setValue` / `provideDelegate`).
+    pub const TYPE_SUSPEND_NOT_ALLOWED: &str = "T0114";
+    /// Spec §18.1: a suspending function (or `suspend` lambda) is called
+    /// from a non-suspending context.
+    pub const TYPE_SUSPEND_CALL_FROM_NON_SUSPEND: &str = "T0115";
+    /// Spec §18.1 / §5.4: an `override fun` disagrees with its overridden
+    /// declaration on the `suspend` modifier.
+    pub const TYPE_OVERRIDE_SUSPEND_MISMATCH: &str = "T0069";
+    /// Spec §18.1 cross §4.1: assignment / argument-passing between a
+    /// `suspend (…) -> R` and a non-suspending `(…) -> R` function type.
+    pub const TYPE_SUSPEND_FUNCTION_TYPE_MISMATCH: &str = "T0116";
     /// Spec §17.5.5: WARNING level deprecation.
     pub const WARN_DEPRECATED: &str = "W0006";
     /// Spec §17.5.4: WARNING level opt-in.

@@ -450,7 +450,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     } else if text == "infix" {
                         flags.is_infix = true;
                         self.bump();
-                    } else if matches!(text, "final" | "external" | "suspend") {
+                    } else if text == "suspend" {
+                        flags.is_suspend = true;
+                        flags.suspend_span = Some(self.current_span());
+                        self.bump();
+                    } else if matches!(text, "final" | "external") {
                         self.bump();
                     } else {
                         return flags;
@@ -978,6 +982,13 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             if matches!(self.peek_kind(), TokenKind::Ident)
                 && self.text(self.current_span()) == "constructor"
             {
+                if let Some(sp) = flags.suspend_span {
+                    self.error(
+                        "T0114",
+                        "`suspend` modifier is not allowed on a constructor",
+                        sp,
+                    );
+                }
                 if let Some(sc) = self.parse_secondary_ctor(flags.visibility, flags.annotations) {
                     secondary_ctors.push(sc);
                 }
@@ -1443,6 +1454,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             is_inline: flags.is_inline,
             is_infix: flags.is_infix,
             is_tailrec: flags.is_tailrec,
+            is_suspend: flags.is_suspend,
             visibility: flags.visibility,
             annotations: flags.annotations,
             span: kw.span.join(end),
@@ -1633,6 +1645,13 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     }
 
     fn parse_property_with_flags(&mut self, flags: ModifierFlags) -> Option<Property> {
+        if let Some(sp) = flags.suspend_span {
+            self.error(
+                "T0114",
+                "`suspend` modifier is not allowed on a property declaration",
+                sp,
+            );
+        }
         let kw_tok = self.bump();
         let mutable = matches!(kw_tok.kind, TokenKind::Keyword(Keyword::Var));
         self.skip_nl();
@@ -3726,6 +3745,12 @@ struct ModifierFlags {
     is_tailrec: bool,
     is_value: bool,
     is_annotation: bool,
+    is_suspend: bool,
+    /// Span of the `suspend` modifier when one was consumed. Used to point
+    /// the user at the modifier when emitting the rejection diagnostic on
+    /// constructors / accessors / anonymous functions / delegation
+    /// operators.
+    suspend_span: Option<Span>,
     /// Span of the `inline` modifier when one was consumed. Used to emit a
     /// deprecation warning when the source wrote `inline class`, since
     /// `inline class` is an alias for `value class`.
@@ -4002,6 +4027,42 @@ mod tests {
         assert_eq!(recv.name.name, "String");
         assert_eq!(f.params.len(), 1);
         assert_eq!(f.params[0].name.name, "Int");
+    }
+
+    #[test]
+    fn suspend_modifier_on_fun_sets_flag() {
+        let (file, diags) = parse("suspend fun f() {}\n");
+        assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
+        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
+        assert!(f.is_suspend);
+    }
+
+    #[test]
+    fn suspend_modifier_on_non_suspend_fun_absent() {
+        let (file, diags) = parse("fun f() {}\n");
+        assert!(!diags.has_errors());
+        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
+        assert!(!f.is_suspend);
+    }
+
+    #[test]
+    fn suspend_modifier_on_secondary_ctor_rejected() {
+        let (_file, diags) = parse(
+            "class C { suspend constructor() {} }\n",
+        );
+        assert!(
+            diags.diagnostics().iter().any(|d| d.code() == Some("T0114")),
+            "expected T0114: {:?}", diags.diagnostics()
+        );
+    }
+
+    #[test]
+    fn suspend_modifier_on_property_rejected() {
+        let (_file, diags) = parse("suspend val x = 1\n");
+        assert!(
+            diags.diagnostics().iter().any(|d| d.code() == Some("T0114")),
+            "expected T0114: {:?}", diags.diagnostics()
+        );
     }
 
     #[test]
