@@ -316,6 +316,12 @@ pub mod codes {
     /// supertype to define the member; otherwise the caller must
     /// disambiguate with `super<TypeName>.member`.
     pub const TYPE_AMBIGUOUS_SUPER: &str = "T0093";
+    /// Two callables declared in the same scope, on the same c-level
+    /// partition, are "definitely interlinked" (spec §11.8): they always
+    /// participate together in overload resolution. When the phantom
+    /// call-site MSC procedure picks neither as more specific, the
+    /// declaration pair is a compile-time conflict.
+    pub const TYPE_CONFLICTING_OVERLOADS: &str = "T0094";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -402,6 +408,10 @@ struct FnSig {
     /// Used by MSC's pairwise forwarding test (§11.4.2) to distinguish
     /// otherwise-collapsed `Type::Unresolved` slots.
     param_class_names: Vec<Option<String>>,
+    /// Declaration-name span. `None` for synthetic / constructor sigs.
+    /// Used by the §11.8 conflicting-overloads pass to attach diagnostics
+    /// to the offending declaration sites.
+    decl_span: Option<Span>,
 }
 
 /// Description of a user-declared class.
@@ -660,6 +670,8 @@ impl<'a> Checker<'a> {
         for d in &file.decls {
             self.check_phase_k_decl(d);
         }
+        // §11.8: declaration-site conflicting-overload detection.
+        self.check_conflicting_overloads();
         // T0076: top-level property initializer cycles (spec §6).
         self.check_property_initializer_cycles(file);
         // T0075: non-property primary-ctor param read from method body.
@@ -2845,6 +2857,7 @@ impl<'r> Checker<'r> {
             is_infix: f.is_infix,
             type_param_count: f.type_params.len(),
             param_class_names,
+            decl_span: Some(f.name.span),
         }
     }
 
@@ -2895,6 +2908,7 @@ impl<'r> Checker<'r> {
                 .iter()
                 .map(|p| class_name_from_typeref(&p.ty))
                 .collect(),
+            decl_span: None,
         };
         if !c.primary_params.is_empty() || !c.is_interface {
             info.ctor = Some(ctor_sig);
@@ -5799,6 +5813,60 @@ impl<'r> Checker<'r> {
         }
     }
 
+    /// Spec §11.8: walk every (f, g) declared in the same scope at the
+    /// same c-level partition. The phantom call site is fully-specified
+    /// (every parameter supplied, no defaults used), so we only consider
+    /// pairs of equal arity. If neither dominates the other on the
+    /// pairwise MSC test and the case-3 tiebreakers also fail to pick a
+    /// winner, the pair is a compile-time conflict.
+    fn check_conflicting_overloads(&mut self) {
+        let mut pairs: Vec<(Span, Span, String, Vec<String>, Vec<String>)> = Vec::new();
+        let classes_snapshot = self.classes.clone();
+        for (name, sigs) in &self.fns {
+            if sigs.len() < 2 { continue; }
+            for i in 0..sigs.len() {
+                for j in (i + 1)..sigs.len() {
+                    let (a, b) = (&sigs[i], &sigs[j]);
+                    if a.params.len() != b.params.len() { continue; }
+                    let n = a.params.len();
+                    let a_ge_b = at_least_as_applicable(a, b, n, &classes_snapshot);
+                    let b_ge_a = at_least_as_applicable(b, a, n, &classes_snapshot);
+                    if !(a_ge_b && b_ge_a) { continue; }
+                    // Case 3 tiebreakers: non-parameterized, fewer defaults,
+                    // no-vararg.
+                    if (a.type_param_count == 0) != (b.type_param_count == 0) {
+                        continue;
+                    }
+                    let a_defaults = a.has_default.iter().filter(|h| **h).count();
+                    let b_defaults = b.has_default.iter().filter(|h| **h).count();
+                    if a_defaults != b_defaults { continue; }
+                    let a_va = a.is_vararg.iter().any(|v| *v);
+                    let b_va = b.is_vararg.iter().any(|v| *v);
+                    if a_va != b_va { continue; }
+                    if let (Some(sa), Some(sb)) = (a.decl_span, b.decl_span) {
+                        pairs.push((
+                            sa,
+                            sb,
+                            name.clone(),
+                            a.param_names.clone(),
+                            b.param_names.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        for (sa, sb, name, _ap, _bp) in pairs {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!("Conflicting overloads for `{name}`"),
+                    sa,
+                )
+                .with_code(codes::TYPE_CONFLICTING_OVERLOADS),
+            );
+            let _ = sb;
+        }
+    }
+
     /// Spec §11.2.2 basic super-form: walk the enclosing class's direct
     /// supertypes and emit T0093 when two or more contribute a member
     /// named `name`. The diagnostic encourages disambiguation via
@@ -8098,6 +8166,32 @@ mod tests {
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn conflicting_overloads_reports_t0094() {
+        // Spec §11.8: both functions accept the same fully-specified call
+        // shape (one parameter, identical erased type), so any call site
+        // would be ambiguous. Detect at declaration time.
+        let tc = check_src(
+            r#"
+            fun f(x: Int): Int = x
+            fun f(y: Int): Int = y
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::TYPE_CONFLICTING_OVERLOADS));
+    }
+
+    #[test]
+    fn distinct_overloads_no_conflict() {
+        let tc = check_src(
+            r#"
+            fun f(x: Int): Int = x
+            fun f(x: String): String = x
+            "#,
+        );
+        assert!(!codes(&tc).contains(&codes::TYPE_CONFLICTING_OVERLOADS),
+            "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
