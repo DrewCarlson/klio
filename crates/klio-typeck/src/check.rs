@@ -8488,6 +8488,23 @@ mod tests {
     }
 
     #[test]
+    fn smart_cast_after_unsafe_as() {
+        let tc = check_src(
+            "fun main() { val a: Any = \"hi\"; val s = a as String; println(a.length) }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_safe_as_does_not_narrow_subject() {
+        // `a as? String` yields String? but does NOT narrow a — a may still be the original Any.
+        let tc = check_src(
+            "fun main() { val a: Any = \"hi\"; val s = a as? String; val x: Any = a }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
     fn smart_cast_after_null_check() {
         let tc = check_src(
             "fun main() { val s: String? = null; if (s != null) { println(s.length) } }",
