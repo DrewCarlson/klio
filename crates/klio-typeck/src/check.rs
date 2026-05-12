@@ -374,6 +374,10 @@ pub mod codes {
     /// `reified`, or a generic exception type with non-star arguments.
     /// Spec §15.1: exception types in `catch` must be runtime-available.
     pub const TYPE_RUNTIME_UNAVAILABLE_CATCH_TYPE: &str = "T0105";
+    /// `throw e` where `e`'s static type is not a subtype of
+    /// `kotlin.Throwable`. Spec §16.2: only values of exception types may
+    /// be thrown.
+    pub const TYPE_THROW_NON_THROWABLE: &str = "T0106";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -4295,6 +4299,67 @@ impl<'r> Checker<'r> {
         }
     }
 
+    /// Predicate used at `throw e` sites: is `ty` (the static type of `e`)
+    /// known to descend from `kotlin.Throwable`? Spec §16.2 first bullet.
+    /// `Nothing` is vacuously throwable (the expression diverges anyway);
+    /// `Unresolved` is treated as throwable to avoid cascading reports
+    /// after an upstream error. `TypeParam` is accepted because its bound
+    /// may name a Throwable supertype and a stricter check would require
+    /// bound tracking we don't yet wire through `check_expr`.
+    fn type_is_throwable_subtype(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Nothing | Type::Unresolved | Type::TypeParam(_) => true,
+            Type::Nullable(_) => false,
+            Type::Generic { name, .. } => self.name_is_throwable_subtype(name),
+            Type::Intersection(parts) => {
+                parts.iter().any(|p| self.type_is_throwable_subtype(p))
+            }
+            _ => false,
+        }
+    }
+
+    fn name_is_throwable_subtype(&self, name: &str) -> bool {
+        const BUILTIN_THROWABLES: &[&str] = &[
+            "Throwable",
+            "Exception",
+            "RuntimeException",
+            "Error",
+            "IllegalArgumentException",
+            "IllegalStateException",
+            "IndexOutOfBoundsException",
+            "NullPointerException",
+            "ArithmeticException",
+            "ClassCastException",
+            "NoSuchElementException",
+            "UnsupportedOperationException",
+            "NumberFormatException",
+            "NoWhenBranchMatchedException",
+            "UninitializedPropertyAccessException",
+            "AssertionError",
+            "NotImplementedError",
+            "ConcurrentModificationException",
+        ];
+        if BUILTIN_THROWABLES.contains(&name) {
+            return true;
+        }
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = vec![name.to_string()];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            if BUILTIN_THROWABLES.contains(&n.as_str()) {
+                return true;
+            }
+            if let Some(info) = self.classes.get(&n) {
+                for s in &info.supertypes {
+                    stack.push(s.clone());
+                }
+            }
+        }
+        false
+    }
+
     fn is_throwable_subtype(&self, c: &Class) -> bool {
         const BUILTIN_THROWABLES: &[&str] = &[
             "Throwable",
@@ -5402,8 +5467,19 @@ impl<'r> Checker<'r> {
                 ty
             }
             Expr::Block(b) => self.check_block(b, expected),
-            Expr::Throw { value, .. } => {
-                self.check_expr(value, None);
+            Expr::Throw { value, span } => {
+                let vty = self.check_expr(value, None);
+                if !self.type_is_throwable_subtype(&vty) {
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "`throw` requires a value whose type is a subtype of `kotlin.Throwable`, but got `{vty}`."
+                            ),
+                            *span,
+                        )
+                        .with_code(codes::TYPE_THROW_NON_THROWABLE),
+                    );
+                }
                 Type::Nothing
             }
             Expr::Try { body, catches, finally, .. } => {

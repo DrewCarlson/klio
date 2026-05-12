@@ -548,6 +548,13 @@ fn neg_throwable_type_params() {
 }
 
 #[test]
+fn neg_throw_non_throwable() {
+    assert!(type_codes_for("neg_throw_non_throwable.kt")
+        .iter()
+        .any(|c| c == "T0106"));
+}
+
+#[test]
 fn neg_tailrec_on_open() {
     assert!(type_codes_for("neg_tailrec_on_open.kt")
         .iter()
