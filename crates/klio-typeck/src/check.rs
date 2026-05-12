@@ -297,6 +297,19 @@ pub mod codes {
     /// no args; `get` needs ≥1 arg; `set` needs ≥2 args; `compareTo`
     /// returns `Int`; `contains` returns `Boolean`; …). Spec ch.9.
     pub const TYPE_OPERATOR_SIGNATURE_MISMATCH: &str = "T0088";
+    /// A call uses a named argument whose name matches no parameter of any
+    /// candidate function in the overload set. Spec §11.2.6.
+    pub const TYPE_NAMED_PARAMETER_NOT_FOUND: &str = "T0089";
+    /// A call's overload set has no candidate whose arity and parameter
+    /// types accept the supplied arguments. Spec §11.3.
+    pub const TYPE_NONE_APPLICABLE: &str = "T0090";
+    /// Multiple overload candidates remain equally specific after applying
+    /// the MSC tiebreakers. Spec §11.4.
+    pub const TYPE_OVERLOAD_RESOLUTION_AMBIGUITY: &str = "T0091";
+    /// A call provides an explicit type-argument list (`f<T>(...)`) whose
+    /// length does not match the type-parameter count of any candidate in
+    /// the overload set. Spec §11.2.8.
+    pub const TYPE_TYPE_ARGUMENT_COUNT_MISMATCH: &str = "T0092";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -375,6 +388,9 @@ struct FnSig {
     /// True when the source declared the function with the `infix` modifier.
     /// Required to be `true` for the call to appear in `a name b` form.
     is_infix: bool,
+    /// Number of declaration-site type parameters. Used to filter the OCS
+    /// against an explicit call-site `<...>` list. Spec §11.2.8.
+    type_param_count: usize,
 }
 
 /// Description of a user-declared class.
@@ -2807,7 +2823,15 @@ impl<'r> Checker<'r> {
             .as_ref()
             .map(convert_type_ref_lossy)
             .unwrap_or(Type::Unit);
-        FnSig { params, has_default, param_names: names, is_vararg, return_ty, is_infix: f.is_infix }
+        FnSig {
+            params,
+            has_default,
+            param_names: names,
+            is_vararg,
+            return_ty,
+            is_infix: f.is_infix,
+            type_param_count: f.type_params.len(),
+        }
     }
 
     fn class_info(&self, c: &Class) -> ClassInfo {
@@ -2851,6 +2875,7 @@ impl<'r> Checker<'r> {
             is_vararg: c.primary_params.iter().map(|_| false).collect(),
             return_ty: Type::Unresolved,
             is_infix: false,
+            type_param_count: c.type_params.len(),
         };
         if !c.primary_params.is_empty() || !c.is_interface {
             info.ctor = Some(ctor_sig);
@@ -4649,7 +4674,7 @@ impl<'r> Checker<'r> {
                     *span,
                 )
             }
-            Expr::Call { callee, args, arg_names, span, is_infix, .. } => {
+            Expr::Call { callee, args, arg_names, type_args, span, is_infix, .. } => {
                 if let Expr::Path { segments, .. } = callee.as_ref() {
                     if segments.len() == 1 {
                         let name = &segments[0].name;
@@ -4669,7 +4694,7 @@ impl<'r> Checker<'r> {
                 if let Some(l) = &implicit_label {
                     self.label_stack.push(l.clone());
                 }
-                let result = self.check_call(callee, args, arg_names, *span);
+                let result = self.check_call(callee, args, arg_names, type_args, *span);
                 if implicit_label.is_some() {
                     self.label_stack.pop();
                 }
@@ -5743,7 +5768,8 @@ impl<'r> Checker<'r> {
         &mut self,
         callee: &Expr,
         args: &[Expr],
-        _arg_names: &[Option<String>],
+        arg_names: &[Option<String>],
+        type_args: &[TypeRef],
         call_span: Span,
     ) -> Type {
         // Direct named-callable case: `foo(args)` where `foo` is a known
@@ -5764,7 +5790,13 @@ impl<'r> Checker<'r> {
                             self.check_published_api_use(name, *v, &anns, *callee_span);
                         }
                     }
-                    return self.check_overloaded_call(&sigs, args, callee.span());
+                    return self.check_overloaded_call(
+                        &sigs,
+                        args,
+                        arg_names,
+                        type_args,
+                        callee.span(),
+                    );
                 }
                 if name == "listOf" || name == "mutableListOf" {
                     let mut acc: Option<Type> = None;
@@ -5877,6 +5909,8 @@ impl<'r> Checker<'r> {
                         let _ = self.check_overloaded_call(
                             std::slice::from_ref(&sig),
                             args,
+                            arg_names,
+                            type_args,
                             call_span,
                         );
                     } else {
@@ -5921,11 +5955,67 @@ impl<'r> Checker<'r> {
         &mut self,
         sigs: &[FnSig],
         args: &[Expr],
+        arg_names: &[Option<String>],
+        type_args: &[TypeRef],
         call_span: Span,
     ) -> Type {
-        if sigs.len() == 1 {
-            self.check_arity_and_args(&sigs[0], args, call_span);
-            return sigs[0].return_ty.clone();
+        // Spec §11.2.6 / §11.2.8: filter the candidate set before any MSC
+        // procedure runs. Named-arg names must each map to some parameter
+        // of every surviving candidate; explicit `<...>` must match exactly
+        // the candidate's declaration-site type-parameter count.
+        let named_names: Vec<&str> = arg_names
+            .iter()
+            .filter_map(|n| n.as_deref())
+            .collect();
+        let has_type_args = !type_args.is_empty();
+        let mut filtered: Vec<&FnSig> = sigs
+            .iter()
+            .filter(|s| {
+                if has_type_args && s.type_param_count != type_args.len() {
+                    return false;
+                }
+                named_names
+                    .iter()
+                    .all(|n| s.param_names.iter().any(|p| p == *n))
+            })
+            .collect();
+        if filtered.is_empty() && !sigs.is_empty() {
+            // Emit T0089 / T0092 against the first named arg / call span,
+            // then fall back to the unfiltered set so downstream diagnostics
+            // (arity, assignability) still surface usefully.
+            if has_type_args
+                && !sigs.iter().any(|s| s.type_param_count == type_args.len())
+            {
+                self.diagnostics.emit(
+                    Diagnostic::error(
+                        format!(
+                            "No candidate function accepts {} type argument(s)",
+                            type_args.len()
+                        ),
+                        call_span,
+                    )
+                    .with_code(codes::TYPE_TYPE_ARGUMENT_COUNT_MISMATCH),
+                );
+            }
+            for (i, n) in arg_names.iter().enumerate() {
+                if let Some(name) = n {
+                    if !sigs.iter().any(|s| s.param_names.iter().any(|p| p == name)) {
+                        let sp = args.get(i).map(|a| a.span()).unwrap_or(call_span);
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                format!("No parameter named `{name}` on any candidate"),
+                                sp,
+                            )
+                            .with_code(codes::TYPE_NAMED_PARAMETER_NOT_FOUND),
+                        );
+                    }
+                }
+            }
+            filtered = sigs.iter().collect();
+        }
+        if filtered.len() == 1 {
+            self.check_arity_and_args(filtered[0], args, call_span);
+            return filtered[0].return_ty.clone();
         }
         // Pre-type each argument once; selection consults these types,
         // and assignability checks against the chosen signature reuse them
@@ -5934,21 +6024,21 @@ impl<'r> Checker<'r> {
         let mut chosen: Option<&FnSig> = None;
         let mut arity_match: Option<&FnSig> = None;
         let mut fitting: Vec<&FnSig> = Vec::new();
-        for s in sigs {
+        for s in &filtered {
             let min = s.has_default.iter().filter(|h| !**h).count();
             let max = s.params.len();
             if args.len() < min || args.len() > max {
                 continue;
             }
             if arity_match.is_none() {
-                arity_match = Some(s);
+                arity_match = Some(*s);
             }
             let fits = arg_tys
                 .iter()
                 .zip(s.params.iter())
                 .all(|(a, p)| a.is_subtype_of(p));
             if fits {
-                fitting.push(s);
+                fitting.push(*s);
             }
         }
         if !fitting.is_empty() {
@@ -5964,7 +6054,7 @@ impl<'r> Checker<'r> {
                 .unwrap();
             chosen = Some(best);
         }
-        let sig = chosen.or(arity_match).unwrap_or(&sigs[0]).clone();
+        let sig = chosen.or(arity_match).unwrap_or(filtered[0]).clone();
         let min = sig.has_default.iter().filter(|h| !**h).count();
         let max = sig.params.len();
         if args.len() < min || args.len() > max {
@@ -7672,6 +7762,60 @@ mod tests {
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn named_arg_picks_matching_overload() {
+        // Spec §11.2.6: a named argument filters the OCS to candidates that
+        // declare the name. Without filtering, the first-fit picker would
+        // pick `f(x: Int)` since the literal `1` fits — but `name = "hi"`
+        // matches only the second overload.
+        let tc = check_src(
+            r#"
+            fun f(x: Int): Int = x
+            fun f(name: String): String = name
+            fun main() {
+                val s: String = f(name = "hi")
+            }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn named_arg_unknown_param_reports_t0089() {
+        let tc = check_src(
+            r#"
+            fun f(x: Int): Int = x
+            fun f(y: Int): Int = y
+            fun main() { val _r = f(z = 1) }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::TYPE_NAMED_PARAMETER_NOT_FOUND));
+    }
+
+    #[test]
+    fn type_arg_count_filters_overloads() {
+        // Spec §11.2.8: `f<Int>(...)` filters OCS by exact tp-count.
+        let tc = check_src(
+            r#"
+            fun <T> f(x: T): T = x
+            fun <T, U> f(x: T, y: U): T = x
+            fun main() { val r: Int = f<Int>(1) }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn type_arg_count_mismatch_reports_t0092() {
+        let tc = check_src(
+            r#"
+            fun f(x: Int): Int = x
+            fun main() { val _r = f<Int>(1) }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::TYPE_TYPE_ARGUMENT_COUNT_MISMATCH));
     }
 
     #[test]
