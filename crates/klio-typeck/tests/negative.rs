@@ -506,6 +506,13 @@ fn neg_tailrec_no_calls() {
 }
 
 #[test]
+fn neg_throwable_type_params() {
+    assert!(type_codes_for("neg_throwable_type_params.kt")
+        .iter()
+        .any(|c| c == "T0051"));
+}
+
+#[test]
 fn neg_published_api_missing() {
     assert!(type_codes_for("neg_published_api_missing.kt")
         .iter()

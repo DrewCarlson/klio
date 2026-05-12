@@ -182,6 +182,12 @@ pub mod codes {
     /// so the modifier has no effect. Matches kotlinc-native's
     /// `NO_TAIL_CALLS_FOUND`.
     pub const TYPE_NO_TAIL_CALLS_FOUND: &str = "T0049";
+    /// A class declared as an enum overrides one of the `final` members of
+    /// `kotlin.Enum<T>` (`equals`, `hashCode`, or `compareTo`). Spec §3.9.
+    pub const TYPE_ENUM_FORBIDS_FINAL_OVERRIDE: &str = "T0050";
+    /// A subtype of `kotlin.Throwable` declares type parameters. Spec §3.12
+    /// makes this a compile-time error.
+    pub const TYPE_THROWABLE_TYPE_PARAMS: &str = "T0051";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -2084,6 +2090,22 @@ impl<'r> Checker<'r> {
 
     fn check_class(&mut self, c: &Class) {
         self.class_stack.push(c.name.name.clone());
+        // Spec §3.12: subtypes of `kotlin.Throwable` cannot have type
+        // parameters. Walk the transitive supertype chain looking for any
+        // built-in or user-declared Throwable ancestor.
+        if !c.type_params.is_empty() && self.is_throwable_subtype(c) {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "Subclasses of `kotlin.Throwable` cannot declare type parameters; \
+                         `{}` does (spec §3.12)",
+                        c.name.name
+                    ),
+                    c.name.span,
+                )
+                .with_code(codes::TYPE_THROWABLE_TYPE_PARAMS),
+            );
+        }
         // Soft override diagnostics — walk parents and interfaces, gather
         // their (name, MemberFlags) table, and compare against this class's
         // members. Diagnostics here are not fatal; they surface intent
@@ -2370,6 +2392,43 @@ impl<'r> Checker<'r> {
     /// good enough for diagnostic purposes — the override-correctness
     /// check only cares whether *some* supertype declared an open/abstract
     /// member with that name.
+    fn is_throwable_subtype(&self, c: &Class) -> bool {
+        const BUILTIN_THROWABLES: &[&str] = &[
+            "Throwable",
+            "Exception",
+            "RuntimeException",
+            "Error",
+            "IllegalArgumentException",
+            "IllegalStateException",
+            "IndexOutOfBoundsException",
+            "NullPointerException",
+            "ArithmeticException",
+            "ClassCastException",
+            "NoSuchElementException",
+            "UnsupportedOperationException",
+            "NumberFormatException",
+            "NoWhenBranchMatchedException",
+            "UninitializedPropertyAccessException",
+        ];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> =
+            c.supertypes.iter().map(|s| s.name.name.clone()).collect();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if BUILTIN_THROWABLES.contains(&name.as_str()) {
+                return true;
+            }
+            if let Some(info) = self.classes.get(&name) {
+                for s in &info.supertypes {
+                    stack.push(s.clone());
+                }
+            }
+        }
+        false
+    }
+
     fn collect_inherited_member_flags(
         &self,
         c: &Class,
