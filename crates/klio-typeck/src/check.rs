@@ -322,6 +322,21 @@ pub mod codes {
     /// call-site MSC procedure picks neither as more specific, the
     /// declaration pair is a compile-time conflict.
     pub const TYPE_CONFLICTING_OVERLOADS: &str = "T0094";
+    /// Code emitted at a statement that the control-flow analysis has
+    /// proven is dead — preceded by a `Nothing`-typed expression such as
+    /// `return`, `throw`, `break`, `continue`, or a call to a function
+    /// whose return type is `Nothing`. Spec §12.1.5.
+    pub const WARN_UNREACHABLE_CODE: &str = "W0002";
+    /// Code emitted at a comparison whose result is statically known
+    /// from the flow-sensitive type of one side (e.g. `x == null` where
+    /// `x` is proven non-null). Spec §12.
+    pub const WARN_SENSELESS_COMPARISON: &str = "W0003";
+    /// Code emitted at an `as T` whose subject is already proven to be
+    /// of type `T` along this path. Spec §12.
+    pub const WARN_USELESS_CAST: &str = "W0004";
+    /// Code emitted at an elvis (`?:`) whose left side is proven
+    /// non-null on this path. Spec §12.
+    pub const WARN_USELESS_ELVIS: &str = "W0005";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -4415,9 +4430,24 @@ impl<'r> Checker<'r> {
     fn check_block(&mut self, block: &Block, expected: Option<&Type>) -> Type {
         self.push_frame();
         let mut last = Type::Unit;
+        let mut diverged = false;
+        let mut warned = false;
         for (i, s) in block.stmts.iter().enumerate() {
             let is_last = i + 1 == block.stmts.len();
+            if diverged && !warned {
+                self.diagnostics.emit(
+                    Diagnostic::warning("Unreachable code".to_string(), stmt_span(s))
+                        .with_code(codes::WARN_UNREACHABLE_CODE)
+                        .with_factory(
+                            &klio_diagnostics::generated::factories::UNREACHABLE_CODE,
+                        ),
+                );
+                warned = true;
+            }
             last = self.check_stmt(s, if is_last { expected } else { None });
+            if !diverged && matches!(last, Type::Nothing) && !is_last {
+                diverged = true;
+            }
         }
         self.pop_frame();
         last
@@ -5139,7 +5169,21 @@ impl<'r> Checker<'r> {
                 Type::Boolean
             }
             Expr::As { expr, ty, safe, span } => {
-                self.check_expr(expr, None);
+                let subj_ty = self.check_expr(expr, None);
+                let target_ty = convert_type_ref_lossy(ty);
+                if !matches!(subj_ty, Type::Unresolved)
+                    && !matches!(target_ty, Type::Unresolved)
+                    && subj_ty.is_subtype_of(&target_ty)
+                {
+                    self.diagnostics.emit(
+                        Diagnostic::warning(
+                            format!("No cast needed: `{}` is already `{}`", subj_ty, target_ty),
+                            *span,
+                        )
+                        .with_code(codes::WARN_USELESS_CAST)
+                        .with_factory(&klio_diagnostics::generated::factories::USELESS_CAST),
+                    );
+                }
                 if ty.type_args.iter().any(|a| !a.is_star) {
                     self.diagnostics.emit(
                         Diagnostic::warning(
@@ -6427,6 +6471,30 @@ impl<'r> Checker<'r> {
         // types unrelated by subtyping is a compile-time error. Skip when
         // either side is `null` (the spec routes the null arm separately) or
         // when either side typed to `Unresolved` (we have no information).
+        if matches!(op, BinOp::Eq | BinOp::Neq | BinOp::IdentEq | BinOp::IdentNeq) {
+            let null_other = if matches!(lhs, Expr::NullLit { .. }) {
+                Some(&r)
+            } else if matches!(rhs, Expr::NullLit { .. }) {
+                Some(&l)
+            } else {
+                None
+            };
+            if let Some(other) = null_other {
+                if !matches!(other, Type::Nullable(_) | Type::Unresolved | Type::Nothing) {
+                    let result = matches!(op, BinOp::Neq | BinOp::IdentNeq);
+                    self.diagnostics.emit(
+                        Diagnostic::warning(
+                            format!("Condition is always '{result}'"),
+                            span,
+                        )
+                        .with_code(codes::WARN_SENSELESS_COMPARISON)
+                        .with_factory(
+                            &klio_diagnostics::generated::factories::SENSELESS_COMPARISON,
+                        ),
+                    );
+                }
+            }
+        }
         if matches!(op, BinOp::Eq | BinOp::Neq | BinOp::IdentEq | BinOp::IdentNeq)
             && !matches!(lhs, Expr::NullLit { .. })
             && !matches!(rhs, Expr::NullLit { .. })
@@ -6475,6 +6543,16 @@ impl<'r> Checker<'r> {
             BinOp::And | BinOp::Or => Type::Boolean,
             BinOp::Range | BinOp::RangeUntil => Type::Range(Box::new(numeric_lub(&l, &r))),
             BinOp::Elvis => {
+                if !matches!(l, Type::Nullable(_) | Type::Unresolved | Type::Nothing) {
+                    self.diagnostics.emit(
+                        Diagnostic::warning(
+                            "Elvis operator (?:) always returns the left operand of non-nullable type".to_string(),
+                            span,
+                        )
+                        .with_code(codes::WARN_USELESS_ELVIS)
+                        .with_factory(&klio_diagnostics::generated::factories::USELESS_ELVIS),
+                    );
+                }
                 let lhs_non_null = match l {
                     Type::Nullable(inner) => *inner,
                     other => other,
@@ -7027,6 +7105,20 @@ struct CondNarrow {
 /// (`Any` / `Comparable` etc.) — we can't see those bases at type-check
 /// time, so an `override` on a member of one of these names with no user
 /// supertype-member match isn't necessarily wrong.
+fn stmt_span(s: &Stmt) -> Span {
+    match s {
+        Stmt::Expr(e) => e.span(),
+        Stmt::Decl(d) => match d {
+            Decl::Function(f) => f.name.span,
+            Decl::Property(p) => p.name.span,
+            Decl::Class(c) => c.name.span,
+            Decl::Object(o) => o.name.span,
+            Decl::TypeAlias(t) => t.name.span,
+        },
+        Stmt::Assign { span, .. } | Stmt::DestructuringDecl { span, .. } => *span,
+    }
+}
+
 fn is_builtin_overridable(name: &str) -> bool {
     matches!(
         name,
@@ -8539,6 +8631,116 @@ mod tests {
                 }
                 return 0
             }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn unreachable_after_return() {
+        let tc = check_src(
+            r#"
+            fun main() {
+                return
+                println("dead")
+            }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::WARN_UNREACHABLE_CODE));
+    }
+
+    #[test]
+    fn unreachable_after_throw() {
+        let tc = check_src(
+            r#"
+            fun main() {
+                throw RuntimeException("x")
+                println("dead")
+            }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::WARN_UNREACHABLE_CODE));
+    }
+
+    #[test]
+    fn senseless_comparison_nonnull_eq_null() {
+        let tc = check_src(
+            r#"
+            fun main() {
+                val x: Int = 5
+                if (x == null) { println("nope") }
+            }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::WARN_SENSELESS_COMPARISON));
+    }
+
+    #[test]
+    fn useless_cast_same_type() {
+        let tc = check_src(
+            r#"
+            fun main() {
+                val x: Int = 5
+                val y = x as Int
+                println(y)
+            }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::WARN_USELESS_CAST));
+    }
+
+    #[test]
+    fn useless_elvis_nonnull_lhs() {
+        let tc = check_src(
+            r#"
+            fun main() {
+                val x: Int = 5
+                val y = x ?: 0
+                println(y)
+            }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::WARN_USELESS_ELVIS));
+    }
+
+    #[test]
+    fn contract_run_initializes_val() {
+        let tc = check_src(
+            r#"
+            fun main() {
+                val x: Int
+                run { x = 4 }
+                println(x)
+            }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn contract_check_introduces_smartcast() {
+        let tc = check_src(
+            r#"
+            fun main() {
+                val x: Any = 42
+                check(x is Int)
+                val y: Int = x + 1
+                println(y)
+            }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn contract_require_nonnull() {
+        let tc = check_src(
+            r#"
+            fun f(s: String?): Int {
+                require(s != null)
+                return s.length
+            }
+            fun main() { println(f("hi")) }
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
