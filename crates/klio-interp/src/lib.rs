@@ -6239,16 +6239,27 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<Option<i64>, RuntimeError> {
         let class = Rc::clone(&a.borrow().class);
-        let Some((m, _o)) = class.find_method("compareTo") else {
-            return Ok(None);
-        };
-        let v = self.call_method(a, &m, std::slice::from_ref(b), &[], out)?;
-        match v.as_i64() {
-            Some(n) => Ok(Some(n)),
-            None => Err(RuntimeError::Type(format!(
-                "compareTo must return Int, got {v:?}"
-            ))),
+        if let Some((m, _o)) = class.find_method("compareTo") {
+            let v = self.call_method(a, &m, std::slice::from_ref(b), &[], out)?;
+            return match v.as_i64() {
+                Some(n) => Ok(Some(n)),
+                None => Err(RuntimeError::Type(format!(
+                    "compareTo must return Int, got {v:?}"
+                ))),
+            };
         }
+        // Spec ch.9: extension `operator fun T.compareTo(other)` is also a
+        // valid binding for `<` / `<=` / `>` / `>=` dispatch.
+        let recv = Value::Instance(Rc::clone(a));
+        if let Some(v) = self.try_extension_call_with_values(&recv, "compareTo", &[b.clone()], out)? {
+            return match v.as_i64() {
+                Some(n) => Ok(Some(n)),
+                None => Err(RuntimeError::Type(format!(
+                    "compareTo must return Int, got {v:?}"
+                ))),
+            };
+        }
+        Ok(None)
     }
 
     /// `copy(name = value, …)` for data classes: clone the existing primary
@@ -9833,6 +9844,21 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["Day(1..5)"]);
+    }
+
+    #[test]
+    fn operator_compareto_extension() {
+        let src = r#"
+            class Card(val rank: Int)
+            operator fun Card.compareTo(other: Card): Int = rank - other.rank
+            fun main() {
+                println(Card(2) < Card(7))
+                println(Card(9) > Card(7))
+                println(Card(5) <= Card(5))
+                println(Card(5) >= Card(5))
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["true", "true", "true", "true"]);
     }
 
     #[test]
