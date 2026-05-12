@@ -7410,13 +7410,22 @@ impl<'r> Checker<'r> {
                 if let Some(key) = dot_path_key(expr) {
                     let target = convert_type_ref_lossy(ty);
                     let target_class = class_name_from_typeref(ty);
+                    // `positive ^ negated`:
+                    //   true  — `x is T` in true-arm: x is T in the true side.
+                    //   false — `x !is T` in true-arm: x is T in the false side
+                    //           (the else of a `!is` check). Spec's negation-
+                    //           type second component collapses here into the
+                    //           dual narrowing.
                     if positive ^ *negated {
                         out.true_branch.insert(key.clone(), target);
                         if let Some(cn) = target_class {
                             out.true_class.insert(key, cn);
                         }
                     } else {
-                        // No good non-narrow.
+                        out.false_branch.insert(key.clone(), target);
+                        if let Some(cn) = target_class {
+                            out.false_class.insert(key, cn);
+                        }
                     }
                 }
             }
@@ -8693,6 +8702,22 @@ mod tests {
     fn smart_cast_after_do_while() {
         let tc = check_src(
             "fun f(a: String?): Int { do { if (a == null) return -1 } while (false); return a.length }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_after_not_is_return() {
+        let tc = check_src(
+            "fun f(x: Any): Int { if (x !is String) return -1; return x.length }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_not_is_else_branch() {
+        let tc = check_src(
+            "fun f(x: Any): Int = if (x !is String) -1 else x.length",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
