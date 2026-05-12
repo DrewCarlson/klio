@@ -7223,6 +7223,63 @@ impl<'r> Checker<'r> {
 
     fn collect_narrowings(&self, cond: &Expr, positive: bool, out: &mut CondNarrow) {
         match cond {
+            // Spec §14.1 transfer fns for cross-variable reference equality.
+            // Restricted to `===` / `!==` so we stay within the "equals known
+            // to be reference equality" carve-out the spec calls out.
+            Expr::Binary { op: BinOp::IdentEq, lhs, rhs, .. }
+                if !matches!(**lhs, Expr::NullLit { .. })
+                    && !matches!(**rhs, Expr::NullLit { .. }) =>
+            {
+                if let (Some(ln), Some(rn)) = (single_path_name(lhs), single_path_name(rhs)) {
+                    let lt = self.lookup_narrowed(&ln)
+                        .or_else(|| self.lookup(&ln).map(|b| b.ty.clone()))
+                        .unwrap_or(Type::Unresolved);
+                    let rt = self.lookup_narrowed(&rn)
+                        .or_else(|| self.lookup(&rn).map(|b| b.ty.clone()))
+                        .unwrap_or(Type::Unresolved);
+                    let meet = if lt.is_subtype_of(&rt) {
+                        lt
+                    } else if rt.is_subtype_of(&lt) {
+                        rt
+                    } else {
+                        return;
+                    };
+                    if positive {
+                        out.true_branch.insert(ln, meet.clone());
+                        out.true_branch.insert(rn, meet);
+                    } else {
+                        out.false_branch.insert(ln, meet.clone());
+                        out.false_branch.insert(rn, meet);
+                    }
+                }
+            }
+            Expr::Binary { op: BinOp::IdentNeq, lhs, rhs, .. }
+                if !matches!(**lhs, Expr::NullLit { .. })
+                    && !matches!(**rhs, Expr::NullLit { .. }) =>
+            {
+                if let (Some(ln), Some(rn)) = (single_path_name(lhs), single_path_name(rhs)) {
+                    let lt = self.lookup_narrowed(&ln)
+                        .or_else(|| self.lookup(&ln).map(|b| b.ty.clone()))
+                        .unwrap_or(Type::Unresolved);
+                    let rt = self.lookup_narrowed(&rn)
+                        .or_else(|| self.lookup(&rn).map(|b| b.ty.clone()))
+                        .unwrap_or(Type::Unresolved);
+                    let meet = if lt.is_subtype_of(&rt) {
+                        lt
+                    } else if rt.is_subtype_of(&lt) {
+                        rt
+                    } else {
+                        return;
+                    };
+                    if positive {
+                        out.false_branch.insert(ln, meet.clone());
+                        out.false_branch.insert(rn, meet);
+                    } else {
+                        out.true_branch.insert(ln, meet.clone());
+                        out.true_branch.insert(rn, meet);
+                    }
+                }
+            }
             // `x != null` / `x == null`
             Expr::Binary { op: BinOp::Neq, lhs, rhs, .. }
             | Expr::Binary { op: BinOp::IdentNeq, lhs, rhs, .. } => {
@@ -8536,6 +8593,24 @@ mod tests {
         // `a as? String` yields String? but does NOT narrow a — a may still be the original Any.
         let tc = check_src(
             "fun main() { val a: Any = \"hi\"; val s = a as? String; val x: Any = a }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_cross_variable_ref_eq() {
+        let tc = check_src(
+            "fun main() { val a: Any? = \"hi\"; val b: String = \"bye\"; if (a === b) { val x: String = a; } }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_cross_variable_ref_neq_in_else() {
+        // `a !== b` is true on the then-branch → no narrowing there. On the
+        // else, a and b must alias → narrow a to the narrower of the two.
+        let tc = check_src(
+            "fun main() { val a: Any? = \"x\"; val b: String = \"y\"; if (a !== b) {} else { val s: String = a } }",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
