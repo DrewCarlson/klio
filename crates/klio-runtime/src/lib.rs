@@ -545,6 +545,13 @@ fn collect_companions_walk(
     for iface in cls.interfaces.borrow().iter() {
         collect_companions_walk(iface, out, seen);
     }
+    // Spec §6.1: a companion-object decl scope is ULD to the companion
+    // decl scope of the parent of its parent classifier. Walk the
+    // enclosing class chain so members of a companion can read names
+    // from the enclosing class's companion.
+    if let Some(encl) = cls.enclosing_class.borrow().clone() {
+        collect_companions_walk(&encl, out, seen);
+    }
 }
 
 fn find_method_walk(

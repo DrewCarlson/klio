@@ -4237,6 +4237,16 @@ impl Interpreter {
         let mut nested_built: Vec<(String, Rc<ClassDef>)> = Vec::with_capacity(nested.len());
         for (n, inner) in &nested {
             let nested_class = self.build_class_shell(inner, env, out)?;
+            // Back-link the nested class to its enclosing class so bare-name
+            // reads inside the nested class (or its companion) can reach
+            // the enclosing class's companion. Spec §6.1: companion decl
+            // scope is ULD to the companion decl scope of the parent of
+            // its parent classifier.
+            *nested_class.enclosing_class.borrow_mut() = Some(Rc::clone(&outer_class));
+            if let Some(comp) = &nested_class.companion {
+                *comp.borrow().class.enclosing_class.borrow_mut() =
+                    Some(Rc::clone(&nested_class));
+            }
             nested_built.push((n.clone(), nested_class));
         }
         // Resolve parent links for nested classes — supertype names live in
