@@ -11,6 +11,8 @@ use std::fmt;
 use klio_ast::TypeRef;
 use thiserror::Error;
 
+pub mod constraints;
+
 /// Variance marker on a generic instantiation argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Variance {
@@ -73,6 +75,13 @@ pub enum Type {
         name: String,
         args: Vec<GenericArg>,
     },
+    /// Intersection of two or more types: `A & B`. Per spec §13 the
+    /// greatest lower bound of two types is their intersection. Smart-cast
+    /// composition (`if (x is A && x is B)`) materializes one. Subtyping:
+    /// `T <: A & B` iff `T <: A ∧ T <: B`; `A & B <: T` iff some component
+    /// is a subtype of `T`. Intersections are kept normalized (flattened,
+    /// no `Any`/`Unresolved`/duplicate components) by `Type::intersect`.
+    Intersection(Vec<Type>),
     /// A type the resolver could not name. Treated as compatible with
     /// everything for the purposes of error recovery so unrelated errors do
     /// not cascade.
@@ -127,6 +136,15 @@ impl fmt::Display for Type {
                 }
                 f.write_str(">")
             }
+            Self::Intersection(parts) => {
+                for (i, p) in parts.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(" & ")?;
+                    }
+                    write!(f, "{p}")?;
+                }
+                Ok(())
+            }
             Self::Unresolved => f.write_str("<unresolved>"),
         }
     }
@@ -158,6 +176,38 @@ impl Type {
         }
     }
 
+    /// Intersection constructor with spec-driven normalization (§13.2.3).
+    /// Flattens nested intersections, drops `Any` / `Unresolved` (they are
+    /// no-ops in a greatest-lower-bound), and removes any component whose
+    /// supertype is already present. A single-component result collapses
+    /// to that component; an empty intersection collapses to `Any` (the
+    /// degenerate identity element).
+    #[must_use]
+    pub fn intersect(parts: Vec<Type>) -> Type {
+        let mut flat: Vec<Type> = Vec::with_capacity(parts.len());
+        for p in parts {
+            match p {
+                Type::Intersection(inner) => flat.extend(inner),
+                Type::Any | Type::Unresolved => {}
+                other => flat.push(other),
+            }
+        }
+        // Drop duplicates and supertypes-of-members.
+        let mut keep: Vec<Type> = Vec::with_capacity(flat.len());
+        for t in flat {
+            if keep.iter().any(|k| k.is_subtype_of(&t)) {
+                continue;
+            }
+            keep.retain(|k| !t.is_subtype_of(k));
+            keep.push(t);
+        }
+        match keep.len() {
+            0 => Type::Any,
+            1 => keep.into_iter().next().unwrap(),
+            _ => Type::Intersection(keep),
+        }
+    }
+
     /// Subtyping check covering the rules used by Milestone 4:
     ///
     /// * `Nothing <: T` for every `T`.
@@ -178,6 +228,14 @@ impl Type {
         }
         if matches!(self, Self::Nothing) {
             return true;
+        }
+        // Intersection on the right: must be a subtype of every component.
+        if let Self::Intersection(parts) = other {
+            return parts.iter().all(|p| self.is_subtype_of(p));
+        }
+        // Intersection on the left: any component being a subtype suffices.
+        if let Self::Intersection(parts) = self {
+            return parts.iter().any(|p| p.is_subtype_of(other));
         }
         match (self, other) {
             (_, Self::Nullable(inner)) => self.non_null().is_subtype_of(inner),
@@ -483,6 +541,49 @@ mod tests {
             convert_type_ref_lossy(&type_ref("Int", true)),
             Type::Nullable(Box::new(Type::Int))
         );
+    }
+
+    #[test]
+    fn intersect_drops_any_and_unresolved() {
+        assert_eq!(
+            Type::intersect(vec![Type::Int, Type::Any, Type::Unresolved]),
+            Type::Int
+        );
+    }
+
+    #[test]
+    fn intersect_flattens_nested() {
+        let inner = Type::intersect(vec![Type::Int, Type::String]);
+        let outer = Type::intersect(vec![inner, Type::Boolean]);
+        match outer {
+            Type::Intersection(parts) => assert_eq!(parts.len(), 3),
+            other => panic!("expected intersection, got {other}"),
+        }
+    }
+
+    #[test]
+    fn intersect_drops_supertype_components() {
+        let r = Type::intersect(vec![Type::Int, Type::Any]);
+        assert_eq!(r, Type::Int);
+    }
+
+    #[test]
+    fn intersect_subtype_must_satisfy_every_part() {
+        let i = Type::intersect(vec![Type::Int, Type::Nullable(Box::new(Type::Int))]);
+        // Int <: Int & Int? (both parts satisfied)
+        assert!(Type::Int.is_subtype_of(&i));
+    }
+
+    #[test]
+    fn intersect_left_any_part_suffices_for_supertype() {
+        let i = Type::Intersection(vec![Type::Int, Type::String]);
+        assert!(i.is_subtype_of(&Type::Any));
+    }
+
+    #[test]
+    fn intersect_display() {
+        let i = Type::Intersection(vec![Type::Int, Type::String]);
+        assert_eq!(i.to_string(), "Int & String");
     }
 
     #[test]
