@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use klio_ast::{
     Accessor, AssignOp, BinOp, Block, Class, CtorDelegation, Decl, EnumEntry, Expr,
-    Function, FunctionBody, KotlinFile, ObjectDecl, PostfixOp, Property,
+    Function, FunctionBody, KotlinFile, ObjectDecl, Param, PostfixOp, Property,
     SecondaryCtor, Stmt, StringPart, TypeRef, UnOp, Visibility, WhenBranch, WhenPatternKind,
 };
 use klio_diagnostics::{Diagnostic, DiagnosticSink};
@@ -215,6 +215,14 @@ pub mod codes {
     /// `field`) declares an initializer. Spec §4.3.4: properties without
     /// backing fields are not allowed to have initializer expressions.
     pub const TYPE_PROPERTY_NO_BACKING_FIELD_HAS_INITIALIZER: &str = "T0054";
+    /// An `inline` parameter (lambda) is used in a way that lets it escape
+    /// the function: stored in a variable, returned, or passed to a
+    /// non-inline callee. Spec §4.2.5.
+    pub const TYPE_INLINE_PARAM_LEAK: &str = "T0055";
+    /// A `crossinline` parameter is stored in a variable or returned.
+    /// Capturing into other lambdas is allowed; this catches the disallowed
+    /// store/return forms. Spec §4.2.5.
+    pub const TYPE_CROSSINLINE_PARAM_LEAK: &str = "T0056";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -1111,6 +1119,166 @@ impl<'a> Checker<'a> {
                 }
             }
             (Some(a), Some(b)) => accessor_uses_field(a) || accessor_uses_field(b),
+        }
+    }
+
+    /// Spec §4.2.5: inline-param escape detection. Walk the body and at
+    /// every bare-name use of an inline / crossinline parameter outside a
+    /// `Call.callee` slot, emit T0055/T0056. Conservative: a Path read in
+    /// a non-call context counts as an escape. Re-passing the parameter as
+    /// a call argument also counts (we cannot tell whether the callee is
+    /// itself inline).
+    fn check_inline_param_escape(&mut self, f: &Function) {
+        if !f.is_inline {
+            return;
+        }
+        // Only function-typed parameters are inlined (or crossinline /
+        // noinline). Plain values (`x: Int`) on an inline fun are not
+        // affected by §4.2.5.
+        let is_fn_typed = |p: &Param| p.ty.function.is_some();
+        let inline_params: Vec<String> = f
+            .params
+            .iter()
+            .filter(|p| !p.is_noinline && !p.is_crossinline && is_fn_typed(p))
+            .map(|p| p.name.name.clone())
+            .collect();
+        let crossinline_params: Vec<String> = f
+            .params
+            .iter()
+            .filter(|p| p.is_crossinline && is_fn_typed(p))
+            .map(|p| p.name.name.clone())
+            .collect();
+        if inline_params.is_empty() && crossinline_params.is_empty() {
+            return;
+        }
+        if let Some(body) = &f.body {
+            match body {
+                FunctionBody::Block(b) => {
+                    self.walk_block_for_inline_escape(b, &inline_params, &crossinline_params)
+                }
+                FunctionBody::Expr(e) => {
+                    self.walk_expr_for_inline_escape(e, &inline_params, &crossinline_params, true)
+                }
+            }
+        }
+    }
+
+    fn walk_block_for_inline_escape(
+        &mut self,
+        b: &Block,
+        inline_params: &[String],
+        crossinline_params: &[String],
+    ) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Expr(e) => self.walk_expr_for_inline_escape(e, inline_params, crossinline_params, false),
+                Stmt::Assign { value, .. } => {
+                    self.flag_inline_escape(value, inline_params, crossinline_params, "stored in a variable");
+                    self.walk_expr_for_inline_escape(value, inline_params, crossinline_params, false);
+                }
+                Stmt::Decl(Decl::Property(p)) => {
+                    if let Some(init) = &p.init {
+                        self.flag_inline_escape(init, inline_params, crossinline_params, "stored in a variable");
+                        self.walk_expr_for_inline_escape(init, inline_params, crossinline_params, false);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn walk_expr_for_inline_escape(
+        &mut self,
+        e: &Expr,
+        inline_params: &[String],
+        crossinline_params: &[String],
+        is_callee: bool,
+    ) {
+        match e {
+            Expr::Path { segments, span } if segments.len() == 1 && !is_callee => {
+                let n = &segments[0].name;
+                if inline_params.iter().any(|p| p == n) {
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "inline parameter `{n}` cannot escape the function body — only \
+                                 direct invocation is allowed (spec §4.2.5)"
+                            ),
+                            *span,
+                        )
+                        .with_code(codes::TYPE_INLINE_PARAM_LEAK),
+                    );
+                }
+            }
+            Expr::Call { callee, args, .. } => {
+                self.walk_expr_for_inline_escape(callee, inline_params, crossinline_params, true);
+                for a in args {
+                    // An argument position is an escape for a bare inline
+                    // param reference (we cannot prove the callee is inline).
+                    self.flag_inline_escape(a, inline_params, crossinline_params, "passed as an argument");
+                    self.walk_expr_for_inline_escape(a, inline_params, crossinline_params, false);
+                }
+            }
+            Expr::Return { value, .. } => {
+                if let Some(v) = value {
+                    self.flag_inline_escape(v, inline_params, crossinline_params, "returned from the function");
+                    self.walk_expr_for_inline_escape(v, inline_params, crossinline_params, false);
+                }
+            }
+            Expr::Block(b) => self.walk_block_for_inline_escape(b, inline_params, crossinline_params),
+            Expr::If { cond, then_branch, else_branch, .. } => {
+                self.walk_expr_for_inline_escape(cond, inline_params, crossinline_params, false);
+                self.walk_expr_for_inline_escape(then_branch, inline_params, crossinline_params, false);
+                if let Some(e) = else_branch {
+                    self.walk_expr_for_inline_escape(e, inline_params, crossinline_params, false);
+                }
+            }
+            Expr::Member { receiver, .. } => {
+                self.walk_expr_for_inline_escape(receiver, inline_params, crossinline_params, false);
+            }
+            _ => {}
+        }
+    }
+
+    fn flag_inline_escape(
+        &mut self,
+        e: &Expr,
+        inline_params: &[String],
+        crossinline_params: &[String],
+        action: &str,
+    ) {
+        let Expr::Path { segments, span } = e else { return };
+        if segments.len() != 1 {
+            return;
+        }
+        let n = &segments[0].name;
+        // crossinline: store / return are forbidden; argument-passing is
+        // allowed when the action is exactly "passed as an argument" — but
+        // we still flag store/return.
+        if crossinline_params.iter().any(|p| p == n) && action != "passed as an argument" {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!("crossinline parameter `{n}` cannot be {action} (spec §4.2.5)"),
+                    *span,
+                )
+                .with_code(codes::TYPE_CROSSINLINE_PARAM_LEAK),
+            );
+            return;
+        }
+        // inline (non-crossinline, non-noinline): any non-callee use is an
+        // escape. Already flagged at the bare-Path case for non-call
+        // contexts; only flag here when the bare reference is in an
+        // argument list.
+        if inline_params.iter().any(|p| p == n) && action == "passed as an argument" {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "inline parameter `{n}` cannot be {action} (spec §4.2.5)"
+                    ),
+                    *span,
+                )
+                .with_code(codes::TYPE_INLINE_PARAM_LEAK),
+            );
         }
     }
 
@@ -2201,6 +2369,7 @@ impl<'r> Checker<'r> {
     }
 
     fn check_function(&mut self, f: &Function) {
+        self.check_inline_param_escape(f);
         let saved_assigned = self.assigned.clone();
         self.push_frame();
         for p in &f.params {

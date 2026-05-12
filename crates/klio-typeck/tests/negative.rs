@@ -583,6 +583,20 @@ fn neg_no_backing_field_initializer() {
 }
 
 #[test]
+fn neg_inline_param_leak() {
+    assert!(type_codes_for("neg_inline_param_leak.kt")
+        .iter()
+        .any(|c| c == "T0055"));
+}
+
+#[test]
+fn neg_crossinline_param_leak() {
+    assert!(type_codes_for("neg_crossinline_param_leak.kt")
+        .iter()
+        .any(|c| c == "T0056"));
+}
+
+#[test]
 fn neg_private_primary_ctor_cross_file() {
     use klio_span::SourceMap;
     let src_a = "class Foo private constructor(val x: Int)\n";
