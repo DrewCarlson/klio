@@ -827,7 +827,34 @@ impl Interpreter {
                 }
                 Ok(Value::Unit)
             }
-            Stmt::Assign { target, op, value, .. } => {
+            Stmt::Assign { target, op, value, span } => {
+                // §7.1.3 safe assignment. If any `safe: true` Member appears
+                // along the LHS spine, expand the innermost one into the
+                // when-shaped form `when (val $tmp = recv) { null -> null;
+                // else -> $tmp.<rest> = value }`. Evaluating the receiver may
+                // short-circuit before the RHS is touched, matching the spec
+                // expansion's semantics. Multiple safe operators in the LHS
+                // are unwound by recursion: the rewrite drops one safe at a
+                // time, so the next eval_stmt invocation will find the next.
+                if let Some(safe_recv) = innermost_safe_lhs_receiver(target) {
+                    let recv_val = self.eval_expr(&safe_recv, env, out)?;
+                    if matches!(recv_val, Value::Null) {
+                        return Ok(Value::Unit);
+                    }
+                    // Tmp name lives in a fresh child scope so reused names
+                    // in nested rewrites shadow rather than collide.
+                    let tmp_name = "$$safe_assign_tmp".to_string();
+                    let scope = Rc::new(RefCell::new(Env::with_parent(Rc::clone(env))));
+                    scope.borrow_mut().define(tmp_name.clone(), recv_val);
+                    let rewritten = rewrite_dropping_innermost_safe(target, &tmp_name);
+                    let new_stmt = Stmt::Assign {
+                        target: rewritten,
+                        op: *op,
+                        value: value.clone(),
+                        span: *span,
+                    };
+                    return self.eval_stmt(&new_stmt, &scope, out);
+                }
                 let new_value = self.eval_expr(value, env, out)?;
                 // Member-style assignment: `obj.field = value` or
                 // implicit `field = value` inside a method body. The latter
@@ -7375,6 +7402,73 @@ fn value_hash(v: &Value) -> i64 {
             h
         }
         _ => 0,
+    }
+}
+
+/// Walk an assignment LHS toward its leaves and return the receiver
+/// expression of the innermost `safe: true` `Expr::Member`, if any. The
+/// "spine" includes the chain of `Member.receiver` and `Index.receiver`
+/// links, mirroring the shapes the parser produces for navigation
+/// expressions. `Path` / other leaf nodes terminate the walk.
+fn innermost_safe_lhs_receiver(e: &Expr) -> Option<Expr> {
+    match e {
+        Expr::Member { receiver, safe, .. } => {
+            // Descend first — we want the safe operator closest to the leaf
+            // receiver so the rewrite peels one operator at a time.
+            if let Some(found) = innermost_safe_lhs_receiver(receiver) {
+                return Some(found);
+            }
+            if *safe {
+                return Some((**receiver).clone());
+            }
+            None
+        }
+        Expr::Index { receiver, .. } => innermost_safe_lhs_receiver(receiver),
+        _ => None,
+    }
+}
+
+/// Deep-clone `e` and replace the innermost `Expr::Member { safe: true, .. }`
+/// in the LHS spine with the same Member node carrying `safe: false` and a
+/// freshly-bound `Path[tmp_name]` receiver. The recursion is in lock-step
+/// with `innermost_safe_lhs_receiver` so the substitution targets the same
+/// node that produced the receiver value.
+fn rewrite_dropping_innermost_safe(e: &Expr, tmp_name: &str) -> Expr {
+    match e {
+        Expr::Member { receiver, name, safe, span } => {
+            // If a deeper safe exists, recurse so we drop that one first.
+            if innermost_safe_lhs_receiver(receiver).is_some() {
+                let new_recv = rewrite_dropping_innermost_safe(receiver, tmp_name);
+                return Expr::Member {
+                    receiver: Box::new(new_recv),
+                    name: name.clone(),
+                    safe: *safe,
+                    span: *span,
+                };
+            }
+            if *safe {
+                return Expr::Member {
+                    receiver: Box::new(Expr::Path {
+                        segments: vec![klio_ast::Ident { name: tmp_name.to_string(), span: *span }],
+                        span: *span,
+                    }),
+                    name: name.clone(),
+                    safe: false,
+                    span: *span,
+                };
+            }
+            // Should not happen — caller checked the spine had a safe node.
+            e.clone()
+        }
+        Expr::Index { receiver, args, span } => {
+            let new_recv = rewrite_dropping_innermost_safe(receiver, tmp_name);
+            Expr::Index {
+                receiver: Box::new(new_recv),
+                args: args.clone(),
+                span: *span,
+            }
+        }
+        _ => e.clone(),
     }
 }
 
