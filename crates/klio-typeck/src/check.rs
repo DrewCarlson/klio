@@ -223,6 +223,35 @@ pub mod codes {
     /// Capturing into other lambdas is allowed; this catches the disallowed
     /// store/return forms. Spec §4.2.5.
     pub const TYPE_CROSSINLINE_PARAM_LEAK: &str = "T0056";
+    /// A class declares a non-open/abstract/sealed superclass. Spec §5.1:
+    /// a class is final by default and cannot be inherited from.
+    pub const TYPE_INHERIT_FROM_FINAL_CLASS: &str = "T0063";
+    /// A class declares an object type as a superclass. Spec §5.1: object
+    /// types cannot be inherited from.
+    pub const TYPE_INHERIT_FROM_OBJECT: &str = "T0064";
+    /// An overriding function's return type is not a subtype of the
+    /// overridden function's return type. Spec §5.4.
+    pub const TYPE_OVERRIDE_RETURN_TYPE_MISMATCH: &str = "T0065";
+    /// An overriding property's mutability is stronger than the base
+    /// (e.g. `var` base, `val` override). Spec §5.4.
+    pub const TYPE_OVERRIDE_PROPERTY_MUTABILITY: &str = "T0066";
+    /// An overriding property's type is not a subtype of the base, or two
+    /// `var`s have non-equivalent types. Spec §5.4.
+    pub const TYPE_OVERRIDE_PROPERTY_TYPE: &str = "T0067";
+    /// An overriding declaration's explicit visibility is stronger than the
+    /// overridden declaration's visibility. Spec §5.4.
+    pub const TYPE_OVERRIDE_VISIBILITY_STRONGER: &str = "T0068";
+    /// A declaration is `private` and also `open` / `abstract` / `override`.
+    /// Spec §5.4 forbids the combination.
+    pub const TYPE_PRIVATE_AND_OPEN_OR_ABSTRACT_OR_OVERRIDE: &str = "T0070";
+    /// A local or anonymous type is declared as an inheritor of a `sealed`
+    /// type. Spec §5.1.2: sealed inheritors must have a fully-qualified
+    /// name in the same package and module.
+    pub const TYPE_SEALED_INHERITOR_NOT_QUALIFIED: &str = "T0071";
+    /// A `data` or `enum` class declaration carries `open` / `abstract`
+    /// modifiers. Spec §5.1: data, enum, and annotation classes are
+    /// always closed.
+    pub const TYPE_DATA_OR_ENUM_CLASS_OPEN_OR_ABSTRACT: &str = "T0072";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -335,6 +364,13 @@ struct ClassInfo {
     is_sealed: bool,
     #[allow(dead_code)]
     is_open: bool,
+    /// `object` singleton — registered in `classes` so member lookup works
+    /// but never inheritable (spec §5.1) and never instantiable.
+    is_object: bool,
+    /// Declared inside a function body (local class) or via `object { … }`
+    /// (anonymous object). Used to enforce the sealed-inheritor §5.1.2
+    /// rule that disallows local / anonymous inheritors.
+    is_local_or_anonymous: bool,
     /// Member name -> effective visibility for access checks. Captures
     /// primary-param properties, body properties, methods, and secondary
     /// constructor bodies. Defaults to `Public`.
@@ -2167,6 +2203,8 @@ impl<'r> Checker<'r> {
             Decl::Object(o) => {
                 // Treat object singleton like a class with no ctor.
                 let mut info = ClassInfo::default();
+                info.is_object = true;
+                info.decl_file = Some(o.name.span.file);
                 self.collect_members(&o.members, &mut info);
                 for s in &o.supertypes {
                     info.supertypes.push(s.name.name.clone());
@@ -2415,6 +2453,30 @@ impl<'r> Checker<'r> {
 
     fn check_class(&mut self, c: &Class) {
         self.class_stack.push(c.name.name.clone());
+        // Spec §5.1: data, enum, and annotation classes are always closed
+        // and cannot be declared `open`, `abstract`, or `sealed`.
+        // `value` / `annotation` shape checks fire their own diagnostics.
+        if c.is_data || c.is_enum {
+            let kind = if c.is_data { "data" } else { "enum" };
+            for (is_set, mod_name) in [
+                (c.is_open, "open"),
+                (c.is_abstract, "abstract"),
+                (c.is_sealed, "sealed"),
+            ] {
+                if is_set {
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "`{kind} class {}` cannot be declared `{mod_name}` (spec §5.1)",
+                                c.name.name
+                            ),
+                            c.name.span,
+                        )
+                        .with_code(codes::TYPE_DATA_OR_ENUM_CLASS_OPEN_OR_ABSTRACT),
+                    );
+                }
+            }
+        }
         // Spec §4.1.1: secondary constructor delegation must not form a
         // cycle. Match `this(args)` to a secondary constructor by argument
         // arity (a permissive over-approximation; primary-ctor delegation
@@ -3324,12 +3386,16 @@ impl<'r> Checker<'r> {
                 self.check_function(f);
             }
             Decl::Class(c) => {
-                let info = self.class_info(c);
+                let mut info = self.class_info(c);
+                info.is_local_or_anonymous = true;
                 self.classes.insert(c.name.name.clone(), info);
                 self.check_class(c);
             }
             Decl::Object(o) => {
                 let mut info = ClassInfo::default();
+                info.is_object = true;
+                info.is_local_or_anonymous = true;
+                info.decl_file = Some(o.name.span.file);
                 self.collect_members(&o.members, &mut info);
                 self.classes.insert(o.name.name.clone(), info);
                 self.check_object(o);

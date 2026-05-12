@@ -660,6 +660,16 @@ fn neg_published_api_missing() {
 }
 
 #[test]
+fn neg_data_class_open() {
+    assert!(type_codes_for("neg_data_class_open.kt").iter().any(|c| c == "T0072"));
+}
+
+#[test]
+fn neg_enum_class_abstract() {
+    assert!(type_codes_for("neg_enum_class_abstract.kt").iter().any(|c| c == "T0072"));
+}
+
+#[test]
 fn pos_definitely_non_null_on_type_param() {
     use klio_span::SourceMap;
     let src = "fun <T> id(x: T & Any): T & Any = x\nfun main() { println(id(7)) }\n";
