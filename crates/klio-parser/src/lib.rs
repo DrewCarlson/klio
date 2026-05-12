@@ -574,6 +574,41 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             Vec::new()
         };
         self.skip_nl();
+        // Optional primary-ctor visibility: `class Foo (private)? constructor(...)`.
+        let mut primary_ctor_visibility: Option<Visibility> = None;
+        let save = self.pos;
+        let mut peek_vis: Option<Visibility> = None;
+        if matches!(self.peek_kind(), TokenKind::Ident) {
+            let txt = self.text(self.current_span());
+            peek_vis = match txt {
+                "public" => Some(Visibility::Public),
+                "private" => Some(Visibility::Private),
+                "protected" => Some(Visibility::Protected),
+                "internal" => Some(Visibility::Internal),
+                _ => None,
+            };
+        }
+        if peek_vis.is_some() {
+            // Only commit if the next non-newline token is `constructor`.
+            let saved = self.pos;
+            self.bump();
+            self.skip_nl();
+            if matches!(self.peek_kind(), TokenKind::Ident)
+                && self.text(self.current_span()) == "constructor"
+            {
+                primary_ctor_visibility = peek_vis;
+                self.bump(); // constructor
+                self.skip_nl();
+            } else {
+                self.pos = saved;
+            }
+        } else if matches!(self.peek_kind(), TokenKind::Ident)
+            && self.text(self.current_span()) == "constructor"
+        {
+            self.bump();
+            self.skip_nl();
+        }
+        let _ = save;
         let primary_params = if matches!(self.peek_kind(), TokenKind::LParen) {
             self.bump();
             let params = self.parse_class_param_list();
@@ -598,6 +633,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             type_params,
             where_bounds,
             primary_params,
+            primary_ctor_visibility,
             init_blocks,
             supertypes,
             supertype_args,
@@ -761,6 +797,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             enum_entries: Vec::new(),
             members,
             visibility,
+            primary_ctor_visibility: None,
             annotations,
             span: kw.span.join(end),
         })

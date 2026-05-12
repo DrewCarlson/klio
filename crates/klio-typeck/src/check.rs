@@ -338,6 +338,10 @@ struct ClassInfo {
     decl_visibility: Visibility,
     /// File the class is declared in. Used by `private`-class enforcement.
     decl_file: Option<klio_span::FileId>,
+    /// Visibility of the primary constructor when it diverges from the
+    /// class itself (`class Foo private constructor(...)`). `None` means
+    /// the constructor inherits the class visibility.
+    primary_ctor_visibility: Option<Visibility>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2052,6 +2056,7 @@ impl<'r> Checker<'r> {
             has_secondary_ctors: !c.secondary_ctors.is_empty(),
             decl_visibility: c.visibility,
             decl_file: Some(c.name.span.file),
+            primary_ctor_visibility: c.primary_ctor_visibility,
             ..ClassInfo::default()
         };
         // Primary ctor params that are properties become members.
@@ -4025,13 +4030,28 @@ impl<'r> Checker<'r> {
         info: &ClassInfo,
         use_span: Span,
     ) {
-        if matches!(info.decl_visibility, Visibility::Public | Visibility::Internal) {
-            return;
-        }
+        // Spec §4.6: a per-primary-ctor visibility (`class Foo private
+        // constructor(...)`) gates constructor invocations independently of
+        // the class visibility itself.
         let same_file = info
             .decl_file
             .map(|f| f == use_span.file)
             .unwrap_or(true);
+        if let Some(pcv) = info.primary_ctor_visibility {
+            if matches!(pcv, Visibility::Private) && !same_file {
+                self.diagnostics.emit(
+                    Diagnostic::error(
+                        format!("Cannot access `{name}`: primary constructor is private"),
+                        use_span,
+                    )
+                    .with_code(codes::TYPE_INVISIBLE_MEMBER),
+                );
+                return;
+            }
+        }
+        if matches!(info.decl_visibility, Visibility::Public | Visibility::Internal) {
+            return;
+        }
         match info.decl_visibility {
             Visibility::Private if same_file => return,
             Visibility::Protected => {

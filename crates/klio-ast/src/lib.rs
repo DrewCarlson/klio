@@ -343,6 +343,10 @@ pub struct Class {
     pub enum_entries: Vec<EnumEntry>,
     pub members: Vec<Decl>,
     pub visibility: Visibility,
+    /// Visibility on the primary constructor when the source uses the
+    /// explicit `class Foo private constructor(...)` form. `None` means the
+    /// primary constructor inherits the class visibility. Spec §4.6.
+    pub primary_ctor_visibility: Option<Visibility>,
     pub annotations: Vec<Annotation>,
     pub span: Span,
 }

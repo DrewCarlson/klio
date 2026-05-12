@@ -1703,6 +1703,7 @@ impl Interpreter {
             enum_entries: Vec::new(),
             members: members.to_vec(),
             visibility: klio_ast::Visibility::Public,
+            primary_ctor_visibility: None,
             annotations: Vec::new(),
             span,
         };
