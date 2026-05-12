@@ -757,3 +757,12 @@ fn neg_label_on_arbitrary_expr() {
             .any(|c| c == "T0078")
     );
 }
+
+#[test]
+fn neg_property_init_cycle() {
+    assert!(
+        type_codes_for("neg_property_init_cycle.kt")
+            .iter()
+            .any(|c| c == "T0076")
+    );
+}

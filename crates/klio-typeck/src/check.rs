@@ -256,6 +256,10 @@ pub mod codes {
     /// spec §6.3 (only lambda literals, loops, and calls that pass a
     /// trailing lambda may carry a label).
     pub const TYPE_LABEL_TARGET_NOT_LABELABLE: &str = "T0078";
+    /// A top-level property's initializer participates in a read cycle
+    /// with other top-level properties. Spec §6 note: initialization
+    /// cycles in declaration scopes have unspecified behavior.
+    pub const TYPE_PROPERTY_INITIALIZER_CYCLE: &str = "T0076";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -578,6 +582,124 @@ impl<'a> Checker<'a> {
         // Phase K: `tailrec` tail-call analysis.
         for d in &file.decls {
             self.check_phase_k_decl(d);
+        }
+        // T0076: top-level property initializer cycles (spec §6).
+        self.check_property_initializer_cycles(file);
+    }
+
+    /// Detect cycles among top-level property initializer reads. A property
+    /// whose initializer reads another property — directly or transitively
+    /// back to itself — forms a cycle whose evaluation order is unspecified.
+    fn check_property_initializer_cycles(&mut self, file: &KotlinFile) {
+        use std::collections::{HashMap, HashSet};
+
+        let mut props: Vec<(&Property, usize)> = Vec::new();
+        let mut by_name: HashMap<String, usize> = HashMap::new();
+        for d in &file.decls {
+            if let Decl::Property(p) = d {
+                if p.init.is_some() {
+                    let idx = props.len();
+                    by_name.insert(p.name.name.clone(), idx);
+                    props.push((p, idx));
+                }
+            }
+        }
+        if props.is_empty() {
+            return;
+        }
+
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); props.len()];
+        for (p, idx) in &props {
+            let init = p.init.as_ref().unwrap();
+            let mut reads: HashSet<usize> = HashSet::new();
+            collect_property_reads(init, &by_name, &mut reads);
+            edges[*idx] = reads.into_iter().collect();
+        }
+
+        // Tarjan SCC over `edges`.
+        let n = edges.len();
+        let mut index = 0usize;
+        let mut idx_of: Vec<Option<usize>> = vec![None; n];
+        let mut lowlink: Vec<usize> = vec![0; n];
+        let mut on_stack: Vec<bool> = vec![false; n];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut sccs: Vec<Vec<usize>> = Vec::new();
+
+        fn strongconnect(
+            v: usize,
+            edges: &[Vec<usize>],
+            index: &mut usize,
+            idx_of: &mut [Option<usize>],
+            lowlink: &mut [usize],
+            on_stack: &mut [bool],
+            stack: &mut Vec<usize>,
+            sccs: &mut Vec<Vec<usize>>,
+        ) {
+            idx_of[v] = Some(*index);
+            lowlink[v] = *index;
+            *index += 1;
+            stack.push(v);
+            on_stack[v] = true;
+            for &w in &edges[v] {
+                if idx_of[w].is_none() {
+                    strongconnect(w, edges, index, idx_of, lowlink, on_stack, stack, sccs);
+                    lowlink[v] = lowlink[v].min(lowlink[w]);
+                } else if on_stack[w] {
+                    lowlink[v] = lowlink[v].min(idx_of[w].unwrap());
+                }
+            }
+            if lowlink[v] == idx_of[v].unwrap() {
+                let mut comp = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on_stack[w] = false;
+                    comp.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                sccs.push(comp);
+            }
+        }
+
+        for v in 0..n {
+            if idx_of[v].is_none() {
+                strongconnect(
+                    v,
+                    &edges,
+                    &mut index,
+                    &mut idx_of,
+                    &mut lowlink,
+                    &mut on_stack,
+                    &mut stack,
+                    &mut sccs,
+                );
+            }
+        }
+
+        for comp in &sccs {
+            let is_cycle = comp.len() > 1 || edges[comp[0]].contains(&comp[0]);
+            if !is_cycle {
+                continue;
+            }
+            let names: Vec<String> = comp
+                .iter()
+                .map(|&i| props[i].0.name.name.clone())
+                .collect();
+            let chain = names.join(" -> ");
+            for &i in comp {
+                let p = props[i].0;
+                self.diagnostics.emit(
+                    Diagnostic::warning(
+                        format!(
+                            "Property `{}` participates in an initializer cycle: {}",
+                            p.name.name, chain
+                        ),
+                        p.init.as_ref().unwrap().span(),
+                    )
+                    .with_code(codes::TYPE_PROPERTY_INITIALIZER_CYCLE),
+                );
+            }
         }
     }
 
@@ -5745,6 +5867,98 @@ fn block_uses_field(b: &Block) -> bool {
         Stmt::Decl(Decl::Property(p)) => p.init.as_ref().map_or(false, expr_uses_field),
         _ => false,
     })
+}
+
+/// Walk `e` and record any bare-name path segment whose first identifier
+/// maps to an entry in `by_name` (the set of top-level properties with
+/// initializers). Used by the T0076 cycle detector.
+fn collect_property_reads(
+    e: &Expr,
+    by_name: &std::collections::HashMap<String, usize>,
+    out: &mut std::collections::HashSet<usize>,
+) {
+    match e {
+        Expr::Path { segments, .. } => {
+            if let Some(first) = segments.first() {
+                if let Some(&idx) = by_name.get(&first.name) {
+                    out.insert(idx);
+                }
+            }
+        }
+        Expr::Member { receiver, .. } => collect_property_reads(receiver, by_name, out),
+        Expr::Call { callee, args, .. } => {
+            collect_property_reads(callee, by_name, out);
+            for a in args {
+                collect_property_reads(a, by_name, out);
+            }
+        }
+        Expr::Index { receiver, args, .. } => {
+            collect_property_reads(receiver, by_name, out);
+            for a in args {
+                collect_property_reads(a, by_name, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_property_reads(lhs, by_name, out);
+            collect_property_reads(rhs, by_name, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => {
+            collect_property_reads(expr, by_name, out);
+        }
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            collect_property_reads(cond, by_name, out);
+            collect_property_reads(then_branch, by_name, out);
+            if let Some(eb) = else_branch {
+                collect_property_reads(eb, by_name, out);
+            }
+        }
+        Expr::When { subject, branches, .. } => {
+            if let Some(s) = subject {
+                collect_property_reads(s, by_name, out);
+            }
+            for b in branches {
+                for p in &b.patterns {
+                    match &p.kind {
+                        klio_ast::WhenPatternKind::Value(e)
+                        | klio_ast::WhenPatternKind::InRange(e)
+                        | klio_ast::WhenPatternKind::NotInRange(e) => {
+                            collect_property_reads(e, by_name, out);
+                        }
+                        _ => {}
+                    }
+                }
+                collect_property_reads(&b.body, by_name, out);
+            }
+        }
+        Expr::Labeled { expr, .. } => collect_property_reads(expr, by_name, out),
+        Expr::Block(b) => {
+            for s in &b.stmts {
+                if let Stmt::Expr(e) = s {
+                    collect_property_reads(e, by_name, out);
+                }
+            }
+        }
+        Expr::StringTemplate { parts, .. } => {
+            for part in parts {
+                match part {
+                    klio_ast::StringPart::ShortInterp(id) => {
+                        if let Some(&idx) = by_name.get(&id.name) {
+                            out.insert(idx);
+                        }
+                    }
+                    klio_ast::StringPart::Interp(e) => collect_property_reads(e, by_name, out),
+                    klio_ast::StringPart::Text(_) => {}
+                }
+            }
+        }
+        Expr::Return { value: Some(v), .. } | Expr::Throw { value: v, .. } => {
+            collect_property_reads(v, by_name, out);
+        }
+        Expr::IsCheck { expr, .. } | Expr::As { expr, .. } | Expr::Spread { expr, .. } => {
+            collect_property_reads(expr, by_name, out);
+        }
+        _ => {}
+    }
 }
 
 /// Spec §6.3: labels may only be attached to lambda literals, loop
