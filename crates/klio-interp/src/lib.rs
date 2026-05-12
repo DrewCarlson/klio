@@ -984,7 +984,7 @@ impl Interpreter {
             }
             Stmt::DestructuringDecl { names, init, .. } => {
                 let value = self.eval_expr(init, env, out)?;
-                let components = destructure_components(self, &value, names.len(), out)?;
+                let components = destructure_components(self, &value, names, out)?;
                 for (n, c) in names.iter().zip(components) {
                     if n.name == "_" {
                         continue;
@@ -1701,7 +1701,7 @@ impl Interpreter {
                     if vars.len() == 1 {
                         scope.borrow_mut().define(vars[0].name.clone(), v);
                     } else {
-                        let components = match destructure_for_loop(&v, vars.len()) {
+                        let components = match destructure_components(self, &v, vars, out) {
                             Ok(c) => c,
                             Err(e) => {
                                 loop_result = Err(e);
@@ -1709,6 +1709,10 @@ impl Interpreter {
                             }
                         };
                         for (var, c) in vars.iter().zip(components) {
+                            // Spec ch.9: `_` placeholder binds nothing.
+                            if var.name == "_" {
+                                continue;
+                            }
                             scope.borrow_mut().define(var.name.clone(), c);
                         }
                     }
@@ -7859,9 +7863,10 @@ fn wrap_collection(items: Vec<Value>, _as_sequence: bool) -> Value {
 fn destructure_components(
     interp: &mut Interpreter,
     value: &Value,
-    n: usize,
+    slots: &[klio_ast::Ident],
     out: &mut dyn Output,
 ) -> Result<Vec<Value>, RuntimeError> {
+    let n = slots.len();
     let pieces: Vec<Value> = match value {
         Value::Pair(a, b) => vec![(**a).clone(), (**b).clone()],
         Value::Triple(a, b, c) => vec![(**a).clone(), (**b).clone(), (**c).clone()],
@@ -7871,8 +7876,13 @@ fn destructure_components(
             let class = Rc::clone(&inst.borrow().class);
             let env = interp.globals_ref();
             let mut out_vals = Vec::with_capacity(n);
-            for i in 1..=n {
-                let mname = format!("component{i}");
+            for (idx, slot) in slots.iter().enumerate() {
+                // Spec ch.9: `_` placeholder skips the `componentK` call.
+                if slot.name == "_" {
+                    out_vals.push(Value::Unit);
+                    continue;
+                }
+                let mname = format!("component{}", idx + 1);
                 // Data classes synthesize componentN — handled by
                 // `eval_instance_auto_member`.
                 if let Some(v) = interp.eval_instance_auto_member(
@@ -7893,31 +7903,6 @@ fn destructure_components(
             }
             return Ok(out_vals);
         }
-        other => {
-            return Err(RuntimeError::Type(format!(
-                "cannot destructure {other:?}"
-            )))
-        }
-    };
-    if pieces.len() < n {
-        return Err(RuntimeError::Type(format!(
-            "destructuring expects {n} components, got {}",
-            pieces.len()
-        )));
-    }
-    Ok(pieces.into_iter().take(n).collect())
-}
-
-/// Back-compat wrapper used by the for-loop path which previously handled
-/// only the value-level shapes. Routes through `destructure_components`
-/// without an `Interpreter` for the no-instance shapes; for instances the
-/// caller must use `destructure_components` directly.
-fn destructure_for_loop(value: &Value, n: usize) -> Result<Vec<Value>, RuntimeError> {
-    let pieces: Vec<Value> = match value {
-        Value::Pair(a, b) => vec![(**a).clone(), (**b).clone()],
-        Value::Triple(a, b, c) => vec![(**a).clone(), (**b).clone(), (**c).clone()],
-        Value::MapEntry { key, value } => vec![(**key).clone(), (**value).clone()],
-        Value::List { items, .. } => items.borrow().clone(),
         other => {
             return Err(RuntimeError::Type(format!(
                 "cannot destructure {other:?}"
@@ -10033,6 +10018,43 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["Day(1..5)"]);
+    }
+
+    #[test]
+    fn destructure_underscore_skips_component() {
+        // Spec ch.9: `_` placeholder makes no `componentK` call. Visible
+        // here via a counter incremented inside each component getter — the
+        // `_` slot must not increment it.
+        let src = r#"
+            var calls = 0
+            class Counted(val a: Int, val b: Int, val c: Int) {
+                operator fun component1(): Int { calls = calls + 1; return a }
+                operator fun component2(): Int { calls = calls + 1; return b }
+                operator fun component3(): Int { calls = calls + 1; return c }
+            }
+            fun main() {
+                val (x, _, z) = Counted(7, 8, 11)
+                println(x)
+                println(z)
+                println(calls)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["7", "11", "2"]);
+    }
+
+    #[test]
+    fn destructure_underscore_in_for_loop() {
+        let src = r#"
+            fun main() {
+                val pairs = listOf(1 to "a", 2 to "b", 3 to "c")
+                for ((n, _) in pairs) println(n)
+                for ((_, s) in pairs) println(s)
+            }
+        "#;
+        assert_eq!(
+            run(src).lines,
+            vec!["1", "2", "3", "a", "b", "c"]
+        );
     }
 
     #[test]
