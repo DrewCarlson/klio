@@ -96,6 +96,18 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         &self.src[span.range()]
     }
 
+    /// Read the identifier name stored in the token's span, stripping the
+    /// surrounding backticks when the source uses an escaped identifier
+    /// (`` `foo bar` ``). For unescaped identifiers this is a plain slice.
+    fn ident_name(&self, span: Span) -> String {
+        let raw = self.text(span);
+        if raw.len() >= 2 && raw.starts_with('`') && raw.ends_with('`') {
+            raw[1..raw.len() - 1].to_string()
+        } else {
+            raw.to_string()
+        }
+    }
+
     fn current_span(&self) -> Span {
         self.peek().span
     }
@@ -202,7 +214,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             self.skip_nl();
             if matches!(self.peek_kind(), TokenKind::Ident) {
                 let tok = self.bump();
-                path.push(Ident { name: self.text(tok.span).to_string(), span: tok.span });
+                path.push(Ident { name: self.ident_name(tok.span), span: tok.span });
             } else {
                 self.error("P0047", "malformed import: missing path", kw.span);
             }
@@ -216,7 +228,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 self.skip_nl();
                 if matches!(self.peek_kind(), TokenKind::Ident) {
                     let tok = self.bump();
-                    path.push(Ident { name: self.text(tok.span).to_string(), span: tok.span });
+                    path.push(Ident { name: self.ident_name(tok.span), span: tok.span });
                 } else {
                     self.error("P0047", "malformed import: trailing `.` with no segment", dot.span);
                     break;
@@ -2044,7 +2056,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.skip_nl();
         if matches!(self.peek_kind(), TokenKind::Ident) {
             let tok = self.bump();
-            Some(Ident { name: self.text(tok.span).to_string(), span: tok.span })
+            Some(Ident { name: self.ident_name(tok.span), span: tok.span })
         } else {
             let span = self.current_span();
             self.error("E0003", format!("expected {what}"), span);
@@ -2744,7 +2756,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             return None;
         }
         let tok = self.bump(); // ident
-        let name = self.text(tok.span).to_string();
+        let name = self.ident_name(tok.span);
         self.bump(); // `=`
         self.skip_nl();
         Some(name)
@@ -2791,7 +2803,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     return Some(label_expr);
                 }
                 let tok = self.bump();
-                let ident = Ident { name: self.text(tok.span).to_string(), span: tok.span };
+                let ident = Ident { name: self.ident_name(tok.span), span: tok.span };
                 Some(Expr::Path { segments: vec![ident], span: tok.span })
             }
             TokenKind::LParen => {
@@ -3163,7 +3175,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             return None;
         }
         let name_span = self.current_span();
-        let label = Ident { name: self.text(name_span).to_string(), span: name_span };
+        let label = Ident { name: self.ident_name(name_span), span: name_span };
         self.bump();
         self.bump();
         self.skip_nl();
@@ -3602,7 +3614,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 match self.peek_kind() {
                     TokenKind::Ident => {
                         let tok = self.bump();
-                        local.push(Ident { name: self.text(tok.span).to_string(), span: tok.span });
+                        local.push(Ident { name: self.ident_name(tok.span), span: tok.span });
                         self.skip_nl();
                         if matches!(self.peek_kind(), TokenKind::Colon) {
                             self.bump();
@@ -3781,6 +3793,25 @@ mod tests {
         assert_eq!(file.imports.len(), 2);
         assert!(file.imports[1].wildcard);
         assert!(file.imports[1].alias.is_none());
+    }
+
+    #[test]
+    fn import_with_backticked_segment() {
+        let src = "import kotlin.collections.`Map`\n";
+        let (file, diags) = parse(src);
+        assert!(!diags.has_errors(), "diags: {:?}", diags.diagnostics());
+        let imp = &file.imports[0];
+        let segs: Vec<_> = imp.path.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(segs, vec!["kotlin", "collections", "Map"]);
+    }
+
+    #[test]
+    fn import_with_backticked_alias() {
+        let src = "import kotlin.math.PI as `tau-ish`\n";
+        let (file, diags) = parse(src);
+        assert!(!diags.has_errors(), "diags: {:?}", diags.diagnostics());
+        let alias = file.imports[0].alias.as_ref().expect("alias");
+        assert_eq!(alias.name, "tau-ish");
     }
 
     #[test]

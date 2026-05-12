@@ -356,6 +356,13 @@ impl<'src> Lexer<'src> {
             return Some(tok);
         }
 
+        // Backtick-escaped identifier: `…` admits any character except backtick,
+        // newline, CR, or NUL. The identifier carries the backticks in its span;
+        // the parser strips them when materializing names.
+        if b == b'`' {
+            return Some(self.lex_backtick_ident(start));
+        }
+
         // Identifiers / keywords. Unicode XID for the start; ASCII fast path first.
         if is_ident_start_byte(b) || self.peek_char().is_some_and(UnicodeXID::is_xid_start) {
             return Some(self.lex_ident_or_keyword(start));
@@ -381,6 +388,30 @@ impl<'src> Lexer<'src> {
     }
 
     // ---------- identifiers ----------
+
+    fn lex_backtick_ident(&mut self, start: u32) -> Token {
+        // Consume opening backtick.
+        self.bump_char();
+        let mut closed = false;
+        while let Some(c) = self.peek_char() {
+            if c == '`' {
+                self.bump_char();
+                closed = true;
+                break;
+            }
+            if c == '\n' || c == '\r' || c == '\0' {
+                break;
+            }
+            self.bump_char();
+        }
+        let span = self.span(start);
+        if !closed {
+            self.diagnostics.emit(
+                Diagnostic::error("unterminated backtick identifier", span).with_code("E0022"),
+            );
+        }
+        Token { kind: TokenKind::Ident, span }
+    }
 
     fn lex_ident_or_keyword(&mut self, start: u32) -> Token {
         // Consume one start char.
