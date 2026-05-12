@@ -391,6 +391,11 @@ struct FnSig {
     /// Number of declaration-site type parameters. Used to filter the OCS
     /// against an explicit call-site `<...>` list. Spec §11.2.8.
     type_param_count: usize,
+    /// User-class simple name for each parameter whose declared type names
+    /// a known class. `None` for primitive / function / unresolved slots.
+    /// Used by MSC's pairwise forwarding test (§11.4.2) to distinguish
+    /// otherwise-collapsed `Type::Unresolved` slots.
+    param_class_names: Vec<Option<String>>,
 }
 
 /// Description of a user-declared class.
@@ -2823,6 +2828,8 @@ impl<'r> Checker<'r> {
             .as_ref()
             .map(convert_type_ref_lossy)
             .unwrap_or(Type::Unit);
+        let param_class_names: Vec<Option<String>> =
+            f.params.iter().map(|p| class_name_from_typeref(&p.ty)).collect();
         FnSig {
             params,
             has_default,
@@ -2831,6 +2838,7 @@ impl<'r> Checker<'r> {
             return_ty,
             is_infix: f.is_infix,
             type_param_count: f.type_params.len(),
+            param_class_names,
         }
     }
 
@@ -2876,6 +2884,11 @@ impl<'r> Checker<'r> {
             return_ty: Type::Unresolved,
             is_infix: false,
             type_param_count: c.type_params.len(),
+            param_class_names: c
+                .primary_params
+                .iter()
+                .map(|p| class_name_from_typeref(&p.ty))
+                .collect(),
         };
         if !c.primary_params.is_empty() || !c.is_interface {
             info.ctor = Some(ctor_sig);
@@ -6042,17 +6055,34 @@ impl<'r> Checker<'r> {
             }
         }
         if !fitting.is_empty() {
-            // Spec §3.5.1: when an integer literal fits multiple overloads,
-            // prefer the one whose parameter has the narrower `Widen()` set.
-            // Widen(Int) covers Short/Byte/Long, so a candidate taking `Int`
-            // wins over one taking `Short` / `Byte` / `Long` for the same
-            // literal. Apply per-parameter then sum to a score.
-            let best = fitting
-                .iter()
-                .copied()
-                .min_by_key(|s| widen_score(&s.params))
-                .unwrap();
-            chosen = Some(best);
+            // Spec §11.4.2: full MSC pairwise forwarding test, with the
+            // integer-widening rule folded into the constraint comparison.
+            // Falls back to the widen-only tiebreaker when MSC reports an
+            // ambiguity, so untyped corpora remain parity-stable.
+            match pick_msc(&fitting, args.len(), &self.classes) {
+                Ok(best) => chosen = Some(best),
+                Err(frontier) => {
+                    let names: Vec<String> = frontier
+                        .iter()
+                        .map(|s| format!("({})", describe_params(&s.params)))
+                        .collect();
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "Overload resolution ambiguity between candidates: {}",
+                                names.join(", ")
+                            ),
+                            call_span,
+                        )
+                        .with_code(codes::TYPE_OVERLOAD_RESOLUTION_AMBIGUITY),
+                    );
+                    let best = frontier
+                        .into_iter()
+                        .min_by_key(|s| widen_score(&s.params))
+                        .unwrap();
+                    chosen = Some(best);
+                }
+            }
         }
         if chosen.is_none() && arity_match.is_none() {
             // Spec §11.3: no candidate is applicable for the call. The
@@ -7120,16 +7150,174 @@ fn lub(a: &Type, b: &Type) -> Type {
 /// when the same literal applies to both overloads. Non-integer types score
 /// zero so overloads that don't mix integer parameters are unaffected.
 fn widen_score(params: &[Type]) -> u32 {
-    fn one(t: &Type) -> u32 {
-        match t {
-            Type::Int => 0,
-            Type::Short => 1,
-            Type::Long => 2,
-            Type::Byte => 3,
-            _ => 0,
+    params.iter().map(int_widen_rank).sum()
+}
+
+fn describe_params(params: &[Type]) -> String {
+    params
+        .iter()
+        .map(|t| format!("{t:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Lower rank = wider integer type per Kotlin's literal-widening rule.
+/// `Int` is the spec-preferred default for an integer literal, so it gets
+/// rank 0; `Short` / `Long` / `Byte` rank above it. Non-int types collapse
+/// to 0 — they're handled by ordinary subtyping in the MSC test, never by
+/// the widening rule.
+fn int_widen_rank(t: &Type) -> u32 {
+    match t {
+        Type::Int => 0,
+        Type::Short => 1,
+        Type::Long => 2,
+        Type::Byte => 3,
+        _ => 0,
+    }
+}
+
+fn is_builtin_integer(t: &Type) -> bool {
+    matches!(t, Type::Int | Type::Long | Type::Short | Type::Byte)
+}
+
+/// Class-aware subtype check used by the MSC pairwise test. Walks `sub`'s
+/// supertype chain in `classes` looking for `sup`. Returns true on a hit
+/// or on `sub == sup`. Anonymous / not-in-table classes fall through.
+fn class_is_subtype_of(
+    classes: &HashMap<String, ClassInfo>,
+    sub: &str,
+    sup: &str,
+) -> bool {
+    if sub == sup { return true; }
+    let mut stack: Vec<String> = vec![sub.to_string()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n.clone()) { continue; }
+        if let Some(info) = classes.get(&n) {
+            for s in &info.supertypes {
+                if s == sup { return true; }
+                stack.push(s.clone());
+            }
         }
     }
-    params.iter().map(one).sum()
+    false
+}
+
+/// Spec §11.4.2: returns true when F1 is equally or more applicable than
+/// F2 as an overload candidate for a call providing `arg_count` arguments.
+/// Builds the conceptual constraint system Xk <: Yk over the first
+/// `arg_count` non-vararg slots (Widen(Xk) <: Widen(Yk) when both are
+/// built-in integer types) and reports soundness as a bool. Type
+/// parameters of F1 are treated as free wildcards via `Type::Unresolved`
+/// (which `is_subtype_of` already permits to subtype anything), modeling
+/// the spec's "F1's type params bound to fresh variables, F2's free".
+fn at_least_as_applicable(
+    f1: &FnSig,
+    f2: &FnSig,
+    arg_count: usize,
+    classes: &HashMap<String, ClassInfo>,
+) -> bool {
+    let n = arg_count.min(f1.params.len()).min(f2.params.len());
+    for k in 0..n {
+        let x = &f1.params[k];
+        let y = &f2.params[k];
+        if is_builtin_integer(x) && is_builtin_integer(y) {
+            // Widen(X) <: Widen(Y) iff X's widening set is a subset of Y's.
+            // Encoded compactly via the rank: a *smaller* rank means a
+            // narrower widening set (Int has the smallest set, Byte the
+            // largest). F1 is at-least-as-applicable iff rank(X) <= rank(Y).
+            if int_widen_rank(x) > int_widen_rank(y) {
+                return false;
+            }
+        } else if matches!(x, Type::Unresolved) && matches!(y, Type::Unresolved) {
+            // Both params are user-class slots collapsed to `Unresolved`.
+            // Compare via the class hierarchy when both names are known;
+            // otherwise treat the pair as a tie (wildcard ≡ wildcard) and
+            // fall through to subsequent slots.
+            if let (Some(xn), Some(yn)) = (
+                f1.param_class_names.get(k).and_then(|n| n.as_deref()),
+                f2.param_class_names.get(k).and_then(|n| n.as_deref()),
+            ) {
+                if !class_is_subtype_of(classes, xn, yn) {
+                    return false;
+                }
+            }
+        } else if !x.is_subtype_of(y) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Spec §11.4.2: pick the most specific candidate among `fitting`. Returns
+/// `Ok(&FnSig)` when a unique most-specific candidate exists, `Err(set)`
+/// when the call is ambiguous (the returned set is the equally-specific
+/// frontier — caller chooses how to report it).
+fn pick_msc<'a>(
+    fitting: &[&'a FnSig],
+    arg_count: usize,
+    classes: &HashMap<String, ClassInfo>,
+) -> Result<&'a FnSig, Vec<&'a FnSig>> {
+    if fitting.is_empty() {
+        return Err(Vec::new());
+    }
+    if fitting.len() == 1 {
+        return Ok(fitting[0]);
+    }
+    // Frontier: every candidate that is at-least-as-applicable as every
+    // other candidate. Spec §11.4.2 case 1 picks a unique frontier member.
+    let mut frontier: Vec<&FnSig> = Vec::new();
+    for (i, f1) in fitting.iter().enumerate() {
+        let dominates_all = fitting.iter().enumerate().all(|(j, f2)| {
+            i == j || at_least_as_applicable(f1, f2, arg_count, classes)
+        });
+        if dominates_all {
+            frontier.push(*f1);
+        }
+    }
+    if frontier.is_empty() {
+        // §11.4.2 case 2: nobody dominates everyone. Fall to case-3
+        // tiebreakers over the original set.
+        frontier = fitting.to_vec();
+    }
+    if frontier.len() == 1 {
+        return Ok(frontier[0]);
+    }
+    // Tiebreakers, in order: non-parameterized > parameterized; then
+    // fewer unspecified defaults; then no-vararg > has-vararg.
+    let any_non_param = frontier.iter().any(|s| s.type_param_count == 0);
+    if any_non_param {
+        frontier.retain(|s| s.type_param_count == 0);
+    }
+    if frontier.len() == 1 {
+        return Ok(frontier[0]);
+    }
+    let min_defaults = frontier
+        .iter()
+        .map(|s| {
+            let supplied = arg_count.min(s.params.len());
+            s.has_default[..supplied].iter().filter(|h| **h).count()
+                + s.has_default.iter().skip(supplied).filter(|h| **h).count()
+        })
+        .min()
+        .unwrap();
+    frontier.retain(|s| {
+        let supplied = arg_count.min(s.params.len());
+        let used_defaults = s.has_default[..supplied].iter().filter(|h| **h).count()
+            + s.has_default.iter().skip(supplied).filter(|h| **h).count();
+        used_defaults == min_defaults
+    });
+    if frontier.len() == 1 {
+        return Ok(frontier[0]);
+    }
+    let any_no_vararg = frontier.iter().any(|s| !s.is_vararg.iter().any(|v| *v));
+    if any_no_vararg {
+        frontier.retain(|s| !s.is_vararg.iter().any(|v| *v));
+    }
+    if frontier.len() == 1 {
+        return Ok(frontier[0]);
+    }
+    Err(frontier)
 }
 
 // === Phase K tailrec analysis helpers ===
@@ -7827,6 +8015,81 @@ mod tests {
             fun <T> f(x: T): T = x
             fun <T, U> f(x: T, y: U): T = x
             fun main() { val r: Int = f<Int>(1) }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn msc_picks_more_specific_subtype() {
+        // Spec §11.4.2: when one candidate's parameter is a subtype of
+        // another's, the subtype wins. Here `Dog` is a subtype of `Animal`,
+        // so the `Dog` overload is more specific.
+        let tc = check_src(
+            r#"
+            open class Animal
+            class Dog : Animal()
+            fun f(a: Animal): Int = 1
+            fun f(d: Dog): String = "dog"
+            fun main() { val r: String = f(Dog()) }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn msc_non_parameterized_beats_parameterized() {
+        // Spec §11.4.2 case 3 tiebreaker: a non-generic candidate wins
+        // over a generic one when applicability is otherwise equal.
+        let tc = check_src(
+            r#"
+            fun f(x: Int): Int = x
+            fun <T> f(x: T): Int = 0
+            fun main() { val _r: Int = f(1) }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn msc_ambiguous_reports_t0091() {
+        // Spec §11.4.2: both candidates are equally specific (sibling
+        // unrelated types fit the literal `Any?` slot), no tiebreaker
+        // distinguishes them, so emit T0091.
+        let tc = check_src(
+            r#"
+            class A
+            class B
+            fun f(a: A): Int = 1
+            fun f(b: B): Int = 2
+            fun g(x: Any): Int = 0
+            fun main() { val _r: Int = g(1) ; val _s: Int = f(A()) }
+            "#,
+        );
+        // Sanity: the call to f(A()) above is unambiguous. We need an
+        // actually-ambiguous pair. Force ambiguity via unrelated supers.
+        let tc2 = check_src(
+            r#"
+            interface I
+            interface J
+            class Both : I, J
+            fun f(x: I): Int = 1
+            fun f(x: J): Int = 2
+            fun main() { val _r: Int = f(Both()) }
+            "#,
+        );
+        let _ = tc;
+        assert!(codes(&tc2).contains(&codes::TYPE_OVERLOAD_RESOLUTION_AMBIGUITY),
+            "{:?}", tc2.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn msc_no_vararg_beats_vararg() {
+        let tc = check_src(
+            r#"
+            fun f(x: Int): Int = x
+            fun f(vararg xs: Int): Int = 0
+            fun main() { val _r: Int = f(1) }
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
