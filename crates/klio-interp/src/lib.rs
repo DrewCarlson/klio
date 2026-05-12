@@ -237,6 +237,51 @@ impl Interpreter {
 
     /// Resolve a type name through the active reified-type frame. Returns
     /// the original name unchanged when no rebinding is active.
+    /// Synthesize a `Value::Class` for a Kotlin built-in type name when one
+    /// is needed at runtime — used by `Int::class`, reified-T class literals,
+    /// and `T::class` for any primitive parameter. The class is intentionally
+    /// minimal: no methods, no companion, no parent. The reflection surface
+    /// the user can reach is just `simpleName` and `qualifiedName`.
+    fn synth_primitive_class(&self, name: &str) -> Option<Value> {
+        let fqn = match name {
+            "Int" | "Long" | "Short" | "Byte" | "Float" | "Double" | "Boolean" | "Char"
+            | "Unit" | "String" | "Any" | "Nothing" | "Number" | "CharSequence" => {
+                format!("kotlin.{name}")
+            }
+            _ => return None,
+        };
+        Some(Value::Class(Rc::new(ClassDef {
+            name: name.to_string(),
+            fqn,
+            primary_params: Vec::new(),
+            methods: Vec::new(),
+            body_properties: Vec::new(),
+            init_blocks: Vec::new(),
+            is_data: false,
+            is_object: false,
+            is_enum: false,
+            is_sealed: false,
+            is_open: false,
+            is_abstract: false,
+            is_inner: false,
+            is_anonymous: false,
+            secondary_ctors: Vec::new(),
+            supertype_names: Vec::new(),
+            parent: RefCell::new(None),
+            interfaces: RefCell::new(Vec::new()),
+            is_interface: false,
+            is_fun_interface: false,
+            parent_ctor_args: Vec::new(),
+            enum_entries: RefCell::new(Vec::new()),
+            companion: None,
+            enclosing_class: RefCell::new(None),
+            nested_classes: RefCell::new(Vec::new()),
+            captured_env: Rc::clone(&self.globals),
+            supertype_delegates: RefCell::new(Vec::new()),
+            delegate_forwarders: RefCell::new(Vec::new()),
+        })))
+    }
+
     fn resolve_reified(&self, name: &str) -> String {
         for frame in self.reified_stack.iter().rev() {
             if let Some(real) = frame.get(name) {
@@ -1986,26 +2031,25 @@ impl Interpreter {
                 Ok(Value::PropertyRef { name: Rc::new(name.name.clone()) })
             }
             Expr::MemberRef { receiver, name, .. } => {
-                // `T::class` where `T` is a reified type param of an
-                // enclosing inline call: resolve through the reified frame
-                // before treating the receiver as a value.
+                // `T::class` / `Int::class` — resolve through the reified
+                // frame, then look the resolved name up through file scope
+                // and globals. When the resolved name is a Kotlin primitive
+                // (or other classifier without a user-side `Value::Class`),
+                // synthesize one so `simpleName` / `qualifiedName` work.
                 if name.name == "class" {
                     if let Expr::Path { segments, .. } = receiver.as_ref() {
                         if segments.len() == 1 {
                             let raw = &segments[0].name;
                             let resolved = self.resolve_reified(raw);
-                            if &resolved != raw {
-                                // Look up the resolved class name through
-                                // the active env first (so file-scope
-                                // classes are reachable), then fall back to
-                                // globals.
-                                let lookup = env
-                                    .borrow()
-                                    .lookup(&resolved)
-                                    .or_else(|| self.globals.borrow().lookup(&resolved));
-                                if let Some(v) = lookup {
-                                    return self.eval_member_ref(&v, &name.name);
-                                }
+                            let lookup = env
+                                .borrow()
+                                .lookup(&resolved)
+                                .or_else(|| self.globals.borrow().lookup(&resolved));
+                            if let Some(v) = lookup {
+                                return self.eval_member_ref(&v, &name.name);
+                            }
+                            if let Some(v) = self.synth_primitive_class(&resolved) {
+                                return self.eval_member_ref(&v, &name.name);
                             }
                         }
                     }
