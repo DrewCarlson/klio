@@ -5301,9 +5301,14 @@ impl<'r> Checker<'r> {
                 .with_code(codes::TYPE_NULL_SAFETY),
             );
         }
+        // Spec §11.3.2: a receiver whose static type is `Nothing` (or
+        // `Nothing?`) is never applicable for member callables. Skip the
+        // class-chain walk entirely so only extensions can resolve here.
+        let recv_is_nothing = matches!(recv_ty, Type::Nothing)
+            || matches!(recv_ty, Type::Nullable(inner) if matches!(**inner, Type::Nothing));
         let mut result = Type::Unresolved;
         let mut found_as_member = false;
-        if let Some(class) = recv_class {
+        if let Some(class) = recv_class.filter(|_| !recv_is_nothing) {
             if let Some((ty, cn)) = self.lookup_member_through_chain(class, name) {
                 result = ty;
                 found_as_member = true;
@@ -8046,6 +8051,25 @@ mod tests {
             fun f(x: Int): Int = x
             fun <T> f(x: T): Int = 0
             fun main() { val _r: Int = f(1) }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn nothing_receiver_uses_extension_only() {
+        // Spec §11.3.2: a receiver of type `Nothing` is not applicable
+        // for any member callable; only extensions remain. Without the
+        // class-chain walk firing on `Nothing`, the extension here must
+        // resolve cleanly even though no class declares `describe()`.
+        let tc = check_src(
+            r#"
+            fun Any?.describe(): String = "x"
+            fun bottom(): Nothing = throw RuntimeException("x")
+            fun main() {
+                val s: String = bottom().describe()
+                println(s)
+            }
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
