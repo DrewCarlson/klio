@@ -219,6 +219,7 @@ pub enum RangeKind {
     #[default]
     Int,
     Long,
+    Char,
 }
 
 /// Numeric promotion rank — wider types win in mixed arithmetic.
@@ -1127,6 +1128,13 @@ impl Value {
                         "kotlin.ranges.LongProgression"
                     }
                 }
+                RangeKind::Char => {
+                    if *step == 1 {
+                        "kotlin.ranges.CharRange"
+                    } else {
+                        "kotlin.ranges.CharProgression"
+                    }
+                }
             },
             Self::Function { .. }
             | Self::Lambda { .. }
@@ -1213,6 +1221,10 @@ impl Value {
                 RangeKind::Long => matches!(
                     name,
                     "LongRange" | "LongProgression" | "ClosedRange" | "Iterable" | "Any"
+                ),
+                RangeKind::Char => matches!(
+                    name,
+                    "CharRange" | "CharProgression" | "ClosedRange" | "Iterable" | "Any"
                 ),
             },
             Value::List { mutable, enum_class, .. } => {

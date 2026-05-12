@@ -1812,6 +1812,9 @@ impl Interpreter {
                             klio_runtime::RangeKind::Int => {
                                 Box::new(it.map(|v| Value::new_int(v as i32)))
                             }
+                            klio_runtime::RangeKind::Char => Box::new(it.map(|v| {
+                                char::from_u32(v as u32).map(Value::Char).unwrap_or(Value::Null)
+                            })),
                         }
                     }
                     Value::List { items, .. } => {
@@ -3940,6 +3943,9 @@ impl Interpreter {
                         let mk = |c: i64| match kind {
                             klio_runtime::RangeKind::Long => Value::Long(c),
                             klio_runtime::RangeKind::Int => Value::new_int(c as i32),
+                            klio_runtime::RangeKind::Char => char::from_u32(c as u32)
+                                .map(Value::Char)
+                                .unwrap_or(Value::Null),
                         };
                         if step > 0 {
                             while cur <= end {
@@ -4790,6 +4796,9 @@ impl Interpreter {
                                 out_items.push(match kind {
                                     klio_runtime::RangeKind::Long => Value::Long(n),
                                     klio_runtime::RangeKind::Int => Value::new_int(n as i32),
+                                    klio_runtime::RangeKind::Char => char::from_u32(n as u32)
+                                        .map(Value::Char)
+                                        .unwrap_or(Value::Null),
                                 });
                             }
                         }
@@ -8336,6 +8345,17 @@ fn destructure_components(
 ///   * `String/Char in String` — substring/contains.
 fn value_in(needle: &Value, haystack: &Value) -> Result<bool, RuntimeError> {
     match (needle, haystack) {
+        (Value::Char(c), Value::Range { start, end, step, kind: klio_runtime::RangeKind::Char }) => {
+            let n = *c as i64;
+            if *step == 0 {
+                return Ok(false);
+            }
+            if *step > 0 {
+                Ok(n >= *start && n <= *end && (n - *start) % *step == 0)
+            } else {
+                Ok(n <= *start && n >= *end && (*start - n) % (-*step) == 0)
+            }
+        }
         (n, Value::Range { start, end, step, .. }) if n.is_integral() => {
             let n = &n.as_i64().unwrap();
             if *step == 0 {
@@ -9216,6 +9236,18 @@ fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value, RuntimeError> {
             } else {
                 klio_runtime::RangeKind::Int
             },
+        }),
+        (Range, Char(a), Char(b)) => Ok(Value::Range {
+            start: *a as i64,
+            end: *b as i64,
+            step: 1,
+            kind: klio_runtime::RangeKind::Char,
+        }),
+        (RangeUntil, Char(a), Char(b)) => Ok(Value::Range {
+            start: *a as i64,
+            end: (*b as i64).saturating_sub(1),
+            step: 1,
+            kind: klio_runtime::RangeKind::Char,
         }),
 
         _ => Err(RuntimeError::Type(format!(

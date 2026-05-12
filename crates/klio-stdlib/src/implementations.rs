@@ -3205,6 +3205,9 @@ fn range_endpoint(kind: klio_runtime::RangeKind, v: i64) -> Value {
     match kind {
         klio_runtime::RangeKind::Long => Value::Long(v),
         klio_runtime::RangeKind::Int => Value::Int(v as i32),
+        klio_runtime::RangeKind::Char => char::from_u32(v as u32)
+            .map(Value::Char)
+            .unwrap_or(Value::Char('\0')),
     }
 }
 
@@ -3291,6 +3294,7 @@ fn range_sum(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(match kind {
         klio_runtime::RangeKind::Long => Value::Long(s),
         klio_runtime::RangeKind::Int => Value::new_int(s),
+        klio_runtime::RangeKind::Char => Value::new_int(s),
     })
 }
 
