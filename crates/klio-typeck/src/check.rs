@@ -378,6 +378,32 @@ pub mod codes {
     /// `kotlin.Throwable`. Spec §16.2: only values of exception types may
     /// be thrown.
     pub const TYPE_THROW_NON_THROWABLE: &str = "T0106";
+    /// Spec §17.1: annotation type cannot reference itself directly or
+    /// transitively (via `Array<A>` or another annotation type).
+    pub const TYPE_ANNOTATION_CYCLE: &str = "T0107";
+    /// Spec §17.1: annotation-class primary-ctor parameter default values
+    /// must be compile-time constant expressions of the allowed types.
+    pub const TYPE_ANNOTATION_PARAM_DEFAULT_NOT_CONST: &str = "T0108";
+    /// Spec §17.4: non-repeatable annotations cannot be applied to the
+    /// same entity more than once.
+    pub const TYPE_ANNOTATION_NOT_REPEATABLE: &str = "T0109";
+    /// Spec §17.3: annotation application site does not match any of the
+    /// declared `@Target` entries on the annotation class.
+    pub const TYPE_ANNOTATION_TARGET_MISMATCH: &str = "T0110";
+    /// Spec §17.5.5: use site references a declaration marked
+    /// `@Deprecated(level = DeprecationLevel.ERROR)` or HIDDEN.
+    pub const TYPE_DEPRECATED_ERROR: &str = "T0111";
+    /// Spec §17.5.4: use site references a declaration marked
+    /// `@RequiresOptIn(level = Level.ERROR)` without an enclosing `@OptIn`
+    /// for the matching marker.
+    pub const TYPE_OPT_IN_REQUIRED: &str = "T0112";
+    /// Spec §17.5.9: member call resolves through a shadowed implicit
+    /// receiver that belongs to the same DSL.
+    pub const TYPE_DSL_SCOPE_VIOLATION: &str = "T0113";
+    /// Spec §17.5.5: WARNING level deprecation.
+    pub const WARN_DEPRECATED: &str = "W0006";
+    /// Spec §17.5.4: WARNING level opt-in.
+    pub const WARN_OPT_IN: &str = "W0007";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -657,6 +683,14 @@ struct Checker<'a> {
     fn_annotations: HashMap<String, Vec<Vec<klio_ast::Annotation>>>,
     /// Annotations of each top-level property by simple name.
     prop_annotations: HashMap<String, Vec<klio_ast::Annotation>>,
+    /// File-level set of `annotation class` simple names. Populated before
+    /// Phase F so `check_annotation_class` can accept another annotation
+    /// type as a primary-ctor parameter type per spec §17.1.
+    annotation_class_names: HashSet<String>,
+    /// File-level set of `enum class` simple names. Populated before
+    /// Phase F so `check_annotation_class` can accept enum types as
+    /// primary-ctor parameter types per spec §17.1.
+    enum_class_names: HashSet<String>,
 }
 
 /// Description of a user-declared `typealias`.
@@ -698,6 +732,8 @@ impl<'a> Checker<'a> {
             type_params_in_scope: Vec::new(),
             fn_annotations: HashMap::new(),
             prop_annotations: HashMap::new(),
+            annotation_class_names: HashSet::new(),
+            enum_class_names: HashSet::new(),
         }
     }
 
@@ -721,6 +757,21 @@ impl<'a> Checker<'a> {
             self.check_definitely_non_null_decl(d, &mut tp_scope);
         }
         // Phase F: `const val`, `value class`, `annotation class` shape checks.
+        // Pre-seed the annotation- and enum-class name sets so the
+        // annotation-class parameter-type check (T0037) can recognise other
+        // annotation types and enums per spec §17.1.
+        {
+            let mut anns: Vec<&Class> = Vec::new();
+            collect_annotation_classes(&file.decls, &mut anns);
+            for c in anns {
+                self.annotation_class_names.insert(c.name.name.clone());
+            }
+            let mut enums: Vec<&Class> = Vec::new();
+            collect_enum_classes(&file.decls, &mut enums);
+            for c in enums {
+                self.enum_class_names.insert(c.name.name.clone());
+            }
+        }
         for d in &file.decls {
             self.check_phase_f_decl(d, PhaseFScope::TopLevel);
         }
@@ -737,6 +788,8 @@ impl<'a> Checker<'a> {
         for d in &file.decls {
             self.check_phase_j_decl(d, /*in_accessor=*/ false);
         }
+        // §17.1: annotation-class self-reference cycle detection.
+        self.check_annotation_cycles(file);
         // Phase K: `tailrec` tail-call analysis.
         for d in &file.decls {
             self.check_phase_k_decl(d);
@@ -2336,7 +2389,11 @@ impl<'a> Checker<'a> {
             );
         }
         for p in &c.primary_params {
-            if !is_annotation_param_type(&p.ty.name.name) || p.ty.nullable {
+            let head = &p.ty.name.name;
+            let allowed_head = is_annotation_param_type(head)
+                || self.annotation_class_names.contains(head)
+                || self.enum_class_names.contains(head);
+            if !allowed_head || p.ty.nullable {
                 self.diagnostics.emit(
                     Diagnostic::error(
                         format!(
@@ -2355,7 +2412,10 @@ impl<'a> Checker<'a> {
                 // are unwrapped via `TypeArg.ty`.
                 if let Some(arg) = p.ty.type_args.first() {
                     let inner = &arg.ty.name.name;
-                    if !is_annotation_param_type(inner) || arg.ty.nullable {
+                    let inner_ok = is_annotation_param_type(inner)
+                        || self.annotation_class_names.contains(inner)
+                        || self.enum_class_names.contains(inner);
+                    if !inner_ok || arg.ty.nullable {
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 format!(
@@ -2369,6 +2429,56 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// Spec §17.1: an annotation type cannot reference itself, either
+    /// directly or indirectly (through another annotation type, or
+    /// through `Array<T>` whose element is an annotation type).
+    fn check_annotation_cycles(&mut self, file: &KotlinFile) {
+        let mut classes: Vec<&Class> = Vec::new();
+        collect_annotation_classes(&file.decls, &mut classes);
+        if classes.is_empty() {
+            return;
+        }
+        let name_set: HashSet<String> =
+            classes.iter().map(|c| c.name.name.clone()).collect();
+        let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+        let mut spans: HashMap<String, Span> = HashMap::new();
+        for c in &classes {
+            spans.insert(c.name.name.clone(), c.name.span);
+            let mut out: Vec<String> = Vec::new();
+            for p in &c.primary_params {
+                let head = &p.ty.name.name;
+                if name_set.contains(head) {
+                    out.push(head.clone());
+                } else if head == "Array" {
+                    if let Some(arg) = p.ty.type_args.first() {
+                        let inner = &arg.ty.name.name;
+                        if name_set.contains(inner) {
+                            out.push(inner.clone());
+                        }
+                    }
+                }
+            }
+            deps.insert(c.name.name.clone(), out);
+        }
+        for c in &classes {
+            let start = &c.name.name;
+            let mut seen: HashSet<String> = HashSet::new();
+            if annotation_reaches_self(start, start, &deps, &mut seen) {
+                let span = spans[start];
+                self.diagnostics.emit(
+                    Diagnostic::error(
+                        format!(
+                            "annotation class `{}` cannot reference itself, directly or transitively",
+                            start
+                        ),
+                        span,
+                    )
+                    .with_code(codes::TYPE_ANNOTATION_CYCLE),
+                );
             }
         }
     }
@@ -8347,6 +8457,51 @@ fn expr_uses_field(e: &Expr) -> bool {
         Expr::Labeled { expr, .. } => expr_uses_field(expr),
         _ => false,
     }
+}
+
+fn collect_annotation_classes<'a>(decls: &'a [Decl], out: &mut Vec<&'a Class>) {
+    for d in decls {
+        if let Decl::Class(c) = d {
+            if c.is_annotation {
+                out.push(c);
+            }
+            collect_annotation_classes(&c.members, out);
+        }
+    }
+}
+
+fn collect_enum_classes<'a>(decls: &'a [Decl], out: &mut Vec<&'a Class>) {
+    for d in decls {
+        if let Decl::Class(c) = d {
+            if c.is_enum {
+                out.push(c);
+            }
+            collect_enum_classes(&c.members, out);
+        }
+    }
+}
+
+fn annotation_reaches_self(
+    start: &str,
+    current: &str,
+    deps: &HashMap<String, Vec<String>>,
+    seen: &mut HashSet<String>,
+) -> bool {
+    if !seen.insert(current.to_string()) {
+        return false;
+    }
+    let Some(targets) = deps.get(current) else {
+        return false;
+    };
+    for t in targets {
+        if t == start {
+            return true;
+        }
+        if annotation_reaches_self(start, t, deps, seen) {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_annotation_param_type(name: &str) -> bool {

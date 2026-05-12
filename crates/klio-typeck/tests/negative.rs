@@ -443,6 +443,27 @@ fn neg_annotation_class_param_type() {
 }
 
 #[test]
+fn neg_annotation_class_cycle_direct() {
+    assert!(type_codes_for("neg_annotation_class_cycle_direct.kt")
+        .iter()
+        .any(|c| c == "T0107"));
+}
+
+#[test]
+fn neg_annotation_class_cycle_array() {
+    assert!(type_codes_for("neg_annotation_class_cycle_array.kt")
+        .iter()
+        .any(|c| c == "T0107"));
+}
+
+#[test]
+fn neg_annotation_class_unsupported_user_param() {
+    assert!(type_codes_for("neg_annotation_class_unsupported_user_param.kt")
+        .iter()
+        .any(|c| c == "T0037"));
+}
+
+#[test]
 fn neg_recursive_typealias() {
     assert!(type_codes_for("neg_recursive_typealias.kt")
         .iter()
