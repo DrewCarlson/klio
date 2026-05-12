@@ -7474,6 +7474,17 @@ impl Interpreter {
                 }
                 _ => {}
             }
+            // `Function.invoke(...)` — explicit invocation of a callable
+            // value. Mirrors what `recv(...)` would dispatch.
+            if name.name == "invoke" {
+                if let Value::Lambda { params, body, env: captured } = &recv {
+                    let mut arg_vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        arg_vals.push(self.eval_expr(a, env, out)?);
+                    }
+                    return self.call_lambda(params, body, captured, &arg_vals, out);
+                }
+            }
             return Err(RuntimeError::Unimplemented(type_fqn));
         }
 
