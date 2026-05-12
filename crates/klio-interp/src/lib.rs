@@ -6654,7 +6654,20 @@ impl Interpreter {
                 func(&mut ctx)
             }
             Value::Function { decl, env: captured } => {
-                self.call_function_named_spread(&decl, &captured, &arg_vals, arg_names, &is_spread_mask, out)
+                // Spec §4.2 implicit lambda labels: a lambda passed as an
+                // argument may be exited via `return@<callee-name>`. Bind
+                // the callee's simple name onto the lambda-label stack for
+                // the duration of the call so lambdas executed inside the
+                // user function recognize the label as their own.
+                let pushed = simple_callee_name(callee).map(|s| s.to_string());
+                if let Some(l) = &pushed {
+                    self.implicit_lambda_label_stack.push(l.clone());
+                }
+                let r = self.call_function_named_spread(&decl, &captured, &arg_vals, arg_names, &is_spread_mask, out);
+                if pushed.is_some() {
+                    self.implicit_lambda_label_stack.pop();
+                }
+                r
             }
             Value::Lambda { params, body, env: captured } => {
                 self.call_lambda(&params, &body, &captured, &arg_vals, out)
