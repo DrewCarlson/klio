@@ -310,6 +310,12 @@ pub mod codes {
     /// length does not match the type-parameter count of any candidate in
     /// the overload set. Spec §11.2.8.
     pub const TYPE_TYPE_ARGUMENT_COUNT_MISMATCH: &str = "T0092";
+    /// `super.member` is ambiguous: multiple supertypes contribute a
+    /// member with this name. Spec §11.2.2 "Call with an explicit
+    /// super-form receiver" — basic super-form requires exactly one
+    /// supertype to define the member; otherwise the caller must
+    /// disambiguate with `super<TypeName>.member`.
+    pub const TYPE_AMBIGUOUS_SUPER: &str = "T0093";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -4696,6 +4702,17 @@ impl<'r> Checker<'r> {
                         }
                     }
                 }
+                // Spec §11.2.2: `super.f(...)` with no `<Qualifier>` must
+                // resolve to a member from exactly one direct supertype.
+                // Two or more contributing supertypes require the caller
+                // to disambiguate via `super<Type>.f(...)`.
+                if let Expr::Member { receiver, name, .. } = callee.as_ref() {
+                    if let Expr::Super { qualifier: None, span: super_span, .. } =
+                        receiver.as_ref()
+                    {
+                        self.check_ambiguous_super(name.name.as_str(), *super_span);
+                    }
+                }
                 // Spec §4.2: implicit lambda label — bind the call's
                 // callee simple name as a label visible inside any lambda
                 // argument so `xs.forEach { return@forEach }` checks.
@@ -5778,6 +5795,33 @@ impl<'r> Checker<'r> {
                     call_span,
                 )
                 .with_code(codes::TYPE_INFIX_MODIFIER_REQUIRED),
+            );
+        }
+    }
+
+    /// Spec §11.2.2 basic super-form: walk the enclosing class's direct
+    /// supertypes and emit T0093 when two or more contribute a member
+    /// named `name`. The diagnostic encourages disambiguation via
+    /// `super<TypeName>.name(...)`.
+    fn check_ambiguous_super(&mut self, name: &str, super_span: Span) {
+        let Some(enclosing) = self.class_stack.last().cloned() else { return };
+        let Some(info) = self.classes.get(&enclosing).cloned() else { return };
+        let mut contributors: Vec<String> = Vec::new();
+        for s in &info.supertypes {
+            if self.lookup_member_through_chain(s, name).is_some() {
+                contributors.push(s.clone());
+            }
+        }
+        if contributors.len() >= 2 {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "`super.{name}` is ambiguous: members named `{name}` exist in {}. Use `super<TypeName>.{name}(...)` to disambiguate.",
+                        contributors.join(" and ")
+                    ),
+                    super_span,
+                )
+                .with_code(codes::TYPE_AMBIGUOUS_SUPER),
             );
         }
     }
@@ -8054,6 +8098,37 @@ mod tests {
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn super_ambiguous_reports_t0093() {
+        // Spec §11.2.2: both supertypes define `f`, basic `super.f` is
+        // ambiguous; require `super<TypeName>.f`.
+        let tc = check_src(
+            r#"
+            interface A { fun f(): Int }
+            interface B { fun f(): Int }
+            class C : A, B {
+                override fun f(): Int = super.f() + 1
+            }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::TYPE_AMBIGUOUS_SUPER));
+    }
+
+    #[test]
+    fn super_qualified_unambiguous_ok() {
+        let tc = check_src(
+            r#"
+            interface A { fun f(): Int { return 1 } }
+            interface B { fun f(): Int { return 2 } }
+            class C : A, B {
+                override fun f(): Int = super<A>.f() + super<B>.f()
+            }
+            "#,
+        );
+        let cs = codes(&tc);
+        assert!(!cs.contains(&codes::TYPE_AMBIGUOUS_SUPER), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
