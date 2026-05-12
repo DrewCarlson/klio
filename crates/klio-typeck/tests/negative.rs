@@ -562,6 +562,13 @@ fn neg_data_class_vararg_property() {
 }
 
 #[test]
+fn neg_annotation_array_bad_element() {
+    assert!(type_codes_for("neg_annotation_array_bad_element.kt")
+        .iter()
+        .any(|c| c == "T0037"));
+}
+
+#[test]
 fn neg_published_api_missing() {
     assert!(type_codes_for("neg_published_api_missing.kt")
         .iter()

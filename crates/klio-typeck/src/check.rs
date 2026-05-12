@@ -1394,6 +1394,28 @@ impl<'a> Checker<'a> {
                     )
                     .with_code(codes::TYPE_ANNOTATION_PARAM_TYPE),
                 );
+            } else if p.ty.name.name == "Array" {
+                // Spec §4.1.4: Array element type is restricted to the same
+                // allowed-type set (primitives / String / KClass / annotation /
+                // enum). Look into the first type-argument; reject anything
+                // that isn't a recognised allowed name. `out T` projections
+                // are unwrapped via `TypeArg.ty`.
+                if let Some(arg) = p.ty.type_args.first() {
+                    let inner = &arg.ty.name.name;
+                    if !is_annotation_param_type(inner) || arg.ty.nullable {
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                format!(
+                                    "annotation-class parameter `{}` has `Array` of unsupported \
+                                     element type `{}`",
+                                    p.name.name, inner
+                                ),
+                                arg.ty.span,
+                            )
+                            .with_code(codes::TYPE_ANNOTATION_PARAM_TYPE),
+                        );
+                    }
+                }
             }
         }
     }
