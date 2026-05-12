@@ -790,6 +790,8 @@ impl<'a> Checker<'a> {
         }
         // §17.1: annotation-class self-reference cycle detection.
         self.check_annotation_cycles(file);
+        // §17.3 / §17.4: annotation @Target / @Repeatable enforcement.
+        self.check_annotation_applications(file);
         // Phase K: `tailrec` tail-call analysis.
         for d in &file.decls {
             self.check_phase_k_decl(d);
@@ -2485,6 +2487,38 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
+
+    /// Spec §17.3 / §17.4: enforce `@Target` and `@Repeatable` on
+    /// annotation applications across the whole file.
+    ///
+    /// `@Target(AnnotationTarget.X, ...)` on an annotation class restricts
+    /// the source-level entities the annotation may be applied to.
+    /// `@Repeatable` opts the annotation into being applied to the same
+    /// entity more than once; non-repeatable annotations (the default)
+    /// applied twice to the same entity get T0109.
+    fn check_annotation_applications(&mut self, file: &KotlinFile) {
+        let mut meta: HashMap<String, AnnotationMeta> = HashMap::new();
+        let mut classes: Vec<&Class> = Vec::new();
+        collect_annotation_classes(&file.decls, &mut classes);
+        for c in classes {
+            let mut m = AnnotationMeta::default();
+            for a in &c.annotations {
+                let leaf = a.path.last().map(|s| s.name.as_str()).unwrap_or("");
+                if leaf == "Repeatable" {
+                    m.repeatable = true;
+                } else if leaf == "Target" {
+                    let mut targets: Vec<AnnotationTarget> = Vec::new();
+                    for arg in &a.args {
+                        extract_annotation_targets(arg, &mut targets);
+                    }
+                    m.targets = Some(targets);
+                }
+            }
+            meta.insert(c.name.name.clone(), m);
+        }
+        let mut walker = AnnotationWalker { ch: self, meta: &meta };
+        walker.walk_file(file);
     }
 
     /// Spec §17.1: an annotation type cannot reference itself, either
@@ -8510,6 +8544,235 @@ fn expr_uses_field(e: &Expr) -> bool {
         Expr::Spread { expr, .. } => expr_uses_field(expr),
         Expr::Labeled { expr, .. } => expr_uses_field(expr),
         _ => false,
+    }
+}
+
+/// Spec §17.3 annotation target kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AnnotationTarget {
+    Class,
+    AnnotationClass,
+    TypeParameter,
+    Property,
+    Field,
+    LocalVariable,
+    ValueParameter,
+    Constructor,
+    Function,
+    PropertyGetter,
+    PropertySetter,
+    Type,
+    Expression,
+    File,
+    TypeAlias,
+}
+
+impl AnnotationTarget {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "CLASS" => Self::Class,
+            "ANNOTATION_CLASS" => Self::AnnotationClass,
+            "TYPE_PARAMETER" => Self::TypeParameter,
+            "PROPERTY" => Self::Property,
+            "FIELD" => Self::Field,
+            "LOCAL_VARIABLE" => Self::LocalVariable,
+            "VALUE_PARAMETER" => Self::ValueParameter,
+            "CONSTRUCTOR" => Self::Constructor,
+            "FUNCTION" => Self::Function,
+            "PROPERTY_GETTER" => Self::PropertyGetter,
+            "PROPERTY_SETTER" => Self::PropertySetter,
+            "TYPE" => Self::Type,
+            "EXPRESSION" => Self::Expression,
+            "FILE" => Self::File,
+            "TYPEALIAS" => Self::TypeAlias,
+            _ => return None,
+        })
+    }
+
+    fn display(self) -> &'static str {
+        match self {
+            Self::Class => "CLASS",
+            Self::AnnotationClass => "ANNOTATION_CLASS",
+            Self::TypeParameter => "TYPE_PARAMETER",
+            Self::Property => "PROPERTY",
+            Self::Field => "FIELD",
+            Self::LocalVariable => "LOCAL_VARIABLE",
+            Self::ValueParameter => "VALUE_PARAMETER",
+            Self::Constructor => "CONSTRUCTOR",
+            Self::Function => "FUNCTION",
+            Self::PropertyGetter => "PROPERTY_GETTER",
+            Self::PropertySetter => "PROPERTY_SETTER",
+            Self::Type => "TYPE",
+            Self::Expression => "EXPRESSION",
+            Self::File => "FILE",
+            Self::TypeAlias => "TYPEALIAS",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct AnnotationMeta {
+    /// `@Repeatable` set on the annotation class.
+    repeatable: bool,
+    /// `@Target(...)` set on the annotation class. `None` means no
+    /// explicit `@Target` — application sites are not restricted.
+    targets: Option<Vec<AnnotationTarget>>,
+}
+
+fn extract_annotation_targets(e: &Expr, out: &mut Vec<AnnotationTarget>) {
+    match e {
+        Expr::Path { segments, .. } => {
+            if let Some(seg) = segments.last() {
+                if let Some(t) = AnnotationTarget::from_name(&seg.name) {
+                    out.push(t);
+                }
+            }
+        }
+        Expr::Member { name, .. } => {
+            if let Some(t) = AnnotationTarget::from_name(&name.name) {
+                out.push(t);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct AnnotationWalker<'a, 'r> {
+    ch: &'a mut Checker<'r>,
+    meta: &'a HashMap<String, AnnotationMeta>,
+}
+
+impl<'a, 'r> AnnotationWalker<'a, 'r> {
+    fn walk_file(&mut self, file: &KotlinFile) {
+        self.check_set(&[], AnnotationTarget::File);
+        for d in &file.decls {
+            self.walk_decl(d);
+        }
+    }
+
+    fn walk_decl(&mut self, d: &Decl) {
+        match d {
+            Decl::Function(f) => self.walk_function(f),
+            Decl::Property(p) => self.walk_property(p, /*local=*/ false),
+            Decl::Class(c) => self.walk_class(c),
+            Decl::Object(o) => {
+                for m in &o.members {
+                    self.walk_decl(m);
+                }
+            }
+            Decl::TypeAlias(a) => {
+                self.check_set(&a.annotations, AnnotationTarget::TypeAlias);
+            }
+        }
+    }
+
+    fn walk_function(&mut self, f: &Function) {
+        self.check_set(&f.annotations, AnnotationTarget::Function);
+        for tp in &f.type_params {
+            self.check_set(&tp.annotations, AnnotationTarget::TypeParameter);
+        }
+        for p in &f.params {
+            self.check_set(&p.annotations, AnnotationTarget::ValueParameter);
+        }
+    }
+
+    fn walk_property(&mut self, p: &Property, local: bool) {
+        let site = if local {
+            AnnotationTarget::LocalVariable
+        } else {
+            AnnotationTarget::Property
+        };
+        self.check_set(&p.annotations, site);
+        if let Some(g) = &p.getter {
+            self.check_set(&g.annotations, AnnotationTarget::PropertyGetter);
+        }
+        if let Some(s) = &p.setter {
+            self.check_set(&s.annotations, AnnotationTarget::PropertySetter);
+        }
+    }
+
+    fn walk_class(&mut self, c: &Class) {
+        let site = if c.is_annotation {
+            AnnotationTarget::AnnotationClass
+        } else {
+            AnnotationTarget::Class
+        };
+        self.check_set(&c.annotations, site);
+        for tp in &c.type_params {
+            self.check_set(&tp.annotations, AnnotationTarget::TypeParameter);
+        }
+        for p in &c.primary_params {
+            self.check_set(&p.annotations, AnnotationTarget::ValueParameter);
+        }
+        for sc in &c.secondary_ctors {
+            self.check_set(&sc.annotations, AnnotationTarget::Constructor);
+            for p in &sc.params {
+                self.check_set(&p.annotations, AnnotationTarget::ValueParameter);
+            }
+        }
+        for e in &c.enum_entries {
+            self.check_set(&e.annotations, AnnotationTarget::Property);
+        }
+        for m in &c.members {
+            self.walk_decl(m);
+        }
+    }
+
+    fn check_set(&mut self, anns: &[klio_ast::Annotation], site: AnnotationTarget) {
+        use std::collections::HashMap as Map;
+        let mut counts: Map<String, (Span, &klio_ast::Annotation)> = Map::new();
+        for a in anns {
+            let leaf = match a.path.last() {
+                Some(s) => s.name.clone(),
+                None => continue,
+            };
+            // §17.3 @Target check — only when we know the annotation
+            // class and it carries a @Target list.
+            if let Some(m) = self.meta.get(&leaf) {
+                if let Some(targets) = &m.targets {
+                    if !targets.contains(&site) {
+                        self.ch.diagnostics.emit(
+                            Diagnostic::error(
+                                format!(
+                                    "annotation `@{}` cannot be applied to {} — declared @Target list is {{{}}}",
+                                    leaf,
+                                    site.display(),
+                                    targets
+                                        .iter()
+                                        .map(|t| t.display())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                                a.span,
+                            )
+                            .with_code(codes::TYPE_ANNOTATION_TARGET_MISMATCH),
+                        );
+                    }
+                }
+            }
+            // §17.4 duplicate detection — only when the annotation class
+            // is known to be non-repeatable (it lives in `self.meta` and
+            // its `repeatable` flag is `false`).
+            if let Some((prev_span, _)) = counts.get(&leaf) {
+                if let Some(m) = self.meta.get(&leaf) {
+                    if !m.repeatable {
+                        self.ch.diagnostics.emit(
+                            Diagnostic::error(
+                                format!(
+                                    "annotation `@{}` is not repeatable but is applied more than once",
+                                    leaf
+                                ),
+                                a.span,
+                            )
+                            .with_code(codes::TYPE_ANNOTATION_NOT_REPEATABLE)
+                            .with_label(*prev_span, "previously applied here"),
+                        );
+                    }
+                }
+            } else {
+                counts.insert(leaf, (a.span, a));
+            }
+        }
     }
 }
 

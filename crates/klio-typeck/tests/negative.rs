@@ -457,6 +457,20 @@ fn neg_annotation_class_cycle_array() {
 }
 
 #[test]
+fn neg_annotation_duplicate_non_repeatable() {
+    assert!(type_codes_for("neg_annotation_duplicate_non_repeatable.kt")
+        .iter()
+        .any(|c| c == "T0109"));
+}
+
+#[test]
+fn neg_annotation_target_class_only_on_function() {
+    assert!(type_codes_for("neg_annotation_target_class_only_on_function.kt")
+        .iter()
+        .any(|c| c == "T0110"));
+}
+
+#[test]
 fn neg_annotation_class_param_default_non_const() {
     assert!(type_codes_for("neg_annotation_class_param_default_non_const.kt")
         .iter()
