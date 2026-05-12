@@ -748,3 +748,12 @@ fn pos_definitely_non_null_on_type_param() {
         .collect();
     assert!(!codes.iter().any(|c| c == "T0027"), "unexpected T0027 on type parameter use: {codes:?}");
 }
+
+#[test]
+fn neg_label_on_arbitrary_expr() {
+    assert!(
+        type_codes_for("neg_label_on_arbitrary_expr.kt")
+            .iter()
+            .any(|c| c == "T0078")
+    );
+}

@@ -252,6 +252,10 @@ pub mod codes {
     /// modifiers. Spec §5.1: data, enum, and annotation classes are
     /// always closed.
     pub const TYPE_DATA_OR_ENUM_CLASS_OPEN_OR_ABSTRACT: &str = "T0072";
+    /// A label was attached to an expression that is not labelable per
+    /// spec §6.3 (only lambda literals, loops, and calls that pass a
+    /// trailing lambda may carry a label).
+    pub const TYPE_LABEL_TARGET_NOT_LABELABLE: &str = "T0078";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -4166,6 +4170,18 @@ impl<'r> Checker<'r> {
                 Type::Nothing
             }
             Expr::Labeled { label, expr, .. } => {
+                if !is_labelable_target(expr) {
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "Label `{}@` can only be attached to a lambda literal, a loop, or a call with a trailing lambda",
+                                label.name
+                            ),
+                            label.span,
+                        )
+                        .with_code(codes::TYPE_LABEL_TARGET_NOT_LABELABLE),
+                    );
+                }
                 self.label_stack.push(label.name.clone());
                 let ty = self.check_expr(expr, expected);
                 self.label_stack.pop();
@@ -5729,6 +5745,17 @@ fn block_uses_field(b: &Block) -> bool {
         Stmt::Decl(Decl::Property(p)) => p.init.as_ref().map_or(false, expr_uses_field),
         _ => false,
     })
+}
+
+/// Spec §6.3: labels may only be attached to lambda literals, loop
+/// statements, or a call whose trailing argument is a lambda literal.
+fn is_labelable_target(e: &Expr) -> bool {
+    match e {
+        Expr::Lambda { .. } => true,
+        Expr::For { .. } | Expr::While { .. } => true,
+        Expr::Call { args, .. } => matches!(args.last(), Some(Expr::Lambda { .. })),
+        _ => false,
+    }
 }
 
 fn expr_uses_field(e: &Expr) -> bool {
