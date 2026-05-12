@@ -875,6 +875,20 @@ mod tests {
     }
 
     #[test]
+    fn forward_reference_to_local_val_in_statement_scope_errors() {
+        // Spec §6: statement scopes bind names in source order; forward refs
+        // are illegal.
+        let ast = parse(r#"
+            fun main() {
+                println(x)
+                val x = 1
+            }
+        "#);
+        let r = resolve(&ast);
+        assert!(codes(&r).contains(&"R0001"));
+    }
+
+    #[test]
     fn object_literal_member_forward_reference_resolves() {
         let ast = parse(r#"
             interface Greeter { fun hello(): String }
