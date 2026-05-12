@@ -734,6 +734,10 @@ impl Interpreter {
         let param_names: Vec<&str> = decl.params.iter().map(|p| p.name.name.as_str()).collect();
         let slotted = reorder_named_args(args, arg_names, &param_names, &decl.name.name)?;
         let frame = Rc::new(RefCell::new(Env::with_parent(Rc::clone(captured_env))));
+        // Spec §8.24: inside the extension body and any lambda nested in
+        // it, `this@<fnName>` must resolve to the extension receiver.
+        let this_at_fn = format!("this@{}", decl.name.name);
+        frame.borrow_mut().define(this_at_fn, receiver.clone());
         frame.borrow_mut().define("this", receiver);
         for (i, p) in decl.params.iter().enumerate() {
             let v = if let Some(Some(v)) = slotted.get(i) {
