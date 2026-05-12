@@ -660,6 +660,16 @@ fn neg_published_api_missing() {
 }
 
 #[test]
+fn neg_private_open() {
+    assert!(type_codes_for("neg_private_open.kt").iter().any(|c| c == "T0070"));
+}
+
+#[test]
+fn neg_private_override() {
+    assert!(type_codes_for("neg_private_override.kt").iter().any(|c| c == "T0070"));
+}
+
+#[test]
 fn neg_inherit_from_final() {
     assert!(type_codes_for("neg_inherit_from_final.kt").iter().any(|c| c == "T0063"));
 }

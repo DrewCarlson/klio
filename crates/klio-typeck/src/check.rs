@@ -2645,6 +2645,35 @@ impl<'r> Checker<'r> {
                 .with_code(codes::TYPE_THROWABLE_TYPE_PARAMS),
             );
         }
+        // Spec §5.4: `private` is mutually exclusive with `open`,
+        // `abstract`, and `override` on a member declaration.
+        for m in &c.members {
+            match m {
+                Decl::Function(f) => {
+                    if matches!(f.visibility, Visibility::Private) {
+                        self.check_private_open_or_override(
+                            &f.name.name,
+                            f.name.span,
+                            f.is_open,
+                            f.is_abstract,
+                            f.is_override,
+                        );
+                    }
+                }
+                Decl::Property(p) => {
+                    if matches!(p.visibility, Visibility::Private) {
+                        self.check_private_open_or_override(
+                            &p.name.name,
+                            p.name.span,
+                            false,
+                            p.is_abstract,
+                            p.is_override,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
         // Spec §5.1: supertype validity. A class may inherit from at most
         // one class (open / abstract / sealed) plus any number of
         // interfaces. Inheriting from a closed (default-final) class or
@@ -2936,6 +2965,36 @@ impl<'r> Checker<'r> {
     /// good enough for diagnostic purposes — the override-correctness
     /// check only cares whether *some* supertype declared an open/abstract
     /// member with that name.
+    fn check_private_open_or_override(
+        &mut self,
+        name: &str,
+        span: Span,
+        is_open: bool,
+        is_abstract: bool,
+        is_override: bool,
+    ) {
+        let modifier = if is_open {
+            Some("open")
+        } else if is_abstract {
+            Some("abstract")
+        } else if is_override {
+            Some("override")
+        } else {
+            None
+        };
+        if let Some(modifier) = modifier {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "`{name}` cannot be both `private` and `{modifier}` (spec §5.4)"
+                    ),
+                    span,
+                )
+                .with_code(codes::TYPE_PRIVATE_AND_OPEN_OR_ABSTRACT_OR_OVERRIDE),
+            );
+        }
+    }
+
     /// Spec §5.1: check each declared supertype is legal to inherit from.
     /// Closed (default-final) user classes and `object` types are forbidden;
     /// interfaces, `open` / `abstract` / `sealed` classes are allowed. Built-in
