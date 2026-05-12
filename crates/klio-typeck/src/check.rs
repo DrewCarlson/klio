@@ -367,7 +367,7 @@ struct ClassInfo {
     #[allow(dead_code)]
     is_open: bool,
     /// `object` singleton — registered in `classes` so member lookup works
-    /// but never inheritable (spec §5.1) and never instantiable.
+    /// but never inheritable and never instantiable.
     is_object: bool,
     /// Declared inside a function body (local class) or via `object { … }`
     /// (anonymous object). Used to enforce the sealed-inheritor §5.1.2
@@ -671,7 +671,7 @@ impl<'a> Checker<'a> {
                         Diagnostic::error(
                             format!(
                                 "property `{}` has custom accessors that don't use `field`, so it \
-                                 has no backing field — initializer is not allowed (spec §4.3.4)",
+                                 has no backing field — initializer is not allowed",
                                 p.name.name
                             ),
                             p.name.span,
@@ -1258,7 +1258,7 @@ impl<'a> Checker<'a> {
                         Diagnostic::error(
                             format!(
                                 "inline parameter `{n}` cannot escape the function body — only \
-                                 direct invocation is allowed (spec §4.2.5)"
+                                 direct invocation is allowed"
                             ),
                             *span,
                         )
@@ -1314,7 +1314,7 @@ impl<'a> Checker<'a> {
         if crossinline_params.iter().any(|p| p == n) && action != "passed as an argument" {
             self.diagnostics.emit(
                 Diagnostic::error(
-                    format!("crossinline parameter `{n}` cannot be {action} (spec §4.2.5)"),
+                    format!("crossinline parameter `{n}` cannot be {action}"),
                     *span,
                 )
                 .with_code(codes::TYPE_CROSSINLINE_PARAM_LEAK),
@@ -1329,7 +1329,7 @@ impl<'a> Checker<'a> {
             self.diagnostics.emit(
                 Diagnostic::error(
                     format!(
-                        "inline parameter `{n}` cannot be {action} (spec §4.2.5)"
+                        "inline parameter `{n}` cannot be {action}"
                     ),
                     *span,
                 )
@@ -1358,7 +1358,7 @@ impl<'a> Checker<'a> {
                 Diagnostic::error(
                     format!(
                         "`inline` property `{}` must not have a backing field; declare \
-                         explicit accessors that do not reference `field` (spec §4.3.4)",
+                         explicit accessors that do not reference `field`",
                         p.name.name
                     ),
                     p.name.span,
@@ -2507,7 +2507,7 @@ impl<'r> Checker<'r> {
                     self.diagnostics.emit(
                         Diagnostic::error(
                             format!(
-                                "`{kind} class {}` cannot be declared `{mod_name}` (spec §5.1)",
+                                "`{kind} class {}` cannot be declared `{mod_name}`",
                                 c.name.name
                             ),
                             c.name.span,
@@ -2562,7 +2562,7 @@ impl<'r> Checker<'r> {
                         Diagnostic::error(
                             format!(
                                 "secondary constructor of `{}` participates in a delegation \
-                                 cycle (spec §4.1.1)",
+                                 cycle",
                                 c.name.name
                             ),
                             c.secondary_ctors[start].span,
@@ -2581,7 +2581,7 @@ impl<'r> Checker<'r> {
                     Diagnostic::error(
                         format!(
                             "data class `{}` must declare at least one primary-constructor \
-                             property (spec §4.1.2)",
+                             property",
                             c.name.name
                         ),
                         c.name.span,
@@ -2595,7 +2595,7 @@ impl<'r> Checker<'r> {
                         Diagnostic::error(
                             format!(
                                 "data class `{}` cannot declare a `vararg` property parameter \
-                                 (spec §4.1.2)",
+                                ",
                                 c.name.name
                             ),
                             p.span,
@@ -2616,7 +2616,7 @@ impl<'r> Checker<'r> {
                             Diagnostic::error(
                                 format!(
                                     "`copy` is auto-generated for data class `{}` and cannot be \
-                                     explicified (spec §4.1.2)",
+                                     explicified",
                                     c.name.name
                                 ),
                                 f.name.span,
@@ -2630,7 +2630,7 @@ impl<'r> Checker<'r> {
                                     Diagnostic::error(
                                         format!(
                                             "`{}` is auto-generated for data class `{}` and cannot \
-                                             be explicified (spec §4.1.2)",
+                                             be explicified",
                                             n, c.name.name
                                         ),
                                         f.name.span,
@@ -2658,7 +2658,7 @@ impl<'r> Checker<'r> {
                             Diagnostic::error(
                                 format!(
                                     "`{}` is `final` on `kotlin.Enum` and cannot be overridden \
-                                     (enum class `{}`, spec §3.9)",
+                                     (enum class `{}`)",
                                     n, c.name.name
                                 ),
                                 f.name.span,
@@ -2677,7 +2677,7 @@ impl<'r> Checker<'r> {
                 Diagnostic::error(
                     format!(
                         "Subclasses of `kotlin.Throwable` cannot declare type parameters; \
-                         `{}` does (spec §3.12)",
+                         `{}` does",
                         c.name.name
                     ),
                     c.name.span,
@@ -2836,8 +2836,7 @@ impl<'r> Checker<'r> {
                                 Diagnostic::error(
                                     format!(
                                         "return type `{derived_ret}` of override `{name}` \
-                                         is not a subtype of overridden return type `{base_ret}` \
-                                         (spec §5.4)",
+                                         is not a subtype of overridden return type `{base_ret}`",
                                         name = f.name.name
                                     ),
                                     f.name.span,
@@ -2872,7 +2871,7 @@ impl<'r> Checker<'r> {
                                 Diagnostic::error(
                                     format!(
                                         "property `{name}` overrides `var` base with `val`: \
-                                         mutability cannot strengthen (spec §5.4)",
+                                         mutability cannot strengthen",
                                         name = p.name.name
                                     ),
                                     p.name.span,
@@ -2893,13 +2892,13 @@ impl<'r> Checker<'r> {
                             let msg = if *base_mut && p.mutable {
                                 format!(
                                     "property `{}` overrides `var` base of type `{base_ty}` with \
-                                     non-equivalent type `{derived_ty}` (spec §5.4)",
+                                     non-equivalent type `{derived_ty}`",
                                     p.name.name
                                 )
                             } else {
                                 format!(
                                     "type `{derived_ty}` of override property `{}` is not a \
-                                     subtype of overridden type `{base_ty}` (spec §5.4)",
+                                     subtype of overridden type `{base_ty}`",
                                     p.name.name
                                 )
                             };
@@ -3164,7 +3163,7 @@ impl<'r> Checker<'r> {
                 Diagnostic::error(
                     format!(
                         "override `{name}` cannot weaken visibility: declared `{}` is stronger \
-                         than overridden `{}` (spec §5.4)",
+                         than overridden `{}`",
                         vis_name(derived),
                         vis_name(base)
                     ),
@@ -3196,7 +3195,7 @@ impl<'r> Checker<'r> {
             self.diagnostics.emit(
                 Diagnostic::error(
                     format!(
-                        "`{name}` cannot be both `private` and `{modifier}` (spec §5.4)"
+                        "`{name}` cannot be both `private` and `{modifier}`"
                     ),
                     span,
                 )
@@ -3223,7 +3222,7 @@ impl<'r> Checker<'r> {
                     Diagnostic::error(
                         format!(
                             "local class `{derived_name}` cannot inherit from sealed type `{name}`: \
-                             sealed inheritors must have a fully-qualified name (spec §5.1.2)"
+                             sealed inheritors must have a fully-qualified name"
                         ),
                         s.span,
                     )
@@ -3235,7 +3234,7 @@ impl<'r> Checker<'r> {
                     Diagnostic::error(
                         format!(
                             "`{derived_name}` cannot inherit from object `{name}`: \
-                             object types cannot be inherited from (spec §5.1)"
+                             object types cannot be inherited from"
                         ),
                         s.span,
                     )
@@ -3252,7 +3251,7 @@ impl<'r> Checker<'r> {
                     Diagnostic::error(
                         format!(
                             "`{derived_name}` cannot inherit from final class `{name}`: \
-                             declare it `open`, `abstract`, or `sealed` (spec §5.1)"
+                             declare it `open`, `abstract`, or `sealed`"
                         ),
                         s.span,
                     )
@@ -4408,8 +4407,7 @@ impl<'r> Checker<'r> {
                             Diagnostic::error(
                                 format!(
                                     "anonymous object cannot inherit from sealed type `{pname}`: \
-                                     sealed inheritors must have a fully-qualified name \
-                                     (spec §5.1.2)"
+                                     sealed inheritors must have a fully-qualified name"
                                 ),
                                 s.span,
                             )
@@ -4421,7 +4419,7 @@ impl<'r> Checker<'r> {
                             Diagnostic::error(
                                 format!(
                                     "anonymous object cannot inherit from object `{pname}`: \
-                                     object types cannot be inherited from (spec §5.1)"
+                                     object types cannot be inherited from"
                                 ),
                                 s.span,
                             )
@@ -4438,7 +4436,7 @@ impl<'r> Checker<'r> {
                             Diagnostic::error(
                                 format!(
                                     "anonymous object cannot inherit from final class `{pname}`: \
-                                     declare it `open`, `abstract`, or `sealed` (spec §5.1)"
+                                     declare it `open`, `abstract`, or `sealed`"
                                 ),
                                 s.span,
                             )
