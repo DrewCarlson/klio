@@ -372,6 +372,12 @@ struct Frame {
     /// smart-cast prefix (e.g. after `if (n.shape is Circle)`, access
     /// `n.shape.radius` resolves through the `Circle` member table).
     narrowing_class: HashMap<String, String>,
+    /// Spec §14.1.5 bound smart casts: when `val b = a` ties two immutable
+    /// locals to the same runtime value, narrowing one narrows the other.
+    /// Stored bidirectionally — every `val b = a` adds `b -> [a]` and
+    /// `a -> [..., b]`. Local to the frame that introduced the binding so
+    /// the alias drops out of scope cleanly with `pop_frame`.
+    aliases: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -4827,6 +4833,31 @@ impl<'r> Checker<'r> {
                         needs_init,
                     },
                 );
+                // Spec §14.1.5: tie `val b = a` to its source for bound
+                // smart-cast propagation. Only immutable locals participate
+                // (mutable bindings can be reassigned, breaking the alias).
+                if !p.mutable {
+                    if let Some(init) = &p.init {
+                        if let Some(src) = single_path_name(init) {
+                            // Require the source to be an immutable binding
+                            // in some scope. Otherwise the alias may not
+                            // hold (the source can be reassigned).
+                            let src_is_stable = self
+                                .lookup(&src)
+                                .map(|b| !b.mutable)
+                                .unwrap_or(false);
+                            if src_is_stable && src != p.name.name {
+                                let new_name = p.name.name.clone();
+                                let f = self.current_frame();
+                                f.aliases
+                                    .entry(new_name.clone())
+                                    .or_default()
+                                    .push(src.clone());
+                                f.aliases.entry(src).or_default().push(new_name);
+                            }
+                        }
+                    }
+                }
             }
             Decl::Function(f) => {
                 let sig = self.signature_of(f);
@@ -7495,6 +7526,15 @@ impl<'r> Checker<'r> {
                 return Some(t.clone());
             }
         }
+        // Spec §14.1.5: consult bound-smart-cast peers. A narrowing on a
+        // peer transitively narrows `name`.
+        for peer in self.gather_aliases(name) {
+            for f in self.frames.iter().rev() {
+                if let Some(t) = f.narrowings.get(&peer) {
+                    return Some(t.clone());
+                }
+            }
+        }
         None
     }
 
@@ -7504,7 +7544,34 @@ impl<'r> Checker<'r> {
                 return Some(cn.clone());
             }
         }
+        for peer in self.gather_aliases(key) {
+            for f in self.frames.iter().rev() {
+                if let Some(cn) = f.narrowing_class.get(&peer) {
+                    return Some(cn.clone());
+                }
+            }
+        }
         None
+    }
+
+    fn gather_aliases(&self, name: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(name.to_string());
+        let mut stack: Vec<String> = vec![name.to_string()];
+        while let Some(cur) = stack.pop() {
+            for f in self.frames.iter().rev() {
+                if let Some(peers) = f.aliases.get(&cur) {
+                    for p in peers {
+                        if seen.insert(p.clone()) {
+                            out.push(p.clone());
+                            stack.push(p.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     #[allow(dead_code)]
@@ -8702,6 +8769,32 @@ mod tests {
     fn smart_cast_after_do_while() {
         let tc = check_src(
             "fun f(a: String?): Int { do { if (a == null) return -1 } while (false); return a.length }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_bound_alias_narrows_source() {
+        // Spec §14.1.5: `val b = a; if (b is String) a.length`
+        let tc = check_src(
+            "fun f(a: Any): Int { val b = a; if (b is String) { return a.length }; return -1 }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_bound_alias_narrows_copy() {
+        // The reverse: narrow the source, copy sees it.
+        let tc = check_src(
+            "fun f(a: Any): Int { val b = a; if (a is String) { return b.length }; return -1 }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_bound_alias_chain() {
+        let tc = check_src(
+            "fun f(a: Any): Int { val b = a; val c = b; if (a is String) { return c.length }; return -1 }",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
