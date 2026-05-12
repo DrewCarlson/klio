@@ -576,6 +576,13 @@ fn neg_inline_property_initializer() {
 }
 
 #[test]
+fn neg_no_backing_field_initializer() {
+    assert!(type_codes_for("neg_no_backing_field_initializer.kt")
+        .iter()
+        .any(|c| c == "T0054"));
+}
+
+#[test]
 fn neg_published_api_missing() {
     assert!(type_codes_for("neg_published_api_missing.kt")
         .iter()

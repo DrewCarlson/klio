@@ -211,6 +211,10 @@ pub mod codes {
     /// An `inline val/var` property has a backing field. Spec §4.3.4 forbids
     /// this — inline properties must have explicit accessors with no `field`.
     pub const TYPE_INLINE_PROPERTY_HAS_BACKING_FIELD: &str = "T0053";
+    /// A property without a backing field (custom accessors that don't use
+    /// `field`) declares an initializer. Spec §4.3.4: properties without
+    /// backing fields are not allowed to have initializer expressions.
+    pub const TYPE_PROPERTY_NO_BACKING_FIELD_HAS_INITIALIZER: &str = "T0054";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -581,6 +585,26 @@ impl<'a> Checker<'a> {
                 }
                 if p.is_inline {
                     self.check_inline_property(p);
+                }
+                // Spec §4.3.4: a property without a backing field cannot
+                // declare an initializer. Skip extension properties (T0040
+                // already covers that case) and abstract properties.
+                if p.init.is_some()
+                    && !p.is_abstract
+                    && p.receiver_type.is_none()
+                    && !Self::property_has_backing_field(p)
+                {
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "property `{}` has custom accessors that don't use `field`, so it \
+                                 has no backing field — initializer is not allowed (spec §4.3.4)",
+                                p.name.name
+                            ),
+                            p.name.span,
+                        )
+                        .with_code(codes::TYPE_PROPERTY_NO_BACKING_FIELD_HAS_INITIALIZER),
+                    );
                 }
             }
             Decl::Class(c) => {
@@ -1054,6 +1078,31 @@ impl<'a> Checker<'a> {
             }
         }
         false
+    }
+
+    /// Spec §4.3.4 backing-field rule. A property has a backing field iff:
+    ///   * no custom accessors (default get/set);
+    ///   * any custom accessor body references `field`;
+    ///   * mutable property with exactly one of get/set custom (the other
+    ///     defaults and needs storage).
+    /// Extension properties never have a backing field.
+    fn property_has_backing_field(p: &Property) -> bool {
+        if p.receiver_type.is_some() {
+            return false;
+        }
+        let g = p.getter.as_ref();
+        let s = p.setter.as_ref();
+        match (g, s) {
+            (None, None) => true,
+            (Some(a), None) | (None, Some(a)) => {
+                if p.mutable {
+                    true
+                } else {
+                    accessor_uses_field(a)
+                }
+            }
+            (Some(a), Some(b)) => accessor_uses_field(a) || accessor_uses_field(b),
+        }
     }
 
     fn check_inline_property(&mut self, p: &Property) {
@@ -4910,6 +4959,56 @@ fn is_primitive_type_name(name: &str) -> bool {
 
 fn is_const_capable_type_name(name: &str) -> bool {
     is_primitive_type_name(name) || name == "String"
+}
+
+fn accessor_uses_field(a: &Accessor) -> bool {
+    match &a.body {
+        FunctionBody::Block(b) => block_uses_field(b),
+        FunctionBody::Expr(e) => expr_uses_field(e),
+    }
+}
+
+fn block_uses_field(b: &Block) -> bool {
+    b.stmts.iter().any(|s| match s {
+        Stmt::Expr(e) => expr_uses_field(e),
+        Stmt::Assign { target, value, .. } => expr_uses_field(target) || expr_uses_field(value),
+        Stmt::Decl(Decl::Property(p)) => p.init.as_ref().map_or(false, expr_uses_field),
+        _ => false,
+    })
+}
+
+fn expr_uses_field(e: &Expr) -> bool {
+    match e {
+        Expr::Path { segments, .. } => {
+            segments.len() == 1 && segments[0].name == "field"
+        }
+        Expr::Block(b) => block_uses_field(b),
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            expr_uses_field(cond)
+                || expr_uses_field(then_branch)
+                || else_branch.as_ref().map_or(false, |e| expr_uses_field(e))
+        }
+        Expr::When { subject, branches, .. } => {
+            subject.as_ref().map_or(false, |s| expr_uses_field(s))
+                || branches.iter().any(|b| expr_uses_field(&b.body))
+        }
+        Expr::Call { callee, args, .. } => {
+            expr_uses_field(callee) || args.iter().any(expr_uses_field)
+        }
+        Expr::Member { receiver, .. } => expr_uses_field(receiver),
+        Expr::Index { receiver, args, .. } => {
+            expr_uses_field(receiver) || args.iter().any(expr_uses_field)
+        }
+        Expr::Binary { lhs, rhs, .. } => expr_uses_field(lhs) || expr_uses_field(rhs),
+        Expr::Unary { expr, .. } => expr_uses_field(expr),
+        Expr::Postfix { expr, .. } => expr_uses_field(expr),
+        Expr::Return { value, .. } => value.as_ref().map_or(false, |e| expr_uses_field(e)),
+        Expr::As { expr, .. } => expr_uses_field(expr),
+        Expr::IsCheck { expr, .. } => expr_uses_field(expr),
+        Expr::Spread { expr, .. } => expr_uses_field(expr),
+        Expr::Labeled { expr, .. } => expr_uses_field(expr),
+        _ => false,
+    }
 }
 
 fn is_annotation_param_type(name: &str) -> bool {
