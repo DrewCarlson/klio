@@ -3000,9 +3000,26 @@ impl<'r> Checker<'r> {
     /// interfaces, `open` / `abstract` / `sealed` classes are allowed. Built-in
     /// supertypes we don't know about (Any, Throwable, etc.) are skipped.
     fn check_supertype_validity(&mut self, derived_name: &str, supertypes: &[TypeRef]) {
+        let derived_local = self
+            .classes
+            .get(derived_name)
+            .map(|i| i.is_local_or_anonymous)
+            .unwrap_or(false);
         for s in supertypes {
             let name = &s.name.name;
             let Some(parent) = self.classes.get(name) else { continue };
+            if parent.is_sealed && derived_local {
+                self.diagnostics.emit(
+                    Diagnostic::error(
+                        format!(
+                            "local class `{derived_name}` cannot inherit from sealed type `{name}`: \
+                             sealed inheritors must have a fully-qualified name (spec §5.1.2)"
+                        ),
+                        s.span,
+                    )
+                    .with_code(codes::TYPE_SEALED_INHERITOR_NOT_QUALIFIED),
+                );
+            }
             if parent.is_object {
                 self.diagnostics.emit(
                     Diagnostic::error(
@@ -4094,7 +4111,57 @@ impl<'r> Checker<'r> {
                 self.check_expr(expr, None);
                 Type::Unresolved
             }
-            Expr::ObjectExpr { supertype_args, supertype_delegates, members, .. } => {
+            Expr::ObjectExpr { supertypes, supertype_args, supertype_delegates, members, .. } => {
+                // Spec §5.1.2: anonymous object inheriting from a sealed type
+                // is rejected — sealed inheritors require a fully-qualified
+                // name. Same code path also catches inherit-from-object /
+                // inherit-from-final-class for anonymous objects.
+                for s in supertypes {
+                    let pname = &s.name.name;
+                    let Some(parent) = self.classes.get(pname) else { continue };
+                    if parent.is_sealed {
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                format!(
+                                    "anonymous object cannot inherit from sealed type `{pname}`: \
+                                     sealed inheritors must have a fully-qualified name \
+                                     (spec §5.1.2)"
+                                ),
+                                s.span,
+                            )
+                            .with_code(codes::TYPE_SEALED_INHERITOR_NOT_QUALIFIED),
+                        );
+                    }
+                    if parent.is_object {
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                format!(
+                                    "anonymous object cannot inherit from object `{pname}`: \
+                                     object types cannot be inherited from (spec §5.1)"
+                                ),
+                                s.span,
+                            )
+                            .with_code(codes::TYPE_INHERIT_FROM_OBJECT),
+                        );
+                        continue;
+                    }
+                    if !parent.is_interface
+                        && !parent.is_open
+                        && !parent.is_abstract
+                        && !parent.is_sealed
+                    {
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                format!(
+                                    "anonymous object cannot inherit from final class `{pname}`: \
+                                     declare it `open`, `abstract`, or `sealed` (spec §5.1)"
+                                ),
+                                s.span,
+                            )
+                            .with_code(codes::TYPE_INHERIT_FROM_FINAL_CLASS),
+                        );
+                    }
+                }
                 for d in supertype_delegates.iter().flatten() {
                     self.check_expr(d, None);
                 }

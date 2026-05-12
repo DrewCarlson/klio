@@ -660,6 +660,16 @@ fn neg_published_api_missing() {
 }
 
 #[test]
+fn neg_sealed_local_inheritor() {
+    assert!(type_codes_for("neg_sealed_local_inheritor.kt").iter().any(|c| c == "T0071"));
+}
+
+#[test]
+fn neg_sealed_anonymous_inheritor() {
+    assert!(type_codes_for("neg_sealed_anonymous_inheritor.kt").iter().any(|c| c == "T0071"));
+}
+
+#[test]
 fn neg_private_open() {
     assert!(type_codes_for("neg_private_open.kt").iter().any(|c| c == "T0070"));
 }
