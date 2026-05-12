@@ -3350,7 +3350,21 @@ impl<'r> Checker<'r> {
                         }
                     }
                 }
+                // Spec §4.2: implicit lambda label — bind the call's
+                // callee simple name as a label visible inside any lambda
+                // argument so `xs.forEach { return@forEach }` checks.
+                let implicit_label = match callee.as_ref() {
+                    Expr::Path { segments, .. } => segments.last().map(|s| s.name.clone()),
+                    Expr::Member { name, .. } => Some(name.name.clone()),
+                    _ => None,
+                };
+                if let Some(l) = &implicit_label {
+                    self.label_stack.push(l.clone());
+                }
                 let result = self.check_call(callee, args, arg_names, *span);
+                if implicit_label.is_some() {
+                    self.label_stack.pop();
+                }
                 if *is_infix {
                     self.check_infix_modifier(callee, args, *span);
                 }

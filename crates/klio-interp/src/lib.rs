@@ -114,6 +114,11 @@ pub struct Interpreter {
     /// calls through an alias name) and runtime type checks
     /// (`x is Alias`, `x as Alias`) to the alias target.
     type_aliases: std::collections::HashMap<String, String>,
+    /// Stack of implicit lambda labels — pushed by the higher-order
+    /// dispatcher right before invoking a lambda argument. Lambda call
+    /// frames consult the top entry to swallow `LabeledReturn` matching
+    /// the enclosing call name (`forEach`, `map`, …). Spec §4.2.
+    implicit_lambda_label_stack: Vec<String>,
     /// Stack of active `tailrec` frames. Each entry records the function
     /// name and the set of `Expr::Call` spans inside the current body that
     /// have been classified as tail-position self-calls. The `eval_call`
@@ -162,6 +167,7 @@ impl Interpreter {
             loop_label_stack: Vec::new(),
             label_already_pushed_for_loop: false,
             type_aliases: std::collections::HashMap::new(),
+            implicit_lambda_label_stack: Vec::new(),
             tailrec_stack: Vec::new(),
         }
     }
@@ -1939,9 +1945,15 @@ impl Interpreter {
             frame.borrow_mut().define("this", this_val);
         }
         let result = self.eval_block(body, &frame, out);
+        let implicit_label = self.implicit_lambda_label_stack.last().cloned();
         match result {
             Ok(v) => Ok(v),
             Err(RuntimeError::Return(v)) => Ok(v),
+            Err(RuntimeError::LabeledReturn(l, v))
+                if implicit_label.as_deref() == Some(l.as_str()) =>
+            {
+                Ok(v)
+            }
             Err(e) => Err(e),
         }
     }
@@ -2009,6 +2021,24 @@ impl Interpreter {
             )));
         };
         self.call_lambda(params, body, env, args, out)
+    }
+
+    /// Invoke a lambda whose body may contain `return@<label>` where
+    /// `label` is the name of the calling higher-order function (e.g.
+    /// `forEach`, `map`, `filter`). Catches `LabeledReturn` matching that
+    /// label so the non-local return terminates only the current lambda
+    /// invocation. Spec §4.2 implicit lambda labels.
+    pub fn invoke_lambda_labeled(
+        &mut self,
+        lambda: &Value,
+        label: &str,
+        args: &[Value],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        self.implicit_lambda_label_stack.push(label.to_string());
+        let r = self.invoke_lambda(lambda, args, out);
+        self.implicit_lambda_label_stack.pop();
+        r
     }
 
     /// Handles `receiver.{let,also,apply,run,takeIf,takeUnless}(lambda)`.
@@ -3612,6 +3642,20 @@ impl Interpreter {
     /// fns these need to call back into the interpreter, so they live here
     /// rather than in stdlib intrinsics.
     fn try_eval_collection_higher_order(
+        &mut self,
+        receiver: &Value,
+        name: &str,
+        args: &[Expr],
+        env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
+    ) -> Result<Option<Value>, RuntimeError> {
+        self.implicit_lambda_label_stack.push(name.to_string());
+        let r = self.try_eval_collection_higher_order_inner(receiver, name, args, env, out);
+        self.implicit_lambda_label_stack.pop();
+        r
+    }
+
+    fn try_eval_collection_higher_order_inner(
         &mut self,
         receiver: &Value,
         name: &str,
