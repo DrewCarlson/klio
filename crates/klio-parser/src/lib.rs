@@ -166,7 +166,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
 
         let mut decls = Vec::new();
         loop {
-            self.skip_nl();
+            self.skip_stmt_separators();
             if matches!(self.peek_kind(), TokenKind::Eof) {
                 break;
             }
@@ -986,7 +986,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         }
         self.bump();
         loop {
-            self.skip_nl();
+            self.skip_stmt_separators();
             if matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
                 break;
             }
@@ -1987,6 +1987,58 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         })
     }
 
+    /// Spec userType form `simpleUserType ('.' simpleUserType)*`. Used at
+    /// sites that may name a nested classifier (`is Outer.Inner`, `as
+    /// Outer.Inner`, `catch (e: Outer.Inner)`). Calls `parse_type` for the
+    /// leading head (which handles nullability, function-type shape, and
+    /// type arguments) then folds any trailing `.Ident` segments into the
+    /// name. Regular `parse_type` returns the bare leading segment so that
+    /// extension-function syntax like `operator fun Foo.bar()` keeps the
+    /// trailing name as the function's identity.
+    fn parse_qualified_type(&mut self) -> Option<TypeRef> {
+        let mut head = self.parse_type()?;
+        // Function types and nullable suffixes block further dot folding.
+        if head.function.is_some() || head.nullable {
+            return Some(head);
+        }
+        let mut start = head.span;
+        while matches!(self.peek_kind(), TokenKind::Dot) {
+            let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
+            if !matches!(next, Some(TokenKind::Ident)) {
+                break;
+            }
+            self.bump(); // '.'
+            let Some(seg) = self.parse_ident("type segment") else { break };
+            let new_name = Ident {
+                name: format!("{}.{}", head.name.name, seg.name),
+                span: start.join(seg.span),
+            };
+            start = new_name.span;
+            let type_args = if matches!(self.peek_kind(), TokenKind::Lt) {
+                self.parse_type_args()
+            } else {
+                Vec::new()
+            };
+            head = TypeRef {
+                name: new_name,
+                nullable: false,
+                span: start,
+                type_args,
+                function: None,
+                definitely_non_null: false,
+                annotations: Vec::new(),
+            };
+        }
+        // Trailing nullable suffix after dotted form: `S.A?`.
+        if self.peek_kind().is_question() {
+            let q = self.bump();
+            head.nullable = true;
+            head.span = head.span.join(q.span);
+        }
+        Some(head)
+    }
+
+
     /// At `(`. Either:
     ///   - `(T)` — parenthesized type (returns the inner type).
     ///   - `(T1, T2, ...) -> R` — function type parameters.
@@ -2449,7 +2501,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             };
             self.bump(); // `is`
             self.skip_nl();
-            let Some(ty) = self.parse_type() else { break };
+            let Some(ty) = self.parse_qualified_type() else { break };
             let span = lhs.span().join(ty.span);
             lhs = Expr::IsCheck { expr: Box::new(lhs), ty, negated, span };
         }
@@ -2596,7 +2648,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 self.bump();
             }
             self.skip_nl();
-            let Some(ty) = self.parse_type() else { break };
+            let Some(ty) = self.parse_qualified_type() else { break };
             let span = lhs.span().join(ty.span);
             lhs = Expr::As { expr: Box::new(lhs), ty, safe, span };
         }
@@ -3287,7 +3339,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             self.skip_nl();
             let binding = self.parse_ident("catch binding")?;
             self.expect(&TokenKind::Colon, "`:`")?;
-            let ty = self.parse_type()?;
+            let ty = self.parse_qualified_type()?;
             self.skip_nl();
             self.expect(&TokenKind::RParen, "`)`")?;
             self.skip_nl();
@@ -3462,7 +3514,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             match self.peek_kind() {
                 TokenKind::Keyword(Keyword::Is) => {
                     self.bump();
-                    let ty = self.parse_type()?;
+                    let ty = self.parse_qualified_type()?;
                     let span = start.join(ty.span);
                     return Some(WhenPattern { kind: WhenPatternKind::IsType(ty), span });
                 }
@@ -3479,7 +3531,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                         Some(TokenKind::Keyword(Keyword::Is)) => {
                             self.bump();
                             self.bump();
-                            let ty = self.parse_type()?;
+                            let ty = self.parse_qualified_type()?;
                             let span = start.join(ty.span);
                             return Some(WhenPattern { kind: WhenPatternKind::NotIsType(ty), span });
                         }

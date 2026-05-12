@@ -1271,7 +1271,18 @@ impl Value {
                 if name == "Any" {
                     return true;
                 }
-                inst.class.is_subtype_of(name)
+                if inst.class.is_subtype_of(name) {
+                    return true;
+                }
+                // Qualified nested-class type (`Outer.Inner`) — match against
+                // the trailing simple name when the dotted prefix names an
+                // enclosing classifier of this instance's class.
+                if let Some((_outer, simple)) = name.rsplit_once('.') {
+                    if inst.class.is_subtype_of(simple) {
+                        return true;
+                    }
+                }
+                false
             }
             Value::Delegate(_) => matches!(name, "Any"),
             Value::PropertyRef { .. } => matches!(
