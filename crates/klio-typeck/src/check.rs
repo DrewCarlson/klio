@@ -5386,6 +5386,14 @@ impl<'r> Checker<'r> {
                 let mut has_else = false;
                 let mut branch_assigned: Vec<Option<HashSet<String>>> = Vec::new();
                 let mut acc: Option<Type> = None;
+                // Spec §14.1: the subject of a `when` is a smart-cast sink for
+                // each branch when an `is` pattern matches. Resolve the sink
+                // key — the `val v = ...` binding name if present, otherwise
+                // the subject expression's dot path if it has one.
+                let subject_key: Option<String> = subject_binding
+                    .as_ref()
+                    .map(|b| b.name.name.clone())
+                    .or_else(|| subject.as_ref().and_then(|s| dot_path_key(s)));
                 for b in branches {
                     for p in &b.patterns {
                         match &p.kind {
@@ -5401,7 +5409,33 @@ impl<'r> Checker<'r> {
                         has_else = true;
                     }
                     self.assigned = before.clone();
+                    // Narrow the subject inside this branch if it's a single
+                    // `is T` pattern. Multiple patterns or any `!is` / value
+                    // patterns mean the branch body cannot rely on a single
+                    // refinement, so we skip narrowing in those cases.
+                    let mut branch_frame_pushed = false;
+                    if let Some(key) = &subject_key {
+                        if b.patterns.len() == 1 {
+                            if let WhenPatternKind::IsType(ty) = &b.patterns[0].kind {
+                                let target = convert_type_ref_lossy(ty);
+                                let target_class = class_name_from_typeref(ty);
+                                self.push_frame();
+                                branch_frame_pushed = true;
+                                self.current_frame()
+                                    .narrowings
+                                    .insert(key.clone(), target);
+                                if let Some(cn) = target_class {
+                                    self.current_frame()
+                                        .narrowing_class
+                                        .insert(key.clone(), cn);
+                                }
+                            }
+                        }
+                    }
                     let t = self.check_expr(&b.body, expected);
+                    if branch_frame_pushed {
+                        self.pop_frame();
+                    }
                     let after = if matches!(t, Type::Nothing) {
                         None
                     } else {
@@ -8593,6 +8627,23 @@ mod tests {
         // `a as? String` yields String? but does NOT narrow a — a may still be the original Any.
         let tc = check_src(
             "fun main() { val a: Any = \"hi\"; val s = a as? String; val x: Any = a }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_when_subject_is_branch() {
+        let tc = check_src(
+            "fun f(x: Any): Int = when (x) { is String -> x.length; else -> 0 }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn smart_cast_when_with_subject_binding() {
+        // `when (val v = ...) { is T -> v.use }`
+        let tc = check_src(
+            "fun f(): Int = when (val v: Any = \"hi\") { is String -> v.length; else -> 0 }",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
