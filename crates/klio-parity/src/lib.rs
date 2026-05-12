@@ -388,7 +388,10 @@ pub fn run_with_ktc(file: &Path) -> Result<String, String> {
         return Err(format!("parse diagnostics: {:?}", diags.diagnostics()));
     }
     let mut out = CaptureOutput::default();
+    let r = klio_resolver::resolve(&ast);
+    let tc = klio_typeck::typecheck(&ast, &r);
     Interpreter::new()
+        .with_expr_types(tc.types.clone())
         .run_with_output(&ast, &mut out)
         .map_err(|e| format!("runtime error: {e}"))?;
     // CaptureOutput stores one entry per writeln. Kotlin's process stdout

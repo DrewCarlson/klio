@@ -127,6 +127,13 @@ pub struct Interpreter {
     /// to rebind parameters and re-evaluate the body without growing the
     /// host call stack.
     tailrec_stack: Vec<TailrecFrame>,
+    /// Per-expression static types, supplied by the type checker before
+    /// evaluation begins. Empty when the interpreter is invoked without
+    /// typecheck (older tests, REPL warmups). Used at `==` sites to
+    /// switch Float/Double equality to bit-equality when either operand's
+    /// static type is `Any` / `Any?` / `Number` / `Number?`, matching the
+    /// spec §8.9.2 expansion.
+    expr_types: std::collections::HashMap<klio_span::Span, klio_types::Type>,
 }
 
 #[derive(Clone)]
@@ -169,7 +176,32 @@ impl Interpreter {
             type_aliases: std::collections::HashMap::new(),
             implicit_lambda_label_stack: Vec::new(),
             tailrec_stack: Vec::new(),
+            expr_types: std::collections::HashMap::new(),
         }
+    }
+
+    /// Supply per-expression static types from the type checker. Calls
+    /// to the interpreter that skip this step still work (the map stays
+    /// empty); features that depend on static types will fall back to
+    /// AST-only heuristics in that case.
+    pub fn with_expr_types(
+        mut self,
+        types: std::collections::HashMap<klio_span::Span, klio_types::Type>,
+    ) -> Self {
+        self.expr_types = types;
+        self
+    }
+
+    /// Consult per-expression static types: an operand is "boxed" if its
+    /// static type is `Any` / `Any?`, OR if its AST shape is a syntactic
+    /// `as Any` / `as Number` cast (fallback when typeck data is missing).
+    fn is_boxed_operand(&self, expr: &Expr) -> bool {
+        if let Some(t) = self.expr_types.get(&expr.span()) {
+            if type_is_boxing_for_floats(t) {
+                return true;
+            }
+        }
+        is_boxed_to_any_form(expr)
     }
 
     /// Walk the typealias map to the underlying head type name. Returns
@@ -1294,7 +1326,7 @@ impl Interpreter {
                 // Detect the boxed form syntactically; the precise spec rule
                 // requires static type info we don't thread here.
                 if matches!(op, BinOp::Eq | BinOp::Neq)
-                    && (is_boxed_to_any_form(lhs) || is_boxed_to_any_form(rhs))
+                    && (self.is_boxed_operand(lhs) || self.is_boxed_operand(rhs))
                 {
                     let eq = match (&l, &r) {
                         (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
@@ -1570,6 +1602,21 @@ impl Interpreter {
             }
             Expr::Block(b) => self.eval_block(b, env, out),
             Expr::Member { receiver, name, safe, .. } => {
+                // Primitive companion-object constants: `Int.MAX_VALUE`,
+                // `Double.NaN`, etc. The bare receiver name is not a
+                // bound identifier, so intercept here before falling
+                // through to the env-driven path.
+                if !*safe {
+                    if let Expr::Path { segments, .. } = receiver.as_ref() {
+                        if segments.len() == 1 {
+                            if let Some(v) =
+                                primitive_companion_const(&segments[0].name, &name.name)
+                            {
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
                 // `super.foo` — read a property from the parent class.
                 if matches!(receiver.as_ref(), Expr::Super { .. }) {
                     let inst = match env.borrow().lookup("this") {
@@ -2628,6 +2675,30 @@ impl Interpreter {
             "CharArray" => Some(PrimitiveArrayKind::Char),
             _ => None,
         };
+        // Lowercase variadic factories: `intArrayOf(1, 2, 3)`,
+        // `doubleArrayOf(1.0, 2.0)`, etc. Element type is tagged so
+        // member dispatch / `is`-checks recognize the primitive variant.
+        let variadic_prim_kind = match name {
+            "intArrayOf" => Some(PrimitiveArrayKind::Int),
+            "longArrayOf" => Some(PrimitiveArrayKind::Long),
+            "doubleArrayOf" => Some(PrimitiveArrayKind::Double),
+            "floatArrayOf" => Some(PrimitiveArrayKind::Float),
+            "shortArrayOf" => Some(PrimitiveArrayKind::Short),
+            "byteArrayOf" => Some(PrimitiveArrayKind::Byte),
+            "booleanArrayOf" => Some(PrimitiveArrayKind::Boolean),
+            "charArrayOf" => Some(PrimitiveArrayKind::Char),
+            _ => None,
+        };
+        if let Some(k) = variadic_prim_kind {
+            let mut items = Vec::with_capacity(args.len());
+            for a in args {
+                items.push(self.eval_expr(a, env, out)?);
+            }
+            return Ok(Some(Value::Array {
+                items: Rc::new(RefCell::new(items)),
+                prim: Some(k),
+            }));
+        }
         let default_prim_value = |k: PrimitiveArrayKind| match k {
             PrimitiveArrayKind::Int
             | PrimitiveArrayKind::Long
@@ -6078,6 +6149,13 @@ impl Interpreter {
                 .lookup(name)
                 .ok_or_else(|| RuntimeError::Unbound(name.clone()));
         }
+        // Primitive companion-object constants: `Int.MAX_VALUE`,
+        // `Double.NaN`, `Long.MIN_VALUE`, etc.
+        if segments.len() == 2 {
+            if let Some(v) = primitive_companion_const(&segments[0].name, &segments[1].name) {
+                return Ok(v);
+            }
+        }
         // Multi-segment: treat as a fully qualified stdlib reference.
         let fqn = segments
             .iter()
@@ -7142,6 +7220,49 @@ impl Default for Interpreter {
 /// uninitialized `lateinit var` slot. Reads see this and throw the proper
 /// `kotlin.UninitializedPropertyAccessException` with a message naming the
 /// property. Writes overwrite the slot, clearing the sentinel.
+/// Resolve `Type.NAME` to the stdlib companion-object constant value.
+/// Returns `None` for any name we don't intercept so the caller can
+/// continue dispatching (stdlib FQN lookup, etc.).
+fn primitive_companion_const(ty: &str, name: &str) -> Option<Value> {
+    match (ty, name) {
+        ("Int", "MAX_VALUE") => Some(Value::new_int(i32::MAX)),
+        ("Int", "MIN_VALUE") => Some(Value::new_int(i32::MIN)),
+        ("Int", "SIZE_BITS") => Some(Value::new_int(32)),
+        ("Int", "SIZE_BYTES") => Some(Value::new_int(4)),
+        ("Long", "MAX_VALUE") => Some(Value::Long(i64::MAX)),
+        ("Long", "MIN_VALUE") => Some(Value::Long(i64::MIN)),
+        ("Long", "SIZE_BITS") => Some(Value::new_int(64)),
+        ("Long", "SIZE_BYTES") => Some(Value::new_int(8)),
+        ("Short", "MAX_VALUE") => Some(Value::Short(i16::MAX)),
+        ("Short", "MIN_VALUE") => Some(Value::Short(i16::MIN)),
+        ("Short", "SIZE_BITS") => Some(Value::new_int(16)),
+        ("Short", "SIZE_BYTES") => Some(Value::new_int(2)),
+        ("Byte", "MAX_VALUE") => Some(Value::Byte(i8::MAX)),
+        ("Byte", "MIN_VALUE") => Some(Value::Byte(i8::MIN)),
+        ("Byte", "SIZE_BITS") => Some(Value::new_int(8)),
+        ("Byte", "SIZE_BYTES") => Some(Value::new_int(1)),
+        ("Double", "MAX_VALUE") => Some(Value::Double(f64::MAX)),
+        ("Double", "MIN_VALUE") => Some(Value::Double(f64::MIN_POSITIVE)),
+        ("Double", "POSITIVE_INFINITY") => Some(Value::Double(f64::INFINITY)),
+        ("Double", "NEGATIVE_INFINITY") => Some(Value::Double(f64::NEG_INFINITY)),
+        ("Double", "NaN") => Some(Value::Double(f64::NAN)),
+        ("Double", "SIZE_BITS") => Some(Value::new_int(64)),
+        ("Double", "SIZE_BYTES") => Some(Value::new_int(8)),
+        ("Float", "MAX_VALUE") => Some(Value::Float(f32::MAX)),
+        ("Float", "MIN_VALUE") => Some(Value::Float(f32::MIN_POSITIVE)),
+        ("Float", "POSITIVE_INFINITY") => Some(Value::Float(f32::INFINITY)),
+        ("Float", "NEGATIVE_INFINITY") => Some(Value::Float(f32::NEG_INFINITY)),
+        ("Float", "NaN") => Some(Value::Float(f32::NAN)),
+        ("Float", "SIZE_BITS") => Some(Value::new_int(32)),
+        ("Float", "SIZE_BYTES") => Some(Value::new_int(4)),
+        ("Char", "MAX_VALUE") => Some(Value::Char('\u{FFFF}')),
+        ("Char", "MIN_VALUE") => Some(Value::Char('\u{0}')),
+        ("Char", "SIZE_BITS") => Some(Value::new_int(16)),
+        ("Char", "SIZE_BYTES") => Some(Value::new_int(2)),
+        _ => None,
+    }
+}
+
 /// Detect whether an expression is a syntactic "box-to-Any" form. Used
 /// at `==` sites to switch Float/Double equality to bit-equality per
 /// spec §8.9.2 (the `Any.equals` path matches JVM `Float.equals`).
@@ -7153,6 +7274,20 @@ fn is_boxed_to_any_form(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// True if `t` is a static type that boxes a primitive float — i.e. the
+/// `==` expansion routes through `Any.equals` rather than `ieee754Equals`.
+/// Spec §8.9.2: only the precise float/float static-typed form uses IEEE
+/// semantics; anything that boxes (Any, Number, nullable Any?) uses
+/// reference-equality / `Float.equals` (bit equality).
+fn type_is_boxing_for_floats(t: &klio_types::Type) -> bool {
+    use klio_types::Type;
+    let inner = match t {
+        Type::Nullable(i) => &**i,
+        other => other,
+    };
+    matches!(inner, Type::Any)
 }
 
 const LATEINIT_SENTINEL_FQN: &str = "__klio_lateinit_uninitialized__";

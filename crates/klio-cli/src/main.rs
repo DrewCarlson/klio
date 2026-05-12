@@ -154,7 +154,7 @@ fn run_file(path: &std::path::Path) -> ExitCode {
         let _ = tc.diagnostics.render(&map, std::io::stderr());
         return ExitCode::FAILURE;
     }
-    match Interpreter::new().run(&ast) {
+    match Interpreter::new().with_expr_types(tc.types.clone()).run(&ast) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("runtime error: {e}");
