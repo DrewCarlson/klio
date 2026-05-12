@@ -7459,6 +7459,21 @@ impl Interpreter {
             {
                 return Ok(v);
             }
+            // Universal `Any` members available on every value.
+            match name.name.as_str() {
+                "toString" if args.is_empty() => {
+                    let s = self.format_value(&recv, out)?;
+                    return Ok(Value::String(Rc::new(s)));
+                }
+                "hashCode" if args.is_empty() => {
+                    return Ok(Value::new_int(value_hash(&recv)));
+                }
+                "equals" if args.len() == 1 => {
+                    let other = self.eval_expr(&args[0], env, out)?;
+                    return Ok(Value::Bool(Value::structural_eq(&recv, &other)));
+                }
+                _ => {}
+            }
             return Err(RuntimeError::Unimplemented(type_fqn));
         }
 
