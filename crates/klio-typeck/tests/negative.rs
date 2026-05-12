@@ -859,6 +859,15 @@ fn neg_circular_type_bound() {
 }
 
 #[test]
+fn neg_type_bound_not_satisfied() {
+    assert!(
+        type_codes_for("neg_type_bound_not_satisfied.kt")
+            .iter()
+            .any(|c| c == "T0022")
+    );
+}
+
+#[test]
 fn neg_circular_type_bound_self() {
     assert!(
         type_codes_for("neg_circular_type_bound_self.kt")

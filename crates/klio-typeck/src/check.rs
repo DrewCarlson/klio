@@ -434,6 +434,15 @@ struct FnSig {
     /// Number of declaration-site type parameters. Used to filter the OCS
     /// against an explicit call-site `<...>` list. Spec §11.2.8.
     type_param_count: usize,
+    /// Names of the declaration-site type parameters in order, matching
+    /// `type_param_count`. Used by T0022 bound enforcement to look up
+    /// `where`-bound substitutions.
+    type_param_names: Vec<String>,
+    /// Per-type-parameter upper bounds (inline `<T : B>` plus matching
+    /// `where T : ...` clauses). Each inner Vec is the bound list for
+    /// the corresponding type parameter, in declaration order. Empty when
+    /// the parameter has no declared bound (implicit `Any?`).
+    type_param_bounds: Vec<Vec<Type>>,
     /// User-class simple name for each parameter whose declared type names
     /// a known class. `None` for primitive / function / unresolved slots.
     /// Used by MSC's pairwise forwarding test (§11.4.2) to distinguish
@@ -2861,6 +2870,39 @@ impl<'r> Checker<'r> {
         }
     }
 
+    /// Materializes the per-type-parameter upper-bound list for a
+    /// declaration. The inline `<T : Foo>` bound contributes one entry;
+    /// every `where T : ...` clause that names the parameter appends
+    /// another. Bounds that lower to `Type::Unresolved` are dropped because
+    /// they would render the subtype check vacuously true.
+    fn collect_type_param_bounds(
+        type_params: &[TypeParam],
+        where_bounds: &[WhereBound],
+    ) -> (Vec<String>, Vec<Vec<Type>>) {
+        let mut names = Vec::with_capacity(type_params.len());
+        let mut bounds: Vec<Vec<Type>> = Vec::with_capacity(type_params.len());
+        for tp in type_params {
+            names.push(tp.name.name.clone());
+            let mut v: Vec<Type> = Vec::new();
+            if let Some(b) = &tp.upper_bound {
+                let ty = convert_type_ref_lossy(b);
+                if !matches!(ty, Type::Unresolved) {
+                    v.push(ty);
+                }
+            }
+            for wb in where_bounds {
+                if wb.name.name == tp.name.name {
+                    let ty = convert_type_ref_lossy(&wb.bound);
+                    if !matches!(ty, Type::Unresolved) {
+                        v.push(ty);
+                    }
+                }
+            }
+            bounds.push(v);
+        }
+        (names, bounds)
+    }
+
     fn signature_of(&self, f: &Function) -> FnSig {
         let mut params = Vec::with_capacity(f.params.len());
         let mut has_default = Vec::with_capacity(f.params.len());
@@ -2879,6 +2921,8 @@ impl<'r> Checker<'r> {
             .unwrap_or(Type::Unit);
         let param_class_names: Vec<Option<String>> =
             f.params.iter().map(|p| class_name_from_typeref(&p.ty)).collect();
+        let (type_param_names, type_param_bounds) =
+            Self::collect_type_param_bounds(&f.type_params, &f.where_bounds);
         FnSig {
             params,
             has_default,
@@ -2887,6 +2931,8 @@ impl<'r> Checker<'r> {
             return_ty,
             is_infix: f.is_infix,
             type_param_count: f.type_params.len(),
+            type_param_names,
+            type_param_bounds,
             param_class_names,
             decl_span: Some(f.name.span),
         }
@@ -2922,6 +2968,8 @@ impl<'r> Checker<'r> {
                 );
             }
         }
+        let (ctor_type_param_names, ctor_type_param_bounds) =
+            Self::collect_type_param_bounds(&c.type_params, &c.where_bounds);
         let ctor_sig = FnSig {
             params: c
                 .primary_params
@@ -2934,6 +2982,8 @@ impl<'r> Checker<'r> {
             return_ty: Type::Unresolved,
             is_infix: false,
             type_param_count: c.type_params.len(),
+            type_param_names: ctor_type_param_names,
+            type_param_bounds: ctor_type_param_bounds,
             param_class_names: c
                 .primary_params
                 .iter()
@@ -3267,6 +3317,56 @@ impl<'r> Checker<'r> {
         }
         color.insert(node.to_string(), 2);
         None
+    }
+
+    /// Validates that each user-supplied explicit type argument satisfies
+    /// the declared upper bounds of the corresponding type parameter.
+    /// Builds a substitution `param_name -> supplied Type` and substitutes
+    /// it into each bound before the subtype check so an F-bounded form
+    /// like `<T : Comparable<T>>` lowers correctly. Emits T0022 once per
+    /// failing pair.
+    fn check_type_arg_bounds(&mut self, sig: &FnSig, type_args: &[TypeRef]) {
+        if type_args.len() != sig.type_param_count || sig.type_param_bounds.is_empty() {
+            return;
+        }
+        let supplied: Vec<Type> =
+            type_args.iter().map(convert_type_ref_lossy).collect();
+        let mut subst: std::collections::HashMap<String, Type> =
+            std::collections::HashMap::new();
+        for (i, name) in sig.type_param_names.iter().enumerate() {
+            if let Some(ty) = supplied.get(i) {
+                subst.insert(name.clone(), ty.clone());
+            }
+        }
+        for (i, bounds) in sig.type_param_bounds.iter().enumerate() {
+            if bounds.is_empty() {
+                continue;
+            }
+            let arg_ty = match supplied.get(i) {
+                Some(t) => t,
+                None => continue,
+            };
+            for b in bounds {
+                let bound = substitute_type_params(b, &subst);
+                if matches!(bound, Type::Unresolved) {
+                    continue;
+                }
+                if !arg_ty.is_subtype_of(&bound) {
+                    let sp = type_args[i].span;
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "type argument `{arg_ty}` does not satisfy upper bound `{bound}` on `{}`",
+                                sig.type_param_names[i]
+                            ),
+                            sp,
+                        )
+                        .with_code(codes::TYPE_BOUND_NOT_SATISFIED),
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     fn emit_op_sig(&mut self, f: &Function, msg: &str) {
@@ -6387,6 +6487,10 @@ impl<'r> Checker<'r> {
             filtered = sigs.iter().collect();
         }
         if filtered.len() == 1 {
+            if has_type_args {
+                let sig = filtered[0].clone();
+                self.check_type_arg_bounds(&sig, type_args);
+            }
             self.check_arity_and_args(filtered[0], args, call_span);
             return filtered[0].return_ty.clone();
         }
@@ -6470,6 +6574,9 @@ impl<'r> Checker<'r> {
             return Type::Unresolved;
         }
         let sig = chosen.or(arity_match).unwrap().clone();
+        if has_type_args {
+            self.check_type_arg_bounds(&sig, type_args);
+        }
         let min = sig.has_default.iter().filter(|h| !**h).count();
         let max = sig.params.len();
         if args.len() < min || args.len() > max {
@@ -7266,6 +7373,42 @@ fn collect_aliased_names(t: &TypeRef, out: &mut Vec<String>) {
         if !ta.is_star {
             collect_aliased_names(&ta.ty, out);
         }
+    }
+}
+
+/// Replaces every `Type::TypeParam(name)` whose `name` is a key in `subst`
+/// with the corresponding concrete type. Recurses into nullable, function,
+/// range, and generic forms. Leaves unrelated type-params untouched so a
+/// nested generic-class declaration's type parameters survive substitution
+/// at an outer call site.
+fn substitute_type_params(t: &Type, subst: &std::collections::HashMap<String, Type>) -> Type {
+    use klio_types::GenericArg;
+    match t {
+        Type::TypeParam(n) => subst.get(n).cloned().unwrap_or_else(|| t.clone()),
+        Type::Nullable(inner) => {
+            substitute_type_params(inner, subst).as_nullable()
+        }
+        Type::Function { params, return_type } => Type::Function {
+            params: params.iter().map(|p| substitute_type_params(p, subst)).collect(),
+            return_type: Box::new(substitute_type_params(return_type, subst)),
+        },
+        Type::Range(inner) => Type::Range(Box::new(substitute_type_params(inner, subst))),
+        Type::Generic { name, args } => Type::Generic {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| GenericArg {
+                    variance: a.variance,
+                    is_star: a.is_star,
+                    ty: if a.is_star {
+                        a.ty.clone()
+                    } else {
+                        substitute_type_params(&a.ty, subst)
+                    },
+                })
+                .collect(),
+        },
+        _ => t.clone(),
     }
 }
 
