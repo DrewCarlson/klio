@@ -2716,6 +2716,18 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     } else {
                         self.parse_ident("callable reference name")?
                     };
+                    if name.name == "class" && !pending_type_args.is_empty() {
+                        // Spec §15.1: class literals erase their type
+                        // arguments, so writing them is rejected.
+                        let span_first = pending_type_args.first().map(|t| t.span).unwrap_or(name.span);
+                        let span_last = pending_type_args.last().map(|t| t.span).unwrap_or(name.span);
+                        self.error(
+                            "T0104",
+                            "class literal does not take type arguments — type arguments are erased on `::class`.",
+                            span_first.join(span_last),
+                        );
+                    }
+                    pending_type_args.clear();
                     let span = expr.span().join(name.span);
                     expr = Expr::MemberRef { receiver: Box::new(expr), name, span };
                 }
@@ -3939,6 +3951,13 @@ mod tests {
         let (_file, diags) = parse("import kotlin.collections.* as col\n");
         let codes: Vec<_> = diags.diagnostics().iter().filter_map(|d| d.code()).collect();
         assert!(codes.contains(&"P0044"), "expected P0044, got {codes:?}");
+    }
+
+    #[test]
+    fn class_literal_with_type_arguments_is_rejected() {
+        let (_file, diags) = parse("fun main() { val k = Box<Int>::class }\n");
+        let codes: Vec<_> = diags.diagnostics().iter().filter_map(|d| d.code()).collect();
+        assert!(codes.contains(&"T0104"), "expected T0104, got {codes:?}");
     }
 
     #[test]
