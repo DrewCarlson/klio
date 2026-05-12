@@ -5822,7 +5822,31 @@ impl<'r> Checker<'r> {
                 }
                 // Recurse into the spread expression for diagnostics.
                 if let Expr::Spread { expr, .. } = a {
-                    let _ = self.check_expr(expr, None);
+                    let spread_ty = self.check_expr(expr, None);
+                    // §8.21.5: spread expression's element type must be a
+                    // subtype of the vararg parameter's element type.
+                    if is_va {
+                        if let Some(param_elem) = sig.params.get(target_param) {
+                            let spread_elem = array_element_type(&spread_ty).or_else(|| {
+                                self.expr_class
+                                    .get(&expr.span())
+                                    .and_then(|cn| primitive_array_elem_by_name(cn))
+                            });
+                            if let Some(spread_elem) = spread_elem {
+                                if !spread_elem.is_subtype_of(param_elem) {
+                                    self.diagnostics.emit(
+                                        Diagnostic::error(
+                                            format!(
+                                                "spread argument element type `{spread_elem}` is not a subtype of vararg parameter element type `{param_elem}`"
+                                            ),
+                                            expr.span(),
+                                        )
+                                        .with_code(codes::TYPE_SPREAD_TYPE_MISMATCH),
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -6526,6 +6550,46 @@ fn single_path_name(e: &Expr) -> Option<String> {
         }
     }
     None
+}
+
+/// Element type of a primitive-array class name (`IntArray` → `Int`).
+fn primitive_array_elem_by_name(name: &str) -> Option<Type> {
+    let short = name.strip_prefix("kotlin.").unwrap_or(name);
+    match short {
+        "IntArray" => Some(Type::Int),
+        "LongArray" => Some(Type::Long),
+        "ShortArray" => Some(Type::Short),
+        "ByteArray" => Some(Type::Byte),
+        "DoubleArray" => Some(Type::Double),
+        "FloatArray" => Some(Type::Float),
+        "BooleanArray" => Some(Type::Boolean),
+        "CharArray" => Some(Type::Char),
+        _ => None,
+    }
+}
+
+/// Extract the element type of an array-shaped value type. Recognizes
+/// `Array<T>`, the primitive `IntArray` / `LongArray` / … specializations,
+/// and their nullable forms.
+fn array_element_type(t: &Type) -> Option<Type> {
+    let t = t.non_null();
+    match t {
+        Type::Generic { name, args } if name == "Array" => {
+            args.first().filter(|a| !a.is_star).map(|a| a.ty.clone())
+        }
+        Type::Generic { name, .. } => match name.as_str() {
+            "IntArray" => Some(Type::Int),
+            "LongArray" => Some(Type::Long),
+            "ShortArray" => Some(Type::Short),
+            "ByteArray" => Some(Type::Byte),
+            "DoubleArray" => Some(Type::Double),
+            "FloatArray" => Some(Type::Float),
+            "BooleanArray" => Some(Type::Boolean),
+            "CharArray" => Some(Type::Char),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// True if `a` and `b` are statically compatible enough that an equality

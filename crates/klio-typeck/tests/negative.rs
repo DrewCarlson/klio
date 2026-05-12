@@ -777,6 +777,15 @@ fn neg_reference_equality_distinct() {
 }
 
 #[test]
+fn neg_spread_type_mismatch() {
+    assert!(
+        type_codes_for("neg_spread_type_mismatch.kt")
+            .iter()
+            .any(|c| c == "T0086")
+    );
+}
+
+#[test]
 fn neg_as_safe_type_param() {
     assert!(
         type_codes_for("neg_as_safe_type_param.kt")
