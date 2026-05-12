@@ -527,6 +527,20 @@ fn neg_tailrec_on_open() {
 }
 
 #[test]
+fn neg_data_class_copy_override() {
+    assert!(type_codes_for("neg_data_class_copy_override.kt")
+        .iter()
+        .any(|c| c == "T0059"));
+}
+
+#[test]
+fn neg_data_class_component_override() {
+    assert!(type_codes_for("neg_data_class_component_override.kt")
+        .iter()
+        .any(|c| c == "T0058"));
+}
+
+#[test]
 fn neg_published_api_missing() {
     assert!(type_codes_for("neg_published_api_missing.kt")
         .iter()

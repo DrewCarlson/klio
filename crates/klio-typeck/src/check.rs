@@ -192,6 +192,16 @@ pub mod codes {
     /// Virtual dispatch defeats the trampoline rewrite, so kotlinc emits a
     /// warning. Matches `TAILREC_ON_VIRTUAL_MEMBER`.
     pub const TYPE_TAILREC_ON_OPEN: &str = "T0057";
+    /// A `data class` body declares a `componentN` function whose signature
+    /// matches one of the auto-generated component accessors. Spec §4.1.2
+    /// states `componentN` cannot be explicified.
+    pub const TYPE_DATA_CLASS_FORBIDS_COMPONENT_OVERRIDE: &str = "T0058";
+    /// A `data class` body declares a `copy` function. Spec §4.1.2 states
+    /// `copy` cannot be explicified.
+    pub const TYPE_DATA_CLASS_FORBIDS_COPY_OVERRIDE: &str = "T0059";
+    /// Two or more secondary constructors form a delegation cycle through
+    /// `this(...)` calls. Spec §4.1.1 forbids this.
+    pub const TYPE_CONSTRUCTOR_DELEGATION_CYCLE: &str = "T0060";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -2104,6 +2114,46 @@ impl<'r> Checker<'r> {
 
     fn check_class(&mut self, c: &Class) {
         self.class_stack.push(c.name.name.clone());
+        // Spec §4.1.2: `data class` cannot explicify `copy` or `componentN`.
+        if c.is_data {
+            let n_props = c.primary_params.iter().filter(|p| p.property.is_some()).count();
+            for m in &c.members {
+                if let Decl::Function(f) = m {
+                    let n = f.name.name.as_str();
+                    if n == "copy" {
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                format!(
+                                    "`copy` is auto-generated for data class `{}` and cannot be \
+                                     explicified (spec §4.1.2)",
+                                    c.name.name
+                                ),
+                                f.name.span,
+                            )
+                            .with_code(codes::TYPE_DATA_CLASS_FORBIDS_COPY_OVERRIDE),
+                        );
+                    } else if let Some(rest) = n.strip_prefix("component") {
+                        if let Ok(idx) = rest.parse::<usize>() {
+                            if idx >= 1 && idx <= n_props && f.params.is_empty() {
+                                self.diagnostics.emit(
+                                    Diagnostic::error(
+                                        format!(
+                                            "`{}` is auto-generated for data class `{}` and cannot \
+                                             be explicified (spec §4.1.2)",
+                                            n, c.name.name
+                                        ),
+                                        f.name.span,
+                                    )
+                                    .with_code(
+                                        codes::TYPE_DATA_CLASS_FORBIDS_COMPONENT_OVERRIDE,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Spec §3.9: `kotlin.Enum<T>` declares `equals`, `hashCode`, and
         // `compareTo` as `final`. User-declared enum entries cannot override
         // them. `toString` remains overridable.
