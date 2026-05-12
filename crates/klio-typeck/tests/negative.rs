@@ -768,6 +768,24 @@ fn neg_property_init_cycle() {
 }
 
 #[test]
+fn neg_reference_equality_distinct() {
+    assert!(
+        type_codes_for("neg_reference_equality_distinct.kt")
+            .iter()
+            .any(|c| c == "T0081")
+    );
+}
+
+#[test]
+fn neg_value_equality_distinct() {
+    assert!(
+        type_codes_for("neg_value_equality_distinct.kt")
+            .iter()
+            .any(|c| c == "T0082")
+    );
+}
+
+#[test]
 fn neg_method_reads_nonproperty_ctor_param() {
     assert!(
         type_codes_for("neg_method_reads_nonproperty_ctor_param.kt")

@@ -265,6 +265,27 @@ pub mod codes {
     /// body. Spec §6.1: such params are only DLD to the classifier
     /// initialization scope, so methods cannot see them.
     pub const TYPE_NON_PROPERTY_CTOR_PARAM_OUT_OF_SCOPE: &str = "T0075";
+    /// `A === B` or `A !== B` where the static types of `A` and `B` are
+    /// definitely-distinct and unrelated by subtyping. Spec §8.9.1: such
+    /// reference-equality expressions are invalid.
+    pub const TYPE_REFERENCE_EQUALITY_DISTINCT_TYPES: &str = "T0081";
+    /// `A == B` or `A != B` where the static types of `A` and `B` are
+    /// definitely-distinct and unrelated by subtyping. Spec §8.9.2.
+    pub const TYPE_VALUE_EQUALITY_DISTINCT_TYPES: &str = "T0082";
+    /// `e as? T` where `T` is a type parameter not declared `reified`. Spec
+    /// §8.16: when `T` is not runtime-available the check is not performed,
+    /// so the runtime can return a value of an unrelated type. Warning.
+    pub const TYPE_CAST_TO_NON_REIFIED_TYPE_PARAMETER: &str = "T0083";
+    /// Bare type syntax in `is` / `as` whose type-argument inference would
+    /// produce a star-projection slot. Spec §8.11.1.
+    pub const TYPE_BARE_TYPE_INFERENCE_FAILED: &str = "T0084";
+    /// A non-private function or property returns / exposes an object
+    /// literal value whose anonymous type has more than one declared
+    /// supertype without an explicit return-type ascription. Spec §8.23.
+    pub const TYPE_ANONYMOUS_OBJECT_ESCAPES_PUBLIC: &str = "T0085";
+    /// `*expr` spread argument whose element type is not a subtype of the
+    /// declared vararg parameter's element type. Spec §8.21.5.
+    pub const TYPE_SPREAD_TYPE_MISMATCH: &str = "T0086";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -5765,9 +5786,38 @@ impl<'r> Checker<'r> {
         let _ = sig.param_names.len();
     }
 
-    fn check_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, _span: Span) -> Type {
+    fn check_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) -> Type {
         let l = self.check_expr(lhs, None);
         let r = self.check_expr(rhs, None);
+        // Spec §8.9.1 / §8.9.2: an equality between two definitely-distinct
+        // types unrelated by subtyping is a compile-time error. Skip when
+        // either side is `null` (the spec routes the null arm separately) or
+        // when either side typed to `Unresolved` (we have no information).
+        if matches!(op, BinOp::Eq | BinOp::Neq | BinOp::IdentEq | BinOp::IdentNeq)
+            && !matches!(lhs, Expr::NullLit { .. })
+            && !matches!(rhs, Expr::NullLit { .. })
+            && !equality_types_compatible(&l, &r)
+        {
+            let (code, label) = if matches!(op, BinOp::IdentEq | BinOp::IdentNeq) {
+                (
+                    codes::TYPE_REFERENCE_EQUALITY_DISTINCT_TYPES,
+                    "reference equality",
+                )
+            } else {
+                (codes::TYPE_VALUE_EQUALITY_DISTINCT_TYPES, "equality")
+            };
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "{label} between `{}` and `{}` is impossible — types are unrelated",
+                        type_label(&l),
+                        type_label(&r),
+                    ),
+                    span,
+                )
+                .with_code(code),
+            );
+        }
         match op {
             BinOp::Add => {
                 if matches!(l.non_null(), Type::String) || matches!(r.non_null(), Type::String) {
@@ -6427,6 +6477,48 @@ fn single_path_name(e: &Expr) -> Option<String> {
         }
     }
     None
+}
+
+/// True if `a` and `b` are statically compatible enough that an equality
+/// comparison is meaningful (one is a subtype of the other, both are
+/// numeric, either is `Unresolved` / `Any` / `Nothing` / a type parameter,
+/// or both are user classes whose relationship we cannot decide at typeck).
+fn equality_types_compatible(a: &Type, b: &Type) -> bool {
+    if matches!(a, Type::Unresolved) || matches!(b, Type::Unresolved) {
+        return true;
+    }
+    if matches!(a, Type::Nothing) || matches!(b, Type::Nothing) {
+        return true;
+    }
+    if matches!(a, Type::Any | Type::Nullable(_)) || matches!(b, Type::Any | Type::Nullable(_)) {
+        // Comparing through a nullable / Any reference is always legal.
+        if matches!(a.non_null(), Type::Any) || matches!(b.non_null(), Type::Any) {
+            return true;
+        }
+    }
+    // Type parameters and generics with unresolved bounds: stay permissive.
+    if matches!(a, Type::TypeParam(_)) || matches!(b, Type::TypeParam(_)) {
+        return true;
+    }
+    if a.is_subtype_of(b) || b.is_subtype_of(a) {
+        return true;
+    }
+    // Both numeric: cross-type comparison is allowed (Kotlin's `Number`
+    // equality compares mathematical values, `1 == 1L` is true).
+    if is_numeric(a) && is_numeric(b) {
+        return true;
+    }
+    // User-class generics where we cannot resolve subtyping precisely: be
+    // permissive to avoid false positives on instances flowing through
+    // `Type::Generic { name, .. }` whose hierarchy isn't known here.
+    if matches!(a, Type::Generic { .. }) || matches!(b, Type::Generic { .. }) {
+        return true;
+    }
+    false
+}
+
+fn type_label(t: &Type) -> String {
+    format!("{t}")
 }
 
 fn is_numeric(t: &Type) -> bool {
