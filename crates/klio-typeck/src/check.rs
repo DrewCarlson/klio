@@ -1642,6 +1642,45 @@ impl<'a> Checker<'a> {
     /// a non-call context counts as an escape. Re-passing the parameter as
     /// a call argument also counts (we cannot tell whether the callee is
     /// itself inline).
+    /// Spec §8.23: a non-private function that returns an anonymous
+    /// object with multiple declared supertypes (and no explicit return
+    /// type annotation) leaks an unnameable type out of its scope.
+    /// Single-supertype anonymous objects are implicitly downcast to
+    /// their supertype, so they are allowed.
+    fn check_anonymous_object_escape(&mut self, f: &Function) {
+        if matches!(f.visibility, Visibility::Private) {
+            return;
+        }
+        if f.return_type.is_some() {
+            return;
+        }
+        let Some(body) = &f.body else { return };
+        let tail = match body {
+            FunctionBody::Expr(e) => e,
+            FunctionBody::Block(b) => {
+                let Some(last) = b.stmts.last() else { return };
+                match last {
+                    klio_ast::Stmt::Expr(e) => e,
+                    _ => return,
+                }
+            }
+        };
+        let Expr::ObjectExpr { supertypes, span, .. } = tail else { return };
+        if supertypes.len() < 2 {
+            return;
+        }
+        self.diagnostics.emit(
+            Diagnostic::error(
+                format!(
+                    "anonymous object with multiple supertypes escapes from non-private function `{}` — declare an explicit return type",
+                    f.name.name
+                ),
+                *span,
+            )
+            .with_code(codes::TYPE_ANONYMOUS_OBJECT_ESCAPES_PUBLIC),
+        );
+    }
+
     fn check_inline_param_escape(&mut self, f: &Function) {
         if !f.is_inline {
             return;
@@ -2918,6 +2957,7 @@ impl<'r> Checker<'r> {
 
     fn check_function(&mut self, f: &Function) {
         self.check_inline_param_escape(f);
+        self.check_anonymous_object_escape(f);
         let saved_assigned = self.assigned.clone();
         self.push_frame();
         for p in &f.params {

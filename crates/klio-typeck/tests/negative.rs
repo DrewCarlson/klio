@@ -777,6 +777,15 @@ fn neg_reference_equality_distinct() {
 }
 
 #[test]
+fn neg_anonymous_object_escapes_multi() {
+    assert!(
+        type_codes_for("neg_anonymous_object_escapes_multi.kt")
+            .iter()
+            .any(|c| c == "T0085")
+    );
+}
+
+#[test]
 fn neg_spread_type_mismatch() {
     assert!(
         type_codes_for("neg_spread_type_mismatch.kt")
