@@ -1589,6 +1589,36 @@ impl Env {
         self.parent.as_ref()?.borrow().lookup(name)
     }
 
+    /// Look up `name` in this scope only, skipping the parent chain. Used by
+    /// the interpreter when applying spec §10.1 import renames: a renamed
+    /// short name is shadowed if and only if it would have resolved through
+    /// the implicit prelude (a parent scope).
+    #[must_use]
+    pub fn lookup_local(&self, name: &str) -> Option<Value> {
+        self.vars.get(name).cloned()
+    }
+
+    /// Resolve `name` ignoring any binding that lives in `stop_at` (compared
+    /// by `Rc::ptr_eq`). Used by the interpreter to ask "would this lookup
+    /// have come from the implicit prelude?" — pass the prelude env in
+    /// `stop_at` and a non-prelude binding (locals, file-scope, …) is
+    /// returned; a None means only the prelude could have answered it.
+    #[must_use]
+    pub fn lookup_excluding(
+        &self,
+        name: &str,
+        stop_at: &Rc<RefCell<Env>>,
+    ) -> Option<Value> {
+        if let Some(v) = self.vars.get(name) {
+            return Some(v.clone());
+        }
+        let parent = self.parent.as_ref()?;
+        if Rc::ptr_eq(parent, stop_at) {
+            return None;
+        }
+        parent.borrow().lookup_excluding(name, stop_at)
+    }
+
     /// Collect every value bound under `name` walking from the innermost
     /// scope outwards. Returns them in inside-out order. Used to find
     /// enclosing-class `this` bindings when resolving a bare name inside

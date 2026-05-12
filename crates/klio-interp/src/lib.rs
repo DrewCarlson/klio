@@ -134,6 +134,11 @@ pub struct Interpreter {
     /// static type is `Any` / `Any?` / `Number` / `Number?`, matching the
     /// spec §8.9.2 expansion.
     expr_types: std::collections::HashMap<klio_span::Span, klio_types::Type>,
+    /// Renaming imports (§10.1) shadow the original unqualified name in the
+    /// current file. Maps the *original* simple name (the last path segment)
+    /// to the chosen alias so we can surface a helpful "renamed to <alias>"
+    /// message when a user references the shadowed name.
+    import_renames: std::collections::HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -187,6 +192,7 @@ impl Interpreter {
             implicit_lambda_label_stack: Vec::new(),
             tailrec_stack: Vec::new(),
             expr_types: std::collections::HashMap::new(),
+            import_renames: std::collections::HashMap::new(),
         }
     }
 
@@ -292,6 +298,47 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
         let file_env = Rc::new(RefCell::new(Env::with_parent(Rc::clone(&self.globals))));
+
+        // Apply renaming imports (spec §10.1). For each `import path.X as Y`
+        // we bind `Y` to whatever `path.X` resolves to in the stdlib registry
+        // and record the original simple name so referencing `X` unqualified
+        // surfaces a "renamed to `Y`" diagnostic.
+        self.import_renames.clear();
+        for imp in &file.imports {
+            if imp.wildcard {
+                continue;
+            }
+            let Some(alias_ident) = &imp.alias else { continue };
+            let Some(last_seg) = imp.path.last() else { continue };
+            let fqn = imp
+                .path
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if let Some(func) = klio_stdlib::implementation(&fqn) {
+                let fqn_static: &'static str = leak_fqn(&fqn);
+                // `kotlin.math.PI` and friends are property intrinsics — a
+                // zero-arg function that returns the value. Mirror the
+                // `Expr::Member` short-circuit by invoking immediately when
+                // the symbol is a property; for function/class intrinsics
+                // bind the callable Value::Intrinsic as-is.
+                let is_property = klio_stdlib::lookup(&fqn)
+                    .map_or(false, |s| matches!(s.kind, klio_stdlib::SymbolKind::Property));
+                let bound = if is_property {
+                    let mut ctx = CallCtx { args: &[], out };
+                    match func(&mut ctx) {
+                        Ok(v) => v,
+                        Err(_) => Value::Intrinsic { fqn: fqn_static, func },
+                    }
+                } else {
+                    Value::Intrinsic { fqn: fqn_static, func }
+                };
+                file_env.borrow_mut().define(alias_ident.name.clone(), bound);
+            }
+            self.import_renames
+                .insert(last_seg.name.clone(), alias_ident.name.clone());
+        }
 
         // Register top-level `typealias` declarations so constructor calls
         // through an alias name (`val x = S()` where `typealias S = String`)
@@ -1279,6 +1326,17 @@ impl Interpreter {
                 // with receiver).
                 if segments.len() == 1 {
                     let name = &segments[0].name;
+                    // Spec §10.1 renaming imports: an `import path.X as Y`
+                    // shadows the implicit-prelude `X` in this file. If `X`
+                    // appears unqualified and would only resolve through the
+                    // prelude (nothing local provides it), report the rename.
+                    if let Some(alias) = self.import_renames.get(name) {
+                        if env.borrow().lookup_excluding(name, &self.globals).is_none() {
+                            return Err(RuntimeError::Unbound(format!(
+                                "{name} (renamed to `{alias}` by an import in this file)"
+                            )));
+                        }
+                    }
                     // A top-level property with a delegate or custom
                     // accessor takes precedence over a plain env lookup
                     // so reads route through `getValue` / the getter.
@@ -6325,9 +6383,20 @@ impl Interpreter {
         if segments.is_empty() {
             return Err(RuntimeError::Type("empty path".into()));
         }
-        // Single-segment: env lookup first.
+        // Single-segment: env lookup first. Spec §10.1: a renaming import
+        // shadows the original simple name in this file when the only
+        // binding for it would have come from the implicit prelude. A local
+        // val / function / class with the same name is unaffected.
         if segments.len() == 1 {
             let name = &segments[0].name;
+            if let Some(alias) = self.import_renames.get(name) {
+                if let Some(v) = env.borrow().lookup_excluding(name, &self.globals) {
+                    return Ok(v);
+                }
+                return Err(RuntimeError::Unbound(format!(
+                    "{name} (renamed to `{alias}` by an import in this file)"
+                )));
+            }
             return env
                 .borrow()
                 .lookup(name)
@@ -8773,6 +8842,41 @@ mod tests {
         let (ast, _) = Parser::new(id, &owned, &lexed.tokens).parse_file();
         let mut out = CaptureOutput::default();
         Interpreter::new().run_with_output(&ast, &mut out).unwrap_err()
+    }
+
+    #[test]
+    fn rename_import_binds_alias() {
+        // `import kotlin.math.PI as TAU` makes `TAU` resolve to PI's value.
+        let out = run("import kotlin.math.PI as TAU\nfun main() { println(TAU) }");
+        let line = out.lines.first().expect("output");
+        assert!(line.starts_with("3.14"), "got {line:?}");
+    }
+
+    #[test]
+    fn rename_import_hides_original_short_name() {
+        // `import kotlin.collections.listOf as ofList` makes bare `listOf`
+        // unresolved in this file; the alias resolves normally.
+        let err = run_err(
+            "import kotlin.collections.listOf as ofList\nfun main() { println(listOf(1, 2)) }",
+        );
+        let msg = format!("{err}");
+        assert!(msg.contains("listOf"), "got {msg:?}");
+        assert!(msg.contains("ofList"), "got {msg:?}");
+    }
+
+    #[test]
+    fn rename_import_does_not_hide_local_shadow() {
+        // A local function with the same short name should still be
+        // reachable through unqualified access; the rename only hides the
+        // implicitly-imported entity.
+        let out = run(
+            r#"
+            import kotlin.collections.listOf as ofList
+            fun listOf(x: Int): Int = x + 1
+            fun main() { println(listOf(7)) }
+            "#,
+        );
+        assert_eq!(out.lines, vec!["8"]);
     }
 
     #[test]
