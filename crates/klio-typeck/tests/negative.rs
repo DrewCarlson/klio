@@ -832,6 +832,24 @@ fn neg_as_safe_type_param() {
 }
 
 #[test]
+fn neg_is_type_param() {
+    assert!(
+        type_codes_for("neg_is_type_param.kt")
+            .iter()
+            .any(|c| c == "T0100")
+    );
+}
+
+#[test]
+fn neg_as_unchecked_type_param() {
+    assert!(
+        type_codes_for("neg_as_unchecked_type_param.kt")
+            .iter()
+            .any(|c| c == "T0028")
+    );
+}
+
+#[test]
 fn neg_value_equality_distinct() {
     assert!(
         type_codes_for("neg_value_equality_distinct.kt")

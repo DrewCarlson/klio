@@ -353,6 +353,27 @@ pub mod codes {
     /// Constraint solver detected a circular dependency between
     /// inference variables that the staged resolver cannot break.
     pub const TYPE_INFERENCE_CYCLE: &str = "T0099";
+    /// `x is T` (or `x !is T`) where `T` is a type parameter that is not
+    /// `reified`. The runtime has no way to check membership of an erased
+    /// type parameter. Spec §15.1: type checks require a runtime-available
+    /// target type.
+    pub const TYPE_CANNOT_CHECK_FOR_ERASED_TYPE_PARAMETER: &str = "T0100";
+    /// `T?::class` — the LHS of a class literal cannot be a nullable
+    /// type. Spec §15.1.
+    pub const TYPE_NULLABLE_CLASS_LITERAL_LHS: &str = "T0101";
+    /// `T::class` where `T` is a type parameter that is not `reified` (or
+    /// is reified but has a nullable upper bound). Spec §15.1.
+    pub const TYPE_NON_REIFIED_CLASS_LITERAL: &str = "T0102";
+    /// `expr::class` where `expr` is neither a classifier name nor a
+    /// value whose static type is a classifier / function type. Spec §15.
+    pub const TYPE_CLASS_LITERAL_LHS_NOT_A_CLASS: &str = "T0103";
+    /// `Foo<X>::class` — generic class literals must use the raw or
+    /// star-projected form. Spec §15.1.
+    pub const TYPE_CLASS_LITERAL_WITH_TYPE_ARGUMENTS: &str = "T0104";
+    /// `catch (e: T)` where `T` is a type parameter that is not
+    /// `reified`, or a generic exception type with non-star arguments.
+    /// Spec §15.1: exception types in `catch` must be runtime-available.
+    pub const TYPE_RUNTIME_UNAVAILABLE_CATCH_TYPE: &str = "T0105";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -5578,6 +5599,27 @@ impl<'r> Checker<'r> {
                         .with_code(codes::TYPE_UNCHECKED_CAST),
                     );
                 }
+                let target_name = &ty.name.name;
+                let is_type_param = self
+                    .type_params_in_scope
+                    .iter()
+                    .any(|s| s.contains(target_name));
+                let is_reified = self
+                    .reified_type_params
+                    .iter()
+                    .any(|s| s.contains(target_name));
+                if is_type_param && !is_reified {
+                    let op = if *negated { "!is" } else { "is" };
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            format!(
+                                "Cannot check for an instance of an erased type parameter `{target_name}`. Mark it as `reified` on an `inline fun` to allow `{op}`."
+                            ),
+                            ty.span,
+                        )
+                        .with_code(codes::TYPE_CANNOT_CHECK_FOR_ERASED_TYPE_PARAMETER),
+                    );
+                }
                 Type::Boolean
             }
             Expr::As { expr, ty, safe, span } => {
@@ -5605,9 +5647,12 @@ impl<'r> Checker<'r> {
                         .with_code(codes::TYPE_UNCHECKED_CAST),
                     );
                 }
-                // Spec §8.16: `as?` against a non-reified type parameter T cannot be checked
-                // at runtime — the cast may succeed even when the value is not a T.
-                if *safe {
+                // Spec §15.1 / §8.16: a cast to a non-reified type parameter
+                // T cannot be checked at runtime. For `as?` the safe-cast can
+                // never observe a failure (always succeeds when the value is
+                // non-null), so we surface the dedicated T0083; for unsafe
+                // `as` the cast is also unchecked — fold it under T0028.
+                {
                     let target_name = &ty.name.name;
                     let is_type_param = self
                         .type_params_in_scope
@@ -5618,15 +5663,27 @@ impl<'r> Checker<'r> {
                         .iter()
                         .any(|s| s.contains(target_name));
                     if is_type_param && !is_reified {
-                        self.diagnostics.emit(
-                            Diagnostic::warning(
-                                format!(
-                                    "Safe cast `as? {target_name}` cannot be checked at runtime — type parameter is not `reified`"
-                                ),
-                                ty.span,
-                            )
-                            .with_code(codes::TYPE_CAST_TO_NON_REIFIED_TYPE_PARAMETER),
-                        );
+                        if *safe {
+                            self.diagnostics.emit(
+                                Diagnostic::warning(
+                                    format!(
+                                        "Safe cast `as? {target_name}` cannot be checked at runtime — type parameter is not `reified`"
+                                    ),
+                                    ty.span,
+                                )
+                                .with_code(codes::TYPE_CAST_TO_NON_REIFIED_TYPE_PARAMETER),
+                            );
+                        } else {
+                            self.diagnostics.emit(
+                                Diagnostic::warning(
+                                    format!(
+                                        "Unchecked cast: target type parameter `{target_name}` is not `reified` and is erased at runtime"
+                                    ),
+                                    ty.span,
+                                )
+                                .with_code(codes::TYPE_UNCHECKED_CAST),
+                            );
+                        }
                     }
                 }
                 let target = convert_type_ref_lossy(ty);
