@@ -52,6 +52,10 @@ pub enum Value {
     /// access like `s.uppercase`. Calling it invokes `func` with the receiver
     /// prepended to the user arguments.
     BoundMethod { fqn: &'static str, func: StdlibFn, receiver: Box<Value> },
+    /// A user-method reference bound to a specific instance — produced by
+    /// `instance::method`. Calling it dispatches through the method
+    /// resolution chain on `receiver` with the caller's arguments.
+    BoundUserMethod { receiver: Rc<RefCell<InstanceData>>, method: Rc<MethodDef> },
     /// A thrown value, modeled as a Kotlin Throwable. Carries an FQN
     /// (e.g. `kotlin.IllegalArgumentException`), an optional message, and
     /// an optional cause (another Throwable) per spec §3.12.
@@ -710,6 +714,12 @@ impl fmt::Debug for Value {
             Self::Lambda { params, .. } => write!(f, "Lambda(params={})", params.len()),
             Self::Intrinsic { fqn, .. } => write!(f, "Intrinsic({fqn})"),
             Self::BoundMethod { fqn, .. } => write!(f, "BoundMethod({fqn})"),
+            Self::BoundUserMethod { receiver, method } => write!(
+                f,
+                "BoundUserMethod({}::{})",
+                receiver.borrow().class.name,
+                method.name
+            ),
             Self::Exception { fqn, message, .. } => match message {
                 Some(m) => write!(f, "Exception({fqn}: {m:?})"),
                 None => write!(f, "Exception({fqn})"),
@@ -794,6 +804,9 @@ impl fmt::Display for Value {
             Self::Lambda { .. } => write!(f, "{{lambda}}"),
             Self::Intrinsic { fqn, .. } | Self::BoundMethod { fqn, .. } => {
                 write!(f, "fun {fqn}(...)")
+            }
+            Self::BoundUserMethod { receiver, method } => {
+                write!(f, "fun {}.{}(...)", receiver.borrow().class.name, method.name)
             }
             Self::Exception { fqn, message, .. } => match message {
                 Some(m) => write!(f, "{fqn}: {m}"),
@@ -1102,7 +1115,8 @@ impl Value {
             Self::Function { .. }
             | Self::Lambda { .. }
             | Self::Intrinsic { .. }
-            | Self::BoundMethod { .. } => "kotlin.Function",
+            | Self::BoundMethod { .. }
+            | Self::BoundUserMethod { .. } => "kotlin.Function",
             Self::Exception { .. } => "kotlin.Throwable",
             // EnumEntries values dispatch through the regular `List` member
             // table at runtime — the EnumEntries identity is only surfaced
@@ -1227,7 +1241,8 @@ impl Value {
             Value::Function { .. }
             | Value::Lambda { .. }
             | Value::Intrinsic { .. }
-            | Value::BoundMethod { .. } => {
+            | Value::BoundMethod { .. }
+            | Value::BoundUserMethod { .. } => {
                 if matches!(
                     name,
                     "Function"

@@ -5875,6 +5875,10 @@ impl Interpreter {
                 let mut ctx = CallCtx { args: &all, out };
                 func(&mut ctx)
             }
+            Value::BoundUserMethod { receiver, method } => {
+                let arg_names: Vec<Option<String>> = vec![None; args.len()];
+                self.call_method(receiver, method, args, &arg_names, out)
+            }
             other => Err(RuntimeError::Type(format!(
                 "cannot invoke non-callable delegate component: {other:?}"
             ))),
@@ -6174,17 +6178,26 @@ impl Interpreter {
                 return Ok(Value::PropertyRef { name: Rc::new(name.to_string()) });
             }
         }
-        // `instance::method` — bind the method to the receiver and return a
-        // zero-arg-friendly lambda that re-invokes through normal dispatch.
+        // `instance::method` — produce a `Value::BoundUserMethod` that the
+        // call-dispatch path invokes through `call_method` with the captured
+        // receiver. Falls back to a `Value::PropertyRef` when the name
+        // resolves as a property (data-class property, body property, etc.).
         if let Value::Instance(inst) = recv {
             let class = Rc::clone(&inst.borrow().class);
             if let Some((m, _)) = class.find_method(name) {
-                // Produce a `Value::Function` whose body is the method's
-                // body — but we need `this` bound. Cheapest: capture both
-                // and route through `call_method` via a stored marker.
-                return Ok(Value::PropertyRef {
-                    name: Rc::new(format!("{}::{}", class.name, m.name)),
+                return Ok(Value::BoundUserMethod {
+                    receiver: Rc::clone(inst),
+                    method: Rc::new(m),
                 });
+            }
+            let is_property = class
+                .primary_params
+                .iter()
+                .any(|p| p.name == name && p.property.is_some())
+                || class.body_properties.iter().any(|p| p.name == name)
+                || class.find_body_property(name).is_some();
+            if is_property {
+                return Ok(Value::PropertyRef { name: Rc::new(name.to_string()) });
             }
         }
         Err(RuntimeError::Type(format!("unresolved callable reference `::{name}`")))
@@ -7316,6 +7329,9 @@ impl Interpreter {
                 all.extend(user_args);
                 let mut ctx = CallCtx { args: &all, out };
                 func(&mut ctx)
+            }
+            Value::BoundUserMethod { receiver, method } => {
+                self.call_method(&receiver, &method, &arg_vals, arg_names, out)
             }
             Value::Function { decl, env: captured } => {
                 // Spec §4.2 implicit lambda labels: a lambda passed as an
