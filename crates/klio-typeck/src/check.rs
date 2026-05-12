@@ -4648,6 +4648,14 @@ impl<'r> Checker<'r> {
                     let got = self.check_expr(value, Some(&want));
                     self.check_assignable(&got, &want, value.span());
                     self.assigned.insert(name.clone());
+                    // Spec §12.2.2 killDataFlow: a write to a narrowed
+                    // variable invalidates the prior smart-cast. Drop the
+                    // narrowing from every enclosing frame so subsequent
+                    // reads see the declared (post-assignment) type.
+                    for f in self.frames.iter_mut() {
+                        f.narrowings.remove(name);
+                        f.narrowing_class.remove(name);
+                    }
                     return;
                 }
             }
@@ -8762,6 +8770,25 @@ mod tests {
             "#,
         );
         assert!(codes(&tc).contains(&codes::WARN_USELESS_ELVIS));
+    }
+
+    #[test]
+    fn var_reassign_kills_narrowing() {
+        let tc = check_src(
+            r#"
+            fun src(): String? = null
+            fun main() {
+                var x: String? = "ok"
+                if (x != null) {
+                    while (true) {
+                        x = src()
+                        println(x.length)
+                    }
+                }
+            }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::TYPE_NULL_SAFETY));
     }
 
     #[test]
