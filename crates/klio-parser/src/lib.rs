@@ -3126,6 +3126,35 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         }
     }
 
+    /// Parses a `controlStructureBody` per the spec: a statement (which
+    /// may be an assignment) wrapped as a single-statement block, or an
+    /// expression. Used for `if` / `else` / `while` / `for` / `do-while`
+    /// bodies so a non-block body can be an assignment like
+    /// `if (c) x = v`.
+    fn parse_control_structure_body(&mut self) -> Option<Expr> {
+        let save = self.pos;
+        let expr = self.parse_expr()?;
+        let op = match self.peek_kind() {
+            TokenKind::Eq => Some(AssignOp::Assign),
+            TokenKind::PlusEq => Some(AssignOp::Add),
+            TokenKind::MinusEq => Some(AssignOp::Sub),
+            TokenKind::StarEq => Some(AssignOp::Mul),
+            TokenKind::SlashEq => Some(AssignOp::Div),
+            TokenKind::PercentEq => Some(AssignOp::Rem),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.bump();
+            self.skip_nl();
+            let rhs = self.parse_expr()?;
+            let span = expr.span().join(rhs.span());
+            let stmt = Stmt::Assign { target: expr, op, value: rhs, span };
+            return Some(Expr::Block(Block { stmts: vec![stmt], span }));
+        }
+        let _ = save;
+        Some(expr)
+    }
+
     fn parse_if(&mut self) -> Option<Expr> {
         let kw = self.bump();
         self.expect(&TokenKind::LParen, "`(`")?;
@@ -3148,7 +3177,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             TokenKind::Keyword(Keyword::Else) => {
                 Expr::Block(Block { stmts: Vec::new(), span: cond_span })
             }
-            _ => self.parse_expr()?,
+            _ => self.parse_control_structure_body()?,
         };
         // `else` may follow on the next line.
         let save = self.pos;
@@ -3160,7 +3189,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 let semi = self.bump();
                 Some(Box::new(Expr::Block(Block { stmts: Vec::new(), span: semi.span })))
             } else {
-                self.parse_expr().map(Box::new)
+                self.parse_control_structure_body().map(Box::new)
             }
         } else {
             self.pos = save;
@@ -3185,7 +3214,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.skip_nl();
         self.expect(&TokenKind::RParen, "`)`")?;
         self.skip_nl();
-        let body = self.parse_expr()?;
+        let body = self.parse_control_structure_body()?;
         Some(Expr::While {
             cond: Box::new(cond),
             body: Box::new(body.clone()),
@@ -3200,7 +3229,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         let body = if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::While)) {
             None
         } else {
-            let b = self.parse_expr()?;
+            let b = self.parse_control_structure_body()?;
             Some(Box::new(b))
         };
         self.skip_nl();
@@ -3277,7 +3306,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.skip_nl();
         self.expect(&TokenKind::RParen, "`)`")?;
         self.skip_nl();
-        let body = self.parse_expr()?;
+        let body = self.parse_control_structure_body()?;
         Some(Expr::For {
             vars,
             var_ty,
