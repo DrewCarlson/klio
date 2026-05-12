@@ -3479,8 +3479,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         // We're at `{`. Header is `params ->` (optional). Body is a
         // statement list.
         let lbrace = self.bump();
-        let params = self.parse_lambda_header();
-        let mut stmts = Vec::new();
+        let (params, dest_stmts) = self.parse_lambda_header();
+        let mut stmts = dest_stmts;
         loop {
             self.skip_stmt_separators();
             if matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
@@ -3509,11 +3509,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     fn parse_trailing_lambda(&mut self) -> Option<Expr> {
         // Same shape; if no `->` is present, default to a single `it` param.
         let lbrace = self.bump();
-        let mut params = self.parse_lambda_header();
+        let (mut params, dest_stmts) = self.parse_lambda_header();
         if params.is_empty() {
             params.push(Ident { name: "it".into(), span: lbrace.span });
         }
-        let mut stmts = Vec::new();
+        let mut stmts = dest_stmts;
         loop {
             self.skip_stmt_separators();
             if matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
@@ -3540,30 +3540,79 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     }
 
     /// Reads the optional `params ->` header inside a `{ ... }` lambda.
-    /// Returns the param list (empty if no `->` is present).
-    fn parse_lambda_header(&mut self) -> Vec<Ident> {
+    /// Returns the param list (empty if no `->` is present) and a list of
+    /// destructuring statements that the caller should prepend to the body
+    /// — one `val (a, b, …) = $$dest_<i>` per destructured slot.
+    fn parse_lambda_header(&mut self) -> (Vec<Ident>, Vec<Stmt>) {
         let save = self.pos;
         let mut params = Vec::new();
+        let mut dest_stmts: Vec<Stmt> = Vec::new();
         self.skip_nl();
         // Empty `{ -> ... }` form: arrow at front, no params.
         if matches!(self.peek_kind(), TokenKind::Arrow) {
             self.bump();
-            return params;
+            return (params, dest_stmts);
         }
-        // `ident (: Type)? , ident (: Type)? , ... ->`
-        if matches!(self.peek_kind(), TokenKind::Ident) {
-            let mut local = Vec::new();
+        // `(ident (: Type)?, …)` destructured param OR
+        // `ident (: Type)?, ident (: Type)?, … ->`
+        if matches!(self.peek_kind(), TokenKind::Ident | TokenKind::LParen) {
+            let mut local: Vec<Ident> = Vec::new();
+            let mut pending_dest: Vec<(usize, Vec<Ident>, Span)> = Vec::new();
             loop {
-                let TokenKind::Ident = self.peek_kind() else { break };
-                let tok = self.bump();
-                local.push(Ident { name: self.text(tok.span).to_string(), span: tok.span });
-                self.skip_nl();
-                // Optional type annotation: `: Type`. We don't model the type
-                // on lambda params today; just skip the tokens.
-                if matches!(self.peek_kind(), TokenKind::Colon) {
-                    self.bump();
-                    let _ = self.parse_type();
-                    self.skip_nl();
+                match self.peek_kind() {
+                    TokenKind::Ident => {
+                        let tok = self.bump();
+                        local.push(Ident { name: self.text(tok.span).to_string(), span: tok.span });
+                        self.skip_nl();
+                        if matches!(self.peek_kind(), TokenKind::Colon) {
+                            self.bump();
+                            let _ = self.parse_type();
+                            self.skip_nl();
+                        }
+                    }
+                    TokenKind::LParen => {
+                        let lparen = self.bump();
+                        let mut names: Vec<Ident> = Vec::new();
+                        loop {
+                            self.skip_nl();
+                            if matches!(self.peek_kind(), TokenKind::RParen) {
+                                break;
+                            }
+                            let id_span = self.current_span();
+                            let text = self.text(id_span);
+                            let id = if text == "_" && matches!(self.peek_kind(), TokenKind::Ident) {
+                                self.bump();
+                                Ident { name: "_".into(), span: id_span }
+                            } else if let Some(id) = self.parse_ident("destructured lambda param") {
+                                id
+                            } else {
+                                break;
+                            };
+                            // Optional per-slot type annotation — recorded
+                            // by the parser but not yet typeck-enforced.
+                            if matches!(self.peek_kind(), TokenKind::Colon) {
+                                self.bump();
+                                let _ = self.parse_type();
+                            }
+                            names.push(id);
+                            self.skip_nl();
+                            if matches!(self.peek_kind(), TokenKind::Comma) {
+                                self.bump();
+                                continue;
+                            }
+                            break;
+                        }
+                        let Some(rparen) = self.expect(&TokenKind::RParen, "`)`") else {
+                            self.pos = save;
+                            return (Vec::new(), Vec::new());
+                        };
+                        let span = lparen.span.join(rparen.span);
+                        let outer = format!("$$dest_{}", local.len());
+                        local.push(Ident { name: outer, span });
+                        pending_dest.push((local.len() - 1, names, span));
+                        self.skip_nl();
+                    }
+                    _ => break,
                 }
                 if matches!(self.peek_kind(), TokenKind::Comma) {
                     self.bump();
@@ -3575,14 +3624,21 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             self.skip_nl();
             if matches!(self.peek_kind(), TokenKind::Arrow) {
                 self.bump();
+                for (idx, names, span) in pending_dest {
+                    let init = Expr::Path {
+                        segments: vec![local[idx].clone()],
+                        span,
+                    };
+                    dest_stmts.push(Stmt::DestructuringDecl { mutable: false, names, init, span });
+                }
                 params = local;
-                return params;
+                return (params, dest_stmts);
             }
             // No arrow — the idents we consumed are actually body expression
             // tokens. Rewind so parse_stmt sees them.
             self.pos = save;
         }
-        params
+        (params, dest_stmts)
     }
 }
 

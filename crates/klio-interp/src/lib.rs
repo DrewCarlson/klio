@@ -10043,6 +10043,35 @@ mod tests {
     }
 
     #[test]
+    fn destructure_lambda_params() {
+        let src = r#"
+            fun main() {
+                val pairs = listOf(1 to "a", 2 to "b", 3 to "c")
+                pairs.forEach { (n, s) -> println("$n=$s") }
+                pairs.forEach { (n, _) -> println(n) }
+                pairs.forEach { (_, s) -> println(s) }
+            }
+        "#;
+        assert_eq!(
+            run(src).lines,
+            vec!["1=a", "2=b", "3=c", "1", "2", "3", "a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn destructure_lambda_params_typed() {
+        // Spec ch.9: per-slot type annotations are allowed; the runtime
+        // ignores them, but the parser must accept them without failing.
+        let src = r#"
+            fun main() {
+                val pairs = listOf(1 to "a", 2 to "b")
+                pairs.forEach { (n: Int, s: String) -> println("$n-$s") }
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["1-a", "2-b"]);
+    }
+
+    #[test]
     fn destructure_underscore_in_for_loop() {
         let src = r#"
             fun main() {
