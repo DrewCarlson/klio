@@ -8520,41 +8520,123 @@ fn walk_expr_tail(
 }
 
 /// Returns `true` if the given thrown value satisfies a `catch (e: T)`
-/// clause with the named type. We match on the exception's stored FQN,
-/// the FQN's terminal segment, and the universal `Throwable` / `Exception`
-/// supertypes — enough for the M6b exception set.
+/// clause with the named type. Spec §16.1: a catch-block is applicable
+/// when the runtime type of the thrown value is a subtype of the bound
+/// exception parameter. We walk both the built-in exception hierarchy
+/// (for `Value::Exception` and any supertype name not present in the
+/// captured environment) and the user-declared class chain (for
+/// `Value::Instance`), so a user subclass like
+/// `class MyErr : RuntimeException(...)` is caught via `RuntimeException`,
+/// `Exception`, or `Throwable` without any per-callsite enumeration.
 fn exception_matches(thrown: &Value, type_name: &str) -> bool {
-    let fqn = thrown.exception_fqn().unwrap_or(thrown.type_fqn());
-    if fqn == type_name {
-        return true;
-    }
-    if let Some(tail) = fqn.rsplit('.').next() {
-        if tail == type_name {
-            return true;
+    let target = strip_kotlin_prefix(type_name);
+
+    match thrown {
+        Value::Exception { .. } => {
+            let fqn = thrown.exception_fqn().unwrap_or(thrown.type_fqn());
+            let tail = fqn.rsplit('.').next().unwrap_or(fqn);
+            if tail == target || fqn == type_name {
+                return true;
+            }
+            if builtin_exception_is_subtype(tail, target) {
+                return true;
+            }
+            // Every `Value::Exception` is a Throwable by construction. Built-in
+            // exception types not yet enumerated in the hierarchy table still
+            // need to catch as `Throwable` / `Exception`.
+            matches!(target, "Throwable" | "Exception")
+        }
+        Value::Instance(i) => {
+            let inst = i.borrow();
+            if inst.class.is_subtype_of(type_name) || inst.class.is_subtype_of(target) {
+                return true;
+            }
+            // The user class chain may end at a built-in name (e.g.
+            // `RuntimeException`) that isn't itself a `Value::Class` in the
+            // captured env. Walk those built-in tails through the built-in
+            // hierarchy table so `class MyErr : RuntimeException()` matches
+            // `catch (e: Throwable)`.
+            let mut frontier: Vec<String> = inst.class.supertype_names.clone();
+            let mut seen: Vec<String> = vec![inst.class.name.clone()];
+            let mut steps = 0;
+            while let Some(p) = frontier.pop() {
+                if steps > 64 {
+                    break;
+                }
+                steps += 1;
+                if seen.iter().any(|s| s == &p) {
+                    continue;
+                }
+                seen.push(p.clone());
+                let pt = strip_kotlin_prefix(&p);
+                if pt == target {
+                    return true;
+                }
+                if builtin_exception_is_subtype(pt, target) {
+                    return true;
+                }
+                if let Some(Value::Class(c)) = inst.class.captured_env.borrow().lookup(&p) {
+                    for sp in &c.supertype_names {
+                        if !seen.iter().any(|s| s == sp) {
+                            frontier.push(sp.clone());
+                        }
+                    }
+                }
+            }
+            false
+        }
+        _ => {
+            let fqn = thrown.type_fqn();
+            fqn == type_name
+                || fqn.rsplit('.').next().map(|t| t == target).unwrap_or(false)
         }
     }
-    // Universal supertypes — every Throwable also catches as Exception / Throwable.
-    if matches!(type_name, "Throwable" | "Exception" | "kotlin.Throwable" | "kotlin.Exception") {
-        return matches!(thrown, Value::Exception { .. });
+}
+
+fn strip_kotlin_prefix(name: &str) -> &str {
+    name.strip_prefix("kotlin.").unwrap_or(name)
+}
+
+/// Direct-parent chain for each built-in exception type the interpreter
+/// surfaces. Names are simple (no `kotlin.` prefix). Used to answer
+/// subtype queries when the supertype isn't itself a `Value::Class` in the
+/// runtime environment.
+fn builtin_exception_parent(name: &str) -> Option<&'static str> {
+    match name {
+        "Throwable" => None,
+        "Error" | "Exception" => Some("Throwable"),
+        "RuntimeException" => Some("Exception"),
+        "IllegalArgumentException"
+        | "IllegalStateException"
+        | "NullPointerException"
+        | "IndexOutOfBoundsException"
+        | "ArithmeticException"
+        | "ClassCastException"
+        | "NoSuchElementException"
+        | "UnsupportedOperationException"
+        | "UninitializedPropertyAccessException"
+        | "NumberFormatException"
+        | "NoWhenBranchMatchedException"
+        | "ConcurrentModificationException" => Some("RuntimeException"),
+        "AssertionError" | "OutOfMemoryError" | "StackOverflowError" | "NotImplementedError" => {
+            Some("Error")
+        }
+        _ => None,
     }
-    // RuntimeException matches the small set of stdlib RuntimeException
-    // subtypes we surface.
-    if matches!(type_name, "RuntimeException" | "kotlin.RuntimeException") {
-        let runtime_subs = [
-            "kotlin.RuntimeException",
-            "kotlin.IllegalArgumentException",
-            "kotlin.IllegalStateException",
-            "kotlin.NullPointerException",
-            "kotlin.IndexOutOfBoundsException",
-            "kotlin.ArithmeticException",
-            "kotlin.ClassCastException",
-            "kotlin.NoSuchElementException",
-            "kotlin.UnsupportedOperationException",
-            "kotlin.UninitializedPropertyAccessException",
-            "kotlin.NumberFormatException",
-            "kotlin.NoWhenBranchMatchedException",
-        ];
-        return runtime_subs.contains(&fqn);
+}
+
+fn builtin_exception_is_subtype(name: &str, target: &str) -> bool {
+    let name = strip_kotlin_prefix(name);
+    let target = strip_kotlin_prefix(target);
+    if name == target {
+        return true;
+    }
+    let mut cur = name;
+    while let Some(parent) = builtin_exception_parent(cur) {
+        if parent == target {
+            return true;
+        }
+        cur = parent;
     }
     false
 }
@@ -9687,6 +9769,37 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["ok=7", "err=boom"]);
+    }
+
+    #[test]
+    fn user_exception_caught_via_builtin_supertype() {
+        let src = r#"
+            open class MyErr : RuntimeException("boom")
+            class SubErr : MyErr()
+            class TreeErr : Throwable()
+            fun main() {
+                try { throw MyErr() } catch (e: RuntimeException) { println("a") }
+                try { throw MyErr() } catch (e: Exception) { println("b") }
+                try { throw MyErr() } catch (e: Throwable) { println("c") }
+                try { throw SubErr() } catch (e: MyErr) { println("d") }
+                try { throw TreeErr() } catch (e: Throwable) { println("e") }
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn unrelated_user_exception_propagates_past_unmatched_catch() {
+        let src = r#"
+            class A : Throwable()
+            class B : Throwable()
+            fun main() {
+                try {
+                    try { throw A() } catch (e: B) { println("wrong") }
+                } catch (e: A) { println("outer") }
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["outer"]);
     }
 
     #[test]
