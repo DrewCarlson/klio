@@ -6658,6 +6658,26 @@ impl Interpreter {
                     out,
                 )
             }
+            Value::Instance(inst) => {
+                // Spec §5.1.3: function-type supertypes contribute an
+                // `invoke` slot. Calling the instance like a function routes
+                // through that method when present.
+                let class = Rc::clone(&inst.borrow().class);
+                if let Some((method, owner)) = class.find_method("invoke") {
+                    return self.call_method_with_owner(
+                        &inst,
+                        &owner,
+                        &method,
+                        &arg_vals,
+                        arg_names,
+                        out,
+                    );
+                }
+                Err(RuntimeError::Type(format!(
+                    "`{}` is not callable",
+                    Value::Instance(inst)
+                )))
+            }
             other => Err(RuntimeError::Type(format!("`{other}` is not callable"))),
         }
     }

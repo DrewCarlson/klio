@@ -2723,7 +2723,14 @@ impl<'r> Checker<'r> {
         // their (name, MemberFlags) table, and compare against this class's
         // members. Diagnostics here are not fatal; they surface intent
         // mismatches between subclass and supertype declarations.
-        let inherited = self.collect_inherited_member_flags(c);
+        let mut inherited = self.collect_inherited_member_flags(c);
+        // Spec §5.1.3: function-type supertypes act like interfaces — they
+        // contribute an abstract `invoke` slot. Inject it so the
+        // override-walk accepts `override fun invoke(...)`.
+        {
+            let mut sigs_tmp: HashMap<String, MemberSig> = HashMap::new();
+            self.inject_function_type_supertypes(c, &mut inherited, &mut sigs_tmp);
+        }
         for m in &c.members {
             let (mname, mspan, mflags) = match m {
                 Decl::Function(f) => (
@@ -2803,7 +2810,8 @@ impl<'r> Checker<'r> {
         // Spec §5.4 override-rule diagnostics — for every member declared
         // with `override`, locate the matching base member by name and
         // verify return-type / property-type / mutability / visibility.
-        let inherited_sigs = self.collect_inherited_member_sigs(c);
+        let mut inherited_sigs = self.collect_inherited_member_sigs(c);
+        self.inject_function_type_supertypes(c, &mut inherited, &mut inherited_sigs);
         for m in &c.members {
             match m {
                 Decl::Function(f) if f.is_override => {
@@ -3289,6 +3297,41 @@ impl<'r> Checker<'r> {
             }
         }
         false
+    }
+
+    /// Synthesize the `invoke` slot for each function-type supertype, so
+    /// `class C : () -> Int { override fun invoke(): Int = ... }` resolves
+    /// correctly. Spec §5.1.3: function types are treated as interfaces.
+    fn inject_function_type_supertypes(
+        &self,
+        c: &Class,
+        flags: &mut HashMap<String, MemberFlags>,
+        sigs: &mut HashMap<String, MemberSig>,
+    ) {
+        for s in &c.supertypes {
+            let Some(fnref) = s.function.as_ref() else { continue };
+            flags
+                .entry("invoke".to_string())
+                .or_insert(MemberFlags {
+                    is_open: true,
+                    is_override: false,
+                    is_abstract: true,
+                    is_operator: true,
+                    is_infix: false,
+                    has_default_body: false,
+                });
+            let param_types: Vec<Type> = fnref
+                .params
+                .iter()
+                .map(convert_type_ref_lossy)
+                .collect();
+            let return_ty = convert_type_ref_lossy(&fnref.ret);
+            sigs.entry("invoke".to_string()).or_insert(MemberSig::Function {
+                param_types,
+                return_ty,
+                visibility: Visibility::Public,
+            });
+        }
     }
 
     /// Same walk as `collect_inherited_member_flags`, but collects the
