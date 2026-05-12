@@ -2645,6 +2645,11 @@ impl<'r> Checker<'r> {
                 .with_code(codes::TYPE_THROWABLE_TYPE_PARAMS),
             );
         }
+        // Spec §5.1: supertype validity. A class may inherit from at most
+        // one class (open / abstract / sealed) plus any number of
+        // interfaces. Inheriting from a closed (default-final) class or
+        // from an `object` type is a compile-time error.
+        self.check_supertype_validity(&c.name.name, &c.supertypes);
         // Soft override diagnostics — walk parents and interfaces, gather
         // their (name, MemberFlags) table, and compare against this class's
         // members. Diagnostics here are not fatal; they surface intent
@@ -2931,6 +2936,46 @@ impl<'r> Checker<'r> {
     /// good enough for diagnostic purposes — the override-correctness
     /// check only cares whether *some* supertype declared an open/abstract
     /// member with that name.
+    /// Spec §5.1: check each declared supertype is legal to inherit from.
+    /// Closed (default-final) user classes and `object` types are forbidden;
+    /// interfaces, `open` / `abstract` / `sealed` classes are allowed. Built-in
+    /// supertypes we don't know about (Any, Throwable, etc.) are skipped.
+    fn check_supertype_validity(&mut self, derived_name: &str, supertypes: &[TypeRef]) {
+        for s in supertypes {
+            let name = &s.name.name;
+            let Some(parent) = self.classes.get(name) else { continue };
+            if parent.is_object {
+                self.diagnostics.emit(
+                    Diagnostic::error(
+                        format!(
+                            "`{derived_name}` cannot inherit from object `{name}`: \
+                             object types cannot be inherited from (spec §5.1)"
+                        ),
+                        s.span,
+                    )
+                    .with_code(codes::TYPE_INHERIT_FROM_OBJECT),
+                );
+                continue;
+            }
+            if parent.is_interface {
+                continue;
+            }
+            let open = parent.is_open || parent.is_abstract || parent.is_sealed;
+            if !open {
+                self.diagnostics.emit(
+                    Diagnostic::error(
+                        format!(
+                            "`{derived_name}` cannot inherit from final class `{name}`: \
+                             declare it `open`, `abstract`, or `sealed` (spec §5.1)"
+                        ),
+                        s.span,
+                    )
+                    .with_code(codes::TYPE_INHERIT_FROM_FINAL_CLASS),
+                );
+            }
+        }
+    }
+
     fn is_throwable_subtype(&self, c: &Class) -> bool {
         const BUILTIN_THROWABLES: &[&str] = &[
             "Throwable",
@@ -3267,6 +3312,7 @@ impl<'r> Checker<'r> {
     fn check_object(&mut self, o: &ObjectDecl) {
         let saved = self.assigned.clone();
         self.class_stack.push(o.name.name.clone());
+        self.check_supertype_validity(&o.name.name, &o.supertypes);
         self.push_frame();
         for m in &o.members {
             match m {
