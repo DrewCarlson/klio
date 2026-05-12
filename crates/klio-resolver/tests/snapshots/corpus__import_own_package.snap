@@ -1,0 +1,12 @@
+---
+source: crates/klio-resolver/tests/corpus.rs
+assertion_line: 79
+expression: "package my.app\n\nimport my.app.Foo\n\nfun main() {\n    println(\"hi\")\n}\n"
+---
+# symbols
+  [0] Builtin println @builtin
+  [1] Builtin print @builtin
+  [2] TopLevelFunction main @39..43
+
+# uses
+  @52..59 -> [0] println (Builtin)

@@ -1,0 +1,15 @@
+---
+source: crates/klio-resolver/tests/corpus.rs
+assertion_line: 78
+expression: "import kotlin.reflect.KClass\n\nfun main() {\n    println(\"hi\")\n}\n"
+---
+# symbols
+  [0] Builtin println @builtin
+  [1] Builtin print @builtin
+  [2] TopLevelFunction main @34..38
+
+# uses
+  @47..54 -> [0] println (Builtin)
+
+# diagnostics
+  [R0012] Error no package `kotlin.reflect` is known to this build @0..28

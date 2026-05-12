@@ -75,3 +75,5 @@ corpus_test!(mutual_recursion, "mutual_recursion.kt");
 corpus_test!(shadowing, "shadowing.kt");
 corpus_test!(diag_unresolved, "diag_unresolved.kt");
 corpus_test!(diag_non_kotlin_import, "diag_non_kotlin_import.kt");
+corpus_test!(diag_unknown_kotlin_package, "diag_unknown_kotlin_package.kt");
+corpus_test!(import_own_package, "import_own_package.kt");

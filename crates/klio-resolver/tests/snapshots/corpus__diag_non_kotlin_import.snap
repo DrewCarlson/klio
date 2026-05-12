@@ -1,5 +1,6 @@
 ---
-source: crates/ktc-resolver/tests/corpus.rs
+source: crates/klio-resolver/tests/corpus.rs
+assertion_line: 77
 expression: "import com.example.Widget\n\nfun main() {\n    println(\"hi\")\n}\n"
 ---
 # symbols
@@ -11,4 +12,4 @@ expression: "import com.example.Widget\n\nfun main() {\n    println(\"hi\")\n}\n
   @44..51 -> [0] println (Builtin)
 
 # diagnostics
-  [R0003] Error third-party imports are not supported; only `kotlin.*` may be imported @0..25
+  [R0003] Error no package `com.example.Widget` is known to this build @0..25

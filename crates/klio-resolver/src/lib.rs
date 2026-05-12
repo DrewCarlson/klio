@@ -134,6 +134,8 @@ struct Resolver {
     symbols: Vec<Symbol>,
     uses: HashMap<Span, SymbolId>,
     diagnostics: DiagnosticSink,
+    /// Dotted package name from the file's `package` header, if any.
+    file_package: Option<String>,
 }
 
 impl Resolver {
@@ -143,6 +145,7 @@ impl Resolver {
             symbols: Vec::new(),
             uses: HashMap::new(),
             diagnostics: DiagnosticSink::new(),
+            file_package: None,
         };
         let builtins = r.push_scope(None, ScopeKind::Builtins);
         for name in BUILTINS {
@@ -157,6 +160,11 @@ impl Resolver {
     fn run(&mut self, file: &KotlinFile) {
         let builtins = ScopeId(0);
         let file_scope = self.push_scope(Some(builtins), ScopeKind::File);
+
+        self.file_package = file
+            .package
+            .as_ref()
+            .map(|p| p.path.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join("."));
 
         for imp in &file.imports {
             self.check_import(imp);
@@ -173,14 +181,69 @@ impl Resolver {
     }
 
     fn check_import(&mut self, imp: &ImportDecl) {
-        if imp.path.first().is_none_or(|seg| seg.name != "kotlin") {
+        if imp.path.is_empty() {
+            // Parser already emitted P0047; nothing further to validate.
+            return;
+        }
+        let own_pkg = self.file_package.clone();
+        let path_owned: Vec<String> =
+            imp.path.iter().map(|seg| seg.name.clone()).collect();
+        let path_str = path_owned.join(".");
+
+        // Importing from the file's own package is permitted by the spec and
+        // is effectively a no-op (entities of the same package are already
+        // visible). Skip diagnostics for that case.
+        if let Some(own) = &own_pkg {
+            let same_package = if imp.wildcard {
+                path_str == *own
+            } else {
+                // For a non-wildcard import, the package is the path minus
+                // the trailing entity segment.
+                path_owned
+                    .split_last()
+                    .map_or(false, |(_, prefix)| prefix.join(".") == *own)
+            };
+            if same_package {
+                return;
+            }
+        }
+
+        if path_owned[0] != "kotlin" {
             self.diagnostics.emit(
                 Diagnostic::error(
-                    "third-party imports are not supported; only `kotlin.*` may be imported",
+                    format!("no package `{path_str}` is known to this build"),
                     imp.span,
                 )
                 .with_code("R0003")
-                .with_note("see docs/STDLIB.md for the supported surface"),
+                .with_note("only the `kotlin.*` standard library is available"),
+            );
+            return;
+        }
+
+        // Path starts with `kotlin`. Validate that the *package portion* is one
+        // of the implicitly imported packages we know about. For a wildcard the
+        // path is the package itself; for a regular import the package is the
+        // path minus the entity segment.
+        let candidate_pkg = if imp.wildcard {
+            path_str.clone()
+        } else if path_owned.len() >= 2 {
+            path_owned[..path_owned.len() - 1].join(".")
+        } else {
+            // `import kotlin` — the whole path is just the package, which
+            // matches an implicitly imported package, so let it pass.
+            path_str.clone()
+        };
+        if !klio_stdlib::is_implicitly_imported_package(&candidate_pkg) {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!("no package `{candidate_pkg}` is known to this build"),
+                    imp.span,
+                )
+                .with_code("R0012")
+                .with_note(
+                    "klio implements the spec's implicitly imported packages \
+                    (kotlin, kotlin.collections, kotlin.text, ...); see docs/STDLIB.md",
+                ),
             );
         }
     }
