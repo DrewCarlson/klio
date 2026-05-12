@@ -1246,7 +1246,7 @@ impl Interpreter {
                     for a in idx_args {
                         idx_vals.push(self.eval_expr(a, env, out)?);
                     }
-                    return self.assign_index(recv, &idx_vals, *op, new_value);
+                    return self.assign_index(recv, &idx_vals, *op, new_value, out);
                 }
                 let Expr::Path { segments, .. } = target else {
                     return Err(RuntimeError::Unimplemented(
@@ -2001,6 +2001,18 @@ impl Interpreter {
                         }));
                     }
                     return Ok(items_ref[i as usize].clone());
+                }
+                // User-class indexed read — dispatch `operator fun get`.
+                if let Value::Instance(inst) = &recv {
+                    let class = Rc::clone(&inst.borrow().class);
+                    if let Some((m, _)) = class.find_method("get") {
+                        let mut idx_vals: Vec<Value> = Vec::with_capacity(args.len());
+                        for a in args {
+                            idx_vals.push(self.eval_expr(a, env, out)?);
+                        }
+                        let arg_names: Vec<Option<String>> = vec![None; idx_vals.len()];
+                        return self.call_method(inst, &m, &idx_vals, &arg_names, out);
+                    }
                 }
                 let mut arg_vals = Vec::with_capacity(args.len() + 1);
                 arg_vals.push(recv);
@@ -2864,6 +2876,7 @@ impl Interpreter {
         idx_vals: &[Value],
         op: AssignOp,
         new_value: Value,
+        out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
         match receiver {
             Value::Array { items, .. } => {
@@ -2969,6 +2982,40 @@ impl Interpreter {
                 } else {
                     entries_mut.push((key, final_value));
                 }
+                Ok(Value::Unit)
+            }
+            Value::Instance(ref inst) => {
+                // Dispatch `operator fun set(...)` on the receiver. For
+                // compound forms (`a[i] += x`), evaluate the current value
+                // via `operator fun get(...)` first and combine.
+                let class = Rc::clone(&inst.borrow().class);
+                let value_to_write = match op {
+                    AssignOp::Assign => new_value,
+                    other => {
+                        let get_method = class.find_method("get");
+                        let Some((m, _)) = get_method else {
+                            return Err(RuntimeError::Type(format!(
+                                "compound indexed assignment requires `operator fun get`/`set` on `{}`",
+                                class.name
+                            )));
+                        };
+                        let arg_names: Vec<Option<String>> = vec![None; idx_vals.len()];
+                        let cur = self.call_method(inst, &m, idx_vals, &arg_names, out)?;
+                        eval_binop(compound_to_binop(other), cur, new_value)?
+                    }
+                };
+                let set_method = class.find_method("set");
+                let Some((m, _)) = set_method else {
+                    return Err(RuntimeError::Type(format!(
+                        "cannot assign through an index on `{}` — declare `operator fun set(...)`",
+                        class.name
+                    )));
+                };
+                let mut all_args: Vec<Value> = Vec::with_capacity(idx_vals.len() + 1);
+                all_args.extend_from_slice(idx_vals);
+                all_args.push(value_to_write);
+                let arg_names: Vec<Option<String>> = vec![None; all_args.len()];
+                self.call_method(inst, &m, &all_args, &arg_names, out)?;
                 Ok(Value::Unit)
             }
             other => Err(RuntimeError::Type(format!(
@@ -7605,7 +7652,7 @@ impl Interpreter {
         match l {
             IncDecLValue::Ident(name) => self.write_ident_live(name, value, env),
             IncDecLValue::Index { recv, idxs } => {
-                self.assign_index(recv.clone(), idxs, AssignOp::Assign, value)?;
+                self.assign_index(recv.clone(), idxs, AssignOp::Assign, value, out)?;
                 Ok(())
             }
             IncDecLValue::Member { recv, name } => {
