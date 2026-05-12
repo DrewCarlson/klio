@@ -7,9 +7,23 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let Some(file) = args.get(1) else {
-        eprintln!("usage: ktc-parity <file.kt> [<file.kt> ...]");
+        eprintln!(
+            "usage: ktc-parity <file.kt> [<file.kt> ...]\n       ktc-parity --install"
+        );
         return ExitCode::from(2);
     };
+    if file == "--install" {
+        return match ktc_parity::install_kotlinc(ktc_parity::TARGET_VERSION) {
+            Ok(p) => {
+                println!("kotlin-native ready at {}", p.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("install failed: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let mut any_mismatch = false;
     for path in &args[1..] {
         let p = PathBuf::from(path);

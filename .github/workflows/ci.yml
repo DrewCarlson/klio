@@ -19,15 +19,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: cache kotlin-native (~/.konan)
+        id: konan-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ runner.arch }}-2.3.21
+          restore-keys: |
+            konan-${{ runner.os }}-${{ runner.arch }}-
+
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # ktc-parity tests auto-skip when kotlinc-native is absent (see
-      # crates/ktc-parity/tests/parity.rs), so the full workspace test run
-      # is safe on CI runners without Kotlin/Native installed.
+      - name: install kotlin-native (if not cached)
+        if: steps.konan-cache.outputs.cache-hit != 'true'
+        run: cargo run -q -p ktc-parity --bin ktc-parity -- --install
+
       - name: cargo test
         run: cargo test --workspace
 
