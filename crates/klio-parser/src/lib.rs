@@ -1733,6 +1733,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             getter,
             setter,
             is_abstract: flags.is_abstract,
+            is_open: flags.is_open,
             is_override: flags.is_override,
             is_lateinit: flags.is_lateinit,
             is_const: flags.is_const,

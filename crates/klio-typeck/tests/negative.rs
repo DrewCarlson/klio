@@ -660,6 +660,26 @@ fn neg_published_api_missing() {
 }
 
 #[test]
+fn neg_override_return_type() {
+    assert!(type_codes_for("neg_override_return_type.kt").iter().any(|c| c == "T0065"));
+}
+
+#[test]
+fn neg_override_property_mutability() {
+    assert!(type_codes_for("neg_override_property_mutability.kt").iter().any(|c| c == "T0066"));
+}
+
+#[test]
+fn neg_override_property_type() {
+    assert!(type_codes_for("neg_override_property_type.kt").iter().any(|c| c == "T0067"));
+}
+
+#[test]
+fn neg_override_visibility_stronger() {
+    assert!(type_codes_for("neg_override_visibility_stronger.kt").iter().any(|c| c == "T0068"));
+}
+
+#[test]
 fn neg_sealed_local_inheritor() {
     assert!(type_codes_for("neg_sealed_local_inheritor.kt").iter().any(|c| c == "T0071"));
 }

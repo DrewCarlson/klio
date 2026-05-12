@@ -231,6 +231,9 @@ pub struct Property {
     /// `abstract class` / `interface`. Abstract properties carry no `init`
     /// and no body for their accessors.
     pub is_abstract: bool,
+    /// Declared with the `open` modifier (`open val foo: Int = 1`). Required
+    /// for a subclass to `override` the property (spec §5.4).
+    pub is_open: bool,
     /// Declared with the `override` modifier (`override val foo: T = ...`).
     pub is_override: bool,
     /// `lateinit var name: T` — non-null `var` without initializer. Reads

@@ -353,6 +353,8 @@ struct ClassInfo {
     /// Per-member modifier flags: `is_open`, `is_override`. Used to drive
     /// the override-diagnostic codes T0009/T0010/T0011.
     member_flags: HashMap<String, MemberFlags>,
+    /// Per-member detailed signature used by T0065 / T0066 / T0067 / T0068.
+    member_sigs: HashMap<String, MemberSig>,
     /// Member name -> user-class name when the member's declared type
     /// names a user class. Populated alongside `members` so member access
     /// can propagate `expr_class` through chains like `foo.bar.baz`.
@@ -386,6 +388,24 @@ struct ClassInfo {
     /// class itself (`class Foo private constructor(...)`). `None` means
     /// the constructor inherits the class visibility.
     primary_ctor_visibility: Option<Visibility>,
+}
+
+/// Detailed per-member signature used by override-rule diagnostics
+/// (T0065 / T0066 / T0067 / T0068). Stored separately from `MemberFlags`
+/// so existing name-keyed override walks keep their semantics.
+#[derive(Debug, Clone)]
+enum MemberSig {
+    Function {
+        #[allow(dead_code)]
+        param_types: Vec<Type>,
+        return_ty: Type,
+        visibility: Visibility,
+    },
+    Property {
+        ty: Type,
+        mutable: bool,
+        visibility: Visibility,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2276,6 +2296,10 @@ impl<'r> Checker<'r> {
                     info.member_class.insert(p.name.name.clone(), cn);
                 }
                 info.member_visibility.insert(p.name.name.clone(), p.visibility);
+                info.member_sigs.insert(
+                    p.name.name.clone(),
+                    MemberSig::Property { ty: ty.clone(), mutable, visibility: p.visibility },
+                );
             }
         }
         let ctor_sig = FnSig {
@@ -2305,6 +2329,14 @@ impl<'r> Checker<'r> {
             match m {
                 Decl::Function(f) => {
                     let sig = self.signature_of(f);
+                    info.member_sigs.insert(
+                        f.name.name.clone(),
+                        MemberSig::Function {
+                            param_types: sig.params.clone(),
+                            return_ty: sig.return_ty.clone(),
+                            visibility: f.visibility,
+                        },
+                    );
                     let ty = Type::Function {
                         params: sig.params,
                         return_type: Box::new(sig.return_ty),
@@ -2342,6 +2374,14 @@ impl<'r> Checker<'r> {
                         .as_ref()
                         .map(convert_type_ref_lossy)
                         .unwrap_or(Type::Unresolved);
+                    info.member_sigs.insert(
+                        p.name.name.clone(),
+                        MemberSig::Property {
+                            ty: ty.clone(),
+                            mutable: p.mutable,
+                            visibility: p.visibility,
+                        },
+                    );
                     info.members.insert(p.name.name.clone(), ty);
                     info.member_mutable.insert(p.name.name.clone(), p.mutable);
                     if let Some(cn) = p.ty.as_ref().and_then(class_name_from_typeref) {
@@ -2352,7 +2392,7 @@ impl<'r> Checker<'r> {
                     info.member_flags.insert(
                         p.name.name.clone(),
                         MemberFlags {
-                            is_open: implicit_open,
+                            is_open: p.is_open || implicit_open,
                             is_override: p.is_override,
                             is_abstract: p.is_abstract,
                             is_operator: false,
@@ -2702,7 +2742,7 @@ impl<'r> Checker<'r> {
                     &p.name.name,
                     p.name.span,
                     MemberFlags {
-                        is_open: p.is_override || p.is_abstract,
+                        is_open: p.is_open || p.is_override || p.is_abstract,
                         is_override: p.is_override,
                         is_abstract: p.is_abstract,
                         is_operator: false,
@@ -2758,6 +2798,117 @@ impl<'r> Checker<'r> {
                         );
                     }
                 }
+            }
+        }
+        // Spec §5.4 override-rule diagnostics — for every member declared
+        // with `override`, locate the matching base member by name and
+        // verify return-type / property-type / mutability / visibility.
+        let inherited_sigs = self.collect_inherited_member_sigs(c);
+        for m in &c.members {
+            match m {
+                Decl::Function(f) if f.is_override => {
+                    if let Some(MemberSig::Function {
+                        return_ty: base_ret,
+                        visibility: base_vis,
+                        ..
+                    }) = inherited_sigs.get(&f.name.name)
+                    {
+                        // Only check when both ends have explicit return
+                        // types — an omitted return type on an expression
+                        // body is inferred and may legitimately resolve to
+                        // the base's type.
+                        let derived_ret = f.return_type.as_ref().map(convert_type_ref_lossy);
+                        let check_ret = derived_ret
+                            .as_ref()
+                            .map(|d| !d.is_subtype_of(base_ret))
+                            .unwrap_or(false);
+                        if check_ret {
+                            let derived_ret = derived_ret.unwrap();
+                            self.diagnostics.emit(
+                                Diagnostic::error(
+                                    format!(
+                                        "return type `{derived_ret}` of override `{name}` \
+                                         is not a subtype of overridden return type `{base_ret}` \
+                                         (spec §5.4)",
+                                        name = f.name.name
+                                    ),
+                                    f.name.span,
+                                )
+                                .with_code(codes::TYPE_OVERRIDE_RETURN_TYPE_MISMATCH),
+                            );
+                        }
+                        self.check_override_visibility(
+                            &f.name.name,
+                            f.name.span,
+                            f.visibility,
+                            *base_vis,
+                        );
+                    }
+                }
+                Decl::Property(p) if p.is_override => {
+                    if let Some(MemberSig::Property {
+                        ty: base_ty,
+                        mutable: base_mut,
+                        visibility: base_vis,
+                    }) = inherited_sigs.get(&p.name.name)
+                    {
+                        let derived_ty = p
+                            .ty
+                            .as_ref()
+                            .map(convert_type_ref_lossy)
+                            .unwrap_or(Type::Unresolved);
+                        // T0066: mutability cannot strengthen. var base + val
+                        // override is forbidden (val is stronger than var).
+                        if *base_mut && !p.mutable {
+                            self.diagnostics.emit(
+                                Diagnostic::error(
+                                    format!(
+                                        "property `{name}` overrides `var` base with `val`: \
+                                         mutability cannot strengthen (spec §5.4)",
+                                        name = p.name.name
+                                    ),
+                                    p.name.span,
+                                )
+                                .with_code(codes::TYPE_OVERRIDE_PROPERTY_MUTABILITY),
+                            );
+                        }
+                        // T0067: type subtype, except both `var` requires
+                        // equivalent types.
+                        let type_ok = if *base_mut && p.mutable {
+                            derived_ty == *base_ty
+                                || matches!(derived_ty, Type::Unresolved)
+                                || matches!(base_ty, Type::Unresolved)
+                        } else {
+                            derived_ty.is_subtype_of(base_ty)
+                        };
+                        if !type_ok {
+                            let msg = if *base_mut && p.mutable {
+                                format!(
+                                    "property `{}` overrides `var` base of type `{base_ty}` with \
+                                     non-equivalent type `{derived_ty}` (spec §5.4)",
+                                    p.name.name
+                                )
+                            } else {
+                                format!(
+                                    "type `{derived_ty}` of override property `{}` is not a \
+                                     subtype of overridden type `{base_ty}` (spec §5.4)",
+                                    p.name.name
+                                )
+                            };
+                            self.diagnostics.emit(
+                                Diagnostic::error(msg, p.name.span)
+                                    .with_code(codes::TYPE_OVERRIDE_PROPERTY_TYPE),
+                            );
+                        }
+                        self.check_override_visibility(
+                            &p.name.name,
+                            p.name.span,
+                            p.visibility,
+                            *base_vis,
+                        );
+                    }
+                }
+                _ => {}
             }
         }
         // Abstract-member check for concrete classes inheriting from one
@@ -2965,6 +3116,44 @@ impl<'r> Checker<'r> {
     /// good enough for diagnostic purposes — the override-correctness
     /// check only cares whether *some* supertype declared an open/abstract
     /// member with that name.
+    /// Spec §5.4: an explicit override visibility must not be stronger
+    /// than the overridden declaration's visibility. Strength order:
+    /// public < internal < protected < private.
+    fn check_override_visibility(
+        &mut self,
+        name: &str,
+        span: Span,
+        derived: Visibility,
+        base: Visibility,
+    ) {
+        let strength = |v: Visibility| match v {
+            Visibility::Public => 0u8,
+            Visibility::Internal => 1,
+            Visibility::Protected => 2,
+            Visibility::Private => 3,
+        };
+        if strength(derived) > strength(base) {
+            let vis_name = |v: Visibility| match v {
+                Visibility::Public => "public",
+                Visibility::Internal => "internal",
+                Visibility::Protected => "protected",
+                Visibility::Private => "private",
+            };
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "override `{name}` cannot weaken visibility: declared `{}` is stronger \
+                         than overridden `{}` (spec §5.4)",
+                        vis_name(derived),
+                        vis_name(base)
+                    ),
+                    span,
+                )
+                .with_code(codes::TYPE_OVERRIDE_VISIBILITY_STRONGER),
+            );
+        }
+    }
+
     fn check_private_open_or_override(
         &mut self,
         name: &str,
@@ -3087,6 +3276,36 @@ impl<'r> Checker<'r> {
             }
         }
         false
+    }
+
+    /// Same walk as `collect_inherited_member_flags`, but collects the
+    /// detailed member signatures used by T0065 / T0066 / T0067 / T0068.
+    /// The first occurrence wins (closest ancestor in the supertype walk),
+    /// matching the inheritance-order rule.
+    fn collect_inherited_member_sigs(&self, c: &Class) -> HashMap<String, MemberSig> {
+        let mut out: HashMap<String, MemberSig> = HashMap::new();
+        let mut frontier: Vec<String> =
+            c.supertypes.iter().map(|s| s.name.name.clone()).collect();
+        let mut seen: Vec<String> = vec![c.name.name.clone()];
+        let mut steps = 0;
+        while let Some(parent_name) = frontier.pop() {
+            if steps > 64 {
+                break;
+            }
+            steps += 1;
+            if seen.iter().any(|s| s == &parent_name) {
+                continue;
+            }
+            seen.push(parent_name.clone());
+            let Some(parent) = self.classes.get(&parent_name) else { continue };
+            for (n, sig) in &parent.member_sigs {
+                out.entry(n.clone()).or_insert_with(|| sig.clone());
+            }
+            for s in &parent.supertypes {
+                frontier.push(s.clone());
+            }
+        }
+        out
     }
 
     fn collect_inherited_member_flags(
