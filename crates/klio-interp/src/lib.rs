@@ -540,6 +540,7 @@ impl Interpreter {
                         decl.name.name, p.name.name
                     )));
                 };
+                let v = self.maybe_sam_coerce(v, Some(&p.ty.name.name), captured_env, out)?;
                 frame.borrow_mut().define(p.name.name.clone(), v);
             }
         }
@@ -5318,6 +5319,33 @@ impl Interpreter {
     /// abstract method, then builds a subclass whose only difference is
     /// that the abstract slot is filled by a `MethodDef` whose
     /// `sam_lambda` carries the user's lambda.
+    /// Spec §4.1.6: implicit lambda → fun-interface conversion at an
+    /// argument site. If `param_ty_name` resolves to a `fun interface`
+    /// class in scope and `value` is a `Value::Lambda`, lift it via
+    /// `sam_construct`. Otherwise return `value` unchanged.
+    fn maybe_sam_coerce(
+        &mut self,
+        value: Value,
+        param_ty_name: Option<&str>,
+        scope_env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        if !matches!(value, Value::Lambda { .. }) {
+            return Ok(value);
+        }
+        let Some(name) = param_ty_name else { return Ok(value) };
+        let looked = scope_env
+            .borrow()
+            .lookup(name)
+            .or_else(|| self.globals.borrow().lookup(name));
+        if let Some(Value::Class(cls)) = looked {
+            if cls.is_fun_interface {
+                return self.sam_construct(&cls, value, out);
+            }
+        }
+        Ok(value)
+    }
+
     fn sam_construct(
         &mut self,
         iface: &Rc<ClassDef>,
@@ -5343,6 +5371,18 @@ impl Interpreter {
                 "fun interface `{}` has no abstract method to satisfy",
                 iface.name
             )));
+        };
+        // If the lambda was written without an explicit header (no `->`)
+        // and the SAM has exactly one parameter, inject `it` as the lone
+        // parameter so the body's `it` reference resolves.
+        let lambda = if let Value::Lambda { params, body, env } = lambda {
+            if params.is_empty() && sam.decl.params.len() == 1 {
+                Value::Lambda { params: Rc::new(vec!["it".into()]), body, env }
+            } else {
+                Value::Lambda { params, body, env }
+            }
+        } else {
+            lambda
         };
         let mut methods = iface.methods.clone();
         for m in &mut methods {
