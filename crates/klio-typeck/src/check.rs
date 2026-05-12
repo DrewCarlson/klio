@@ -6054,7 +6054,32 @@ impl<'r> Checker<'r> {
                 .unwrap();
             chosen = Some(best);
         }
-        let sig = chosen.or(arity_match).unwrap_or(filtered[0]).clone();
+        if chosen.is_none() && arity_match.is_none() {
+            // Spec §11.3: no candidate is applicable for the call. The
+            // single-message form here keeps the diagnostic from
+            // multiplying out into one per non-matching overload.
+            let arities: Vec<String> = filtered
+                .iter()
+                .map(|s| {
+                    let min = s.has_default.iter().filter(|h| !**h).count();
+                    let max = s.params.len();
+                    if min == max { format!("{min}") } else { format!("{min}..{max}") }
+                })
+                .collect();
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "No candidate accepts {} argument(s); expected {}",
+                        args.len(),
+                        arities.join(" or ")
+                    ),
+                    call_span,
+                )
+                .with_code(codes::TYPE_NONE_APPLICABLE),
+            );
+            return Type::Unresolved;
+        }
+        let sig = chosen.or(arity_match).unwrap().clone();
         let min = sig.has_default.iter().filter(|h| !**h).count();
         let max = sig.params.len();
         if args.len() < min || args.len() > max {
@@ -7805,6 +7830,19 @@ mod tests {
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn none_applicable_reports_t0090() {
+        // Spec §11.3: no candidate accepts 3 args.
+        let tc = check_src(
+            r#"
+            fun f(x: Int): Int = x
+            fun f(x: Int, y: Int): Int = x + y
+            fun main() { val _r = f(1, 2, 3) }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::TYPE_NONE_APPLICABLE));
     }
 
     #[test]
