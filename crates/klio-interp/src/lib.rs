@@ -7202,9 +7202,10 @@ impl Interpreter {
                 )
             }
             Value::Instance(inst) => {
-                // Spec §5.1.3: function-type supertypes contribute an
-                // `invoke` slot. Calling the instance like a function routes
-                // through that method when present.
+                // Spec §5.1.3 + ch.9: function-type supertypes contribute an
+                // `invoke` slot, and any class declaring `operator fun
+                // invoke(...)` is callable like a function. Member dispatch
+                // first; extension `operator fun T.invoke(...)` second.
                 let class = Rc::clone(&inst.borrow().class);
                 if let Some((method, owner)) = class.find_method("invoke") {
                     return self.call_method_with_owner(
@@ -7215,6 +7216,10 @@ impl Interpreter {
                         arg_names,
                         out,
                     );
+                }
+                let recv = Value::Instance(Rc::clone(&inst));
+                if let Some(v) = self.try_extension_call_with_values(&recv, "invoke", &arg_vals, out)? {
+                    return Ok(v);
                 }
                 Err(RuntimeError::Type(format!(
                     "`{}` is not callable",
@@ -9844,6 +9849,36 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["Day(1..5)"]);
+    }
+
+    #[test]
+    fn operator_invoke_user_class_member() {
+        let src = r#"
+            class Greeter(val prefix: String) {
+                operator fun invoke(name: String): String = "$prefix, $name"
+            }
+            fun main() {
+                val g = Greeter("hello")
+                println(g("world"))
+                println(g("kotlin"))
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["hello, world", "hello, kotlin"]);
+    }
+
+    #[test]
+    fn operator_invoke_extension() {
+        let src = r#"
+            class Counter(var n: Int)
+            operator fun Counter.invoke(): Int { n = n + 1; return n }
+            fun main() {
+                val c = Counter(0)
+                println(c())
+                println(c())
+                println(c())
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["1", "2", "3"]);
     }
 
     #[test]
