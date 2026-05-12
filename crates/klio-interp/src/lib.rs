@@ -856,6 +856,18 @@ impl Interpreter {
                     return self.eval_stmt(&new_stmt, &scope, out);
                 }
                 let new_value = self.eval_expr(value, env, out)?;
+                // §7.1.2 operator-assignment dispatch. Compound ops first
+                // attempt `*Assign` (plusAssign / minusAssign / …) on the
+                // LHS receiver. When that resolves to a member or to a
+                // built-in mutable collection, the in-place mutation
+                // replaces the read/arith/write fallback. Falls through
+                // to the existing `A = A op B` path when no `*Assign`
+                // candidate exists.
+                if !matches!(op, AssignOp::Assign) {
+                    if let Some(()) = self.try_compound_assign_dispatch(target, *op, &new_value, env, out)? {
+                        return Ok(Value::Unit);
+                    }
+                }
                 // Member-style assignment: `obj.field = value` or
                 // implicit `field = value` inside a method body. The latter
                 // happens because the resolver-level desugaring binds field
@@ -3034,6 +3046,103 @@ impl Interpreter {
         }
         if let Some(v) = self.try_extension_call(recv, name, &[], &[], env, out)? {
             return Ok(Some(v));
+        }
+        Ok(None)
+    }
+
+    /// §7.1.2 operator-assignment dispatch. Reads the LHS once, then tries
+    /// to invoke the matching `*Assign` operator on it. Returns `Some(())`
+    /// when an in-place mutation handled the assignment, `None` to let the
+    /// caller fall through to the read/arith/write expansion. The LHS is
+    /// evaluated as an expression (e.g. through any custom getter), so
+    /// receivers with side-effects observe the same single read kotlinc
+    /// would emit when expanding to `lhs.plusAssign(rhs)`.
+    fn try_compound_assign_dispatch(
+        &mut self,
+        target: &Expr,
+        op: AssignOp,
+        rhs: &Value,
+        env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
+    ) -> Result<Option<()>, RuntimeError> {
+        let method = match op {
+            AssignOp::Add => "plusAssign",
+            AssignOp::Sub => "minusAssign",
+            AssignOp::Mul => "timesAssign",
+            AssignOp::Div => "divAssign",
+            AssignOp::Rem => "remAssign",
+            AssignOp::Assign => return Ok(None),
+        };
+        let cur = self.eval_expr(target, env, out)?;
+        // User-class member dispatch.
+        if let Value::Instance(inst) = &cur {
+            let class = Rc::clone(&inst.borrow().class);
+            if let Some((m, _)) = class.find_method(method) {
+                self.call_method(&inst.clone(), &m, &[rhs.clone()], &[None], out)?;
+                return Ok(Some(()));
+            }
+        }
+        // Built-in mutable collections (spec stdlib operator extensions).
+        match (&cur, method) {
+            (Value::List { items, mutable: true, .. }, "plusAssign") => {
+                items.borrow_mut().push(rhs.clone());
+                return Ok(Some(()));
+            }
+            (Value::List { items, mutable: true, .. }, "minusAssign") => {
+                let mut v = items.borrow_mut();
+                if let Some(pos) = v.iter().position(|x| Value::structural_eq(x, rhs)) {
+                    v.remove(pos);
+                }
+                return Ok(Some(()));
+            }
+            (Value::Set { items, mutable: true, .. }, "plusAssign") => {
+                let mut v = items.borrow_mut();
+                if !v.iter().any(|x| Value::structural_eq(x, rhs)) {
+                    v.push(rhs.clone());
+                }
+                return Ok(Some(()));
+            }
+            (Value::Set { items, mutable: true, .. }, "minusAssign") => {
+                let mut v = items.borrow_mut();
+                if let Some(pos) = v.iter().position(|x| Value::structural_eq(x, rhs)) {
+                    v.remove(pos);
+                }
+                return Ok(Some(()));
+            }
+            (Value::Map { entries, mutable: true, .. }, "plusAssign") => {
+                // Spec: `map += pair` puts the key/value into the map.
+                if let Value::Pair(k, v) = rhs {
+                    let mut es = entries.borrow_mut();
+                    if let Some(pos) = es.iter().position(|(ek, _)| Value::structural_eq(ek, k)) {
+                        es[pos].1 = (**v).clone();
+                    } else {
+                        es.push(((**k).clone(), (**v).clone()));
+                    }
+                    return Ok(Some(()));
+                }
+            }
+            (Value::Map { entries, mutable: true, .. }, "minusAssign") => {
+                let mut es = entries.borrow_mut();
+                if let Some(pos) = es.iter().position(|(ek, _)| Value::structural_eq(ek, rhs)) {
+                    es.remove(pos);
+                }
+                return Ok(Some(()));
+            }
+            _ => {}
+        }
+        // Extension dispatch. Pass the RHS as a synthetic argument by
+        // wrapping it as an Expr::Path lookup of a temporary; the simpler
+        // route is to extend try_extension_call to accept value args, but
+        // for now we synthesize a fresh binding in a child scope.
+        let scope = Rc::new(RefCell::new(Env::with_parent(Rc::clone(env))));
+        let tmp = "$$compound_assign_rhs".to_string();
+        scope.borrow_mut().define(tmp.clone(), rhs.clone());
+        let arg_expr = Expr::Path {
+            segments: vec![klio_ast::Ident { name: tmp.clone(), span: target.span() }],
+            span: target.span(),
+        };
+        if let Some(_v) = self.try_extension_call(&cur, method, &[arg_expr], &[None], &scope, out)? {
+            return Ok(Some(()));
         }
         Ok(None)
     }

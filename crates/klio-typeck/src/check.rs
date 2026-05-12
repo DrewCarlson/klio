@@ -4247,7 +4247,7 @@ impl<'r> Checker<'r> {
         }
     }
 
-    fn check_assign(&mut self, target: &Expr, _op: AssignOp, value: &Expr, _span: Span) {
+    fn check_assign(&mut self, target: &Expr, op: AssignOp, value: &Expr, _span: Span) {
         // Reassignment-of-val check for the simple identifier case.
         if let Expr::Path { segments, span } = target {
             if segments.len() == 1 {
@@ -4275,7 +4275,13 @@ impl<'r> Checker<'r> {
                 if let Some((want, mutable, needs_init)) = info {
                     let already_assigned = self.assigned.contains(name);
                     let is_first_write = needs_init && !already_assigned;
-                    if !mutable && !is_first_write {
+                    // §7.1.2: a compound assignment to a `val` is permitted
+                    // when the LHS type carries a matching `*Assign` operator
+                    // (the operator-function path mutates in place, never
+                    // rebinds the name). Plain `=` reassignment still errors.
+                    let compound_with_assign = !matches!(op, AssignOp::Assign)
+                        && type_has_compound_assign(&want, op);
+                    if !mutable && !is_first_write && !compound_with_assign {
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 format!("Val cannot be reassigned: `{name}`"),
@@ -6287,6 +6293,55 @@ fn collect_property_reads(
 
 /// Spec §6.3: labels may only be attached to lambda literals, loop
 /// statements, or a call whose trailing argument is a lambda literal.
+/// Spec §7.1.2: does the LHS type carry a built-in or stdlib-shipped
+/// matching `*Assign` operator function? This is the conservative
+/// allowlist that the typeck consults to decide whether a compound
+/// assignment to a `val`-bound name should be allowed. User classes that
+/// declare their own `operator fun plusAssign` are accepted at runtime
+/// through the interpreter's dispatch path; here we only need to greenlight
+/// the well-known stdlib shapes so the canonical `val xs = mutableListOf(...);
+/// xs += elem` form typechecks. Unresolved or wildcard types are accepted
+/// to avoid cascading errors when generics aren't fully reconstructed.
+fn type_has_compound_assign(ty: &Type, op: AssignOp) -> bool {
+    if matches!(op, AssignOp::Assign) {
+        return false;
+    }
+    // Be permissive when the static type is unknown — runtime can still
+    // produce a precise error if no method exists.
+    if matches!(ty, Type::Unresolved | Type::TypeParam(_)) {
+        return true;
+    }
+    let head = match ty {
+        Type::Generic { name, .. } => name.as_str(),
+        Type::Nullable(inner) => return type_has_compound_assign(inner, op),
+        _ => return false,
+    };
+    // Stdlib mutable collections accept `+=` / `-=`. Atomics accept the
+    // same plus `*=` (timesAssign) via the kotlin.concurrent.atomics
+    // extension surface. Conservative: only emit `true` for ops we know
+    // are defined; primitives and immutable collections fall through.
+    let allow_plus_minus = matches!(
+        head,
+        "MutableList"
+            | "MutableSet"
+            | "MutableMap"
+            | "MutableCollection"
+            | "MutableIterable"
+            | "ArrayList"
+            | "HashMap"
+            | "HashSet"
+            | "LinkedHashMap"
+            | "LinkedHashSet"
+            | "StringBuilder"
+            | "AtomicInt"
+            | "AtomicLong"
+    );
+    match op {
+        AssignOp::Add | AssignOp::Sub => allow_plus_minus,
+        _ => matches!(head, "AtomicInt" | "AtomicLong"),
+    }
+}
+
 fn is_labelable_target(e: &Expr) -> bool {
     match e {
         Expr::Lambda { .. } => true,
