@@ -792,6 +792,9 @@ impl<'a> Checker<'a> {
         self.check_annotation_cycles(file);
         // §17.3 / §17.4: annotation @Target / @Repeatable enforcement.
         self.check_annotation_applications(file);
+        // §17.5.5: emit deprecation warning/error at every reference to a
+        // declaration marked `@Deprecated`.
+        self.check_deprecated_references(file);
         // Phase K: `tailrec` tail-call analysis.
         for d in &file.decls {
             self.check_phase_k_decl(d);
@@ -2486,6 +2489,27 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Spec §17.5.5: emit a warning / error / hidden diagnostic at every
+    /// bare-name reference to a top-level declaration carrying
+    /// `@Deprecated(message, replaceWith, level)`. Only top-level
+    /// functions / properties / classes / typealiases are tracked; member
+    /// accesses are not flagged.
+    fn check_deprecated_references(&mut self, file: &KotlinFile) {
+        let mut info: HashMap<String, DeprecationInfo> = HashMap::new();
+        collect_deprecation_info(&file.decls, &mut info);
+        if info.is_empty() {
+            return;
+        }
+        // Walk every expression in the file looking for bare-name
+        // references to a deprecated declaration. Declaration sites
+        // themselves are not visited (we only descend into bodies /
+        // initializers / accessors / arguments / annotation args).
+        let diags = collect_deprecation_diagnostics(file, &info);
+        for d in diags {
+            self.diagnostics.emit(d);
         }
     }
 
@@ -8544,6 +8568,393 @@ fn expr_uses_field(e: &Expr) -> bool {
         Expr::Spread { expr, .. } => expr_uses_field(expr),
         Expr::Labeled { expr, .. } => expr_uses_field(expr),
         _ => false,
+    }
+}
+
+/// Spec §17.5.5 deprecation levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeprecationLevel {
+    Warning,
+    Error,
+    Hidden,
+}
+
+#[derive(Debug, Clone)]
+struct DeprecationInfo {
+    level: DeprecationLevel,
+    message: Option<String>,
+}
+
+fn parse_deprecation(anns: &[klio_ast::Annotation]) -> Option<DeprecationInfo> {
+    for a in anns {
+        let leaf = a.path.last().map(|s| s.name.as_str()).unwrap_or("");
+        if leaf != "Deprecated" {
+            continue;
+        }
+        let mut info = DeprecationInfo { level: DeprecationLevel::Warning, message: None };
+        // Positional first arg is `message: String` unless an explicit
+        // `message = ...` named arg is also given. ReplaceWith / level
+        // can appear in any position by name.
+        let mut positional_idx = 0usize;
+        for (i, arg) in a.args.iter().enumerate() {
+            let name = a.arg_names.get(i).cloned().flatten();
+            let slot = match name.as_deref() {
+                Some("message") => "message",
+                Some("level") => "level",
+                Some("replaceWith") => "replaceWith",
+                Some(_) => continue,
+                None => match positional_idx {
+                    0 => {
+                        positional_idx += 1;
+                        "message"
+                    }
+                    1 => {
+                        positional_idx += 1;
+                        "replaceWith"
+                    }
+                    2 => {
+                        positional_idx += 1;
+                        "level"
+                    }
+                    _ => continue,
+                },
+            };
+            match slot {
+                "message" => info.message = extract_string_literal(arg),
+                "level" => {
+                    if let Some(lv) = extract_deprecation_level(arg) {
+                        info.level = lv;
+                    }
+                }
+                _ => {}
+            }
+        }
+        return Some(info);
+    }
+    None
+}
+
+fn extract_string_literal(e: &Expr) -> Option<String> {
+    if let Expr::StringTemplate { parts, .. } = e {
+        let mut out = String::new();
+        for p in parts {
+            match p {
+                StringPart::Text(t) => out.push_str(t),
+                _ => return None,
+            }
+        }
+        return Some(out);
+    }
+    None
+}
+
+fn extract_deprecation_level(e: &Expr) -> Option<DeprecationLevel> {
+    let name = match e {
+        Expr::Path { segments, .. } => segments.last().map(|s| s.name.as_str()),
+        Expr::Member { name, .. } => Some(name.name.as_str()),
+        _ => None,
+    }?;
+    match name {
+        "WARNING" => Some(DeprecationLevel::Warning),
+        "ERROR" => Some(DeprecationLevel::Error),
+        "HIDDEN" => Some(DeprecationLevel::Hidden),
+        _ => None,
+    }
+}
+
+fn collect_deprecation_info(decls: &[Decl], out: &mut HashMap<String, DeprecationInfo>) {
+    for d in decls {
+        match d {
+            Decl::Function(f) => {
+                if let Some(info) = parse_deprecation(&f.annotations) {
+                    out.insert(f.name.name.clone(), info);
+                }
+            }
+            Decl::Property(p) => {
+                if let Some(info) = parse_deprecation(&p.annotations) {
+                    out.insert(p.name.name.clone(), info);
+                }
+            }
+            Decl::Class(c) => {
+                if let Some(info) = parse_deprecation(&c.annotations) {
+                    out.insert(c.name.name.clone(), info);
+                }
+            }
+            Decl::Object(o) => {
+                // Object name acts as a value reference; recurse into
+                // members for top-level-like decls.
+                for m in &o.members {
+                    collect_deprecation_info(std::slice::from_ref(m), out);
+                }
+            }
+            Decl::TypeAlias(a) => {
+                if let Some(info) = parse_deprecation(&a.annotations) {
+                    out.insert(a.name.name.clone(), info);
+                }
+            }
+        }
+    }
+}
+
+fn collect_deprecation_diagnostics(
+    file: &KotlinFile,
+    info: &HashMap<String, DeprecationInfo>,
+) -> Vec<Diagnostic> {
+    let mut out: Vec<Diagnostic> = Vec::new();
+    for d in &file.decls {
+        walk_decl_for_deprecation(d, info, &mut out);
+    }
+    out
+}
+
+fn walk_decl_for_deprecation(
+    d: &Decl,
+    info: &HashMap<String, DeprecationInfo>,
+    out: &mut Vec<Diagnostic>,
+) {
+    match d {
+        Decl::Function(f) => {
+            if let Some(body) = &f.body {
+                match body {
+                    FunctionBody::Expr(e) => walk_expr_for_deprecation(e, info, out),
+                    FunctionBody::Block(b) => walk_block_for_deprecation(b, info, out),
+                }
+            }
+            for p in &f.params {
+                if let Some(def) = &p.default {
+                    walk_expr_for_deprecation(def, info, out);
+                }
+            }
+        }
+        Decl::Property(p) => {
+            if let Some(init) = &p.init {
+                walk_expr_for_deprecation(init, info, out);
+            }
+            for acc in [p.getter.as_ref(), p.setter.as_ref()].into_iter().flatten() {
+                match &acc.body {
+                    FunctionBody::Expr(e) => walk_expr_for_deprecation(e, info, out),
+                    FunctionBody::Block(b) => walk_block_for_deprecation(b, info, out),
+                }
+            }
+        }
+        Decl::Class(c) => {
+            for ib in &c.init_blocks {
+                walk_block_for_deprecation(ib, info, out);
+            }
+            for p in &c.primary_params {
+                if let Some(def) = &p.default {
+                    walk_expr_for_deprecation(def, info, out);
+                }
+            }
+            for sc in &c.secondary_ctors {
+                if let Some(body) = &sc.body {
+                    walk_block_for_deprecation(body, info, out);
+                }
+            }
+            for ee in &c.enum_entries {
+                for a in &ee.args {
+                    walk_expr_for_deprecation(a, info, out);
+                }
+                for m in &ee.body_members {
+                    walk_decl_for_deprecation(m, info, out);
+                }
+            }
+            for m in &c.members {
+                walk_decl_for_deprecation(m, info, out);
+            }
+        }
+        Decl::Object(o) => {
+            for m in &o.members {
+                walk_decl_for_deprecation(m, info, out);
+            }
+        }
+        Decl::TypeAlias(_) => {}
+    }
+}
+
+fn walk_block_for_deprecation(
+    b: &Block,
+    info: &HashMap<String, DeprecationInfo>,
+    out: &mut Vec<Diagnostic>,
+) {
+    for s in &b.stmts {
+        walk_stmt_for_deprecation(s, info, out);
+    }
+}
+
+fn walk_stmt_for_deprecation(
+    s: &Stmt,
+    info: &HashMap<String, DeprecationInfo>,
+    out: &mut Vec<Diagnostic>,
+) {
+    match s {
+        Stmt::Expr(e) => walk_expr_for_deprecation(e, info, out),
+        Stmt::Decl(d) => walk_decl_for_deprecation(d, info, out),
+        Stmt::Assign { target, value, .. } => {
+            walk_expr_for_deprecation(target, info, out);
+            walk_expr_for_deprecation(value, info, out);
+        }
+        Stmt::DestructuringDecl { init, .. } => {
+            walk_expr_for_deprecation(init, info, out);
+        }
+    }
+}
+
+fn walk_expr_for_deprecation(
+    e: &Expr,
+    info: &HashMap<String, DeprecationInfo>,
+    out: &mut Vec<Diagnostic>,
+) {
+    match e {
+        Expr::Path { segments, span } => {
+            if segments.len() == 1 {
+                emit_deprecation_at(&segments[0].name, *span, info, out);
+            }
+        }
+        Expr::Call { callee, args, span, .. } => {
+            // Recurse into the callee unless it's a bare-name reference
+            // to a deprecated symbol — we emit once for the call as a
+            // whole using the call's span.
+            let mut emitted_at_call = false;
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1 {
+                    if info.contains_key(&segments[0].name) {
+                        emit_deprecation_at(&segments[0].name, *span, info, out);
+                        emitted_at_call = true;
+                    }
+                }
+            }
+            if !emitted_at_call {
+                walk_expr_for_deprecation(callee, info, out);
+            }
+            for a in args {
+                walk_expr_for_deprecation(a, info, out);
+            }
+        }
+        Expr::Member { receiver, .. } => walk_expr_for_deprecation(receiver, info, out),
+        Expr::MemberRef { receiver, .. } => walk_expr_for_deprecation(receiver, info, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_expr_for_deprecation(lhs, info, out);
+            walk_expr_for_deprecation(rhs, info, out);
+        }
+        Expr::Unary { expr, .. } => walk_expr_for_deprecation(expr, info, out),
+        Expr::Postfix { expr, .. } => walk_expr_for_deprecation(expr, info, out),
+        Expr::Index { receiver, args, .. } => {
+            walk_expr_for_deprecation(receiver, info, out);
+            for a in args {
+                walk_expr_for_deprecation(a, info, out);
+            }
+        }
+        Expr::Return { value, .. } => {
+            if let Some(v) = value {
+                walk_expr_for_deprecation(v, info, out);
+            }
+        }
+        Expr::As { expr, .. } => walk_expr_for_deprecation(expr, info, out),
+        Expr::IsCheck { expr, .. } => walk_expr_for_deprecation(expr, info, out),
+        Expr::Spread { expr, .. } => walk_expr_for_deprecation(expr, info, out),
+        Expr::Labeled { expr, .. } => walk_expr_for_deprecation(expr, info, out),
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            walk_expr_for_deprecation(cond, info, out);
+            walk_expr_for_deprecation(then_branch, info, out);
+            if let Some(eb) = else_branch {
+                walk_expr_for_deprecation(eb, info, out);
+            }
+        }
+        Expr::While { cond, body, .. } | Expr::DoWhile { cond, body: Some(body), .. } => {
+            walk_expr_for_deprecation(cond, info, out);
+            walk_expr_for_deprecation(body, info, out);
+        }
+        Expr::DoWhile { cond, body: None, .. } => {
+            walk_expr_for_deprecation(cond, info, out);
+        }
+        Expr::For { iter, body, .. } => {
+            walk_expr_for_deprecation(iter, info, out);
+            walk_expr_for_deprecation(body, info, out);
+        }
+        Expr::When { subject, branches, .. } => {
+            if let Some(s) = subject {
+                walk_expr_for_deprecation(s, info, out);
+            }
+            for br in branches {
+                for p in &br.patterns {
+                    match &p.kind {
+                        WhenPatternKind::Value(e)
+                        | WhenPatternKind::InRange(e)
+                        | WhenPatternKind::NotInRange(e) => {
+                            walk_expr_for_deprecation(e, info, out)
+                        }
+                        _ => {}
+                    }
+                }
+                walk_expr_for_deprecation(&br.body, info, out);
+            }
+        }
+        Expr::Try { body, catches, finally, .. } => {
+            walk_block_for_deprecation(body, info, out);
+            for c in catches {
+                walk_block_for_deprecation(&c.body, info, out);
+            }
+            if let Some(f) = finally {
+                walk_block_for_deprecation(f, info, out);
+            }
+        }
+        Expr::Throw { value, .. } => walk_expr_for_deprecation(value, info, out),
+        Expr::Block(b) => walk_block_for_deprecation(b, info, out),
+        Expr::Lambda { body, .. } => walk_block_for_deprecation(body, info, out),
+        Expr::AnonFun { body, .. } => {
+            if let Some(b) = body {
+                match b.as_ref() {
+                    FunctionBody::Expr(e) => walk_expr_for_deprecation(e, info, out),
+                    FunctionBody::Block(blk) => walk_block_for_deprecation(blk, info, out),
+                }
+            }
+        }
+        Expr::ObjectExpr { members, supertype_args, supertype_delegates, .. } => {
+            for m in members {
+                walk_decl_for_deprecation(m, info, out);
+            }
+            for args in supertype_args.iter().flatten() {
+                for a in args {
+                    walk_expr_for_deprecation(a, info, out);
+                }
+            }
+            for d in supertype_delegates.iter().flatten() {
+                walk_expr_for_deprecation(d, info, out);
+            }
+        }
+        Expr::StringTemplate { parts, .. } => {
+            for p in parts {
+                if let StringPart::Interp(inner) = p {
+                    walk_expr_for_deprecation(inner, info, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn emit_deprecation_at(
+    name: &str,
+    span: Span,
+    info: &HashMap<String, DeprecationInfo>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(d) = info.get(name) else { return };
+    let suffix = match &d.message {
+        Some(m) if !m.is_empty() => format!(": {m}"),
+        _ => String::new(),
+    };
+    let body = format!("`{name}` is deprecated{suffix}");
+    match d.level {
+        DeprecationLevel::Warning => {
+            out.push(
+                Diagnostic::warning(body, span).with_code(codes::WARN_DEPRECATED),
+            );
+        }
+        DeprecationLevel::Error | DeprecationLevel::Hidden => {
+            out.push(Diagnostic::error(body, span).with_code(codes::TYPE_DEPRECATED_ERROR));
+        }
     }
 }
 
