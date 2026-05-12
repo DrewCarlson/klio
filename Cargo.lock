@@ -589,6 +589,7 @@ dependencies = [
  "klio-lexer",
  "klio-parser",
  "klio-span",
+ "klio-stdlib",
  "klio-types",
  "thiserror",
 ]
