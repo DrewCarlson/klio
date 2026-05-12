@@ -260,6 +260,11 @@ pub mod codes {
     /// with other top-level properties. Spec §6 note: initialization
     /// cycles in declaration scopes have unspecified behavior.
     pub const TYPE_PROPERTY_INITIALIZER_CYCLE: &str = "T0076";
+    /// A primary-constructor parameter that is not marked `val` / `var`
+    /// (i.e. not a property) is read from a member function or accessor
+    /// body. Spec §6.1: such params are only DLD to the classifier
+    /// initialization scope, so methods cannot see them.
+    pub const TYPE_NON_PROPERTY_CTOR_PARAM_OUT_OF_SCOPE: &str = "T0075";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -585,6 +590,284 @@ impl<'a> Checker<'a> {
         }
         // T0076: top-level property initializer cycles (spec §6).
         self.check_property_initializer_cycles(file);
+        // T0075: non-property primary-ctor param read from method body.
+        for d in &file.decls {
+            self.check_ctor_param_scope_decl(d);
+        }
+    }
+
+    fn check_ctor_param_scope_decl(&mut self, d: &Decl) {
+        match d {
+            Decl::Class(c) => {
+                // Names visible as members of this class — own members and
+                // transitively inherited supertype members / properties — are
+                // shadowed by their member binding rather than the ctor
+                // param. Skip those names when computing the non-property set.
+                let member_names = self.collect_member_name_set(c);
+                let non_prop: std::collections::HashMap<String, Span> = c
+                    .primary_params
+                    .iter()
+                    .filter(|p| p.property.is_none() && !member_names.contains(&p.name.name))
+                    .map(|p| (p.name.name.clone(), p.name.span))
+                    .collect();
+                if !non_prop.is_empty() {
+                    for m in &c.members {
+                        match m {
+                            Decl::Function(f) => {
+                                if let Some(body) = &f.body {
+                                    let mut local: std::collections::HashSet<String> = f
+                                        .params
+                                        .iter()
+                                        .map(|p| p.name.name.clone())
+                                        .collect();
+                                    self.check_ctor_param_in_body(body, &non_prop, &mut local);
+                                }
+                            }
+                            Decl::Property(p) => {
+                                // Property initializers run during instance
+                                // init — non-property ctor params are visible
+                                // there. Accessor bodies, however, are
+                                // invoked post-construction and must not see
+                                // them.
+                                if let Some(getter) = &p.getter {
+                                    let mut local = std::collections::HashSet::new();
+                                    self.check_ctor_param_in_body(&getter.body, &non_prop, &mut local);
+                                }
+                                if let Some(setter) = &p.setter {
+                                    let mut local: std::collections::HashSet<String> =
+                                        setter.params.iter().map(|i| i.name.clone()).collect();
+                                    self.check_ctor_param_in_body(&setter.body, &non_prop, &mut local);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for m in &c.members {
+                    self.check_ctor_param_scope_decl(m);
+                }
+            }
+            Decl::Object(o) => {
+                for m in &o.members {
+                    self.check_ctor_param_scope_decl(m);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Names that resolve as class members at any point in the class's
+    /// inheritance chain — own properties / functions / property-form ctor
+    /// params, plus transitively inherited equivalents via `self.classes`.
+    fn collect_member_name_set(&self, c: &Class) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for p in &c.primary_params {
+            if p.property.is_some() {
+                out.insert(p.name.name.clone());
+            }
+        }
+        for m in &c.members {
+            match m {
+                Decl::Function(f) => {
+                    out.insert(f.name.name.clone());
+                }
+                Decl::Property(p) => {
+                    out.insert(p.name.name.clone());
+                }
+                _ => {}
+            }
+        }
+        for s in &c.supertypes {
+            if let Some(info) = self.classes.get(&s.name.name) {
+                for k in info.members.keys() {
+                    out.insert(k.clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn check_ctor_param_in_body(
+        &mut self,
+        body: &FunctionBody,
+        non_prop: &std::collections::HashMap<String, Span>,
+        local: &mut std::collections::HashSet<String>,
+    ) {
+        match body {
+            FunctionBody::Block(b) => self.check_ctor_param_in_block(b, non_prop, local),
+            FunctionBody::Expr(e) => self.check_ctor_param_in_expr(e, non_prop, local),
+        }
+    }
+
+    fn check_ctor_param_in_block(
+        &mut self,
+        b: &Block,
+        non_prop: &std::collections::HashMap<String, Span>,
+        local: &mut std::collections::HashSet<String>,
+    ) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Expr(e) => self.check_ctor_param_in_expr(e, non_prop, local),
+                Stmt::Assign { target, value, .. } => {
+                    self.check_ctor_param_in_expr(target, non_prop, local);
+                    self.check_ctor_param_in_expr(value, non_prop, local);
+                }
+                Stmt::Decl(Decl::Property(p)) => {
+                    if let Some(init) = &p.init {
+                        self.check_ctor_param_in_expr(init, non_prop, local);
+                    }
+                    local.insert(p.name.name.clone());
+                }
+                Stmt::Decl(Decl::Function(f)) => {
+                    local.insert(f.name.name.clone());
+                }
+                Stmt::DestructuringDecl { names, init, .. } => {
+                    self.check_ctor_param_in_expr(init, non_prop, local);
+                    for n in names {
+                        if n.name != "_" {
+                            local.insert(n.name.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check_ctor_param_in_expr(
+        &mut self,
+        e: &Expr,
+        non_prop: &std::collections::HashMap<String, Span>,
+        local: &mut std::collections::HashSet<String>,
+    ) {
+        match e {
+            Expr::Path { segments, .. } => {
+                if let Some(first) = segments.first() {
+                    if segments.len() == 1 && !local.contains(&first.name) {
+                        if non_prop.contains_key(&first.name) {
+                            self.diagnostics.emit(
+                                Diagnostic::error(
+                                    format!(
+                                        "`{}` is a primary-constructor parameter (not a `val`/`var`) and is not in scope here; declare it as `val {0}` to promote it to a property",
+                                        first.name
+                                    ),
+                                    first.span,
+                                )
+                                .with_code(codes::TYPE_NON_PROPERTY_CTOR_PARAM_OUT_OF_SCOPE),
+                            );
+                        }
+                    }
+                }
+            }
+            Expr::Member { receiver, .. } => self.check_ctor_param_in_expr(receiver, non_prop, local),
+            Expr::Call { callee, args, .. } => {
+                self.check_ctor_param_in_expr(callee, non_prop, local);
+                for a in args {
+                    self.check_ctor_param_in_expr(a, non_prop, local);
+                }
+            }
+            Expr::Index { receiver, args, .. } => {
+                self.check_ctor_param_in_expr(receiver, non_prop, local);
+                for a in args {
+                    self.check_ctor_param_in_expr(a, non_prop, local);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.check_ctor_param_in_expr(lhs, non_prop, local);
+                self.check_ctor_param_in_expr(rhs, non_prop, local);
+            }
+            Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => {
+                self.check_ctor_param_in_expr(expr, non_prop, local);
+            }
+            Expr::If { cond, then_branch, else_branch, .. } => {
+                self.check_ctor_param_in_expr(cond, non_prop, local);
+                self.check_ctor_param_in_expr(then_branch, non_prop, local);
+                if let Some(eb) = else_branch {
+                    self.check_ctor_param_in_expr(eb, non_prop, local);
+                }
+            }
+            Expr::While { cond, body, .. } => {
+                self.check_ctor_param_in_expr(cond, non_prop, local);
+                self.check_ctor_param_in_expr(body, non_prop, local);
+            }
+            Expr::For { iter, body, vars, .. } => {
+                self.check_ctor_param_in_expr(iter, non_prop, local);
+                let mut inner = local.clone();
+                for v in vars {
+                    inner.insert(v.name.clone());
+                }
+                self.check_ctor_param_in_expr(body, non_prop, &mut inner);
+            }
+            Expr::Block(b) => self.check_ctor_param_in_block(b, non_prop, local),
+            Expr::Return { value: Some(v), .. } | Expr::Throw { value: v, .. } => {
+                self.check_ctor_param_in_expr(v, non_prop, local);
+            }
+            Expr::Labeled { expr, .. } => self.check_ctor_param_in_expr(expr, non_prop, local),
+            Expr::StringTemplate { parts, .. } => {
+                for part in parts {
+                    match part {
+                        klio_ast::StringPart::ShortInterp(id) => {
+                            if !local.contains(&id.name) && non_prop.contains_key(&id.name) {
+                                self.diagnostics.emit(
+                                    Diagnostic::error(
+                                        format!(
+                                            "`{}` is a primary-constructor parameter (not a `val`/`var`) and is not in scope here; declare it as `val {0}` to promote it to a property",
+                                            id.name
+                                        ),
+                                        id.span,
+                                    )
+                                    .with_code(codes::TYPE_NON_PROPERTY_CTOR_PARAM_OUT_OF_SCOPE),
+                                );
+                            }
+                        }
+                        klio_ast::StringPart::Interp(e) => {
+                            self.check_ctor_param_in_expr(e, non_prop, local)
+                        }
+                        klio_ast::StringPart::Text(_) => {}
+                    }
+                }
+            }
+            Expr::IsCheck { expr, .. } | Expr::As { expr, .. } | Expr::Spread { expr, .. } => {
+                self.check_ctor_param_in_expr(expr, non_prop, local);
+            }
+            Expr::Lambda { params, body, .. } => {
+                let mut inner = local.clone();
+                for p in params {
+                    inner.insert(p.name.clone());
+                }
+                self.check_ctor_param_in_block(body, non_prop, &mut inner);
+            }
+            Expr::When { subject, branches, .. } => {
+                if let Some(s) = subject {
+                    self.check_ctor_param_in_expr(s, non_prop, local);
+                }
+                for b in branches {
+                    for p in &b.patterns {
+                        match &p.kind {
+                            klio_ast::WhenPatternKind::Value(e)
+                            | klio_ast::WhenPatternKind::InRange(e)
+                            | klio_ast::WhenPatternKind::NotInRange(e) => {
+                                self.check_ctor_param_in_expr(e, non_prop, local);
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.check_ctor_param_in_expr(&b.body, non_prop, local);
+                }
+            }
+            Expr::Try { body, catches, finally, .. } => {
+                self.check_ctor_param_in_block(body, non_prop, local);
+                for c in catches {
+                    let mut inner = local.clone();
+                    inner.insert(c.binding.name.clone());
+                    self.check_ctor_param_in_block(&c.body, non_prop, &mut inner);
+                }
+                if let Some(fb) = finally {
+                    self.check_ctor_param_in_block(fb, non_prop, local);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Detect cycles among top-level property initializer reads. A property

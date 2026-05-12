@@ -766,3 +766,12 @@ fn neg_property_init_cycle() {
             .any(|c| c == "T0076")
     );
 }
+
+#[test]
+fn neg_method_reads_nonproperty_ctor_param() {
+    assert!(
+        type_codes_for("neg_method_reads_nonproperty_ctor_param.kt")
+            .iter()
+            .any(|c| c == "T0075")
+    );
+}
