@@ -776,6 +776,13 @@ fn neg_override_property_type() {
 }
 
 #[test]
+fn neg_suspend_call_from_non_suspend() {
+    assert!(type_codes_for("neg_suspend_call_from_non_suspend.kt")
+        .iter()
+        .any(|c| c == "T0115"));
+}
+
+#[test]
 fn neg_override_suspend_added() {
     assert!(type_codes_for("neg_override_suspend_added.kt").iter().any(|c| c == "T0069"));
 }

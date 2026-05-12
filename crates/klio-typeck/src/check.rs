@@ -523,6 +523,9 @@ struct FnSig {
     /// Used by the §11.8 conflicting-overloads pass to attach diagnostics
     /// to the offending declaration sites.
     decl_span: Option<Span>,
+    /// True when declared with the `suspend` modifier. Drives the §18.1
+    /// function-colouring check at call sites.
+    is_suspend: bool,
 }
 
 /// Description of a user-declared class.
@@ -685,6 +688,11 @@ struct Checker<'a> {
     /// references to `internal` declarations are forbidden unless the
     /// target carries `@PublishedApi`.
     public_inline_stack: Vec<bool>,
+    /// Stack tracking whether each enclosing function / lambda is a
+    /// suspending context. Spec §18.1: a suspending function may call
+    /// other suspending functions; a non-suspending function may not.
+    /// An inline lambda inherits its enclosing scope's suspending bit.
+    suspend_context_stack: Vec<bool>,
     /// Stack of reified type-parameter name sets for each enclosing
     /// function. Used at `as?` / `as` sites to decide whether the target
     /// type is runtime-available.
@@ -743,6 +751,7 @@ impl<'a> Checker<'a> {
             setter_visibility: HashMap::new(),
             aliases: HashMap::new(),
             public_inline_stack: Vec::new(),
+            suspend_context_stack: Vec::new(),
             reified_type_params: Vec::new(),
             type_params_in_scope: Vec::new(),
             fn_annotations: HashMap::new(),
@@ -3233,6 +3242,7 @@ impl<'r> Checker<'r> {
             type_param_bounds,
             param_class_names,
             decl_span: Some(f.name.span),
+            is_suspend: f.is_suspend,
         }
     }
 
@@ -3288,6 +3298,7 @@ impl<'r> Checker<'r> {
                 .map(|p| class_name_from_typeref(&p.ty))
                 .collect(),
             decl_span: None,
+            is_suspend: false,
         };
         if !c.primary_params.is_empty() || !c.is_interface {
             info.ctor = Some(ctor_sig);
@@ -3703,6 +3714,7 @@ impl<'r> Checker<'r> {
         self.label_stack.push(f.name.name.clone());
         let is_public_inline = f.is_inline && matches!(f.visibility, Visibility::Public);
         self.public_inline_stack.push(is_public_inline);
+        self.suspend_context_stack.push(f.is_suspend);
         let reified = f
             .type_params
             .iter()
@@ -3732,6 +3744,7 @@ impl<'r> Checker<'r> {
         self.fn_return_stack.pop();
         self.label_stack.pop();
         self.public_inline_stack.pop();
+        self.suspend_context_stack.pop();
         self.reified_type_params.pop();
         self.type_params_in_scope.pop();
         self.pop_frame();
@@ -7069,6 +7082,30 @@ impl<'r> Checker<'r> {
         Type::Unresolved
     }
 
+    /// Spec §18.1: emit T0115 when a suspending callee is invoked from a
+    /// non-suspending context. The suspending context is set on entry to
+    /// every `suspend fun` body and inherited by enclosing lambdas; the
+    /// non-suspending base case is the top of any non-suspending function
+    /// or file-top-level code.
+    fn enforce_suspend_coloring(&mut self, callee_is_suspend: bool, callee_label: &str, span: Span) {
+        if !callee_is_suspend {
+            return;
+        }
+        let in_suspend = self.suspend_context_stack.last().copied().unwrap_or(false);
+        if in_suspend {
+            return;
+        }
+        self.diagnostics.emit(
+            Diagnostic::error(
+                format!(
+                    "suspending {callee_label} called from a non-suspending context"
+                ),
+                span,
+            )
+            .with_code(codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND),
+        );
+    }
+
     /// Picks an overload from `sigs` by first-fit on argument types and
     /// drives arity + assignability diagnostics against the chosen
     /// signature. Falls back to the first arity-matching signature when
@@ -7142,6 +7179,7 @@ impl<'r> Checker<'r> {
                 self.check_type_arg_bounds(&sig, type_args);
             }
             self.check_arity_and_args(&sig, args, call_span);
+            self.enforce_suspend_coloring(sig.is_suspend, "function", call_span);
             if has_type_args || sig.type_param_count == 0 {
                 return sig.return_ty.clone();
             }
@@ -7231,6 +7269,7 @@ impl<'r> Checker<'r> {
         if has_type_args {
             self.check_type_arg_bounds(&sig, type_args);
         }
+        self.enforce_suspend_coloring(sig.is_suspend, "function", call_span);
         let min = sig.has_default.iter().filter(|h| !**h).count();
         let max = sig.params.len();
         if args.len() < min || args.len() > max {
@@ -11640,5 +11679,29 @@ mod tests {
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn suspend_call_from_suspend_ok() {
+        let tc = check_src(
+            r#"
+            suspend fun a() {}
+            suspend fun b() { a() }
+            fun main() {}
+            "#,
+        );
+        let cs = codes(&tc);
+        assert!(!cs.contains(&codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND), "{:?}", cs);
+    }
+
+    #[test]
+    fn suspend_call_from_non_suspend_flagged() {
+        let tc = check_src(
+            r#"
+            suspend fun a() {}
+            fun main() { a() }
+            "#,
+        );
+        assert!(codes(&tc).contains(&codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND));
     }
 }
