@@ -92,6 +92,20 @@ fn neg_delegate_missing_operator() {
 }
 
 #[test]
+fn neg_operator_keyword_missing_plus() {
+    assert!(type_codes_for("neg_operator_keyword_missing_plus.kt")
+        .iter()
+        .any(|c| c == "T0087"));
+}
+
+#[test]
+fn neg_operator_keyword_missing_get() {
+    assert!(type_codes_for("neg_operator_keyword_missing_get.kt")
+        .iter()
+        .any(|c| c == "T0087"));
+}
+
+#[test]
 fn neg_diamond_conflict() {
     assert!(type_codes_for("neg_diamond_conflict.kt")
         .iter()

@@ -286,6 +286,17 @@ pub mod codes {
     /// `*expr` spread argument whose element type is not a subtype of the
     /// declared vararg parameter's element type. Spec §8.21.5.
     pub const TYPE_SPREAD_TYPE_MISMATCH: &str = "T0086";
+    /// A function used at an operator-overloading dispatch site (`+ - * /
+    /// % ..` / unary / `[]` / `++` / `--` / `in` / `invoke` / `iterator` /
+    /// `componentN` / `provideDelegate` …) lacks the `operator` modifier.
+    /// Spec ch.9: every convention call site requires `operator`. Emitted
+    /// as a warning to stay parity-safe.
+    pub const TYPE_OPERATOR_KEYWORD_MISSING: &str = "T0087";
+    /// An `operator fun` declaration's signature does not match the shape
+    /// required by its name (`inc`/`dec` take no args; `componentN` takes
+    /// no args; `get` needs ≥1 arg; `set` needs ≥2 args; `compareTo`
+    /// returns `Int`; `contains` returns `Boolean`; …). Spec ch.9.
+    pub const TYPE_OPERATOR_SIGNATURE_MISMATCH: &str = "T0088";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -4262,10 +4273,14 @@ impl<'r> Checker<'r> {
             }
             Stmt::DestructuringDecl { names, init, mutable, .. } => {
                 let _ = self.check_expr(init, None);
-                for n in names {
+                // Spec ch.9: each non-`_` slot dispatches `componentN`.
+                let init_cls = self.expr_class.get(&init.span()).cloned();
+                for (idx, n) in names.iter().enumerate() {
                     if n.name == "_" {
                         continue;
                     }
+                    let comp = format!("component{}", idx + 1);
+                    self.check_user_operator_keyword(init_cls.as_deref(), &comp, n.span);
                     self.current_frame().bindings.insert(
                         n.name.clone(),
                         Binding {
@@ -4558,16 +4573,30 @@ impl<'r> Checker<'r> {
                 }
                 result
             }
-            Expr::Index { receiver, args, .. } => {
+            Expr::Index { receiver, args, span } => {
                 let _ = self.check_expr(receiver, None);
                 for a in args {
                     self.check_expr(a, None);
                 }
+                // Spec ch.9: `xs[i]` dispatches `operator fun get`.
+                let cls = self.expr_class.get(&receiver.span()).cloned();
+                self.check_user_operator_keyword(cls.as_deref(), "get", *span);
                 Type::Unresolved
             }
             Expr::Binary { op, lhs, rhs, span } => self.check_binary(*op, lhs, rhs, *span),
-            Expr::Unary { op, expr, .. } => {
+            Expr::Unary { op, expr, span } => {
                 let t = self.check_expr(expr, None);
+                let cls = self.expr_class.get(&expr.span()).cloned();
+                let op_name: Option<&str> = match op {
+                    UnOp::Pos => Some("unaryPlus"),
+                    UnOp::Neg => Some("unaryMinus"),
+                    UnOp::Not => Some("not"),
+                    UnOp::PreInc => Some("inc"),
+                    UnOp::PreDec => Some("dec"),
+                };
+                if let Some(name) = op_name {
+                    self.check_user_operator_keyword(cls.as_deref(), name, *span);
+                }
                 match op {
                     UnOp::Neg | UnOp::Pos => {
                         if is_numeric(&t) {
@@ -4582,8 +4611,17 @@ impl<'r> Checker<'r> {
                     UnOp::PreInc | UnOp::PreDec => t,
                 }
             }
-            Expr::Postfix { op, expr, .. } => {
+            Expr::Postfix { op, expr, span } => {
                 let t = self.check_expr(expr, None);
+                let cls = self.expr_class.get(&expr.span()).cloned();
+                let op_name: Option<&str> = match op {
+                    PostfixOp::Inc => Some("inc"),
+                    PostfixOp::Dec => Some("dec"),
+                    PostfixOp::NotNull => None,
+                };
+                if let Some(name) = op_name {
+                    self.check_user_operator_keyword(cls.as_deref(), name, *span);
+                }
                 match op {
                     PostfixOp::Inc | PostfixOp::Dec => t,
                     PostfixOp::NotNull => match t {
@@ -4677,8 +4715,14 @@ impl<'r> Checker<'r> {
                 self.assigned = before;
                 Type::Unit
             }
-            Expr::For { vars, iter, body, .. } => {
+            Expr::For { vars, iter, body, span, .. } => {
                 let _ = self.check_expr(iter, None);
+                // Spec ch.9: `for (x in c)` dispatches `iterator()` on `c`,
+                // then `hasNext()` / `next()` on the iterator. We only know
+                // the iterable's class here; the inner iterator class isn't
+                // tracked, so the check is best-effort on `iterator`.
+                let cls = self.expr_class.get(&iter.span()).cloned();
+                self.check_user_operator_keyword(cls.as_deref(), "iterator", *span);
                 let before = self.assigned.clone();
                 self.push_frame();
                 for v in vars {
@@ -5943,9 +5987,65 @@ impl<'r> Checker<'r> {
         let _ = sig.param_names.len();
     }
 
+    /// Spec ch.9: every function reached through a definition-by-convention
+    /// dispatch site must carry the `operator` modifier. Look up the member
+    /// (walking supertypes) on the receiver's user-class name and emit
+    /// T0087 when found without the flag. No diagnostic when the class isn't
+    /// known (built-in types, type params, generics without bound info).
+    fn check_user_operator_keyword(&mut self, receiver_class: Option<&str>, op_name: &str, span: Span) {
+        let Some(class_name) = receiver_class else { return };
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<String> = vec![class_name.to_string()];
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name.clone()) {
+                continue;
+            }
+            let Some(info) = self.classes.get(&name) else { continue };
+            if let Some(flags) = info.member_flags.get(op_name) {
+                if !flags.is_operator {
+                    self.diagnostics.emit(
+                        Diagnostic::warning(
+                            format!(
+                                "`{name}.{op_name}` is used as an operator-convention function but is missing the `operator` modifier"
+                            ),
+                            span,
+                        )
+                        .with_code(codes::TYPE_OPERATOR_KEYWORD_MISSING),
+                    );
+                }
+                return;
+            }
+            for s in &info.supertypes {
+                stack.push(s.clone());
+            }
+        }
+    }
+
     fn check_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) -> Type {
         let l = self.check_expr(lhs, None);
         let r = self.check_expr(rhs, None);
+        // Spec ch.9: dispatch-site `operator` modifier check. Binary arith
+        // / range / comparison dispatches on the LHS class; `in` / `!in`
+        // dispatches on the RHS class.
+        let op_name: Option<&str> = match op {
+            BinOp::Add => Some("plus"),
+            BinOp::Sub => Some("minus"),
+            BinOp::Mul => Some("times"),
+            BinOp::Div => Some("div"),
+            BinOp::Rem => Some("rem"),
+            BinOp::Range => Some("rangeTo"),
+            BinOp::RangeUntil => Some("rangeUntil"),
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Some("compareTo"),
+            _ => None,
+        };
+        if let Some(name) = op_name {
+            let cls = self.expr_class.get(&lhs.span()).cloned();
+            self.check_user_operator_keyword(cls.as_deref(), name, span);
+        }
+        if matches!(op, BinOp::In | BinOp::NotIn) {
+            let cls = self.expr_class.get(&rhs.span()).cloned();
+            self.check_user_operator_keyword(cls.as_deref(), "contains", span);
+        }
         // Spec §8.9.1 / §8.9.2: an equality between two definitely-distinct
         // types unrelated by subtyping is a compile-time error. Skip when
         // either side is `null` (the spec routes the null arm separately) or
