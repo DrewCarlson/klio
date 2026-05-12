@@ -2984,9 +2984,114 @@ impl<'r> Checker<'r> {
         self.check_accessor_return_types(p);
     }
 
+    /// Spec ch.9: validate the signature of an `operator fun` declaration
+    /// against its name. Each well-known operator name has a fixed shape
+    /// (arity / return type). Extensions add an implicit receiver "slot"
+    /// to the conceptual arity; user param count is one less than for a
+    /// member with the equivalent operator semantics. T0088 is a warning
+    /// so existing programs keep running while authors fix shapes.
+    fn check_operator_signature(&mut self, f: &Function) {
+        if !f.is_operator {
+            return;
+        }
+        let is_extension = f.receiver_type.is_some();
+        let extra_receiver: usize = if is_extension { 0 } else { 0 };
+        let _ = extra_receiver;
+        let n = f.params.len();
+        let name = f.name.name.as_str();
+        // For each name, the expected user-param count is what a member
+        // form would declare. Extensions match the same shape; the
+        // receiver is the LHS.
+        let (expected, returns_bool, returns_int): (Option<&str>, bool, bool) = match name {
+            "inc" | "dec" => (Some("0 args"), false, false),
+            "unaryPlus" | "unaryMinus" | "not" => (Some("0 args"), false, false),
+            "iterator" | "hasNext" | "next" => {
+                let rb = name == "hasNext";
+                (Some("0 args"), rb, false)
+            }
+            "plus" | "minus" | "times" | "div" | "rem"
+            | "rangeTo" | "rangeUntil" => (Some("1 arg"), false, false),
+            "plusAssign" | "minusAssign" | "timesAssign" | "divAssign" | "remAssign" => {
+                (Some("1 arg"), false, false)
+            }
+            "compareTo" => (Some("1 arg"), false, true),
+            "contains" => (Some("1 arg"), true, false),
+            "equals" => (Some("1 arg"), true, false),
+            "get" => {
+                // ≥1 user arg.
+                if n < 1 {
+                    self.emit_op_sig(f, "`get` operator requires at least 1 argument");
+                }
+                (None, false, false)
+            }
+            "set" => {
+                // ≥2 user args.
+                if n < 2 {
+                    self.emit_op_sig(f, "`set` operator requires at least 2 arguments (last is the value)");
+                }
+                (None, false, false)
+            }
+            "invoke" => (None, false, false),
+            "componentN" => (None, false, false),
+            "provideDelegate" => (Some("2 args"), false, false),
+            "getValue" => (Some("2 args"), false, false),
+            "setValue" => (Some("3 args"), false, false),
+            _ => {
+                // componentN: digits after "component"
+                if let Some(rest) = name.strip_prefix("component") {
+                    if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                        if n != 0 {
+                            self.emit_op_sig(f, &format!("`{name}` operator must take no arguments"));
+                        }
+                    }
+                }
+                (None, false, false)
+            }
+        };
+        if let Some(shape) = expected {
+            let want: usize = match shape {
+                "0 args" => 0,
+                "1 arg" => 1,
+                "2 args" => 2,
+                "3 args" => 3,
+                _ => return,
+            };
+            if n != want {
+                self.emit_op_sig(
+                    f,
+                    &format!("`{name}` operator must take exactly {shape}, got {n}"),
+                );
+            }
+        }
+        if returns_bool {
+            if let Some(rt) = &f.return_type {
+                let ty = convert_type_ref_lossy(rt);
+                if !matches!(ty.non_null(), Type::Boolean | Type::Unresolved) {
+                    self.emit_op_sig(f, &format!("`{name}` operator must return Boolean"));
+                }
+            }
+        }
+        if returns_int {
+            if let Some(rt) = &f.return_type {
+                let ty = convert_type_ref_lossy(rt);
+                if !matches!(ty.non_null(), Type::Int | Type::Unresolved) {
+                    self.emit_op_sig(f, &format!("`{name}` operator must return Int"));
+                }
+            }
+        }
+    }
+
+    fn emit_op_sig(&mut self, f: &Function, msg: &str) {
+        self.diagnostics.emit(
+            Diagnostic::warning(msg.to_string(), f.name.span)
+                .with_code(codes::TYPE_OPERATOR_SIGNATURE_MISMATCH),
+        );
+    }
+
     fn check_function(&mut self, f: &Function) {
         self.check_inline_param_escape(f);
         self.check_anonymous_object_escape(f);
+        self.check_operator_signature(f);
         let saved_assigned = self.assigned.clone();
         self.push_frame();
         for p in &f.params {

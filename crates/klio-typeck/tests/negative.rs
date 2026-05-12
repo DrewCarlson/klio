@@ -106,6 +106,20 @@ fn neg_operator_keyword_missing_get() {
 }
 
 #[test]
+fn neg_operator_signature_inc_takes_arg() {
+    assert!(type_codes_for("neg_operator_signature_inc_takes_arg.kt")
+        .iter()
+        .any(|c| c == "T0088"));
+}
+
+#[test]
+fn neg_operator_signature_compareto_return() {
+    assert!(type_codes_for("neg_operator_signature_compareto_return.kt")
+        .iter()
+        .any(|c| c == "T0088"));
+}
+
+#[test]
 fn neg_diamond_conflict() {
     assert!(type_codes_for("neg_diamond_conflict.kt")
         .iter()
