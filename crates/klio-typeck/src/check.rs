@@ -2904,12 +2904,14 @@ impl<'r> Checker<'r> {
     }
 
     fn signature_of(&self, f: &Function) -> FnSig {
+        let tparams: std::collections::HashSet<String> =
+            f.type_params.iter().map(|tp| tp.name.name.clone()).collect();
         let mut params = Vec::with_capacity(f.params.len());
         let mut has_default = Vec::with_capacity(f.params.len());
         let mut names = Vec::with_capacity(f.params.len());
         let mut is_vararg = Vec::with_capacity(f.params.len());
         for p in &f.params {
-            params.push(convert_type_ref_lossy(&p.ty));
+            params.push(convert_type_ref_with_tparams(&p.ty, &tparams));
             has_default.push(p.default.is_some());
             names.push(p.name.name.clone());
             is_vararg.push(p.is_vararg);
@@ -2917,7 +2919,7 @@ impl<'r> Checker<'r> {
         let return_ty = f
             .return_type
             .as_ref()
-            .map(convert_type_ref_lossy)
+            .map(|rt| convert_type_ref_with_tparams(rt, &tparams))
             .unwrap_or(Type::Unit);
         let param_class_names: Vec<Option<String>> =
             f.params.iter().map(|p| class_name_from_typeref(&p.ty)).collect();
@@ -6487,12 +6489,16 @@ impl<'r> Checker<'r> {
             filtered = sigs.iter().collect();
         }
         if filtered.len() == 1 {
+            let sig = filtered[0].clone();
             if has_type_args {
-                let sig = filtered[0].clone();
                 self.check_type_arg_bounds(&sig, type_args);
             }
-            self.check_arity_and_args(filtered[0], args, call_span);
-            return filtered[0].return_ty.clone();
+            self.check_arity_and_args(&sig, args, call_span);
+            if has_type_args || sig.type_param_count == 0 {
+                return sig.return_ty.clone();
+            }
+            let arg_tys: Vec<Type> = args.iter().map(|a| self.check_expr(a, None)).collect();
+            return self.infer_call_return(&sig, &arg_tys, call_span);
         }
         // Pre-type each argument once; selection consults these types,
         // and assignability checks against the chosen signature reuse them
@@ -6595,7 +6601,72 @@ impl<'r> Checker<'r> {
                 self.check_assignable(at, p, a.span());
             }
         }
-        sig.return_ty
+        if has_type_args {
+            return sig.return_ty;
+        }
+        self.infer_call_return(&sig, &arg_tys, call_span)
+    }
+
+    /// Spec §13: at a generic call with no explicit `<...>`, allocate one
+    /// inference variable per declared type parameter, seed bounds from
+    /// each `arg_ty <: param_ty` constraint (replacing TypeParam(name)
+    /// with the corresponding inference var), solve to fixpoint, and
+    /// substitute the solution into the declared return type. Emits
+    /// T0097 if reduction fails. Returns `sig.return_ty` unchanged when
+    /// the sig has no type parameters or the return type doesn't
+    /// reference any of them.
+    fn infer_call_return(&mut self, sig: &FnSig, arg_tys: &[Type], call_span: Span) -> Type {
+        use klio_types::constraints::{ConstraintSystem, SolutionPreference};
+        if sig.type_param_count == 0 || sig.type_param_names.is_empty() {
+            return sig.return_ty.clone();
+        }
+        let mut cs = ConstraintSystem::new();
+        let mut subst: std::collections::HashMap<String, Type> =
+            std::collections::HashMap::new();
+        let mut vars: Vec<klio_types::constraints::InferenceVar> = Vec::new();
+        for name in &sig.type_param_names {
+            let (v, t) = cs.fresh(name);
+            cs.set_preference(v, SolutionPreference::PullUp);
+            subst.insert(name.clone(), t);
+            vars.push(v);
+        }
+        for (i, p) in sig.params.iter().enumerate() {
+            if let Some(at) = arg_tys.get(i) {
+                // Skip non-resolved arg types so the solver doesn't pin
+                // a variable to `Unresolved` and lose precision.
+                if matches!(at, Type::Unresolved) {
+                    continue;
+                }
+                let p_with_vars = substitute_type_params(p, &subst);
+                cs.add_constraint(at.clone(), p_with_vars);
+            }
+        }
+        if let Err(_e) = cs.solve_to_fixpoint() {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    "type inference failed for this call",
+                    call_span,
+                )
+                .with_code(codes::TYPE_INFERENCE_FAILED),
+            );
+            return sig.return_ty.clone();
+        }
+        let sol = cs.solve();
+        let mut final_subst: std::collections::HashMap<String, Type> =
+            std::collections::HashMap::new();
+        for (i, name) in sig.type_param_names.iter().enumerate() {
+            if let Some(v) = vars.get(i) {
+                if let Some(t) = sol.get(v) {
+                    // `Nothing` results from a variable with no concrete
+                    // lower bound; keep it as TypeParam so callers don't
+                    // pin to bottom prematurely.
+                    if !matches!(t, Type::Nothing) {
+                        final_subst.insert(name.clone(), t.clone());
+                    }
+                }
+            }
+        }
+        substitute_type_params(&sig.return_ty, &final_subst)
     }
 
     fn check_arity_and_args(&mut self, sig: &FnSig, args: &[Expr], call_span: Span) {
@@ -7410,6 +7481,55 @@ fn substitute_type_params(t: &Type, subst: &std::collections::HashMap<String, Ty
         },
         _ => t.clone(),
     }
+}
+
+/// Lowers a `TypeRef` while preserving references to declared type
+/// parameters as `Type::TypeParam(name)` so the constraint-system pass
+/// can identify them. Outside of `tparams`, falls back to
+/// `convert_type_ref_lossy`. Nested generic arguments and function
+/// receiver / params / return are walked recursively.
+fn convert_type_ref_with_tparams(t: &TypeRef, tparams: &std::collections::HashSet<String>) -> Type {
+    use klio_types::GenericArg;
+    if t.name.name == "*" {
+        return Type::Any;
+    }
+    if tparams.contains(t.name.name.as_str()) && t.type_args.is_empty() && t.function.is_none() {
+        let inner = Type::TypeParam(t.name.name.clone());
+        return if t.nullable { inner.as_nullable() } else { inner };
+    }
+    if let Some(ft) = &t.function {
+        let params: Vec<Type> = ft
+            .params
+            .iter()
+            .map(|p| convert_type_ref_with_tparams(p, tparams))
+            .collect();
+        let ret = convert_type_ref_with_tparams(&ft.ret, tparams);
+        let func = Type::Function { params, return_type: Box::new(ret) };
+        return if t.nullable { func.as_nullable() } else { func };
+    }
+    if !t.type_args.is_empty() {
+        if let Some(builtin) = builtin_by_name(&t.name.name) {
+            let _ = builtin;
+        }
+        let args: Vec<GenericArg> = t
+            .type_args
+            .iter()
+            .map(|a| {
+                if a.is_star {
+                    GenericArg { variance: a.variance.into(), is_star: true, ty: Type::Any }
+                } else {
+                    GenericArg {
+                        variance: a.variance.into(),
+                        is_star: false,
+                        ty: convert_type_ref_with_tparams(&a.ty, tparams),
+                    }
+                }
+            })
+            .collect();
+        let g = Type::Generic { name: t.name.name.clone(), args };
+        return if t.nullable { g.as_nullable() } else { g };
+    }
+    convert_type_ref_lossy(t)
 }
 
 fn class_name_from_typeref(t: &TypeRef) -> Option<String> {
@@ -9172,6 +9292,24 @@ mod tests {
                 return s.length
             }
             fun main() { println(f("hi")) }
+            "#,
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn infer_call_return_propagates_arg_type() {
+        // Spec §13: `id(5)` with `fun <T> id(x: T): T` should infer T = Int,
+        // so the result is assignable to `Int`.
+        let tc = check_src(
+            r#"
+            fun <T> id(x: T): T = x
+            fun main() {
+                val n: Int = id(5)
+                val s: String = id("hi")
+                println(n)
+                println(s)
+            }
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());

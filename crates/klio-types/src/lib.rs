@@ -223,6 +223,16 @@ impl Type {
         if matches!(self, Self::Unresolved) || matches!(other, Self::Unresolved) {
             return true;
         }
+        // Type parameters act as permissive wildcards at the subtype
+        // boundary unless both sides name the same parameter. The
+        // constraint solver narrows them when inference runs; outside of
+        // inference the checker keeps user code parity-stable.
+        if matches!(self, Self::TypeParam(_)) || matches!(other, Self::TypeParam(_)) {
+            if let (Self::TypeParam(a), Self::TypeParam(b)) = (self, other) {
+                return a == b;
+            }
+            return true;
+        }
         if self == other {
             return true;
         }
