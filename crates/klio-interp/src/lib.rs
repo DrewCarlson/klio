@@ -1499,6 +1499,7 @@ impl Interpreter {
                             message: Some(Rc::new(format!(
                                 "Index {i} out of bounds for length {n}"
                             ))),
+                            cause: None,
                         }));
                     }
                     return Ok(items_ref[i as usize].clone());
@@ -1611,6 +1612,7 @@ impl Interpreter {
                             "class {actual} cannot be cast to class {}",
                             ty.name.name
                         ))),
+                        cause: None,
                     }))
                 }
             }
@@ -1822,6 +1824,7 @@ impl Interpreter {
         Err(RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.NoWhenBranchMatchedException".to_string()),
             message: None,
+            cause: None,
         }))
     }
 
@@ -2068,6 +2071,7 @@ impl Interpreter {
                     return Err(RuntimeError::Thrown(Value::Exception {
                         fqn: Rc::new("kotlin.IllegalArgumentException".into()),
                         message: msg.map(Rc::new),
+                        cause: None,
                     }));
                 }
                 Ok(Some(Value::Unit))
@@ -2093,6 +2097,7 @@ impl Interpreter {
                     return Err(RuntimeError::Thrown(Value::Exception {
                         fqn: Rc::new("kotlin.IllegalStateException".into()),
                         message: msg.map(Rc::new),
+                        cause: None,
                     }));
                 }
                 Ok(Some(Value::Unit))
@@ -2106,6 +2111,7 @@ impl Interpreter {
                 Err(RuntimeError::Thrown(Value::Exception {
                     fqn: Rc::new("kotlin.IllegalStateException".into()),
                     message: Some(Rc::new(msg)),
+                    cause: None,
                 }))
             }
             "checkNotNull" => {
@@ -2126,6 +2132,7 @@ impl Interpreter {
                     return Err(RuntimeError::Thrown(Value::Exception {
                         fqn: Rc::new("kotlin.IllegalStateException".into()),
                         message: msg.map(Rc::new),
+                        cause: None,
                     }));
                 }
                 Ok(Some(v))
@@ -2148,6 +2155,7 @@ impl Interpreter {
                     return Err(RuntimeError::Thrown(Value::Exception {
                         fqn: Rc::new("kotlin.IllegalArgumentException".into()),
                         message: msg.map(Rc::new),
+                        cause: None,
                     }));
                 }
                 Ok(Some(v))
@@ -2166,6 +2174,7 @@ impl Interpreter {
                 Err(RuntimeError::Thrown(Value::Exception {
                     fqn: Rc::new("kotlin.NotImplementedError".into()),
                     message: Some(Rc::new(msg)),
+                    cause: None,
                 }))
             }
             _ => Ok(None),
@@ -2347,6 +2356,7 @@ impl Interpreter {
                         message: Some(Rc::new(format!(
                             "Index {i} out of bounds for length {n}"
                         ))),
+                        cause: None,
                     }));
                 }
                 let idx = i as usize;
@@ -2384,6 +2394,7 @@ impl Interpreter {
                         message: Some(Rc::new(format!(
                             "Index {i} out of bounds for length {n}"
                         ))),
+                        cause: None,
                     }));
                 }
                 let idx = i as usize;
@@ -2797,6 +2808,7 @@ impl Interpreter {
                         RuntimeError::Thrown(Value::Exception {
                             fqn: Rc::new("kotlin.NoSuchElementException".into()),
                             message: Some(Rc::new("Sequence is empty.".into())),
+                            cause: None,
                         })
                     }).map(Some)
                 }
@@ -2805,6 +2817,7 @@ impl Interpreter {
                         RuntimeError::Thrown(Value::Exception {
                             fqn: Rc::new("kotlin.NoSuchElementException".into()),
                             message: Some(Rc::new("Sequence is empty.".into())),
+                            cause: None,
                         })
                     }).map(Some)
                 }
@@ -2881,6 +2894,7 @@ impl Interpreter {
                     message: Some(Rc::new(format!(
                         "Sequence materialization exceeded {safety_limit} iterations; use a Take to bound it."
                     ))),
+                    cause: None,
                 }));
             }
             let item = match self.pull_sequence_source(&data.source, &mut source_state, out)? {
@@ -3738,6 +3752,7 @@ impl Interpreter {
                     message: Some(Rc::new(
                         "Collection contains no element matching the predicate.".into(),
                     )),
+                    cause: None,
                 }))
             }
             "lastOrNull" => {
@@ -3764,6 +3779,7 @@ impl Interpreter {
                         message: Some(Rc::new(
                             "Collection contains no element matching the predicate.".into(),
                         )),
+                        cause: None,
                     })
                 })
             }
@@ -3820,6 +3836,7 @@ impl Interpreter {
                     RuntimeError::Thrown(Value::Exception {
                         fqn: Rc::new("kotlin.NoSuchElementException".into()),
                         message: Some(Rc::new("Collection is empty.".into())),
+                        cause: None,
                     })
                 })
                 .map(Some)
@@ -3838,6 +3855,7 @@ impl Interpreter {
                     return Err(RuntimeError::Thrown(Value::Exception {
                         fqn: Rc::new("kotlin.UnsupportedOperationException".into()),
                         message: Some(Rc::new("Empty collection can't be reduced.".into())),
+                        cause: None,
                     }));
                 };
                 for v in iter {
@@ -4464,6 +4482,7 @@ impl Interpreter {
                     "Cannot create an instance of an abstract class: {}",
                     class.name
                 ))),
+                cause: None,
             }));
         }
         if class.is_interface {
@@ -4473,6 +4492,7 @@ impl Interpreter {
                     "Cannot create an instance of an interface: {}",
                     class.name
                 ))),
+                cause: None,
             }));
         }
         let identity = self.next_instance_id();
@@ -5033,6 +5053,7 @@ impl Interpreter {
                         message: Some(Rc::new(format!(
                             "Property {pname} should be initialized before get."
                         ))),
+                        cause: None,
                     }))
                 }
             },
@@ -6257,6 +6278,7 @@ impl Interpreter {
                                     "kotlin.IllegalArgumentException".to_string(),
                                 ),
                                 message: Some(Rc::new(msg)),
+                                cause: None,
                             }));
                         }
                         _ => {}
@@ -6637,12 +6659,13 @@ fn make_lateinit_sentinel(name: &str) -> Value {
     Value::Exception {
         fqn: Rc::new(LATEINIT_SENTINEL_FQN.to_string()),
         message: Some(Rc::new(name.to_string())),
+        cause: None,
     }
 }
 
 fn lateinit_sentinel_name(v: &Value) -> Option<String> {
     match v {
-        Value::Exception { fqn, message } if fqn.as_str() == LATEINIT_SENTINEL_FQN => {
+        Value::Exception { fqn, message, .. } if fqn.as_str() == LATEINIT_SENTINEL_FQN => {
             message.as_ref().map(|s| (**s).clone())
         }
         _ => None,
@@ -6655,6 +6678,7 @@ fn lateinit_throw(name: &str) -> RuntimeError {
         message: Some(Rc::new(format!(
             "lateinit property {name} has not been initialized"
         ))),
+        cause: None,
     })
 }
 
@@ -7428,6 +7452,7 @@ fn eval_numeric_arith(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value, R
                         return Some(Err(RuntimeError::Thrown(Value::Exception {
                             fqn: Rc::new("kotlin.ArithmeticException".to_string()),
                             message: None,
+                            cause: None,
                         })));
                     }
                     a.wrapping_div(b)
@@ -7437,6 +7462,7 @@ fn eval_numeric_arith(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value, R
                         return Some(Err(RuntimeError::Thrown(Value::Exception {
                             fqn: Rc::new("kotlin.ArithmeticException".to_string()),
                             message: None,
+                            cause: None,
                         })));
                     }
                     a.wrapping_rem(b)
@@ -7836,7 +7862,7 @@ mod tests {
             fun main() { println(1 / 0) }
         "#;
         let err = run_err(src);
-        let RuntimeError::Thrown(Value::Exception { fqn, message }) = err else {
+        let RuntimeError::Thrown(Value::Exception { fqn, message, .. }) = err else {
             panic!("expected Thrown(ArithmeticException), got {err:?}")
         };
         assert_eq!(*fqn, "kotlin.ArithmeticException");

@@ -192,6 +192,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
 
     // ----- Throwable members -----
     ("kotlin.Throwable.message", throwable_message),
+    ("kotlin.Throwable.cause", throwable_cause),
     ("kotlin.Throwable.toString", throwable_to_string),
 
     // ----- Collection constructors -----
@@ -1271,6 +1272,7 @@ fn string_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.IllegalArgumentException".into()),
             message: Some(Rc::new(format!("Size {size} must be greater than zero."))),
+            cause: None,
         }));
     }
     let size = *size as usize;
@@ -1295,6 +1297,7 @@ fn string_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.IllegalArgumentException".into()),
             message: Some(Rc::new(format!("size {size} must be greater than zero."))),
+            cause: None,
         }));
     }
     let step = match ctx.args.get(2) {
@@ -1311,6 +1314,7 @@ fn string_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.IllegalArgumentException".into()),
             message: Some(Rc::new(format!("step {step} must be greater than zero."))),
+            cause: None,
         }));
     }
     let chars: Vec<char> = s.chars().collect();
@@ -1841,17 +1845,50 @@ fn make_exception(fqn: &str, message: Option<String>) -> Value {
     Value::Exception {
         fqn: Rc::new(fqn.to_string()),
         message: message.map(Rc::new),
+        cause: None,
     }
 }
 
 fn build_exception(ctx: &CallCtx<'_>, fqn: &str) -> Result<Value, RuntimeError> {
-    let message = match ctx.args.first() {
-        None => None,
-        Some(Value::Null) => None,
-        Some(Value::String(s)) => Some((**s).clone()),
-        Some(other) => Some(format!("{other}")),
+    // Throwable accepts up to two arguments per spec §3.12:
+    //   (), (message), (cause), (message, cause).
+    // A single Throwable-typed argument is treated as `cause`; anything else
+    // becomes `message`.
+    let (message, cause) = match (ctx.args.first(), ctx.args.get(1)) {
+        (None, _) => (None, None),
+        (Some(v), None) => {
+            if matches!(v, Value::Exception { .. }) {
+                (None, Some(Box::new(v.clone())))
+            } else {
+                let m = match v {
+                    Value::Null => None,
+                    Value::String(s) => Some((**s).clone()),
+                    other => Some(format!("{other}")),
+                };
+                (m, None)
+            }
+        }
+        (Some(m), Some(c)) => {
+            let msg = match m {
+                Value::Null => None,
+                Value::String(s) => Some((**s).clone()),
+                other => Some(format!("{other}")),
+            };
+            let cause = match c {
+                Value::Null => None,
+                Value::Exception { .. } => Some(Box::new(c.clone())),
+                _ => return Err(RuntimeError::Type(
+                    "Throwable cause must be a Throwable or null".into(),
+                )),
+            };
+            (msg, cause)
+        }
     };
-    Ok(make_exception(fqn, message))
+    Ok(Value::Exception {
+        fqn: Rc::new(fqn.to_string()),
+        message: message.map(Rc::new),
+        cause,
+    })
 }
 
 fn excn_throwable(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -1905,6 +1942,13 @@ fn throwable_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Type("toString requires a Throwable receiver".into()));
     };
     Ok(Value::String(Rc::new(format!("{v}"))))
+}
+
+fn throwable_cause(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let Some(Value::Exception { cause, .. }) = ctx.args.first() else {
+        return Err(RuntimeError::Type("cause requires a Throwable receiver".into()));
+    };
+    Ok(cause.as_ref().map_or(Value::Null, |c| (**c).clone()))
 }
 
 // ============================================================
@@ -2082,6 +2126,7 @@ fn coll_list_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
                 "Index {i} out of bounds for length {}",
                 borrow.len()
             ))),
+            cause: None,
         }));
     }
     Ok(borrow[i as usize].clone())
@@ -2092,6 +2137,7 @@ fn coll_list_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.NoSuchElementException".into()),
             message: Some(Rc::new("List is empty.".into())),
+            cause: None,
         })
     })
 }
@@ -2101,6 +2147,7 @@ fn coll_list_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.NoSuchElementException".into()),
             message: Some(Rc::new("List is empty.".into())),
+            cause: None,
         })
     })
 }
@@ -2170,6 +2217,7 @@ fn coll_mut_list_remove_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
                 "Index {i} out of bounds for length {}",
                 borrow.len()
             ))),
+            cause: None,
         }));
     }
     Ok(borrow.remove(*i as usize))
@@ -2377,6 +2425,7 @@ fn list_take_count(ctx: &CallCtx<'_>, what: &str) -> Result<i64, RuntimeError> {
         return Err(RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.IllegalArgumentException".into()),
             message: Some(Rc::new(format!("Requested element count {n} is less than zero."))),
+            cause: None,
         }));
     }
     Ok(n)
@@ -2425,6 +2474,7 @@ fn coll_list_slice(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
                         message: Some(Rc::new(format!(
                             "Index {i} out of bounds for length {len}"
                         ))),
+                        cause: None,
                     }));
                 }
                 v.push(borrow[i as usize].clone());
@@ -2445,6 +2495,7 @@ fn coll_list_slice(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
                         message: Some(Rc::new(format!(
                             "Index {i} out of bounds for length {len}"
                         ))),
+                        cause: None,
                     }));
                 }
                 v.push(borrow[i as usize].clone());
@@ -2474,6 +2525,7 @@ fn coll_list_sublist(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             message: Some(Rc::new(format!(
                 "fromIndex: {from}, toIndex: {to}, size: {len}"
             ))),
+            cause: None,
         }));
     }
     Ok(make_list(borrow[from as usize..to as usize].to_vec(), false))
@@ -2524,6 +2576,7 @@ fn coll_list_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.IllegalArgumentException".into()),
             message: Some(Rc::new(format!("Size {size} must be greater than zero."))),
+            cause: None,
         }));
     }
     let size = *size as usize;
@@ -2547,6 +2600,7 @@ fn coll_list_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.IllegalArgumentException".into()),
             message: Some(Rc::new(format!("size {size} must be greater than zero."))),
+            cause: None,
         }));
     }
     let step = match ctx.args.get(2) {
@@ -2558,6 +2612,7 @@ fn coll_list_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.IllegalArgumentException".into()),
             message: Some(Rc::new(format!("step {step} must be greater than zero."))),
+            cause: None,
         }));
     }
     let partial_windows = match ctx.args.get(3) {
@@ -3000,6 +3055,7 @@ fn seq_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.NoSuchElementException".into()),
             message: Some(Rc::new("Sequence is empty.".into())),
+            cause: None,
         })
     })
 }
@@ -3013,6 +3069,7 @@ fn seq_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         RuntimeError::Thrown(Value::Exception {
             fqn: Rc::new("kotlin.NoSuchElementException".into()),
             message: Some(Rc::new("Sequence is empty.".into())),
+            cause: None,
         })
     })
 }
@@ -3074,6 +3131,7 @@ fn ranges_step(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
                     message: Some(Rc::new(format!(
                         "Step must be positive, was: {n}."
                     ))),
+                    cause: None,
                 }));
             }
             let signed = if *step < 0 { -n } else { n };
@@ -5257,7 +5315,7 @@ mod tests {
 
     #[test]
     fn excn_constructors_carry_message() {
-        let Ok(Value::Exception { fqn, message }) = call(
+        let Ok(Value::Exception { fqn, message, .. }) = call(
             excn_illegal_argument,
             &[Value::String(Rc::new("bad".into()))],
         ) else { panic!() };

@@ -53,8 +53,9 @@ pub enum Value {
     /// prepended to the user arguments.
     BoundMethod { fqn: &'static str, func: StdlibFn, receiver: Box<Value> },
     /// A thrown value, modeled as a Kotlin Throwable. Carries an FQN
-    /// (e.g. `kotlin.IllegalArgumentException`) and an optional message.
-    Exception { fqn: Rc<String>, message: Option<Rc<String>> },
+    /// (e.g. `kotlin.IllegalArgumentException`), an optional message, and
+    /// an optional cause (another Throwable) per spec §3.12.
+    Exception { fqn: Rc<String>, message: Option<Rc<String>>, cause: Option<Box<Value>> },
     /// `kotlin.collections.List` / `MutableList`. The mutability tag drives
     /// `type_fqn` and any mutability checks; the storage is shared.
     /// `enum_class` is `Some(name)` for the result of `EnumName.entries` /
@@ -679,7 +680,7 @@ impl fmt::Debug for Value {
             Self::Lambda { params, .. } => write!(f, "Lambda(params={})", params.len()),
             Self::Intrinsic { fqn, .. } => write!(f, "Intrinsic({fqn})"),
             Self::BoundMethod { fqn, .. } => write!(f, "BoundMethod({fqn})"),
-            Self::Exception { fqn, message } => match message {
+            Self::Exception { fqn, message, .. } => match message {
                 Some(m) => write!(f, "Exception({fqn}: {m:?})"),
                 None => write!(f, "Exception({fqn})"),
             },
@@ -758,7 +759,7 @@ impl fmt::Display for Value {
             Self::Intrinsic { fqn, .. } | Self::BoundMethod { fqn, .. } => {
                 write!(f, "fun {fqn}(...)")
             }
-            Self::Exception { fqn, message } => match message {
+            Self::Exception { fqn, message, .. } => match message {
                 Some(m) => write!(f, "{fqn}: {m}"),
                 None => write!(f, "{fqn}"),
             },
