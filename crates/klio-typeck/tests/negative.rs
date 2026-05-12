@@ -776,6 +776,16 @@ fn neg_override_property_type() {
 }
 
 #[test]
+fn neg_override_suspend_added() {
+    assert!(type_codes_for("neg_override_suspend_added.kt").iter().any(|c| c == "T0069"));
+}
+
+#[test]
+fn neg_override_suspend_dropped() {
+    assert!(type_codes_for("neg_override_suspend_dropped.kt").iter().any(|c| c == "T0069"));
+}
+
+#[test]
 fn neg_override_visibility_stronger() {
     assert!(type_codes_for("neg_override_visibility_stronger.kt").iter().any(|c| c == "T0068"));
 }

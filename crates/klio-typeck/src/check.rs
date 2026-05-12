@@ -596,6 +596,7 @@ enum MemberSig {
         param_types: Vec<Type>,
         return_ty: Type,
         visibility: Visibility,
+        is_suspend: bool,
     },
     Property {
         ty: Type,
@@ -3309,6 +3310,7 @@ impl<'r> Checker<'r> {
                             param_types: sig.params.clone(),
                             return_ty: sig.return_ty.clone(),
                             visibility: f.visibility,
+                            is_suspend: f.is_suspend,
                         },
                     );
                     let ty = Type::Function {
@@ -4075,9 +4077,27 @@ impl<'r> Checker<'r> {
                     if let Some(MemberSig::Function {
                         return_ty: base_ret,
                         visibility: base_vis,
+                        is_suspend: base_suspend,
                         ..
                     }) = inherited_sigs.get(&f.name.name)
                     {
+                        if *base_suspend != f.is_suspend {
+                            let msg = if f.is_suspend {
+                                format!(
+                                    "override `{name}` is `suspend` but the overridden function is not",
+                                    name = f.name.name
+                                )
+                            } else {
+                                format!(
+                                    "override `{name}` is not `suspend` but the overridden function is",
+                                    name = f.name.name
+                                )
+                            };
+                            self.diagnostics.emit(
+                                Diagnostic::error(msg, f.name.span)
+                                    .with_code(codes::TYPE_OVERRIDE_SUSPEND_MISMATCH),
+                            );
+                        }
                         // Only check when both ends have explicit return
                         // types — an omitted return type on an expression
                         // body is inferred and may legitimately resolve to
@@ -4692,6 +4712,7 @@ impl<'r> Checker<'r> {
                 param_types,
                 return_ty,
                 visibility: Visibility::Public,
+                is_suspend: fnref.is_suspend,
             });
         }
     }
