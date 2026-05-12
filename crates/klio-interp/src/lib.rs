@@ -5458,7 +5458,10 @@ impl Interpreter {
                     }
                     Ok(Some(Value::new_int(h)))
                 } else {
-                    Ok(Some(Value::Int(0)))
+                    // Plain-class default: identity-based, matching the
+                    // `Foo@<hex>` toString. Truncated from u64 to i32.
+                    let id = recv.borrow().identity;
+                    Ok(Some(Value::Int(id as i32)))
                 }
             }
             "equals" if args.len() == 1 => {
