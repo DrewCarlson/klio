@@ -242,7 +242,7 @@ impl Resolver {
             // matches an implicitly imported package, so let it pass.
             path_str.clone()
         };
-        if !klio_stdlib::is_implicitly_imported_package(&candidate_pkg) {
+        if !klio_stdlib::is_known_package(&candidate_pkg) {
             self.diagnostics.emit(
                 Diagnostic::error(
                     format!("no package `{candidate_pkg}` is known to this build"),
@@ -250,8 +250,8 @@ impl Resolver {
                 )
                 .with_code("R0012")
                 .with_note(
-                    "klio implements the spec's implicitly imported packages \
-                    (kotlin, kotlin.collections, kotlin.text, ...); see docs/STDLIB.md",
+                    "klio implements the `kotlin.*` standard library packages \
+                    mined from upstream Kotlin; see docs/STDLIB.md",
                 ),
             );
         }

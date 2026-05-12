@@ -1,6 +1,7 @@
 ---
 source: crates/klio-resolver/tests/corpus.rs
-expression: "import kotlin.reflect.KClass\n\nfun main() {\n    println(\"hi\")\n}\n"
+assertion_line: 78
+expression: "import kotlin.bogus.Thing\n\nfun main() {\n    println(\"hi\")\n}\n"
 ---
 # symbols
   [0] Builtin println @builtin
@@ -14,10 +15,10 @@ expression: "import kotlin.reflect.KClass\n\nfun main() {\n    println(\"hi\")\n
   [8] Builtin buildSet @builtin
   [9] Builtin sequence @builtin
   [10] Builtin iterator @builtin
-  [11] TopLevelFunction main @34..38
+  [11] TopLevelFunction main @31..35
 
 # uses
-  @47..54 -> [0] println (Builtin)
+  @44..51 -> [0] println (Builtin)
 
 # diagnostics
-  [R0012] Error no package `kotlin.reflect` is known to this build @0..28
+  [R0012] Error no package `kotlin.bogus` is known to this build @0..25

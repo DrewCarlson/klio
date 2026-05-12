@@ -65,6 +65,23 @@ pub fn is_implicitly_imported_package(package_path: &str) -> bool {
     IMPLICITLY_IMPORTED_PACKAGES.iter().any(|p| *p == package_path)
 }
 
+/// Returns true when `package_path` names any package recognised by the
+/// stdlib registry. Wider than [`is_implicitly_imported_package`] — covers
+/// every package that has at least one symbol mined from upstream Kotlin
+/// (e.g. `kotlin.coroutines`, `kotlin.coroutines.intrinsics`, `kotlin.reflect`).
+/// Used by the resolver to decide whether an `import kotlin.<pkg>.*` is
+/// well-formed even though the package is not implicitly visible.
+#[must_use]
+pub fn is_known_package(package_path: &str) -> bool {
+    if is_implicitly_imported_package(package_path) {
+        return true;
+    }
+    let prefix = format!("{package_path}.");
+    generated::STDLIB_SYMBOLS
+        .iter()
+        .any(|e| e.package == package_path || e.fqn.starts_with(&prefix))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Function,
@@ -290,5 +307,33 @@ mod tests {
         assert!(is_implicitly_imported_package("kotlin.math"));
         assert!(!is_implicitly_imported_package("kotlin.reflect"));
         assert!(!is_implicitly_imported_package("kotlin.math.foo"));
+    }
+
+    #[test]
+    fn is_known_package_covers_coroutines() {
+        // Spec §18.3: kotlin.coroutines and kotlin.coroutines.intrinsics
+        // are not implicitly imported, but the symbols exist in the
+        // registry so an explicit `import kotlin.coroutines.*` must
+        // resolve.
+        assert!(is_known_package("kotlin.coroutines"));
+        assert!(is_known_package("kotlin.coroutines.intrinsics"));
+        assert!(!is_known_package("kotlin.bogus"));
+    }
+
+    #[test]
+    fn coroutine_core_types_present() {
+        for fqn in [
+            "kotlin.coroutines.Continuation",
+            "kotlin.coroutines.CoroutineContext",
+            "kotlin.coroutines.EmptyCoroutineContext",
+            "kotlin.coroutines.ContinuationInterceptor",
+            "kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn",
+            "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED",
+        ] {
+            assert!(
+                lookup(fqn).is_some(),
+                "stdlib registry missing {fqn}"
+            );
+        }
     }
 }

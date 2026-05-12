@@ -1,4 +1,4 @@
-import kotlin.reflect.KClass
+import kotlin.bogus.Thing
 
 fun main() {
     println("hi")
