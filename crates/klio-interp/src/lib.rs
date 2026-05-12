@@ -6192,7 +6192,7 @@ impl Interpreter {
             }
             // Built-in Array methods kept local — they bridge to a List
             // (for `toList`) or echo a property (for `isEmpty`).
-            if let Value::Array { items, .. } = &recv {
+            if let Value::Array { items, prim } = &recv {
                 match name.name.as_str() {
                     "toList" if args.is_empty() => {
                         let snapshot = items.borrow().clone();
@@ -6208,7 +6208,63 @@ impl Interpreter {
                     "isNotEmpty" if args.is_empty() => {
                         return Ok(Value::Bool(!items.borrow().is_empty()));
                     }
+                    "iterator" if args.is_empty() => {
+                        return Ok(Value::Iterator {
+                            items: Rc::clone(items),
+                            pos: Rc::new(RefCell::new(0)),
+                            prim: *prim,
+                        });
+                    }
                     _ => {}
+                }
+            }
+            // Iterator method dispatch — hasNext / next / next{TYPE}.
+            if let Value::Iterator { items, pos, prim } = &recv {
+                match name.name.as_str() {
+                    "hasNext" if args.is_empty() => {
+                        return Ok(Value::Bool(*pos.borrow() < items.borrow().len()));
+                    }
+                    "next" if args.is_empty() => {
+                        let mut p = pos.borrow_mut();
+                        let it = items.borrow();
+                        if *p >= it.len() {
+                            return Err(RuntimeError::Thrown(Value::Exception {
+                                fqn: Rc::new("kotlin.NoSuchElementException".into()),
+                                message: Some(Rc::new("Iterator exhausted".into())),
+                                cause: None,
+                            }));
+                        }
+                        let v = it[*p].clone();
+                        *p += 1;
+                        return Ok(v);
+                    }
+                    other if args.is_empty() && prim.is_some()
+                        && other == format!("next{}", prim.unwrap().simple_name()) =>
+                    {
+                        let mut p = pos.borrow_mut();
+                        let it = items.borrow();
+                        if *p >= it.len() {
+                            return Err(RuntimeError::Thrown(Value::Exception {
+                                fqn: Rc::new("kotlin.NoSuchElementException".into()),
+                                message: Some(Rc::new("Iterator exhausted".into())),
+                                cause: None,
+                            }));
+                        }
+                        let v = it[*p].clone();
+                        *p += 1;
+                        return Ok(v);
+                    }
+                    _ => {}
+                }
+            }
+            // Lists also expose `.iterator()`.
+            if let Value::List { items, .. } = &recv {
+                if name.name == "iterator" && args.is_empty() {
+                    return Ok(Value::Iterator {
+                        items: Rc::clone(items),
+                        pos: Rc::new(RefCell::new(0)),
+                        prim: None,
+                    });
                 }
             }
             // Instance method dispatch (user classes).

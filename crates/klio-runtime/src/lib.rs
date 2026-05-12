@@ -113,6 +113,15 @@ pub enum Value {
     /// (`generateSequence { … }`) only emit as many items as the terminal
     /// op consumes.
     Sequence(Rc<SequenceData>),
+    /// `kotlin.collections.Iterator<T>` and its primitive specializations
+    /// (`IntIterator`, `CharIterator`, …). Sequential cursor over a fixed
+    /// vector; `prim` tags the typed-iterator variant so `is`-checks and
+    /// `next{TYPE}` dispatch resolve correctly.
+    Iterator {
+        items: Rc<RefCell<Vec<Value>>>,
+        pos: Rc<RefCell<usize>>,
+        prim: Option<PrimitiveArrayKind>,
+    },
     /// A built-in property delegate produced by `lazy { … }` /
     /// `Delegates.observable(...)` / `Delegates.notNull()`. Carries the
     /// state the delegate needs across calls (cached value, change
@@ -239,6 +248,20 @@ impl PrimitiveArrayKind {
             Self::Byte => "kotlin.ByteArray",
             Self::Boolean => "kotlin.BooleanArray",
             Self::Char => "kotlin.CharArray",
+        }
+    }
+
+    #[must_use]
+    pub fn simple_name(self) -> &'static str {
+        match self {
+            Self::Int => "Int",
+            Self::Long => "Long",
+            Self::Double => "Double",
+            Self::Float => "Float",
+            Self::Short => "Short",
+            Self::Byte => "Byte",
+            Self::Boolean => "Boolean",
+            Self::Char => "Char",
         }
     }
 }
@@ -708,6 +731,12 @@ impl fmt::Debug for Value {
                 descending
             ),
             Self::Sequence(data) => write!(f, "Sequence(source={:?}, ops={})", data.source, data.ops.len()),
+            Self::Iterator { items, pos, prim } => write!(
+                f,
+                "Iterator(prim={prim:?}, pos={}/{})",
+                pos.borrow(),
+                items.borrow().len()
+            ),
             Self::Class(c) => write!(f, "Class({})", c.fqn),
             Self::BoundInnerClass { class, .. } => write!(f, "BoundInnerClass({})", class.fqn),
             Self::Instance(i) => write!(f, "Instance({})", i.borrow().class.fqn),
@@ -837,6 +866,10 @@ impl fmt::Display for Value {
             }
             Self::Comparator { .. } => write!(f, "Comparator"),
             Self::Sequence { .. } => write!(f, "kotlin.sequences.Sequence"),
+            Self::Iterator { prim, .. } => match prim {
+                Some(p) => write!(f, "{}Iterator", p.simple_name()),
+                None => write!(f, "kotlin.collections.Iterator"),
+            },
             Self::Class(c) => write!(f, "class {}", c.name),
             Self::BoundInnerClass { class, .. } => write!(f, "class {}", class.name),
             Self::Delegate(_) => write!(f, "<delegate>"),
@@ -1081,6 +1114,17 @@ impl Value {
             Self::Result { .. } => "kotlin.Result",
             Self::Comparator { .. } => "kotlin.Comparator",
             Self::Sequence { .. } => "kotlin.sequences.Sequence",
+            Self::Iterator { prim, .. } => match prim {
+                Some(PrimitiveArrayKind::Int) => "kotlin.collections.IntIterator",
+                Some(PrimitiveArrayKind::Long) => "kotlin.collections.LongIterator",
+                Some(PrimitiveArrayKind::Double) => "kotlin.collections.DoubleIterator",
+                Some(PrimitiveArrayKind::Float) => "kotlin.collections.FloatIterator",
+                Some(PrimitiveArrayKind::Short) => "kotlin.collections.ShortIterator",
+                Some(PrimitiveArrayKind::Byte) => "kotlin.collections.ByteIterator",
+                Some(PrimitiveArrayKind::Boolean) => "kotlin.collections.BooleanIterator",
+                Some(PrimitiveArrayKind::Char) => "kotlin.collections.CharIterator",
+                None => "kotlin.collections.Iterator",
+            },
             // User classes/instances live outside the stdlib dispatch path
             // and never key into the intrinsic table.
             Self::Class(_) | Self::BoundInnerClass { .. } => "kotlin.reflect.KClass",
@@ -1163,6 +1207,15 @@ impl Value {
             Value::MapEntry { .. } => matches!(name, "Entry" | "MapEntry" | "Map.Entry" | "Any"),
             Value::Result { .. } => matches!(name, "Result" | "Any"),
             Value::Sequence(_) => matches!(name, "Sequence" | "Any"),
+            Value::Iterator { prim, .. } => {
+                if matches!(name, "Iterator" | "Any") {
+                    return true;
+                }
+                match prim {
+                    Some(p) => name == &format!("{}Iterator", p.simple_name())[..],
+                    None => false,
+                }
+            }
             Value::Comparator { .. } => matches!(name, "Comparator" | "Any"),
             Value::Function { .. }
             | Value::Lambda { .. }
