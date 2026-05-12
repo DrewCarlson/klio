@@ -3457,6 +3457,23 @@ impl<'r> Checker<'r> {
         if !f.is_operator {
             return;
         }
+        if f.is_suspend
+            && matches!(
+                f.name.name.as_str(),
+                "getValue" | "setValue" | "provideDelegate"
+            )
+        {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!(
+                        "delegation operator `{}` cannot be `suspend`",
+                        f.name.name
+                    ),
+                    f.name.span,
+                )
+                .with_code(codes::TYPE_SUSPEND_NOT_ALLOWED),
+            );
+        }
         let is_extension = f.receiver_type.is_some();
         let extra_receiver: usize = if is_extension { 0 } else { 0 };
         let _ = extra_receiver;

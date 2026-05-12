@@ -1027,3 +1027,12 @@ fn neg_super_qualifier_not_supertype() {
             .any(|c| c == "T0073")
     );
 }
+
+#[test]
+fn neg_suspend_delegate_get_value() {
+    assert!(
+        type_codes_for("neg_suspend_delegate_get_value.kt")
+            .iter()
+            .any(|c| c == "T0114")
+    );
+}
