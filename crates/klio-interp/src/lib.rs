@@ -1146,6 +1146,30 @@ impl Interpreter {
                         inst.borrow_mut().define(&name.name, final_value);
                         return Ok(Value::Unit);
                     }
+                    // `ClassName.prop = v` — write through to the
+                    // companion-object instance when the class has one.
+                    if let Value::Class(class) = &recv {
+                        if let Some(comp) = &class.companion {
+                            if comp.borrow().get(&name.name).is_some() {
+                                let comp_inst = Rc::clone(comp);
+                                let final_value = match op {
+                                    AssignOp::Assign => new_value,
+                                    other => {
+                                        let current = comp_inst
+                                            .borrow()
+                                            .get(&name.name)
+                                            .ok_or_else(|| {
+                                                RuntimeError::Unbound(name.name.clone())
+                                            })?;
+                                        let binop = compound_to_binop(*other);
+                                        eval_binop(binop, current, new_value)?
+                                    }
+                                };
+                                comp_inst.borrow_mut().define(&name.name, final_value);
+                                return Ok(Value::Unit);
+                            }
+                        }
+                    }
                     // Non-instance receiver — only valid target is an
                     // extension property's setter (e.g. `var Int.foo`).
                     if self.find_extension_property(&recv, &name.name).is_some() {
