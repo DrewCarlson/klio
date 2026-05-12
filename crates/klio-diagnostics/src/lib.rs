@@ -212,6 +212,10 @@ impl DiagnosticSink {
         &self.diagnostics
     }
 
+    pub fn retain<F: FnMut(&Diagnostic) -> bool>(&mut self, predicate: F) {
+        self.diagnostics.retain(predicate);
+    }
+
     /// Convenience: render with the default plain-text renderer.
     pub fn render(
         &self,

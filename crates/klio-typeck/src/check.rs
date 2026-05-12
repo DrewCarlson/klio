@@ -37,6 +37,7 @@ impl TypeCheck {
 pub fn typecheck(file: &KotlinFile, resolution: &Resolution) -> TypeCheck {
     let mut tc = Checker::new(resolution);
     tc.run(file);
+    apply_suppress_annotations(file, &mut tc.diagnostics);
     TypeCheck {
         types: tc.types,
         diagnostics: tc.diagnostics,
@@ -8571,6 +8572,110 @@ fn expr_uses_field(e: &Expr) -> bool {
     }
 }
 
+/// Spec §17.5.6: a `@Suppress("code", ...)` annotation on a declaration
+/// silences each named diagnostic emitted anywhere inside that
+/// declaration's span. Scope is lexical: an inner `@Suppress` adds to
+/// the enclosing one.
+fn apply_suppress_annotations(file: &KotlinFile, diagnostics: &mut DiagnosticSink) {
+    let mut regions: Vec<SuppressRegion> = Vec::new();
+    collect_suppress_regions(file, &mut regions);
+    if regions.is_empty() {
+        return;
+    }
+    diagnostics.retain(|d| {
+        let code = match d.code() {
+            Some(c) => c,
+            None => return true,
+        };
+        let span = d.primary.span;
+        for r in &regions {
+            if r.span.file != span.file {
+                continue;
+            }
+            if r.span.start <= span.start && span.end <= r.span.end {
+                if r.codes.iter().any(|c| c == code) {
+                    return false;
+                }
+            }
+        }
+        true
+    });
+}
+
+struct SuppressRegion {
+    span: Span,
+    codes: Vec<String>,
+}
+
+fn collect_suppress_regions(file: &KotlinFile, out: &mut Vec<SuppressRegion>) {
+    // `@file:Suppress(...)` on the KotlinFile covers the whole file.
+    // The parser currently lifts `@file:` annotations onto the
+    // top-level declaration that follows, so file-level suppression is
+    // handled via the decls below.
+    for d in &file.decls {
+        collect_suppress_decl(d, out);
+    }
+}
+
+fn collect_suppress_decl(d: &Decl, out: &mut Vec<SuppressRegion>) {
+    match d {
+        Decl::Function(f) => {
+            push_suppress(&f.annotations, f.span, out);
+            for p in &f.params {
+                push_suppress(&p.annotations, p.span, out);
+            }
+        }
+        Decl::Property(p) => {
+            push_suppress(&p.annotations, p.span, out);
+        }
+        Decl::Class(c) => {
+            push_suppress(&c.annotations, c.span, out);
+            for cp in &c.primary_params {
+                push_suppress(&cp.annotations, cp.span, out);
+            }
+            for sc in &c.secondary_ctors {
+                push_suppress(&sc.annotations, sc.span, out);
+            }
+            for ee in &c.enum_entries {
+                push_suppress(&ee.annotations, ee.span, out);
+            }
+            for m in &c.members {
+                collect_suppress_decl(m, out);
+            }
+        }
+        Decl::Object(o) => {
+            for m in &o.members {
+                collect_suppress_decl(m, out);
+            }
+        }
+        Decl::TypeAlias(a) => {
+            push_suppress(&a.annotations, a.span, out);
+        }
+    }
+}
+
+fn push_suppress(
+    anns: &[klio_ast::Annotation],
+    span: Span,
+    out: &mut Vec<SuppressRegion>,
+) {
+    for a in anns {
+        let leaf = a.path.last().map(|s| s.name.as_str()).unwrap_or("");
+        if leaf != "Suppress" {
+            continue;
+        }
+        let mut codes: Vec<String> = Vec::new();
+        for arg in &a.args {
+            if let Some(s) = extract_string_literal(arg) {
+                codes.push(s);
+            }
+        }
+        if !codes.is_empty() {
+            out.push(SuppressRegion { span, codes });
+        }
+    }
+}
+
 /// Spec §17.5.5 deprecation levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeprecationLevel {
@@ -10938,6 +11043,27 @@ mod tests {
             "#,
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn suppress_silences_deprecation_warning() {
+        // Without @Suppress the call site fires W0006; with it the
+        // diagnostic is filtered out of the sink.
+        let src_unsuppressed = r#"
+            @Deprecated("gone")
+            fun foo(): Int = 1
+            fun caller(): Int = foo()
+        "#;
+        let tc = check_src(src_unsuppressed);
+        assert!(codes(&tc).contains(&codes::WARN_DEPRECATED));
+        let src_suppressed = r#"
+            @Deprecated("gone")
+            fun foo(): Int = 1
+            @Suppress("W0006")
+            fun caller(): Int = foo()
+        "#;
+        let tc = check_src(src_suppressed);
+        assert!(!codes(&tc).contains(&codes::WARN_DEPRECATED));
     }
 
     #[test]
