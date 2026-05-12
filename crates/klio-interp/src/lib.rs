@@ -279,6 +279,7 @@ impl Interpreter {
             captured_env: Rc::clone(&self.globals),
             supertype_delegates: RefCell::new(Vec::new()),
             delegate_forwarders: RefCell::new(Vec::new()),
+            object_singleton: RefCell::new(None),
         })))
     }
 
@@ -4786,11 +4787,16 @@ impl Interpreter {
         // Nested (non-companion) classes — collected here, parent-link
         // resolution happens after the outer class is itself in scope.
         let mut nested: Vec<(String, Rc<klio_ast::Class>)> = Vec::new();
+        let mut nested_objects: Vec<(String, klio_ast::ObjectDecl)> = Vec::new();
         for m in &c.members {
-            if let Decl::Class(inner) = m {
-                if !inner.is_companion {
+            match m {
+                Decl::Class(inner) if !inner.is_companion => {
                     nested.push((inner.name.name.clone(), Rc::new(inner.clone())));
                 }
+                Decl::Object(o) => {
+                    nested_objects.push((o.name.name.clone(), o.clone()));
+                }
+                _ => {}
             }
         }
         let primary_params = c
@@ -4868,6 +4874,7 @@ impl Interpreter {
             captured_env: Rc::clone(env),
             supertype_delegates: RefCell::new(supertype_delegates),
             delegate_forwarders: RefCell::new(Vec::new()),
+            object_singleton: RefCell::new(None),
         });
         // Set companion's back-link to the enclosing class so its method
         // bodies can see enum entries / `entries` when the enclosing class
@@ -4894,10 +4901,24 @@ impl Interpreter {
             }
             nested_built.push((n.clone(), nested_class));
         }
-        // Resolve parent links for nested classes — supertype names live in
-        // the outer's env (the same `env` used to build them).
+        for (n, o) in &nested_objects {
+            let nested_class = self.build_object_class(o, env, out)?;
+            *nested_class.enclosing_class.borrow_mut() = Some(Rc::clone(&outer_class));
+            nested_built.push((n.clone(), nested_class));
+        }
+        // Bind the outer class temporarily so nested supertypes (e.g.
+        // `sealed class S { class Inner : S() }`) can resolve through the
+        // enclosing-class name.
+        let had_self = env.borrow().lookup(&c.name.name).is_some();
+        if !had_self {
+            env.borrow_mut()
+                .define(c.name.name.clone(), Value::Class(Rc::clone(&outer_class)));
+        }
         for (_, nc) in &nested_built {
             self.resolve_parent_link(nc);
+        }
+        if !had_self {
+            env.borrow_mut().remove_local(&c.name.name);
         }
         *outer_class.nested_classes.borrow_mut() = nested_built;
         Ok(outer_class)
@@ -5071,6 +5092,7 @@ impl Interpreter {
                     captured_env: Rc::clone(&class.captured_env),
                     supertype_delegates: RefCell::new(class.supertype_delegates.borrow().clone()),
                     delegate_forwarders: RefCell::new(class.delegate_forwarders.borrow().clone()),
+                    object_singleton: RefCell::new(None),
                 })
             };
             // Construct the instance against the entry class.
@@ -5154,6 +5176,7 @@ impl Interpreter {
             captured_env: Rc::clone(env),
             supertype_delegates: RefCell::new(Vec::new()),
             delegate_forwarders: RefCell::new(Vec::new()),
+            object_singleton: RefCell::new(None),
         }))
     }
 
@@ -6170,6 +6193,7 @@ impl Interpreter {
             captured_env: Rc::clone(&iface.captured_env),
             supertype_delegates: RefCell::new(Vec::new()),
             delegate_forwarders: RefCell::new(Vec::new()),
+            object_singleton: RefCell::new(None),
         });
         let identity = self.next_instance_id();
         let inst = Rc::new(RefCell::new(InstanceData {
@@ -6661,9 +6685,18 @@ impl Interpreter {
             }
             // `Foo.Bar` — nested class (only the non-inner kind is reachable
             // qualified-class-style; an `inner class` must be navigated
-            // through an outer instance).
+            // through an outer instance). For a nested `object`, return the
+            // (lazily constructed) singleton instance instead of the class.
             if let Some(nc) = lookup_nested_class(class, name) {
                 if !nc.is_inner {
+                    if nc.is_object {
+                        if let Some(inst) = nc.object_singleton.borrow().clone() {
+                            return Ok(Value::Instance(inst));
+                        }
+                        let inst = self.construct_object_singleton(&nc, out)?;
+                        *nc.object_singleton.borrow_mut() = Some(Rc::clone(&inst));
+                        return Ok(Value::Instance(inst));
+                    }
                     return Ok(Value::Class(nc));
                 }
             }

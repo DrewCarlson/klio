@@ -368,6 +368,12 @@ pub struct ClassDef {
     /// are resolved (at parent-link time). Walked by `find_method_walk`
     /// after the class's own methods miss but before the parent chain.
     pub delegate_forwarders: RefCell<Vec<MethodDef>>,
+    /// Lazily-constructed singleton for `is_object` classes that are
+    /// nested inside another classifier. Top-level objects materialize
+    /// their singleton at file load and bind it in globals; nested
+    /// objects (including ones inside sealed classes) need lazy
+    /// construction the first time `Outer.NestedObj` is read.
+    pub object_singleton: RefCell<Option<Rc<RefCell<InstanceData>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1607,6 +1613,11 @@ impl Env {
         self.vars.insert(name.into(), value);
     }
 
+    /// Remove a binding from this scope (does not touch parent scopes).
+    pub fn remove_local(&mut self, name: &str) {
+        self.vars.remove(name);
+    }
+
     #[must_use]
     pub fn lookup(&self, name: &str) -> Option<Value> {
         if let Some(v) = self.vars.get(name) {
@@ -1739,6 +1750,7 @@ mod tests {
             captured_env: Rc::new(RefCell::new(Env::new())),
             supertype_delegates: RefCell::new(Vec::new()),
             delegate_forwarders: RefCell::new(Vec::new()),
+            object_singleton: RefCell::new(None),
         })
     }
 
