@@ -43,6 +43,28 @@ pub mod implementations;
 pub use implementations::compare_values;
 pub use text::compare_utf16;
 
+/// Packages whose top-level entities are implicitly visible in every Kotlin
+/// source file, per Kotlin language spec §10.1. The exact set the spec lists
+/// for `Kotlin/Core`.
+pub const IMPLICITLY_IMPORTED_PACKAGES: &[&str] = &[
+    "kotlin",
+    "kotlin.annotation",
+    "kotlin.collections",
+    "kotlin.comparisons",
+    "kotlin.io",
+    "kotlin.ranges",
+    "kotlin.sequences",
+    "kotlin.text",
+    "kotlin.math",
+];
+
+/// Returns true when `package_path` is one of the spec's implicitly imported
+/// packages (an exact match against [`IMPLICITLY_IMPORTED_PACKAGES`]).
+#[must_use]
+pub fn is_implicitly_imported_package(package_path: &str) -> bool {
+    IMPLICITLY_IMPORTED_PACKAGES.iter().any(|p| *p == package_path)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Function,
@@ -245,5 +267,28 @@ mod tests {
     #[test]
     fn lookup_returns_none_for_unknown() {
         assert!(lookup("definitely.not.a.real.kotlin.symbol").is_none());
+    }
+
+    #[test]
+    fn implicitly_imported_packages_match_spec_list() {
+        // Spec §10.1 fixes this list. Lock it down so accidental
+        // additions or reorderings fail loudly.
+        assert_eq!(
+            IMPLICITLY_IMPORTED_PACKAGES,
+            &[
+                "kotlin",
+                "kotlin.annotation",
+                "kotlin.collections",
+                "kotlin.comparisons",
+                "kotlin.io",
+                "kotlin.ranges",
+                "kotlin.sequences",
+                "kotlin.text",
+                "kotlin.math",
+            ]
+        );
+        assert!(is_implicitly_imported_package("kotlin.math"));
+        assert!(!is_implicitly_imported_package("kotlin.reflect"));
+        assert!(!is_implicitly_imported_package("kotlin.math.foo"));
     }
 }
