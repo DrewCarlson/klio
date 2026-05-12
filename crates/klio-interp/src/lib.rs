@@ -8208,6 +8208,10 @@ fn value_in(needle: &Value, haystack: &Value) -> Result<bool, RuntimeError> {
                 Ok(*n <= *start && *n >= *end && (*start - *n) % (-*step) == 0)
             }
         }
+        // Ranges are typed (`IntRange`, `LongRange`, …). A non-matching
+        // needle simply doesn't belong — return `false` rather than erroring
+        // so `when (x: Any) { in 1..10 -> … }` works.
+        (_, Value::Range { .. }) => Ok(false),
         (v, Value::List { items, .. }) | (v, Value::Set { items, .. }) => {
             Ok(items.borrow().iter().any(|x| Value::structural_eq(x, v)))
         }
