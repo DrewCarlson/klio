@@ -5413,6 +5413,44 @@ impl<'r> Checker<'r> {
                 let mut acc = body_ty;
                 let mut common: HashSet<String> = after_body.clone();
                 for c in catches {
+                    // Spec §15.1: exception types in `catch` must be
+                    // runtime-available. A non-reified type parameter is
+                    // erased at runtime, and a generic exception type with
+                    // non-star arguments has erased arguments — neither
+                    // can be matched by the JVM/native dispatch.
+                    {
+                        let tname = &c.ty.name.name;
+                        let is_type_param = self
+                            .type_params_in_scope
+                            .iter()
+                            .any(|s| s.contains(tname));
+                        let is_reified = self
+                            .reified_type_params
+                            .iter()
+                            .any(|s| s.contains(tname));
+                        if is_type_param && !is_reified {
+                            self.diagnostics.emit(
+                                Diagnostic::error(
+                                    format!(
+                                        "Cannot catch by an erased type parameter `{tname}` — exception types must be runtime-available. Mark it as `reified` on an `inline fun` or use a concrete exception type."
+                                    ),
+                                    c.ty.span,
+                                )
+                                .with_code(codes::TYPE_RUNTIME_UNAVAILABLE_CATCH_TYPE),
+                            );
+                        }
+                        if c.ty.type_args.iter().any(|a| !a.is_star) {
+                            self.diagnostics.emit(
+                                Diagnostic::error(
+                                    format!(
+                                        "Cannot catch by a generic exception type `{tname}<…>` with concrete type arguments — the arguments are erased at runtime. Use the raw form or star projections."
+                                    ),
+                                    c.ty.span,
+                                )
+                                .with_code(codes::TYPE_RUNTIME_UNAVAILABLE_CATCH_TYPE),
+                            );
+                        }
+                    }
                     self.assigned = before.clone();
                     self.push_frame();
                     self.current_frame().bindings.insert(
