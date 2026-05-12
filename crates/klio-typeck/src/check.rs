@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use klio_ast::{
     Accessor, AssignOp, BinOp, Block, Class, CtorDelegation, Decl, EnumEntry, Expr,
     Function, FunctionBody, KotlinFile, ObjectDecl, Param, PostfixOp, Property,
-    SecondaryCtor, Stmt, StringPart, TypeRef, UnOp, Visibility, WhenBranch, WhenPatternKind,
+    SecondaryCtor, Stmt, StringPart, TypeParam, TypeRef, UnOp, Visibility, WhenBranch,
+    WhenPatternKind, WhereBound,
 };
 use klio_diagnostics::{Diagnostic, DiagnosticSink};
 use klio_resolver::Resolution;
@@ -337,6 +338,21 @@ pub mod codes {
     /// Code emitted at an elvis (`?:`) whose left side is proven
     /// non-null on this path. Spec §12.
     pub const WARN_USELESS_ELVIS: &str = "W0005";
+    /// Write through a star-projected generic receiver where the RHS
+    /// static type is not `Nothing`. Spec §13.2.1 bivariant rule.
+    pub const TYPE_STAR_PROJECTION_WRITE: &str = "T0095";
+    /// `where` clause forms a cycle through type-parameter bounds
+    /// (e.g. `where T : U, U : T`). Spec §13.
+    pub const TYPE_CIRCULAR_TYPE_BOUND: &str = "T0096";
+    /// Constraint solver could not find a substitution for one or more
+    /// inference variables at a call site. Spec §13.2.
+    pub const TYPE_INFERENCE_FAILED: &str = "T0097";
+    /// Constraint solver found multiple non-comparable substitutions
+    /// at a call site with no optimal pick. Spec §13.2.
+    pub const TYPE_INFERENCE_AMBIGUOUS: &str = "T0098";
+    /// Constraint solver detected a circular dependency between
+    /// inference variables that the staged resolver cannot break.
+    pub const TYPE_INFERENCE_CYCLE: &str = "T0099";
 }
 
 /// A scope frame mapping local names to their declared/inferred types
@@ -3154,6 +3170,105 @@ impl<'r> Checker<'r> {
         }
     }
 
+    /// Head name of a type reference — i.e. the top-level classifier name,
+    /// ignoring generic args. F-bounded forms like `T : Comparable<T>` are
+    /// not cycles; only an edge through the *head* of a bound counts.
+    fn head_name(t: &TypeRef) -> &str {
+        &t.name.name
+    }
+
+    /// Detects cycles in the type-parameter bound graph for a declaration.
+    /// An edge `T -> U` exists when any bound on `T` (either the inline
+    /// `upper_bound` or a `where T : ...` entry) mentions `U`. A bare
+    /// self-reference (`T : T`) and a longer cycle (`T : U, U : T`) both
+    /// trip the diagnostic. Emits at most one diagnostic per declaration
+    /// at the first offending type-param site.
+    fn check_circular_bounds(
+        &mut self,
+        type_params: &[TypeParam],
+        where_bounds: &[WhereBound],
+    ) {
+        if type_params.is_empty() {
+            return;
+        }
+        let tp_set: std::collections::HashSet<&str> =
+            type_params.iter().map(|tp| tp.name.name.as_str()).collect();
+        let mut graph: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut spans: std::collections::HashMap<String, Span> = std::collections::HashMap::new();
+        for tp in type_params {
+            spans.insert(tp.name.name.clone(), tp.name.span);
+            graph.entry(tp.name.name.clone()).or_default();
+            if let Some(b) = &tp.upper_bound {
+                let head = Self::head_name(b);
+                if tp_set.contains(head) {
+                    graph
+                        .entry(tp.name.name.clone())
+                        .or_default()
+                        .push(head.to_string());
+                }
+            }
+        }
+        for wb in where_bounds {
+            if !tp_set.contains(wb.name.name.as_str()) {
+                continue;
+            }
+            let head = Self::head_name(&wb.bound);
+            if tp_set.contains(head) {
+                graph
+                    .entry(wb.name.name.clone())
+                    .or_default()
+                    .push(head.to_string());
+            }
+        }
+        // Tarjan-lite: DFS, mark gray/black, any back-edge to gray is a cycle.
+        let mut color: std::collections::HashMap<String, u8> =
+            std::collections::HashMap::new();
+        for tp in type_params {
+            if color.get(&tp.name.name).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            if let Some(start) =
+                Self::find_cycle_dfs(&tp.name.name, &graph, &mut color)
+            {
+                let sp = spans.get(&start).copied().unwrap_or(tp.name.span);
+                self.diagnostics.emit(
+                    Diagnostic::error(
+                        format!(
+                            "type parameter `{start}` has a circular bound",
+                        ),
+                        sp,
+                    )
+                    .with_code(codes::TYPE_CIRCULAR_TYPE_BOUND),
+                );
+                return;
+            }
+        }
+    }
+
+    fn find_cycle_dfs(
+        node: &str,
+        graph: &std::collections::HashMap<String, Vec<String>>,
+        color: &mut std::collections::HashMap<String, u8>,
+    ) -> Option<String> {
+        color.insert(node.to_string(), 1);
+        if let Some(succs) = graph.get(node) {
+            for s in succs {
+                match color.get(s).copied().unwrap_or(0) {
+                    1 => return Some(s.clone()),
+                    0 => {
+                        if let Some(c) = Self::find_cycle_dfs(s, graph, color) {
+                            return Some(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        color.insert(node.to_string(), 2);
+        None
+    }
+
     fn emit_op_sig(&mut self, f: &Function, msg: &str) {
         self.diagnostics.emit(
             Diagnostic::warning(msg.to_string(), f.name.span)
@@ -3165,6 +3280,7 @@ impl<'r> Checker<'r> {
         self.check_inline_param_escape(f);
         self.check_anonymous_object_escape(f);
         self.check_operator_signature(f);
+        self.check_circular_bounds(&f.type_params, &f.where_bounds);
         let saved_assigned = self.assigned.clone();
         self.push_frame();
         for p in &f.params {
@@ -3225,6 +3341,7 @@ impl<'r> Checker<'r> {
 
     fn check_class(&mut self, c: &Class) {
         self.class_stack.push(c.name.name.clone());
+        self.check_circular_bounds(&c.type_params, &c.where_bounds);
         // Spec §5.1: data, enum, and annotation classes are always closed
         // and cannot be declared `open`, `abstract`, or `sealed`.
         // `value` / `annotation` shape checks fire their own diagnostics.

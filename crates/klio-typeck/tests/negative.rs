@@ -848,3 +848,21 @@ fn neg_method_reads_nonproperty_ctor_param() {
             .any(|c| c == "T0075")
     );
 }
+
+#[test]
+fn neg_circular_type_bound() {
+    assert!(
+        type_codes_for("neg_circular_type_bound.kt")
+            .iter()
+            .any(|c| c == "T0096")
+    );
+}
+
+#[test]
+fn neg_circular_type_bound_self() {
+    assert!(
+        type_codes_for("neg_circular_type_bound_self.kt")
+            .iter()
+            .any(|c| c == "T0096")
+    );
+}

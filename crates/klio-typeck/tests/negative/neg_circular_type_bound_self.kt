@@ -1,0 +1,1 @@
+class Bad<T : T> {}
