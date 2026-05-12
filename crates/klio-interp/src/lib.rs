@@ -1328,7 +1328,7 @@ impl Interpreter {
                 let v = self.eval_expr(expr, env, out)?;
                 eval_unop(*op, v)
             }
-            Expr::Postfix { op, expr, .. } => self.eval_postfix(*op, expr, env),
+            Expr::Postfix { op, expr, .. } => self.eval_postfix(*op, expr, env, out),
             Expr::If { cond, then_branch, else_branch, .. } => {
                 let c = self.eval_expr(cond, env, out)?;
                 let Value::Bool(b) = c else {
@@ -6993,6 +6993,7 @@ impl Interpreter {
         op: PostfixOp,
         target: &Expr,
         env: &Rc<RefCell<Env>>,
+        out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
         match op {
             PostfixOp::Inc | PostfixOp::Dec => {
@@ -7009,7 +7010,18 @@ impl Interpreter {
                 self.write_ident_live(&name, Value::Int(next), env)?;
                 Ok(Value::Int(n))
             }
-            PostfixOp::NotNull => Err(RuntimeError::Unimplemented("`!!` operator".into())),
+            PostfixOp::NotNull => {
+                let v = self.eval_expr(target, env, out)?;
+                if matches!(v, Value::Null) {
+                    Err(RuntimeError::Thrown(Value::Exception {
+                        fqn: Rc::new("kotlin.NullPointerException".into()),
+                        message: None,
+                        cause: None,
+                    }))
+                } else {
+                    Ok(v)
+                }
+            }
         }
     }
 
