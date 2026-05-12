@@ -1472,6 +1472,29 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            // Inside an enum class's own method bodies, bare
+                            // `RED` / `GREEN` resolve to the entry, and bare
+                            // `entries` yields the entry list.
+                            if class.is_enum {
+                                if name == "entries" {
+                                    let items: Vec<Value> = class
+                                        .enum_entries
+                                        .borrow()
+                                        .iter()
+                                        .map(|(_, v)| v.clone())
+                                        .collect();
+                                    return Some(Value::List {
+                                        items: Rc::new(RefCell::new(items)),
+                                        mutable: false,
+                                        enum_class: Some(Rc::new(class.name.clone())),
+                                    });
+                                }
+                                for (n, v) in class.enum_entries.borrow().iter() {
+                                    if n == name {
+                                        return Some(v.clone());
+                                    }
+                                }
+                            }
                             let mut cur_outer = inst.borrow().outer.clone();
                             while let Some(Value::Instance(oi)) = cur_outer {
                                 if let Some(v) = oi.borrow().get(name) {
