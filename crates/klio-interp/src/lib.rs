@@ -5222,6 +5222,29 @@ impl Interpreter {
             }
             let parent_arg_names: Vec<Option<String>> = vec![None; parent_args.len()];
             self.run_ctor_chain(&parent, inst, &parent_args, &parent_arg_names, out)?;
+        } else if !class.parent_ctor_args.is_empty() {
+            // Parent is a built-in supertype (no ClassDef captured). When it
+            // is a Throwable subtype, surface `message` and `cause` from the
+            // parent-ctor arguments so user subclasses observe spec §3.12
+            // accessors (`Throwable(message, cause)`).
+            let parent_name = class.supertype_names.first().map(|s| s.as_str()).unwrap_or("");
+            if is_builtin_throwable(parent_name) {
+                let mut parent_args: Vec<Value> =
+                    Vec::with_capacity(class.parent_ctor_args.len());
+                for e in &class.parent_ctor_args {
+                    parent_args.push(self.eval_expr(e, &ctor_env, out)?);
+                }
+                if let Some(msg) = parent_args.first() {
+                    if !matches!(msg, Value::Null) {
+                        inst.borrow_mut().define("message", msg.clone());
+                    } else {
+                        inst.borrow_mut().define("message", Value::Null);
+                    }
+                }
+                if let Some(cause) = parent_args.get(1) {
+                    inst.borrow_mut().define("cause", cause.clone());
+                }
+            }
         }
         // Inheritance delegation: evaluate `: I by expr` in the primary-ctor
         // frame after super-init and before body initializers so the delegate
@@ -6506,6 +6529,12 @@ impl Interpreter {
             }
             if let Some(v) = self.try_extension_property_get(&receiver, name, out)? {
                 return Ok(v);
+            }
+            // Built-in Throwable surface: `message` / `cause` default to
+            // `null` when an instance of a Throwable subclass has not been
+            // explicitly populated (e.g. `class MyErr : Throwable()`).
+            if matches!(name, "message" | "cause") && instance_is_throwable(inst) {
+                return Ok(Value::Null);
             }
             // Companion forwarding: `Instance` of a companion exposes the
             // companion's properties directly. (For class.companion, see
@@ -8591,6 +8620,45 @@ fn exception_matches(thrown: &Value, type_name: &str) -> bool {
                 || fqn.rsplit('.').next().map(|t| t == target).unwrap_or(false)
         }
     }
+}
+
+/// Returns true when `name` (simple or `kotlin.`-qualified) names a
+/// built-in Throwable type or any of its subtypes that klio surfaces
+/// without a user-side `ClassDef`. Used at super-init time to lift
+/// `message` / `cause` ctor arguments onto a user subclass instance.
+/// True when the instance's class chain reaches a built-in Throwable
+/// type without going through a user-defined `ClassDef` for it. Used to
+/// answer `Throwable.message` / `Throwable.cause` reads against user
+/// subclasses that don't declare those properties themselves.
+fn instance_is_throwable(inst: &Rc<RefCell<InstanceData>>) -> bool {
+    let b = inst.borrow();
+    let mut frontier: Vec<String> = b.class.supertype_names.clone();
+    let mut seen: Vec<String> = vec![b.class.name.clone()];
+    while let Some(p) = frontier.pop() {
+        if seen.iter().any(|s| s == &p) {
+            continue;
+        }
+        seen.push(p.clone());
+        if is_builtin_throwable(&p) {
+            return true;
+        }
+        if let Some(Value::Class(c)) = b.class.captured_env.borrow().lookup(&p) {
+            for sp in &c.supertype_names {
+                if !seen.iter().any(|s| s == sp) {
+                    frontier.push(sp.clone());
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_builtin_throwable(name: &str) -> bool {
+    let tail = strip_kotlin_prefix(name);
+    if tail == "Throwable" || tail == "Exception" || tail == "Error" {
+        return true;
+    }
+    builtin_exception_parent(tail).is_some()
 }
 
 fn strip_kotlin_prefix(name: &str) -> &str {
