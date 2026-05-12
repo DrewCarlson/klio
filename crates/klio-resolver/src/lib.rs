@@ -548,11 +548,30 @@ impl Resolver {
                 for d in supertype_delegates.iter().flatten() {
                     self.resolve_expr(scope, d);
                 }
-                // Member bodies resolve against the same scope — anonymous
-                // objects capture their enclosing scope and the interpreter
-                // handles `this` / property dispatch at evaluation time.
+                // Object literal body is a declaration scope per spec §6:
+                // members can refer to each other regardless of source order.
+                // Pre-declare every member name into a fresh scope, then walk
+                // bodies against that scope.
+                let body_scope = self.push_scope(Some(scope), ScopeKind::Block);
                 for m in members {
-                    self.resolve_member_decl(scope, m);
+                    let (name, kind, span) = match m {
+                        Decl::Function(f) => (
+                            f.name.name.clone(),
+                            SymbolKind::LocalFunction,
+                            f.name.span,
+                        ),
+                        Decl::Property(p) => (
+                            p.name.name.clone(),
+                            SymbolKind::LocalProperty,
+                            p.name.span,
+                        ),
+                        Decl::Class(_) | Decl::Object(_) | Decl::TypeAlias(_) => continue,
+                    };
+                    let sym = self.add_symbol(name.clone(), kind, Some(span));
+                    self.scopes[body_scope.0 as usize].bindings.insert(name, sym);
+                }
+                for m in members {
+                    self.resolve_member_decl(body_scope, m);
                 }
             }
         }
@@ -853,6 +872,26 @@ mod tests {
             .filter(|d| d.code() == Some("UNNECESSARY_SAFE_CALL"))
             .collect();
         assert!(warns.is_empty(), "expected no R0005, got {:?}", warns);
+    }
+
+    #[test]
+    fn object_literal_member_forward_reference_resolves() {
+        let ast = parse(r#"
+            interface Greeter { fun hello(): String }
+            fun main() {
+                val g = object : Greeter {
+                    override fun hello() = name
+                    val name = "world"
+                }
+                println(g.hello())
+            }
+        "#);
+        let r = resolve(&ast);
+        assert!(
+            !r.diagnostics.has_errors(),
+            "unexpected diags: {:?}",
+            r.diagnostics.diagnostics()
+        );
     }
 
     #[test]
