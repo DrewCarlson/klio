@@ -13,6 +13,11 @@ klio-ast         = { workspace = true }
 
 [dev-dependencies]
 insta           = { workspace = true }
+criterion       = { workspace = true }
+
+[[bench]]
+name = "parse"
+harness = false
 
 [lints]
 workspace = true

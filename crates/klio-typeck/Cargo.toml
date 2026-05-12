@@ -17,6 +17,11 @@ klio-lexer       = { workspace = true }
 klio-parser      = { workspace = true }
 klio-diagnostics = { workspace = true }
 klio-resolver    = { workspace = true }
+criterion        = { workspace = true }
+
+[[bench]]
+name = "typeck"
+harness = false
 
 [lints]
 workspace = true

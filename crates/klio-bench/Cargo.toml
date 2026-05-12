@@ -1,0 +1,50 @@
+[package]
+name = "klio-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Enable dhat heap profiling on the driver binary.
+dhat = ["dep:dhat"]
+# Run the reference Kotlin compilers (kotlinc-native, kotlinc-jvm). Off by
+# default so a vanilla `cargo bench` doesn't pull a 200 MB JDK toolchain.
+ref = []
+
+[dependencies]
+klio-span     = { workspace = true }
+klio-lexer    = { workspace = true }
+klio-parser   = { workspace = true }
+klio-ast      = { workspace = true }
+klio-resolver = { workspace = true }
+klio-typeck   = { workspace = true }
+klio-interp   = { workspace = true }
+klio-runtime  = { workspace = true }
+klio-parity   = { path = "../klio-parity" }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+dhat          = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bin]]
+name = "klio-bench"
+path = "src/bin/klio-bench.rs"
+
+[[bench]]
+name = "e2e_pipeline"
+harness = false
+
+[[bench]]
+name = "runtime_micro"
+harness = false
+
+[[bench]]
+name = "memory_profile"
+harness = false
+
+[lints]
+workspace = true

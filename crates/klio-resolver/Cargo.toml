@@ -16,6 +16,11 @@ thiserror       = { workspace = true }
 klio-lexer       = { workspace = true }
 klio-parser      = { workspace = true }
 insta           = { workspace = true }
+criterion        = { workspace = true }
+
+[[bench]]
+name = "resolve"
+harness = false
 
 [lints]
 workspace = true

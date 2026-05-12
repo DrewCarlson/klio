@@ -1,0 +1,66 @@
+name: bench
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  bench-fast:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build driver
+        run: cargo build --release -p klio-bench --bin klio-bench
+      - name: Run fast bench (PR set)
+        run: |
+          target/release/klio-bench --json --out current.json
+      - name: Diff against baseline
+        id: diff
+        run: |
+          target/release/klio-bench --diff benches-baseline/HEAD.json --filter '' --json --out /dev/null 2> diff.txt || true
+          {
+            echo "## klio-bench diff vs. baseline"
+            echo
+            echo '```'
+            cat diff.txt
+            echo '```'
+          } > comment.md
+          cat comment.md
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: comment.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-current
+          path: current.json
+
+  bench-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build driver (with ref runners)
+        run: cargo build --release -p klio-bench --bin klio-bench --features ref
+      - name: Run full bench
+        run: target/release/klio-bench --full --json --out nightly.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-nightly
+          path: nightly.json

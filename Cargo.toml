@@ -16,6 +16,7 @@ members = [
     "crates/klio-cli",
     "crates/klio-parity",
     "crates/klio-diagnostics-gen",
+    "crates/klio-bench",
 ]
 
 [workspace.package]
@@ -45,6 +46,10 @@ unicode-xid    = "0.2"
 clap           = { version = "4", features = ["derive"] }
 rustyline      = "18.0.0"
 insta          = { version = "1", features = ["yaml"] }
+criterion      = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+dhat           = "0.3"
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -58,3 +63,7 @@ missing_errors_doc = "allow"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+debug = 1
