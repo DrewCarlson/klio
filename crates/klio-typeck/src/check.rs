@@ -8791,6 +8791,25 @@ mod tests {
     }
 
     #[test]
+    fn bare_type_argument_inference_is_check() {
+        // Spec §14.4: `x is List` / `x is Map` (no <T>) accepted; type
+        // arguments are inferred to star projections.
+        let tc = check_src(
+            "fun f(x: Any) { if (x is List) {}; if (x is Map) {} }",
+        );
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn bare_type_argument_inference_user_generic() {
+        let tc = check_src(
+            "class Box<T>(val v: T); fun f(x: Any) { if (x is Box) {}; val y = x as Box }",
+        );
+        // The unsafe cast may emit an UNCHECKED_CAST warning, but no errors.
+        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+    }
+
+    #[test]
     fn lambda_zero_arity_against_unit_callable() {
         // Spec §14.3.2 step 3: when the expected callable has zero params,
         // a zero-`->` lambda is treated as zero-arity (no phantom `it`),
