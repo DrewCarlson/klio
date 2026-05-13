@@ -1625,6 +1625,17 @@ impl Interpreter {
                     };
                     return Ok(Value::Bool(rb));
                 }
+                // Elvis short-circuits: only evaluate the RHS when LHS
+                // is null. This matters when the RHS has side effects
+                // (e.g. `m[key] ?: error("…")`).
+                if matches!(op, BinOp::Elvis) {
+                    let l = self.eval_expr(lhs, env, out)?;
+                    return if matches!(l, Value::Null) {
+                        self.eval_expr(rhs, env, out)
+                    } else {
+                        Ok(l)
+                    };
+                }
                 let l = self.eval_expr(lhs, env, out)?;
                 let r = self.eval_expr(rhs, env, out)?;
                 // `x in y` / `x !in y` — membership / range tests outside `when`.
