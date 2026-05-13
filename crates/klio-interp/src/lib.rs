@@ -845,6 +845,36 @@ impl Interpreter {
                 } else if simple.starts_with("MutableMap") {
                     out.push("Map".to_string());
                 }
+                // Surface stdlib interface aliases so extensions on
+                // `Iterable` / `Collection` / `CharSequence` / `Comparable`
+                // dispatch through any subtype receiver.
+                match simple {
+                    "List" | "MutableList" | "Set" | "MutableSet" | "Array"
+                    | "IntArray" | "LongArray" | "DoubleArray" | "FloatArray"
+                    | "ShortArray" | "ByteArray" | "BooleanArray" | "CharArray" => {
+                        out.push("Collection".to_string());
+                        out.push("Iterable".to_string());
+                    }
+                    "Map" | "MutableMap" => {
+                        out.push("Iterable".to_string());
+                    }
+                    "String" => {
+                        out.push("CharSequence".to_string());
+                        out.push("Comparable".to_string());
+                    }
+                    "Int" | "Long" | "Short" | "Byte" | "Float" | "Double" => {
+                        out.push("Number".to_string());
+                        out.push("Comparable".to_string());
+                    }
+                    "Char" | "Boolean" => {
+                        out.push("Comparable".to_string());
+                    }
+                    "IntRange" | "LongRange" | "CharRange" => {
+                        out.push("Iterable".to_string());
+                        out.push("ClosedRange".to_string());
+                    }
+                    _ => {}
+                }
             }
         }
         out.push("Any".to_string());
