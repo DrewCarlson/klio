@@ -12534,6 +12534,48 @@ mod tests {
     }
 
     #[test]
+    fn suspend_anf_nested_calls() {
+        // ANF normalisation: a suspend body whose statements contain
+        // suspending calls nested inside expressions (binary operands,
+        // function arguments, string templates) lowers to a sequence
+        // of state-machine states whose results are stitched back via
+        // synthetic temps.
+        let src = r#"
+            import kotlin.coroutines.*
+            suspend fun ask(n: Int): Int = suspendCoroutine { cont -> cont.resume(n * 10) }
+            suspend fun work(): Int {
+                val a = ask(1) + ask(2)
+                val b = ask(3) + ask(a)
+                println("a=$a b=$b")
+                return a + b
+            }
+            fun main() {
+                val r = runBlocking { work() }
+                println(r)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["a=30 b=330", "360"]);
+    }
+
+    #[test]
+    fn suspend_anf_string_template() {
+        let src = r#"
+            import kotlin.coroutines.*
+            suspend fun ask(n: Int): Int = suspendCoroutine { cont -> cont.resume(n + 100) }
+            suspend fun greet(): String {
+                val s = "x=${ask(1)} y=${ask(2)}"
+                println(s)
+                return "got ${ask(3)}"
+            }
+            fun main() {
+                val r = runBlocking { greet() }
+                println(r)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["x=101 y=102", "got 103"]);
+    }
+
+    #[test]
     fn reflection_member_call_and_property_set() {
         // KFunction.call on a member fn reference takes the receiver
         // as the leading argument. KMutableProperty1.set writes the

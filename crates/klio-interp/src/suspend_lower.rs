@@ -120,6 +120,17 @@ impl<'a> Lowering<'a> {
                             );
                             return;
                         }
+                        if self.expr_contains_suspending_call(init) {
+                            let rewritten = self.anf_spill(init);
+                            // Last spill is the binding's value source.
+                            self.pending_stmts.push(Stmt::Decl(klio_ast::Decl::Property(
+                                klio_ast::Property {
+                                    init: Some(rewritten),
+                                    ..p.clone()
+                                },
+                            )));
+                            return;
+                        }
                     }
                 }
                 // Non-init decls and non-suspending inits stay in
@@ -142,11 +153,169 @@ impl<'a> Lowering<'a> {
                     });
                     return;
                 }
+                if self.expr_contains_suspending_call(value) {
+                    let rewritten = self.anf_spill(value);
+                    self.pending_stmts.push(Stmt::Assign {
+                        target: target.clone(),
+                        op: *op,
+                        value: rewritten,
+                        span: *span,
+                    });
+                    return;
+                }
                 self.pending_stmts.push(stmt.clone());
             }
             _ => {
                 self.pending_stmts.push(stmt.clone());
             }
+        }
+    }
+
+    /// Walk `e` and return true if any sub-expression is a call whose
+    /// callee resolves to a known suspending function. Used by the
+    /// ANF spill to decide whether the expression must be split.
+    fn expr_contains_suspending_call(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Call { callee, args, .. } => {
+                if let Some(name) = simple_callee_name(callee) {
+                    if self.suspend_names.contains(name) {
+                        return true;
+                    }
+                }
+                if self.expr_contains_suspending_call(callee) {
+                    return true;
+                }
+                args.iter().any(|a| self.expr_contains_suspending_call(a))
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.expr_contains_suspending_call(lhs)
+                    || self.expr_contains_suspending_call(rhs)
+            }
+            Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => {
+                self.expr_contains_suspending_call(expr)
+            }
+            Expr::Member { receiver, .. } => self.expr_contains_suspending_call(receiver),
+            Expr::Index { receiver, args, .. } => {
+                self.expr_contains_suspending_call(receiver)
+                    || args.iter().any(|a| self.expr_contains_suspending_call(a))
+            }
+            Expr::StringTemplate { parts, .. } => parts.iter().any(|p| match p {
+                klio_ast::StringPart::Interp(e) => self.expr_contains_suspending_call(e),
+                _ => false,
+            }),
+            Expr::Return { value: Some(v), .. } => self.expr_contains_suspending_call(v),
+            Expr::Throw { value, .. } => self.expr_contains_suspending_call(value),
+            Expr::As { expr, .. } | Expr::IsCheck { expr, .. } | Expr::Spread { expr, .. } => {
+                self.expr_contains_suspending_call(expr)
+            }
+            Expr::Labeled { expr, .. } => self.expr_contains_suspending_call(expr),
+            _ => false,
+        }
+    }
+
+    /// Recursively rewrite `e`, hoisting each suspending sub-call into
+    /// a fresh `$$susp_t<N>` temp emitted as its own suspending state.
+    /// Non-suspending sub-expressions are preserved structurally.
+    fn anf_spill(&mut self, e: &Expr) -> Expr {
+        // Top-level suspending call: hoist and replace with the temp.
+        if self.expr_is_simple_suspending_call(e) {
+            let tmp = self.fresh_temp();
+            let span = e.span();
+            self.emit_suspending_assignment(e.clone(), Some(tmp.clone()));
+            return Expr::Path {
+                segments: vec![klio_ast::Ident { name: tmp, span }],
+                span,
+            };
+        }
+        match e {
+            Expr::Call { callee, args, arg_names, type_args, is_infix, span } => {
+                let new_callee = if self.expr_contains_suspending_call(callee) {
+                    Box::new(self.anf_spill(callee))
+                } else {
+                    callee.clone()
+                };
+                let new_args: Vec<Expr> = args
+                    .iter()
+                    .map(|a| {
+                        if self.expr_contains_suspending_call(a) {
+                            self.anf_spill(a)
+                        } else {
+                            a.clone()
+                        }
+                    })
+                    .collect();
+                Expr::Call {
+                    callee: new_callee,
+                    args: new_args,
+                    arg_names: arg_names.clone(),
+                    type_args: type_args.clone(),
+                    is_infix: *is_infix,
+                    span: *span,
+                }
+            }
+            Expr::Binary { op, lhs, rhs, span } => Expr::Binary {
+                op: *op,
+                lhs: if self.expr_contains_suspending_call(lhs) {
+                    Box::new(self.anf_spill(lhs))
+                } else {
+                    lhs.clone()
+                },
+                rhs: if self.expr_contains_suspending_call(rhs) {
+                    Box::new(self.anf_spill(rhs))
+                } else {
+                    rhs.clone()
+                },
+                span: *span,
+            },
+            Expr::Unary { op, expr, span } => Expr::Unary {
+                op: *op,
+                expr: Box::new(self.anf_spill(expr)),
+                span: *span,
+            },
+            Expr::Member { receiver, name, safe, span } => Expr::Member {
+                receiver: Box::new(self.anf_spill(receiver)),
+                name: name.clone(),
+                safe: *safe,
+                span: *span,
+            },
+            Expr::Index { receiver, args, span } => Expr::Index {
+                receiver: Box::new(self.anf_spill(receiver)),
+                args: args
+                    .iter()
+                    .map(|a| {
+                        if self.expr_contains_suspending_call(a) {
+                            self.anf_spill(a)
+                        } else {
+                            a.clone()
+                        }
+                    })
+                    .collect(),
+                span: *span,
+            },
+            Expr::Return { value, label, span } => Expr::Return {
+                value: value.as_ref().map(|v| Box::new(self.anf_spill(v))),
+                label: label.clone(),
+                span: *span,
+            },
+            Expr::Throw { value, span } => Expr::Throw {
+                value: Box::new(self.anf_spill(value)),
+                span: *span,
+            },
+            Expr::StringTemplate { parts, span } => {
+                let new_parts: Vec<klio_ast::StringPart> = parts
+                    .iter()
+                    .map(|p| match p {
+                        klio_ast::StringPart::Interp(e)
+                            if self.expr_contains_suspending_call(e) =>
+                        {
+                            klio_ast::StringPart::Interp(self.anf_spill(e))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect();
+                Expr::StringTemplate { parts: new_parts, span: *span }
+            }
+            _ => e.clone(),
         }
     }
 
