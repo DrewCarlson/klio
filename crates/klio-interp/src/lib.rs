@@ -953,6 +953,23 @@ impl Interpreter {
                 }
             }
         }
+        if chosen.is_none() {
+            for (key, list) in &self.extensions {
+                for ext in list {
+                    let is_generic_receiver = ext.decl.type_params.iter().any(|tp| tp.name.name == *key);
+                    if is_generic_receiver
+                        && ext.decl.name.name == name
+                        && arg_vals.len() <= ext.decl.params.len()
+                    {
+                        chosen = Some(ext.clone());
+                        break;
+                    }
+                }
+                if chosen.is_some() {
+                    break;
+                }
+            }
+        }
         let Some(ext) = chosen else { return Ok(None) };
         let arg_names: Vec<Option<String>> = vec![None; arg_vals.len()];
         let v = self.call_extension(&ext.decl, &ext.env, receiver.clone(), arg_vals, &arg_names, out)?;
