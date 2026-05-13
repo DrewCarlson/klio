@@ -5,6 +5,7 @@
 //! lowering (Phase 2) and the dataflow framework (Phase 3) build on
 //! top of this without touching the types here.
 
+pub mod analyses;
 pub mod builder;
 pub mod dataflow;
 pub mod ir;
