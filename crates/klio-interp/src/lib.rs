@@ -6985,6 +6985,15 @@ impl Interpreter {
                 return self.call_method(inst, &m, &[owner.clone(), prop.clone()], &[], out);
             }
         }
+        let _ = env;
+        if let Some(v) = self.try_extension_call_with_values(
+            delegate,
+            "getValue",
+            &[owner.clone(), prop.clone()],
+            out,
+        )? {
+            return Ok(v);
+        }
         Err(RuntimeError::Type(
             "property delegate has no `getValue` method".into(),
         ))
@@ -7014,6 +7023,18 @@ impl Interpreter {
                 )?;
                 return Ok(());
             }
+        }
+        let _ = env;
+        if self
+            .try_extension_call_with_values(
+                delegate,
+                "setValue",
+                &[owner.clone(), prop.clone(), new_value],
+                out,
+            )?
+            .is_some()
+        {
+            return Ok(());
         }
         Err(RuntimeError::Type(
             "property delegate has no `setValue` method".into(),
@@ -8118,6 +8139,23 @@ impl Interpreter {
             }
             if let Some(v) = self.try_eval_array_constructor(name, args, env, out)? {
                 return Ok(v);
+            }
+            // `Comparator<T> { a, b -> Int }` — SAM construction
+            // of a Comparator from a 2-arg comparison lambda. The
+            // chain dispatcher (apply_comparator_step) already
+            // accepts 2-arg lambdas in step position, so we just
+            // wrap the lambda directly as the sole step.
+            if name == "Comparator" && args.len() == 1 {
+                let v = self.eval_expr(&args[0], env, out)?;
+                if let Value::Lambda { .. } = &v {
+                    return Ok(Value::Comparator {
+                        steps: Rc::new(vec![(v, false)]),
+                        descending: false,
+                    });
+                }
+                return Err(RuntimeError::Type(
+                    "Comparator { … } expects a 2-arg comparison lambda".into(),
+                ));
             }
             if name == "compareBy" || name == "compareByDescending" {
                 let per_step_descending = name == "compareByDescending";
@@ -12229,6 +12267,60 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["11"]);
+    }
+
+    #[test]
+    fn delegate_extension_get_set() {
+        // Spec ch.9: `operator getValue` / `setValue` may be supplied
+        // as extension functions on the delegate type, not just as
+        // members of its class. Both class-member and top-level
+        // delegated properties must route through the extension.
+        let src = r#"
+            import kotlin.reflect.KProperty
+            class D
+            operator fun D.getValue(thisRef: Any?, prop: KProperty<*>): String = "g-${prop.name}"
+            operator fun D.setValue(thisRef: Any?, prop: KProperty<*>, v: String) { println("s-${prop.name}=$v") }
+            class Owner {
+                val a: String by D()
+                var b: String by D()
+            }
+            val topA: String by D()
+            var topB: String by D()
+            fun main() {
+                val o = Owner()
+                println(o.a)
+                o.b = "x"
+                println(topA)
+                topB = "y"
+            }
+        "#;
+        assert_eq!(
+            run(src).lines,
+            vec!["g-a", "s-b=x", "g-topA", "s-topB=y"]
+        );
+    }
+
+    #[test]
+    fn delegate_nothing_null_this_ref() {
+        // Spec ch.9: top-level delegated properties pass `thisRef = null`
+        // and may be typed `Nothing?`. The dispatch must accept either
+        // `Any?` or `Nothing?` receiver shapes uniformly.
+        let src = r#"
+            import kotlin.reflect.KProperty
+            class A {
+                operator fun getValue(thisRef: Any?, prop: KProperty<*>): Int = 10
+            }
+            class B {
+                operator fun getValue(thisRef: Nothing?, prop: KProperty<*>): Int = 20
+            }
+            val a: Int by A()
+            val b: Int by B()
+            fun main() {
+                println(a)
+                println(b)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["10", "20"]);
     }
 
     #[test]
