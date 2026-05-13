@@ -500,6 +500,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "klio-cfa"
+version = "0.1.0"
+dependencies = [
+ "insta",
+ "klio-ast",
+ "klio-span",
+ "klio-types",
+]
+
+[[package]]
 name = "klio-cli"
 version = "0.1.0"
 dependencies = [

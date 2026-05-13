@@ -10,6 +10,7 @@ members = [
     "crates/klio-types",
     "crates/klio-resolver",
     "crates/klio-typeck",
+    "crates/klio-cfa",
     "crates/klio-stdlib",
     "crates/klio-stdlib-gen",
     "crates/klio-interp",
@@ -36,6 +37,7 @@ klio-runtime     = { path = "crates/klio-runtime" }
 klio-types       = { path = "crates/klio-types" }
 klio-resolver    = { path = "crates/klio-resolver" }
 klio-typeck      = { path = "crates/klio-typeck" }
+klio-cfa         = { path = "crates/klio-cfa" }
 klio-stdlib      = { path = "crates/klio-stdlib" }
 klio-interp      = { path = "crates/klio-interp" }
 

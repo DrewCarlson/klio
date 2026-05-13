@@ -1,0 +1,24 @@
+---
+source: crates/klio-cfa/tests/builder.rs
+expression: print_cfg(&cfg)
+---
+cfg: entry=b0
+exits: b3
+
+b0:
+  r0 = eval @0..1 :: Any
+  term: switch r0 [is String -> b1] default b2
+
+b1:
+  preds: b0
+  assume r0 is String
+  term: goto b3
+
+b2:
+  preds: b0
+  assume r0 !is String
+  term: goto b3
+
+b3:
+  preds: b1, b2
+  term: return

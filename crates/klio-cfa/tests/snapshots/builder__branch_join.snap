@@ -1,0 +1,26 @@
+---
+source: crates/klio-cfa/tests/builder.rs
+expression: print_cfg(&cfg)
+---
+cfg: entry=b0
+exits: b3
+
+b0:
+  r0 = eval @0..4 :: Boolean
+  term: branch r0 -> b1 else b2
+
+b1:
+  preds: b0(T)
+  assume r0
+  r1 = eval @5..6 :: Int
+  term: goto b3
+
+b2:
+  preds: b0(F)
+  assume !r0
+  r2 = eval @7..8 :: Int
+  term: goto b3
+
+b3:
+  preds: b1, b2
+  term: return

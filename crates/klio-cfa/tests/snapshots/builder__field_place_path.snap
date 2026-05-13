@@ -1,0 +1,11 @@
+---
+source: crates/klio-cfa/tests/builder.rs
+expression: print_cfg(&cfg)
+---
+cfg: entry=b0
+exits: b0
+
+b0:
+  r0 = eval @0..1 :: Int
+  assign p.x.y = r0
+  term: return
