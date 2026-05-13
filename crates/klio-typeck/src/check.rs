@@ -5655,7 +5655,18 @@ impl<'r> Checker<'r> {
                         if let Some(cn) = cn {
                             self.expr_class.insert(*span, cn);
                         }
-                        return ty;
+                        // GADT static refinement: when this read
+                        // lies inside a branch whose smart-cast
+                        // narrows a generic receiver, fold the
+                        // implied type-parameter substitution into
+                        // the declared type. Outside any branch
+                        // the substitution is empty and `ty` is
+                        // returned unchanged.
+                        let gadt = self.cfg_gadt_subst_at(*span);
+                        if gadt.is_empty() {
+                            return ty;
+                        }
+                        return substitute_type_params(&ty, &gadt);
                     }
                     if let Some(sigs) = self.fns.get(name) {
                         // Function reference (not a call) — pick the first
