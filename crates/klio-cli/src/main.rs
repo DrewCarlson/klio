@@ -100,6 +100,17 @@ enum PackCmd {
         #[arg(long = "smoke")]
         smoke: Option<PathBuf>,
     },
+    /// Scaffold a new library project: `klio.toml`, `src/main/kotlin/`,
+    /// a placeholder Kotlin file, and a short README explaining how
+    /// to build and install the resulting pack.
+    New {
+        /// Directory to create. Must not exist.
+        dir: PathBuf,
+        /// Library id written into `klio.toml`. Defaults to the
+        /// directory name.
+        #[arg(long = "id")]
+        id: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -205,7 +216,52 @@ fn run_pack(cmd: PackCmd) -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        PackCmd::New { dir, id } => match scaffold_library(&dir, id.as_deref()) {
+            Ok(()) => {
+                eprintln!("scaffolded {}", dir.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
     }
+}
+
+fn scaffold_library(dir: &std::path::Path, id_override: Option<&str>) -> Result<(), String> {
+    if dir.exists() {
+        return Err(format!("{} already exists", dir.display()));
+    }
+    let id = id_override
+        .map(|s| s.to_string())
+        .or_else(|| {
+            dir.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .ok_or_else(|| "could not derive library id from path".to_string())?;
+    let src_dir = dir.join("src").join("main").join("kotlin");
+    std::fs::create_dir_all(&src_dir).map_err(|e| e.to_string())?;
+    let klio_toml = format!(
+        "[library]\nid = \"{id}\"\nversion = \"0.1.0\"\nabi = 1\nimplicit_packages = []\nsource_roots = [\"src/main/kotlin\"]\n\n[[deps]]\nid = \"stdlib\"\n\n# Map FQN to host_symbol for any native binding the host registers.\n# Omit the table when the library is pure Kotlin.\n# [bindings]\n# \"{id}.example.hello\" = \"{id}.example.hello\"\n",
+    );
+    std::fs::write(dir.join("klio.toml"), klio_toml).map_err(|e| e.to_string())?;
+    let sample_path = src_dir.join("Sample.kt");
+    let pkg = sanitize_package(&id);
+    let sample = format!("package {pkg}\n\nfun greet(name: String): String = \"hello, $name\"\n");
+    std::fs::write(&sample_path, sample).map_err(|e| e.to_string())?;
+    let readme = format!(
+        "# {id}\n\nA klio pack scaffold.\n\nBuild:\n\n    klio pack build .\n\nInstall:\n\n    klio pack install target/packs/{id}.klio-pack\n\nUse from a program:\n\n    import {pkg}.greet\n    fun main() {{ println(greet(\"world\")) }}\n"
+    );
+    std::fs::write(dir.join("README.md"), readme).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn sanitize_package(id: &str) -> String {
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '_' })
+        .collect()
 }
 
 fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, String> {

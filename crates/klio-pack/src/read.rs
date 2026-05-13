@@ -19,6 +19,16 @@ pub struct PackReader {
 }
 
 impl PackReader {
+    /// Construct a reader by loading the file at `path` and decoding
+    /// its bytes. Equivalent to `PackReader::from_bytes(std::fs::read(path)?)`
+    /// with the I/O error normalised through [`PackError`]. Provides a
+    /// stable entry point for callers that may later move to mmap
+    /// without touching their code.
+    pub fn from_path(path: &std::path::Path) -> Result<Self, PackError> {
+        let bytes = std::fs::read(path).map_err(PackError::Compression)?;
+        Self::from_bytes(bytes)
+    }
+
     /// Construct a reader from a complete pack byte stream. Verifies the
     /// magic, format version, and pack hash; rejects truncated streams.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, PackError> {

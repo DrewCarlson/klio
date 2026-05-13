@@ -291,6 +291,13 @@ impl Interpreter {
         use klio_pack::section_names;
         if let Some(bytes) = pack.read_section(section_names::MANIFEST)? {
             let manifest: PackManifest = decode(&bytes)?;
+            if manifest.abi_version > klio_pack::SUPPORTED_ABI_VERSION {
+                return Err(klio_pack::PackError::AbiMismatch {
+                    library_id: manifest.library_id,
+                    found: manifest.abi_version,
+                    supported: klio_pack::SUPPORTED_ABI_VERSION,
+                });
+            }
             for pkg in manifest.implicit_packages {
                 if !self.pack_implicit_packages.iter().any(|p| p == &pkg) {
                     self.pack_implicit_packages.push(pkg.clone());

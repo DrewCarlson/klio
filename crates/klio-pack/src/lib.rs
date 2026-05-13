@@ -23,6 +23,12 @@ pub use format::{
 pub use read::PackReader;
 pub use write::{PackWriter, DEFAULT_ZSTD_LEVEL};
 
+/// Highest ABI version this build of klio supports. Pack manifests
+/// declare an `abi_version`; the loader rejects packs whose ABI is
+/// greater than this value. Bump when the `StdlibFn` signature, the
+/// `Value` shape, or any other runtime-binding contract changes.
+pub const SUPPORTED_ABI_VERSION: u32 = 1;
+
 /// Errors produced while encoding or decoding a pack.
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
@@ -50,6 +56,15 @@ pub enum PackError {
     },
     #[error("section directory of {0} bytes is larger than the format permits")]
     DirectoryTooLarge(usize),
+    #[error(
+        "pack `{library_id}` declares abi {found} but this build of klio supports up to abi {supported}; \
+         regenerate the pack against klio >= the matching release"
+    )]
+    AbiMismatch {
+        library_id: String,
+        found: u32,
+        supported: u32,
+    },
 }
 
 #[cfg(test)]
