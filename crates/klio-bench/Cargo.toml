@@ -30,9 +30,14 @@ dhat          = { workspace = true, optional = true }
 [dev-dependencies]
 criterion = { workspace = true }
 
+[lib]
+test = false
+doctest = false
+
 [[bin]]
 name = "klio-bench"
 path = "src/bin/klio-bench.rs"
+test = false
 
 [[bench]]
 name = "e2e_pipeline"
