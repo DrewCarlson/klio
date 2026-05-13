@@ -5301,24 +5301,11 @@ impl<'r> Checker<'r> {
         } else {
             self.check_expr(body, None);
         }
-        let nar = std::mem::take(&mut self.current_frame().narrowings);
-        let cls = std::mem::take(&mut self.current_frame().narrowing_class);
+        // Narrowings established inside a definitely-executed loop body
+        // are propagated to the outer scope via the CFG: the killDataFlow
+        // pass invalidates only re-assigned places, so unmodified facts
+        // survive the back-edge naturally.
         self.pop_frame();
-        for (key, ty) in nar {
-            // Only propagate when the key refers to a binding declared in
-            // an outer scope. Loop-local declarations live in the popped
-            // frame and must not leak.
-            let base = key.split('.').next().unwrap_or(&key);
-            if self.lookup(base).is_some() {
-                self.current_frame().narrowings.insert(key, ty);
-            }
-        }
-        for (key, cn) in cls {
-            let base = key.split('.').next().unwrap_or(&key);
-            if self.lookup(base).is_some() {
-                self.current_frame().narrowing_class.insert(key, cn);
-            }
-        }
     }
 
     fn check_block(&mut self, block: &Block, expected: Option<&Type>) -> Type {
@@ -5806,6 +5793,10 @@ impl<'r> Checker<'r> {
                 let cond_narrow = self.check_condition(cond);
                 let before = self.assigned.clone();
                 self.push_frame();
+                // Cross-variable reference-equality narrowings from
+                // `a === b` and the like are produced by
+                // check_condition and not yet modelled by the CFG.
+                // The Frame.narrowings path still owns them.
                 for (n, t) in &cond_narrow.true_branch {
                     self.current_frame().narrowings.insert(n.clone(), t.clone());
                 }
@@ -6445,16 +6436,9 @@ impl<'r> Checker<'r> {
                 if let Some(cn) = class_name_from_typeref(ty) {
                     self.expr_class.insert(*span, cn);
                 }
-                if !*safe {
-                    if let Some(key) = dot_path_key(expr) {
-                        self.current_frame()
-                            .narrowings
-                            .insert(key.clone(), target.clone());
-                        if let Some(cn) = class_name_from_typeref(ty) {
-                            self.current_frame().narrowing_class.insert(key, cn);
-                        }
-                    }
-                }
+                // `expr as T` narrowing is handled by the CFG via the
+                // AssumeIs node the lowering emits for the cast.
+                let _ = ();
                 if *safe {
                     target.as_nullable()
                 } else {
@@ -7974,6 +7958,10 @@ impl<'r> Checker<'r> {
             } else {
                 &nar.false_class
             };
+            // Cross-variable reference-equality narrowings from
+            // check_condition are not yet modelled by the CFG; the
+            // Frame.narrowings path still carries them through the
+            // rhs of && / ||.
             for (k, v) in branch {
                 self.current_frame().narrowings.insert(k.clone(), v.clone());
             }
@@ -8107,16 +8095,11 @@ impl<'r> Checker<'r> {
                 // Spec §14.1: when the rhs diverges (return / throw / continue /
                 // break, all typed as `Nothing`), control falls through only when
                 // the lhs was non-null. Narrow the lhs in the enclosing frame.
-                if matches!(r, Type::Nothing) {
-                    if let Some(key) = dot_path_key(lhs) {
-                        self.current_frame()
-                            .narrowings
-                            .insert(key.clone(), lhs_non_null.clone());
-                        if let Some(cn) = self.expr_class.get(&lhs.span()).cloned() {
-                            self.current_frame().narrowing_class.insert(key, cn);
-                        }
-                    }
-                }
+                // Elvis-return / elvis-throw narrowing is handled by
+                // the CFG: the diverging rhs makes the null arm
+                // unreachable, so the join state inherits the lhs's
+                // non-null projection from the nonnull arm.
+                let _ = lhs_non_null.clone();
                 lub(&lhs_non_null, &r)
             }
             BinOp::Assign => Type::Unit,
@@ -8272,6 +8255,9 @@ impl<'r> Checker<'r> {
                 for a in &args[1..] {
                     self.check_expr(a, None);
                 }
+                // Cross-variable equality narrowings stay on the
+                // Frame path; the CFA's contracts hookup handles
+                // `is` and `!= null` cases via AssumeIs / AssumeNull.
                 for (n, t) in &nar.true_branch {
                     self.current_frame().narrowings.insert(n.clone(), t.clone());
                 }
@@ -8831,16 +8817,29 @@ impl<'r> Checker<'r> {
         for _ in 0..8 {
             if let Some(fact) = state.map.get(&place) {
                 if let Some(t) = fact.narrowed.clone() {
-                    // Builtins-only — user-class narrowings come
-                    // back through `cfg_narrowed_class_at`. Skip
-                    // `Unresolved` here so callers don't widen the
-                    // declared type for class refinements they can
-                    // address via the class-name path.
-                    if !matches!(t, Type::Unresolved) {
-                        if matches!(fact.null, Nullability::NonNull) {
-                            return Some(t.non_null().clone());
+                    // For a user-class narrowing the underlying Type
+                    // is `Unresolved`; the typechecker treats that as
+                    // "permissive" and recovers the class via
+                    // `cfg_narrowed_class_at`. Return it so callers
+                    // get the same shape as the legacy frame path.
+                    if matches!(fact.null, Nullability::NonNull) && !matches!(t, Type::Unresolved) {
+                        return Some(t.non_null().clone());
+                    }
+                    return Some(t);
+                }
+                // No type-narrowing but the place is known non-null
+                // (or definitely null). Project the declared type's
+                // non-null form so the caller sees a usable Type.
+                if matches!(fact.null, Nullability::NonNull) {
+                    let bound = if let klio_cfa::Place::Local(sym) = &place {
+                        self.lookup(&sym.0).map(|b| b.ty.clone())
+                    } else {
+                        None
+                    };
+                    if let Some(declared) = bound {
+                        if declared.is_nullable() {
+                            return Some(declared.non_null().clone());
                         }
-                        return Some(t);
                     }
                 }
             }
