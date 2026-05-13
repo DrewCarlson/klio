@@ -324,6 +324,12 @@ pub enum DelegateKind {
 pub struct ClassDef {
     pub name: String,
     pub fqn: String,
+    /// Runtime-retained annotation class names applied to this
+    /// declaration. Populated at class-registration time from the
+    /// AST, filtered to spec §17 RUNTIME retention (the default).
+    /// `KClass.annotations` / `KClass.findAnnotation` walk this
+    /// list when reflection asks for them.
+    pub annotation_names: Vec<String>,
     pub primary_params: Vec<ClassParamDef>,
     /// Member functions keyed by simple name.
     pub methods: Vec<MethodDef>,

@@ -73,6 +73,17 @@ pub struct Interpreter {
     /// Top-level properties keyed by simple name. Used to dispatch reads
     /// and writes through custom getters/setters or property delegates.
     top_level_props: std::collections::HashMap<String, PropertyDef>,
+    /// `@Retention` value declared on each annotation class (`SOURCE`,
+    /// `BINARY`, or `RUNTIME`). Populated when an `annotation class`
+    /// is registered. Drives whether the annotation surfaces through
+    /// `KClass.annotations`. Defaults to `RUNTIME` (spec §17.2) when
+    /// the annotation class doesn't declare an explicit retention.
+    annotation_class_retentions: std::collections::HashMap<String, String>,
+    /// Class table populated at registration so reflection can look
+    /// up a `ClassDef` by simple name without walking the lexical
+    /// scope chain. `synthesize_annotation_value` consults this when
+    /// building `KClass.annotations` instances.
+    class_table: std::collections::HashMap<String, Rc<ClassDef>>,
     /// Monotonic counter for synthesizing unique names for anonymous-object
     /// `ClassDef`s. Only surfaces in diagnostic-style debug output.
     anon_class_counter: usize,
@@ -186,6 +197,8 @@ impl Interpreter {
         Self {
             globals: Rc::new(RefCell::new(env)),
             top_level_props: std::collections::HashMap::new(),
+            annotation_class_retentions: std::collections::HashMap::new(),
+            class_table: std::collections::HashMap::new(),
             anon_class_counter: 0,
             instance_id_counter: 0,
             extensions: std::collections::HashMap::new(),
@@ -338,6 +351,7 @@ impl Interpreter {
         Some(Value::Class(Rc::new(ClassDef {
             name: name.to_string(),
             fqn,
+            annotation_names: Vec::new(),
             primary_params: Vec::new(),
             methods: Vec::new(),
             body_properties: Vec::new(),
@@ -366,6 +380,47 @@ impl Interpreter {
             delegate_forwarders: RefCell::new(Vec::new()),
             object_singleton: RefCell::new(None),
         })))
+    }
+
+    /// Build a `Value::Instance` representing a runtime-retained
+    /// annotation application. The instance carries the annotation
+    /// class so user-side `is`-checks (`it is Foo`) and
+    /// `findAnnotation<Foo>()` discriminate correctly. Falls back
+    /// to a string holder when the annotation class isn't
+    /// registered (e.g. references to a stdlib annotation type
+    /// that isn't user-declared).
+    fn synthesize_annotation_value(&self, name: &str) -> Value {
+        if let Some(c) = self.class_table.get(name) {
+            let inst = Rc::new(RefCell::new(InstanceData {
+                class: Rc::clone(c),
+                fields: Vec::new(),
+                outer: None,
+                identity: 0,
+            }));
+            return Value::Instance(inst);
+        }
+        Value::String(Rc::new(name.to_string()))
+    }
+
+    /// Filter an AST annotation list to those with `@Retention(RUNTIME)`.
+    /// Per spec §17.2 the default retention is RUNTIME; only an
+    /// explicit `@Retention(AnnotationRetention.SOURCE)` or
+    /// `BINARY` excludes an annotation from runtime reflection.
+    fn runtime_annotation_names(&self, annotations: &[klio_ast::Annotation]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for ann in annotations {
+            let Some(simple) = ann.path.last().map(|s| s.name.clone()) else { continue };
+            // Look up the annotation class's own @Retention.
+            let retention = self
+                .annotation_class_retentions
+                .get(&simple)
+                .cloned()
+                .unwrap_or_else(|| "RUNTIME".to_string());
+            if retention == "RUNTIME" {
+                out.push(simple);
+            }
+        }
+        out
     }
 
     fn resolve_reified(&self, name: &str) -> String {
@@ -634,6 +689,8 @@ impl Interpreter {
             match d {
                 Decl::Class(c) => {
                     let class = self.build_class_shell(c, &file_env, out)?;
+                    self.class_table
+                        .insert(c.name.name.clone(), Rc::clone(&class));
                     file_env
                         .borrow_mut()
                         .define(c.name.name.clone(), Value::Class(Rc::clone(&class)));
@@ -5502,6 +5559,14 @@ impl Interpreter {
         env: &Rc<RefCell<Env>>,
         out: &mut dyn Output,
     ) -> Result<Rc<ClassDef>, RuntimeError> {
+        // Spec §17.2: capture the @Retention on an annotation class
+        // when it is declared, so applications of that class can
+        // be filtered when reflection asks for them later.
+        if c.is_annotation {
+            let retention = extract_retention(&c.annotations).unwrap_or_else(|| "RUNTIME".to_string());
+            self.annotation_class_retentions
+                .insert(c.name.name.clone(), retention);
+        }
         let mut methods = Vec::new();
         let mut body_properties = Vec::new();
         let mut companion: Option<Rc<RefCell<InstanceData>>> = None;
@@ -5599,6 +5664,7 @@ impl Interpreter {
         let outer_class = Rc::new(ClassDef {
             name: c.name.name.clone(),
             fqn: self.qualify_simple_name(&c.name.name),
+            annotation_names: self.runtime_annotation_names(&c.annotations),
             primary_params,
             methods,
             body_properties,
@@ -5825,6 +5891,7 @@ impl Interpreter {
                 Rc::new(ClassDef {
                     name: class.name.clone(),
                     fqn: class.fqn.clone(),
+                    annotation_names: class.annotation_names.clone(),
                     primary_params: class.primary_params.clone(),
                     methods,
                     body_properties,
@@ -5909,6 +5976,7 @@ impl Interpreter {
         Ok(Rc::new(ClassDef {
             name: o.name.name.clone(),
             fqn: self.qualify_simple_name(&o.name.name),
+            annotation_names: Vec::new(),
             primary_params: Vec::new(),
             methods,
             body_properties,
@@ -6945,6 +7013,7 @@ impl Interpreter {
         let synth = Rc::new(ClassDef {
             name: iface.name.clone(),
             fqn: iface.fqn.clone(),
+            annotation_names: iface.annotation_names.clone(),
             primary_params: Vec::new(),
             methods,
             body_properties: Vec::new(),
@@ -7370,6 +7439,22 @@ impl Interpreter {
             match name {
                 "simpleName" => return Ok(Value::String(Rc::new(c.name.clone()))),
                 "qualifiedName" => return Ok(Value::String(Rc::new(c.fqn.clone()))),
+                "annotations" => {
+                    // Synthesize a placeholder annotation instance
+                    // per recorded runtime-retained name. The class
+                    // for each instance is the registered annotation
+                    // class (if known) so `is`-checks against the
+                    // annotation type work in user code.
+                    let mut items: Vec<Value> = Vec::with_capacity(c.annotation_names.len());
+                    for ann_name in &c.annotation_names {
+                        items.push(self.synthesize_annotation_value(ann_name));
+                    }
+                    return Ok(Value::List {
+                        items: Rc::new(RefCell::new(items)),
+                        mutable: false,
+                        enum_class: None,
+                    });
+                }
                 _ => {}
             }
         }
@@ -8868,6 +8953,33 @@ fn primitive_companion_const(ty: &str, name: &str) -> Option<Value> {
 /// Detect whether an expression is a syntactic "box-to-Any" form. Used
 /// at `==` sites to switch Float/Double equality to bit-equality per
 /// spec §8.9.2 (the `Any.equals` path matches JVM `Float.equals`).
+/// Extract the `AnnotationRetention` value from `@Retention(...)`
+/// in an annotation list. Returns `Some("SOURCE"|"BINARY"|"RUNTIME")`
+/// when present, otherwise `None` (caller falls back to default).
+fn extract_retention(annotations: &[klio_ast::Annotation]) -> Option<String> {
+    for ann in annotations {
+        let path_last = ann.path.last().map(|s| s.name.as_str()).unwrap_or("");
+        if path_last != "Retention" {
+            continue;
+        }
+        if let Some(arg) = ann.args.first() {
+            // `@Retention(AnnotationRetention.RUNTIME)` (Member) or
+            // `@Retention(RUNTIME)` (Path).
+            let name = match arg {
+                klio_ast::Expr::Path { segments, .. } => {
+                    segments.last().map(|s| s.name.clone())
+                }
+                klio_ast::Expr::Member { name, .. } => Some(name.name.clone()),
+                _ => None,
+            };
+            if let Some(n) = name {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 fn is_boxed_to_any_form(expr: &Expr) -> bool {
     match expr {
         Expr::As { ty, .. } => {
