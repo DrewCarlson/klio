@@ -212,6 +212,31 @@ fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, String> {
     klio_stdlib::build_stdlib_pack(compress_symbols).map_err(|e| e.to_string())
 }
 
+/// Parse every source file at pack-build time. Files that fail to lex
+/// or parse are dropped from the returned bundle; the loader falls
+/// back to the `sources` section to re-parse them later. Spans inside
+/// the bundle carry SourceMap FileIds allocated during the build,
+/// which the loader rebases when it ingests the AST.
+fn build_ast_bundle(files: &[klio_pack::schema::SourceFile]) -> klio_pack::schema::AstBundle {
+    use klio_pack::schema::{AstBundle, AstFile};
+    let mut out = AstBundle::default();
+    let mut map = SourceMap::new();
+    for f in files {
+        let id = map.add(&f.rel_path, String::from_utf8_lossy(&f.bytes).into_owned());
+        let src = map.get(id).source.clone();
+        let lexed = klio_lexer::Lexer::new(id, &src).tokenize();
+        if lexed.diagnostics.has_errors() {
+            continue;
+        }
+        let (ast, diags) = klio_parser::Parser::new(id, &src, &lexed.tokens).parse_file();
+        if diags.has_errors() {
+            continue;
+        }
+        out.files.push(AstFile { rel_path: f.rel_path.clone(), kotlin_file: ast });
+    }
+    out
+}
+
 #[derive(serde::Deserialize, Debug)]
 struct LibraryToml {
     library: LibraryHeader,
@@ -358,12 +383,20 @@ fn build_library_pack(
     let bindings_bytes = encode(&BindingManifest { bindings }).map_err(|e| e.to_string())?;
 
     // Sources (zstd-compressed; common case is many KB of Kotlin text).
-    let sources_bytes = encode(&SourceBundle { files }).map_err(|e| e.to_string())?;
+    let sources_bytes = encode(&SourceBundle { files: files.clone() }).map_err(|e| e.to_string())?;
+
+    // Frozen AST: try to parse every source file at pack-build time
+    // and ship the resulting `KotlinFile` tree alongside the raw
+    // bytes. Files that fail to lex / parse are skipped and the
+    // loader falls back to the source-bundle path for them.
+    let ast_bundle = build_ast_bundle(&files);
+    let ast_bytes = encode(&ast_bundle).map_err(|e| e.to_string())?;
 
     let mut writer = PackWriter::new();
     writer.add_raw(section_names::MANIFEST, manifest_bytes);
     writer.add_raw(section_names::BINDINGS, bindings_bytes);
     writer.add_section(section_names::SOURCES, sources_bytes, Compression::Zstd);
+    writer.add_section(section_names::AST, ast_bytes, Compression::Zstd);
     let pack_bytes = writer.finish().map_err(|e| e.to_string())?;
 
     let out_path = match out {
@@ -899,9 +932,25 @@ fn install_one_extra_pack(
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let pack = PackReader::from_bytes(bytes).map_err(|e| e.to_string())?;
     interp.install_pack(&pack, host).map_err(|e| e.to_string())?;
-    // Sources, when present, get parsed and registered as sibling
-    // module files. Diagnostics are surfaced but do not abort the
-    // load — packs may legitimately ship partial source coverage.
+    // Frozen AST takes precedence: when the pack carries a
+    // pre-parsed AST bundle, feed those KotlinFiles directly into
+    // the interpreter and skip the parse pass entirely. Falls back
+    // to the source-bundle path when no AST section is present or
+    // when it deserialises to an empty bundle.
+    use klio_pack::schema::AstBundle;
+    if let Some(payload) = pack.read_section(section_names::AST).map_err(|e| e.to_string())? {
+        let bundle: AstBundle = decode(&payload).map_err(|e| e.to_string())?;
+        if !bundle.files.is_empty() {
+            let asts: Vec<klio_ast::KotlinFile> =
+                bundle.files.into_iter().map(|f| f.kotlin_file).collect();
+            let mut out = klio_runtime::StdoutOutput;
+            interp
+                .register_pack_sources(&asts, &mut out)
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+    // No frozen AST — re-parse from the raw source bytes.
     if let Some(payload) = pack.read_section(section_names::SOURCES).map_err(|e| e.to_string())? {
         let bundle: SourceBundle = decode(&payload).map_err(|e| e.to_string())?;
         if !bundle.files.is_empty() {

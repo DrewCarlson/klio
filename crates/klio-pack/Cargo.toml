@@ -16,3 +16,4 @@ blake3     = { version = "1", default-features = false }
 zstd       = { version = "0.13", default-features = false }
 thiserror  = "2"
 bitflags   = { version = "2", features = ["serde"] }
+klio-ast   = { workspace = true }

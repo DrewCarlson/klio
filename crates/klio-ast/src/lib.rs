@@ -2,7 +2,7 @@
 
 use klio_span::Span;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Ident {
     pub name: String,
     pub span: Span,
@@ -12,7 +12,7 @@ pub struct Ident {
 /// `Public` when the source omits a modifier, matching Kotlin's default.
 /// Phase E will enforce cross-visibility access; the parser models the
 /// modifier today so downstream passes can read it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Visibility {
     #[default]
     Public,
@@ -24,7 +24,7 @@ pub enum Visibility {
 /// Use-site target for a declaration-site annotation, e.g. `@field:Foo`,
 /// `@get:Bar`. `None` on an `Annotation` means the source wrote a plain
 /// `@Foo` with no explicit target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AnnotationUseSite {
     Field,
     Property,
@@ -40,7 +40,7 @@ pub enum AnnotationUseSite {
 /// A single `@Foo(args)` / `@use-site:Foo` annotation at a declaration
 /// site. Values inside are parsed best-effort; downstream passes treat
 /// them as opaque for now.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Annotation {
     pub use_site: Option<AnnotationUseSite>,
     pub path: Vec<Ident>,
@@ -50,7 +50,7 @@ pub struct Annotation {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KotlinFile {
     pub package: Option<PackageHeader>,
     pub imports: Vec<ImportDecl>,
@@ -58,13 +58,13 @@ pub struct KotlinFile {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PackageHeader {
     pub path: Vec<Ident>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportDecl {
     pub path: Vec<Ident>,
     pub alias: Option<Ident>,
@@ -72,7 +72,7 @@ pub struct ImportDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Decl {
     Function(Function),
     Property(Property),
@@ -85,7 +85,7 @@ pub enum Decl {
     TypeAlias(TypeAlias),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypeAlias {
     pub name: Ident,
     pub type_params: Vec<TypeParam>,
@@ -95,7 +95,7 @@ pub struct TypeAlias {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Function {
     pub name: Ident,
     /// Receiver type for an extension function declared as
@@ -142,7 +142,7 @@ pub struct Function {
 }
 
 /// Variance of a type parameter (declaration site) or type argument (use site).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Variance {
     #[default]
     Invariant,
@@ -153,7 +153,7 @@ pub enum Variance {
 }
 
 /// Generic type parameter declaration, e.g. `<out T : Comparable<T>>`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypeParam {
     pub name: Ident,
     pub variance: Variance,
@@ -167,7 +167,7 @@ pub struct TypeParam {
 }
 
 /// Single `where` clause bound: `where T : Foo`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WhereBound {
     pub name: Ident,
     pub bound: TypeRef,
@@ -176,7 +176,7 @@ pub struct WhereBound {
 
 /// Type argument inside a `<...>` instantiation. Tracks projection (`*`,
 /// `out X`, `in X`) so the type checker can enforce variance on use sites.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypeArg {
     pub variance: Variance,
     /// `*` star-projection; when true `ty` is unused.
@@ -185,13 +185,13 @@ pub struct TypeArg {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum FunctionBody {
     Block(Block),
     Expr(Expr),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Param {
     pub name: Ident,
     pub ty: TypeRef,
@@ -209,7 +209,7 @@ pub struct Param {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Property {
     pub mutable: bool,
     pub name: Ident,
@@ -262,7 +262,7 @@ pub struct Property {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Accessor {
     /// For a setter the single parameter (`set(value)`); empty for a
     /// getter.
@@ -279,7 +279,7 @@ pub struct Accessor {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Class {
     pub name: Ident,
     /// Generic type parameters: `class Box<out T>`.
@@ -359,7 +359,7 @@ pub struct Class {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EnumEntry {
     pub name: Ident,
     /// Constructor arguments — present when the enum declares a primary ctor.
@@ -371,7 +371,7 @@ pub struct EnumEntry {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClassParam {
     /// `None` when the param isn't a property; `Some(true)` for `var`,
     /// `Some(false)` for `val`.
@@ -387,7 +387,7 @@ pub struct ClassParam {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SecondaryCtor {
     pub params: Vec<Param>,
     pub delegation: CtorDelegation,
@@ -397,7 +397,7 @@ pub struct SecondaryCtor {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CtorDelegation {
     /// `: this(args)` — delegate to another constructor on this class.
     This(Vec<Expr>),
@@ -409,7 +409,7 @@ pub enum CtorDelegation {
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ObjectDecl {
     pub name: Ident,
     pub supertypes: Vec<TypeRef>,
@@ -426,7 +426,7 @@ pub struct ObjectDecl {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TypeRef {
     pub name: Ident,
     pub nullable: bool,
@@ -453,7 +453,7 @@ pub struct TypeRef {
 
 /// Function type written as a type annotation, e.g.
 /// `(Int, String) -> Boolean` or `Receiver.(Int) -> Unit`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FunctionTypeRef {
     pub receiver: Option<TypeRef>,
     pub params: Vec<TypeRef>,
@@ -462,13 +462,13 @@ pub struct FunctionTypeRef {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Stmt {
     Expr(Expr),
     Decl(Decl),
@@ -490,7 +490,7 @@ pub enum Stmt {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AssignOp {
     Assign,
     Add,
@@ -504,7 +504,7 @@ pub enum AssignOp {
 /// `Long`, `1u` is `UInt`, `1uL` is `ULong`. Drives both the runtime
 /// variant chosen by the interpreter and the literal's static type
 /// in the type checker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum IntLitKind {
     #[default]
     Int,
@@ -515,14 +515,14 @@ pub enum IntLitKind {
 
 /// Suffix-derived kind of a floating-point literal. `1.0` is `Double`;
 /// `1.0f` / `1.0F` is `Float`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum FloatLitKind {
     #[default]
     Double,
     Float,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
     IntLit { value: i64, kind: IntLitKind, span: Span },
     FloatLit { value: f64, kind: FloatLitKind, span: Span },
@@ -647,7 +647,7 @@ pub enum Expr {
 /// `when (val name: Ty = subject)` — binds `name` to the subject's value
 /// for the duration of the when's branches. `ty` is `None` when the
 /// source omitted the type annotation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WhenBinding {
     pub name: Ident,
     pub ty: Option<TypeRef>,
@@ -655,7 +655,7 @@ pub struct WhenBinding {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WhenBranch {
     /// Comma-separated patterns on the left of `->`. A branch fires when any
     /// pattern matches. An `Else` pattern can only appear by itself.
@@ -664,13 +664,13 @@ pub struct WhenBranch {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WhenPattern {
     pub kind: WhenPatternKind,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum WhenPatternKind {
     /// `value` — equality match against the subject (subject-bound `when`),
     /// or Boolean condition (subject-free `when`).
@@ -688,7 +688,7 @@ pub enum WhenPatternKind {
     Else,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Catch {
     pub binding: Ident,
     pub ty: TypeRef,
@@ -696,14 +696,14 @@ pub struct Catch {
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum StringPart {
     Text(String),
     ShortInterp(Ident),
     Interp(Expr),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BinOp {
     Add, Sub, Mul, Div, Rem,
     Eq, Neq, IdentEq, IdentNeq,
@@ -718,7 +718,7 @@ pub enum BinOp {
     Assign,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UnOp {
     Neg,
     Pos,
@@ -727,7 +727,7 @@ pub enum UnOp {
     PreDec,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PostfixOp {
     Inc,
     Dec,

@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 klio-span = { workspace = true }
+serde     = { workspace = true }
 
 [lints]
 workspace = true

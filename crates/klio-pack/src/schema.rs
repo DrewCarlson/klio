@@ -210,6 +210,26 @@ pub struct SourceFile {
 }
 
 // ---------------------------------------------------------------------
+// ast
+// ---------------------------------------------------------------------
+
+/// Frozen front-end output. When present, the interpreter skips the
+/// parse pass at install time and feeds the carried `KotlinFile`
+/// directly into `register_pack_sources`. The pack still ships the
+/// raw source bytes in `sources` for diagnostic spans and re-parse
+/// fallback.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AstBundle {
+    pub files: Vec<AstFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AstFile {
+    pub rel_path: String,
+    pub kotlin_file: klio_ast::KotlinFile,
+}
+
+// ---------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------
 

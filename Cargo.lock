@@ -675,6 +675,7 @@ name = "klio-ast"
 version = "0.1.0"
 dependencies = [
  "klio-span",
+ "serde",
 ]
 
 [[package]]
@@ -815,6 +816,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "blake3",
+ "klio-ast",
  "postcard",
  "serde",
  "thiserror",
@@ -875,6 +877,9 @@ dependencies = [
 [[package]]
 name = "klio-span"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "klio-stdlib"
