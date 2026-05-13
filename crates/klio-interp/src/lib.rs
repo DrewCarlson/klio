@@ -817,6 +817,23 @@ impl Interpreter {
                     cur = p.parent.borrow().clone();
                 }
             }
+            Value::Class(c) => {
+                // A bare reference to a class can dispatch to extensions
+                // on the class's companion object via the enclosing class
+                // name, e.g. `Foo.bar()` where `bar` is declared on
+                // `Foo.Companion`. Match the registration key shape used
+                // for those extensions.
+                if let Some(comp) = &c.companion {
+                    let comp_name = &comp.borrow().class.name;
+                    out.push(format!("{}.{}", c.name, comp_name));
+                    out.push(comp_name.clone());
+                    // The `Companion` keyword aliases the companion
+                    // regardless of its declared name, per Kotlin spec.
+                    out.push(format!("{}.Companion", c.name));
+                    out.push("Companion".to_string());
+                }
+                out.push(c.name.clone());
+            }
             _ => {
                 let fqn = value.type_fqn();
                 let simple = fqn.rsplit('.').next().unwrap_or(fqn);
@@ -7391,6 +7408,14 @@ impl Interpreter {
                         }
                         return self.construct_instance(&nc, &arg_vals, arg_names, out);
                     }
+                }
+                // Extension functions on the class or its companion —
+                // `fun Foo.bar()` or `fun Foo.Companion.bar()` invoked
+                // via `Foo.bar()`.
+                if let Some(v) =
+                    self.try_extension_call(&recv, &name.name, args, arg_names, env, out)?
+                {
+                    return Ok(v);
                 }
                 return Err(RuntimeError::Unimplemented(format!(
                     "{}.{}",
