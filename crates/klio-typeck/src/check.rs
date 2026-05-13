@@ -8046,6 +8046,29 @@ impl<'r> Checker<'r> {
                 }
                 None
             }
+            // Spec §18.6 coroutine bridge: `runBlocking { suspend ... }`
+            // executes its trailing lambda inside a new suspending
+            // context. Type-check the lambda body with the suspend bit
+            // set so `suspend` callees and `suspendCoroutine { ... }`
+            // type-check; this is the language-side contract that lets
+            // our synchronous coroutine runtime in klio-interp drive
+            // the lambda.
+            "runBlocking" | "suspendCoroutine"
+            | "suspendCoroutineUninterceptedOrReturn"
+            | "suspendCancellableCoroutine"
+                if args.len() == 1 =>
+            {
+                if let Expr::Lambda { params, body, .. } = &args[0] {
+                    self.suspend_context_stack.push(true);
+                    let ty = self.check_lambda_in_place(params, body, None, None);
+                    self.suspend_context_stack.pop();
+                    return Some(match ty {
+                        Type::Function { return_type, .. } => *return_type,
+                        _ => Type::Unresolved,
+                    });
+                }
+                None
+            }
             "with" if args.len() == 2 => {
                 let recv = self.check_expr(&args[0], None);
                 let recv_cls = self.expr_class.get(&args[0].span()).cloned();

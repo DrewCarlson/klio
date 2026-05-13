@@ -84,6 +84,14 @@ pub struct Interpreter {
     /// scope chain. `synthesize_annotation_value` consults this when
     /// building `KClass.annotations` instances.
     class_table: std::collections::HashMap<String, Rc<ClassDef>>,
+    /// Stack of pending coroutine continuation holders. Pushed by
+    /// `suspendCoroutine` / `suspendCoroutineUninterceptedOrReturn`
+    /// before the user lambda runs; the synthetic `Continuation`
+    /// value passed into that lambda writes back into the top
+    /// holder when `resume` / `resumeWith` / `resumeWithException`
+    /// is called. Drained by the suspending-call site after the
+    /// lambda returns to produce its result.
+    coroutine_continuations: Vec<Rc<RefCell<ContinuationSlot>>>,
     /// Monotonic counter for synthesizing unique names for anonymous-object
     /// `ClassDef`s. Only surfaces in diagnostic-style debug output.
     anon_class_counter: usize,
@@ -157,7 +165,19 @@ pub struct Interpreter {
     current_package: Option<String>,
 }
 
-#[derive(Clone)]
+/// Holder a `Continuation<T>` writes into when its `resume` /
+/// `resumeWith` / `resumeWithException` is called inside a
+/// `suspendCoroutine { cont -> … }` block. The enclosing
+/// suspending call site reads the slot once the user lambda
+/// returns and produces either a normal value or a re-thrown
+/// exception.
+#[derive(Debug, Clone)]
+enum ContinuationSlot {
+    Pending,
+    Resumed(Value),
+    Failed(Value),
+}
+
 struct TailrecFrame {
     name: String,
     sites: Rc<std::collections::HashSet<klio_span::Span>>,
@@ -199,6 +219,7 @@ impl Interpreter {
             top_level_props: std::collections::HashMap::new(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
+            coroutine_continuations: Vec::new(),
             anon_class_counter: 0,
             instance_id_counter: 0,
             extensions: std::collections::HashMap::new(),
@@ -4835,6 +4856,144 @@ impl Interpreter {
         }
     }
 
+    /// Spec §18.2 `suspendCoroutine` / `suspendCoroutineUninterceptedOrReturn`.
+    /// Allocates a continuation slot, builds a synthetic
+    /// `Continuation` value bound to it, invokes the user lambda,
+    /// and reads back whichever of `resume` / `resumeWith` /
+    /// `resumeWithException` populated the slot. The state-machine
+    /// lowering that lets a `suspend` body actually pause across
+    /// dispatcher boundaries lives in `kotlinx.coroutines` — out
+    /// of scope; what we provide here is the language-level
+    /// machinery that lets a synchronous `suspendCoroutine { cont ->
+    /// cont.resume(v) }` produce `v`.
+    fn eval_suspend_coroutine(
+        &mut self,
+        lam: &Value,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        let Value::Lambda { params, body, env: captured, .. } = lam else {
+            return Err(RuntimeError::Type(
+                "suspendCoroutine expects a lambda".into(),
+            ));
+        };
+        let slot = Rc::new(RefCell::new(ContinuationSlot::Pending));
+        self.coroutine_continuations.push(Rc::clone(&slot));
+        let cont = self.make_continuation_value(Rc::clone(&slot));
+        let lambda_result = self.call_lambda(params, body, captured, &[cont], out);
+        self.coroutine_continuations.pop();
+        // If the lambda completed normally we honour the
+        // continuation's recorded resume value. If it threw, that
+        // propagates as-is. The intrinsic-return value (when the
+        // lambda returns a normal value rather than calling
+        // resume) is the suspend-or-return shortcut — return it
+        // directly, matching the "Uninterceptedy" semantics.
+        let direct = lambda_result?;
+        let slot_state = slot.borrow().clone();
+        match slot_state {
+            ContinuationSlot::Resumed(v) => Ok(v),
+            ContinuationSlot::Failed(e) => Err(RuntimeError::Thrown(e)),
+            ContinuationSlot::Pending => Ok(direct),
+        }
+    }
+
+    /// Build a synthetic `Continuation<T>` value the user lambda
+    /// receives in `suspendCoroutine { cont -> … }`. Implemented as
+    /// a `Value::Instance` of a runtime-only synthetic class so
+    /// `cont.resume(v)` / `cont.resumeWith(r)` /
+    /// `cont.resumeWithException(e)` and the `context` accessor
+    /// dispatch through the standard member-lookup path.
+    /// `kotlin.coroutines.EmptyCoroutineContext` as a synthetic
+    /// `Value::Instance`. Returned by `Continuation.context` and
+    /// available as the `coroutineContext` top-level property in a
+    /// suspend body.
+    fn empty_coroutine_context(&self) -> Value {
+        let class = Rc::new(ClassDef {
+            name: "EmptyCoroutineContext".to_string(),
+            fqn: "kotlin.coroutines.EmptyCoroutineContext".to_string(),
+            annotation_names: Vec::new(),
+            primary_params: Vec::new(),
+            methods: Vec::new(),
+            body_properties: Vec::new(),
+            init_blocks: Vec::new(),
+            is_data: false,
+            is_object: true,
+            is_enum: false,
+            is_sealed: false,
+            supertype_names: vec!["CoroutineContext".to_string()],
+            parent: RefCell::new(None),
+            interfaces: RefCell::new(Vec::new()),
+            is_interface: false,
+            is_fun_interface: false,
+            parent_ctor_args: Vec::new(),
+            is_open: false,
+            is_abstract: false,
+            is_inner: false,
+            is_anonymous: true,
+            secondary_ctors: Vec::new(),
+            enum_entries: RefCell::new(Vec::new()),
+            companion: None,
+            enclosing_class: RefCell::new(None),
+            nested_classes: RefCell::new(Vec::new()),
+            captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
+            supertype_delegates: RefCell::new(Vec::new()),
+            delegate_forwarders: RefCell::new(Vec::new()),
+            object_singleton: RefCell::new(None),
+        });
+        Value::Instance(Rc::new(RefCell::new(InstanceData {
+            class,
+            fields: Vec::new(),
+            outer: None,
+            identity: 0,
+        })))
+    }
+
+    fn make_continuation_value(&self, slot: Rc<RefCell<ContinuationSlot>>) -> Value {
+        let class = Rc::new(ClassDef {
+            name: "Continuation".to_string(),
+            fqn: "kotlin.coroutines.Continuation".to_string(),
+            annotation_names: Vec::new(),
+            primary_params: Vec::new(),
+            methods: Vec::new(),
+            body_properties: Vec::new(),
+            init_blocks: Vec::new(),
+            is_data: false,
+            is_object: false,
+            is_enum: false,
+            is_sealed: false,
+            supertype_names: vec!["Continuation".to_string()],
+            parent: RefCell::new(None),
+            interfaces: RefCell::new(Vec::new()),
+            is_interface: false,
+            is_fun_interface: false,
+            parent_ctor_args: Vec::new(),
+            is_open: false,
+            is_abstract: false,
+            is_inner: false,
+            is_anonymous: true,
+            secondary_ctors: Vec::new(),
+            enum_entries: RefCell::new(Vec::new()),
+            companion: None,
+            enclosing_class: RefCell::new(None),
+            nested_classes: RefCell::new(Vec::new()),
+            captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
+            supertype_delegates: RefCell::new(Vec::new()),
+            delegate_forwarders: RefCell::new(Vec::new()),
+            object_singleton: RefCell::new(None),
+        });
+        let inst = Rc::new(RefCell::new(InstanceData {
+            class,
+            fields: Vec::new(),
+            outer: None,
+            identity: 0,
+        }));
+        // The active suspendCoroutine call holds the slot at the top
+        // of coroutine_continuations; the instance itself is a
+        // marker. resume / resumeWith / resumeWithException
+        // dispatch reaches in through the stack.
+        let _ = slot;
+        Value::Instance(inst)
+    }
+
     /// Indexed higher-order list ops: `mapIndexed`, `forEachIndexed`,
     /// `filterIndexed`. The lambda receives `(index, value)`.
     fn try_eval_indexed_higher_order(
@@ -7814,6 +7973,36 @@ impl Interpreter {
                 return self.eval_run_catching(&lam, None, out);
             }
         }
+        // Coroutine intrinsics (spec §18.2). For our purposes a
+        // `suspend` block is executed synchronously: there is no
+        // state-machine lowering; the suspending function's body
+        // runs to completion and any `cont.resume(v)` inside a
+        // `suspendCoroutine { … }` writes the result into a slot
+        // we read once the lambda returns. Real async (delay,
+        // launch, async) lives in kotlinx.coroutines which is
+        // out of scope.
+        if let Some(name) = simple_callee_name(callee) {
+            match name {
+                "runBlocking" if args.len() == 1 => {
+                    let lam = self.eval_expr(&args[0], env, out)?;
+                    if let Value::Lambda { params, body, env: captured, .. } = &lam {
+                        return self.call_lambda(params, body, captured, &[], out);
+                    }
+                    return Err(RuntimeError::Type(
+                        "runBlocking expects a lambda".into(),
+                    ));
+                }
+                "suspendCoroutine"
+                | "suspendCoroutineUninterceptedOrReturn"
+                | "suspendCancellableCoroutine"
+                    if args.len() == 1 =>
+                {
+                    let lam = self.eval_expr(&args[0], env, out)?;
+                    return self.eval_suspend_coroutine(&lam, out);
+                }
+                _ => {}
+            }
+        }
         // `Result.success(x)` / `Result.failure(e)` — static factories.
         if let Expr::Member { receiver, name, safe: false, .. } = callee {
             if let Some(rname) = simple_callee_name(receiver) {
@@ -8090,6 +8279,48 @@ impl Interpreter {
                         pos: Rc::new(RefCell::new(0)),
                         prim: None,
                     });
+                }
+            }
+            // Synthetic kotlin.coroutines.Continuation: resume /
+            // resumeWith / resumeWithException write into the
+            // active continuation slot.
+            if let Value::Instance(inst) = &recv {
+                let cls_fqn = inst.borrow().class.fqn.clone();
+                if cls_fqn == "kotlin.coroutines.Continuation" {
+                    match name.name.as_str() {
+                        "resume" | "resumeWith" | "resumeWithException"
+                            if args.len() == 1 =>
+                        {
+                            let v = self.eval_expr(&args[0], env, out)?;
+                            let Some(slot) = self.coroutine_continuations.last() else {
+                                return Err(RuntimeError::Type(
+                                    "continuation used outside an active suspendCoroutine".into(),
+                                ));
+                            };
+                            let mut s = slot.borrow_mut();
+                            match name.name.as_str() {
+                                "resume" => *s = ContinuationSlot::Resumed(v),
+                                "resumeWith" => {
+                                    if let Value::Result { ok, payload } = v {
+                                        *s = if ok {
+                                            ContinuationSlot::Resumed(*payload)
+                                        } else {
+                                            ContinuationSlot::Failed(*payload)
+                                        };
+                                    } else {
+                                        *s = ContinuationSlot::Resumed(v);
+                                    }
+                                }
+                                "resumeWithException" => *s = ContinuationSlot::Failed(v),
+                                _ => unreachable!(),
+                            }
+                            return Ok(Value::Unit);
+                        }
+                        "context" if args.is_empty() => {
+                            return Ok(self.empty_coroutine_context());
+                        }
+                        _ => {}
+                    }
                 }
             }
             // Instance method dispatch (user classes).
@@ -11955,5 +12186,43 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["true", "false", "true"]);
+    }
+
+    #[test]
+    fn coroutines_suspend_resume() {
+        let src = r#"
+            import kotlin.coroutines.*
+            suspend fun double(x: Int): Int = suspendCoroutine { cont ->
+                cont.resume(x * 2)
+            }
+            suspend fun chain(): Int {
+                val a = double(5)
+                val b = double(a)
+                return a + b
+            }
+            fun main() {
+                println(runBlocking { chain() })
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["30"]);
+    }
+
+    #[test]
+    fn coroutines_resume_with_exception() {
+        let src = r#"
+            import kotlin.coroutines.*
+            fun main() {
+                val r = runCatching {
+                    runBlocking {
+                        suspendCoroutine<Int> { cont ->
+                            cont.resumeWithException(RuntimeException("boom"))
+                        }
+                    }
+                }
+                println(r.isFailure)
+                println(r.exceptionOrNull()?.message)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["true", "boom"]);
     }
 }
