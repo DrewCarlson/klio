@@ -594,6 +594,16 @@ struct ClassInfo {
     member_class: HashMap<String, String>,
     /// Names of supertypes (raw — interfaces or classes).
     supertypes: Vec<String>,
+    /// Typed supertypes paired with type-arg lists, in declaration
+    /// order. Each entry is `(supertype_name, [Type, Type, ...])`.
+    /// Drives the GADT static refinement: when a smart-cast narrows
+    /// a value of declared type `Super<T>` to a class whose typed
+    /// supertypes include `Super<Int>`, the typechecker derives
+    /// `T -> Int` for the branch body.
+    typed_supertypes: Vec<(String, Vec<Type>)>,
+    /// Type parameter names declared on this class. Parallel to
+    /// `typed_supertypes` for substitution lookups.
+    type_param_names: Vec<String>,
     is_abstract: bool,
     is_interface: bool,
     is_sealed: bool,
@@ -3417,10 +3427,62 @@ impl<'r> Checker<'r> {
             info.ctor = Some(ctor_sig);
         }
         self.collect_members(&c.members, &mut info);
+        info.type_param_names = c.type_params.iter().map(|tp| tp.name.name.clone()).collect();
         for s in &c.supertypes {
             info.supertypes.push(s.name.name.clone());
+            let type_args: Vec<Type> = s
+                .type_args
+                .iter()
+                .map(|ta| {
+                    if ta.is_star {
+                        Type::Unresolved
+                    } else {
+                        convert_type_ref_lossy(&ta.ty)
+                    }
+                })
+                .collect();
+            info.typed_supertypes.push((s.name.name.clone(), type_args));
         }
         info
+    }
+
+    /// GADT supertype walk: given a `subclass` and a `target` class
+    /// name, find the type-arg list `subclass` declares for
+    /// `target` in its supertype chain. Returns `Some(args)` when a
+    /// match is found anywhere along the transitive supertype
+    /// chain; `None` when the chain has no link to `target`.
+    fn walk_supertype_args(&self, subclass: &str, target: &str) -> Option<Vec<Type>> {
+        let info = self.classes.get(subclass)?;
+        if subclass == target {
+            return Some(
+                info.type_param_names
+                    .iter()
+                    .map(|n| Type::TypeParam(n.clone()))
+                    .collect(),
+            );
+        }
+        for (s_name, s_args) in &info.typed_supertypes {
+            if s_name == target {
+                return Some(s_args.clone());
+            }
+            if let Some(deeper) = self.walk_supertype_args(s_name, target) {
+                // Substitute the subclass's args into the deeper
+                // result: if `subclass : Mid<X>` and
+                // `Mid<X> : Target<f(X)>`, derive `Target<f(arg)>`
+                // by replacing `X` in `deeper` with `s_args`.
+                let mid_info = self.classes.get(s_name)?;
+                let mut subst: HashMap<String, Type> = HashMap::new();
+                for (name, arg) in mid_info.type_param_names.iter().zip(s_args.iter()) {
+                    subst.insert(name.clone(), arg.clone());
+                }
+                let substituted: Vec<Type> = deeper
+                    .iter()
+                    .map(|t| substitute_type_params(t, &subst))
+                    .collect();
+                return Some(substituted);
+            }
+        }
+        None
     }
 
     fn collect_members(&self, members: &[Decl], info: &mut ClassInfo) {
@@ -8529,10 +8591,17 @@ impl<'r> Checker<'r> {
         if src.is_subtype_of(dst) {
             return;
         }
-        // Don't flag nullable-to-non-null here when src is `Nothing?` (the
-        // type of literal `null`) against a nullable dst — already handled
-        // by is_subtype_of via Nothing <: T <: T?. The remaining case is
-        // assigning `T?` to `T`, which is a real error.
+        // GADT-style refinement: when the dst carries a type
+        // parameter that the CFG knows has been refined to a
+        // concrete type at this branch (via an `is`-narrowing on a
+        // declared `Super<T>` receiver), substitute and retry.
+        let gadt = self.cfg_gadt_subst_at(span);
+        if !gadt.is_empty() {
+            let dst_refined = substitute_type_params(dst, &gadt);
+            if src.is_subtype_of(&dst_refined) {
+                return;
+            }
+        }
         self.diagnostics.emit(
             Diagnostic::error(
                 format!("Type mismatch: inferred type is `{src}` but `{dst}` was expected"),
@@ -8642,6 +8711,70 @@ impl<'r> Checker<'r> {
             break;
         }
         None
+    }
+
+    /// GADT-style refinement: when a smart-cast narrowing at
+    /// `query_span` has refined a place from `Super<T>` to a
+    /// subclass whose typed-supertype chain instantiates
+    /// `Super<f(...)>`, derive the substitution that unifies `T`
+    /// with the corresponding position in `f(...)`. Returns the
+    /// per-type-parameter substitution accumulated over every
+    /// in-scope place at this program point; empty when the CFG
+    /// has no class narrowings or the declared types don't carry
+    /// type parameters.
+    fn cfg_gadt_subst_at(&self, query_span: Span) -> std::collections::HashMap<String, Type> {
+        let mut subst = std::collections::HashMap::new();
+        let Some(fn_span) = self.cfg_fn_stack.last().copied() else { return subst };
+        let Some(lowered) = self.lowerings.get(&fn_span) else { return subst };
+        let Some((bid, pos)) = lowered
+            .span_to_pos
+            .get(&(query_span.start, query_span.end))
+            .copied()
+        else { return subst };
+        use klio_cfa::analyses::smartcast;
+        let declared = self.cfg_declared_types();
+        let entries = smartcast::solve_with_declared(
+            &lowered.cfg,
+            &lowered.reg_to_place,
+            Some(&declared),
+        );
+        let Some(entry) = entries.into_iter().nth(bid.0 as usize) else {
+            return subst;
+        };
+        let states = smartcast::states_within_block_with_declared(
+            &lowered.cfg,
+            bid,
+            entry,
+            &lowered.reg_to_place,
+            Some(&declared),
+        );
+        let Some(state) = states.get(pos) else { return subst };
+        for (place, fact) in &state.map {
+            let Some(narrowed_class) = &fact.narrowed_class else { continue };
+            let klio_cfa::Place::Local(sym) = place else { continue };
+            let Some(binding) = self.lookup(&sym.0) else { continue };
+            let Type::Generic { name: declared_head, args: declared_args } =
+                &binding.ty.non_null()
+            else {
+                continue;
+            };
+            let Some(supertype_args) =
+                self.walk_supertype_args(narrowed_class, declared_head)
+            else {
+                continue;
+            };
+            for (declared_arg, super_arg) in declared_args.iter().zip(supertype_args.iter()) {
+                if declared_arg.is_star {
+                    continue;
+                }
+                if let Type::TypeParam(tp_name) = &declared_arg.ty {
+                    if !matches!(super_arg, Type::TypeParam(_) | Type::Unresolved) {
+                        subst.entry(tp_name.clone()).or_insert_with(|| super_arg.clone());
+                    }
+                }
+            }
+        }
+        subst
     }
 
     /// Returns true when the CFG's VIA analysis classifies `name`
