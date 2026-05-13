@@ -1254,7 +1254,12 @@ impl Interpreter {
                                 return Ok(Value::Unit);
                             }
                         }
-                        let cur = if pdef.as_ref().map_or(false, |p| p.delegate.is_some() || p.getter.is_some()) {
+                        let cur = if matches!(op, AssignOp::Assign) {
+                            // Plain assignment: no need to read the old
+                            // value — skip the getter so it isn't fired
+                            // as a side effect of the write.
+                            None
+                        } else if pdef.as_ref().map_or(false, |p| p.delegate.is_some() || p.getter.is_some()) {
                             // For delegated / computed properties, route
                             // reads through the dispatch path so compound
                             // assignments observe the right "current" value.
