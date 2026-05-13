@@ -44,6 +44,34 @@ pub fn typecheck(file: &KotlinFile, resolution: &Resolution) -> TypeCheck {
     }
 }
 
+/// Multi-file entry point. Synthesizes a merged `KotlinFile` whose decls
+/// and imports are the concatenation of every input file's; per-decl
+/// `Span::file` is preserved so cross-file visibility checks (T0032)
+/// continue to work.
+#[must_use]
+pub fn typecheck_module(files: &[KotlinFile], resolution: &Resolution) -> TypeCheck {
+    let merged = merge_module_files(files);
+    typecheck(&merged, resolution)
+}
+
+fn merge_module_files(files: &[KotlinFile]) -> KotlinFile {
+    let mut iter = files.iter();
+    let Some(first) = iter.next() else {
+        return KotlinFile {
+            package: None,
+            imports: Vec::new(),
+            decls: Vec::new(),
+            span: klio_span::Span { file: klio_span::FileId(0), start: 0, end: 0 },
+        };
+    };
+    let mut out = first.clone();
+    for f in iter {
+        out.decls.extend(f.decls.iter().cloned());
+        out.imports.extend(f.imports.iter().cloned());
+    }
+    out
+}
+
 /// Diagnostic codes emitted by the type checker.
 pub mod codes {
     pub const TYPE_MISMATCH: &str = "T0001";
@@ -731,6 +759,17 @@ struct Checker<'a> {
     /// Phase F so `check_annotation_class` can accept enum types as
     /// primary-ctor parameter types per spec §17.1.
     enum_class_names: HashSet<String>,
+    /// Annotation-class names that are themselves marked `@DslMarker`.
+    /// Spec §17.5.9: classes carrying any such annotation participate in
+    /// the dsl-scope tower-shadowing check.
+    dsl_marker_annotations: HashSet<String>,
+    /// Class name → set of dsl-marker annotation names applied to that
+    /// class.
+    dsl_class_markers: HashMap<String, HashSet<String>>,
+    /// Stack of currently-active implicit `this` receivers and their dsl
+    /// markers. Pushed by `check_lambda_in_place` when a lambda binds
+    /// `this` to a class-typed receiver.
+    dsl_receiver_stack: Vec<(String, HashSet<String>)>,
 }
 
 /// Description of a user-declared `typealias`.
@@ -775,6 +814,9 @@ impl<'a> Checker<'a> {
             prop_annotations: HashMap::new(),
             annotation_class_names: HashSet::new(),
             enum_class_names: HashSet::new(),
+            dsl_marker_annotations: HashSet::new(),
+            dsl_class_markers: HashMap::new(),
+            dsl_receiver_stack: Vec::new(),
         }
     }
 
@@ -783,6 +825,35 @@ impl<'a> Checker<'a> {
         // top-level property types so forward references in bodies typecheck.
         for d in &file.decls {
             self.declare_top_level(d);
+        }
+        // §17.5.9: collect dsl-marker annotation classes and the user
+        // classes that carry them so per-body DSL-scope diagnostics can
+        // consult them as the lambda-receiver stack is pushed.
+        {
+            let mut all_classes: Vec<&Class> = Vec::new();
+            collect_all_classes(&file.decls, &mut all_classes);
+            for c in &all_classes {
+                if !c.is_annotation { continue; }
+                for a in &c.annotations {
+                    if annotation_simple_name(a) == "DslMarker" {
+                        self.dsl_marker_annotations.insert(c.name.name.clone());
+                        break;
+                    }
+                }
+            }
+            for c in &all_classes {
+                if c.is_annotation { continue; }
+                let mut markers: HashSet<String> = HashSet::new();
+                for a in &c.annotations {
+                    let nm = annotation_simple_name(a);
+                    if self.dsl_marker_annotations.contains(&nm) {
+                        markers.insert(nm);
+                    }
+                }
+                if !markers.is_empty() {
+                    self.dsl_class_markers.insert(c.name.name.clone(), markers);
+                }
+            }
         }
         // Second pass: typecheck bodies.
         for d in &file.decls {
@@ -5494,6 +5565,7 @@ impl<'r> Checker<'r> {
             Expr::Path { segments, span } => {
                 if segments.len() == 1 {
                     let name = &segments[0].name;
+                    self.enforce_dsl_scope_for_member(name, *span);
                     if let Some(cn) = self.lookup_narrowed_class(name) {
                         self.expr_class.insert(*span, cn);
                     }
@@ -5556,6 +5628,12 @@ impl<'r> Checker<'r> {
                         let _ = self.check_expr(receiver, None);
                         return narrowed;
                     }
+                }
+                // §17.5.9: `this@Outer.b` is rejected when a closer DSL
+                // receiver sharing a marker with `Outer` is also in scope
+                // and itself exposes a member named `b`.
+                if let Expr::This { qualifier: Some(q), .. } = receiver.as_ref() {
+                    self.enforce_dsl_scope_for_qualified_this(&q.name, &name.name, name.span);
                 }
                 let recv_ty = self.check_expr(receiver, None);
                 let recv_class = self.expr_class.get(&receiver.span()).cloned();
@@ -6878,6 +6956,77 @@ impl<'r> Checker<'r> {
         None
     }
 
+    /// §17.5.9: a bare member reference inside nested DSL lambdas must
+    /// resolve against the innermost implicit receiver whenever any
+    /// closer receiver shares a dsl marker with the receiver that
+    /// actually owns the member. Emits T0113 at `member_span` otherwise.
+    fn enforce_dsl_scope_for_member(&mut self, name: &str, member_span: Span) {
+        let stack = self.dsl_receiver_stack.clone();
+        if stack.len() < 2 { return; }
+        let last_idx = stack.len() - 1;
+        let mut resolved: Option<usize> = None;
+        for (i, (cls, _)) in stack.iter().enumerate() {
+            if self.lookup_member_through_chain(cls, name).is_some() {
+                resolved = Some(i);
+            }
+        }
+        let Some(idx) = resolved else { return };
+        if idx == last_idx { return; }
+        let (resolved_cls, resolved_markers) = stack[idx].clone();
+        if resolved_markers.is_empty() { return; }
+        let mut inner_cls: Option<String> = None;
+        for (cls, markers) in &stack[idx + 1..] {
+            if markers.iter().any(|m| resolved_markers.contains(m)) {
+                inner_cls = Some(cls.clone());
+                break;
+            }
+        }
+        let Some(inner) = inner_cls else { return };
+        self.diagnostics.emit(
+            Diagnostic::error(
+                format!(
+                    "member `{name}` of `{resolved_cls}` is shadowed by a closer DSL receiver of type `{inner}`"
+                ),
+                member_span,
+            )
+            .with_code(codes::TYPE_DSL_SCOPE_VIOLATION),
+        );
+    }
+
+    /// §17.5.9: `this@Outer.b` is rejected when a closer implicit
+    /// receiver shares a marker with `Outer` and also exposes `b`.
+    fn enforce_dsl_scope_for_qualified_this(
+        &mut self,
+        qualifier: &str,
+        member_name: &str,
+        member_span: Span,
+    ) {
+        let stack = self.dsl_receiver_stack.clone();
+        if stack.len() < 2 { return; }
+        let Some(idx) = stack.iter().position(|(c, _)| c == qualifier) else { return };
+        if idx == stack.len() - 1 { return; }
+        let (resolved_cls, resolved_markers) = stack[idx].clone();
+        if resolved_markers.is_empty() { return; }
+        if self.lookup_member_through_chain(&resolved_cls, member_name).is_none() { return; }
+        let mut inner_cls: Option<String> = None;
+        for (cls, markers) in &stack[idx + 1..] {
+            if markers.iter().any(|m| resolved_markers.contains(m)) {
+                inner_cls = Some(cls.clone());
+                break;
+            }
+        }
+        let Some(inner) = inner_cls else { return };
+        self.diagnostics.emit(
+            Diagnostic::error(
+                format!(
+                    "member `{member_name}` of `{resolved_cls}` is shadowed by a closer DSL receiver of type `{inner}`"
+                ),
+                member_span,
+            )
+            .with_code(codes::TYPE_DSL_SCOPE_VIOLATION),
+        );
+    }
+
     /// `a name b` (`is_infix == true`) must resolve to a function declared
     /// with the `infix` modifier. Walks top-level fns, the lhs's class
     /// members, and extension functions visible on the lhs's class chain;
@@ -7130,6 +7279,7 @@ impl<'r> Checker<'r> {
         if let Expr::Path { segments, span: callee_span } = callee {
             if segments.len() == 1 {
                 let name = &segments[0].name;
+                self.enforce_dsl_scope_for_member(name, *callee_span);
                 if !self.fns.contains_key(name) && !self.classes.contains_key(name) {
                     if let Some(ty) = self.check_toplevel_contract_call(name, args, call_span) {
                         return ty;
@@ -8147,9 +8297,16 @@ impl<'r> Checker<'r> {
                 },
             );
             if let Some(cn) = this_cls {
+                let markers = self
+                    .dsl_class_markers
+                    .get(&cn)
+                    .cloned()
+                    .unwrap_or_default();
+                self.dsl_receiver_stack.push((cn.clone(), markers));
                 self.class_stack.push(cn);
                 let actual_ret = self.check_block(body, None);
                 self.class_stack.pop();
+                self.dsl_receiver_stack.pop();
                 self.pop_frame();
                 return Type::Function {
                     params: vec![],
@@ -10196,6 +10353,19 @@ fn collect_annotation_classes<'a>(decls: &'a [Decl], out: &mut Vec<&'a Class>) {
             collect_annotation_classes(&c.members, out);
         }
     }
+}
+
+fn collect_all_classes<'a>(decls: &'a [Decl], out: &mut Vec<&'a Class>) {
+    for d in decls {
+        if let Decl::Class(c) = d {
+            out.push(c);
+            collect_all_classes(&c.members, out);
+        }
+    }
+}
+
+fn annotation_simple_name(a: &klio_ast::Annotation) -> String {
+    a.path.last().map(|s| s.name.clone()).unwrap_or_default()
 }
 
 fn collect_enum_classes<'a>(decls: &'a [Decl], out: &mut Vec<&'a Class>) {

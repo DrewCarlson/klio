@@ -75,6 +75,7 @@ cargo run -p klio-cli -- run examples/<name>.kt
 | `safe_assign.kt` | §7.1.3 safe assignment `a?.b = c` and chained forms (`p?.address?.city = …`). Receivers are evaluated once and the assignment is skipped — including its RHS — when any safe operator on the LHS spine yields `null`. |
 | `notnull_assertion.kt` | §8.19 not-null assertion `e!!`: passes the value through unchanged when non-null, throws `kotlin.NullPointerException` when null. Typeck narrows the result to the non-nullable variant of the operand's type. |
 | `compound_assign.kt` | §7.1.2 operator assignments dispatching to overloadable `plusAssign` / `minusAssign` etc. Covers user-defined `operator fun plusAssign` for in-place mutation and the built-in mutable collection forms (`xs += elem`, `m -= key`). A `val`-bound name is allowed when its type carries a matching `*Assign` operator. |
+| `dsl_marker.kt` | §17.5.9 `@DslMarker` scoping: two classes carrying the same dsl-marker annotation form one DSL. Inside a nested receiver lambda the outer receiver's members are hidden, so each `apply` block only sees its own builder API. T0113 fires when nested lambdas would otherwise let a closer DSL receiver shadow an outer one's member. |
 
 All examples are gated by `cargo test -p klio-parity --test parity` — every entry here produces byte-identical output to `kotlinc-native`. New examples must include a passing parity check before they ship.
 

@@ -1047,6 +1047,15 @@ fn neg_missing_return() {
 }
 
 #[test]
+fn neg_dsl_marker_nested_shadow() {
+    assert!(
+        type_codes_for("neg_dsl_marker_nested_shadow.kt")
+            .iter()
+            .any(|c| c == "T0113")
+    );
+}
+
+#[test]
 fn neg_suspend_delegate_get_value() {
     assert!(
         type_codes_for("neg_suspend_delegate_get_value.kt")
