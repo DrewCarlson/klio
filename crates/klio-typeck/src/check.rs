@@ -4662,6 +4662,19 @@ impl<'r> Checker<'r> {
         for b in &c.init_blocks {
             self.check_block(b, None);
         }
+        // Build a synthetic CFG covering the primary-ctor init
+        // flow: each declared property (with or without an
+        // initializer) becomes a DeclLocal, body initializers run
+        // in source order interleaved with init blocks. The exit
+        // state's VIA tells us which `needs_init` properties were
+        // definitely assigned along every path.
+        let init_cfg_span = c.name.span;
+        let init_body = self.synthesize_class_init_body(c);
+        let mut lowered = klio_cfa::lower::lower_function(&init_body, init_cfg_span);
+        klio_cfa::dataflow::infer_kill_data_flow(&mut lowered.cfg);
+        self.cfgs.insert(init_cfg_span, lowered.cfg.clone());
+        self.lowerings
+            .insert(init_cfg_span, std::rc::Rc::new(lowered));
         // VIA §12.2.3: every uninitialized `val` / `var` property must be
         // definitely assigned by the time all init blocks (and the primary
         // ctor path) complete. Secondary ctors run a separate flow and
@@ -4672,7 +4685,10 @@ impl<'r> Checker<'r> {
             // positives until that flow is modeled.
         } else {
             for (name, span, _mutable, _decl_span) in &needs_init_props {
-                if !self.assigned.contains(name) {
+                let cfg_says_unassigned = self
+                    .cfg_via_unassigned_at_exit(init_cfg_span, name)
+                    .unwrap_or(true);
+                if cfg_says_unassigned {
                     self.diagnostics.emit(
                         Diagnostic::error(
                             format!("Property `{name}` must be initialized"),
@@ -8781,6 +8797,86 @@ impl<'r> Checker<'r> {
             }
         }
         subst
+    }
+
+    /// Build a synthetic `Block` representing the primary-
+    /// constructor init flow: every declared property becomes a
+    /// `Stmt::Decl(Decl::Property(_))` in source order, and every
+    /// init block contributes its statements at the position it
+    /// appears in `c.members`. Lowering this block produces a CFG
+    /// whose exit state's VIA tells us which `needs_init`
+    /// properties were definitely assigned along every primary-
+    /// ctor path.
+    fn synthesize_class_init_body(&self, c: &Class) -> Block {
+        let mut stmts: Vec<Stmt> = Vec::new();
+        // Primary-param properties are pre-assigned by their
+        // matching ctor argument; emit a declared-and-assigned
+        // shadow as a degenerate `val name = name` so VIA seeds
+        // them as Assigned at the synthetic entry.
+        for p in &c.primary_params {
+            if p.property.is_some() {
+                let shadow = Property {
+                    mutable: p.property == Some(true),
+                    name: p.name.clone(),
+                    receiver_type: None,
+                    ty: Some(p.ty.clone()),
+                    init: Some(Expr::Path {
+                        segments: vec![p.name.clone()],
+                        span: p.name.span,
+                    }),
+                    delegate: None,
+                    getter: None,
+                    setter: None,
+                    is_abstract: false,
+                    is_open: false,
+                    is_override: false,
+                    is_lateinit: false,
+                    is_const: false,
+                    is_inline: false,
+                    setter_visibility: None,
+                    span: p.name.span,
+                    visibility: p.visibility,
+                    annotations: Vec::new(),
+                };
+                stmts.push(Stmt::Decl(Decl::Property(shadow)));
+            }
+        }
+        // Walk members in source order so property initializers
+        // interleave with init blocks correctly.
+        let mut init_block_iter = c.init_blocks.iter();
+        for m in &c.members {
+            if let Decl::Property(p) = m {
+                if p.getter.is_some() || p.delegate.is_some() {
+                    continue;
+                }
+                stmts.push(Stmt::Decl(Decl::Property(p.clone())));
+            }
+        }
+        for ib in init_block_iter.by_ref() {
+            for s in &ib.stmts {
+                stmts.push(s.clone());
+            }
+        }
+        Block { stmts, span: c.name.span }
+    }
+
+    /// VIA classification of `name` at the *exit* of the CFG whose
+    /// owning span matches `cfg_span`. Used by the class
+    /// post-init walker to ask "did every primary-ctor path
+    /// assign this property?" against the synthetic class-init
+    /// CFG built by `check_class`.
+    fn cfg_via_unassigned_at_exit(&self, cfg_span: Span, name: &str) -> Option<bool> {
+        use klio_cfa::analyses::via::{self, AssignState};
+        use klio_cfa::dataflow::Flat;
+        let lowered = self.lowerings.get(&cfg_span)?;
+        let states = via::solve_via(&lowered.cfg);
+        let exit = *lowered.cfg.exits.first()?;
+        let state = states.get(exit.0 as usize)?;
+        let place = klio_cfa::Place::Local(klio_cfa::Symbol(name.to_string()));
+        Some(matches!(
+            state.get(&place),
+            Flat::Bottom | Flat::Value(AssignState::Unassigned) | Flat::Top
+        ))
     }
 
     /// Returns true when the CFG's VIA analysis classifies `name`
