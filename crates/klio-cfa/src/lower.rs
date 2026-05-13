@@ -11,9 +11,10 @@
 //! prune them later).
 //!
 //! The lowering does not consult type information; every `Eval`
-//! node is emitted with `Type::Unresolved`. Phase 6 will pass typed
-//! expression results from the typechecker into the lowering so
-//! analyses (smart-cast, reachability) can read them.
+//! node is emitted with `Type::Unresolved`. A later integration
+//! step routes typed expression results from the typechecker into
+//! the lowering so analyses (smart-cast, reachability) can read
+//! them.
 
 use crate::builder::CfgBuilder;
 use crate::ir::{

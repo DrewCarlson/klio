@@ -1,9 +1,9 @@
 //! Control-flow graph IR for analyses on Kotlin functions.
 //!
 //! This crate hosts the IR (`ir`), low-level construction primitives
-//! (`builder`), and a snapshot-printable form (`print`). AST → CFG
-//! lowering (Phase 2) and the dataflow framework (Phase 3) build on
-//! top of this without touching the types here.
+//! (`builder`), and a snapshot-printable form (`print`). The AST →
+//! CFG lowering (`lower`) and the dataflow framework (`dataflow`)
+//! build on top of this without touching the types here.
 
 pub mod analyses;
 pub mod builder;

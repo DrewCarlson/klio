@@ -891,9 +891,9 @@ impl<'a> Checker<'a> {
         for d in &file.decls {
             self.check_decl(d);
         }
-        // M28: generics-related diagnostics (reified/inline, vararg, declaration-site variance).
+        // Generics-related diagnostics (reified/inline, vararg, declaration-site variance).
         for d in &file.decls {
-            self.check_m28_decl(d);
+            self.check_generics_decl(d);
         }
         // T0027: definitely-non-nullable (`T & Any`) used outside a type parameter.
         let mut tp_scope: Vec<HashSet<String>> = vec![HashSet::new()];
@@ -2937,17 +2937,17 @@ impl<'a> Checker<'a> {
         }
     }
 
-    // ---- M28: generics & inline diagnostics --------------------------------
+    // ---- Generics + inline diagnostics --------------------------------------
 
-    fn check_m28_decl(&mut self, d: &Decl) {
+    fn check_generics_decl(&mut self, d: &Decl) {
         match d {
-            Decl::Function(f) => self.check_m28_function(f),
-            Decl::Class(c) => self.check_m28_class(c),
+            Decl::Function(f) => self.check_generics_function(f),
+            Decl::Class(c) => self.check_generics_class(c),
             Decl::Property(_) | Decl::Object(_) | Decl::TypeAlias(_) => {}
         }
     }
 
-    fn check_m28_function(&mut self, f: &Function) {
+    fn check_generics_function(&mut self, f: &Function) {
         // T0023 — reified outside inline
         for tp in &f.type_params {
             if tp.is_reified && !f.is_inline {
@@ -3019,13 +3019,13 @@ impl<'a> Checker<'a> {
         // Recurse into nested functions/classes inside the body.
         if let Some(body) = &f.body {
             match body {
-                FunctionBody::Block(b) => self.walk_block_for_m28(b),
-                FunctionBody::Expr(e) => self.walk_expr_for_m28(e),
+                FunctionBody::Block(b) => self.walk_block_for_generics(b),
+                FunctionBody::Expr(e) => self.walk_expr_for_generics(e),
             }
         }
     }
 
-    fn check_m28_class(&mut self, c: &Class) {
+    fn check_generics_class(&mut self, c: &Class) {
         // T0024 — declaration-site variance positions on member functions.
         for tp in &c.type_params {
             if matches!(tp.variance, klio_ast::Variance::Invariant) {
@@ -3044,7 +3044,7 @@ impl<'a> Checker<'a> {
             }
         }
         for m in &c.members {
-            self.check_m28_decl(m);
+            self.check_generics_decl(m);
         }
     }
 
@@ -3093,45 +3093,45 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn walk_block_for_m28(&mut self, b: &Block) {
+    fn walk_block_for_generics(&mut self, b: &Block) {
         for s in &b.stmts {
             match s {
-                Stmt::Decl(d) => self.check_m28_decl(d),
-                Stmt::Expr(e) => self.walk_expr_for_m28(e),
-                Stmt::Assign { value, .. } => self.walk_expr_for_m28(value),
-                Stmt::DestructuringDecl { init, .. } => self.walk_expr_for_m28(init),
+                Stmt::Decl(d) => self.check_generics_decl(d),
+                Stmt::Expr(e) => self.walk_expr_for_generics(e),
+                Stmt::Assign { value, .. } => self.walk_expr_for_generics(value),
+                Stmt::DestructuringDecl { init, .. } => self.walk_expr_for_generics(init),
             }
         }
     }
 
-    fn walk_expr_for_m28(&mut self, e: &Expr) {
+    fn walk_expr_for_generics(&mut self, e: &Expr) {
         match e {
-            Expr::Block(b) => self.walk_block_for_m28(b),
+            Expr::Block(b) => self.walk_block_for_generics(b),
             Expr::If { cond, then_branch, else_branch, .. } => {
-                self.walk_expr_for_m28(cond);
-                self.walk_expr_for_m28(then_branch);
+                self.walk_expr_for_generics(cond);
+                self.walk_expr_for_generics(then_branch);
                 if let Some(eb) = else_branch {
-                    self.walk_expr_for_m28(eb);
+                    self.walk_expr_for_generics(eb);
                 }
             }
             Expr::While { cond, body, .. } => {
-                self.walk_expr_for_m28(cond);
-                self.walk_expr_for_m28(body);
+                self.walk_expr_for_generics(cond);
+                self.walk_expr_for_generics(body);
             }
             Expr::DoWhile { body, cond, .. } => {
                 if let Some(b) = body {
-                    self.walk_expr_for_m28(b);
+                    self.walk_expr_for_generics(b);
                 }
-                self.walk_expr_for_m28(cond);
+                self.walk_expr_for_generics(cond);
             }
             Expr::For { iter, body, .. } => {
-                self.walk_expr_for_m28(iter);
-                self.walk_expr_for_m28(body);
+                self.walk_expr_for_generics(iter);
+                self.walk_expr_for_generics(body);
             }
-            Expr::Lambda { body, .. } => self.walk_block_for_m28(body),
+            Expr::Lambda { body, .. } => self.walk_block_for_generics(body),
             Expr::ObjectExpr { members, .. } => {
                 for m in members {
-                    self.check_m28_decl(m);
+                    self.check_generics_decl(m);
                 }
             }
             _ => {}
@@ -7692,13 +7692,13 @@ impl<'r> Checker<'r> {
             }
         }
         // The return type carries our fresh inference vars. Outer
-        // call resolution (and Phase 4 lambda re-typing) sees them
-        // as `TypeParam(...)` which downstream checks treat
-        // permissively. When we are the root call, we solve below
-        // and replace them with the concrete substitution.
+        // call resolution (and the lambda re-typing pass below)
+        // sees them as `TypeParam(...)` which downstream checks
+        // treat permissively. When we are the root call, we solve
+        // below and replace them with the concrete substitution.
         let mut returned = substitute_type_params(&sig.return_ty, &local_subst);
-        // Phase 4: re-check lambda args with substituted expected
-        // types when the outer call has begun to refine them.
+        // Lambda re-typing: re-check lambda args with substituted
+        // expected types when the outer call has begun to refine them.
         // Works without a final solution because the partial
         // substitution maps every TypeParam(name) we own to its
         // session var, and the smart-cast walk through cfg_narrowed_at
@@ -7739,7 +7739,7 @@ impl<'r> Checker<'r> {
                 }
             }
         }
-        // Phase 4 lambda re-typing — only meaningful at the root,
+        // Lambda re-typing pass — only meaningful at the root,
         // since the substitution carries the fully-solved types.
         if is_root {
             for (i, arg) in args.iter().enumerate() {
@@ -11866,8 +11866,9 @@ mod tests {
     #[test]
     fn stdlib_chain_infers_lambda_params_and_fold_result() {
         // The fold result is annotated as Int; the lambda parameters get
-        // Int (init) and Int (elem). Without the M23 chain inference this
-        // annotation would not match a fold whose return is Unresolved.
+        // Int (init) and Int (elem). Without the stdlib chain
+        // inference this annotation would not match a fold whose
+        // return is Unresolved.
         let tc = check_src(
             r#"
             fun main() {

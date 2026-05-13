@@ -1,4 +1,4 @@
-// M27 numeric fidelity: Long literals.
+// numeric fidelity: Long literals.
 //
 // `1L`, `0xFFL`, and arithmetic between Longs stay 64-bit and surface as
 // `kotlin.Long` at runtime so `is Long` answers correctly.

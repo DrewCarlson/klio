@@ -1,4 +1,4 @@
-// M22 Char Unicode categories. Drives every Char predicate against a curated
+// Char Unicode categories. Drives every Char predicate against a curated
 // set of codepoints chosen to expose divergence between Rust's `char::is_*`
 // and Kotlin's `Character.UnicodeCategory`-driven rules. Must produce
 // byte-identical output to kotlinc-native 2.3.21.

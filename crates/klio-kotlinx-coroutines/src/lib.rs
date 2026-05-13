@@ -1,12 +1,11 @@
 //! Native bindings for `kotlinx.coroutines`.
 //!
-//! M0 of kotlinx-coroutines support: the host registry is empty.
-//! Future work adds Rust-backed implementations for the dispatcher,
-//! channel buffer queues, and select-clause arbitration, which then
-//! get wired into [`host_bindings`] and matched against FQNs from
-//! the kotlinx-coroutines klio pack at install time. The
-//! interpreted Kotlin in the pack's `sources` section covers
-//! everything else.
+//! The host registry is currently empty. Rust-backed
+//! implementations for the dispatcher, channel buffer queues, and
+//! select-clause arbitration will get wired into [`host_bindings`]
+//! and matched against FQNs from the kotlinx-coroutines klio pack
+//! at install time. The interpreted Kotlin in the pack's `sources`
+//! section covers everything else.
 
 use klio_stdlib::HostBindings;
 

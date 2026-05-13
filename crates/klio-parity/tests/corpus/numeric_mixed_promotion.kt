@@ -1,4 +1,4 @@
-// M27 numeric fidelity: mixed-type arithmetic follows Kotlin promotion
+// numeric fidelity: mixed-type arithmetic follows Kotlin promotion
 // rules.
 
 fun main() {

@@ -1,10 +1,11 @@
 //! Kotlin type system.
 //!
 //! Provides a `Type` enum that models the slice of the Kotlin type system the
-//! interpreter needs at Milestone 4: the primitive builtins, `Unit`, `Any`,
+//! interpreter currently consumes: the primitive builtins, `Unit`, `Any`,
 //! `Nothing`, nullability via `T?`, function types, and integer ranges.
-//! Generics are intentionally deferred: anything that would require a real
-//! type parameter is modeled as `Type::Unresolved`.
+//! Full user-class generics are represented through `Type::Generic`; anything
+//! that would require type-parameter machinery we don't yet implement is
+//! modeled as `Type::Unresolved`.
 
 use std::fmt;
 
@@ -223,7 +224,7 @@ impl Type {
         }
     }
 
-    /// Subtyping check covering the rules used by Milestone 4:
+    /// Subtyping check covering the rules currently consumed by typeck:
     ///
     /// * `Nothing <: T` for every `T`.
     /// * `T <: T?` for every non-null `T`.

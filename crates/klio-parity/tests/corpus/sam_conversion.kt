@@ -1,4 +1,4 @@
-// M26: SAM conversion via `fun interface`. A single-abstract-method
+// SAM conversion via `fun interface`. A single-abstract-method
 // interface can be constructed from a lambda using the
 // `Interface { lambda }` form. The synthesized instance dispatches
 // the abstract method through the lambda body.

@@ -1,4 +1,4 @@
-// M26: reflection-lite. `Foo::class` produces a KClass with
+// reflection-lite. `Foo::class` produces a KClass with
 // `simpleName` / `qualifiedName`. `Foo::name` produces a property
 // reference whose `.get(receiver)` reads the named field. `::topFn`
 // and `Foo::method` produce callable references with `.call(args)`

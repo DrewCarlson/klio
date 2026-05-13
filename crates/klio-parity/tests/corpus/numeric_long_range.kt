@@ -1,4 +1,4 @@
-// M27 numeric fidelity: `1L..n` is a LongRange whose iteration variable
+// numeric fidelity: `1L..n` is a LongRange whose iteration variable
 // is Long.
 
 fun main() {

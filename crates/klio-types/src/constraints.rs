@@ -123,8 +123,9 @@ pub enum ConstraintKind {
 
 /// Where a constraint came from, so failure diagnostics can point at
 /// the responsible source expression instead of a synthesised
-/// description. Phase 6 wires renderers to consume this; Phase 1
-/// just carries the data alongside every constraint.
+/// description. Diagnostic renderers consume this side-channel;
+/// the solver itself just carries the data alongside every
+/// constraint.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Provenance {
     /// Argument at position `arg_idx` of a call at `span` is bound to
@@ -204,8 +205,8 @@ pub struct ConstraintSystem {
     /// Equality classes over inference variables. When `α ≡ β` is
     /// derived (either explicitly or by `S <: α ∧ α <: S` for the
     /// same `S`), we collapse them so subsequent constraints share
-    /// a single bound set. Phase 2 will rewrite pending constraints
-    /// through this map.
+    /// a single bound set. Pending constraints are rewritten through
+    /// this map as new equivalences land.
     equiv: BTreeMap<InferenceVar, InferenceVar>,
     /// Last `InferenceError` recorded with the failing provenance
     /// attached. The solver continues processing the pool to surface
@@ -354,8 +355,8 @@ impl ConstraintSystem {
     }
 
     /// Returns the canonical representative of an inference variable's
-    /// equivalence class. After Phase 2 lands, callers use this to
-    /// rewrite bounds through the union-find before consulting them.
+    /// equivalence class. Callers use this to rewrite bounds through
+    /// the union-find before consulting them.
     pub fn canonical(&self, v: InferenceVar) -> InferenceVar {
         self.find_root(v)
     }
@@ -685,11 +686,10 @@ impl ConstraintSystem {
     /// `α →dep β` (β occurs in α's bounds), computes SCCs, fixes the
     /// variables in reverse topological order, substituting the
     /// resolved type into every remaining bound before moving on.
-    /// This is the entry point that matters once postponed variables
-    /// land in Phase 4 — order-independent batches are fixed in
-    /// parallel inside a stage, and an SCC of mutually-dependent
-    /// vars is resolved together by repeated substitution until the
-    /// fix points.
+    /// This is the entry point that handles postponed variables:
+    /// order-independent batches are fixed in parallel inside a
+    /// stage, and an SCC of mutually-dependent vars is resolved
+    /// together by repeated substitution until the fix points.
     pub fn solve_staged(&self) -> HashMap<InferenceVar, Type> {
         let vars: Vec<InferenceVar> = self.bounds.keys().copied().collect();
         let mut deps: HashMap<InferenceVar, Vec<InferenceVar>> = HashMap::new();

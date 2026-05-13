@@ -1,4 +1,4 @@
-// M27 numeric fidelity: cross-type comparison through compareTo and
+// numeric fidelity: cross-type comparison through compareTo and
 // natural ordering operators (kotlinc forbids cross-type `==` at compile
 // time, so the test focuses on the operators that *are* legal).
 

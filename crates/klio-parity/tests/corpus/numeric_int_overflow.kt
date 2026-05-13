@@ -1,4 +1,4 @@
-// M27 numeric fidelity: Int (32-bit) wraps at i32::MAX boundary.
+// numeric fidelity: Int (32-bit) wraps at i32::MAX boundary.
 
 fun main() {
     val a = 2147483647

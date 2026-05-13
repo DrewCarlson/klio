@@ -1,4 +1,4 @@
-// M27 numeric fidelity: conversion methods carry semantic meaning, not
+// numeric fidelity: conversion methods carry semantic meaning, not
 // no-ops. Saturating float-to-int for out-of-range, NaN-to-0.
 
 fun main() {

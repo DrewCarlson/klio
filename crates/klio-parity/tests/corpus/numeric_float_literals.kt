@@ -1,4 +1,4 @@
-// M27 numeric fidelity: Float literals carry single-precision rounding
+// numeric fidelity: Float literals carry single-precision rounding
 // distinct from Double.
 
 fun main() {

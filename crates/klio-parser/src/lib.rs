@@ -1929,8 +1929,9 @@ impl<'src, 'tok> Parser<'src, 'tok> {
 
     fn parse_type(&mut self) -> Option<TypeRef> {
         self.skip_nl();
-        // Soft-keyword `suspend` before a function type — accepted but not
-        // yet enforced anywhere (M31 territory).
+        // Soft-keyword `suspend` before a function type — accepted on the
+        // type-reference syntax even when downstream enforcement of the
+        // suspending colouring at this site is a future addition.
         let mut is_suspend = false;
         if self.peek_ident_text() == Some("suspend") {
             // Only consume as a type modifier when followed by `(` or by an

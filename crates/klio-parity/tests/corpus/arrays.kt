@@ -1,4 +1,4 @@
-// M24 arrays + index-assign: `Array<T>`, `IntArray` and friends, with
+// arrays + index-assign: `Array<T>`, `IntArray` and friends, with
 // `.size`, `.indices`, `.lastIndex`, `.toList()`, `for` iteration, and
 // `xs[i] = v` writes on both Array and MutableList. Printed via
 // iteration since the default array `toString` (`[I@<hash>`) is not

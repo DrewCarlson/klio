@@ -6,10 +6,11 @@
 //! without re-running the front end. The same format is used by the
 //! Kotlin standard library, by kotlinx modules, and by user libraries.
 //!
-//! M0 (this module) ships the container only: header layout, section
-//! directory, deterministic writer, validating reader, optional
-//! per-section zstd compression. Higher-level schemas (manifest,
-//! symbol index, binding table) are added in later milestones.
+//! The core of this crate is the on-disk container: header layout,
+//! section directory, deterministic writer, validating reader, and
+//! optional per-section zstd compression. Higher-level schemas
+//! (manifest, symbol index, bindings, AST bundle, source bundle)
+//! live in [`schema`].
 
 pub mod format;
 pub mod read;

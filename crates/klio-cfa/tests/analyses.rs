@@ -1,4 +1,4 @@
-//! Tests for the Phase 4 analyses: VIA, reachability, finally pruning.
+//! Tests for the CFG analyses: VIA, reachability, finally pruning.
 
 use klio_cfa::analyses::{finally, reachable, via};
 use klio_cfa::dataflow::Flat;

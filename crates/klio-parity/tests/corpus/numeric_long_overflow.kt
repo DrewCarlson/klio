@@ -1,4 +1,4 @@
-// M27 numeric fidelity: Long (64-bit) wraps at i64::MAX boundary.
+// numeric fidelity: Long (64-bit) wraps at i64::MAX boundary.
 
 fun main() {
     val a = 9223372036854775807L

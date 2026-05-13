@@ -11695,7 +11695,7 @@ mod tests {
         assert_eq!(run(src).lines, vec!["caught: / by zero"]);
     }
 
-    // ---------- M6: stdlib dispatch ----------
+    // ---------- stdlib dispatch ----------
 
     #[test]
     fn stdlib_fqn_call_math_abs() {
@@ -12120,7 +12120,7 @@ mod tests {
         assert_eq!(run(src).lines, vec!["0.0", "1.0", "3.0"]);
     }
 
-    // ---------- M12: when / is / sealed ----------
+    // ---------- when / is / sealed ----------
 
     #[test]
     fn when_subject_bound_with_value_and_else() {
@@ -12524,7 +12524,7 @@ mod tests {
         assert!(out.lines[0].starts_with("caught: index"), "got {:?}", out.lines);
     }
 
-    // --- M22: default `toString` for plain classes -------------------------
+    // --- default `toString` for plain classes -------------------------
 
     #[test]
     fn plain_class_default_tostring_has_class_at_hex() {
@@ -12595,7 +12595,7 @@ mod tests {
         assert_eq!(run(src).lines, vec!["Singleton"]);
     }
 
-    // --- M22: anonymous-object default toString ---------------------------
+    // --- anonymous-object default toString ---------------------------
 
     #[test]
     fn anon_object_default_tostring_has_at_and_hex_tail() {
@@ -12628,7 +12628,7 @@ mod tests {
         assert_eq!(run(src).lines, vec!["explicit"]);
     }
 
-    // --- M22: EnumEntries interface ---------------------------------------
+    // --- EnumEntries interface ---------------------------------------
 
     #[test]
     fn enum_entries_is_both_list_and_enum_entries() {

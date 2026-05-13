@@ -4,9 +4,9 @@
 //! lattice. `DeclLocal` seeds `Unassigned`; `Assign` sets `Assigned`.
 //! A read of a place whose state is not `Assigned` (i.e. `Unassigned`
 //! or `Top` — "may be unassigned along some path") is a definite-
-//! assignment violation. The migration step in Phase 6 will reroute
-//! T0020 onto this analysis; for now we expose the per-place facts
-//! and a helper that reports violations as a list of spans.
+//! assignment violation. A future integration step reroutes T0020
+//! onto this analysis; for now we expose the per-place facts and a
+//! helper that reports violations as a list of spans.
 
 use crate::dataflow::{Flat, ForwardTransfer, Lattice, MapLattice, solve_forward};
 use crate::ir::{BlockId, Cfg, Node, Place};
@@ -78,7 +78,7 @@ pub fn states_within_block(cfg: &Cfg, block: BlockId, entry: ViaLattice) -> Vec<
 /// an `Eval` whose AST shape would touch it. The IR does not record
 /// reads directly — those live in `ExprRef.span`. This helper
 /// therefore returns the per-block fact stream so the typechecker
-/// (Phase 6) can query "is this place assigned at this span?" by
+/// can query "is this place assigned at this span?" by
 /// indexing the state map with the place at the eval's preceding
 /// program point.
 pub fn place_state_at_block_entry(

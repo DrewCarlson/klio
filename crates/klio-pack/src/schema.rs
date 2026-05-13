@@ -1,9 +1,9 @@
 //! High-level pack section schemas.
 //!
-//! M0 ships the container; this module adds the typed payloads carried
-//! inside well-known section names. Every type here is `Serialize +
-//! Deserialize`; sections are stored as `postcard::to_allocvec(&value)`
-//! bytes inside the [`crate::format::SectionDirectory`] envelope.
+//! The typed payloads carried inside well-known section names. Every
+//! type here is `Serialize + Deserialize`; sections are stored as
+//! `postcard::to_allocvec(&value)` bytes inside the
+//! [`crate::format::SectionDirectory`] envelope.
 //!
 //! The Serde representations are stable for a given
 //! [`crate::format::FORMAT_VERSION`]. When the schema changes

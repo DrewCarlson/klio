@@ -1,4 +1,4 @@
-// M27 numeric fidelity: Int and Long bitwise ops at boundaries.
+// numeric fidelity: Int and Long bitwise ops at boundaries.
 
 fun main() {
     println(1.shl(0))
