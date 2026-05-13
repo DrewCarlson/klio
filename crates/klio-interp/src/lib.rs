@@ -825,9 +825,26 @@ impl Interpreter {
                     .entry(f.name.name.clone())
                     .or_default()
                     .push((Rc::clone(&decl), Rc::clone(&file_env)));
-                let value = Value::Function {
-                    decl,
-                    env: Rc::clone(&file_env),
+                // When a pack has installed a native binding for this
+                // top-level FQN (`<package>.<fn-name>`), bind the
+                // simple name to the intrinsic so the shim's default
+                // Kotlin body doesn't shadow the binding.
+                let value = if let Some(pkg) = self.current_package.as_deref() {
+                    let fqn = format!("{pkg}.{}", f.name.name);
+                    if let Some(func) = self.installed_bindings.get(&fqn).copied() {
+                        let fqn_static: &'static str = leak_fqn(&fqn);
+                        Value::Intrinsic { fqn: fqn_static, func }
+                    } else {
+                        Value::Function {
+                            decl,
+                            env: Rc::clone(&file_env),
+                        }
+                    }
+                } else {
+                    Value::Function {
+                        decl,
+                        env: Rc::clone(&file_env),
+                    }
                 };
                 file_env.borrow_mut().define(f.name.name.clone(), value);
             }

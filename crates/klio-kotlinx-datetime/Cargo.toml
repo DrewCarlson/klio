@@ -13,3 +13,5 @@ workspace = true
 klio-stdlib  = { workspace = true }
 klio-runtime = { workspace = true }
 chrono       = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz    = { version = "0.10", default-features = false }
+iana-time-zone = "0.1"
