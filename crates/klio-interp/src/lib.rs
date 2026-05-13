@@ -7355,6 +7355,22 @@ impl Interpreter {
                             }
                             return self.call_method(inst, &m, &arg_vals, arg_names, out);
                         }
+                        // Companion-method dispatch through the class
+                        // chain. Inside a subclass method body, bare
+                        // calls resolve through parent companion methods.
+                        for comp in class.all_companions() {
+                            let comp_class = Rc::clone(&comp.borrow().class);
+                            if let Some(m) =
+                                comp_class.methods.iter().find(|m| m.name == name)
+                            {
+                                let m = m.clone();
+                                let mut arg_vals = Vec::with_capacity(args.len());
+                                for a in args {
+                                    arg_vals.push(self.eval_expr(a, env, out)?);
+                                }
+                                return self.call_method(&comp, &m, &arg_vals, arg_names, out);
+                            }
+                        }
                     }
                     let fqn = format!("{}.{}", this_val.type_fqn(), name);
                     if let Some(func) = klio_stdlib::implementation(&fqn) {
