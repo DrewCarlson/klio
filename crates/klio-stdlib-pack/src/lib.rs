@@ -34,6 +34,26 @@ pub fn stdlib_pack_bytes() -> Cow<'static, [u8]> {
     Cow::Borrowed(STDLIB_PACK)
 }
 
+/// Read the embedded stdlib pack's manifest and return the implicit
+/// package list it declares. Reflects the pack's declaration, so as
+/// the embedded pack adds packages (or future kotlinx packs declare
+/// their own) callers automatically see the union.
+#[must_use]
+pub fn embedded_implicit_packages() -> Vec<String> {
+    let bytes = stdlib_pack_bytes();
+    let Ok(pack) = klio_pack::PackReader::from_bytes(bytes.into_owned()) else {
+        return Vec::new();
+    };
+    let Ok(Some(payload)) = pack.read_section(klio_pack::section_names::MANIFEST) else {
+        return Vec::new();
+    };
+    let manifest: klio_pack::schema::PackManifest = match klio_pack::schema::decode(&payload) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    manifest.implicit_packages
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,5 +68,19 @@ mod tests {
         let names: Vec<_> = pack.section_names().collect();
         assert!(names.iter().any(|n| *n == klio_pack::section_names::MANIFEST));
         assert!(names.iter().any(|n| *n == klio_pack::section_names::BINDINGS));
+    }
+
+    #[test]
+    fn embedded_implicit_packages_match_static_list() {
+        // The static `klio_stdlib::IMPLICITLY_IMPORTED_PACKAGES` is
+        // the boot-time source; the pack manifest is the persistent
+        // form a future build will read directly. They must agree for
+        // the duration of the transition.
+        let from_pack = embedded_implicit_packages();
+        let from_static: Vec<String> = klio_stdlib::IMPLICITLY_IMPORTED_PACKAGES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(from_pack, from_static);
     }
 }

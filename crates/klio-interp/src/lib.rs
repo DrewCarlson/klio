@@ -286,14 +286,16 @@ impl Interpreter {
                 if !self.pack_implicit_packages.iter().any(|p| p == &pkg) {
                     self.pack_implicit_packages.push(pkg.clone());
                 }
-                self.pack_known_packages.insert(pkg);
+                self.pack_known_packages.insert(pkg.clone());
+                klio_stdlib::register_known_package(pkg);
             }
         }
         if let Some(bytes) = pack.read_section(section_names::SYMBOLS)? {
             let symbols: SymbolIndex = decode(&bytes)?;
             for record in symbols.entries {
                 if !record.package.is_empty() {
-                    self.pack_known_packages.insert(record.package);
+                    self.pack_known_packages.insert(record.package.clone());
+                    klio_stdlib::register_known_package(record.package);
                 }
             }
         }

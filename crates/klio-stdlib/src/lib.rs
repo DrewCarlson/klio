@@ -78,11 +78,34 @@ pub fn is_known_package(package_path: &str) -> bool {
     if is_implicitly_imported_package(package_path) {
         return true;
     }
+    if EXTRA_KNOWN_PACKAGES
+        .get_or_init(Default::default)
+        .lock()
+        .map(|s| s.contains(package_path))
+        .unwrap_or(false)
+    {
+        return true;
+    }
     let prefix = format!("{package_path}.");
     generated::STDLIB_SYMBOLS
         .iter()
         .any(|e| e.package == package_path || e.fqn.starts_with(&prefix))
 }
+
+/// Augment the set of packages that [`is_known_package`] recognises.
+/// Loaded packs call this when their manifest's `implicit_packages`
+/// or symbol index declares packages outside the static stdlib
+/// surface (e.g. `kotlinx.coroutines` once that pack ships). Idempotent.
+pub fn register_known_package(package_path: impl Into<String>) {
+    let pkg = package_path.into();
+    if let Ok(mut set) = EXTRA_KNOWN_PACKAGES.get_or_init(Default::default).lock() {
+        set.insert(pkg);
+    }
+}
+
+static EXTRA_KNOWN_PACKAGES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
