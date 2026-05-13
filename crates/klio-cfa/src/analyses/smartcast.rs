@@ -18,6 +18,11 @@ pub struct SmartCastFact {
     /// The type the place has been narrowed to along this path. `None`
     /// means "no narrowing" — fall back to the declared type.
     pub narrowed: Option<Type>,
+    /// User-class narrowing recorded alongside `narrowed` when the
+    /// runtime type is a non-builtin class. The typechecker uses this
+    /// to recover the class-name path it previously kept in its
+    /// `narrowing_class` map.
+    pub narrowed_class: Option<String>,
     /// Negative `is` refinements: types the place is known *not* to
     /// be along this path. Used for exhaustive-`when` propagation.
     pub not_types: Vec<Type>,
@@ -36,17 +41,27 @@ pub enum Nullability {
 
 impl SmartCastFact {
     pub fn unknown() -> Self {
-        Self { narrowed: None, not_types: Vec::new(), null: Nullability::Unknown }
+        Self {
+            narrowed: None,
+            narrowed_class: None,
+            not_types: Vec::new(),
+            null: Nullability::Unknown,
+        }
     }
 
     /// Compose `self` with an `is T` narrowing. Intersection-on-rhs
     /// when both are non-trivial; otherwise the more specific one
-    /// wins by direct replacement (Type::intersect normalises).
-    pub fn assume_is(&mut self, ty: Type) {
+    /// wins by direct replacement (Type::intersect normalises). The
+    /// optional `class_name` is recorded alongside for user-class
+    /// narrowings whose Type is `Unresolved`.
+    pub fn assume_is(&mut self, ty: Type, class_name: Option<String>) {
         self.narrowed = Some(match self.narrowed.take() {
             Some(prev) => intersect(prev, ty),
             None => ty,
         });
+        if let Some(cn) = class_name {
+            self.narrowed_class = Some(cn);
+        }
     }
 
     pub fn assume_not_is(&mut self, ty: Type) {
@@ -90,6 +105,15 @@ impl Lattice for SmartCastFact {
         };
         if new_narrow != self.narrowed {
             self.narrowed = new_narrow;
+            changed = true;
+        }
+        // Class narrowing: drops to None unless both sides agree.
+        let new_class = match (&self.narrowed_class, &other.narrowed_class) {
+            (Some(a), Some(b)) if a == b => Some(a.clone()),
+            _ => None,
+        };
+        if new_class != self.narrowed_class {
+            self.narrowed_class = new_class;
             changed = true;
         }
         // Negative refinements intersect: only those known on *both*
@@ -147,11 +171,11 @@ pub struct SmartCastTransfer<'a> {
 impl<'a> ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'a> {
     fn transfer_node(&mut self, node: &Node, state: &mut SmartCastLattice) {
         match node {
-            Node::AssumeIs { reg, ty, polarity, .. } => {
+            Node::AssumeIs { reg, ty, class_name, polarity, .. } => {
                 if let Some(place) = self.reg_to_place.get(reg) {
                     let mut fact = state.map.get(place).cloned().unwrap_or_else(SmartCastFact::unknown);
                     if *polarity {
-                        fact.assume_is(ty.clone());
+                        fact.assume_is(ty.clone(), class_name.clone());
                     } else {
                         fact.assume_not_is(ty.clone());
                     }

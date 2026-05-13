@@ -782,6 +782,13 @@ struct Checker<'a> {
     /// surfaced on the public [`TypeCheck`] output for downstream
     /// dataflow consumers.
     cfgs: HashMap<Span, klio_cfa::Cfg>,
+    /// Full lowering output per function: CFG + side tables. The
+    /// smart-cast / VIA / reachability queries need span_to_pos and
+    /// aliases, which the CFG itself doesn't carry.
+    lowerings: HashMap<Span, std::rc::Rc<klio_cfa::lower::Lowered>>,
+    /// Stack of currently-active function spans so per-expression
+    /// queries know which CFG to read.
+    cfg_fn_stack: Vec<Span>,
 }
 
 /// Description of a user-declared `typealias`.
@@ -830,6 +837,8 @@ impl<'a> Checker<'a> {
             dsl_class_markers: HashMap::new(),
             dsl_receiver_stack: Vec::new(),
             cfgs: HashMap::new(),
+            lowerings: HashMap::new(),
+            cfg_fn_stack: Vec::new(),
         }
     }
 
@@ -3855,17 +3864,18 @@ impl<'r> Checker<'r> {
         self.type_params_in_scope.push(all_tps);
         if let Some(body) = &f.body {
             // Build a CFG for the body alongside type checking. The
-            // CFG is consumed by `klio-cfa` analyses during the
-            // M-CFA migration; today it runs as a parallel artifact
-            // so downstream consumers can read it without forcing
-            // an immediate cutover of check.rs's flow tracking.
+            // lowering's side tables (span_to_pos, aliases) feed the
+            // smart-cast read sites once they switch over.
             let body_block = match body {
                 FunctionBody::Block(b) => b.clone(),
                 FunctionBody::Expr(e) => Block { stmts: vec![Stmt::Expr(e.clone())], span: e.span() },
             };
             let mut lowered = klio_cfa::lower::lower_function(&body_block, f.span);
             klio_cfa::dataflow::infer_kill_data_flow(&mut lowered.cfg);
-            self.cfgs.insert(f.span, lowered.cfg);
+            self.cfgs.insert(f.span, lowered.cfg.clone());
+            self.lowerings
+                .insert(f.span, std::rc::Rc::new(lowered));
+            self.cfg_fn_stack.push(f.span);
             match body {
                 FunctionBody::Block(b) => {
                     let body_ty = self.check_block(b, Some(&declared_return));
@@ -3906,6 +3916,9 @@ impl<'r> Checker<'r> {
         self.type_params_in_scope.pop();
         self.pop_frame();
         self.assigned = saved_assigned;
+        if f.body.is_some() {
+            self.cfg_fn_stack.pop();
+        }
     }
 
     fn check_class(&mut self, c: &Class) {
@@ -5591,10 +5604,13 @@ impl<'r> Checker<'r> {
                 if segments.len() == 1 {
                     let name = &segments[0].name;
                     self.enforce_dsl_scope_for_member(name, *span);
-                    if let Some(cn) = self.lookup_narrowed_class(name) {
+                    if let Some(cn) = self
+                        .lookup_narrowed_class(name)
+                        .or_else(|| self.cfg_narrowed_class_at(name, *span))
+                    {
                         self.expr_class.insert(*span, cn);
                     }
-                    if let Some(narrowed) = self.lookup_narrowed(name) {
+                    if let Some(narrowed) = self.lookup_narrowed_at(name, *span) {
                         return narrowed;
                     }
                     if let Some(b) = self.lookup(name) {
@@ -5646,10 +5662,13 @@ impl<'r> Checker<'r> {
             }
             Expr::Member { receiver, name, safe, span } => {
                 if let Some(key) = dot_path_key(expr) {
-                    if let Some(cn) = self.lookup_narrowed_class(&key) {
+                    if let Some(cn) = self
+                        .lookup_narrowed_class(&key)
+                        .or_else(|| self.cfg_narrowed_class_at(&key, *span))
+                    {
                         self.expr_class.insert(*span, cn);
                     }
-                    if let Some(narrowed) = self.lookup_narrowed(&key) {
+                    if let Some(narrowed) = self.lookup_narrowed_at(&key, *span) {
                         let _ = self.check_expr(receiver, None);
                         return narrowed;
                     }
@@ -8770,6 +8789,107 @@ impl<'r> Checker<'r> {
                     return Some(t.clone());
                 }
             }
+        }
+        None
+    }
+
+    /// Narrowed type at the expression located at `query_span`.
+    /// Consults the existing `Frame.narrowings` (still the source of
+    /// truth) and falls back to the CFG when the frames have nothing
+    /// to say. This is the wiring point for the M-CFA migration:
+    /// once the CFG covers every case the frames do, the fallback
+    /// becomes the primary and the frames drop out.
+    fn lookup_narrowed_at(&self, name: &str, query_span: Span) -> Option<Type> {
+        if let Some(t) = self.lookup_narrowed(name) {
+            return Some(t);
+        }
+        self.cfg_narrowed_at(name, query_span)
+    }
+
+    /// CFG-derived narrowed type for `name` at `query_span`. Walks
+    /// the bound-smart-cast alias chain when the place itself has
+    /// no recorded fact. Returns `None` if the CFG offers nothing
+    /// more specific than the declared type.
+    fn cfg_narrowed_at(&self, name: &str, query_span: Span) -> Option<Type> {
+        use klio_cfa::analyses::smartcast::{self, Nullability};
+        let fn_span = *self.cfg_fn_stack.last()?;
+        let lowered = self.lowerings.get(&fn_span)?;
+        let (bid, pos) = lowered
+            .span_to_pos
+            .get(&(query_span.start, query_span.end))
+            .copied()?;
+        let entry = smartcast::solve(&lowered.cfg, &lowered.reg_to_place)
+            .into_iter()
+            .nth(bid.0 as usize)?;
+        let states = smartcast::states_within_block(
+            &lowered.cfg,
+            bid,
+            entry,
+            &lowered.reg_to_place,
+        );
+        let state = states.get(pos)?;
+        let mut place = klio_cfa::Place::Local(klio_cfa::Symbol(name.to_string()));
+        for _ in 0..8 {
+            if let Some(fact) = state.map.get(&place) {
+                if let Some(t) = fact.narrowed.clone() {
+                    // Builtins-only — user-class narrowings come
+                    // back through `cfg_narrowed_class_at`. Skip
+                    // `Unresolved` here so callers don't widen the
+                    // declared type for class refinements they can
+                    // address via the class-name path.
+                    if !matches!(t, Type::Unresolved) {
+                        if matches!(fact.null, Nullability::NonNull) {
+                            return Some(t.non_null().clone());
+                        }
+                        return Some(t);
+                    }
+                }
+            }
+            if let klio_cfa::Place::Local(sym) = &place {
+                if let Some(next) = lowered.aliases.get(sym) {
+                    place = next.clone();
+                    continue;
+                }
+            }
+            break;
+        }
+        None
+    }
+
+    /// CFG-derived class-name narrowing for `name` at `query_span`.
+    /// Parallels `cfg_narrowed_at` for the user-class branch.
+    fn cfg_narrowed_class_at(&self, name: &str, query_span: Span) -> Option<String> {
+        let fn_span = *self.cfg_fn_stack.last()?;
+        let lowered = self.lowerings.get(&fn_span)?;
+        let (bid, pos) = lowered
+            .span_to_pos
+            .get(&(query_span.start, query_span.end))
+            .copied()?;
+        use klio_cfa::analyses::smartcast;
+        let entry = smartcast::solve(&lowered.cfg, &lowered.reg_to_place)
+            .into_iter()
+            .nth(bid.0 as usize)?;
+        let states = smartcast::states_within_block(
+            &lowered.cfg,
+            bid,
+            entry,
+            &lowered.reg_to_place,
+        );
+        let state = states.get(pos)?;
+        let mut place = klio_cfa::Place::Local(klio_cfa::Symbol(name.to_string()));
+        for _ in 0..8 {
+            if let Some(fact) = state.map.get(&place) {
+                if let Some(cn) = fact.narrowed_class.clone() {
+                    return Some(cn);
+                }
+            }
+            if let klio_cfa::Place::Local(sym) = &place {
+                if let Some(next) = lowered.aliases.get(sym) {
+                    place = next.clone();
+                    continue;
+                }
+            }
+            break;
         }
         None
     }

@@ -65,12 +65,18 @@ fn format_node(n: &Node) -> String {
             if *polarity { "" } else { "!" },
             reg.0
         ),
-        Node::AssumeIs { reg, ty, polarity, .. } => format!(
-            "assume r{} {} {:?}",
-            reg.0,
-            if *polarity { "is" } else { "!is" },
-            ty
-        ),
+        Node::AssumeIs { reg, ty, class_name, polarity, .. } => {
+            let cn = class_name
+                .as_ref()
+                .map(|s| format!(" [{s}]"))
+                .unwrap_or_default();
+            format!(
+                "assume r{} {} {:?}{cn}",
+                reg.0,
+                if *polarity { "is" } else { "!is" },
+                ty
+            )
+        }
         Node::AssumeNull { reg, eq_null, .. } => format!(
             "assume r{} {} null",
             reg.0,

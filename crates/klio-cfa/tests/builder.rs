@@ -87,13 +87,25 @@ fn is_check_arm_carries_assume_is() {
 
     b.push(
         str_arm,
-        Node::AssumeIs { reg: subj, ty: Type::String, polarity: true, span: span(0, 1) },
+        Node::AssumeIs {
+            reg: subj,
+            ty: Type::String,
+            class_name: None,
+            polarity: true,
+            span: span(0, 1),
+        },
     );
     b.set_terminator(str_arm, Terminator::Goto(join));
 
     b.push(
         def_arm,
-        Node::AssumeIs { reg: subj, ty: Type::String, polarity: false, span: span(0, 1) },
+        Node::AssumeIs {
+            reg: subj,
+            ty: Type::String,
+            class_name: None,
+            polarity: false,
+            span: span(0, 1),
+        },
     );
     b.set_terminator(def_arm, Terminator::Goto(join));
 

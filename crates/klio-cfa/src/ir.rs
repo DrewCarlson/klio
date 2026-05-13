@@ -83,8 +83,11 @@ pub enum Node {
     Assume { reg: Reg, polarity: bool },
     /// Assume the runtime type of `reg` is (is not) `ty`. Emitted on
     /// the arms of `is` / `!is` checks; smart-cast lattice consumes
-    /// both polarities.
-    AssumeIs { reg: Reg, ty: Type, polarity: bool, span: Span },
+    /// both polarities. `class_name` carries the source type-ref's
+    /// simple name so the typechecker can recover a user-class
+    /// narrowing — `ty` itself is `Type::Unresolved` for any name
+    /// not in `builtin_by_name`.
+    AssumeIs { reg: Reg, ty: Type, class_name: Option<String>, polarity: bool, span: Span },
     /// Assume `reg == null` (or `reg != null`). Distinct from
     /// `AssumeIs Nothing?` because nullability is its own axis on
     /// the smart-cast lattice.

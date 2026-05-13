@@ -104,9 +104,9 @@ fn fact_resets_after_assignment() {
 #[test]
 fn join_drops_disagreeing_narrowings() {
     let mut fact_a = SmartCastFact::unknown();
-    fact_a.assume_is(Type::String);
+    fact_a.assume_is(Type::String, None);
     let mut fact_b = SmartCastFact::unknown();
-    fact_b.assume_is(Type::Int);
+    fact_b.assume_is(Type::Int, None);
     use klio_cfa::dataflow::Lattice;
     fact_a.join(&fact_b);
     // String join Int should drop to None — disagreement.

@@ -84,7 +84,7 @@ struct TryFrame {
 /// `AssumeNull` on the correct branch arm.
 #[derive(Debug, Clone)]
 enum Refinement {
-    Is { reg: Reg, ty: Type, polarity: bool, span: Span },
+    Is { reg: Reg, ty: Type, class_name: Option<String>, polarity: bool, span: Span },
     NullEq { reg: Reg, span: Span, eq_null: bool },
     /// `!cond` flips polarity of every contained refinement.
     Not(Box<Refinement>),
@@ -158,11 +158,17 @@ impl Lowering {
     /// the else-arm.
     fn emit_refinement(&mut self, blk: BlockId, refinement: &Refinement, truth: bool) {
         match refinement {
-            Refinement::Is { reg, ty, polarity, span } => {
+            Refinement::Is { reg, ty, class_name, polarity, span } => {
                 let effective = *polarity == truth;
                 self.b.push(
                     blk,
-                    Node::AssumeIs { reg: *reg, ty: ty.clone(), polarity: effective, span: *span },
+                    Node::AssumeIs {
+                        reg: *reg,
+                        ty: ty.clone(),
+                        class_name: class_name.clone(),
+                        polarity: effective,
+                        span: *span,
+                    },
                 );
             }
             Refinement::NullEq { reg, span, eq_null } => {
@@ -501,19 +507,41 @@ impl Lowering {
                     Node::Eval { reg: result, expr: ExprRef { span: *span, ty: Type::Boolean } },
                 );
                 let ty_t = klio_types::convert_type_ref_lossy(ty);
+                let class_name = if klio_types::builtin_by_name(&ty.name.name).is_none() {
+                    Some(ty.name.name.clone())
+                } else {
+                    None
+                };
                 self.pending_refinements.insert(
                     result,
-                    Refinement::Is { reg: r, ty: ty_t, polarity: !*negated, span: *span },
+                    Refinement::Is {
+                        reg: r,
+                        ty: ty_t,
+                        class_name,
+                        polarity: !*negated,
+                        span: *span,
+                    },
                 );
                 self.record_reg(*span, result)
             }
             Expr::As { expr, ty, safe, span } => {
                 let r = self.lower_expr(expr, cur);
                 let ty_t = klio_types::convert_type_ref_lossy(ty);
+                let class_name = if klio_types::builtin_by_name(&ty.name.name).is_none() {
+                    Some(ty.name.name.clone())
+                } else {
+                    None
+                };
                 if !*safe {
                     self.b.push(
                         *cur,
-                        Node::AssumeIs { reg: r, ty: ty_t, polarity: true, span: *span },
+                        Node::AssumeIs {
+                            reg: r,
+                            ty: ty_t,
+                            class_name,
+                            polarity: true,
+                            span: *span,
+                        },
                     );
                     self.b.push(*cur, Node::Assert { reg: r, span: *span });
                 }
@@ -767,10 +795,21 @@ impl Lowering {
                 let polarity = !negated;
                 let cmp = self.b.new_reg();
                 let ty_t = klio_types::convert_type_ref_lossy(ty);
+                let class_name = if klio_types::builtin_by_name(&ty.name.name).is_none() {
+                    Some(ty.name.name.clone())
+                } else {
+                    None
+                };
                 if let Some(s) = subj {
                     self.b.push(
                         cur,
-                        Node::AssumeIs { reg: s, ty: ty_t.clone(), polarity, span: ty.span },
+                        Node::AssumeIs {
+                            reg: s,
+                            ty: ty_t.clone(),
+                            class_name,
+                            polarity,
+                            span: ty.span,
+                        },
                     );
                     self.b.push(
                         cur,
