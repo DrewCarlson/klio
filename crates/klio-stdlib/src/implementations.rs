@@ -2222,11 +2222,37 @@ fn coll_list_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn coll_mut_list_add(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "MutableList.add")?;
-    let Some(arg) = ctx.args.get(1) else {
-        return Err(RuntimeError::Arity("add requires an argument".into()));
-    };
-    it.borrow_mut().push(arg.clone());
-    Ok(Value::Bool(true))
+    // `add(item)` — single user arg → append, returns Boolean.
+    // `add(index, item)` — two user args → insert at index, returns Unit.
+    let user = ctx.args.len() - 1;
+    if user == 1 {
+        let arg = ctx.args.get(1).unwrap().clone();
+        it.borrow_mut().push(arg);
+        return Ok(Value::Bool(true));
+    }
+    if user >= 2 {
+        let Some(Value::Int(i)) = ctx.args.get(1) else {
+            return Err(RuntimeError::Type(
+                "add(index, item) requires an Int index".into(),
+            ));
+        };
+        let item = ctx.args.get(2).unwrap().clone();
+        let mut borrow = it.borrow_mut();
+        let idx = *i as usize;
+        if *i < 0 || idx > borrow.len() {
+            return Err(RuntimeError::Thrown(Value::Exception {
+                fqn: Rc::new("kotlin.IndexOutOfBoundsException".into()),
+                message: Some(Rc::new(format!(
+                    "Index {i} out of bounds for length {}",
+                    borrow.len()
+                ))),
+                cause: None,
+            }));
+        }
+        borrow.insert(idx, item);
+        return Ok(Value::Unit);
+    }
+    Err(RuntimeError::Arity("add requires an argument".into()))
 }
 fn coll_mut_list_remove_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "MutableList.removeAt")?;
