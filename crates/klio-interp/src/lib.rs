@@ -998,7 +998,13 @@ impl Interpreter {
         };
         if let Value::Instance(inst) = l {
             let class = Rc::clone(&inst.borrow().class);
-            if let Some((m, _)) = class.find_method(name) {
+            let arg_type_simple = match r {
+                Value::Instance(i) => Some(i.borrow().class.name.clone()),
+                _ => None,
+            };
+            if let Some((m, _)) =
+                class.find_method_for_arg(name, arg_type_simple.as_deref())
+            {
                 if m.decl.body.is_some() {
                     let inst = Rc::clone(inst);
                     let v = self.call_method(&inst, &m, &[r.clone()], &[None], out)?;
