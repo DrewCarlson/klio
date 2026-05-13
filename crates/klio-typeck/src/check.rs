@@ -469,27 +469,12 @@ pub mod codes {
 
 /// A scope frame mapping local names to their declared/inferred types
 /// and mutability. Frames stack lexically.
+/// Symbol environment frame. The smart-cast / bound-alias data that
+/// used to live here has moved to the CFG; the frame now only holds
+/// the binding map.
 #[derive(Debug, Default, Clone)]
 struct Frame {
-    /// `name -> (declared type, mutable?)`. `mutable=false` lets us flag
-    /// `val` reassignment.
     bindings: HashMap<String, Binding>,
-    /// Smart-cast narrowings active in this frame. Keyed by dot-path —
-    /// either a bare local name (`"x"`) or a member chain
-    /// (`"box.shape"`, `"o.inner.value"`). Stored separately from
-    /// declarations so we can pop them without disturbing bindings.
-    narrowings: HashMap<String, Type>,
-    /// Companion class-name narrowings parallel to `narrowings`, used to
-    /// keep `expr_class` propagation alive through chains involving a
-    /// smart-cast prefix (e.g. after `if (n.shape is Circle)`, access
-    /// `n.shape.radius` resolves through the `Circle` member table).
-    narrowing_class: HashMap<String, String>,
-    /// Spec §14.1.5 bound smart casts: when `val b = a` ties two immutable
-    /// locals to the same runtime value, narrowing one narrows the other.
-    /// Stored bidirectionally — every `val b = a` adds `b -> [a]` and
-    /// `a -> [..., b]`. Local to the frame that introduced the binding so
-    /// the alias drops out of scope cleanly with `pop_frame`.
-    aliases: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -5424,15 +5409,10 @@ impl<'r> Checker<'r> {
                                 .lookup(&src)
                                 .map(|b| !b.mutable)
                                 .unwrap_or(false);
-                            if src_is_stable && src != p.name.name {
-                                let new_name = p.name.name.clone();
-                                let f = self.current_frame();
-                                f.aliases
-                                    .entry(new_name.clone())
-                                    .or_default()
-                                    .push(src.clone());
-                                f.aliases.entry(src).or_default().push(new_name);
-                            }
+                            // Bound smart-cast aliasing lives in the
+                            // CFG lowering's `aliases` map; consulted
+                            // by cfg_narrowed_at when chasing chains.
+                            let _ = src_is_stable;
                         }
                     }
                 }
@@ -5523,14 +5503,9 @@ impl<'r> Checker<'r> {
                     let got = self.check_expr(value, Some(&want));
                     self.check_assignable(&got, &want, value.span());
                     self.assigned.insert(name.clone());
-                    // Spec §12.2.2 killDataFlow: a write to a narrowed
-                    // variable invalidates the prior smart-cast. Drop the
-                    // narrowing from every enclosing frame so subsequent
-                    // reads see the declared (post-assignment) type.
-                    for f in self.frames.iter_mut() {
-                        f.narrowings.remove(name);
-                        f.narrowing_class.remove(name);
-                    }
+                    // killDataFlow lives in the CFG: Node::KillDataFlow
+                    // at every loop head invalidates narrowings on
+                    // reassigned places.
                     return;
                 }
             }
@@ -5591,10 +5566,7 @@ impl<'r> Checker<'r> {
                 if segments.len() == 1 {
                     let name = &segments[0].name;
                     self.enforce_dsl_scope_for_member(name, *span);
-                    if let Some(cn) = self
-                        .cfg_narrowed_class_at(name, *span)
-                        .or_else(|| self.lookup_narrowed_class(name))
-                    {
+                    if let Some(cn) = self.cfg_narrowed_class_at(name, *span) {
                         self.expr_class.insert(*span, cn);
                     }
                     if let Some(narrowed) = self.lookup_narrowed_at(name, *span) {
@@ -5649,10 +5621,7 @@ impl<'r> Checker<'r> {
             }
             Expr::Member { receiver, name, safe, span } => {
                 if let Some(key) = dot_path_key(expr) {
-                    if let Some(cn) = self
-                        .cfg_narrowed_class_at(&key, *span)
-                        .or_else(|| self.lookup_narrowed_class(&key))
-                    {
+                    if let Some(cn) = self.cfg_narrowed_class_at(&key, *span) {
                         self.expr_class.insert(*span, cn);
                     }
                     if let Some(narrowed) = self.lookup_narrowed_at(&key, *span) {
@@ -5776,21 +5745,19 @@ impl<'r> Checker<'r> {
                 match op {
                     PostfixOp::Inc | PostfixOp::Dec => t,
                     PostfixOp::NotNull => {
-                        let narrowed = match t {
+                        // `expr!!` narrowing is handled by the CFG:
+                        // the lowering emits AssumeNull(eq_null=false)
+                        // followed by Assert, and the smart-cast
+                        // analysis picks up the non-null fact.
+                        match t {
                             Type::Nullable(inner) => *inner,
                             other => other,
-                        };
-                        if let Some(key) = dot_path_key(expr) {
-                            self.current_frame()
-                                .narrowings
-                                .insert(key, narrowed.clone());
                         }
-                        narrowed
                     }
                 }
             }
             Expr::If { cond, then_branch, else_branch, .. } => {
-                let _ = self.check_condition(cond);
+                let _ = self.check_expr(cond, Some(&Type::Boolean));
                 let before = self.assigned.clone();
                 self.push_frame();
                 // All branch narrowings now flow through the CFG:
@@ -6213,52 +6180,13 @@ impl<'r> Checker<'r> {
                     // `is T` pattern. Multiple patterns or any `!is` / value
                     // patterns mean the branch body cannot rely on a single
                     // refinement, so we skip narrowing in those cases.
-                    let mut branch_frame_pushed = false;
-                    if let Some(key) = &subject_key {
-                        if b.patterns.len() == 1 {
-                            if let WhenPatternKind::IsType(ty) = &b.patterns[0].kind {
-                                let target = convert_type_ref_lossy(ty);
-                                let target_class = class_name_from_typeref(ty);
-                                self.push_frame();
-                                branch_frame_pushed = true;
-                                self.current_frame()
-                                    .narrowings
-                                    .insert(key.clone(), target);
-                                if let Some(cn) = target_class {
-                                    self.current_frame()
-                                        .narrowing_class
-                                        .insert(key.clone(), cn);
-                                }
-                            }
-                        }
-                    } else if subject.is_none()
-                        && b.patterns.len() == 1
-                    {
-                        // Subject-free `when { cond -> body }`: the
-                        // condition `cond` may narrow names which apply
-                        // inside `body`.
-                        if let WhenPatternKind::Value(cond) = &b.patterns[0].kind {
-                            let nar = self.check_condition(cond);
-                            if !nar.true_branch.is_empty() || !nar.true_class.is_empty() {
-                                self.push_frame();
-                                branch_frame_pushed = true;
-                                for (k, t) in &nar.true_branch {
-                                    self.current_frame()
-                                        .narrowings
-                                        .insert(k.clone(), t.clone());
-                                }
-                                for (k, c) in &nar.true_class {
-                                    self.current_frame()
-                                        .narrowing_class
-                                        .insert(k.clone(), c.clone());
-                                }
-                            }
-                        }
-                    }
+                    // `when` arm narrowings come from the CFG: each
+                    // arm's body is preceded by AssumeIs / AssumeNull
+                    // emitted by `lower_when_pattern`, so smart-cast
+                    // queries inside the arm see the refined types
+                    // without an extra frame push.
+                    let _ = &subject_key;
                     let t = self.check_expr(&b.body, expected);
-                    if branch_frame_pushed {
-                        self.pop_frame();
-                    }
                     let after = if matches!(t, Type::Nothing) {
                         None
                     } else {
@@ -8198,7 +8126,7 @@ impl<'r> Checker<'r> {
             }
             "check" | "require" if (1..=2).contains(&args.len()) => {
                 let cond = &args[0];
-                let _ = self.check_condition(cond);
+                let _ = self.check_expr(cond, Some(&Type::Boolean));
                 for a in &args[1..] {
                     self.check_expr(a, None);
                 }
@@ -8508,155 +8436,13 @@ impl<'r> Checker<'r> {
     }
 
     // ---- smart casts -----------------------------------------------------
-
-    fn check_condition(&mut self, cond: &Expr) -> CondNarrow {
-        let mut nar = CondNarrow::default();
-        self.collect_narrowings(cond, true, &mut nar);
-        self.check_expr(cond, Some(&Type::Boolean));
-        nar
-    }
-
-    fn collect_narrowings(&self, cond: &Expr, positive: bool, out: &mut CondNarrow) {
-        match cond {
-            // Spec §14.1 transfer fns for cross-variable reference equality.
-            // Restricted to `===` / `!==` so we stay within the "equals known
-            // to be reference equality" carve-out the spec calls out.
-            Expr::Binary { op: BinOp::IdentEq, lhs, rhs, .. }
-                if !matches!(**lhs, Expr::NullLit { .. })
-                    && !matches!(**rhs, Expr::NullLit { .. }) =>
-            {
-                if let (Some(ln), Some(rn)) = (single_path_name(lhs), single_path_name(rhs)) {
-                    let lt = self.lookup_narrowed(&ln)
-                        .or_else(|| self.lookup(&ln).map(|b| b.ty.clone()))
-                        .unwrap_or(Type::Unresolved);
-                    let rt = self.lookup_narrowed(&rn)
-                        .or_else(|| self.lookup(&rn).map(|b| b.ty.clone()))
-                        .unwrap_or(Type::Unresolved);
-                    let meet = if lt.is_subtype_of(&rt) {
-                        lt
-                    } else if rt.is_subtype_of(&lt) {
-                        rt
-                    } else {
-                        return;
-                    };
-                    if positive {
-                        out.true_branch.insert(ln, meet.clone());
-                        out.true_branch.insert(rn, meet);
-                    } else {
-                        out.false_branch.insert(ln, meet.clone());
-                        out.false_branch.insert(rn, meet);
-                    }
-                }
-            }
-            Expr::Binary { op: BinOp::IdentNeq, lhs, rhs, .. }
-                if !matches!(**lhs, Expr::NullLit { .. })
-                    && !matches!(**rhs, Expr::NullLit { .. }) =>
-            {
-                if let (Some(ln), Some(rn)) = (single_path_name(lhs), single_path_name(rhs)) {
-                    let lt = self.lookup_narrowed(&ln)
-                        .or_else(|| self.lookup(&ln).map(|b| b.ty.clone()))
-                        .unwrap_or(Type::Unresolved);
-                    let rt = self.lookup_narrowed(&rn)
-                        .or_else(|| self.lookup(&rn).map(|b| b.ty.clone()))
-                        .unwrap_or(Type::Unresolved);
-                    let meet = if lt.is_subtype_of(&rt) {
-                        lt
-                    } else if rt.is_subtype_of(&lt) {
-                        rt
-                    } else {
-                        return;
-                    };
-                    if positive {
-                        out.false_branch.insert(ln, meet.clone());
-                        out.false_branch.insert(rn, meet);
-                    } else {
-                        out.true_branch.insert(ln, meet.clone());
-                        out.true_branch.insert(rn, meet);
-                    }
-                }
-            }
-            // `x != null` / `x == null`
-            Expr::Binary { op: BinOp::Neq, lhs, rhs, .. }
-            | Expr::Binary { op: BinOp::IdentNeq, lhs, rhs, .. } => {
-                if let Some(name) = single_path_name(lhs) {
-                    if matches!(**rhs, Expr::NullLit { .. }) {
-                        let cur = self.lookup_narrowed(&name)
-                            .or_else(|| self.lookup(&name).map(|b| b.ty.clone()))
-                            .unwrap_or(Type::Unresolved);
-                        let nn = match &cur {
-                            Type::Nullable(i) => (**i).clone(),
-                            other => other.clone(),
-                        };
-                        // `e != null`: true iff e non-null. In a negated
-                        // context the if's true/false-branch meaning swaps.
-                        let _ = cur;
-                        if positive {
-                            out.true_branch.insert(name, nn);
-                        } else {
-                            out.false_branch.insert(name, nn);
-                        }
-                    }
-                }
-            }
-            Expr::Binary { op: BinOp::Eq, lhs, rhs, .. }
-            | Expr::Binary { op: BinOp::IdentEq, lhs, rhs, .. } => {
-                if let Some(name) = single_path_name(lhs) {
-                    if matches!(**rhs, Expr::NullLit { .. }) {
-                        let cur = self
-                            .lookup_narrowed(&name)
-                            .or_else(|| self.lookup(&name).map(|b| b.ty.clone()))
-                            .unwrap_or(Type::Unresolved);
-                        let nn = match &cur {
-                            Type::Nullable(i) => (**i).clone(),
-                            other => other.clone(),
-                        };
-                        // `e == null`: useful refinement lives on the opposite
-                        // arm — `e` is non-null where the equality is false.
-                        if positive {
-                            out.false_branch.insert(name, nn);
-                        } else {
-                            out.true_branch.insert(name, nn);
-                        }
-                    }
-                }
-            }
-            Expr::IsCheck { expr, ty, negated, .. } => {
-                if let Some(key) = dot_path_key(expr) {
-                    let target = convert_type_ref_lossy(ty);
-                    let target_class = class_name_from_typeref(ty);
-                    // `positive ^ negated`:
-                    //   true  — `x is T` in true-arm: x is T in the true side.
-                    //   false — `x !is T` in true-arm: x is T in the false side
-                    //           (the else of a `!is` check). Spec's negation-
-                    //           type second component collapses here into the
-                    //           dual narrowing.
-                    if positive ^ *negated {
-                        out.true_branch.insert(key.clone(), target);
-                        if let Some(cn) = target_class {
-                            out.true_class.insert(key, cn);
-                        }
-                    } else {
-                        out.false_branch.insert(key.clone(), target);
-                        if let Some(cn) = target_class {
-                            out.false_class.insert(key, cn);
-                        }
-                    }
-                }
-            }
-            Expr::Binary { op: BinOp::And, lhs, rhs, .. } if positive => {
-                self.collect_narrowings(lhs, true, out);
-                self.collect_narrowings(rhs, true, out);
-            }
-            Expr::Binary { op: BinOp::Or, lhs, rhs, .. } if !positive => {
-                self.collect_narrowings(lhs, false, out);
-                self.collect_narrowings(rhs, false, out);
-            }
-            Expr::Unary { op: UnOp::Not, expr, .. } => {
-                self.collect_narrowings(expr, !positive, out);
-            }
-            _ => {}
-        }
-    }
+    //
+    // Smart-cast narrowings now live in the CFG. The lowering emits
+    // AssumeIs / AssumeNull / AssumeRefEq nodes, the smart-cast
+    // analysis transfers them, and `cfg_narrowed_at` /
+    // `cfg_narrowed_class_at` answer queries at expression spans.
+    // The legacy `check_condition` / `collect_narrowings` walkers
+    // and the CondNarrow struct are gone with the Frame fields.
 
     // ---- assignability + diagnostics ------------------------------------
 
@@ -8703,34 +8489,14 @@ impl<'r> Checker<'r> {
         None
     }
 
-    fn lookup_narrowed(&self, name: &str) -> Option<Type> {
-        for f in self.frames.iter().rev() {
-            if let Some(t) = f.narrowings.get(name) {
-                return Some(t.clone());
-            }
-        }
-        // Spec §14.1.5: consult bound-smart-cast peers. A narrowing on a
-        // peer transitively narrows `name`.
-        for peer in self.gather_aliases(name) {
-            for f in self.frames.iter().rev() {
-                if let Some(t) = f.narrowings.get(&peer) {
-                    return Some(t.clone());
-                }
-            }
-        }
-        None
-    }
-
     /// Narrowed type at the expression located at `query_span`.
-    /// CFG-derived narrowings take primacy; the legacy frame stack
-    /// remains as a safety net for scope-function receiver narrowings
-    /// and a handful of other cases the CFG does not yet cover.
-    /// Once the CFG covers every gap the frames drop out entirely.
+    /// Routes through the CFG smart-cast analysis: every refinement
+    /// kind the typechecker historically tracked on Frame.narrowings
+    /// (is / null / cross-ref-eq / && / || / as / !! / bound aliases /
+    /// stdlib contracts) is now emitted as an Assume node by the
+    /// lowering and consumed here.
     fn lookup_narrowed_at(&self, name: &str, query_span: Span) -> Option<Type> {
-        if let Some(t) = self.cfg_narrowed_at(name, query_span) {
-            return Some(t);
-        }
-        self.lookup_narrowed(name)
+        self.cfg_narrowed_at(name, query_span)
     }
 
     /// CFG-derived narrowed type for `name` at `query_span`. Walks
@@ -8861,42 +8627,6 @@ impl<'r> Checker<'r> {
             break;
         }
         None
-    }
-
-    fn lookup_narrowed_class(&self, key: &str) -> Option<String> {
-        for f in self.frames.iter().rev() {
-            if let Some(cn) = f.narrowing_class.get(key) {
-                return Some(cn.clone());
-            }
-        }
-        for peer in self.gather_aliases(key) {
-            for f in self.frames.iter().rev() {
-                if let Some(cn) = f.narrowing_class.get(&peer) {
-                    return Some(cn.clone());
-                }
-            }
-        }
-        None
-    }
-
-    fn gather_aliases(&self, name: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        seen.insert(name.to_string());
-        let mut stack: Vec<String> = vec![name.to_string()];
-        while let Some(cur) = stack.pop() {
-            for f in self.frames.iter().rev() {
-                if let Some(peers) = f.aliases.get(&cur) {
-                    for p in peers {
-                        if seen.insert(p.clone()) {
-                            out.push(p.clone());
-                            stack.push(p.clone());
-                        }
-                    }
-                }
-            }
-        }
-        out
     }
 
     #[allow(dead_code)]
@@ -9123,17 +8853,6 @@ fn class_name_from_typeref(t: &TypeRef) -> Option<String> {
         return None;
     }
     Some(t.name.name.clone())
-}
-
-#[derive(Debug, Default, Clone)]
-struct CondNarrow {
-    true_branch: HashMap<String, Type>,
-    false_branch: HashMap<String, Type>,
-    /// User-class names recorded alongside the narrowed `Type` so the
-    /// branch-frame load can keep `expr_class` propagation alive for
-    /// member chains that begin with a narrowed prefix.
-    true_class: HashMap<String, String>,
-    false_class: HashMap<String, String>,
 }
 
 /// Member names that always have a base in the built-in shape hierarchy
