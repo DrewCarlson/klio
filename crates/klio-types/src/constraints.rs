@@ -38,6 +38,27 @@ impl Default for SolutionPreference {
     }
 }
 
+/// A variable that cannot be fixed in the active stage because its
+/// resolution depends on something else (a lambda body that has not
+/// yet been type-checked, a callable reference whose overload depends
+/// on the expected type, a `@BuilderInference` receiver). The solver
+/// skips postponed vars during staged fixation; the typechecker
+/// re-runs the surrounding lambda body once the gating variable
+/// resolves and feeds the resulting constraints back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostponedKind {
+    /// Lambda whose receiver / parameter types or whose body cannot
+    /// be checked until `gating` resolves.
+    Lambda { gating: InferenceVar },
+    /// `::name` whose overload resolution awaits an expected type.
+    CallableRef,
+    /// `@BuilderInference` receiver — body must be re-typed under the
+    /// fixed receiver type before its constraints can flow.
+    BuilderInference { owner: InferenceVar },
+    /// Eta-expansion of a callable to a function-typed expectation.
+    Eta,
+}
+
 /// Per-variable bound set. The implicit `Nothing <: α <: Any?` bounds
 /// are pre-installed; callers may freely add tighter bounds.
 #[derive(Debug, Clone, Default)]
@@ -45,6 +66,9 @@ pub struct BoundSet {
     pub lower: Vec<Type>,
     pub upper: Vec<Type>,
     pub preference: SolutionPreference,
+    /// When set, the variable is postponed; staged fixation skips it
+    /// in the current pass.
+    pub postponed: Option<PostponedKind>,
 }
 
 impl BoundSet {
@@ -56,7 +80,19 @@ impl BoundSet {
             lower: vec![Type::Nothing],
             upper: vec![Type::Nullable(Box::new(Type::Any))],
             preference: SolutionPreference::PullUp,
+            postponed: None,
         }
+    }
+
+    /// Mark this bound set as postponed under the given kind.
+    pub fn postpone(&mut self, kind: PostponedKind) {
+        self.postponed = Some(kind);
+    }
+
+    /// `true` once the postponed gating has been cleared and this
+    /// variable is eligible for fixation in the next stage.
+    pub fn is_postponed(&self) -> bool {
+        self.postponed.is_some()
     }
 
     pub fn add_lower(&mut self, t: Type) -> bool {
@@ -184,6 +220,25 @@ impl ConstraintSystem {
         if let Some(b) = self.bounds.get_mut(&v) {
             b.preference = p;
         }
+    }
+
+    /// Mark a variable postponed under `kind`. The staged fixation
+    /// pass will skip it until `clear_postponed(v)` is called.
+    pub fn postpone(&mut self, v: InferenceVar, kind: PostponedKind) {
+        if let Some(b) = self.bounds.get_mut(&v) {
+            b.postpone(kind);
+        }
+    }
+
+    pub fn clear_postponed(&mut self, v: InferenceVar) {
+        if let Some(b) = self.bounds.get_mut(&v) {
+            b.postponed = None;
+        }
+    }
+
+    /// Returns the postponed kind for `v`, if any.
+    pub fn postponed_kind(&self, v: InferenceVar) -> Option<&PostponedKind> {
+        self.bounds.get(&v).and_then(|b| b.postponed.as_ref())
     }
 
     /// `true` if `t` is the canonical encoding of an inference variable.
@@ -634,6 +689,12 @@ impl ConstraintSystem {
             while changed && local_iters < 64 {
                 changed = false;
                 for v in scc {
+                    // Postponed variables are skipped — the
+                    // typechecker will re-feed constraints once the
+                    // gating event clears.
+                    if self.bounds.get(v).and_then(|b| b.postponed.as_ref()).is_some() {
+                        continue;
+                    }
                     let pick = self.fix_var(*v, &resolved);
                     match resolved.get(v) {
                         Some(prev) if prev == &pick => {}
@@ -1188,6 +1249,23 @@ mod tests {
         cs.add_constraint(b, a);
         cs.solve_to_fixpoint().unwrap();
         assert_eq!(cs.canonical(av), cs.canonical(bv));
+    }
+
+    #[test]
+    fn postponed_var_is_not_fixed_by_staged_solve() {
+        let mut cs = ConstraintSystem::new();
+        let (av, a) = cs.fresh("A");
+        cs.add_constraint(Type::Int, a);
+        cs.postpone(av, PostponedKind::Eta);
+        cs.solve_to_fixpoint().unwrap();
+        let sol = cs.solve_staged();
+        // The postponed var was not fixed — it does not appear in
+        // the solution map.
+        assert!(sol.get(&av).is_none());
+        // Clearing the postponement and re-running fixes it.
+        cs.clear_postponed(av);
+        let sol2 = cs.solve_staged();
+        assert_eq!(sol2.get(&av), Some(&Type::Int));
     }
 
     #[test]
