@@ -9247,6 +9247,37 @@ fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value, RuntimeError> {
         (Add, String(a), r) => {
             Ok(String(Rc::new(format!("{}{}", a, r))))
         }
+        // `List<T>.plus(other: List<T>): List<T>` and
+        // `List<T>.plus(elem: T): List<T>` — stdlib operators.
+        (Add, List { items: a, .. }, List { items: b, .. }) => {
+            let mut out = a.borrow().clone();
+            out.extend(b.borrow().iter().cloned());
+            Ok(List { items: Rc::new(RefCell::new(out)), mutable: false, enum_class: None })
+        }
+        (Add, List { items, .. }, other) => {
+            let mut out = items.borrow().clone();
+            out.push((*other).clone());
+            Ok(List { items: Rc::new(RefCell::new(out)), mutable: false, enum_class: None })
+        }
+        (Sub, List { items: a, .. }, List { items: b, .. }) => {
+            let bb = b.borrow();
+            let result: Vec<_> = a
+                .borrow()
+                .iter()
+                .filter(|v| !bb.iter().any(|x| Value::structural_eq(x, v)))
+                .cloned()
+                .collect();
+            Ok(List { items: Rc::new(RefCell::new(result)), mutable: false, enum_class: None })
+        }
+        (Sub, List { items, .. }, other) => {
+            let result: Vec<_> = items
+                .borrow()
+                .iter()
+                .filter(|v| !Value::structural_eq(v, other))
+                .cloned()
+                .collect();
+            Ok(List { items: Rc::new(RefCell::new(result)), mutable: false, enum_class: None })
+        }
 
         (Eq, a, b) => Ok(Bool(Value::structural_eq(a, b))),
         (Neq, a, b) => Ok(Bool(!Value::structural_eq(a, b))),
