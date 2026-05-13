@@ -5273,7 +5273,15 @@ impl<'r> Checker<'r> {
         let mut warned = false;
         for (i, s) in block.stmts.iter().enumerate() {
             let is_last = i + 1 == block.stmts.len();
-            if diverged && !warned {
+            // Spec §12.1.5 unreachable code: fires when either the
+            // type-level Nothing tracker or the CFG's reachability
+            // analysis says this statement is dead. The CFG catches
+            // patterns Nothing-tracking misses (e.g. unconditional
+            // break / continue inside a non-Nothing-typed loop body).
+            let cfg_dead = self
+                .cfg_is_unreachable_at(stmt_span(s))
+                .unwrap_or(false);
+            if (diverged || cfg_dead) && !warned {
                 self.diagnostics.emit(
                     Diagnostic::warning("Unreachable code".to_string(), stmt_span(s))
                         .with_code(codes::WARN_UNREACHABLE_CODE)
