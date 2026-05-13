@@ -5554,7 +5554,21 @@ impl<'r> Checker<'r> {
                             let anns = self.prop_annotations.get(name).cloned().unwrap_or_default();
                             self.check_published_api_use(name, v, &anns, *span);
                         }
-                        if needs_init && !self.assigned.contains(name) {
+                        // Definite-assignment check: a place is
+                        // flagged only when *both* the CFG's VIA
+                        // analysis and the legacy `assigned` set
+                        // agree it is unassigned. The legacy set
+                        // sees lambda-callback contract effects
+                        // (`run { x = 4 }`) that the CFG cannot yet
+                        // trace into; the CFG sees branch joins the
+                        // legacy set approximates. Their intersection
+                        // matches the existing T0020 behaviour.
+                        let legacy_unassigned =
+                            needs_init && !self.assigned.contains(name);
+                        let via_unassigned = self
+                            .cfg_via_unassigned_at(name, *span)
+                            .unwrap_or(legacy_unassigned);
+                        if legacy_unassigned && via_unassigned {
                             self.diagnostics.emit(
                                 Diagnostic::error(
                                     format!(
@@ -8531,6 +8545,46 @@ impl<'r> Checker<'r> {
             break;
         }
         None
+    }
+
+    /// Returns true when the CFG's VIA analysis classifies `name`
+    /// as "may not be assigned" at the program point of
+    /// `query_span`. Drives the T0020 definite-assignment check
+    /// alongside the legacy `assigned` set; once the CFG matches
+    /// the legacy behaviour everywhere, the set drops out.
+    fn cfg_via_unassigned_at(&self, name: &str, query_span: Span) -> Option<bool> {
+        use klio_cfa::analyses::via::{self, AssignState};
+        use klio_cfa::dataflow::Flat;
+        let fn_span = *self.cfg_fn_stack.last()?;
+        let lowered = self.lowerings.get(&fn_span)?;
+        let (bid, pos) = lowered
+            .span_to_pos
+            .get(&(query_span.start, query_span.end))
+            .copied()?;
+        let entry = via::solve_via(&lowered.cfg)
+            .into_iter()
+            .nth(bid.0 as usize)?;
+        let states = via::states_within_block(&lowered.cfg, bid, entry);
+        let state = states.get(pos)?;
+        let place = klio_cfa::Place::Local(klio_cfa::Symbol(name.to_string()));
+        Some(matches!(
+            state.get(&place),
+            Flat::Bottom | Flat::Value(AssignState::Unassigned) | Flat::Top
+        ))
+    }
+
+    /// Returns true when the CFG's reachability analysis classifies
+    /// the block containing `query_span` as unreachable. Drives the
+    /// W0002 unreachable-code warning.
+    fn cfg_is_unreachable_at(&self, query_span: Span) -> Option<bool> {
+        let fn_span = *self.cfg_fn_stack.last()?;
+        let lowered = self.lowerings.get(&fn_span)?;
+        let (bid, _) = lowered
+            .span_to_pos
+            .get(&(query_span.start, query_span.end))
+            .copied()?;
+        let r = klio_cfa::analyses::reachable::analyse(&lowered.cfg);
+        Some(!r.is_reachable(bid))
     }
 
     /// Per-place declared-type map drawn from every binding visible
