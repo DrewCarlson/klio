@@ -489,10 +489,6 @@ struct Binding {
     /// exhaustiveness, member-access lookup, and smart-cast widening of
     /// `val` properties.
     class_name: Option<String>,
-    /// True for `var` declarations that lack both an initializer and the
-    /// `lateinit` modifier. Reads through such a binding must be preceded
-    /// by an unconditional write on every control-flow path; otherwise the
-    /// definite-assignment check (T0020) fires.
     /// Original declared-type name when the binding was annotated with a
     /// bare identifier (e.g. `t: T` for a type parameter). Lets
     /// runtime-availability checks recover the spelling that
@@ -4568,8 +4564,11 @@ impl<'r> Checker<'r> {
                 self.check_assignable(&dty, &convert_type_ref_lossy(&p.ty), default.span());
             }
         }
-        // Body properties bind in declaration order.
-        let mut needs_init_props: Vec<(String, Span, bool, Span)> = Vec::new();
+        // Body properties bind in declaration order. Properties
+        // without an initializer are collected here so the class
+        // post-init walker can verify each one is definitely
+        // assigned by some primary-ctor path.
+        let mut uninitialized_properties: Vec<(String, Span, bool, Span)> = Vec::new();
         for m in &c.members {
             match m {
                 Decl::Property(p) => {
@@ -4600,7 +4599,7 @@ impl<'r> Checker<'r> {
                     decl_type_name: None,
                             },
                         );
-                        needs_init_props.push((p.name.name.clone(), p.name.span, p.mutable, p.name.span));
+                        uninitialized_properties.push((p.name.name.clone(), p.name.span, p.mutable, p.name.span));
                     }
                     let _ = self.handle_accessors(p);
                 }
@@ -4672,7 +4671,7 @@ impl<'r> Checker<'r> {
             // be conservative and skip the post-init check to avoid false
             // positives until that flow is modeled.
         } else {
-            for (name, span, _mutable, _decl_span) in &needs_init_props {
+            for (name, span, _mutable, _decl_span) in &uninitialized_properties {
                 let cfg_says_unassigned = self
                     .cfg_via_unassigned_at_exit(init_cfg_span, name)
                     .unwrap_or(true);
@@ -8657,7 +8656,7 @@ impl<'r> Checker<'r> {
     /// `Stmt::Decl(Decl::Property(_))` in source order, and every
     /// init block contributes its statements at the position it
     /// appears in `c.members`. Lowering this block produces a CFG
-    /// whose exit state's VIA tells us which `needs_init`
+    /// whose exit state's VIA tells us which uninitialized
     /// properties were definitely assigned along every primary-
     /// ctor path.
     fn synthesize_class_init_body(&self, c: &Class) -> Block {
