@@ -1528,6 +1528,23 @@ impl Interpreter {
                                 }
                                 cur_outer = oi.borrow().outer.clone();
                             }
+                            // Nested class / nested object on the
+                            // enclosing class chain. `class A { class B }`
+                            // — inside A's method body, bare `B` resolves
+                            // to the nested classifier (object → singleton,
+                            // class → Value::Class).
+                            let mut cur_cls: Option<Rc<ClassDef>> = Some(Rc::clone(&class));
+                            while let Some(cc) = cur_cls {
+                                if let Some(nc) = lookup_nested_class(&cc, name) {
+                                    if nc.is_object {
+                                        if let Some(inst) = nc.object_singleton.borrow().clone() {
+                                            return Some(Value::Instance(inst));
+                                        }
+                                    }
+                                    return Some(Value::Class(nc));
+                                }
+                                cur_cls = cc.enclosing_class.borrow().clone();
+                            }
                             None
                         };
                         // If a lexical binding lives strictly closer than this
@@ -5061,6 +5078,7 @@ impl Interpreter {
         // `captured_env` is the outer class's env so inner methods can
         // resolve names the outer class can see.
         let mut nested_built: Vec<(String, Rc<ClassDef>)> = Vec::with_capacity(nested.len());
+        let mut pending_nested_enums: Vec<(Rc<ClassDef>, Rc<klio_ast::Class>)> = Vec::new();
         for (n, inner) in &nested {
             let nested_class = self.build_class_shell(inner, env, out)?;
             // Back-link the nested class to its enclosing class so bare-name
@@ -5072,6 +5090,9 @@ impl Interpreter {
             if let Some(comp) = &nested_class.companion {
                 *comp.borrow().class.enclosing_class.borrow_mut() =
                     Some(Rc::clone(&nested_class));
+            }
+            if inner.is_enum {
+                pending_nested_enums.push((Rc::clone(&nested_class), Rc::clone(inner)));
             }
             nested_built.push((n.clone(), nested_class));
         }
@@ -5090,6 +5111,10 @@ impl Interpreter {
         }
         for (_, nc) in &nested_built {
             self.resolve_parent_link(nc);
+        }
+        // Build enum entries for nested enums after parent links resolve.
+        for (nc, ast) in pending_nested_enums {
+            self.build_enum_entries(&nc, &ast, env, out)?;
         }
         if !had_self {
             env.borrow_mut().remove_local(&c.name.name);
