@@ -2140,11 +2140,12 @@ impl Interpreter {
                 // User-class indexed read — dispatch `operator fun get`.
                 if let Value::Instance(inst) = &recv {
                     let class = Rc::clone(&inst.borrow().class);
-                    if let Some((m, _)) = class.find_method("get") {
-                        let mut idx_vals: Vec<Value> = Vec::with_capacity(args.len());
-                        for a in args {
-                            idx_vals.push(self.eval_expr(a, env, out)?);
-                        }
+                    let mut idx_vals: Vec<Value> = Vec::with_capacity(args.len());
+                    for a in args {
+                        idx_vals.push(self.eval_expr(a, env, out)?);
+                    }
+                    let first_arg_type = idx_vals.first().map(value_runtime_type_name);
+                    if let Some((m, _)) = class.find_method_for_arg("get", first_arg_type.as_deref()) {
                         let arg_names: Vec<Option<String>> = vec![None; idx_vals.len()];
                         return self.call_method(inst, &m, &idx_vals, &arg_names, out);
                     }
@@ -8698,6 +8699,32 @@ fn destructure_components(
 ///   * `Any in List/Set` — structural equality.
 ///   * `Any in Map` — key membership.
 ///   * `String/Char in String` — substring/contains.
+/// Short simple-name for a Value's runtime type, used for overload
+/// resolution by argument type. Picks the kind a user would write in a
+/// type annotation (`Int` for primitives, `IntRange` for typed ranges,
+/// the class's simple name for instances).
+fn value_runtime_type_name(v: &Value) -> String {
+    match v {
+        Value::Instance(i) => i.borrow().class.name.clone(),
+        Value::Range { kind, step, .. } => {
+            let base = match kind {
+                klio_runtime::RangeKind::Int => "IntRange",
+                klio_runtime::RangeKind::Long => "LongRange",
+                klio_runtime::RangeKind::Char => "CharRange",
+            };
+            if *step == 1 {
+                base.to_string()
+            } else {
+                base.replace("Range", "Progression")
+            }
+        }
+        _ => {
+            let fqn = v.type_fqn();
+            fqn.rsplit('.').next().unwrap_or(fqn).to_string()
+        }
+    }
+}
+
 fn value_in(needle: &Value, haystack: &Value) -> Result<bool, RuntimeError> {
     match (needle, haystack) {
         (Value::Char(c), Value::Range { start, end, step, kind: klio_runtime::RangeKind::Char }) => {
