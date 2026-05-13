@@ -138,6 +138,47 @@ pub fn resolve(file: &KotlinFile) -> Resolution {
     }
 }
 
+/// Resolve a multi-file module. Every file's top-level declarations
+/// share a module-level scope, but each file applies its own imports
+/// only inside its own decls (file-local import scoping per spec
+/// §10.1). Use-spans across files remain distinguishable through the
+/// `klio_span::FileId` carried on each Span.
+pub fn resolve_module(files: &[KotlinFile]) -> Resolution {
+    let mut r = Resolver::new();
+    let builtins = ScopeId(0);
+    let module_scope = r.push_scope(Some(builtins), ScopeKind::File);
+    // Phase 1: forward-declare every file's top-level decls into the
+    // shared module scope so cross-file references resolve.
+    for file in files {
+        r.file_package = file.package.as_ref().map(|p| {
+            p.path.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(".")
+        });
+        for decl in &file.decls {
+            r.declare_top_level(module_scope, decl);
+        }
+    }
+    // Phase 2: per-file pass that applies that file's imports inside
+    // a fresh child of the module scope, then resolves decl bodies.
+    for file in files {
+        r.file_package = file.package.as_ref().map(|p| {
+            p.path.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(".")
+        });
+        let file_scope = r.push_scope(Some(module_scope), ScopeKind::File);
+        for imp in &file.imports {
+            r.check_import(imp);
+        }
+        for decl in &file.decls {
+            r.resolve_decl(file_scope, decl, /*is_top_level=*/ true);
+        }
+    }
+    Resolution {
+        scopes: r.scopes,
+        symbols: r.symbols,
+        uses: r.uses,
+        diagnostics: r.diagnostics,
+    }
+}
+
 struct Resolver {
     scopes: Vec<Scope>,
     symbols: Vec<Symbol>,

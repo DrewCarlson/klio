@@ -17,6 +17,7 @@ klio-parser      = { workspace = true }
 klio-resolver    = { workspace = true }
 klio-typeck      = { workspace = true }
 klio-interp      = { workspace = true }
+klio-ast         = { workspace = true }
 clap            = { workspace = true }
 rustyline       = { workspace = true }
 

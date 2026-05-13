@@ -419,6 +419,58 @@ impl Interpreter {
         self.run_with_output(file, &mut StdoutOutput)
     }
 
+    /// Run a multi-file module. Each file's top-level declarations
+    /// register into the shared globals first, then the file
+    /// containing `fun main` is run with its own imports applied.
+    /// This is the minimal multi-file interpreter contract: all
+    /// declarations from sibling files are visible cross-file, but
+    /// each file's `import` list applies only inside that file's
+    /// declarations as they execute.
+    pub fn run_module(
+        &mut self,
+        files: &[KotlinFile],
+    ) -> Result<Value, RuntimeError> {
+        self.run_module_with_output(files, &mut StdoutOutput)
+    }
+
+    pub fn run_module_with_output(
+        &mut self,
+        files: &[KotlinFile],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        if files.is_empty() {
+            return Err(RuntimeError::NoMain);
+        }
+        // Walk every file first to populate the shared globals with
+        // every cross-file class / function / property declaration.
+        // We do this by feeding each non-main file through
+        // run_with_output, which registers its top-level decls and
+        // returns without invoking `main` (because the file doesn't
+        // have one). Then run the main file.
+        let main_idx = files.iter().position(|f| {
+            f.decls.iter().any(|d| {
+                matches!(d, klio_ast::Decl::Function(f) if f.name.name == "main")
+            })
+        });
+        for (i, file) in files.iter().enumerate() {
+            if Some(i) == main_idx {
+                continue;
+            }
+            // Non-main file: register top-level decls into the
+            // shared globals (persist=true), don't call main
+            // (invoke_main=false).
+            self.run_with_output_mode(file, out, false, true)?;
+        }
+        if let Some(idx) = main_idx {
+            // The main file's decls also persist into globals so
+            // they survive any subsequent invocation against the
+            // same Interpreter instance.
+            self.run_with_output_mode(&files[idx], out, true, true)
+        } else {
+            Err(RuntimeError::NoMain)
+        }
+    }
+
     fn globals_ref(&self) -> Rc<RefCell<Env>> {
         Rc::clone(&self.globals)
     }
@@ -428,7 +480,44 @@ impl Interpreter {
         file: &KotlinFile,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
-        let file_env = Rc::new(RefCell::new(Env::with_parent(Rc::clone(&self.globals))));
+        self.run_with_output_mode(file, out, /*invoke_main=*/ true, /*persist=*/ false)
+    }
+
+    /// Internal entry point. When `invoke_main` is true the file's
+    /// `fun main` is called after every declaration is in scope;
+    /// when false the function returns `Unit` once all decls have
+    /// been registered. `persist` controls whether the file's
+    /// declarations land directly in the shared globals (so other
+    /// files in the same module can see them) or in a transient
+    /// file-scoped environment.
+    pub fn run_with_output_mode(
+        &mut self,
+        file: &KotlinFile,
+        out: &mut dyn Output,
+        invoke_main: bool,
+        persist: bool,
+    ) -> Result<Value, RuntimeError> {
+        let _ = (invoke_main, persist);
+        self.run_with_output_impl(file, out, invoke_main, persist)
+    }
+
+    fn run_with_output_impl(
+        &mut self,
+        file: &KotlinFile,
+        out: &mut dyn Output,
+        invoke_main: bool,
+        persist: bool,
+    ) -> Result<Value, RuntimeError> {
+        // When `persist` is true, register decls directly into the
+        // shared globals so sibling files in a module can see them
+        // after this call returns. Otherwise (the common single-
+        // file path) decls live in a transient file-scoped env that
+        // drops on return.
+        let file_env = if persist {
+            Rc::clone(&self.globals)
+        } else {
+            Rc::new(RefCell::new(Env::with_parent(Rc::clone(&self.globals))))
+        };
 
         // Record the file's package so user-declared classes get a fully-
         // qualified `<package>.<simple-name>` FQN, matching JVM Kotlin's
@@ -629,6 +718,9 @@ impl Interpreter {
             }
         }
 
+        if !invoke_main {
+            return Ok(Value::Unit);
+        }
         let main = file_env.borrow().lookup("main");
         let Some(Value::Function { decl, env }) = main else {
             return Err(RuntimeError::NoMain);

@@ -23,8 +23,11 @@ enum Cmd {
     Lex { file: PathBuf },
     /// Parse a source file and print the AST.
     Parse { file: PathBuf },
-    /// Run a `.kt` source file.
-    Run { file: PathBuf },
+    /// Run one or more `.kt` source files. When more than one file is
+    /// supplied, every file's top-level declarations are visible to
+    /// every other file (single-module semantics), with `fun main`
+    /// invoked from whichever file declares it.
+    Run { files: Vec<PathBuf> },
     /// Type-check `.kt` files and emit diagnostics. Exit 1 on any error.
     Check {
         files: Vec<PathBuf>,
@@ -48,7 +51,14 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Lex { file } => run_lex(&file),
         Cmd::Parse { file } => run_parse(&file),
-        Cmd::Run { file } => run_file(&file),
+        Cmd::Run { files } => match files.as_slice() {
+            [] => {
+                eprintln!("usage: klio run <file.kt> [<file2.kt> ...]");
+                ExitCode::from(2)
+            }
+            [single] => run_file(single),
+            many => run_module_files(many),
+        },
         Cmd::Check { files, format } => run_check(&files, format),
         Cmd::Repl => run_repl(),
     }
@@ -132,6 +142,41 @@ fn run_parse(path: &std::path::Path) -> ExitCode {
     let _ = diags.render(&map, std::io::stderr());
     println!("{ast:#?}");
     if diags.has_errors() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+fn run_module_files(paths: &[PathBuf]) -> ExitCode {
+    let mut map = SourceMap::new();
+    let mut asts: Vec<klio_ast::KotlinFile> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let Some(id) = load(&mut map, path) else { return ExitCode::FAILURE };
+        let src = map.get(id).source.clone();
+        let lexed = klio_lexer::Lexer::new(id, &src).tokenize();
+        let _ = lexed.diagnostics.render(&map, std::io::stderr());
+        if lexed.diagnostics.has_errors() {
+            return ExitCode::FAILURE;
+        }
+        let (ast, diags) = klio_parser::Parser::new(id, &src, &lexed.tokens).parse_file();
+        let _ = diags.render(&map, std::io::stderr());
+        if diags.has_errors() {
+            return ExitCode::FAILURE;
+        }
+        asts.push(ast);
+    }
+    let tc = klio_typeck::typecheck_module(&asts, &klio_resolver::resolve_module(&asts));
+    if tc.diagnostics.has_errors() {
+        let _ = tc.diagnostics.render(&map, std::io::stderr());
+        return ExitCode::FAILURE;
+    }
+    match Interpreter::new()
+        .with_expr_types(tc.types.clone())
+        .run_module(&asts)
+    {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("runtime error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn run_file(path: &std::path::Path) -> ExitCode {
