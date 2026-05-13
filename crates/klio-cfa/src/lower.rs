@@ -264,6 +264,15 @@ impl Lowering {
                 let rhs = self.lower_expr(value, cur);
                 let lhs_place = self.expr_to_place(target);
                 let place = lhs_place.unwrap_or(Place::Local(Symbol("<expr>".into())));
+                // Record both the assignment span and the LHS
+                // target's span as pointing at the position right
+                // before the Assign node executes. The typechecker
+                // queries this for the val-first-write check.
+                let pos = self.b.current_node_count(*cur).unwrap_or(0);
+                self.span_to_pos.insert((span.start, span.end), (*cur, pos));
+                let lhs_span = target.span();
+                self.span_to_pos
+                    .insert((lhs_span.start, lhs_span.end), (*cur, pos));
                 self.b.push(*cur, Node::Assign { lhs: place, rhs, span: *span });
                 None
             }

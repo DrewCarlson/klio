@@ -493,7 +493,6 @@ struct Binding {
     /// `lateinit` modifier. Reads through such a binding must be preceded
     /// by an unconditional write on every control-flow path; otherwise the
     /// definite-assignment check (T0020) fires.
-    needs_init: bool,
     /// Original declared-type name when the binding was annotated with a
     /// bare identifier (e.g. `t: T` for a type parameter). Lets
     /// runtime-availability checks recover the spelling that
@@ -3238,7 +3237,7 @@ impl<'r> Checker<'r> {
                 } else {
                     self.frames[0].bindings.insert(
                         p.name.name.clone(),
-                        Binding { ty, mutable: p.mutable, decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name: None },
+                        Binding { ty, mutable: p.mutable, decl_span: Some(p.name.span), class_name: cn, decl_type_name: None },
                     );
                     self.prop_visibility
                         .insert(p.name.name.clone(), (p.visibility, p.name.span.file));
@@ -3276,7 +3275,7 @@ impl<'r> Checker<'r> {
                         ty: Type::Unresolved,
                         mutable: false,
                         decl_span: Some(o.name.span),
-                        class_name: Some(o.name.name.clone()), needs_init: false, decl_type_name: None },
+                        class_name: Some(o.name.name.clone()), decl_type_name: None },
                 );
             }
             Decl::TypeAlias(a) => {
@@ -3890,7 +3889,7 @@ impl<'r> Checker<'r> {
             };
             self.current_frame()
                 .bindings
-                .insert(p.name.name.clone(), Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name });
+                .insert(p.name.name.clone(), Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, decl_type_name });
             if let Some(default) = &p.default {
                 let dty = self.check_expr(default, Some(&convert_type_ref_lossy(&p.ty)));
                 self.check_assignable(&dty, &convert_type_ref_lossy(&p.ty), default.span());
@@ -4562,7 +4561,7 @@ impl<'r> Checker<'r> {
             let cn = class_name_from_typeref(&p.ty);
             self.current_frame().bindings.insert(
                 p.name.name.clone(),
-                Binding { ty, mutable: p.property == Some(true), decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name: None },
+                Binding { ty, mutable: p.property == Some(true), decl_span: Some(p.name.span), class_name: cn, decl_type_name: None },
             );
             if let Some(default) = &p.default {
                 let dty = self.check_expr(default, Some(&convert_type_ref_lossy(&p.ty)));
@@ -4597,7 +4596,7 @@ impl<'r> Checker<'r> {
                                 mutable: p.mutable,
                                 decl_span: Some(p.name.span),
                                 class_name: p.ty.as_ref().and_then(class_name_from_typeref),
-                                needs_init: true,
+                                
                     decl_type_name: None,
                             },
                         );
@@ -4648,15 +4647,10 @@ impl<'r> Checker<'r> {
                 }
             }
         }
-        for b in &c.init_blocks {
-            self.check_block(b, None);
-        }
-        // Build a synthetic CFG covering the primary-ctor init
-        // flow: each declared property (with or without an
-        // initializer) becomes a DeclLocal, body initializers run
-        // in source order interleaved with init blocks. The exit
-        // state's VIA tells us which `needs_init` properties were
-        // definitely assigned along every path.
+        // Build the synthetic class-init CFG before walking the
+        // init blocks so check_block can consult it for
+        // val-first-write and T0020 queries against the property
+        // bindings declared on this class.
         let init_cfg_span = c.name.span;
         let init_body = self.synthesize_class_init_body(c);
         let mut lowered = klio_cfa::lower::lower_function(&init_body, init_cfg_span);
@@ -4664,6 +4658,11 @@ impl<'r> Checker<'r> {
         self.cfgs.insert(init_cfg_span, lowered.cfg.clone());
         self.lowerings
             .insert(init_cfg_span, std::rc::Rc::new(lowered));
+        self.cfg_fn_stack.push(init_cfg_span);
+        for b in &c.init_blocks {
+            self.check_block(b, None);
+        }
+        self.cfg_fn_stack.pop();
         // VIA §12.2.3: every uninitialized `val` / `var` property must be
         // definitely assigned by the time all init blocks (and the primary
         // ctor path) complete. Secondary ctors run a separate flow and
@@ -5264,7 +5263,7 @@ impl<'r> Checker<'r> {
         for p in &a.params {
             self.current_frame().bindings.insert(
                 p.name.clone(),
-                Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(p.span), class_name: None, needs_init: false, decl_type_name: None },
+                Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(p.span), class_name: None, decl_type_name: None },
             );
         }
         match &a.body {
@@ -5285,7 +5284,7 @@ impl<'r> Checker<'r> {
             let cn = class_name_from_typeref(&p.ty);
             self.current_frame().bindings.insert(
                 p.name.name.clone(),
-                Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name: None },
+                Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, decl_type_name: None },
             );
         }
         match &sc.delegation {
@@ -5385,7 +5384,7 @@ impl<'r> Checker<'r> {
                         Binding {
                             ty: Type::Unresolved,
                             mutable: *mutable,
-                            decl_span: Some(n.span), class_name: None, needs_init: false, decl_type_name: None },
+                            decl_span: Some(n.span), class_name: None, decl_type_name: None },
                     );
                 }
                 Type::Unit
@@ -5415,10 +5414,6 @@ impl<'r> Checker<'r> {
                         cn = self.expr_class.get(&init.span()).cloned();
                     }
                 }
-                let has_init = p.init.is_some() || p.delegate.is_some();
-                let needs_init = !has_init && !p.is_lateinit;
-                if !needs_init {
-                }
                 self.current_frame().bindings.insert(
                     p.name.name.clone(),
                     Binding {
@@ -5426,7 +5421,7 @@ impl<'r> Checker<'r> {
                         mutable: p.mutable,
                         decl_span: Some(p.name.span),
                         class_name: cn,
-                        needs_init,
+                        
                         decl_type_name: p
                             .ty
                             .as_ref()
@@ -5464,7 +5459,7 @@ impl<'r> Checker<'r> {
                 };
                 self.current_frame().bindings.insert(
                     f.name.name.clone(),
-                    Binding { ty: fn_ty, mutable: false, decl_span: Some(f.name.span), class_name: None, needs_init: false, decl_type_name: None },
+                    Binding { ty: fn_ty, mutable: false, decl_span: Some(f.name.span), class_name: None, decl_type_name: None },
                 );
                 self.fns.entry(f.name.name.clone()).or_default().push(sig);
                 self.check_function(f);
@@ -5518,19 +5513,19 @@ impl<'r> Checker<'r> {
                 }
                 let info = self
                     .lookup(name)
-                    .map(|b| (b.ty.clone(), b.mutable, b.needs_init));
-                if let Some((want, mutable, needs_init)) = info {
+                    .map(|b| (b.ty.clone(), b.mutable));
+                if let Some((want, mutable)) = info {
                     // `val x: T` followed by `x = …` later in scope:
-                    // CFG VIA reports `x` as Unassigned at the assignment
-                    // span, marking this as the binding's first (and
-                    // only legal) write. Outside any CFG-tracked
-                    // span we conservatively allow the write — the
-                    // caller is responsible for a separate scope
-                    // check (constructor body etc.).
-                    let cfg_first = self
-                        .cfg_via_unassigned_at(name, *span)
-                        .unwrap_or(true);
-                    let is_first_write = needs_init && cfg_first;
+                    // CFG VIA reports `x` as Unassigned at the
+                    // assignment span, marking this as the binding's
+                    // first (and only legal) write. CFG fact `None`
+                    // (no DeclLocal upstream) means the binding is
+                    // already in scope as a parameter or top-level
+                    // — never a first write.
+                    let is_first_write = matches!(
+                        self.cfg_via_unassigned_at(name, *span),
+                        Some(true)
+                    );
                     // §7.1.2: a compound assignment to a `val` is permitted
                     // when the LHS type carries a matching `*Assign` operator
                     // (the operator-function path mutates in place, never
@@ -5620,24 +5615,20 @@ impl<'r> Checker<'r> {
                     if let Some(b) = self.lookup(name) {
                         let cn = b.class_name.clone();
                         let ty = b.ty.clone();
-                        let needs_init = b.needs_init;
                         if let Some((v, f)) = self.prop_visibility.get(name).copied() {
                             self.check_top_level_visibility(name, v, f, *span);
                             let anns = self.prop_annotations.get(name).cloned().unwrap_or_default();
                             self.check_published_api_use(name, v, &anns, *span);
                         }
-                        // Definite-assignment check via the CFG's
-                        // VIA analysis. Lambda-call-in-place CFA
-                        // inlines EXACTLY_ONCE bodies so the VIA
-                        // state sees assignments performed inside
-                        // them. Outside any CFG-tracked span we
-                        // assume the binding is assigned — the
-                        // typechecker emits T0020 only against the
-                        // CFG verdict, never against a guess.
-                        let via_unassigned = self
-                            .cfg_via_unassigned_at(name, *span)
-                            .unwrap_or(false);
-                        if needs_init && via_unassigned {
+                        // Definite-assignment check: the CFG's VIA
+                        // analysis is authoritative. It returns
+                        // None when the place isn't tracked
+                        // (parameter, top-level property), Some(true)
+                        // when declared without an initializer and
+                        // no subsequent Assign reaches this read,
+                        // Some(false) when assigned along every
+                        // path. T0020 fires only on Some(true).
+                        if matches!(self.cfg_via_unassigned_at(name, *span), Some(true)) {
                             self.diagnostics.emit(
                                 Diagnostic::error(
                                     format!(
@@ -5857,7 +5848,7 @@ impl<'r> Checker<'r> {
                 for v in vars {
                     self.current_frame().bindings.insert(
                         v.name.clone(),
-                        Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(v.span), class_name: None, needs_init: false, decl_type_name: None },
+                        Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(v.span), class_name: None, decl_type_name: None },
                     );
                 }
                 self.check_expr(body, None);
@@ -6015,7 +6006,7 @@ impl<'r> Checker<'r> {
                         Binding {
                             ty: convert_type_ref_lossy(&c.ty),
                             mutable: false,
-                            decl_span: Some(c.binding.span), class_name: None, needs_init: false, decl_type_name: None },
+                            decl_span: Some(c.binding.span), class_name: None, decl_type_name: None },
                     );
                     let cty = self.check_block(&c.body, expected);
                     self.pop_frame();
@@ -6125,7 +6116,7 @@ impl<'r> Checker<'r> {
                             mutable: false,
                             decl_span: Some(b.name.span),
                             class_name,
-                            needs_init: false,
+                            
                             decl_type_name: None,
                         },
                     );
@@ -6321,7 +6312,7 @@ impl<'r> Checker<'r> {
                             mutable: false,
                             decl_span: Some(p.span),
                             class_name: None,
-                            needs_init: false,
+                            
                             decl_type_name: if klio_types::builtin_by_name(&p.ty.name.name).is_none() {
                                 Some(p.ty.name.name.clone())
                             } else {
@@ -8318,7 +8309,7 @@ impl<'r> Checker<'r> {
                     mutable: false,
                     decl_span: None,
                     class_name: it_cls,
-                    needs_init: false,
+                    
                     decl_type_name: None,
                 },
             );
@@ -8331,7 +8322,7 @@ impl<'r> Checker<'r> {
                         mutable: false,
                         decl_span: Some(p.span),
                         class_name: None,
-                        needs_init: false,
+                        
                         decl_type_name: None,
                     },
                 );
@@ -8345,7 +8336,7 @@ impl<'r> Checker<'r> {
                     mutable: false,
                     decl_span: None,
                     class_name: this_cls.clone(),
-                    needs_init: false,
+                    
                     decl_type_name: None,
                 },
             );
@@ -8416,7 +8407,7 @@ impl<'r> Checker<'r> {
                 Binding {
                     ty: param_tys.first().cloned().unwrap_or(Type::Unresolved),
                     mutable: false,
-                    decl_span: None, class_name: None, needs_init: false, decl_type_name: None },
+                    decl_span: None, class_name: None, decl_type_name: None },
             );
         } else if !effective_empty {
             for (i, p) in params.iter().enumerate() {
@@ -8425,7 +8416,7 @@ impl<'r> Checker<'r> {
                     Binding {
                         ty: param_tys.get(i).cloned().unwrap_or(Type::Unresolved),
                         mutable: false,
-                        decl_span: Some(p.span), class_name: None, needs_init: false, decl_type_name: None },
+                        decl_span: Some(p.span), class_name: None, decl_type_name: None },
                 );
             }
         }
@@ -8735,10 +8726,11 @@ impl<'r> Checker<'r> {
         let exit = *lowered.cfg.exits.first()?;
         let state = states.get(exit.0 as usize)?;
         let place = klio_cfa::Place::Local(klio_cfa::Symbol(name.to_string()));
-        Some(matches!(
-            state.get(&place),
-            Flat::Bottom | Flat::Value(AssignState::Unassigned) | Flat::Top
-        ))
+        match state.get(&place) {
+            Flat::Bottom => None,
+            Flat::Value(AssignState::Assigned) => Some(false),
+            Flat::Value(AssignState::Unassigned) | Flat::Top => Some(true),
+        }
     }
 
     /// Returns true when the CFG's VIA analysis classifies `name`
@@ -8761,10 +8753,17 @@ impl<'r> Checker<'r> {
         let states = via::states_within_block(&lowered.cfg, bid, entry);
         let state = states.get(pos)?;
         let place = klio_cfa::Place::Local(klio_cfa::Symbol(name.to_string()));
-        Some(matches!(
-            state.get(&place),
-            Flat::Bottom | Flat::Value(AssignState::Unassigned) | Flat::Top
-        ))
+        // `Flat::Bottom` means the place has no VIA fact at this
+        // program point — typically a parameter (assigned at
+        // function entry, never `DeclLocal`-ed) or a name the
+        // typechecker tracks outside the CFG. Return `None` so
+        // callers fall back to other signals; only return a
+        // verdict when the CFG genuinely tracks the place.
+        match state.get(&place) {
+            Flat::Bottom => None,
+            Flat::Value(AssignState::Assigned) => Some(false),
+            Flat::Value(AssignState::Unassigned) | Flat::Top => Some(true),
+        }
     }
 
     /// Returns true when the CFG's reachability analysis classifies
