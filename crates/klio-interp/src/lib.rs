@@ -2793,6 +2793,57 @@ impl Interpreter {
                 }
                 Ok(Some(lam))
             }
+            "buildList" | "buildSet" if (1..=2).contains(&args.len()) => {
+                let lambda = args.last().unwrap();
+                let lam = self.eval_expr(lambda, env, out)?;
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
+                    return Err(RuntimeError::Type(format!("`{name}` requires a lambda argument")));
+                };
+                let mutable = Value::List {
+                    items: Rc::new(RefCell::new(Vec::new())),
+                    mutable: true,
+                    enum_class: None,
+                };
+                self.call_lambda_with_this(params, body, captured, &[], Some(mutable.clone()), false, out)?;
+                let Value::List { items, .. } = mutable else { unreachable!() };
+                if name == "buildSet" {
+                    let mut deduped: Vec<Value> = Vec::new();
+                    for v in items.borrow().iter() {
+                        if !deduped.iter().any(|x| Value::structural_eq(x, v)) {
+                            deduped.push(v.clone());
+                        }
+                    }
+                    return Ok(Some(Value::Set {
+                        items: Rc::new(RefCell::new(deduped)),
+                        mutable: false,
+                    }));
+                }
+                Ok(Some(Value::List { items, mutable: false, enum_class: None }))
+            }
+            "buildMap" if (1..=2).contains(&args.len()) => {
+                let lambda = args.last().unwrap();
+                let lam = self.eval_expr(lambda, env, out)?;
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
+                    return Err(RuntimeError::Type("`buildMap` requires a lambda argument".into()));
+                };
+                let mutable = Value::Map {
+                    entries: Rc::new(RefCell::new(Vec::new())),
+                    mutable: true,
+                };
+                self.call_lambda_with_this(params, body, captured, &[], Some(mutable.clone()), false, out)?;
+                let Value::Map { entries, .. } = mutable else { unreachable!() };
+                Ok(Some(Value::Map { entries, mutable: false }))
+            }
+            "buildString" if args.len() == 1 => {
+                let lam = self.eval_expr(&args[0], env, out)?;
+                let Value::Lambda { params, body, env: captured, .. } = &lam else {
+                    return Err(RuntimeError::Type("`buildString` requires a lambda argument".into()));
+                };
+                let sb = Value::StringBuilder(Rc::new(RefCell::new(String::new())));
+                self.call_lambda_with_this(params, body, captured, &[], Some(sb.clone()), false, out)?;
+                let Value::StringBuilder(s) = sb else { unreachable!() };
+                Ok(Some(Value::String(Rc::new(s.borrow().clone()))))
+            }
             "repeat" if args.len() == 2 => {
                 let n = self.eval_expr(&args[0], env, out)?;
                 let lam = self.eval_expr(&args[1], env, out)?;
