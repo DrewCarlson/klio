@@ -4593,10 +4593,114 @@ impl Interpreter {
         };
         let _ = initial; // keep clippy quiet — fold reads its initial below
         let lam = self.eval_expr(lam_expr, env, out)?;
+        // Allow callable references (`Foo::name`, `String::uppercase`,
+        // `::topFn`) as the higher-order argument by wrapping the call
+        // through `invoke_callable_value`. We synthesize a tiny lambda
+        // shim by routing all single-argument applications through a
+        // helper closure.
+        let lam_for_dispatch = lam.clone();
+        let mut apply_to = |this: &mut Interpreter,
+                            recv: Value,
+                            out: &mut dyn Output|
+         -> Result<Value, RuntimeError> {
+            match &lam_for_dispatch {
+                Value::Lambda { params, body, env: captured, absorb_return } => this
+                    .call_lambda_with_this(
+                        params,
+                        body,
+                        captured,
+                        std::slice::from_ref(&recv),
+                        None,
+                        *absorb_return,
+                        out,
+                    ),
+                Value::PropertyRef { name: pname } => this.eval_property_access(recv, pname, out),
+                _ => this.invoke_callable_value(&lam_for_dispatch, &[recv], &[], out),
+            }
+        };
+        let _ = &mut apply_to;
         let Value::Lambda { params, body, env: captured, .. } = &lam else {
-            return Err(RuntimeError::Type(format!(
-                "`.{name}` requires a lambda argument"
-            )));
+            // For non-lambda callables, route through `apply_to` for the
+            // operations that take a single-argument transform. Fall
+            // through with synthesized output for those cases below; the
+            // remaining ops still require a real Lambda.
+            return match name {
+                "map" => {
+                    let mut out_items = Vec::with_capacity(items.len());
+                    for v in items {
+                        out_items.push(apply_to(self, v, out)?);
+                    }
+                    Ok(Some(wrap_collection(out_items, is_sequence)))
+                }
+                "forEach" => {
+                    for v in items {
+                        apply_to(self, v, out)?;
+                    }
+                    Ok(Some(Value::Unit))
+                }
+                "filter" => {
+                    let mut out_items = Vec::new();
+                    for v in items {
+                        let r = apply_to(self, v.clone(), out)?;
+                        if matches!(r, Value::Bool(true)) {
+                            out_items.push(v);
+                        }
+                    }
+                    Ok(Some(wrap_collection(out_items, is_sequence)))
+                }
+                "filterNot" => {
+                    let mut out_items = Vec::new();
+                    for v in items {
+                        let r = apply_to(self, v.clone(), out)?;
+                        if matches!(r, Value::Bool(false)) {
+                            out_items.push(v);
+                        }
+                    }
+                    Ok(Some(wrap_collection(out_items, is_sequence)))
+                }
+                "sortedBy" => {
+                    let mut tagged: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+                    for v in items {
+                        let k = apply_to(self, v.clone(), out)?;
+                        tagged.push((k, v));
+                    }
+                    tagged.sort_by(|a, b| {
+                        klio_stdlib::compare_values(&a.0, &b.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let result: Vec<Value> = tagged.into_iter().map(|(_, v)| v).collect();
+                    Ok(Some(wrap_collection(result, is_sequence)))
+                }
+                "groupBy" => {
+                    let mut entries: Vec<(Value, Vec<Value>)> = Vec::new();
+                    for v in items {
+                        let k = apply_to(self, v.clone(), out)?;
+                        match entries.iter_mut().find(|(ek, _)| Value::structural_eq(ek, &k)) {
+                            Some((_, list)) => list.push(v),
+                            None => entries.push((k, vec![v])),
+                        }
+                    }
+                    let map_entries: Vec<(Value, Value)> = entries
+                        .into_iter()
+                        .map(|(k, vs)| {
+                            (
+                                k,
+                                Value::List {
+                                    items: Rc::new(RefCell::new(vs)),
+                                    mutable: false,
+                                    enum_class: None,
+                                },
+                            )
+                        })
+                        .collect();
+                    Ok(Some(Value::Map {
+                        entries: Rc::new(RefCell::new(map_entries)),
+                        mutable: false,
+                    }))
+                }
+                _ => Err(RuntimeError::Type(format!(
+                    "`.{name}` requires a lambda argument"
+                ))),
+            };
         };
         match name {
             "forEach" => {
