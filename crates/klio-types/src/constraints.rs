@@ -174,6 +174,13 @@ pub enum InferenceError {
     ContradictoryBounds(InferenceVar),
 }
 
+/// Stable identifier for an interned type. Two types are
+/// `TypeId`-equal iff they are structurally equal modulo
+/// interning. Used as the key of the solver's `seen` set so we
+/// don't re-emit a constraint we've already reduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeId(pub u32);
+
 /// Solver workspace: holds the set of inference variables, their bounds,
 /// and the pending constraint pool.
 #[derive(Debug, Default)]
@@ -184,9 +191,16 @@ pub struct ConstraintSystem {
     var_names: HashMap<String, InferenceVar>,
     next_id: u32,
     pending: Vec<Constraint>,
-    /// Constraints already reduced. Prevents the incorporation phase
-    /// from re-emitting an `S <: T` that has been processed.
-    seen: HashSet<(String, String, ConstraintKind)>,
+    /// Constraints already reduced, keyed by interned type ids
+    /// rather than `Type::to_string()`. Prevents the incorporation
+    /// phase from re-emitting an `S <: T` that has been processed.
+    seen: HashSet<(TypeId, TypeId, ConstraintKind)>,
+    /// Interned type pool. Each unique `Type` (by structural
+    /// equality) gets a stable `TypeId`. Lookup is `O(types_seen)`
+    /// which is fine for solver-sized workloads — far cheaper than
+    /// the previous `Type::to_string()` allocation.
+    type_pool: Vec<Type>,
+    type_index: HashMap<Type, TypeId>,
     /// Equality classes over inference variables. When `α ≡ β` is
     /// derived (either explicitly or by `S <: α ∧ α <: S` for the
     /// same `S`), we collapse them so subsequent constraints share
@@ -284,11 +298,23 @@ impl ConstraintSystem {
         kind: ConstraintKind,
         provenance: Provenance,
     ) {
-        let key = (lhs.to_string(), rhs.to_string(), kind);
+        let key = (self.intern(&lhs), self.intern(&rhs), kind);
         if self.seen.contains(&key) {
             return;
         }
         self.pending.push(Constraint { lhs, rhs, kind, provenance });
+    }
+
+    /// Look up an interned id for `t`, allocating a fresh one if
+    /// this is the first time we've seen its structural form.
+    fn intern(&mut self, t: &Type) -> TypeId {
+        if let Some(id) = self.type_index.get(t) {
+            return *id;
+        }
+        let id = TypeId(u32::try_from(self.type_pool.len()).expect("type pool overflow"));
+        self.type_pool.push(t.clone());
+        self.type_index.insert(t.clone(), id);
+        id
     }
 
     fn union_vars(&mut self, a: InferenceVar, b: InferenceVar) {
@@ -346,7 +372,7 @@ impl ConstraintSystem {
     /// fixpoint via [`Self::solve_to_fixpoint`].
     pub fn reduce(&mut self) -> Result<(), InferenceError> {
         while let Some(c) = self.pending.pop() {
-            let key = (c.lhs.to_string(), c.rhs.to_string(), c.kind);
+            let key = (self.intern(&c.lhs), self.intern(&c.rhs), c.kind);
             if !self.seen.insert(key) {
                 continue;
             }
