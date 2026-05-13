@@ -5543,7 +5543,12 @@ impl Interpreter {
             interfaces: RefCell::new(Vec::new()),
             is_interface: false,
             is_fun_interface: false,
-            parent_ctor_args: Vec::new(),
+            parent_ctor_args: o
+                .supertype_args
+                .iter()
+                .find_map(|a| a.as_ref())
+                .map(|args| args.iter().map(|e| Rc::new(e.clone())).collect())
+                .unwrap_or_default(),
             enum_entries: RefCell::new(Vec::new()),
             companion: None,
             enclosing_class: RefCell::new(None),
@@ -5568,6 +5573,20 @@ impl Interpreter {
             outer: None,
             identity,
         }));
+        // Invoke the parent constructor when the object extends a class
+        // with a primary ctor (e.g. `object Red : Color(0xff0000)`).
+        if !class.parent_ctor_args.is_empty() {
+            let ctor_env = Rc::new(RefCell::new(Env::with_parent(Rc::clone(&class.captured_env))));
+            if let Some(parent) = class.parent.borrow().clone() {
+                let mut parent_args: Vec<Value> =
+                    Vec::with_capacity(class.parent_ctor_args.len());
+                for e in &class.parent_ctor_args {
+                    parent_args.push(self.eval_expr(e, &ctor_env, out)?);
+                }
+                let parent_arg_names: Vec<Option<String>> = vec![None; parent_args.len()];
+                self.run_ctor_chain(&parent, &inst, &parent_args, &parent_arg_names, out)?;
+            }
+        }
         self.run_body_initializers(class, &inst, out)?;
         Ok(inst)
     }
@@ -7034,6 +7053,19 @@ impl Interpreter {
             )));
         }
         if let Value::Class(class) = &receiver {
+            // A `Value::Class` for an `object` is really a deferred
+            // singleton reference. Construct it (if not already) and
+            // route the access to the resulting instance.
+            if class.is_object {
+                let inst = if let Some(inst) = class.object_singleton.borrow().clone() {
+                    inst
+                } else {
+                    let inst = self.construct_object_singleton(class, out)?;
+                    *class.object_singleton.borrow_mut() = Some(Rc::clone(&inst));
+                    inst
+                };
+                return self.eval_property_access(Value::Instance(inst), name, out);
+            }
             // `Color.RED` — enum entry as a value.
             if class.is_enum {
                 for (n, v) in class.enum_entries.borrow().iter() {

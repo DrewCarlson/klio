@@ -890,10 +890,10 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     fn parse_object(&mut self, is_data: bool) -> Option<ObjectDecl> {
         let kw = self.bump(); // `object`
         let name = self.parse_ident("object name")?;
-        let (supertypes, _args) = self.parse_optional_supertypes();
+        let (supertypes, supertype_args) = self.parse_optional_supertypes();
         let (members, _init, _sec) = self.parse_class_body();
         let end = self.tokens[self.pos.saturating_sub(1)].span;
-        Some(ObjectDecl { name, supertypes, members, is_data, span: kw.span.join(end) })
+        Some(ObjectDecl { name, supertypes, supertype_args, members, is_data, span: kw.span.join(end) })
     }
 
     fn parse_optional_supertypes(&mut self) -> (Vec<TypeRef>, Vec<Option<Vec<Expr>>>) {

@@ -414,6 +414,10 @@ pub struct ObjectDecl {
     pub name: Ident,
     pub supertypes: Vec<TypeRef>,
     pub members: Vec<Decl>,
+    /// Constructor arguments for each declared supertype (`object O :
+    /// Foo(arg1, arg2)`). Slot per supertype; `None` when no `(args)` was
+    /// written (interface or default-ctor base).
+    pub supertype_args: Vec<Option<Vec<Expr>>>,
     /// `data object Foo { … }` — auto-generates `toString` returning the
     /// simple class name. Distinct from `data class`: no `copy` / no
     /// `componentN`, and user-declared `equals`/`hashCode` overrides are
