@@ -600,6 +600,99 @@ impl ConstraintSystem {
         Ok(())
     }
 
+    /// Spec §13.2.2 staged fixation. Builds the dependency graph
+    /// `α →dep β` (β occurs in α's bounds), computes SCCs, fixes the
+    /// variables in reverse topological order, substituting the
+    /// resolved type into every remaining bound before moving on.
+    /// This is the entry point that matters once postponed variables
+    /// land in Phase 4 — order-independent batches are fixed in
+    /// parallel inside a stage, and an SCC of mutually-dependent
+    /// vars is resolved together by repeated substitution until the
+    /// fix points.
+    pub fn solve_staged(&self) -> HashMap<InferenceVar, Type> {
+        let vars: Vec<InferenceVar> = self.bounds.keys().copied().collect();
+        let mut deps: HashMap<InferenceVar, Vec<InferenceVar>> = HashMap::new();
+        for v in &vars {
+            let mut targets: Vec<InferenceVar> = Vec::new();
+            let bs = self.bounds.get(v).unwrap();
+            for t in bs.lower.iter().chain(bs.upper.iter()) {
+                collect_vars(t, &self.var_names, &mut targets);
+            }
+            targets.retain(|t| t != v);
+            targets.sort();
+            targets.dedup();
+            deps.insert(*v, targets);
+        }
+        let sccs = tarjan_scc(&vars, &deps);
+        let mut resolved: HashMap<InferenceVar, Type> = HashMap::new();
+        for scc in sccs.iter().rev() {
+            // Inside an SCC, iterate: fix each var assuming current
+            // substitution of the others; repeat until no var's
+            // resolved type changes.
+            let mut changed = true;
+            let mut local_iters = 0u32;
+            while changed && local_iters < 64 {
+                changed = false;
+                for v in scc {
+                    let pick = self.fix_var(*v, &resolved);
+                    match resolved.get(v) {
+                        Some(prev) if prev == &pick => {}
+                        _ => {
+                            resolved.insert(*v, pick);
+                            changed = true;
+                        }
+                    }
+                }
+                local_iters += 1;
+            }
+        }
+        resolved
+    }
+
+    fn fix_var(
+        &self,
+        v: InferenceVar,
+        already_resolved: &HashMap<InferenceVar, Type>,
+    ) -> Type {
+        let bs = match self.bounds.get(&v) {
+            Some(bs) => bs,
+            None => return Type::Nothing,
+        };
+        let substitute = |t: &Type| -> Type {
+            substitute_vars(t, already_resolved, &self.var_names)
+        };
+        match bs.preference {
+            SolutionPreference::PushDown => {
+                let uppers: Vec<Type> = bs
+                    .upper
+                    .iter()
+                    .map(|t| substitute(t))
+                    .filter(|t| !matches!(t, Type::Nullable(inner) if matches!(**inner, Type::Any)))
+                    .filter(|t| self.is_inference_var(t).is_none())
+                    .collect();
+                if uppers.is_empty() {
+                    Type::Nullable(Box::new(Type::Any))
+                } else {
+                    Type::intersect(uppers)
+                }
+            }
+            SolutionPreference::PullUp => {
+                let lowers: Vec<Type> = bs
+                    .lower
+                    .iter()
+                    .map(|t| substitute(t))
+                    .filter(|t| !matches!(t, Type::Nothing))
+                    .filter(|t| self.is_inference_var(t).is_none())
+                    .collect();
+                if lowers.is_empty() {
+                    Type::Nothing
+                } else {
+                    lub_many(&lowers)
+                }
+            }
+        }
+    }
+
     /// Picks a concrete substitution for every inference variable using
     /// the spec §13.2.2 rule: push-down → GLB of upper bounds (= their
     /// intersection); pull-up (and default) → LUB of lower bounds.
@@ -662,6 +755,162 @@ pub fn lub_many(types: &[Type]) -> Type {
 
 fn is_inference_var_type(t: &Type) -> bool {
     matches!(t, Type::TypeParam(name) if name.starts_with('?'))
+}
+
+/// Collects all inference variables appearing inside `t`.
+fn collect_vars(
+    t: &Type,
+    var_names: &HashMap<String, InferenceVar>,
+    out: &mut Vec<InferenceVar>,
+) {
+    match t {
+        Type::TypeParam(name) => {
+            if let Some(id) = var_names.get(name) {
+                out.push(*id);
+            }
+        }
+        Type::Nullable(inner) => collect_vars(inner, var_names, out),
+        Type::Range(inner) => collect_vars(inner, var_names, out),
+        Type::Function { params, return_type, .. } => {
+            for p in params {
+                collect_vars(p, var_names, out);
+            }
+            collect_vars(return_type, var_names, out);
+        }
+        Type::Generic { args, .. } => {
+            for a in args {
+                if !a.is_star {
+                    collect_vars(&a.ty, var_names, out);
+                }
+            }
+        }
+        Type::Intersection(parts) => {
+            for p in parts {
+                collect_vars(p, var_names, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Substitute resolved inference variables inside `t` with their
+/// concrete types. Used during staged fixation when prior SCC's
+/// variables have already been resolved.
+fn substitute_vars(
+    t: &Type,
+    resolved: &HashMap<InferenceVar, Type>,
+    var_names: &HashMap<String, InferenceVar>,
+) -> Type {
+    match t {
+        Type::TypeParam(name) => match var_names.get(name).and_then(|id| resolved.get(id)) {
+            Some(r) => r.clone(),
+            None => t.clone(),
+        },
+        Type::Nullable(inner) => {
+            Type::Nullable(Box::new(substitute_vars(inner, resolved, var_names)))
+        }
+        Type::Range(inner) => Type::Range(Box::new(substitute_vars(inner, resolved, var_names))),
+        Type::Function { params, return_type, is_suspend } => Type::Function {
+            params: params.iter().map(|p| substitute_vars(p, resolved, var_names)).collect(),
+            return_type: Box::new(substitute_vars(return_type, resolved, var_names)),
+            is_suspend: *is_suspend,
+        },
+        Type::Generic { name, args } => Type::Generic {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| {
+                    if a.is_star {
+                        a.clone()
+                    } else {
+                        crate::GenericArg {
+                            variance: a.variance,
+                            is_star: false,
+                            ty: substitute_vars(&a.ty, resolved, var_names),
+                        }
+                    }
+                })
+                .collect(),
+        },
+        Type::Intersection(parts) => Type::Intersection(
+            parts.iter().map(|p| substitute_vars(p, resolved, var_names)).collect(),
+        ),
+        _ => t.clone(),
+    }
+}
+
+/// Tarjan's SCC algorithm over inference variables. Returns the
+/// SCCs in topological order (deepest dependencies first), so the
+/// staged fixation can fix later batches once their dependencies
+/// resolve.
+fn tarjan_scc(
+    vars: &[InferenceVar],
+    deps: &HashMap<InferenceVar, Vec<InferenceVar>>,
+) -> Vec<Vec<InferenceVar>> {
+    let mut idx_of: HashMap<InferenceVar, usize> = HashMap::new();
+    let mut lowlink: HashMap<InferenceVar, usize> = HashMap::new();
+    let mut on_stack: HashMap<InferenceVar, bool> = HashMap::new();
+    let mut stack: Vec<InferenceVar> = Vec::new();
+    let mut counter = 0usize;
+    let mut sccs: Vec<Vec<InferenceVar>> = Vec::new();
+
+    fn strong_connect(
+        v: InferenceVar,
+        deps: &HashMap<InferenceVar, Vec<InferenceVar>>,
+        idx_of: &mut HashMap<InferenceVar, usize>,
+        lowlink: &mut HashMap<InferenceVar, usize>,
+        on_stack: &mut HashMap<InferenceVar, bool>,
+        stack: &mut Vec<InferenceVar>,
+        counter: &mut usize,
+        sccs: &mut Vec<Vec<InferenceVar>>,
+    ) {
+        idx_of.insert(v, *counter);
+        lowlink.insert(v, *counter);
+        *counter += 1;
+        stack.push(v);
+        on_stack.insert(v, true);
+        if let Some(ns) = deps.get(&v) {
+            for w in ns {
+                if !idx_of.contains_key(w) {
+                    strong_connect(*w, deps, idx_of, lowlink, on_stack, stack, counter, sccs);
+                    let lw = *lowlink.get(w).unwrap();
+                    let lv = *lowlink.get(&v).unwrap();
+                    lowlink.insert(v, lv.min(lw));
+                } else if *on_stack.get(w).unwrap_or(&false) {
+                    let iw = *idx_of.get(w).unwrap();
+                    let lv = *lowlink.get(&v).unwrap();
+                    lowlink.insert(v, lv.min(iw));
+                }
+            }
+        }
+        if lowlink.get(&v) == idx_of.get(&v) {
+            let mut scc: Vec<InferenceVar> = Vec::new();
+            while let Some(w) = stack.pop() {
+                on_stack.insert(w, false);
+                scc.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            sccs.push(scc);
+        }
+    }
+
+    for v in vars {
+        if !idx_of.contains_key(v) {
+            strong_connect(
+                *v,
+                deps,
+                &mut idx_of,
+                &mut lowlink,
+                &mut on_stack,
+                &mut stack,
+                &mut counter,
+                &mut sccs,
+            );
+        }
+    }
+    sccs
 }
 
 fn lub_pair(a: &Type, b: &Type) -> Type {
@@ -901,6 +1150,33 @@ mod tests {
             "T should be equated with Int via incorporation; bounds: lower={:?} upper={:?}",
             bs.lower, bs.upper
         );
+    }
+
+    #[test]
+    fn solve_staged_fixes_dependent_vars_after_independents() {
+        let mut cs = ConstraintSystem::new();
+        let (av, a) = cs.fresh("A");
+        let (bv, b) = cs.fresh("B");
+        // A <: Int and B <: A. After fixation A = Int, then B = Int.
+        cs.add_constraint(Type::Int, a.clone());
+        cs.add_constraint(a, b);
+        cs.solve_to_fixpoint().unwrap();
+        let sol = cs.solve_staged();
+        assert_eq!(sol.get(&av), Some(&Type::Int));
+        assert_eq!(sol.get(&bv), Some(&Type::Int));
+    }
+
+    #[test]
+    fn solve_staged_handles_independent_vars_in_one_stage() {
+        let mut cs = ConstraintSystem::new();
+        let (av, a) = cs.fresh("A");
+        let (bv, b) = cs.fresh("B");
+        cs.add_constraint(Type::Int, a);
+        cs.add_constraint(Type::String, b);
+        cs.solve_to_fixpoint().unwrap();
+        let sol = cs.solve_staged();
+        assert_eq!(sol.get(&av), Some(&Type::Int));
+        assert_eq!(sol.get(&bv), Some(&Type::String));
     }
 
     #[test]
