@@ -1,8 +1,9 @@
-//! Reference runners: `kotlinc-native` (delegated to `klio-parity`) and
-//! `kotlinc` JVM (downloaded on demand, never assumed on PATH).
+//! Reference runners: `kotlinc-native` and JVM `kotlinc`. Both are downloaded
+//! on demand via `klio-parity`'s install machinery and are never assumed on
+//! PATH.
 //!
-//! Both runners cache compiled artifacts under `target/bench-cache/`
-//! keyed by source-content hash so repeated bench passes don't recompile.
+//! Compiled artifacts are cached under `target/bench-cache/` keyed by
+//! source-content hash so repeated bench passes don't recompile.
 
 use std::collections::hash_map::DefaultHasher;
 use std::env;
@@ -58,11 +59,32 @@ fn hash_file(p: &Path) -> String {
     format!("{:016x}", h.finish())
 }
 
+// ---------------------- kotlinc-native ----------------------
+
 /// Time a single end-to-end run of `kotlinc-native` (compile + execute).
-/// Compilation is cached; only the execution time is measured.
+/// Compilation is cached by `klio-parity`; only the execution time is measured.
 pub fn time_kotlinc_native(file: &Path, iters: u32) -> Result<Duration, RefError> {
-    let exe = klio_parity::compile_with_kotlinc(file)
-        .map_err(|e| RefError::Compile(format!("kotlinc-native: {e}")))?;
+    let kotlinc = klio_parity::find_kotlinc_kind(klio_parity::KotlincKind::Native)
+        .map_err(|e| RefError::Install(format!("kotlinc-native: {e}")))?;
+
+    let cache = bench_cache_dir().join("native");
+    fs::create_dir_all(&cache)?;
+    let key = hash_file(file);
+    let exe = cache.join(format!("{key}.kexe"));
+    if !exe.is_file() {
+        let result = Command::new(&kotlinc)
+            .arg(file)
+            .arg("-o")
+            .arg(&exe)
+            .output()?;
+        if !result.status.success() {
+            return Err(RefError::Compile(format!(
+                "kotlinc-native:\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            )));
+        }
+    }
     let mut samples = Vec::with_capacity(iters as usize);
     for _ in 0..iters {
         let t = Instant::now();

@@ -1,5 +1,11 @@
-//! Parity harness: compile a `.kt` file with `kotlinc-native`, run the
-//! resulting binary, run the same file under `klio`, and diff stdout.
+//! Parity harness: compile a `.kt` file with `kotlinc` (JVM by default; native
+//! is also supported), run it, run the same file under `klio`, and diff stdout.
+//!
+//! We default to the JVM compiler because native compilation per-file is
+//! dominated by LLVM codegen and linking, which makes a corpus sweep take
+//! hours. JVM `kotlinc` compiles each file in ~1s and the produced jar runs
+//! under `java` in ~200ms, keeping the full sweep tractable. The native path
+//! is kept for callers that need a native runtime baseline (e.g. `klio-bench`).
 
 use std::collections::hash_map::DefaultHasher;
 use std::env;
@@ -25,6 +31,7 @@ pub struct ParityReport {
 #[derive(Debug)]
 pub enum ParityError {
     NoKotlinc,
+    NoJava,
     Compile(String),
     Install(String),
     UnsupportedPlatform(String),
@@ -36,12 +43,16 @@ impl std::fmt::Display for ParityError {
         match self {
             Self::NoKotlinc => write!(
                 f,
-                "kotlinc-native not found. Set KLIO_KOTLINC_NATIVE, install Kotlin Native under ~/.konan, or put kotlinc-native on PATH."
+                "kotlinc not found. Set KLIO_KOTLINC_JVM_HOME to a kotlinc dist, or let the harness auto-install."
+            ),
+            Self::NoJava => write!(
+                f,
+                "java not found on PATH (required to run JVM kotlinc output); set JAVA_HOME or install a JDK."
             ),
             Self::Compile(msg) => write!(f, "kotlinc compile failed:\n{msg}"),
-            Self::Install(msg) => write!(f, "kotlin-native install failed: {msg}"),
+            Self::Install(msg) => write!(f, "kotlinc install failed: {msg}"),
             Self::UnsupportedPlatform(s) => {
-                write!(f, "no kotlin-native prebuilt for platform: {s}")
+                write!(f, "no kotlinc prebuilt for platform: {s}")
             }
             Self::Io(e) => write!(f, "io error: {e}"),
         }
@@ -54,47 +65,144 @@ impl From<std::io::Error> for ParityError {
     }
 }
 
-/// Default kotlinc-native version we target. Mirrors the `kotlin/` checkout
-/// pinned for stdlib mining.
+/// Default kotlinc version we target (applies to both JVM and Native).
 pub const TARGET_VERSION: &str = "2.3.21";
 
-/// Locate `kotlinc-native`. Search order:
-/// 1. `KLIO_KOTLINC_NATIVE` env var.
-/// 2. `~/.konan/kotlin-native-prebuilt-*-{TARGET_VERSION}/bin/kotlinc-native`.
-/// 3. `PATH`.
-///
-/// When not found, attempts to install `TARGET_VERSION` into `~/.konan`
-/// (matching the gradle/konan layout) unless `KLIO_NO_AUTO_INSTALL_KOTLINC=1`.
+/// Which Kotlin compiler distribution to download/locate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KotlincKind {
+    /// JVM `kotlinc` (`kotlin-compiler-<v>.zip` from JetBrains GitHub).
+    Jvm,
+    /// `kotlinc-native` (`kotlin-native-prebuilt-<slug>-<v>.tar.gz` from the
+    /// JetBrains CDN, extracted under `~/.konan/`).
+    Native,
+}
+
+impl KotlincKind {
+    fn binary_name(self) -> &'static str {
+        match self {
+            Self::Jvm => {
+                if cfg!(windows) { "kotlinc.bat" } else { "kotlinc" }
+            }
+            Self::Native => {
+                if cfg!(windows) { "kotlinc-native.bat" } else { "kotlinc-native" }
+            }
+        }
+    }
+
+    fn env_override(self) -> &'static str {
+        match self {
+            Self::Jvm => "KLIO_KOTLINC_JVM_HOME",
+            Self::Native => "KLIO_KOTLINC_NATIVE",
+        }
+    }
+}
+
+fn java_filename() -> &'static str {
+    if cfg!(windows) { "java.exe" } else { "java" }
+}
+
+fn workspace_root() -> PathBuf {
+    let m = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    m.parent().and_then(|p| p.parent()).map(PathBuf::from).unwrap_or(m)
+}
+
+fn parity_cache_dir() -> PathBuf {
+    let target = env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"));
+    target.join("parity-cache")
+}
+
+fn konan_root() -> Result<PathBuf, ParityError> {
+    if let Ok(v) = env::var("KONAN_DATA_DIR") {
+        return Ok(PathBuf::from(v));
+    }
+    let home = env::var_os("HOME")
+        .ok_or_else(|| ParityError::Install("HOME not set; cannot resolve ~/.konan".into()))?;
+    Ok(PathBuf::from(home).join(".konan"))
+}
+
+/// Kotlin/Native distribution descriptor: (archive os-arch slug, CDN subdir, archive extension).
+fn native_platform_slug() -> Result<(&'static str, &'static str, &'static str), ParityError> {
+    let os = env::consts::OS;
+    let arch = env::consts::ARCH;
+    let triple = match (os, arch) {
+        ("macos", "aarch64") => ("macos-aarch64", "macos", "tar.gz"),
+        ("macos", "x86_64") => ("macos-x86_64", "macos", "tar.gz"),
+        ("linux", "x86_64") => ("linux-x86_64", "linux", "tar.gz"),
+        ("windows", "x86_64") => ("windows-x86_64", "windows", "zip"),
+        _ => return Err(ParityError::UnsupportedPlatform(format!("{os}-{arch}"))),
+    };
+    Ok(triple)
+}
+
+/// JVM install directory for `version` (default-cached layout).
+fn jvm_install_dir(version: &str) -> PathBuf {
+    parity_cache_dir().join(format!("kotlinc-{version}"))
+}
+
+/// Backwards-compatible alias for [`find_kotlinc_kind`] with [`KotlincKind::Jvm`].
 pub fn find_kotlinc() -> Result<PathBuf, ParityError> {
-    if let Some(p) = locate_kotlinc() {
+    find_kotlinc_kind(KotlincKind::Jvm)
+}
+
+/// Locate the requested `kotlinc` binary. Search order (per kind):
+///   1. Kind-specific env var (`KLIO_KOTLINC_JVM_HOME` / `KLIO_KOTLINC_NATIVE`).
+///   2. Default cached install location.
+///   3. `PATH`.
+///
+/// When not found, attempts to auto-install unless `KLIO_NO_AUTO_INSTALL_KOTLINC=1`.
+pub fn find_kotlinc_kind(kind: KotlincKind) -> Result<PathBuf, ParityError> {
+    if let Some(p) = locate_kotlinc(kind) {
         return Ok(p);
     }
     if env::var("KLIO_NO_AUTO_INSTALL_KOTLINC").is_ok_and(|v| !v.is_empty() && v != "0") {
         return Err(ParityError::NoKotlinc);
     }
-    install_kotlinc(TARGET_VERSION)?;
-    locate_kotlinc().ok_or(ParityError::NoKotlinc)
+    install_kotlinc_kind(kind, TARGET_VERSION)?;
+    locate_kotlinc(kind).ok_or(ParityError::NoKotlinc)
 }
 
-fn locate_kotlinc() -> Option<PathBuf> {
-    if let Ok(v) = env::var("KLIO_KOTLINC_NATIVE") {
-        let p = PathBuf::from(v);
-        if p.is_file() {
-            return Some(p);
+fn locate_kotlinc(kind: KotlincKind) -> Option<PathBuf> {
+    let binary = kind.binary_name();
+    if let Ok(v) = env::var(kind.env_override()) {
+        // The JVM override is a kotlinc dist root (with bin/kotlinc inside); the
+        // native override historically points at the kotlinc-native binary
+        // directly. Accept either form for both.
+        let candidate = PathBuf::from(&v);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        let inside = candidate.join("bin").join(binary);
+        if inside.is_file() {
+            return Some(inside);
         }
     }
-    if let Some(home) = env::var_os("HOME") {
-        let konan = PathBuf::from(home).join(".konan");
-        if let Ok(entries) = fs::read_dir(&konan) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let s = name.to_string_lossy();
-                if s.starts_with("kotlin-native-prebuilt-") && s.contains(TARGET_VERSION)
-                    && !s.contains("-RC")
-                {
-                    let p = entry.path().join("bin").join("kotlinc-native");
-                    if p.is_file() {
-                        return Some(p);
+    match kind {
+        KotlincKind::Jvm => {
+            let p = jvm_install_dir(TARGET_VERSION).join("bin").join(binary);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        KotlincKind::Native => {
+            // Match any kotlin-native-prebuilt-*-{TARGET_VERSION} dir under ~/.konan
+            // (not just our default slug), to honor pre-existing installs.
+            if let Ok(root) = konan_root()
+                && let Ok(entries) = fs::read_dir(&root)
+            {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let s = name.to_string_lossy();
+                    if s.starts_with("kotlin-native-prebuilt-")
+                        && s.contains(TARGET_VERSION)
+                        && !s.contains("-RC")
+                    {
+                        let p = entry.path().join("bin").join(binary);
+                        if p.is_file() {
+                            return Some(p);
+                        }
                     }
                 }
             }
@@ -102,7 +210,7 @@ fn locate_kotlinc() -> Option<PathBuf> {
     }
     if let Ok(path) = env::var("PATH") {
         for dir in env::split_paths(&path) {
-            let p = dir.join("kotlinc-native");
+            let p = dir.join(binary);
             if p.is_file() {
                 return Some(p);
             }
@@ -111,46 +219,116 @@ fn locate_kotlinc() -> Option<PathBuf> {
     None
 }
 
-fn konan_root() -> Result<PathBuf, ParityError> {
-    if let Ok(v) = env::var("KONAN_DATA_DIR") {
-        return Ok(PathBuf::from(v));
+fn locate_java() -> Result<PathBuf, ParityError> {
+    if let Ok(home) = env::var("JAVA_HOME") {
+        let p = PathBuf::from(home).join("bin").join(java_filename());
+        if p.is_file() {
+            return Ok(p);
+        }
     }
-    let home = env::var_os("HOME").ok_or_else(|| {
-        ParityError::Install("HOME not set; cannot resolve ~/.konan".into())
-    })?;
-    Ok(PathBuf::from(home).join(".konan"))
+    if let Ok(path) = env::var("PATH") {
+        for dir in env::split_paths(&path) {
+            let p = dir.join(java_filename());
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+    }
+    Err(ParityError::NoJava)
 }
 
-/// Kotlin/Native distribution descriptor: the os/arch slug embedded in the
-/// archive name and the CDN subdirectory.
-fn platform_slug() -> Result<(&'static str, &'static str, &'static str), ParityError> {
-    let os = env::consts::OS;
-    let arch = env::consts::ARCH;
-    let (slug, subdir, ext) = match (os, arch) {
-        ("macos", "aarch64") => ("macos-aarch64", "macos", "tar.gz"),
-        ("macos", "x86_64") => ("macos-x86_64", "macos", "tar.gz"),
-        ("linux", "x86_64") => ("linux-x86_64", "linux", "tar.gz"),
-        ("windows", "x86_64") => ("windows-x86_64", "windows", "zip"),
-        _ => return Err(ParityError::UnsupportedPlatform(format!("{os}-{arch}"))),
-    };
-    Ok((slug, subdir, ext))
-}
-
-/// Download + extract `kotlin-native-prebuilt-{platform}-{version}` into
-/// `~/.konan/` (or `$KONAN_DATA_DIR`). Idempotent: if the destination already
-/// exists with a working `bin/kotlinc-native`, this is a no-op.
+/// Backwards-compatible alias for [`install_kotlinc_kind`] with [`KotlincKind::Jvm`].
 pub fn install_kotlinc(version: &str) -> Result<PathBuf, ParityError> {
-    let (slug, subdir, ext) = platform_slug()?;
-    let root = konan_root()?;
-    fs::create_dir_all(&root)?;
-    let dir_name = format!("kotlin-native-prebuilt-{slug}-{version}");
-    let dest = root.join(&dir_name);
-    let kotlinc = dest.join("bin").join(kotlinc_native_filename());
+    install_kotlinc_kind(KotlincKind::Jvm, version)
+}
+
+/// Download + extract the requested kotlinc distribution. Idempotent: if the
+/// destination already has a working binary, this is a no-op.
+pub fn install_kotlinc_kind(kind: KotlincKind, version: &str) -> Result<PathBuf, ParityError> {
+    match kind {
+        KotlincKind::Jvm => install_jvm(version),
+        KotlincKind::Native => install_native(version),
+    }
+}
+
+fn install_jvm(version: &str) -> Result<PathBuf, ParityError> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("macos" | "linux" | "windows", _) => {}
+        (os, arch) => return Err(ParityError::UnsupportedPlatform(format!("{os}-{arch}"))),
+    }
+
+    let cache = parity_cache_dir();
+    fs::create_dir_all(&cache)?;
+    let dest = cache.join(format!("kotlinc-{version}"));
+    let kotlinc = dest.join("bin").join(KotlincKind::Jvm.binary_name());
     if kotlinc.is_file() {
         return Ok(dest);
     }
 
-    // Cross-process lock so concurrent cargo test invocations don't race.
+    let lock_path = cache.join(format!(".kotlinc-{version}.installing"));
+    let _lock = InstallLock::acquire(&lock_path)?;
+    if kotlinc.is_file() {
+        return Ok(dest);
+    }
+
+    let archive_name = format!("kotlin-compiler-{version}.zip");
+    let url = format!(
+        "https://github.com/JetBrains/kotlin/releases/download/v{version}/{archive_name}"
+    );
+    let archive_path = cache.join(&archive_name);
+    eprintln!("[parity] installing JVM kotlinc {version} into {}", cache.display());
+    eprintln!("[parity] downloading {url}");
+    download(&url, &archive_path)?;
+
+    let staging = cache.join(format!(".kotlinc-{version}.partial"));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)?;
+    extract_archive(&archive_path, &staging, "zip")?;
+
+    let inner = staging.join("kotlinc");
+    if !inner.is_dir() {
+        return Err(ParityError::Install("kotlinc/ missing in archive".into()));
+    }
+    if dest.exists() {
+        let _ = fs::remove_dir_all(&dest);
+    }
+    fs::rename(&inner, &dest).map_err(|e| {
+        ParityError::Install(format!("rename {} -> {}: {e}", inner.display(), dest.display()))
+    })?;
+    let _ = fs::remove_dir_all(&staging);
+    let _ = fs::remove_file(&archive_path);
+
+    #[cfg(unix)]
+    {
+        for name in ["kotlinc", "kotlin", "kotlinc-jvm"] {
+            let p = dest.join("bin").join(name);
+            if p.is_file() {
+                let _ = Command::new("chmod").arg("+x").arg(&p).status();
+            }
+        }
+    }
+
+    if !kotlinc.is_file() {
+        return Err(ParityError::Install(format!(
+            "{} missing after extract",
+            kotlinc.display()
+        )));
+    }
+    eprintln!("[parity] kotlinc {version} ready at {}", dest.display());
+    Ok(dest)
+}
+
+fn install_native(version: &str) -> Result<PathBuf, ParityError> {
+    let (slug, subdir, ext) = native_platform_slug()?;
+    let root = konan_root()?;
+    fs::create_dir_all(&root)?;
+    let dir_name = format!("kotlin-native-prebuilt-{slug}-{version}");
+    let dest = root.join(&dir_name);
+    let kotlinc = dest.join("bin").join(KotlincKind::Native.binary_name());
+    if kotlinc.is_file() {
+        return Ok(dest);
+    }
+
     let lock_path = root.join(format!(".{dir_name}.installing"));
     let _lock = InstallLock::acquire(&lock_path)?;
     if kotlinc.is_file() {
@@ -162,23 +340,23 @@ pub fn install_kotlinc(version: &str) -> Result<PathBuf, ParityError> {
         "https://download.jetbrains.com/kotlin/native/builds/releases/{version}/{subdir}/{archive_name}"
     );
     let archive_path = root.join(&archive_name);
-    eprintln!("[parity] installing kotlin-native {version} ({slug}) into {}", root.display());
+    eprintln!(
+        "[parity] installing kotlin-native {version} ({slug}) into {}",
+        root.display()
+    );
     eprintln!("[parity] downloading {url}");
     download(&url, &archive_path)?;
 
-    // Extract into root; the archive's top-level dir matches `dir_name`.
     let staging = root.join(format!(".{dir_name}.partial"));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;
-    extract(&archive_path, &staging, ext)?;
+    extract_archive(&archive_path, &staging, ext)?;
 
-    // The archive contains `dir_name/...`. Move that out to the final spot.
     let extracted = staging.join(&dir_name);
     let extracted = if extracted.is_dir() {
         extracted
     } else {
-        // Fallback: some archives may extract a slightly different top-level
-        // dir. Pick the single child directory.
+        // Fallback: pick the single top-level dir the archive produced.
         let mut children = fs::read_dir(&staging)?
             .filter_map(Result::ok)
             .map(|e| e.path())
@@ -215,12 +393,7 @@ pub fn install_kotlinc(version: &str) -> Result<PathBuf, ParityError> {
     Ok(dest)
 }
 
-fn kotlinc_native_filename() -> &'static str {
-    if cfg!(windows) { "kotlinc-native.bat" } else { "kotlinc-native" }
-}
-
 fn download(url: &str, dest: &Path) -> Result<(), ParityError> {
-    // Prefer curl, fall back to wget. Both are present on macOS/Linux CI.
     let tmp = dest.with_extension("part");
     let _ = fs::remove_file(&tmp);
     let status = Command::new("curl")
@@ -249,7 +422,7 @@ fn download(url: &str, dest: &Path) -> Result<(), ParityError> {
     Ok(())
 }
 
-fn extract(archive: &Path, into: &Path, ext: &str) -> Result<(), ParityError> {
+fn extract_archive(archive: &Path, into: &Path, ext: &str) -> Result<(), ParityError> {
     let status = if ext == "zip" {
         Command::new("unzip")
             .arg("-q")
@@ -317,23 +490,6 @@ impl Drop for InstallLock {
     }
 }
 
-fn parity_cache_dir() -> PathBuf {
-    // Live next to the workspace target/, which is where everything else
-    // builds. CARGO_TARGET_DIR overrides honored automatically.
-    let target = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root().join("target"));
-    target.join("parity-cache")
-}
-
-fn workspace_root() -> PathBuf {
-    let m = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    m.parent()
-        .and_then(|p| p.parent())
-        .map(PathBuf::from)
-        .unwrap_or(m)
-}
-
 fn cache_key(file: &Path) -> String {
     let bytes = fs::read(file).unwrap_or_default();
     let mut h = DefaultHasher::new();
@@ -341,19 +497,21 @@ fn cache_key(file: &Path) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// Compile a `.kt` file with `kotlinc-native`, caching by content hash.
+/// Compile a `.kt` file with JVM `kotlinc` into a self-contained jar, cached by
+/// content hash.
 pub fn compile_with_kotlinc(file: &Path) -> Result<PathBuf, ParityError> {
     let kotlinc = find_kotlinc()?;
-    let dir = parity_cache_dir();
+    let dir = parity_cache_dir().join("jars");
     fs::create_dir_all(&dir)?;
     let key = cache_key(file);
-    let out = dir.join(format!("{key}.kexe"));
+    let out = dir.join(format!("{key}.jar"));
     if out.is_file() {
         return Ok(out);
     }
     let result = Command::new(&kotlinc)
         .arg(file)
-        .arg("-o")
+        .arg("-include-runtime")
+        .arg("-d")
         .arg(&out)
         .output()?;
     if !result.status.success() {
@@ -366,10 +524,286 @@ pub fn compile_with_kotlinc(file: &Path) -> Result<PathBuf, ParityError> {
     Ok(out)
 }
 
-fn run_binary(path: &Path) -> Result<(String, Option<i32>), ParityError> {
-    let result = Command::new(path).output()?;
+/// Run a previously-compiled jar under `java -jar`, returning captured stdout
+/// and exit code. Exposed so the parity test can time the stages individually.
+pub fn run_kotlinc_jar(jar: &Path) -> Result<(String, Option<i32>), ParityError> {
+    let java = locate_java()?;
+    let result = Command::new(java).arg("-jar").arg(jar).output()?;
     let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
     Ok((stdout, result.status.code()))
+}
+
+/// Run a specific fully-qualified main class out of `jar`. Used by the bulk
+/// corpus build, where one jar contains all corpus mains in distinct packages.
+pub fn run_class(jar: &Path, fqcn: &str) -> Result<(String, Option<i32>), ParityError> {
+    let java = locate_java()?;
+    let result = Command::new(java).arg("-cp").arg(jar).arg(fqcn).output()?;
+    let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
+    Ok((stdout, result.status.code()))
+}
+
+/// Output of a one-shot `kotlinc` compile over an entire corpus: a single jar
+/// holding every file's `main`, each in its own `klio_parity.<label>.<stem>`
+/// package, plus the mapping from original `.kt` path to the JVM FQCN of its
+/// `main` class.
+#[derive(Debug, Clone)]
+pub struct CorpusBuild {
+    pub jar: PathBuf,
+    pub classes: Vec<(PathBuf, String)>,
+}
+
+/// Compile a whole list of `.kt` files in one `kotlinc` invocation. Each file
+/// is staged under a unique package so `fun main()` declarations don't collide.
+/// The resulting jar is cached by `(label, sorted file contents)` and reused.
+///
+/// Assumes the inputs are simple top-level scripts with no existing `package`
+/// declaration or `@file:` annotations — the current corpus and `examples/`
+/// satisfy that. If that assumption breaks, audit `stage_one`.
+pub fn compile_corpus(label: &str, files: &[PathBuf]) -> Result<CorpusBuild, ParityError> {
+    let kotlinc = find_kotlinc()?;
+    let cache = parity_cache_dir();
+    fs::create_dir_all(&cache)?;
+
+    let key = corpus_cache_key(label, files);
+    let jar = cache.join(format!("corpus-{label}-{key}.jar"));
+    let stage = cache.join(format!("stage-{label}-{key}"));
+
+    let mut classes = Vec::with_capacity(files.len());
+    for file in files {
+        let stem = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| ParityError::Compile(format!("bad filename: {}", file.display())))?;
+        let pkg_seg = sanitize_pkg_segment(stem);
+        let pkg = format!("klio_parity.{label}.{pkg_seg}");
+        let fqcn = format!("{pkg}.{}Kt", capitalize_first(stem));
+        classes.push((file.clone(), fqcn));
+    }
+
+    if jar.is_file() {
+        return Ok(CorpusBuild { jar, classes });
+    }
+
+    // Re-stage from scratch — cheap, and avoids stale shims when the cache key
+    // changed but the stage dir from a prior run still exists.
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage)?;
+    for (file, fqcn) in &classes {
+        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap();
+        let pkg = fqcn.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+        let src = fs::read_to_string(file)?;
+        let rewritten = inject_jvm_inline(&src);
+        let shimmed = format!("package {pkg}\n\n{rewritten}");
+        fs::write(stage.join(format!("{stem}.kt")), shimmed)?;
+    }
+
+    // kotlinc picks output kind from the `-d` extension: `.jar` → jar file,
+    // anything else → a directory of `.class` files. We need a jar, so the
+    // partial path must keep `.jar` last; previously we used `.jar.part`
+    // (extension `.part`) and ended up with a stale directory that the rename
+    // below could not move over the real jar.
+    let tmp = cache.join(format!("corpus-{label}-{key}.partial.jar"));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_dir_all(&tmp);
+    let result = Command::new(&kotlinc)
+        .arg(&stage)
+        .arg("-include-runtime")
+        .arg("-d")
+        .arg(&tmp)
+        .output()?;
+    if !result.status.success() {
+        let _ = fs::remove_file(&tmp);
+        return Err(ParityError::Compile(format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        )));
+    }
+    fs::rename(&tmp, &jar)?;
+    // Stage dir is no longer needed; leaving it would just bloat target/.
+    let _ = fs::remove_dir_all(&stage);
+    Ok(CorpusBuild { jar, classes })
+}
+
+fn corpus_cache_key(label: &str, files: &[PathBuf]) -> String {
+    let mut h = DefaultHasher::new();
+    label.hash(&mut h);
+    let mut sorted: Vec<&PathBuf> = files.iter().collect();
+    sorted.sort();
+    for f in sorted {
+        f.file_name().and_then(|s| s.to_str()).unwrap_or("").hash(&mut h);
+        let bytes = fs::read(f).unwrap_or_default();
+        bytes.hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// Kotlin (hard) and Java reserved words. A `.kt` file whose stem is one of
+/// these can't be used directly as a package segment — `package …​.typealias`
+/// is rejected by kotlinc-native because `typealias` is a keyword. We suffix
+/// an underscore for collisions; the staged filename (and therefore the
+/// generated `…​Kt` class name) is unchanged, so the original capitalization
+/// continues to drive `FQCN`.
+fn sanitize_pkg_segment(stem: &str) -> String {
+    const RESERVED: &[&str] = &[
+        // Kotlin hard keywords
+        "as", "break", "class", "continue", "do", "else", "false", "for", "fun", "if", "in",
+        "interface", "is", "null", "object", "package", "return", "super", "this", "throw",
+        "true", "try", "typealias", "typeof", "val", "var", "when", "while",
+        // Java reserved words (JVM backend rejects these as package segments too)
+        "abstract", "assert", "boolean", "byte", "case", "catch", "char", "const", "default",
+        "double", "enum", "extends", "final", "finally", "float", "goto", "implements",
+        "import", "instanceof", "int", "long", "native", "new", "private", "protected",
+        "public", "short", "static", "strictfp", "switch", "synchronized", "throws",
+        "transient", "void", "volatile",
+    ];
+    if RESERVED.iter().any(|w| *w == stem) {
+        format!("{stem}_")
+    } else {
+        stem.to_string()
+    }
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// JVM `kotlinc` rejects `value class` declarations without an explicit
+/// `@JvmInline` annotation; native `kotlinc` doesn't require it. The corpus is
+/// JVM-agnostic so we inject the annotation during staging to keep both backends
+/// happy from a single source.
+///
+/// The scan is line-based and intentionally conservative: a line is considered
+/// a `value class` declaration when, after stripping leading whitespace,
+/// annotations, and recognized declaration modifiers, it begins with
+/// `value class`. If the preceding non-blank emitted line is already
+/// `@JvmInline` we leave it alone.
+fn inject_jvm_inline(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + 32);
+    let mut prev_had_jvminline = false;
+    for line in src.split_inclusive('\n') {
+        if declares_value_class(line) && !prev_had_jvminline {
+            let trimmed = line.trim_start();
+            let indent = &line[..line.len() - trimmed.len()];
+            out.push_str(indent);
+            out.push_str("@JvmInline\n");
+        }
+        out.push_str(line);
+        let t = line.trim();
+        if !t.is_empty() {
+            prev_had_jvminline = t.starts_with("@JvmInline");
+        }
+    }
+    out
+}
+
+fn declares_value_class(line: &str) -> bool {
+    const MODIFIERS: &[&str] = &[
+        "public ",
+        "private ",
+        "internal ",
+        "protected ",
+        "expect ",
+        "actual ",
+        "external ",
+        "open ",
+        "final ",
+        "abstract ",
+        "sealed ",
+        "data ",
+        "enum ",
+        "annotation ",
+        "companion ",
+        "inner ",
+        "inline ",
+    ];
+    let mut rest = line.trim_start();
+    loop {
+        // Strip a leading annotation `@Foo` or `@Foo(...)`.
+        if let Some(after_at) = rest.strip_prefix('@') {
+            let end = after_at
+                .find(|c: char| c.is_whitespace() || c == '(')
+                .unwrap_or(after_at.len());
+            let mut tail = &after_at[end..];
+            // Skip a parenthesized arg list if present.
+            if tail.starts_with('(') {
+                let mut depth = 0i32;
+                let bytes = tail.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                tail = &tail[i..];
+            }
+            rest = tail.trim_start();
+            continue;
+        }
+        let mut advanced = None;
+        for m in MODIFIERS {
+            if let Some(s) = rest.strip_prefix(m) {
+                advanced = Some(s.trim_start());
+                break;
+            }
+        }
+        match advanced {
+            Some(next) => rest = next,
+            None => break,
+        }
+    }
+    rest.starts_with("value class ") || rest.starts_with("value class\t")
+}
+
+#[cfg(test)]
+mod inject_tests {
+    use super::*;
+
+    #[test]
+    fn plain_value_class_gets_annotation() {
+        let out = inject_jvm_inline("value class UserId(val raw: Int)\n");
+        assert!(out.starts_with("@JvmInline\nvalue class UserId"));
+    }
+
+    #[test]
+    fn modifier_chain_handled() {
+        let out = inject_jvm_inline("public value class X(val a: Int)\n");
+        assert!(out.contains("@JvmInline\npublic value class X"));
+    }
+
+    #[test]
+    fn existing_annotation_left_alone() {
+        let src = "@JvmInline\nvalue class X(val a: Int)\n";
+        assert_eq!(inject_jvm_inline(src), src);
+    }
+
+    #[test]
+    fn indented_value_class_preserves_indent() {
+        let src = "    value class Inner(val a: Int)\n";
+        assert_eq!(
+            inject_jvm_inline(src),
+            "    @JvmInline\n    value class Inner(val a: Int)\n"
+        );
+    }
+
+    #[test]
+    fn unrelated_lines_unchanged() {
+        let src = "fun main() { println(\"value class\") }\n";
+        assert_eq!(inject_jvm_inline(src), src);
+    }
 }
 
 /// Run a `.kt` file directly through the `klio` interpreter library, returning
@@ -394,9 +828,6 @@ pub fn run_with_ktc(file: &Path) -> Result<String, String> {
         .with_expr_types(tc.types.clone())
         .run_with_output(&ast, &mut out)
         .map_err(|e| format!("runtime error: {e}"))?;
-    // CaptureOutput stores one entry per writeln. Kotlin's process stdout
-    // ends each println with a newline, including a trailing newline after
-    // the last print. Match that by appending a newline.
     let mut joined = out.lines.join("\n");
     if !joined.is_empty() {
         joined.push('\n');
@@ -406,8 +837,8 @@ pub fn run_with_ktc(file: &Path) -> Result<String, String> {
 
 /// Full parity check: compile + run both compilers, return a report.
 pub fn check(file: &Path) -> Result<ParityReport, ParityError> {
-    let kexe = compile_with_kotlinc(file)?;
-    let (kotlinc_stdout, kotlinc_exit) = run_binary(&kexe)?;
+    let jar = compile_with_kotlinc(file)?;
+    let (kotlinc_stdout, kotlinc_exit) = run_kotlinc_jar(&jar)?;
     match run_with_ktc(file) {
         Ok(klio_stdout) => Ok(ParityReport {
             matched: kotlinc_stdout == klio_stdout,
@@ -434,7 +865,7 @@ pub fn render_diff(report: &ParityReport) -> String {
         return String::new();
     }
     let mut out = String::new();
-    out.push_str("--- kotlinc-native\n");
+    out.push_str("--- kotlinc\n");
     out.push_str("+++ klio\n");
     let a: Vec<&str> = report.kotlinc_stdout.lines().collect();
     let b: Vec<&str> = report.klio_stdout.lines().collect();

@@ -9,8 +9,8 @@ license.workspace = true
 default = []
 # Enable dhat heap profiling on the driver binary.
 dhat = ["dep:dhat"]
-# Run the reference Kotlin compilers (kotlinc-native, kotlinc-jvm). Off by
-# default so a vanilla `cargo bench` doesn't pull a 200 MB JDK toolchain.
+# Run the reference Kotlin compilers (kotlinc-native, JVM kotlinc). Off by
+# default so a vanilla `cargo bench` doesn't pull the toolchains.
 ref = []
 
 [dependencies]
