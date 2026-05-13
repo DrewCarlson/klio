@@ -2784,6 +2784,15 @@ impl Interpreter {
                 };
                 Ok(Some(self.call_lambda(params, body, captured, &[], out)?))
             }
+            "suspend" if args.len() == 1 => {
+                let lam = self.eval_expr(&args[0], env, out)?;
+                if !matches!(lam, Value::Lambda { .. }) {
+                    return Err(RuntimeError::Type(
+                        "`suspend` requires a lambda argument".into(),
+                    ));
+                }
+                Ok(Some(lam))
+            }
             "repeat" if args.len() == 2 => {
                 let n = self.eval_expr(&args[0], env, out)?;
                 let lam = self.eval_expr(&args[1], env, out)?;
