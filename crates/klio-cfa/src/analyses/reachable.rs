@@ -7,11 +7,14 @@
 //! node is encountered before the terminator (typical for code
 //! after a `Nothing`-typed call).
 //!
-//! Phase 6 will reroute `W0002 unreachable code` and similar
-//! diagnostics through this pass.
+//! The `_with_types` variant consults a span-keyed type map so an
+//! `Eval` of a `Nothing`-returning call (`error("…")`, `TODO()`)
+//! prunes its block's successors the same way an explicit
+//! `Throw` would. The typechecker passes its `types` map in.
 
 use crate::ir::{BlockId, Cfg, Node, Terminator};
-use std::collections::BTreeSet;
+use klio_types::Type;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone)]
 pub struct Reachability {
@@ -33,6 +36,14 @@ impl Reachability {
 }
 
 pub fn analyse(cfg: &Cfg) -> Reachability {
+    analyse_with_types(cfg, None)
+}
+
+/// Same as `analyse` but consults `type_map` (typechecker-supplied
+/// span→Type results) so an `Eval` of a `Nothing`-typed expression
+/// is treated like an in-block `Unreachable` marker: control does
+/// not propagate past it.
+pub fn analyse_with_types(cfg: &Cfg, type_map: Option<&HashMap<(u32, u32), Type>>) -> Reachability {
     let mut reachable = vec![false; cfg.blocks.len()];
     let mut stack: Vec<BlockId> = vec![cfg.entry];
     let mut visited: BTreeSet<BlockId> = BTreeSet::new();
@@ -43,16 +54,20 @@ pub fn analyse(cfg: &Cfg) -> Reachability {
         }
         reachable[b.0 as usize] = true;
         let block = cfg.block(b);
-        // Block-internal divergence: any explicit Unreachable node
-        // before the terminator kills the rest of the block but we
-        // still mark the block reachable (entry survived).
-        if block.nodes.iter().any(|n| matches!(n, Node::Unreachable)) {
+        let block_diverges = block.nodes.iter().any(|n| match n {
+            Node::Unreachable => true,
+            Node::Eval { expr, .. } => match type_map {
+                Some(tm) => matches!(
+                    tm.get(&(expr.span.start, expr.span.end)),
+                    Some(Type::Nothing)
+                ),
+                None => matches!(expr.ty, Type::Nothing),
+            },
+            _ => false,
+        });
+        if block_diverges {
             continue;
         }
-        // Successors propagate only when the terminator is
-        // non-divergent. Throw/Return/Unreachable do not propagate
-        // by their nature, even though the IR records preds for
-        // exception edges separately.
         match &block.term {
             Terminator::Throw(_) | Terminator::Return(_) | Terminator::Unreachable => {}
             _ => {

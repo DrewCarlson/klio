@@ -8675,7 +8675,10 @@ impl<'r> Checker<'r> {
 
     /// Returns true when the CFG's reachability analysis classifies
     /// the block containing `query_span` as unreachable. Drives the
-    /// W0002 unreachable-code warning.
+    /// W0002 unreachable-code warning. The typechecker's `types` map
+    /// is threaded through so `Nothing`-returning expressions
+    /// (`error(...)`, `TODO()`) prune their block's successors the
+    /// same way an explicit `return` / `throw` would.
     fn cfg_is_unreachable_at(&self, query_span: Span) -> Option<bool> {
         let fn_span = *self.cfg_fn_stack.last()?;
         let lowered = self.lowerings.get(&fn_span)?;
@@ -8683,7 +8686,15 @@ impl<'r> Checker<'r> {
             .span_to_pos
             .get(&(query_span.start, query_span.end))
             .copied()?;
-        let r = klio_cfa::analyses::reachable::analyse(&lowered.cfg);
+        let type_map: std::collections::HashMap<(u32, u32), Type> = self
+            .types
+            .iter()
+            .map(|(s, t)| ((s.start, s.end), t.clone()))
+            .collect();
+        let r = klio_cfa::analyses::reachable::analyse_with_types(
+            &lowered.cfg,
+            Some(&type_map),
+        );
         Some(!r.is_reachable(bid))
     }
 
