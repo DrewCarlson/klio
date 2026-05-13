@@ -12429,6 +12429,90 @@ mod tests {
     }
 
     #[test]
+    fn coroutines_pipeline_three_step() {
+        let src = r#"
+            import kotlin.coroutines.*
+            suspend fun step(x: Int): Int = suspendCoroutine<Int> { it.resume(x + 10) }
+            suspend fun pipeline(): Int {
+                val a = step(1)
+                val b = step(a)
+                val c = step(b)
+                return c
+            }
+            fun main() {
+                println(runBlocking { pipeline() })
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["31"]);
+    }
+
+    #[test]
+    fn coroutines_capture_and_resume_via_callback() {
+        let src = r#"
+            import kotlin.coroutines.*
+            fun later(action: (Int) -> Unit) { action(99) }
+            suspend fun deferred(): Int = suspendCoroutine<Int> { cont ->
+                later { v -> cont.resume(v) }
+            }
+            suspend fun doWork(): Int {
+                val a = deferred()
+                return a + 1
+            }
+            fun main() { println(runBlocking { doWork() }) }
+        "#;
+        assert_eq!(run(src).lines, vec!["100"]);
+    }
+
+    #[test]
+    fn coroutines_exception_through_try_catch() {
+        let src = r#"
+            import kotlin.coroutines.*
+            suspend fun fails(): Int = suspendCoroutine<Int> { cont ->
+                cont.resumeWithException(RuntimeException("nope"))
+            }
+            suspend fun caller(): Int {
+                val a = try { fails() } catch (e: RuntimeException) { -1 }
+                return a + 100
+            }
+            fun main() { println(runBlocking { caller() }) }
+        "#;
+        assert_eq!(run(src).lines, vec!["99"]);
+    }
+
+    #[test]
+    fn coroutines_for_loop_with_synchronous_suspends() {
+        let src = r#"
+            import kotlin.coroutines.*
+            suspend fun unit(x: Int): Int = suspendCoroutine<Int> { it.resume(x) }
+            suspend fun sum(n: Int): Int {
+                var total = 0
+                for (i in 1..n) {
+                    total = total + unit(i)
+                }
+                return total
+            }
+            fun main() { println(runBlocking { sum(5) }) }
+        "#;
+        assert_eq!(run(src).lines, vec!["15"]);
+    }
+
+    #[test]
+    fn coroutines_if_branch_inside_suspend() {
+        let src = r#"
+            import kotlin.coroutines.*
+            suspend fun unit(x: Int): Int = suspendCoroutine<Int> { it.resume(x) }
+            suspend fun branchy(n: Int): Int {
+                return if (n > 0) unit(n * 10) else unit(-n)
+            }
+            fun main() {
+                println(runBlocking { branchy(5) })
+                println(runBlocking { branchy(-3) })
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["50", "3"]);
+    }
+
+    #[test]
     fn coroutines_resume_with_exception() {
         let src = r#"
             import kotlin.coroutines.*
