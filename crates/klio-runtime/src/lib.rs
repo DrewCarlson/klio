@@ -1927,6 +1927,7 @@ mod tests {
         Rc::new(ClassDef {
             name: name.to_string(),
             fqn: name.to_string(),
+            annotation_names: Vec::new(),
             primary_params: Vec::new(),
             methods: Vec::new(),
             body_properties: Vec::new(),
