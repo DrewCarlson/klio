@@ -20,6 +20,7 @@ klio-interp      = { workspace = true }
 klio-ast         = { workspace = true }
 klio-pack        = { workspace = true }
 klio-stdlib      = { workspace = true }
+klio-runtime     = { workspace = true }
 clap            = { workspace = true }
 rustyline       = { workspace = true }
 

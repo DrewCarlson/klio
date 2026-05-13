@@ -629,6 +629,7 @@ dependencies = [
  "klio-pack",
  "klio-parser",
  "klio-resolver",
+ "klio-runtime",
  "klio-span",
  "klio-stdlib",
  "klio-typeck",

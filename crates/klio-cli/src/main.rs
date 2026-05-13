@@ -326,17 +326,48 @@ fn verify_pack(path: &std::path::Path, smoke: Option<&std::path::Path>) -> Resul
         }
     }
     if let Some(file) = smoke {
-        return run_smoke(file);
+        return run_smoke(path, file);
     }
     Ok(())
 }
 
-fn run_smoke(file: &std::path::Path) -> Result<(), String> {
-    // run_file prints to stdout/stderr and returns ExitCode; ExitCode
-    // has no PartialEq, so we approximate "ok?" by checking that the
-    // file is parseable. The full success bar is a follow-up wired
-    // through Interpreter::install_pack once M2 lands.
-    let _ = file;
+fn run_smoke(pack_path: &std::path::Path, smoke: &std::path::Path) -> Result<(), String> {
+    use klio_pack::PackReader;
+    let bytes =
+        std::fs::read(pack_path).map_err(|e| format!("read {}: {e}", pack_path.display()))?;
+    let pack = PackReader::from_bytes(bytes).map_err(|e| e.to_string())?;
+    let host = klio_stdlib::HostBindings::with_stdlib_defaults();
+    let mut interp = Interpreter::new();
+    let installed = interp
+        .install_pack(&pack, &host)
+        .map_err(|e| format!("install_pack: {e}"))?;
+    eprintln!("installed {installed} bindings from pack");
+
+    let mut map = SourceMap::new();
+    let id = load(&mut map, smoke).ok_or_else(|| format!("cannot read {}", smoke.display()))?;
+    let src = map.get(id).source.clone();
+    let lexed = Lexer::new(id, &src).tokenize();
+    if lexed.diagnostics.has_errors() {
+        return Err(format!("lex errors in {}", smoke.display()));
+    }
+    let (ast, parse_diags) = Parser::new(id, &src, &lexed.tokens).parse_file();
+    if parse_diags.has_errors() {
+        return Err(format!("parse errors in {}", smoke.display()));
+    }
+    // The resolver is intentionally tolerant — stdlib references
+    // (e.g. `listOf`) surface as UNRESOLVED_REFERENCE warnings here
+    // and rebind at the interp's dispatch site. Only typecheck
+    // diagnostics are treated as fatal, matching `klio run`.
+    let r = resolve(&ast);
+    let tc = typecheck(&ast, &r);
+    if tc.diagnostics.has_errors() {
+        return Err(format!("typecheck errors in {}", smoke.display()));
+    }
+    interp = interp.with_expr_types(tc.types);
+    let mut stdout = klio_runtime::StdoutOutput;
+    interp
+        .run_with_output(&ast, &mut stdout)
+        .map_err(|e| format!("runtime error: {e}"))?;
     Ok(())
 }
 
