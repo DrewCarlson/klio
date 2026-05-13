@@ -7631,7 +7631,39 @@ impl<'r> Checker<'r> {
 
     fn check_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) -> Type {
         let l = self.check_expr(lhs, None);
+        // Spec §14.1: smart-cast narrowings established by the lhs of
+        // `&&` / `||` must apply when checking the rhs. For `&&` use the
+        // true-branch narrowings (rhs runs only when lhs was true); for
+        // `||` use the false-branch narrowings.
+        let (saved_narrowings, saved_classes) = if matches!(op, BinOp::And | BinOp::Or) {
+            let nar = self.check_condition(lhs);
+            let saved_n = self.current_frame().narrowings.clone();
+            let saved_c = self.current_frame().narrowing_class.clone();
+            let branch = if matches!(op, BinOp::And) {
+                &nar.true_branch
+            } else {
+                &nar.false_branch
+            };
+            let branch_classes = if matches!(op, BinOp::And) {
+                &nar.true_class
+            } else {
+                &nar.false_class
+            };
+            for (k, v) in branch {
+                self.current_frame().narrowings.insert(k.clone(), v.clone());
+            }
+            for (k, v) in branch_classes {
+                self.current_frame().narrowing_class.insert(k.clone(), v.clone());
+            }
+            (Some(saved_n), Some(saved_c))
+        } else {
+            (None, None)
+        };
         let r = self.check_expr(rhs, None);
+        if let (Some(n), Some(c)) = (saved_narrowings, saved_classes) {
+            self.current_frame().narrowings = n;
+            self.current_frame().narrowing_class = c;
+        }
         // Spec ch.9: dispatch-site `operator` modifier check. Binary arith
         // / range / comparison dispatches on the LHS class; `in` / `!in`
         // dispatches on the RHS class.
