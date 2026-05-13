@@ -1,0 +1,9 @@
+:root {
+  --md-primary-fg-color: #2b5278;
+  --md-primary-fg-color--light: #3a6ea0;
+  --md-primary-fg-color--dark: #1e3a5a;
+}
+
+.md-typeset .admonition {
+  border-radius: 6px;
+}

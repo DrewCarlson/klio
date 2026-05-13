@@ -1,0 +1,79 @@
+site_name: klio
+site_description: An experimental Kotlin interpreter written in Rust.
+site_url: https://klio.dev/
+repo_url: https://github.com/DrewCarlson/kt-exp
+remote_branch: gh-pages
+docs_dir: docs
+edit_uri: edit/main/docs/
+copyright: 'Copyright &copy; 2026 klio Maintainers'
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - content.action.edit
+    - content.code.copy
+    - content.code.annotate
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  - markdownextradata: {}
+
+extra:
+  klio_version: !ENV [VERSION, '0.1.0']
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/DrewCarlson/kt-exp
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Hello, world: getting-started/hello-world.md
+    - CLI Tour: getting-started/cli.md
+  - Architecture:
+    - Pipeline Overview: architecture/pipeline.md
+    - Interpreter: architecture/interpreter.md
+    - Standard Library: architecture/stdlib.md
+    - Diagnostics: architecture/diagnostics.md
+  - Packs:
+    - What is a Pack?: packs/overview.md
+    - Pack Format: packs/format.md
+    - Using Packs: packs/using.md
+    - Authoring a Pack: packs/authoring.md
+    - Native Bindings: packs/native-bindings.md
+    - Shipped Packs:
+      - kotlinx.atomicfu: packs/shipped/atomicfu.md
+      - kotlinx.io: packs/shipped/io.md
+      - kotlinx.datetime: packs/shipped/datetime.md
+      - kotlinx.coroutines: packs/shipped/coroutines.md
+      - io.ktor.client: packs/shipped/ktor-client.md
+  - Development:
+    - Workspace Layout: development/workspace.md
+    - Testing: development/testing.md
+    - Contributing: development/contributing.md
