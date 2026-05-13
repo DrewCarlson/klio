@@ -354,31 +354,19 @@ impl Interpreter {
     ) -> Result<Value, RuntimeError> {
         let file_env = Rc::new(RefCell::new(Env::with_parent(Rc::clone(&self.globals))));
 
-        // Apply renaming imports (spec §10.1). For each `import path.X as Y`
-        // we bind `Y` to whatever `path.X` resolves to in the stdlib registry
-        // and record the original simple name so referencing `X` unqualified
-        // surfaces a "renamed to `Y`" diagnostic.
+        // Apply imports (spec §10.1).
+        //  * `import path.X as Y` binds `Y` to whatever `path.X` resolves to
+        //    in the stdlib registry and records the original simple name so
+        //    referencing `X` unqualified surfaces a "renamed to `Y`"
+        //    diagnostic.
+        //  * `import path.X` (no alias) binds the simple name `X`.
+        //  * `import path.*` binds every stdlib symbol whose FQN starts with
+        //    `path.` and whose remainder has no further `.`.
         self.import_renames.clear();
-        for imp in &file.imports {
-            if imp.wildcard {
-                continue;
-            }
-            let Some(alias_ident) = &imp.alias else { continue };
-            let Some(last_seg) = imp.path.last() else { continue };
-            let fqn = imp
-                .path
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join(".");
-            if let Some(func) = klio_stdlib::implementation(&fqn) {
-                let fqn_static: &'static str = leak_fqn(&fqn);
-                // `kotlin.math.PI` and friends are property intrinsics — a
-                // zero-arg function that returns the value. Mirror the
-                // `Expr::Member` short-circuit by invoking immediately when
-                // the symbol is a property; for function/class intrinsics
-                // bind the callable Value::Intrinsic as-is.
-                let is_property = klio_stdlib::lookup(&fqn)
+        let bind_fqn = |env: &Rc<RefCell<Env>>, simple: String, fqn: &str, out: &mut dyn Output| {
+            if let Some(func) = klio_stdlib::implementation(fqn) {
+                let fqn_static: &'static str = leak_fqn(fqn);
+                let is_property = klio_stdlib::lookup(fqn)
                     .map_or(false, |s| matches!(s.kind, klio_stdlib::SymbolKind::Property));
                 let bound = if is_property {
                     let mut ctx = CallCtx { args: &[], out };
@@ -389,10 +377,41 @@ impl Interpreter {
                 } else {
                     Value::Intrinsic { fqn: fqn_static, func }
                 };
-                file_env.borrow_mut().define(alias_ident.name.clone(), bound);
+                env.borrow_mut().define(simple, bound);
             }
-            self.import_renames
-                .insert(last_seg.name.clone(), alias_ident.name.clone());
+        };
+        for imp in &file.imports {
+            let fqn = imp
+                .path
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if imp.wildcard {
+                let prefix = format!("{fqn}.");
+                let symbols: Vec<String> = klio_stdlib::all_symbol_names()
+                    .filter(|n| {
+                        n.starts_with(&prefix) && !n[prefix.len()..].contains('.')
+                    })
+                    .map(|n| n.to_string())
+                    .collect();
+                for sym_fqn in symbols {
+                    let simple = sym_fqn[prefix.len()..].to_string();
+                    bind_fqn(&file_env, simple, &sym_fqn, out);
+                }
+                continue;
+            }
+            let Some(last_seg) = imp.path.last() else { continue };
+            let simple = imp
+                .alias
+                .as_ref()
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| last_seg.name.clone());
+            bind_fqn(&file_env, simple.clone(), &fqn, out);
+            if let Some(alias_ident) = &imp.alias {
+                self.import_renames
+                    .insert(last_seg.name.clone(), alias_ident.name.clone());
+            }
         }
 
         // Register top-level `typealias` declarations so constructor calls

@@ -176,6 +176,14 @@ pub fn lookup(fqn: &str) -> Option<&'static SymbolEntry> {
     generated::STDLIB_SYMBOLS.iter().find(|e| e.fqn == fqn)
 }
 
+/// Iterate every registered stdlib symbol FQN. Used by import resolution
+/// to expand wildcard imports (`import kotlin.math.*`).
+pub fn all_symbol_names() -> impl Iterator<Item = &'static str> {
+    let registry = generated::STDLIB_SYMBOLS.iter().map(|e| e.fqn);
+    let hand = implementations::all_fqns();
+    registry.chain(hand)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Coverage {
     pub implemented: usize,

@@ -687,6 +687,10 @@ pub fn lookup(fqn: &str) -> Option<StdlibFn> {
     TABLE.iter().find(|(k, _)| *k == fqn).map(|(_, f)| *f)
 }
 
+pub fn all_fqns() -> impl Iterator<Item = &'static str> {
+    TABLE.iter().map(|(k, _)| *k)
+}
+
 // ============================================================
 // io
 // ============================================================
