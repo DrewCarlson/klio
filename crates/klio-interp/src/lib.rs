@@ -174,6 +174,17 @@ pub struct Interpreter {
     /// default `Any.toString` and `Enum.valueOf` failure messages match JVM
     /// Kotlin's `<package>.<simple-name>` form.
     current_package: Option<String>,
+    /// FQN → native binding installed from a loaded pack. Wins over
+    /// the static `klio_stdlib::implementation` lookup so a pack can
+    /// shadow or augment the in-process stdlib.
+    installed_bindings: std::collections::HashMap<String, klio_runtime::StdlibFn>,
+    /// Implicit-import packages contributed by every loaded pack.
+    /// Unioned with `klio_stdlib::IMPLICITLY_IMPORTED_PACKAGES` so
+    /// resolver / typeck see the same surface regardless of source.
+    pack_implicit_packages: Vec<String>,
+    /// `is_known_package` surface contributed by every loaded pack —
+    /// the set of packages reachable through the pack's symbol index.
+    pack_known_packages: std::collections::HashSet<String>,
 }
 
 /// Holder a `Continuation<T>` writes into when its `resume` /
@@ -246,7 +257,84 @@ impl Interpreter {
             expr_types: std::collections::HashMap::new(),
             import_renames: std::collections::HashMap::new(),
             current_package: None,
+            installed_bindings: std::collections::HashMap::new(),
+            pack_implicit_packages: Vec::new(),
+            pack_known_packages: std::collections::HashSet::new(),
         }
+    }
+
+    /// Install bindings, implicit packages, and the package surface
+    /// from a loaded `klio-pack`. The pack carries the FQN → host
+    /// symbol mapping; `host` resolves each host symbol to a Rust
+    /// `StdlibFn` that the interpreter will dispatch when a call site
+    /// hits that FQN. Returns the number of bindings installed.
+    ///
+    /// Multiple packs may be installed; later packs shadow earlier
+    /// packs at colliding FQNs. The static
+    /// `klio_stdlib::implementation` table acts as a fallback for FQNs
+    /// no pack has bound.
+    pub fn install_pack(
+        &mut self,
+        pack: &klio_pack::PackReader,
+        host: &klio_stdlib::HostBindings,
+    ) -> Result<usize, klio_pack::PackError> {
+        use klio_pack::schema::{decode, BindingManifest, PackManifest, SymbolIndex};
+        use klio_pack::section_names;
+        if let Some(bytes) = pack.read_section(section_names::MANIFEST)? {
+            let manifest: PackManifest = decode(&bytes)?;
+            for pkg in manifest.implicit_packages {
+                if !self.pack_implicit_packages.iter().any(|p| p == &pkg) {
+                    self.pack_implicit_packages.push(pkg.clone());
+                }
+                self.pack_known_packages.insert(pkg);
+            }
+        }
+        if let Some(bytes) = pack.read_section(section_names::SYMBOLS)? {
+            let symbols: SymbolIndex = decode(&bytes)?;
+            for record in symbols.entries {
+                if !record.package.is_empty() {
+                    self.pack_known_packages.insert(record.package);
+                }
+            }
+        }
+        let mut installed = 0usize;
+        if let Some(bytes) = pack.read_section(section_names::BINDINGS)? {
+            let manifest: BindingManifest = decode(&bytes)?;
+            for b in manifest.bindings {
+                if let Some(f) = host.resolve(&b.host_symbol) {
+                    self.installed_bindings.insert(b.fqn, f);
+                    installed += 1;
+                }
+            }
+        }
+        Ok(installed)
+    }
+
+    /// Look up an intrinsic by FQN. Checks pack-installed bindings
+    /// first, falls back to the static `klio_stdlib` table.
+    #[must_use]
+    pub fn lookup_intrinsic(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
+        if let Some(f) = self.installed_bindings.get(fqn) {
+            return Some(*f);
+        }
+        klio_stdlib::implementation(fqn)
+    }
+
+    /// Returns the implicit-import packages contributed by loaded
+    /// packs (`install_pack`). The stdlib defaults remain in
+    /// `klio_stdlib::IMPLICITLY_IMPORTED_PACKAGES`; this list adds
+    /// any packs that declared more.
+    #[must_use]
+    pub fn pack_implicit_packages(&self) -> &[String] {
+        &self.pack_implicit_packages
+    }
+
+    /// Returns true when `package_path` appears in any loaded pack's
+    /// implicit-imports list or symbol index. Stdlib coverage from
+    /// `klio_stdlib::is_known_package` is additive.
+    #[must_use]
+    pub fn is_pack_known_package(&self, package_path: &str) -> bool {
+        self.pack_known_packages.contains(package_path)
     }
 
     /// Compose `<file-package>.<simple>` for a top-level user-declared class.
@@ -2006,7 +2094,7 @@ impl Interpreter {
                     }
                     if let Some(this_val) = innermost_this {
                         let fqn = format!("{}.{}", this_val.type_fqn(), name);
-                        if let Some(func) = klio_stdlib::implementation(&fqn) {
+                        if let Some(func) = self.lookup_intrinsic(&fqn) {
                             let args = [this_val];
                             let mut ctx = CallCtx { args: &args, out };
                             return func(&mut ctx);
@@ -2466,7 +2554,7 @@ impl Interpreter {
                 // Try a flattened static lookup first (e.g. `kotlin.math.PI`).
                 if !*safe {
                     if let Some(fqn) = try_qualified_name(expr) {
-                        if let Some(func) = klio_stdlib::implementation(&fqn) {
+                        if let Some(func) = self.lookup_intrinsic(&fqn) {
                             let mut ctx = CallCtx { args: &[], out };
                             return func(&mut ctx);
                         }
@@ -2527,7 +2615,7 @@ impl Interpreter {
                     arg_vals.push(self.eval_expr(a, env, out)?);
                 }
                 let fqn = format!("{}.get", arg_vals[0].type_fqn());
-                let Some(func) = klio_stdlib::implementation(&fqn) else {
+                let Some(func) = self.lookup_intrinsic(&fqn) else {
                     return Err(RuntimeError::Unimplemented(fqn));
                 };
                 let mut ctx = CallCtx { args: &arg_vals, out };
@@ -3037,7 +3125,7 @@ impl Interpreter {
         }
         if let Some((this_val, _)) = this_chain.into_iter().next() {
             let fqn = format!("{}.{}", this_val.type_fqn(), name);
-            if let Some(func) = klio_stdlib::implementation(&fqn) {
+            if let Some(func) = self.lookup_intrinsic(&fqn) {
                 let args = [this_val];
                 let mut ctx = CallCtx { args: &args, out };
                 return func(&mut ctx);
@@ -4072,7 +4160,7 @@ impl Interpreter {
         // `max` / `toMap` / `indices` route through the regular intrinsic
         // table now that the receiver is a List.
         let fqn = format!("kotlin.collections.List.{name}");
-        if let Some(func) = klio_stdlib::implementation(&fqn) {
+        if let Some(func) = self.lookup_intrinsic(&fqn) {
             let mut arg_vals = vec![as_list.clone()];
             for a in args {
                 arg_vals.push(self.eval_expr(a, env, out)?);
@@ -7549,7 +7637,7 @@ impl Interpreter {
             // references. Bind to the corresponding stdlib intrinsic so
             // `xs.map(String::uppercase)` dispatches at call time.
             let fqn = format!("{}.{}", c.fqn, name);
-            if let Some(func) = klio_stdlib::implementation(&fqn) {
+            if let Some(func) = self.lookup_intrinsic(&fqn) {
                 let fqn_static: &'static str = leak_fqn(&fqn);
                 return Ok(Value::Intrinsic { fqn: fqn_static, func });
             }
@@ -7858,7 +7946,7 @@ impl Interpreter {
             .map(|s| s.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
-        if let Some(func) = klio_stdlib::implementation(&fqn) {
+        if let Some(func) = self.lookup_intrinsic(&fqn) {
             // Interned static lifetime needed for Intrinsic::fqn — keep our copy.
             let fqn_static: &'static str = leak_fqn(&fqn);
             return Ok(Value::Intrinsic { fqn: fqn_static, func });
@@ -8157,7 +8245,7 @@ impl Interpreter {
             )));
         }
         let fqn = format!("{}.{}", receiver.type_fqn(), name);
-        if let Some(func) = klio_stdlib::implementation(&fqn) {
+        if let Some(func) = self.lookup_intrinsic(&fqn) {
             let args = [receiver];
             let mut ctx = CallCtx { args: &args, out };
             return func(&mut ctx);
@@ -8491,7 +8579,7 @@ impl Interpreter {
                         }
                     }
                     let fqn = format!("{}.{}", this_val.type_fqn(), name);
-                    if let Some(func) = klio_stdlib::implementation(&fqn) {
+                    if let Some(func) = self.lookup_intrinsic(&fqn) {
                         let mut arg_vals = Vec::with_capacity(args.len() + 1);
                         arg_vals.push(this_val);
                         for a in args {
@@ -8507,7 +8595,7 @@ impl Interpreter {
         // Static dotted call shape, e.g. `kotlin.math.abs(-7)`. Flatten the
         // callee chain to an FQN and dispatch directly if the stdlib has it.
         if let Some(fqn) = try_qualified_name(callee) {
-            if let Some(func) = klio_stdlib::implementation(&fqn) {
+            if let Some(func) = self.lookup_intrinsic(&fqn) {
                 let mut arg_vals = Vec::with_capacity(args.len());
                 for a in args {
                     arg_vals.push(self.eval_expr(a, env, out)?);
@@ -9099,7 +9187,7 @@ impl Interpreter {
                 return Ok(out_val);
             }
             let type_fqn = format!("{}.{}", recv.type_fqn(), name.name);
-            if let Some(func) = klio_stdlib::implementation(&type_fqn) {
+            if let Some(func) = self.lookup_intrinsic(&type_fqn) {
                 let mut user_args = Vec::with_capacity(args.len());
                 for a in args {
                     user_args.push(self.eval_expr(a, env, out)?);
@@ -9192,16 +9280,22 @@ impl Interpreter {
                     }
                     arg_vals = rewritten;
                 }
+                // A pack-installed binding shadows the statically
+                // captured `func` so loaded bindings take effect even
+                // for intrinsics already bound at startup (implicit
+                // aliases, prior callsite caches, etc.).
+                let effective = self.installed_bindings.get(fqn).copied().unwrap_or(func);
                 let mut ctx = CallCtx { args: &arg_vals, out };
-                func(&mut ctx)
+                effective(&mut ctx)
             }
             Value::BoundMethod { fqn, func, receiver } => {
                 let user_args = reorder_intrinsic_args(fqn, arg_vals, arg_names)?;
                 let mut all = Vec::with_capacity(user_args.len() + 1);
                 all.push(*receiver);
                 all.extend(user_args);
+                let effective = self.installed_bindings.get(fqn).copied().unwrap_or(func);
                 let mut ctx = CallCtx { args: &all, out };
-                func(&mut ctx)
+                effective(&mut ctx)
             }
             Value::BoundUserMethod { receiver, method } => {
                 self.call_method(&receiver, &method, &arg_vals, arg_names, out)
@@ -9424,7 +9518,7 @@ impl Interpreter {
         arg_vals.push(recv);
         arg_vals.extend(idxs);
         let fqn = format!("{}.get", arg_vals[0].type_fqn());
-        if let Some(func) = klio_stdlib::implementation(&fqn) {
+        if let Some(func) = self.lookup_intrinsic(&fqn) {
             let mut ctx = CallCtx { args: &arg_vals, out };
             return func(&mut ctx);
         }
@@ -12531,6 +12625,73 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["11"]);
+    }
+
+    #[test]
+    fn pack_install_routes_dispatch_through_bindings() {
+        // Build an in-memory pack that binds kotlin.io.println to a
+        // synthetic Rust function that prefixes "[PACK]", install it,
+        // and verify dispatch through the FQN goes through the
+        // installed binding rather than the static stdlib table.
+        use klio_pack::schema::{
+            encode, Binding, BindingKind, BindingManifest, PackManifest, Purity,
+        };
+        use klio_pack::{section_names, PackReader, PackWriter};
+        use klio_runtime::{CallCtx, RuntimeError, StdlibFn, Value};
+
+        fn marker_println(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+            for v in ctx.args {
+                let s = match v {
+                    Value::String(s) => s.as_str().to_string(),
+                    _ => format!("{v}"),
+                };
+                ctx.out.writeln(&format!("[PACK] {s}"));
+            }
+            Ok(Value::Unit)
+        }
+
+        let manifest = PackManifest {
+            library_id: "test".into(),
+            library_version: "0.0.0".into(),
+            abi_version: 1,
+            implicit_packages: vec![],
+            dependencies: vec![],
+        };
+        let bindings = BindingManifest {
+            bindings: vec![Binding {
+                fqn: "kotlin.io.println".into(),
+                kind: BindingKind::Function,
+                host_symbol: "test.println".into(),
+                overrides_interpreter: true,
+                purity: Purity::Effectful,
+                min_arity: 0,
+                max_arity: 1,
+            }],
+        };
+        let mut w = PackWriter::new();
+        w.add_raw(section_names::MANIFEST, encode(&manifest).unwrap());
+        w.add_raw(section_names::BINDINGS, encode(&bindings).unwrap());
+        let bytes = w.finish().unwrap();
+        let pack = PackReader::from_bytes(bytes).unwrap();
+        let mut host = klio_stdlib::HostBindings::new();
+        let marker: StdlibFn = marker_println;
+        host.register("test.println", marker);
+
+        use klio_lexer::Lexer;
+        use klio_parser::Parser;
+        use klio_span::SourceMap;
+        let src = r#"fun main() { println("hello") }"#;
+        let mut map = SourceMap::new();
+        let id = map.add("test.kt", src);
+        let owned = map.get(id).source.clone();
+        let lexed = Lexer::new(id, &owned).tokenize();
+        let (ast, _) = Parser::new(id, &owned, &lexed.tokens).parse_file();
+        let mut interp = Interpreter::new();
+        let installed = interp.install_pack(&pack, &host).unwrap();
+        assert_eq!(installed, 1);
+        let mut out = CaptureOutput::default();
+        interp.run_with_output(&ast, &mut out).unwrap();
+        assert_eq!(out.lines, vec!["[PACK] hello"]);
     }
 
     #[test]

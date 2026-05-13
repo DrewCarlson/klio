@@ -11,6 +11,7 @@ klio-diagnostics = { workspace = true }
 klio-ast         = { workspace = true }
 klio-runtime     = { workspace = true }
 klio-stdlib      = { workspace = true }
+klio-pack        = { workspace = true }
 klio-types       = { workspace = true }
 
 [dev-dependencies]

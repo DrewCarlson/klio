@@ -220,6 +220,62 @@ pub fn implementation(fqn: &str) -> Option<StdlibFn> {
     implementations::lookup(fqn)
 }
 
+/// Registry of native bindings — `host_symbol` → Rust [`StdlibFn`]. A
+/// pack carries the FQN → `host_symbol` mapping; the host populates
+/// this registry with the actual function pointers; the interpreter
+/// joins them at load time. By convention `host_symbol` equals the
+/// Kotlin FQN, but the registry treats them as opaque keys.
+#[derive(Default, Clone)]
+pub struct HostBindings {
+    table: std::collections::HashMap<&'static str, StdlibFn>,
+}
+
+impl HostBindings {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a registry pre-populated with every FQN this build of
+    /// `klio-stdlib` knows how to handle. Calling this is equivalent
+    /// to "install everything the interpreter already had access to".
+    #[must_use]
+    pub fn with_stdlib_defaults() -> Self {
+        let mut out = Self::new();
+        for fqn in implementations::all_fqns() {
+            if let Some(f) = implementations::lookup(fqn) {
+                out.register(fqn, f);
+            }
+        }
+        for entry in generated::STDLIB_SYMBOLS {
+            if let Some(f) = entry.impl_fn {
+                out.register(entry.fqn, f);
+            }
+        }
+        out
+    }
+
+    pub fn register(&mut self, host_symbol: &'static str, f: StdlibFn) -> &mut Self {
+        self.table.insert(host_symbol, f);
+        self
+    }
+
+    #[must_use]
+    pub fn resolve(&self, host_symbol: &str) -> Option<StdlibFn> {
+        self.table.get(host_symbol).copied()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+}
+
 /// Look up the declared parameter names for a function FQN. The interpreter
 /// uses this to reorder named-argument calls before dispatching the
 /// intrinsic. Returns `None` when no entry exists (e.g. our hand-written

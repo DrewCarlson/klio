@@ -656,6 +656,7 @@ dependencies = [
  "klio-ast",
  "klio-diagnostics",
  "klio-lexer",
+ "klio-pack",
  "klio-parser",
  "klio-runtime",
  "klio-span",
