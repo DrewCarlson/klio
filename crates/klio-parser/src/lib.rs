@@ -1436,7 +1436,35 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         // `Ident (?)? . Ident` so the regular non-extension path can
         // continue using `parse_ident` for the function name.
         let receiver_type = if self.looks_like_extension_receiver() {
-            let ty = self.parse_type();
+            let mut ty = self.parse_type();
+            // Fold additional `.Ident` segments into the receiver type
+            // for qualified extension receivers like `Foo.Companion.bar()`
+            // — keep the final `.Ident` as the function name itself.
+            while let Some(ref mut t) = ty {
+                if t.function.is_some() || t.nullable {
+                    break;
+                }
+                let after = self.tokens.get(self.pos).map(|tok| &tok.kind);
+                let after_next = self.tokens.get(self.pos + 1).map(|tok| &tok.kind);
+                let after_2 = self.tokens.get(self.pos + 2).map(|tok| &tok.kind);
+                // Pattern: `.Ident .Ident` (more segments left). Fold only
+                // when at least two more `.Ident` pairs remain — the very
+                // last one is the function name.
+                if matches!(after, Some(TokenKind::Dot))
+                    && matches!(after_next, Some(TokenKind::Ident))
+                    && matches!(after_2, Some(TokenKind::Dot))
+                {
+                    self.bump(); // '.'
+                    let Some(seg) = self.parse_ident("type segment") else { break };
+                    t.name = Ident {
+                        name: format!("{}.{}", t.name.name, seg.name),
+                        span: t.name.span.join(seg.span),
+                    };
+                    t.span = t.span.join(seg.span);
+                } else {
+                    break;
+                }
+            }
             // `parse_type` already consumed the `Ident` and any trailing
             // `?`; now consume the dot before the function name.
             self.expect(&TokenKind::Dot, "`.`")?;
