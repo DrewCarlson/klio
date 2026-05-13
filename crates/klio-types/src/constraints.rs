@@ -431,33 +431,160 @@ impl ConstraintSystem {
         result
     }
 
-    /// Per spec §13.2.1: for every variable α with `S <: α` and `α <: T`,
-    /// derive `S <: T`. Repeats until no fresh constraints are produced.
+    /// Per spec §13.2.1: for every variable α with `S <: α` and
+    /// `α <: T`, derive `S <: T`. Also derives equalities:
+    ///
+    /// 1. When the same concrete `S` appears as both an upper and a
+    ///    lower bound of α (i.e. `S <: α ∧ α <: S`), record `α ≡ S`.
+    /// 2. When two upper bounds on α share a parameterised head
+    ///    (e.g. `α <: List<X>` and `α <: List<Int>`), pairwise-
+    ///    invariant arguments yield equality constraints
+    ///    (`X ≡ Int`). Same for two lower bounds. This is the rule
+    ///    that infers a type-parameter from multiple call-site
+    ///    requirements without needing supertype lookup.
+    /// 3. Cycles `α <: β <: α` collapse both vars through union-find.
+    ///
+    /// Repeats until no fresh constraints / bounds are produced.
     pub fn incorporate(&mut self) -> Result<(), InferenceError> {
+        let mut iterations = 0u32;
         loop {
-            let mut new_constraints: Vec<(Type, Type)> = Vec::new();
-            for bs in self.bounds.values() {
+            iterations += 1;
+            if iterations > 1024 {
+                // Defensive cap. Reduction never invents fresh class
+                // symbols, so termination is guaranteed in theory;
+                // the cap catches buggy provenance cycles in practice.
+                return Ok(());
+            }
+            let mut new_constraints: Vec<(Type, Type, ConstraintKind, Provenance)> = Vec::new();
+
+            // (1) Classic transitive closure: S <: α ∧ α <: T ⇒ S <: T.
+            //     Also: derive equality when the same concrete type
+            //     appears as both bounds.
+            for (v, bs) in &self.bounds {
                 for s in &bs.lower {
                     for t in &bs.upper {
-                        new_constraints.push((s.clone(), t.clone()));
+                        new_constraints.push((
+                            s.clone(),
+                            t.clone(),
+                            ConstraintKind::Subtype,
+                            Provenance::Derived("incorporate"),
+                        ));
+                    }
+                }
+                // (1a) Equality from same-type bound on both sides.
+                for s in &bs.lower {
+                    if !is_inference_var_type(s) && bs.upper.iter().any(|t| t == s) {
+                        new_constraints.push((
+                            Type::TypeParam(self.encode(v)),
+                            s.clone(),
+                            ConstraintKind::Equality,
+                            Provenance::Derived("equality-same-bound"),
+                        ));
                     }
                 }
             }
-            let before = self.pending.len() + self.seen.len();
-            for (s, t) in new_constraints {
-                self.add_constraint(s, t);
+
+            // (2) Equality derivation from paired generic bounds.
+            //     For each var, pairs of upper or lower bounds sharing
+            //     a parameterised head emit per-arg constraints.
+            let var_ids: Vec<InferenceVar> = self.bounds.keys().copied().collect();
+            for v in &var_ids {
+                let bs = self.bounds.get(v).unwrap().clone();
+                self.paired_generic_args(&bs.upper, &mut new_constraints);
+                self.paired_generic_args(&bs.lower, &mut new_constraints);
             }
-            let after_pending = self.pending.len();
-            if after_pending == 0 {
+
+            // (3) Cycle detection: α <: β AND β <: α (both vars).
+            let cycles = self.collect_var_cycles();
+            for (a, b) in cycles {
+                self.union_vars(a, b);
+            }
+
+            let before_seen = self.seen.len();
+            let before_pending = self.pending.len();
+            for (s, t, kind, prov) in new_constraints {
+                self.add_constraint_with(s, t, kind, prov);
+            }
+            if self.pending.is_empty() {
                 break;
             }
             self.reduce()?;
-            let after = self.pending.len() + self.seen.len();
-            if after == before {
+            if self.pending.len() == before_pending && self.seen.len() == before_seen {
                 break;
             }
         }
         Ok(())
+    }
+
+    fn encode(&self, v: &InferenceVar) -> String {
+        for (name, id) in &self.var_names {
+            if id == v {
+                return name.clone();
+            }
+        }
+        format!("?{}", v.0)
+    }
+
+    fn paired_generic_args(
+        &self,
+        bounds: &[Type],
+        out: &mut Vec<(Type, Type, ConstraintKind, Provenance)>,
+    ) {
+        for i in 0..bounds.len() {
+            for j in (i + 1)..bounds.len() {
+                if let (
+                    Type::Generic { name: an, args: aa },
+                    Type::Generic { name: bn, args: ba },
+                ) = (&bounds[i], &bounds[j])
+                {
+                    if an != bn || aa.len() != ba.len() {
+                        continue;
+                    }
+                    for (l, r) in aa.iter().zip(ba.iter()) {
+                        if l.is_star || r.is_star {
+                            continue;
+                        }
+                        match (l.variance, r.variance) {
+                            (Variance::Invariant, Variance::Invariant) => {
+                                out.push((
+                                    l.ty.clone(),
+                                    r.ty.clone(),
+                                    ConstraintKind::Equality,
+                                    Provenance::Derived("incorporate-generic-equality"),
+                                ));
+                            }
+                            (Variance::Out, Variance::Out) => {
+                                // Both bounds are upper bounds with an
+                                // out-variant arg; the most-specific
+                                // common subtype lives below — leave
+                                // the LUB to the solver fixation step.
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_var_cycles(&self) -> Vec<(InferenceVar, InferenceVar)> {
+        let mut out = Vec::new();
+        for (av, bs_a) in &self.bounds {
+            for t in &bs_a.upper {
+                if let Some(bv) = self.is_inference_var(t) {
+                    if let Some(bs_b) = self.bounds.get(&bv) {
+                        if bs_b
+                            .upper
+                            .iter()
+                            .any(|s| self.is_inference_var(s) == Some(*av))
+                        {
+                            out.push((*av, bv));
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Loops reduce + incorporate to a fixpoint.
@@ -531,6 +658,10 @@ pub fn lub_many(types: &[Type]) -> Type {
     } else {
         acc
     }
+}
+
+fn is_inference_var_type(t: &Type) -> bool {
+    matches!(t, Type::TypeParam(name) if name.starts_with('?'))
 }
 
 fn lub_pair(a: &Type, b: &Type) -> Type {
@@ -746,6 +877,41 @@ mod tests {
         let bs = cs.bounds.get(&av).unwrap();
         assert!(bs.upper.contains(&Type::Int));
         assert!(!bs.lower.contains(&Type::Int));
+    }
+
+    #[test]
+    fn incorporate_derives_equality_from_paired_generic_uppers() {
+        let mut cs = ConstraintSystem::new();
+        let (av, a) = cs.fresh("A");
+        let (tv, t) = cs.fresh("T");
+        // α <: List<T> and α <: List<Int> — invariant arg implies T ≡ Int.
+        cs.add_constraint(
+            a.clone(),
+            Type::Generic { name: "List".into(), args: vec![invariant(t)] },
+        );
+        cs.add_constraint(
+            a,
+            Type::Generic { name: "List".into(), args: vec![invariant(Type::Int)] },
+        );
+        cs.solve_to_fixpoint().unwrap();
+        let _ = av;
+        let bs = cs.bounds.get(&tv).unwrap();
+        assert!(
+            bs.lower.contains(&Type::Int) && bs.upper.contains(&Type::Int),
+            "T should be equated with Int via incorporation; bounds: lower={:?} upper={:?}",
+            bs.lower, bs.upper
+        );
+    }
+
+    #[test]
+    fn incorporate_unions_cyclic_vars() {
+        let mut cs = ConstraintSystem::new();
+        let (av, a) = cs.fresh("A");
+        let (bv, b) = cs.fresh("B");
+        cs.add_constraint(a.clone(), b.clone());
+        cs.add_constraint(b, a);
+        cs.solve_to_fixpoint().unwrap();
+        assert_eq!(cs.canonical(av), cs.canonical(bv));
     }
 
     #[test]
