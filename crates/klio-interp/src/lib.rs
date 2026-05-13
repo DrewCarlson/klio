@@ -7335,7 +7335,24 @@ impl Interpreter {
                     for a in args {
                         arg_vals.push(self.eval_expr(a, env, out)?);
                     }
-                    return self.call_method(inst, &m, &arg_vals, arg_names, out);
+                    // Reified type args: if the method is `inline fun
+                    // <reified T> ...`, push a per-call frame so `T::class`
+                    // / `x is T` inside the body see the call-site type.
+                    let pushed_reified = if !type_args.is_empty()
+                        && m.decl.is_inline
+                        && m.decl.type_params.iter().any(|tp| tp.is_reified)
+                    {
+                        self.push_reified_frame(&m.decl, type_args);
+                        true
+                    } else {
+                        false
+                    };
+                    let result =
+                        self.call_method(inst, &m, &arg_vals, arg_names, out);
+                    if pushed_reified {
+                        self.pop_reified_frame(&m.decl);
+                    }
+                    return result;
                 }
                 // Auto-generated members on every instance / data-class
                 // members on data classes.
