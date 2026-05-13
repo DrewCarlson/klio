@@ -4940,11 +4940,10 @@ impl Interpreter {
         // path already returned without doing so. Surface a
         // diagnostic rather than hang silently.
         Err(RuntimeError::Type(
-            "runBlocking { … } suspended without a synchronous resume path. \
-             Real async dispatching lives in kotlinx.coroutines, which is out of scope; \
-             ensure every suspendCoroutine inside this block calls cont.resume \
-             before its lambda returns, or chain captured continuations through \
-             additional suspendCoroutine calls that do."
+            "runBlocking { … } suspended with no continuation resumed. \
+             The block reached a suspension point and returned without any \
+             cont.resume / cont.resumeWith / cont.resumeWithException firing, \
+             so there is nothing to drive the coroutine forward."
                 .into(),
         ))
     }
