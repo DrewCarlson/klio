@@ -144,6 +144,106 @@ fn killdataflow_invalidates_narrowing() {
 }
 
 #[test]
+fn bound_smart_cast_aliases_recorded() {
+    let mut map = SourceMap::new();
+    let id = map.add("t.kt", "fun foo(a: Any) { val b = a }");
+    let owned = map.get(id).source.clone();
+    let lexed = klio_lexer::Lexer::new(id, &owned).tokenize();
+    let (file, _) = klio_parser::Parser::new(id, &owned, &lexed.tokens).parse_file();
+    let func = file
+        .decls
+        .iter()
+        .find_map(|d| match d {
+            klio_ast::Decl::Function(f) => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    let body = match func.body.as_ref().unwrap() {
+        klio_ast::FunctionBody::Block(b) => b.clone(),
+        klio_ast::FunctionBody::Expr(e) => klio_ast::Block {
+            stmts: vec![klio_ast::Stmt::Expr(e.clone())],
+            span: e.span(),
+        },
+    };
+    let lowered = klio_cfa::lower::lower_function(&body, func.span);
+    let aliased_from = lowered
+        .aliases
+        .get(&Symbol("b".into()))
+        .expect("b should alias a");
+    assert_eq!(aliased_from, &Place::Local(Symbol("a".into())));
+}
+
+#[test]
+fn require_not_null_narrows_post_call() {
+    let (cfg, r2p) = parse_and_lower(
+        "fun foo(x: String?) {
+            requireNotNull(x)
+            println(x)
+        }",
+    );
+    let x = Place::Local(Symbol("x".into()));
+    assert!(
+        any_narrowing_anywhere(&cfg, &r2p, &x, |f| matches!(f.null, Nullability::NonNull)),
+        "expected x narrowed to non-null after requireNotNull"
+    );
+}
+
+#[test]
+fn require_with_is_check_narrows_post_call() {
+    let (cfg, r2p) = parse_and_lower(
+        "fun foo(x: Any) {
+            require(x is String)
+            println(x)
+        }",
+    );
+    let x = Place::Local(Symbol("x".into()));
+    assert!(
+        any_narrowing_anywhere(&cfg, &r2p, &x, |f| matches!(f.narrowed, Some(Type::String))),
+        "expected x narrowed to String after require(x is String)"
+    );
+}
+
+#[test]
+fn span_to_pos_indexes_every_eval() {
+    let mut map = SourceMap::new();
+    let id = map.add("t.kt", "fun foo() { val x = 1 + 2 }");
+    let owned = map.get(id).source.clone();
+    let lexed = klio_lexer::Lexer::new(id, &owned).tokenize();
+    let (file, _) = klio_parser::Parser::new(id, &owned, &lexed.tokens).parse_file();
+    let func = file
+        .decls
+        .iter()
+        .find_map(|d| match d {
+            klio_ast::Decl::Function(f) => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    let body = match func.body.as_ref().unwrap() {
+        klio_ast::FunctionBody::Block(b) => b.clone(),
+        klio_ast::FunctionBody::Expr(e) => klio_ast::Block {
+            stmts: vec![klio_ast::Stmt::Expr(e.clone())],
+            span: e.span(),
+        },
+    };
+    let lowered = klio_cfa::lower::lower_function(&body, func.span);
+    for ((s, e), (bid, idx)) in &lowered.span_to_pos {
+        // Every recorded position points at a real Eval node.
+        let node = &lowered.cfg.block(*bid).nodes[*idx];
+        match node {
+            klio_cfa::Node::Eval { expr, .. } => {
+                assert_eq!(expr.span.start, *s);
+                assert_eq!(expr.span.end, *e);
+            }
+            other => panic!("span_to_pos points at non-Eval node: {other:?}"),
+        }
+    }
+    assert!(
+        !lowered.span_to_pos.is_empty(),
+        "expected at least one span entry"
+    );
+}
+
+#[test]
 fn empty_program_has_no_facts() {
     let (cfg, r2p) = parse_and_lower("fun foo() { }");
     let states = smartcast::solve(&cfg, &r2p);

@@ -27,14 +27,27 @@ use klio_ast::{
 use klio_span::Span;
 use klio_types::Type;
 
-/// Lowered output: the CFG plus a per-source-span register map so
-/// downstream analyses can find the register holding an expression's
-/// value, and a per-register place map so smart-cast can map an
-/// `AssumeIs(reg, T)` back onto the `Place` whose type was refined.
+/// Lowered output: the CFG plus three side tables.
+///
+/// * `reg_for_span` maps an expression's source span to the register
+///   that holds its computed value (last write wins when the same
+///   span is evaluated along multiple paths).
+/// * `reg_to_place` maps a register to the `Place` it reads, so an
+///   `AssumeIs(reg, T)` on a path can refine the original place.
+/// * `span_to_pos` maps a span to the `(block, node_idx)` where its
+///   `Eval` lands. Smart-cast / VIA queries consult this to recover
+///   the in-state right *before* the expression executes — the
+///   semantics the typechecker has historically needed.
 pub struct Lowered {
     pub cfg: Cfg,
     pub reg_for_span: std::collections::HashMap<(u32, u32), Reg>,
     pub reg_to_place: std::collections::HashMap<Reg, Place>,
+    pub span_to_pos: std::collections::HashMap<(u32, u32), (BlockId, usize)>,
+    /// Aliasing introduced by `val b = a` style bindings. Maps the
+    /// new local to the place it shadows so smart-cast lookups can
+    /// follow the chain. Kept here (rather than in the CFG IR) so
+    /// the typechecker can consult it without an extra analysis.
+    pub aliases: std::collections::HashMap<Symbol, Place>,
 }
 
 struct LoopFrame {
@@ -92,6 +105,8 @@ pub struct Lowering {
     reg_for_span: std::collections::HashMap<(u32, u32), Reg>,
     reg_to_place: std::collections::HashMap<Reg, Place>,
     pending_refinements: std::collections::HashMap<Reg, Refinement>,
+    span_to_pos: std::collections::HashMap<(u32, u32), (BlockId, usize)>,
+    aliases: std::collections::HashMap<Symbol, Place>,
 }
 
 impl Lowering {
@@ -104,6 +119,8 @@ impl Lowering {
             reg_for_span: std::collections::HashMap::new(),
             reg_to_place: std::collections::HashMap::new(),
             pending_refinements: std::collections::HashMap::new(),
+            span_to_pos: std::collections::HashMap::new(),
+            aliases: std::collections::HashMap::new(),
         }
     }
 
@@ -130,6 +147,8 @@ impl Lowering {
             cfg,
             reg_for_span: self.reg_for_span,
             reg_to_place: self.reg_to_place,
+            span_to_pos: self.span_to_pos,
+            aliases: self.aliases,
         }
     }
 
@@ -198,6 +217,16 @@ impl Lowering {
                 );
                 if let Some(init) = &p.init {
                     let r = self.lower_expr(init, cur);
+                    // Spec §14.1.5 bound smart casts: when an
+                    // immutable local binds to a place expression
+                    // (another local or a member chain) we record
+                    // the aliasing so smart-cast lookups for the new
+                    // name can follow the chain.
+                    if !p.mutable {
+                        if let Some(src) = self.expr_to_place(init) {
+                            self.aliases.insert(Symbol(p.name.name.clone()), src);
+                        }
+                    }
                     self.b.push(
                         *cur,
                         Node::Assign {
@@ -275,6 +304,15 @@ impl Lowering {
 
     fn emit_eval(&mut self, cur: BlockId, span: Span) -> Reg {
         let reg = self.b.new_reg();
+        // Capture the position the eval lands at *before* pushing it
+        // so smart-cast queries can read the in-state just before the
+        // expression evaluates — that's the semantic the checker
+        // historically needed.
+        let pos = self
+            .b
+            .current_node_count(cur)
+            .expect("emit_eval target block must exist");
+        self.span_to_pos.insert((span.start, span.end), (cur, pos));
         self.b
             .push(cur, Node::Eval { reg, expr: ExprRef { span, ty: Type::Unresolved } });
         self.record_reg(span, reg)
@@ -323,10 +361,13 @@ impl Lowering {
 
             Expr::Call { callee, args, span, .. } => {
                 let _ = self.lower_expr(callee, cur);
+                let mut arg_regs: Vec<Reg> = Vec::with_capacity(args.len());
                 for a in args {
-                    let _ = self.lower_expr(a, cur);
+                    arg_regs.push(self.lower_expr(a, cur));
                 }
-                self.emit_eval(*cur, *span)
+                let result = self.emit_eval(*cur, *span);
+                self.apply_contract_effects(callee, &arg_regs, args, *cur, *span);
+                result
             }
             Expr::Index { receiver, args, span } => {
                 let _ = self.lower_expr(receiver, cur);
@@ -1030,6 +1071,52 @@ impl Default for Lowering {
 
 fn is_null_lit(e: &Expr) -> bool {
     matches!(e, Expr::NullLit { .. })
+}
+
+fn simple_name(callee: &Expr) -> Option<&str> {
+    match callee {
+        Expr::Path { segments, .. } if segments.len() == 1 => Some(&segments[0].name),
+        _ => None,
+    }
+}
+
+impl Lowering {
+    /// Apply spec §12.2.5 contract effects for the stdlib calls we
+    /// recognise by name. Today: `requireNotNull(x)` / `checkNotNull(x)`
+    /// narrow `x` to non-null on the post-call path; `require(c)` /
+    /// `check(c)` propagate the condition's refinement after the
+    /// call returns. User contracts via `kotlin.contracts.contract { }`
+    /// remain handled by the typechecker until the dedicated
+    /// contracts analysis lands.
+    fn apply_contract_effects(
+        &mut self,
+        callee: &Expr,
+        arg_regs: &[Reg],
+        args: &[Expr],
+        cur: BlockId,
+        span: Span,
+    ) {
+        let Some(name) = simple_name(callee) else { return };
+        match name {
+            "requireNotNull" | "checkNotNull" => {
+                if let (Some(r), Some(_)) = (arg_regs.first(), args.first()) {
+                    self.b.push(
+                        cur,
+                        Node::AssumeNull { reg: *r, eq_null: false, span },
+                    );
+                }
+            }
+            "require" | "check" => {
+                if let (Some(r), Some(_)) = (arg_regs.first(), args.first()) {
+                    self.b.push(cur, Node::Assume { reg: *r, polarity: true });
+                    if let Some(refinement) = self.pending_refinements.get(r).cloned() {
+                        self.emit_refinement(cur, &refinement, true);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Convenience entry point: lower a function body into a CFG.

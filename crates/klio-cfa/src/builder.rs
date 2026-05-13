@@ -56,6 +56,13 @@ impl CfgBuilder {
         self.blocks[blk.0 as usize].nodes.push(node);
     }
 
+    /// Number of nodes already in `blk`. Useful for callers that
+    /// want to remember the position a node is about to be pushed
+    /// into — the returned value is the insertion index.
+    pub fn current_node_count(&self, blk: BlockId) -> Option<usize> {
+        self.blocks.get(blk.0 as usize).map(|b| b.nodes.len())
+    }
+
     /// Set the terminator for a block and wire up the edges to the
     /// referenced successors. Replaces any prior terminator on
     /// `blk` and any preds/succs implied by it.
