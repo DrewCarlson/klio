@@ -8957,6 +8957,28 @@ impl Interpreter {
                     return self.call_lambda(params, body, captured, &arg_vals, out);
                 }
             }
+            // Receiver-typed lambda parameter: `recv.block(args)` where
+            // `block` is a local lambda value typed
+            // `Recv.(Args) -> R`. Bind `this` to `recv` inside the lambda
+            // body so member-style calls in the body resolve against
+            // `recv`. Spec §4.1.6.
+            if let Some(v) = env.borrow().lookup(&name.name) {
+                if let Value::Lambda { params, body, env: captured, .. } = &v {
+                    let mut arg_vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        arg_vals.push(self.eval_expr(a, env, out)?);
+                    }
+                    return self.call_lambda_with_this(
+                        params,
+                        body,
+                        captured,
+                        &arg_vals,
+                        Some(recv),
+                        false,
+                        out,
+                    );
+                }
+            }
             return Err(RuntimeError::Unimplemented(type_fqn));
         }
 
@@ -12322,6 +12344,58 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["11"]);
+    }
+
+    #[test]
+    fn builder_inference_user_fn() {
+        // Spec §14: `@BuilderInference` on a user-declared generic fn
+        // postpones type-parameter inference past the call site. Our
+        // tree-walking interpreter relies on runtime values, so the
+        // typecheck side just needs to stop rejecting the call.
+        let src = r#"
+            @BuilderInference
+            fun <T> myBuild(block: MutableList<T>.() -> Unit): List<T> {
+                val list = mutableListOf<T>()
+                list.block()
+                return list
+            }
+            fun main() {
+                val xs = myBuild {
+                    add(1)
+                    add(2)
+                    add(3)
+                }
+                println(xs)
+                val ys = myBuild<String> {
+                    add("a")
+                    add("b")
+                }
+                println(ys)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["[1, 2, 3]", "[a, b]"]);
+    }
+
+    #[test]
+    fn receiver_typed_lambda_parameter_call() {
+        // `recv.block(args)` where `block` is a local lambda value
+        // bound at the call's enclosing scope and the parameter type
+        // declares an extension receiver. The lambda's body runs with
+        // `this` bound to `recv`.
+        let src = r#"
+            fun apply2(list: MutableList<Int>, block: MutableList<Int>.() -> Unit) {
+                list.block()
+            }
+            fun main() {
+                val xs = mutableListOf<Int>()
+                apply2(xs) {
+                    add(10)
+                    add(20)
+                }
+                println(xs)
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["[10, 20]"]);
     }
 
     #[test]

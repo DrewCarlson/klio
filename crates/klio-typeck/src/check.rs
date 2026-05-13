@@ -781,6 +781,11 @@ struct Checker<'a> {
     /// fresh inference vars and bounds to this session; the root
     /// call solves and substitutes once.
     inference_session: Option<InferenceSession>,
+    /// Set while typing a call whose callee is annotated
+    /// `@BuilderInference`. The flag suppresses T0097 inference-
+    /// failure diagnostics and lets the lambda body's calls drive
+    /// type-parameter binding at runtime instead. Spec §14.
+    builder_inference_active: bool,
 }
 
 /// Shared constraint system threaded through every generic call in a
@@ -843,6 +848,7 @@ impl<'a> Checker<'a> {
             lowerings: HashMap::new(),
             cfg_fn_stack: Vec::new(),
             inference_session: None,
+            builder_inference_active: false,
         }
     }
 
@@ -3170,6 +3176,15 @@ fn has_unsafe_variance(anns: &[klio_ast::Annotation]) -> bool {
         a.path
             .last()
             .map(|seg| seg.name == "UnsafeVariance")
+            .unwrap_or(false)
+    })
+}
+
+fn annotations_include(anns: &[klio_ast::Annotation], simple_name: &str) -> bool {
+    anns.iter().any(|a| {
+        a.path
+            .last()
+            .map(|seg| seg.name == simple_name)
             .unwrap_or(false)
     })
 }
@@ -7201,13 +7216,24 @@ impl<'r> Checker<'r> {
                             self.check_published_api_use(name, *v, &anns, *callee_span);
                         }
                     }
-                    return self.check_overloaded_call(
+                    let is_builder = self
+                        .fn_annotations
+                        .get(name)
+                        .map(|list| list.iter().any(|anns| annotations_include(anns, "BuilderInference")))
+                        .unwrap_or(false);
+                    let prev_bi = self.builder_inference_active;
+                    if is_builder {
+                        self.builder_inference_active = true;
+                    }
+                    let result = self.check_overloaded_call(
                         &sigs,
                         args,
                         arg_names,
                         type_args,
                         callee.span(),
                     );
+                    self.builder_inference_active = prev_bi;
+                    return result;
                 }
                 if name == "listOf" || name == "mutableListOf" {
                     let mut acc: Option<Type> = None;
@@ -7681,17 +7707,19 @@ impl<'r> Checker<'r> {
         if is_root {
             let session = self.inference_session.as_mut().unwrap();
             if let Err(_e) = session.cs.solve_to_fixpoint() {
-                let mut msg = "type inference failed for this call".to_string();
-                if let Some((_err, prov)) = session.cs.last_error() {
-                    if let Provenance::CallSite { arg_idx, .. } = prov {
-                        msg = format!(
-                            "type inference failed for this call; argument {} does not satisfy the inferred parameter type",
-                            arg_idx + 1
-                        );
+                if !self.builder_inference_active {
+                    let mut msg = "type inference failed for this call".to_string();
+                    if let Some((_err, prov)) = session.cs.last_error() {
+                        if let Provenance::CallSite { arg_idx, .. } = prov {
+                            msg = format!(
+                                "type inference failed for this call; argument {} does not satisfy the inferred parameter type",
+                                arg_idx + 1
+                            );
+                        }
                     }
+                    self.diagnostics
+                        .emit(Diagnostic::error(msg, call_span).with_code(codes::TYPE_INFERENCE_FAILED));
                 }
-                self.diagnostics
-                    .emit(Diagnostic::error(msg, call_span).with_code(codes::TYPE_INFERENCE_FAILED));
                 session.depth -= 1;
                 if session.depth == 0 {
                     self.inference_session = None;
