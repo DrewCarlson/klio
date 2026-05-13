@@ -886,6 +886,21 @@ impl Interpreter {
         is_spread: &[bool],
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
+        // Owned mutable bindings so the mutual-tailrec trampoline can
+        // replace `decl` / `captured_env` / `args` in place when a
+        // `RuntimeError::TailJump` arrives. The non-tailrec path runs
+        // exactly one iteration of the outer loop.
+        let mut cur_decl: Rc<klio_ast::Function> = Rc::new(decl.clone());
+        let mut cur_captured: Rc<RefCell<Env>> = Rc::clone(captured_env);
+        let mut cur_args: Vec<Value> = args.to_vec();
+        let mut cur_arg_names: Vec<Option<String>> = arg_names.to_vec();
+        let mut cur_is_spread: Vec<bool> = is_spread.to_vec();
+        loop {
+        let decl: &klio_ast::Function = &cur_decl;
+        let captured_env: &Rc<RefCell<Env>> = &cur_captured;
+        let args: &[Value] = &cur_args;
+        let arg_names: &[Option<String>] = &cur_arg_names;
+        let is_spread: &[bool] = &cur_is_spread;
         // If a vararg parameter exists, gather the positional args that map
         // into its slot into a single Array. Spread arguments flatten in.
         let vararg_idx = decl.params.iter().position(|p| p.is_vararg);
@@ -1003,7 +1018,7 @@ impl Interpreter {
         // resume — keeping the host stack flat.
         let tailrec_pushed = if decl.is_tailrec {
             if let Some(body) = &decl.body {
-                let sites = collect_tail_self_calls(body, &decl.name.name);
+                let sites = collect_tail_call_sites(body);
                 self.tailrec_stack.push(TailrecFrame {
                     name: decl.name.name.clone(),
                     sites: Rc::new(sites),
@@ -1036,7 +1051,23 @@ impl Interpreter {
         if tailrec_pushed {
             self.tailrec_stack.pop();
         }
-        match result {
+        // Mutual `tailrec` hop: the inner loop bubbled out a TailJump
+        // before resolving; replace the active decl/env/args and
+        // restart the outer loop so the new callee runs in the same
+        // host frame.
+        if let Err(RuntimeError::TailJump(callee, new_args, new_arg_names)) = &result {
+            if let Value::Function { decl: new_decl, env: new_env } = callee {
+                if new_decl.is_tailrec {
+                    cur_decl = Rc::clone(new_decl);
+                    cur_captured = Rc::clone(new_env);
+                    cur_args = new_args.clone();
+                    cur_arg_names = new_arg_names.clone();
+                    cur_is_spread = vec![false; cur_args.len()];
+                    continue;
+                }
+            }
+        }
+        return match result {
             Ok(v) => Ok(v),
             Err(RuntimeError::Return(v)) => Ok(v),
             Err(RuntimeError::LabeledReturn(l, v)) => {
@@ -1047,6 +1078,7 @@ impl Interpreter {
                 }
             }
             Err(e) => Err(e),
+        };
         }
     }
 
@@ -2007,6 +2039,22 @@ impl Interpreter {
                                 let (vals, mask) = self.eval_args_with_spread(args, env, out)?;
                                 let flat = flatten_spreads(vals, &mask);
                                 return Err(RuntimeError::TailContinue(flat, arg_names.to_vec()));
+                            }
+                            // Mutual tailrec: a tail-position call to
+                            // another top-level `tailrec` function hops
+                            // through the enclosing trampoline so the
+                            // chain reuses a single host frame.
+                            let callee_val = env.borrow().lookup(callee_name);
+                            if let Some(Value::Function { decl, .. }) = &callee_val {
+                                if decl.is_tailrec {
+                                    let (vals, mask) = self.eval_args_with_spread(args, env, out)?;
+                                    let flat = flatten_spreads(vals, &mask);
+                                    return Err(RuntimeError::TailJump(
+                                        callee_val.clone().unwrap(),
+                                        flat,
+                                        arg_names.to_vec(),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -10128,19 +10176,26 @@ fn simple_callee_name(expr: &Expr) -> Option<&str> {
 ///   * the body of an expression-bodied function (entered at `tail=true`)
 /// Not tail: inside `try` / `catch` / `finally`, inside loop bodies, inside
 /// lambda / anonymous-function bodies (separate frames).
-pub(crate) fn collect_tail_self_calls(
+/// Collect every tail-position call site in a function body, regardless
+/// of callee. Used by the mutual `tailrec` trampoline so a tail call
+/// from `A` into another `tailrec` function `B` can be optimised to a
+/// hop in the same host frame.
+pub(crate) fn collect_tail_call_sites(
     body: &klio_ast::FunctionBody,
-    fn_name: &str,
 ) -> std::collections::HashSet<klio_span::Span> {
     let mut sites = std::collections::HashSet::new();
     match body {
-        klio_ast::FunctionBody::Block(b) => walk_block_tail(b, true, fn_name, &mut sites),
-        klio_ast::FunctionBody::Expr(e) => walk_expr_tail(e, true, fn_name, &mut sites),
+        klio_ast::FunctionBody::Block(b) => walk_block_tail(b, true, "", &mut sites),
+        klio_ast::FunctionBody::Expr(e) => walk_expr_tail(e, true, "", &mut sites),
     }
     sites
 }
 
 fn is_self_call(callee: &Expr, fn_name: &str) -> bool {
+    if fn_name.is_empty() {
+        // Empty name acts as a wildcard for `collect_tail_call_sites`.
+        return simple_callee_name(callee).is_some();
+    }
     matches!(simple_callee_name(callee), Some(n) if n == fn_name)
 }
 
@@ -12267,6 +12322,25 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["11"]);
+    }
+
+    #[test]
+    fn mutual_tailrec_no_stack_overflow() {
+        // Two `tailrec` functions calling each other in tail position
+        // must cycle through a single host frame — a 200k-deep
+        // even/odd ping-pong would blow the stack with normal
+        // recursion.
+        let src = r#"
+            tailrec fun isEven(n: Int): Boolean = if (n == 0) true else isOdd(n - 1)
+            tailrec fun isOdd(n: Int): Boolean = if (n == 0) false else isEven(n - 1)
+            fun main() {
+                println(isEven(200000))
+                println(isOdd(200001))
+                println(isEven(7))
+                println(isOdd(7))
+            }
+        "#;
+        assert_eq!(run(src).lines, vec!["true", "true", "false", "true"]);
     }
 
     #[test]

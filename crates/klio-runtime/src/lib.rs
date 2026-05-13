@@ -1762,6 +1762,15 @@ pub enum RuntimeError {
     /// parameters and re-evaluates the body.
     #[error("internal: tail continue")]
     TailContinue(Vec<Value>, Vec<Option<String>>),
+    /// Mutual `tailrec` hop. Raised at a tail-position call from one
+    /// `tailrec` function into another. The enclosing trampoline
+    /// replaces its current decl/env with the new pair and rebinds
+    /// parameters, reusing the same host stack frame so chains of
+    /// mutual tail-recursive functions cycle indefinitely without
+    /// growing the stack. The callee value is opaque to this crate
+    /// — the interpreter unwraps it as `Value::Function`.
+    #[error("internal: tail jump")]
+    TailJump(Value, Vec<Value>, Vec<Option<String>>),
 }
 
 pub trait Output {
