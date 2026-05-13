@@ -9631,7 +9631,7 @@ fn eval_numeric_arith(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value, R
                     if b == 0 {
                         return Some(Err(RuntimeError::Thrown(Value::Exception {
                             fqn: Rc::new("kotlin.ArithmeticException".to_string()),
-                            message: None,
+                            message: Some(Rc::new("/ by zero".to_string())),
                             cause: None,
                         })));
                     }
@@ -9641,7 +9641,7 @@ fn eval_numeric_arith(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value, R
                     if b == 0 {
                         return Some(Err(RuntimeError::Thrown(Value::Exception {
                             fqn: Rc::new("kotlin.ArithmeticException".to_string()),
-                            message: None,
+                            message: Some(Rc::new("/ by zero".to_string())),
                             cause: None,
                         })));
                     }
