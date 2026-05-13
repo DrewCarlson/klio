@@ -139,6 +139,11 @@ pub struct Interpreter {
     /// to the chosen alias so we can surface a helpful "renamed to <alias>"
     /// message when a user references the shadowed name.
     import_renames: std::collections::HashMap<String, String>,
+    /// Dotted package name from the file's `package` header (if any), used to
+    /// stamp fully-qualified names onto user-declared classes and enums so the
+    /// default `Any.toString` and `Enum.valueOf` failure messages match JVM
+    /// Kotlin's `<package>.<simple-name>` form.
+    current_package: Option<String>,
 }
 
 #[derive(Clone)]
@@ -193,6 +198,16 @@ impl Interpreter {
             tailrec_stack: Vec::new(),
             expr_types: std::collections::HashMap::new(),
             import_renames: std::collections::HashMap::new(),
+            current_package: None,
+        }
+    }
+
+    /// Compose `<file-package>.<simple>` for a top-level user-declared class.
+    /// When the file has no `package` header, returns the simple name unchanged.
+    fn qualify_simple_name(&self, simple: &str) -> String {
+        match &self.current_package {
+            Some(pkg) if !pkg.is_empty() => format!("{pkg}.{simple}"),
+            _ => simple.to_string(),
         }
     }
 
@@ -353,6 +368,13 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
         let file_env = Rc::new(RefCell::new(Env::with_parent(Rc::clone(&self.globals))));
+
+        // Record the file's package so user-declared classes get a fully-
+        // qualified `<package>.<simple-name>` FQN, matching JVM Kotlin's
+        // `Any.toString` and `Enum.valueOf` failure-message conventions.
+        self.current_package = file.package.as_ref().map(|p| {
+            p.path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(".")
+        });
 
         // Apply imports (spec §10.1).
         //  * `import path.X as Y` binds `Y` to whatever `path.X` resolves to
@@ -5325,7 +5347,7 @@ impl Interpreter {
         }
         let outer_class = Rc::new(ClassDef {
             name: c.name.name.clone(),
-            fqn: c.name.name.clone(),
+            fqn: self.qualify_simple_name(&c.name.name),
             primary_params,
             methods,
             body_properties,
@@ -5635,7 +5657,7 @@ impl Interpreter {
         }
         Ok(Rc::new(ClassDef {
             name: o.name.name.clone(),
-            fqn: o.name.name.clone(),
+            fqn: self.qualify_simple_name(&o.name.name),
             primary_params: Vec::new(),
             methods,
             body_properties,

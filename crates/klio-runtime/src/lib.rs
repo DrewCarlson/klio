@@ -1005,12 +1005,12 @@ impl fmt::Display for Value {
                     write!(f, ")")
                 } else {
                     // Plain class (incl. anonymous-object instances): match
-                    // kotlinc-native's default `Any.toString` shape
-                    // `ClassName@<hex>`. The hex digits come from a monotonic
+                    // JVM Kotlin's default `Any.toString` shape
+                    // `<fqn>@<hex>`. The hex digits come from a monotonic
                     // per-instance counter — not the real heap address, so
                     // parity programs check the *structure* of the string
                     // (prefix, `@`, hex digits) rather than the exact value.
-                    write!(f, "{}@{:x}", inst.class.name, inst.identity)
+                    write!(f, "{}@{:x}", inst.class.fqn, inst.identity)
                 }
             }
         }
