@@ -1,47 +1,52 @@
 //! Native bindings for `kotlinx.io`.
 //!
-//! Buffer state is kept in a process-wide `thread_local!` map keyed
-//! by the receiver `Value::Instance`'s `identity`. The Kotlin shim
-//! under `shim/` declares the Buffer / ByteString surface; these
-//! bindings override every read / write method with byte-vector
-//! manipulation so each operation runs in O(1) amortised time.
+//! Buffer state lives on the receiver `Value::Instance` itself via
+//! the `InstanceData::native_state` slot. The Kotlin shim under
+//! `shim/` declares the Buffer / ByteString surface; these bindings
+//! override every read / write method with `VecDeque<u8>`
+//! manipulation, matching the FIFO semantics of upstream
+//! kotlinx.io's Buffer at O(1) amortised cost per byte.
+//!
+//! The state lifetime is tied to the instance: when the last
+//! reference to the `Value::Instance` drops, the `NativeState` it
+//! carries drops with it. No side-map cleanup, no identity-based
+//! routing.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::cell::{RefCell, RefMut};
+use std::collections::VecDeque;
+use std::rc::Rc;
 
-use klio_runtime::{CallCtx, PrimitiveArrayKind, RuntimeError, Value};
+use klio_runtime::{CallCtx, InstanceData, PrimitiveArrayKind, RuntimeError, Value};
 use klio_stdlib::HostBindings;
 
-thread_local! {
-    /// Per-instance byte queue keyed by `InstanceData::identity`. The
-    /// kotlinx.io Buffer is FIFO: writes append at the back, reads
-    /// drain from the front. `VecDeque` gives O(1) amortised
-    /// pop_front so a 1 MB write/read loop stays linear instead of
-    /// quadratic. Upstream kotlinx.io uses a segmented linked list
-    /// for the same reason; `VecDeque` is the cheap equivalent that
-    /// satisfies the API contract until segmenting matters.
-    static BUFFERS: RefCell<HashMap<u64, VecDeque<u8>>> = RefCell::new(HashMap::new());
+/// Discriminator the kotlinx.io binding uses to mark `NativeState`
+/// it owns. Other host bindings on the same instance would carry a
+/// different `kind` and panic when this binding tries to coerce.
+const BUFFER_KIND: &str = "kotlinx.io.Buffer";
+
+#[derive(Default)]
+struct BufferState {
+    bytes: VecDeque<u8>,
 }
 
 fn with_buffer<R>(
     ctx: &CallCtx,
-    f: impl FnOnce(&mut VecDeque<u8>) -> Result<R, RuntimeError>,
+    f: impl FnOnce(&mut BufferState) -> Result<R, RuntimeError>,
 ) -> Result<R, RuntimeError> {
-    let id = receiver_id(ctx)?;
-    BUFFERS.with(|map| {
-        let mut map = map.borrow_mut();
-        let buf = map.entry(id).or_default();
-        f(buf)
-    })
+    let cell = buffer_cell(ctx)?;
+    let borrow = cell.borrow_mut();
+    let mut state =
+        RefMut::map(borrow, |any| any.downcast_mut::<BufferState>().expect("buffer state type"));
+    f(&mut state)
 }
 
-fn receiver_id(ctx: &CallCtx) -> Result<u64, RuntimeError> {
-    match ctx.args.first() {
-        Some(Value::Instance(inst)) => Ok(inst.borrow().identity),
-        _ => Err(RuntimeError::Type(
+fn buffer_cell(ctx: &CallCtx) -> Result<Rc<RefCell<dyn std::any::Any>>, RuntimeError> {
+    let Some(Value::Instance(inst)) = ctx.args.first() else {
+        return Err(RuntimeError::Type(
             "kotlinx.io binding expected an instance receiver".into(),
-        )),
-    }
+        ));
+    };
+    Ok(inst.borrow_mut().ensure_native_state(BUFFER_KIND, BufferState::default))
 }
 
 fn arg_int(ctx: &CallCtx, idx: usize) -> Result<i64, RuntimeError> {
@@ -95,37 +100,37 @@ pub fn host_bindings() -> HostBindings {
 }
 
 fn buffer_size(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    with_buffer(ctx, |buf| Ok(Value::Long(buf.len() as i64)))
+    with_buffer(ctx, |state| Ok(Value::Long(state.bytes.len() as i64)))
 }
 
 fn buffer_is_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    with_buffer(ctx, |buf| Ok(Value::Bool(buf.is_empty())))
+    with_buffer(ctx, |state| Ok(Value::Bool(state.bytes.is_empty())))
 }
 
 fn buffer_is_not_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    with_buffer(ctx, |buf| Ok(Value::Bool(!buf.is_empty())))
+    with_buffer(ctx, |state| Ok(Value::Bool(!state.bytes.is_empty())))
 }
 
 fn buffer_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    with_buffer(ctx, |buf| {
-        buf.clear();
+    with_buffer(ctx, |state| {
+        state.bytes.clear();
         Ok(Value::Unit)
     })
 }
 
 fn buffer_write_byte(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = arg_int(ctx, 1)?;
-    with_buffer(ctx, |buf| {
-        buf.push_back(v as u8);
+    with_buffer(ctx, |state| {
+        state.bytes.push_back(v as u8);
         Ok(Value::Unit)
     })
 }
 
 fn buffer_write_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = arg_int(ctx, 1)? as i32;
-    with_buffer(ctx, |buf| {
+    with_buffer(ctx, |state| {
         for b in v.to_be_bytes() {
-            buf.push_back(b);
+            state.bytes.push_back(b);
         }
         Ok(Value::Unit)
     })
@@ -133,9 +138,9 @@ fn buffer_write_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn buffer_write_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = arg_int(ctx, 1)?;
-    with_buffer(ctx, |buf| {
+    with_buffer(ctx, |state| {
         for b in v.to_be_bytes() {
-            buf.push_back(b);
+            state.bytes.push_back(b);
         }
         Ok(Value::Unit)
     })
@@ -143,9 +148,9 @@ fn buffer_write_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn buffer_write_short(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = arg_int(ctx, 1)? as i16;
-    with_buffer(ctx, |buf| {
+    with_buffer(ctx, |state| {
         for b in v.to_be_bytes() {
-            buf.push_back(b);
+            state.bytes.push_back(b);
         }
         Ok(Value::Unit)
     })
@@ -153,65 +158,62 @@ fn buffer_write_short(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn buffer_write_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = arg_string(ctx, 1)?;
-    with_buffer(ctx, |buf| {
+    with_buffer(ctx, |state| {
         for b in s.as_bytes() {
-            buf.push_back(*b);
+            state.bytes.push_back(*b);
         }
         Ok(Value::Unit)
     })
 }
 
-fn drain_front(buf: &mut VecDeque<u8>, n: usize) -> Result<Vec<u8>, RuntimeError> {
-    if buf.len() < n {
+fn drain_front(state: &mut BufferState, n: usize) -> Result<Vec<u8>, RuntimeError> {
+    if state.bytes.len() < n {
         return Err(RuntimeError::Type(format!(
             "kotlinx.io.Buffer: not enough bytes ({} available, {n} requested)",
-            buf.len()
+            state.bytes.len()
         )));
     }
-    Ok(buf.drain(..n).collect())
+    Ok(state.bytes.drain(..n).collect())
 }
 
 fn buffer_read_byte(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    with_buffer(ctx, |buf| {
-        let v = drain_front(buf, 1)?;
+    with_buffer(ctx, |state| {
+        let v = drain_front(state, 1)?;
         Ok(Value::Byte(v[0] as i8))
     })
 }
 
 fn buffer_read_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    with_buffer(ctx, |buf| {
-        let bytes = drain_front(buf, 4)?;
+    with_buffer(ctx, |state| {
+        let bytes = drain_front(state, 4)?;
         let arr: [u8; 4] = bytes.as_slice().try_into().unwrap();
         Ok(Value::new_int(i32::from_be_bytes(arr) as i64))
     })
 }
 
 fn buffer_read_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    with_buffer(ctx, |buf| {
-        let bytes = drain_front(buf, 8)?;
+    with_buffer(ctx, |state| {
+        let bytes = drain_front(state, 8)?;
         let arr: [u8; 8] = bytes.as_slice().try_into().unwrap();
         Ok(Value::Long(i64::from_be_bytes(arr)))
     })
 }
 
 fn buffer_read_short(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    with_buffer(ctx, |buf| {
-        let bytes = drain_front(buf, 2)?;
+    with_buffer(ctx, |state| {
+        let bytes = drain_front(state, 2)?;
         let arr: [u8; 2] = bytes.as_slice().try_into().unwrap();
         Ok(Value::Short(i16::from_be_bytes(arr)))
     })
 }
 
 fn buffer_read_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    with_buffer(ctx, |buf| {
-        // VecDeque can be split into two slices; collect to a Vec
-        // before UTF-8 decoding so the borrow on `buf` clears
-        // before the result is constructed.
-        let bytes: Vec<u8> = buf.drain(..).collect();
+    with_buffer(ctx, |state| {
+        let bytes: Vec<u8> = state.bytes.drain(..).collect();
         let s = String::from_utf8(bytes).map_err(|e| {
             RuntimeError::Type(format!("kotlinx.io.Buffer.readString: invalid UTF-8: {e}"))
         })?;
-        Ok(Value::String(std::rc::Rc::new(s)))
+        Ok(Value::String(Rc::new(s)))
     })
 }
 
@@ -219,36 +221,43 @@ fn buffer_read_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// modelled by a `Value::Array` of bytes. The buffer is left intact;
 /// `snapshot` is a copy, matching kotlinx.io's semantics.
 fn buffer_snapshot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let bytes = with_buffer(ctx, |buf| Ok(buf.clone()))?;
-    let items: Vec<Value> = bytes.iter().map(|b| Value::new_int(*b as i8 as i64)).collect();
-    Ok(Value::Array {
-        items: std::rc::Rc::new(RefCell::new(items)),
-        prim: Some(PrimitiveArrayKind::Byte),
+    with_buffer(ctx, |state| {
+        let items: Vec<Value> =
+            state.bytes.iter().map(|b| Value::Byte(*b as i8)).collect();
+        Ok(Value::Array {
+            items: Rc::new(RefCell::new(items)),
+            prim: Some(PrimitiveArrayKind::Byte),
+        })
     })
 }
 
 fn buffer_copy_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let src_id = receiver_id(ctx)?;
-    let sink_id = match ctx.args.get(1) {
-        Some(Value::Instance(inst)) => inst.borrow().identity,
-        _ => {
-            return Err(RuntimeError::Type(
-                "kotlinx.io.Buffer.copyTo: sink must be a Buffer".into(),
-            ))
-        }
+    // Pull the source bytes first, releasing the borrow on the
+    // source instance before we acquire the sink's native state.
+    // Otherwise borrow_mut on the same Rc would alias when src and
+    // sink happen to be the same Buffer (legal but rare).
+    let src_bytes: VecDeque<u8> = with_buffer(ctx, |state| Ok(state.bytes.clone()))?;
+    let Some(Value::Instance(sink_inst)) = ctx.args.get(1) else {
+        return Err(RuntimeError::Type(
+            "kotlinx.io.Buffer.copyTo: sink must be a Buffer".into(),
+        ));
     };
-    BUFFERS.with(|map| {
-        let mut map = map.borrow_mut();
-        let src_bytes: VecDeque<u8> = map.get(&src_id).cloned().unwrap_or_default();
-        map.entry(sink_id).or_default().extend(src_bytes);
-        Ok(Value::Unit)
-    })
+    let sink_cell = sink_inst
+        .borrow_mut()
+        .ensure_native_state(BUFFER_KIND, BufferState::default);
+    let mut sink_borrow = sink_cell.borrow_mut();
+    let sink: &mut BufferState = sink_borrow
+        .downcast_mut::<BufferState>()
+        .expect("buffer state type");
+    sink.bytes.extend(src_bytes);
+    Ok(Value::Unit)
 }
 
 fn byte_string_decode_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    // ByteString shim stores the byte vector inside `data` field of
-    // the Value::Instance. Reach in via the `data` field on the
-    // receiver instance and decode as UTF-8.
+    // ByteString shim stores the byte vector inside the `data`
+    // field of the Value::Instance — it's a plain ByteArray
+    // construction-time argument, not a native_state slot, so this
+    // binding still reaches in through the field.
     let Some(Value::Instance(inst)) = ctx.args.first() else {
         return Err(RuntimeError::Type(
             "kotlinx.io.ByteString.decodeToString: receiver must be a ByteString".into(),
@@ -262,6 +271,7 @@ fn byte_string_decode_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError
             .map(|v| match v {
                 Value::Int(i) => (*i as i8) as u8,
                 Value::Long(l) => (*l as i8) as u8,
+                Value::Byte(b) => *b as u8,
                 _ => 0u8,
             })
             .collect(),
@@ -272,12 +282,12 @@ fn byte_string_decode_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError
             "kotlinx.io.ByteString.decodeToString: invalid UTF-8: {e}"
         ))
     })?;
-    Ok(Value::String(std::rc::Rc::new(s)))
+    Ok(Value::String(Rc::new(s)))
 }
 
-/// `String.encodeToByteString()` — top-level extension. The function
-/// is exposed as a non-receiver top-level binding because klio's
-/// dispatch table for extension intrinsics keys on the function FQN.
+/// `String.encodeToByteString()` — top-level extension. Bytes
+/// surface as a `Value::Array` so user code can `.toByteArray()` /
+/// iterate; the shim layer rewraps if needed.
 fn string_encode_to_byte_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = match ctx.args.first() {
         Some(Value::String(s)) => s.as_str().to_string(),
@@ -287,14 +297,14 @@ fn string_encode_to_byte_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError
             ))
         }
     };
-    let items: Vec<Value> = s.as_bytes().iter().map(|b| Value::new_int(*b as i8 as i64)).collect();
-    // The shim's ByteString class has a `data: ByteArray` field. We
-    // can't construct a Value::Instance here without access to the
-    // class table — instead surface the bytes as a Value::Array so
-    // user code can `.toByteArray()` / iterate; the shim layer
-    // wraps it back if needed.
+    let items: Vec<Value> = s.as_bytes().iter().map(|b| Value::Byte(*b as i8)).collect();
     Ok(Value::Array {
-        items: std::rc::Rc::new(RefCell::new(items)),
+        items: Rc::new(RefCell::new(items)),
         prim: Some(PrimitiveArrayKind::Byte),
     })
 }
+
+// `InstanceData` is brought into scope above for documentation —
+// suppress the unused-import warning when this gets minified.
+#[allow(dead_code)]
+fn _instance_data_in_scope(_: &InstanceData) {}

@@ -574,6 +574,28 @@ pub struct InstanceData {
     /// counter on the interpreter. Drives `Foo@<hex>` in the default
     /// `toString` for plain (non-data, non-enum, non-singleton) classes.
     pub identity: u64,
+    /// Opaque per-instance state owned by a native host binding —
+    /// kotlinx.io's `Buffer` stashes its byte queue here, for
+    /// example. Lifecycle is tied to the instance: the state is
+    /// dropped when the last `Rc<RefCell<InstanceData>>` clone is
+    /// released, no side-map cleanup needed.
+    pub native_state: Option<NativeState>,
+}
+
+/// Native-side data attached to a `Value::Instance`. The `kind`
+/// discriminator is a free-form string (convention: the FQN of the
+/// owning native binding, e.g. `"kotlinx.io.Buffer"`) that downcasts
+/// surface as a panic-on-mismatch guard so two libraries don't
+/// accidentally trample each other's storage on the same instance.
+pub struct NativeState {
+    pub kind: &'static str,
+    pub data: Rc<RefCell<dyn std::any::Any>>,
+}
+
+impl std::fmt::Debug for NativeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NativeState({})", self.kind)
+    }
 }
 
 impl ClassDef {
@@ -827,6 +849,28 @@ impl InstanceData {
         if !self.set(name, v.clone()) {
             self.fields.push((name.to_string(), v));
         }
+    }
+
+    /// Fetch the instance's native-state cell, creating it via `init`
+    /// on first access. Panics when the instance already carries
+    /// native state under a different `kind`, which indicates two
+    /// host bindings are fighting over the same instance.
+    pub fn ensure_native_state<T: std::any::Any>(
+        &mut self,
+        kind: &'static str,
+        init: impl FnOnce() -> T,
+    ) -> Rc<RefCell<dyn std::any::Any>> {
+        if let Some(ns) = &self.native_state {
+            assert_eq!(
+                ns.kind, kind,
+                "native_state kind mismatch: instance carries `{}`, binding asked for `{}`",
+                ns.kind, kind,
+            );
+            return Rc::clone(&ns.data);
+        }
+        let data: Rc<RefCell<dyn std::any::Any>> = Rc::new(RefCell::new(init()));
+        self.native_state = Some(NativeState { kind, data: Rc::clone(&data) });
+        data
     }
 }
 
@@ -2053,6 +2097,7 @@ mod tests {
             fields: Vec::new(),
             outer: None,
             identity: 0x2a,
+            native_state: None,
         }));
         assert_eq!(format!("{}", Value::Instance(inst)), "Foo@2a");
     }
@@ -2067,6 +2112,7 @@ mod tests {
             fields: Vec::new(),
             outer: None,
             identity: 99,
+            native_state: None,
         }));
         assert_eq!(format!("{}", Value::Instance(inst)), "D()");
     }

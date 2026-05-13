@@ -545,6 +545,7 @@ impl Interpreter {
                 fields: Vec::new(),
                 outer: None,
                 identity: 0,
+            native_state: None,
             }));
             return Value::Instance(inst);
         }
@@ -5336,6 +5337,7 @@ impl Interpreter {
             fields: Vec::new(),
             outer: None,
             identity: 0,
+            native_state: None,
         })))
     }
 
@@ -5377,6 +5379,7 @@ impl Interpreter {
             fields: Vec::new(),
             outer: None,
             identity: 0,
+            native_state: None,
         }));
         // The active suspendCoroutine call holds the slot at the top
         // of coroutine_continuations; the instance itself is a
@@ -6575,6 +6578,7 @@ impl Interpreter {
             fields: Vec::new(),
             outer: None,
             identity,
+            native_state: None,
         }));
         // Invoke the parent constructor when the object extends a class
         // with a primary ctor (e.g. `object Red : Color(0xff0000)`).
@@ -6641,6 +6645,7 @@ impl Interpreter {
             fields: Vec::new(),
             outer,
             identity,
+            native_state: None,
         }));
         // Pick primary vs secondary by arity. We match the call to a
         // secondary first only when the primary's arity doesn't already fit
@@ -7620,6 +7625,7 @@ impl Interpreter {
             fields: Vec::new(),
             outer: None,
             identity,
+            native_state: None,
         }));
         let _ = out;
         Ok(Value::Instance(inst))
