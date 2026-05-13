@@ -11,7 +11,7 @@ use klio_ast::{
 use klio_diagnostics::{Diagnostic, DiagnosticSink};
 use klio_resolver::Resolution;
 use klio_span::Span;
-use klio_types::{builtin_by_name, convert_type_ref_lossy, Type};
+use klio_types::{builtin_by_name, convert_type_ref_lossy, GenericArg, Type, Variance};
 
 /// Output of the type-checking pass.
 #[derive(Debug)]
@@ -8117,6 +8117,7 @@ impl<'r> Checker<'r> {
             // appropriate result type.
             "buildList" | "buildSet" if (1..=2).contains(&args.len()) => {
                 let lambda = args.last().unwrap();
+                let mut elem = Type::Nothing;
                 if let Expr::Lambda { params, body, .. } = lambda {
                     self.check_lambda_in_place(
                         params,
@@ -8124,11 +8125,25 @@ impl<'r> Checker<'r> {
                         None,
                         Some((Type::Unresolved, None)),
                     );
+                    elem = self.collect_builder_call_arg_type(body, "add", 0);
                 }
-                Some(Type::Unresolved)
+                if matches!(elem, Type::Nothing | Type::Unresolved) {
+                    return Some(Type::Unresolved);
+                }
+                let head = if name == "buildList" { "List" } else { "Set" };
+                Some(Type::Generic {
+                    name: head.to_string(),
+                    args: vec![GenericArg {
+                        variance: Variance::Invariant,
+                        is_star: false,
+                        ty: elem,
+                    }],
+                })
             }
             "buildMap" if (1..=2).contains(&args.len()) => {
                 let lambda = args.last().unwrap();
+                let mut k_ty = Type::Nothing;
+                let mut v_ty = Type::Nothing;
                 if let Expr::Lambda { params, body, .. } = lambda {
                     self.check_lambda_in_place(
                         params,
@@ -8136,10 +8151,32 @@ impl<'r> Checker<'r> {
                         None,
                         Some((Type::Unresolved, None)),
                     );
+                    k_ty = self.collect_builder_call_arg_type(body, "put", 0);
+                    v_ty = self.collect_builder_call_arg_type(body, "put", 1);
                 }
-                Some(Type::Unresolved)
+                if matches!(k_ty, Type::Nothing | Type::Unresolved)
+                    || matches!(v_ty, Type::Nothing | Type::Unresolved)
+                {
+                    return Some(Type::Unresolved);
+                }
+                Some(Type::Generic {
+                    name: "Map".to_string(),
+                    args: vec![
+                        GenericArg {
+                            variance: Variance::Invariant,
+                            is_star: false,
+                            ty: k_ty,
+                        },
+                        GenericArg {
+                            variance: Variance::Invariant,
+                            is_star: false,
+                            ty: v_ty,
+                        },
+                    ],
+                })
             }
             "sequence" | "iterator" if args.len() == 1 => {
+                let mut elem = Type::Nothing;
                 if let Expr::Lambda { params, body, .. } = &args[0] {
                     self.check_lambda_in_place(
                         params,
@@ -8147,8 +8184,20 @@ impl<'r> Checker<'r> {
                         None,
                         Some((Type::Unresolved, None)),
                     );
+                    elem = self.collect_builder_call_arg_type(body, "yield", 0);
                 }
-                Some(Type::Unresolved)
+                if matches!(elem, Type::Nothing | Type::Unresolved) {
+                    return Some(Type::Unresolved);
+                }
+                let head = if name == "sequence" { "Sequence" } else { "Iterator" };
+                Some(Type::Generic {
+                    name: head.to_string(),
+                    args: vec![GenericArg {
+                        variance: Variance::Invariant,
+                        is_star: false,
+                        ty: elem,
+                    }],
+                })
             }
             "buildString" if args.len() == 1 => {
                 if let Expr::Lambda { params, body, .. } = &args[0] {
@@ -8238,6 +8287,72 @@ impl<'r> Checker<'r> {
                 Some(recv_ty)
             }
             _ => None,
+        }
+    }
+
+    /// Walk a builder lambda body collecting argument types from every
+    /// implicit-this call of `target_name` (e.g. `add(x)` in `buildList`).
+    /// Returns the LUB of those argument types at `arg_idx`. Used to
+    /// infer the element / key / value type of `buildList` / `buildSet` /
+    /// `buildMap` / `sequence` from the lambda body.
+    fn collect_builder_call_arg_type(
+        &mut self,
+        body: &Block,
+        target_name: &str,
+        arg_idx: usize,
+    ) -> Type {
+        let mut acc: Option<Type> = None;
+        self.walk_builder_block(body, target_name, arg_idx, &mut acc);
+        acc.unwrap_or(Type::Nothing)
+    }
+
+    fn walk_builder_block(
+        &mut self,
+        body: &Block,
+        target_name: &str,
+        arg_idx: usize,
+        acc: &mut Option<Type>,
+    ) {
+        for s in &body.stmts {
+            match s {
+                Stmt::Expr(e) => self.walk_builder_expr(e, target_name, arg_idx, acc),
+                Stmt::Assign { value, .. } => {
+                    self.walk_builder_expr(value, target_name, arg_idx, acc)
+                }
+                Stmt::DestructuringDecl { init, .. } => {
+                    self.walk_builder_expr(init, target_name, arg_idx, acc)
+                }
+                Stmt::Decl(_) => {}
+            }
+        }
+    }
+
+    fn walk_builder_expr(
+        &mut self,
+        expr: &Expr,
+        target_name: &str,
+        arg_idx: usize,
+        acc: &mut Option<Type>,
+    ) {
+        if let Expr::Call { callee, args, .. } = expr {
+            let name = match callee.as_ref() {
+                Expr::Path { segments, .. } if segments.len() == 1 => {
+                    Some(segments[0].name.clone())
+                }
+                _ => None,
+            };
+            if name.as_deref() == Some(target_name) {
+                if let Some(a) = args.get(arg_idx) {
+                    let t = self.check_expr(a, None);
+                    *acc = Some(match acc.take() {
+                        Some(prev) => lub(&prev, &t),
+                        None => t,
+                    });
+                }
+            }
+            for a in args {
+                self.walk_builder_expr(a, target_name, arg_idx, acc);
+            }
         }
     }
 
