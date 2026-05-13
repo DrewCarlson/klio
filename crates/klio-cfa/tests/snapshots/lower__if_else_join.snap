@@ -1,0 +1,36 @@
+---
+source: crates/klio-cfa/tests/lower.rs
+expression: "lower_first_fun(\"fun main() {\n            val c = true\n            val x = if (c) 1 else 2\n        }\")"
+---
+cfg: entry=b0
+exits: b1
+
+b0:
+  decl c : Unresolved
+  r0 = eval @33..37 :: Unresolved
+  assign c = r0
+  decl x : Unresolved
+  r1 = eval @62..63 :: Unresolved
+  term: branch r1 -> b2 else b3
+
+b1:
+  preds: b4
+  term: return
+
+b2:
+  preds: b0(T)
+  assume r1
+  r2 = eval @65..66 :: Unresolved
+  term: goto b4
+
+b3:
+  preds: b0(F)
+  assume !r1
+  r3 = eval @72..73 :: Unresolved
+  term: goto b4
+
+b4:
+  preds: b2, b3
+  r4 = eval @58..73 :: Unresolved
+  assign x = r4
+  term: goto b1

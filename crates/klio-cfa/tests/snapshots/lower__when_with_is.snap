@@ -1,0 +1,58 @@
+---
+source: crates/klio-cfa/tests/lower.rs
+expression: "lower_first_fun(\"fun main() {\n            val x: Any = 1\n            val r = when (x) {\n                is String -> 1\n                is Int -> 2\n                else -> 3\n            }\n        }\")"
+---
+cfg: entry=b0
+exits: b1
+
+b0:
+  decl x : Unresolved
+  r0 = eval @38..39 :: Unresolved
+  assign x = r0
+  decl r : Unresolved
+  r1 = eval @66..67 :: Unresolved
+  term: goto b3
+
+b1:
+  preds: b2
+  term: return
+
+b2:
+  preds: b4, b6, b8, b9
+  r7 = eval @60..169 :: Unresolved
+  assign r = r7
+  term: goto b1
+
+b3:
+  preds: b0
+  assume r1 is String
+  r2 = eval @90..96 :: Boolean
+  term: switch r1 [is String -> b4] default b5
+
+b4:
+  preds: b3
+  r3 = eval @100..101 :: Unresolved
+  term: goto b2
+
+b5:
+  preds: b3
+  assume r1 is Int
+  r4 = eval @121..124 :: Boolean
+  term: switch r1 [is Int -> b6] default b7
+
+b6:
+  preds: b5
+  r5 = eval @128..129 :: Unresolved
+  term: goto b2
+
+b7:
+  preds: b5
+  term: goto b8
+
+b8:
+  preds: b7
+  r6 = eval @154..155 :: Unresolved
+  term: goto b2
+
+b9:
+  term: goto b2

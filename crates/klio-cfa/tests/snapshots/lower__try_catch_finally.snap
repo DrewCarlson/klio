@@ -1,0 +1,45 @@
+---
+source: crates/klio-cfa/tests/lower.rs
+expression: "lower_first_fun(\"fun main() {\n            try {\n                val x = 1\n            } catch (e: RuntimeException) {\n                val y = 2\n            } finally {\n                val z = 3\n            }\n        }\")"
+---
+cfg: entry=b0
+exits: b1
+
+b0:
+  term: goto b6
+
+b1:
+  preds: b3
+  term: return
+
+b2:
+  preds: b6(throw Unresolved)
+  decl y : Unresolved
+  r1 = eval @125..126 :: Unresolved
+  assign y = r1
+  term: goto b5
+
+b3:
+  preds: b5, b5(finally-exit), b4, b4(finally-exit)
+  r4 = eval @25..190 :: Unresolved
+  term: goto b1
+
+b4:
+  decl z : Unresolved
+  r3 = eval @175..176 :: Unresolved
+  assign z = r3
+  term: goto b3
+
+b5:
+  preds: b6, b2
+  decl z : Unresolved
+  r2 = eval @175..176 :: Unresolved
+  assign z = r2
+  term: goto b3
+
+b6:
+  preds: b0
+  decl x : Unresolved
+  r0 = eval @55..56 :: Unresolved
+  assign x = r0
+  term: goto b5

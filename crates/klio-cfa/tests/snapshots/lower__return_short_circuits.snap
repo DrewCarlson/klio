@@ -1,0 +1,23 @@
+---
+source: crates/klio-cfa/tests/lower.rs
+expression: "lower_first_fun(\"fun main() {\n            val x = 1\n            return\n            val y = 2\n        }\")"
+---
+cfg: entry=b0
+exits: b1
+
+b0:
+  decl x : Unresolved
+  r0 = eval @33..34 :: Unresolved
+  assign x = r0
+  term: goto b1
+
+b1:
+  preds: b0, b2
+  term: return
+
+b2:
+  r1 = eval @47..53 :: Unresolved
+  decl y : Unresolved
+  r2 = eval @74..75 :: Unresolved
+  assign y = r2
+  term: goto b1

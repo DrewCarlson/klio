@@ -505,6 +505,9 @@ version = "0.1.0"
 dependencies = [
  "insta",
  "klio-ast",
+ "klio-diagnostics",
+ "klio-lexer",
+ "klio-parser",
  "klio-span",
  "klio-types",
 ]
