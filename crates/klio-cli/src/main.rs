@@ -384,6 +384,27 @@ fn write_pack(out: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(out, bytes)
 }
 
+/// Build a single `HostBindings` table that the loader passes to
+/// every pack: starts with `klio-stdlib`'s defaults and unions in
+/// the bindings each `klio-kotlinx-*` crate ships. A pack's
+/// `host_symbol` keys resolve against this merged table, so a
+/// `kotlinx.atomicfu.AtomicInt.compareAndSet` binding wins exactly
+/// when the user has the matching pack loaded.
+fn merged_host_bindings() -> klio_stdlib::HostBindings {
+    let mut out = klio_stdlib::HostBindings::with_stdlib_defaults();
+    merge_into(&mut out, klio_kotlinx_atomicfu::host_bindings());
+    merge_into(&mut out, klio_kotlinx_io::host_bindings());
+    merge_into(&mut out, klio_kotlinx_datetime::host_bindings());
+    merge_into(&mut out, klio_kotlinx_coroutines::host_bindings());
+    out
+}
+
+fn merge_into(dst: &mut klio_stdlib::HostBindings, src: klio_stdlib::HostBindings) {
+    for (k, f) in src.entries() {
+        dst.register(k, f);
+    }
+}
+
 fn klio_cache_dir() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or("HOME env var unset")?;
     Ok(PathBuf::from(home).join(".klio").join("packs"))
@@ -753,7 +774,7 @@ fn install_embedded_stdlib(interp: &mut Interpreter) {
     let Ok(pack) = klio_pack::PackReader::from_bytes(bytes) else {
         return;
     };
-    let host = klio_stdlib::HostBindings::with_stdlib_defaults();
+    let host = merged_host_bindings();
     let _ = interp.install_pack(&pack, &host);
     install_extra_packs(interp);
 }
@@ -763,7 +784,7 @@ fn install_embedded_stdlib(interp: &mut Interpreter) {
 /// packs are parsed and registered as additional sibling files so
 /// their top-level declarations are visible to the user program.
 fn install_extra_packs(interp: &mut Interpreter) {
-    let host = klio_stdlib::HostBindings::with_stdlib_defaults();
+    let host = merged_host_bindings();
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Ok(env) = std::env::var("KLIO_PACKS") {
         for p in env.split(':') {

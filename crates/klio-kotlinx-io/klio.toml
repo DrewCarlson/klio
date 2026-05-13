@@ -3,9 +3,27 @@ id = "kotlinx.io"
 version = "0.9.0"
 abi = 1
 implicit_packages = []
-source_roots = [
-    "../../third-party/kotlinx/kotlinx-io/core/common/src",
-]
+source_roots = ["shim"]
 
 [[deps]]
 id = "stdlib"
+
+[bindings]
+"kotlinx.io.Buffer.size"       = "kotlinx.io.Buffer.size"
+"kotlinx.io.Buffer.isEmpty"    = "kotlinx.io.Buffer.isEmpty"
+"kotlinx.io.Buffer.isNotEmpty" = "kotlinx.io.Buffer.isNotEmpty"
+"kotlinx.io.Buffer.clear"      = "kotlinx.io.Buffer.clear"
+"kotlinx.io.Buffer.writeByte"  = "kotlinx.io.Buffer.writeByte"
+"kotlinx.io.Buffer.writeInt"   = "kotlinx.io.Buffer.writeInt"
+"kotlinx.io.Buffer.writeLong"  = "kotlinx.io.Buffer.writeLong"
+"kotlinx.io.Buffer.writeShort" = "kotlinx.io.Buffer.writeShort"
+"kotlinx.io.Buffer.writeString" = "kotlinx.io.Buffer.writeString"
+"kotlinx.io.Buffer.readByte"   = "kotlinx.io.Buffer.readByte"
+"kotlinx.io.Buffer.readInt"    = "kotlinx.io.Buffer.readInt"
+"kotlinx.io.Buffer.readLong"   = "kotlinx.io.Buffer.readLong"
+"kotlinx.io.Buffer.readShort"  = "kotlinx.io.Buffer.readShort"
+"kotlinx.io.Buffer.readString" = "kotlinx.io.Buffer.readString"
+"kotlinx.io.Buffer.snapshot"   = "kotlinx.io.Buffer.snapshot"
+"kotlinx.io.Buffer.copyTo"     = "kotlinx.io.Buffer.copyTo"
+"kotlinx.io.ByteString.decodeToString" = "kotlinx.io.ByteString.decodeToString"
+"kotlinx.io.encodeToByteString" = "kotlinx.io.encodeToByteString"

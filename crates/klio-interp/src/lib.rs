@@ -178,6 +178,14 @@ pub struct Interpreter {
     /// the static `klio_stdlib::implementation` lookup so a pack can
     /// shadow or augment the in-process stdlib.
     installed_bindings: std::collections::HashMap<String, klio_runtime::StdlibFn>,
+    /// Top-level function overloads keyed by simple name. The env
+    /// still holds the last-defined `Value::Function` for each name
+    /// (so paths and references resolve), but this side-map carries
+    /// every overload so `eval_call` can pick the most-specific
+    /// candidate at a call site. Order matches source declaration
+    /// order, used as a deterministic tiebreaker.
+    top_level_overloads:
+        std::collections::HashMap<String, Vec<(Rc<klio_ast::Function>, Rc<RefCell<Env>>)>>,
     /// Implicit-import packages contributed by every loaded pack.
     /// Unioned with `klio_stdlib::IMPLICITLY_IMPORTED_PACKAGES` so
     /// resolver / typeck see the same surface regardless of source.
@@ -258,6 +266,7 @@ impl Interpreter {
             import_renames: std::collections::HashMap::new(),
             current_package: None,
             installed_bindings: std::collections::HashMap::new(),
+            top_level_overloads: std::collections::HashMap::new(),
             pack_implicit_packages: Vec::new(),
             pack_known_packages: std::collections::HashSet::new(),
         }
@@ -811,6 +820,10 @@ impl Interpreter {
                         });
                     continue;
                 }
+                self.top_level_overloads
+                    .entry(f.name.name.clone())
+                    .or_default()
+                    .push((Rc::clone(&decl), Rc::clone(&file_env)));
                 let value = Value::Function {
                     decl,
                     env: Rc::clone(&file_env),
@@ -8351,6 +8364,30 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
         let _ = type_args;
+        // Top-level overload resolution. When the callee is a bare
+        // simple name that resolves to multiple top-level function
+        // decls (e.g. kotlinx.atomicfu.atomic(Int) / atomic(Long) /
+        // atomic(Boolean)), evaluate the arguments once and pick the
+        // most-specific candidate by formal-parameter-type vs
+        // argument-runtime-type. Single-overload names fall through
+        // to the regular env-lookup path.
+        if let Some(name) = simple_callee_name(callee) {
+            if let Some(overloads) = self.top_level_overloads.get(name) {
+                if overloads.len() >= 2 {
+                    let overloads = overloads.clone();
+                    let (vals, spread_mask) =
+                        self.eval_args_with_spread(args, env, out)?;
+                    let flat = flatten_spreads(vals, &spread_mask);
+                    if let Some((decl, captured)) =
+                        select_overload(&overloads, &flat, arg_names)
+                    {
+                        return self.call_function_named(
+                            &decl, &captured, &flat, arg_names, out,
+                        );
+                    }
+                }
+            }
+        }
         // Reified-aware dispatch: when the callee resolves by simple name to
         // a `Value::Function` whose decl is `inline fun <reified T> ...`,
         // push a per-call frame that binds each reified type param's name
@@ -8920,6 +8957,27 @@ impl Interpreter {
                         }
                         _ => {}
                     }
+                }
+            }
+            // Pack-installed bindings win over user method bodies. A
+            // kotlinx-style library may ship a Kotlin shim that
+            // declares the class shape, and override individual
+            // methods with native impls keyed by FQN. The shim's body
+            // remains available as a fallback when a binding is not
+            // installed.
+            if let Value::Instance(inst) = &recv {
+                let cls_fqn = inst.borrow().class.fqn.clone();
+                let fqn = format!("{cls_fqn}.{}", name.name);
+                if let Some(func) = self.installed_bindings.get(&fqn).copied() {
+                    let mut user_args = Vec::with_capacity(args.len());
+                    for a in args {
+                        user_args.push(self.eval_expr(a, env, out)?);
+                    }
+                    let mut arg_vals = Vec::with_capacity(user_args.len() + 1);
+                    arg_vals.push(recv.clone());
+                    arg_vals.extend(user_args);
+                    let mut ctx = CallCtx { args: &arg_vals, out };
+                    return func(&mut ctx);
                 }
             }
             // Instance method dispatch (user classes).
@@ -10134,6 +10192,105 @@ fn destructure_components(
 /// resolution by argument type. Picks the kind a user would write in a
 /// type annotation (`Int` for primitives, `IntRange` for typed ranges,
 /// the class's simple name for instances).
+/// Pick the most specific overload from a set of candidate
+/// top-level function declarations against the supplied argument
+/// values. Returns `None` when no candidate is admissible (arity
+/// mismatch on every entry, no compatible type pair). The score
+/// is the sum of per-parameter mismatch costs:
+///
+/// * 0 — declared parameter type names an exact match for the
+///   argument's runtime type.
+/// * 1 — declared parameter type is a numeric supertype (`Number`,
+///   `Any`, `Any?`, `Comparable`) or a generic type parameter.
+/// * 2 — any other admissible widening (e.g. `Int` argument vs
+///   `Long` parameter promotes via Kotlin's arithmetic conversion).
+///
+/// Candidates with any incompatible parameter slot are rejected.
+/// Ties on score break on declaration order (first wins) so the
+/// resolution is deterministic across runs.
+fn select_overload(
+    candidates: &[(Rc<klio_ast::Function>, Rc<RefCell<Env>>)],
+    args: &[Value],
+    arg_names: &[Option<String>],
+) -> Option<(Rc<klio_ast::Function>, Rc<RefCell<Env>>)> {
+    let mut best: Option<(usize, usize)> = None;
+    for (i, (decl, _env)) in candidates.iter().enumerate() {
+        let Some(score) = overload_score(decl, args, arg_names) else {
+            continue;
+        };
+        match best {
+            Some((cur_score, _)) if cur_score <= score => {}
+            _ => best = Some((score, i)),
+        }
+    }
+    best.map(|(_, i)| (Rc::clone(&candidates[i].0), Rc::clone(&candidates[i].1)))
+}
+
+fn overload_score(
+    decl: &klio_ast::Function,
+    args: &[Value],
+    arg_names: &[Option<String>],
+) -> Option<usize> {
+    // Named arguments are not yet folded into overload scoring;
+    // fall through to env dispatch when any are supplied. Common
+    // overload sites (atomicfu / kotlinx primitives) use positional
+    // args exclusively.
+    if arg_names.iter().any(|n| n.is_some()) {
+        return None;
+    }
+    let n_required = decl.params.iter().filter(|p| p.default.is_none() && !p.is_vararg).count();
+    let n_max = decl.params.len();
+    let has_vararg = decl.params.iter().any(|p| p.is_vararg);
+    if !has_vararg && args.len() > n_max {
+        return None;
+    }
+    if args.len() < n_required {
+        return None;
+    }
+    let mut total = 0usize;
+    for (i, arg) in args.iter().enumerate() {
+        let param_idx = i.min(n_max.saturating_sub(1));
+        let Some(param) = decl.params.get(param_idx) else {
+            return None;
+        };
+        let cost = param_cost(&param.ty.name.name, arg)?;
+        total = total.saturating_add(cost);
+    }
+    Some(total)
+}
+
+fn param_cost(param_type: &str, arg: &Value) -> Option<usize> {
+    let arg_name = value_runtime_type_name(arg);
+    if param_type == arg_name {
+        return Some(0);
+    }
+    // Anything matches a generic type parameter (single uppercase
+    // identifier) or Any/Any? — but pay a higher cost so concrete
+    // matches win.
+    if is_generic_param_name(param_type) || param_type == "Any" {
+        return Some(3);
+    }
+    // Numeric widening: Int -> Long, Int -> Double, Int -> Float,
+    // Float -> Double. Kotlin's overload resolution treats these as
+    // admissible-with-cost; an exact match beats a widening.
+    match (param_type, arg_name.as_str()) {
+        ("Long", "Int")
+        | ("Double", "Int" | "Long" | "Float")
+        | ("Float", "Int" | "Long")
+        | ("Number", "Int" | "Long" | "Short" | "Byte" | "Float" | "Double") => Some(2),
+        ("Comparable", "Int" | "Long" | "Short" | "Byte" | "Float" | "Double" | "Char" | "String") => Some(2),
+        // Nullable / specific user-class identity is handled by
+        // value_runtime_type_name returning the class simple name.
+        // Falling through means the candidate is rejected.
+        _ => None,
+    }
+}
+
+fn is_generic_param_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_uppercase()) && chars.next().is_none()
+}
+
 fn value_runtime_type_name(v: &Value) -> String {
     match v {
         Value::Instance(i) => i.borrow().class.name.clone(),

@@ -21,6 +21,10 @@ klio-ast         = { workspace = true }
 klio-pack        = { workspace = true }
 klio-stdlib      = { workspace = true }
 klio-stdlib-pack = { workspace = true }
+klio-kotlinx-atomicfu = { workspace = true }
+klio-kotlinx-io       = { workspace = true }
+klio-kotlinx-datetime = { workspace = true }
+klio-kotlinx-coroutines = { workspace = true }
 klio-runtime     = { workspace = true }
 serde            = { workspace = true }
 toml             = "0.9"

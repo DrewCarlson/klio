@@ -3,9 +3,36 @@ id = "kotlinx.atomicfu"
 version = "0.32.1"
 abi = 1
 implicit_packages = []
-source_roots = [
-    "../../third-party/kotlinx/kotlinx-atomicfu/atomicfu/src/commonMain/kotlin",
-]
+source_roots = ["shim"]
 
 [[deps]]
 id = "stdlib"
+
+[bindings]
+"kotlinx.atomicfu.AtomicInt.compareAndSet"     = "kotlinx.atomicfu.AtomicInt.compareAndSet"
+"kotlinx.atomicfu.AtomicInt.getAndSet"         = "kotlinx.atomicfu.AtomicInt.getAndSet"
+"kotlinx.atomicfu.AtomicInt.getAndIncrement"   = "kotlinx.atomicfu.AtomicInt.getAndIncrement"
+"kotlinx.atomicfu.AtomicInt.getAndDecrement"   = "kotlinx.atomicfu.AtomicInt.getAndDecrement"
+"kotlinx.atomicfu.AtomicInt.incrementAndGet"   = "kotlinx.atomicfu.AtomicInt.incrementAndGet"
+"kotlinx.atomicfu.AtomicInt.decrementAndGet"   = "kotlinx.atomicfu.AtomicInt.decrementAndGet"
+"kotlinx.atomicfu.AtomicInt.getAndAdd"         = "kotlinx.atomicfu.AtomicInt.getAndAdd"
+"kotlinx.atomicfu.AtomicInt.addAndGet"         = "kotlinx.atomicfu.AtomicInt.addAndGet"
+"kotlinx.atomicfu.AtomicInt.plusAssign"        = "kotlinx.atomicfu.AtomicInt.plusAssign"
+"kotlinx.atomicfu.AtomicInt.minusAssign"       = "kotlinx.atomicfu.AtomicInt.minusAssign"
+
+"kotlinx.atomicfu.AtomicLong.compareAndSet"    = "kotlinx.atomicfu.AtomicLong.compareAndSet"
+"kotlinx.atomicfu.AtomicLong.getAndSet"        = "kotlinx.atomicfu.AtomicLong.getAndSet"
+"kotlinx.atomicfu.AtomicLong.getAndIncrement"  = "kotlinx.atomicfu.AtomicLong.getAndIncrement"
+"kotlinx.atomicfu.AtomicLong.getAndDecrement"  = "kotlinx.atomicfu.AtomicLong.getAndDecrement"
+"kotlinx.atomicfu.AtomicLong.incrementAndGet"  = "kotlinx.atomicfu.AtomicLong.incrementAndGet"
+"kotlinx.atomicfu.AtomicLong.decrementAndGet"  = "kotlinx.atomicfu.AtomicLong.decrementAndGet"
+"kotlinx.atomicfu.AtomicLong.getAndAdd"        = "kotlinx.atomicfu.AtomicLong.getAndAdd"
+"kotlinx.atomicfu.AtomicLong.addAndGet"        = "kotlinx.atomicfu.AtomicLong.addAndGet"
+"kotlinx.atomicfu.AtomicLong.plusAssign"       = "kotlinx.atomicfu.AtomicLong.plusAssign"
+"kotlinx.atomicfu.AtomicLong.minusAssign"      = "kotlinx.atomicfu.AtomicLong.minusAssign"
+
+"kotlinx.atomicfu.AtomicBoolean.compareAndSet" = "kotlinx.atomicfu.AtomicBoolean.compareAndSet"
+"kotlinx.atomicfu.AtomicBoolean.getAndSet"     = "kotlinx.atomicfu.AtomicBoolean.getAndSet"
+
+"kotlinx.atomicfu.AtomicRef.compareAndSet"     = "kotlinx.atomicfu.AtomicRef.compareAndSet"
+"kotlinx.atomicfu.AtomicRef.getAndSet"         = "kotlinx.atomicfu.AtomicRef.getAndSet"

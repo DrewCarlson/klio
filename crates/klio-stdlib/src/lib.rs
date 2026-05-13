@@ -290,6 +290,14 @@ impl HostBindings {
         self.table.get(host_symbol).copied()
     }
 
+    /// Iterate every `(host_symbol, fn)` pair currently registered.
+    /// Used by callers that want to fold multiple registries into
+    /// one — `klio-cli` merges the stdlib defaults with each
+    /// `klio-kotlinx-*` crate's bindings this way.
+    pub fn entries(&self) -> impl Iterator<Item = (&'static str, StdlibFn)> + '_ {
+        self.table.iter().map(|(k, f)| (*k, *f))
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.table.len()
