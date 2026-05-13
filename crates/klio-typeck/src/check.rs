@@ -7507,7 +7507,7 @@ impl<'r> Checker<'r> {
                 return sig.return_ty.clone();
             }
             let arg_tys: Vec<Type> = args.iter().map(|a| self.check_expr(a, None)).collect();
-            return self.infer_call_return(&sig, &arg_tys, call_span);
+            return self.infer_call_return_with_args(&sig, &arg_tys, args, call_span);
         }
         // Pre-type each argument once; selection consults these types,
         // and assignability checks against the chosen signature reuse them
@@ -7614,7 +7614,7 @@ impl<'r> Checker<'r> {
         if has_type_args {
             return sig.return_ty;
         }
-        self.infer_call_return(&sig, &arg_tys, call_span)
+        self.infer_call_return_with_args(&sig, &arg_tys, args, call_span)
     }
 
     /// Spec §13: at a generic call with no explicit `<...>`, allocate one
@@ -7625,7 +7625,25 @@ impl<'r> Checker<'r> {
     /// T0097 if reduction fails. Returns `sig.return_ty` unchanged when
     /// the sig has no type parameters or the return type doesn't
     /// reference any of them.
+    #[cfg(test)]
     fn infer_call_return(&mut self, sig: &FnSig, arg_tys: &[Type], call_span: Span) -> Type {
+        self.infer_call_return_with_args(sig, arg_tys, &[], call_span)
+    }
+
+    /// Same as `infer_call_return` but also re-types every lambda
+    /// argument once the surrounding inference resolves any of the
+    /// callee's type parameters (M-Constraints Phase 4: postponed
+    /// lambda body checking). The re-pass updates `self.types` with
+    /// the body's refined types and feeds the resulting return type
+    /// back into the constraint system so the call-site return type
+    /// reflects the body's contribution.
+    fn infer_call_return_with_args(
+        &mut self,
+        sig: &FnSig,
+        arg_tys: &[Type],
+        args: &[Expr],
+        call_span: Span,
+    ) -> Type {
         use klio_types::constraints::{
             ConstraintKind, ConstraintSystem, Provenance, SolutionPreference,
         };
@@ -7670,10 +7688,6 @@ impl<'r> Checker<'r> {
                 .emit(Diagnostic::error(msg, call_span).with_code(codes::TYPE_INFERENCE_FAILED));
             return sig.return_ty.clone();
         }
-        // Phase 3 of M-Constraints: stage fixation by SCC so dependent
-        // type parameters resolve after their dependencies. Falls back
-        // to the legacy single-stage solve when staging yields no
-        // additional information.
         let staged = cs.solve_staged();
         let legacy = cs.solve();
         let mut final_subst: std::collections::HashMap<String, Type> =
@@ -7688,7 +7702,41 @@ impl<'r> Checker<'r> {
                 }
             }
         }
-        substitute_type_params(&sig.return_ty, &final_subst)
+        // Phase 4: re-type each lambda argument with the substituted
+        // expected type. The body then sees concrete parameter types
+        // and contributes its actual return type back to the
+        // solution. This is the postponed-lambda mechanism flattened
+        // into a single re-pass — sufficient for non-chained
+        // builder-style inference.
+        let mut return_substituted = substitute_type_params(&sig.return_ty, &final_subst);
+        for (i, arg) in args.iter().enumerate() {
+            if !matches!(arg, Expr::Lambda { .. }) {
+                continue;
+            }
+            let Some(param_ty) = sig.params.get(i) else { continue };
+            let expected = substitute_type_params(param_ty, &final_subst);
+            if !expected_changed(param_ty, &expected) {
+                continue;
+            }
+            let refined = self.check_expr(arg, Some(&expected));
+            // If the lambda's return type contributed a previously
+            // unresolved part of the call's return type, fold the
+            // refinement into the substitution and rebuild the
+            // return type.
+            if let (
+                Type::Function { return_type: r_expected, .. },
+                Type::Function { return_type: r_refined, .. },
+            ) = (&expected, &refined)
+            {
+                if let Type::TypeParam(name) = r_expected.as_ref() {
+                    if !matches!(**r_refined, Type::Unresolved | Type::Nothing) {
+                        final_subst.insert(name.clone(), (**r_refined).clone());
+                    }
+                }
+            }
+            return_substituted = substitute_type_params(&sig.return_ty, &final_subst);
+        }
+        return_substituted
     }
 
     fn check_arity_and_args(&mut self, sig: &FnSig, args: &[Expr], call_span: Span) {
@@ -8787,6 +8835,14 @@ fn collect_aliased_names(t: &TypeRef, out: &mut Vec<String>) {
 /// range, and generic forms. Leaves unrelated type-params untouched so a
 /// nested generic-class declaration's type parameters survive substitution
 /// at an outer call site.
+/// True when `before` and `after` differ structurally — i.e. the
+/// substitution actually replaced some `TypeParam`. Drives the
+/// post-inference lambda re-type loop so we only re-check lambdas
+/// whose expected type was refined.
+fn expected_changed(before: &Type, after: &Type) -> bool {
+    before != after
+}
+
 fn substitute_type_params(t: &Type, subst: &std::collections::HashMap<String, Type>) -> Type {
     use klio_types::GenericArg;
     match t {
