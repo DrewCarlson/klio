@@ -4395,8 +4395,90 @@ impl Interpreter {
                 steps: Rc::clone(steps),
                 descending: !*descending,
             })),
+            "compare" => {
+                if args.len() != 2 {
+                    return Err(RuntimeError::Arity(
+                        "Comparator.compare expects two arguments".into(),
+                    ));
+                }
+                let a = self.eval_expr(&args[0], env, out)?;
+                let b = self.eval_expr(&args[1], env, out)?;
+                let ord = self.compare_with_comparator(steps, *descending, &a, &b, out)?;
+                let n: i32 = match ord {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                Ok(Some(Value::Int(n)))
+            }
+            "thenComparing" => {
+                if args.len() != 1 {
+                    return Err(RuntimeError::Arity(
+                        "Comparator.thenComparing expects one argument".into(),
+                    ));
+                }
+                let other = self.eval_expr(&args[0], env, out)?;
+                match other {
+                    Value::Comparator { steps: other_steps, descending: other_desc } => {
+                        let mut chain: Vec<(Value, bool)> = (**steps).clone();
+                        for (sel, d) in other_steps.iter() {
+                            chain.push((sel.clone(), *d ^ other_desc));
+                        }
+                        Ok(Some(Value::Comparator {
+                            steps: Rc::new(chain),
+                            descending: *descending,
+                        }))
+                    }
+                    Value::Lambda { .. } => {
+                        let mut chain: Vec<(Value, bool)> = (**steps).clone();
+                        chain.push((other, false));
+                        Ok(Some(Value::Comparator {
+                            steps: Rc::new(chain),
+                            descending: *descending,
+                        }))
+                    }
+                    _ => Err(RuntimeError::Type(
+                        "Comparator.thenComparing expects a Comparator or selector lambda".into(),
+                    )),
+                }
+            }
             _ => Ok(None),
         }
+    }
+
+    fn compare_with_comparator(
+        &mut self,
+        steps: &Rc<Vec<(Value, bool)>>,
+        descending: bool,
+        a: &Value,
+        b: &Value,
+        out: &mut dyn Output,
+    ) -> Result<std::cmp::Ordering, RuntimeError> {
+        if steps.is_empty() {
+            let mut ord = self.compare_with_user(a, b, out)?;
+            if descending {
+                ord = ord.reverse();
+            }
+            return Ok(ord);
+        }
+        for (sel, step_desc) in steps.iter() {
+            let Value::Lambda { params, body, env: captured, .. } = sel else {
+                return Err(RuntimeError::Type("comparator selector must be a lambda".into()));
+            };
+            let ka = self.call_lambda(params, body, captured, std::slice::from_ref(a), out)?;
+            let kb = self.call_lambda(params, body, captured, std::slice::from_ref(b), out)?;
+            let mut ord = self.compare_with_user(&ka, &kb, out)?;
+            if *step_desc {
+                ord = ord.reverse();
+            }
+            if descending {
+                ord = ord.reverse();
+            }
+            if !matches!(ord, std::cmp::Ordering::Equal) {
+                return Ok(ord);
+            }
+        }
+        Ok(std::cmp::Ordering::Equal)
     }
 
     /// Lambda-bearing members on a `Value::Result` receiver. The pure
@@ -10201,9 +10283,7 @@ mod tests {
             panic!("expected Thrown(ArithmeticException), got {err:?}")
         };
         assert_eq!(*fqn, "kotlin.ArithmeticException");
-        // Kotlin/Native produces a message of `null`. Matches kotlinc-native
-        // parity (the JVM message "/ by zero" is a JVM-only detail).
-        assert!(message.is_none(), "expected no message, got {message:?}");
+        assert_eq!(message.as_deref(), Some(&"/ by zero".to_string()));
     }
 
     #[test]
@@ -10217,7 +10297,7 @@ mod tests {
                 }
             }
         "#;
-        assert_eq!(run(src).lines, vec!["caught: null"]);
+        assert_eq!(run(src).lines, vec!["caught: / by zero"]);
     }
 
     // ---------- M6: stdlib dispatch ----------
