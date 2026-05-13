@@ -2085,21 +2085,19 @@ impl Interpreter {
                 // and globals. When the resolved name is a Kotlin primitive
                 // (or other classifier without a user-side `Value::Class`),
                 // synthesize one so `simpleName` / `qualifiedName` work.
-                if name.name == "class" {
-                    if let Expr::Path { segments, .. } = receiver.as_ref() {
-                        if segments.len() == 1 {
-                            let raw = &segments[0].name;
-                            let resolved = self.resolve_reified(raw);
-                            let lookup = env
-                                .borrow()
-                                .lookup(&resolved)
-                                .or_else(|| self.globals.borrow().lookup(&resolved));
-                            if let Some(v) = lookup {
-                                return self.eval_member_ref(&v, &name.name);
-                            }
-                            if let Some(v) = self.synth_primitive_class(&resolved) {
-                                return self.eval_member_ref(&v, &name.name);
-                            }
+                if let Expr::Path { segments, .. } = receiver.as_ref() {
+                    if segments.len() == 1 {
+                        let raw = &segments[0].name;
+                        let resolved = self.resolve_reified(raw);
+                        let lookup = env
+                            .borrow()
+                            .lookup(&resolved)
+                            .or_else(|| self.globals.borrow().lookup(&resolved));
+                        if let Some(v) = lookup {
+                            return self.eval_member_ref(&v, &name.name);
+                        }
+                        if let Some(v) = self.synth_primitive_class(&resolved) {
+                            return self.eval_member_ref(&v, &name.name);
                         }
                     }
                 }
@@ -6354,6 +6352,14 @@ impl Interpreter {
                 || c.find_body_property(name).is_some();
             if is_property {
                 return Ok(Value::PropertyRef { name: Rc::new(name.to_string()) });
+            }
+            // `String::uppercase` etc. — primitive / stdlib class member
+            // references. Bind to the corresponding stdlib intrinsic so
+            // `xs.map(String::uppercase)` dispatches at call time.
+            let fqn = format!("{}.{}", c.fqn, name);
+            if let Some(func) = klio_stdlib::implementation(&fqn) {
+                let fqn_static: &'static str = leak_fqn(&fqn);
+                return Ok(Value::Intrinsic { fqn: fqn_static, func });
             }
         }
         // `instance::method` — produce a `Value::BoundUserMethod` that the
