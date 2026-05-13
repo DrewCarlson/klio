@@ -21,6 +21,12 @@ pub struct TypeCheck {
     /// `Type::Unresolved`.
     pub types: HashMap<Span, Type>,
     pub diagnostics: DiagnosticSink,
+    /// CFGs built during type checking, keyed by the source span of the
+    /// owning function. Populated for every function body the checker
+    /// visits. Consumers (notably the dataflow analyses in `klio-cfa`)
+    /// read this to ground reachability / VIA / smart-cast queries
+    /// during the M-CFA migration.
+    pub cfgs: HashMap<Span, klio_cfa::Cfg>,
 }
 
 impl TypeCheck {
@@ -41,6 +47,7 @@ pub fn typecheck(file: &KotlinFile, resolution: &Resolution) -> TypeCheck {
     TypeCheck {
         types: tc.types,
         diagnostics: tc.diagnostics,
+        cfgs: tc.cfgs,
     }
 }
 
@@ -770,6 +777,11 @@ struct Checker<'a> {
     /// markers. Pushed by `check_lambda_in_place` when a lambda binds
     /// `this` to a class-typed receiver.
     dsl_receiver_stack: Vec<(String, HashSet<String>)>,
+    /// CFGs built during type checking, keyed by owning function span.
+    /// Populated by `check_function` for every function body it visits;
+    /// surfaced on the public [`TypeCheck`] output for downstream
+    /// dataflow consumers.
+    cfgs: HashMap<Span, klio_cfa::Cfg>,
 }
 
 /// Description of a user-declared `typealias`.
@@ -817,6 +829,7 @@ impl<'a> Checker<'a> {
             dsl_marker_annotations: HashSet::new(),
             dsl_class_markers: HashMap::new(),
             dsl_receiver_stack: Vec::new(),
+            cfgs: HashMap::new(),
         }
     }
 
@@ -3841,6 +3854,18 @@ impl<'r> Checker<'r> {
             .collect::<std::collections::HashSet<_>>();
         self.type_params_in_scope.push(all_tps);
         if let Some(body) = &f.body {
+            // Build a CFG for the body alongside type checking. The
+            // CFG is consumed by `klio-cfa` analyses during the
+            // M-CFA migration; today it runs as a parallel artifact
+            // so downstream consumers can read it without forcing
+            // an immediate cutover of check.rs's flow tracking.
+            let body_block = match body {
+                FunctionBody::Block(b) => b.clone(),
+                FunctionBody::Expr(e) => Block { stmts: vec![Stmt::Expr(e.clone())], span: e.span() },
+            };
+            let mut lowered = klio_cfa::lower::lower_function(&body_block, f.span);
+            klio_cfa::dataflow::infer_kill_data_flow(&mut lowered.cfg);
+            self.cfgs.insert(f.span, lowered.cfg);
             match body {
                 FunctionBody::Block(b) => {
                     let body_ty = self.check_block(b, Some(&declared_return));
