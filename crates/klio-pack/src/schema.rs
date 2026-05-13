@@ -177,6 +177,30 @@ pub enum Purity {
 }
 
 // ---------------------------------------------------------------------
+// sources
+// ---------------------------------------------------------------------
+
+/// Kotlin source files shipped inside the pack. The interpreter parses
+/// these at install time and registers the resulting declarations as
+/// if the user had written them. A future phase replaces this section
+/// with frozen `ast` + `resolved` + `typeck` sections produced by the
+/// pack builder.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceBundle {
+    pub files: Vec<SourceFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFile {
+    /// Path relative to the library root (e.g.
+    /// `common/src/main/kotlin/kotlinx/coroutines/Job.kt`). Used for
+    /// diagnostic spans and go-to-definition.
+    pub rel_path: String,
+    /// UTF-8 source bytes.
+    pub bytes: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------
 

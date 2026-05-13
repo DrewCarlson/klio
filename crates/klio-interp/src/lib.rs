@@ -312,6 +312,22 @@ impl Interpreter {
         Ok(installed)
     }
 
+    /// Register a set of parsed pack source files as if they had been
+    /// loaded as additional sibling files in the module. Top-level
+    /// declarations land directly in the shared globals so subsequent
+    /// `run` / `run_module` invocations can see them. `main` functions
+    /// inside pack sources are intentionally not invoked.
+    pub fn register_pack_sources(
+        &mut self,
+        files: &[KotlinFile],
+        out: &mut dyn Output,
+    ) -> Result<(), RuntimeError> {
+        for file in files {
+            self.run_with_output_mode(file, out, /*invoke_main=*/ false, /*persist=*/ true)?;
+        }
+        Ok(())
+    }
+
     /// Look up an intrinsic by FQN. Checks pack-installed bindings
     /// first, falls back to the static `klio_stdlib` table.
     #[must_use]

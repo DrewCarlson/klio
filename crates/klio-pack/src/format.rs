@@ -67,6 +67,11 @@ pub struct SectionDirectory {
 /// readers must tolerate them — but tooling keys off these constants.
 pub mod section_names {
     pub const MANIFEST: &str = "manifest";
+    /// Raw `.kt` source bytes carried in the pack. The interpreter
+    /// parses these at install time. Frozen AST sections (`ast`,
+    /// `resolved`, `typeck`) are reserved for a later phase that
+    /// adds serde derives across the front-end crates.
+    pub const SOURCES: &str = "sources";
     pub const AST: &str = "ast";
     pub const RESOLVED: &str = "resolved";
     pub const TYPECK: &str = "typeck";

@@ -48,6 +48,17 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum PackCmd {
+    /// Build a `.klio-pack` from a library directory containing a
+    /// `klio.toml` and a `src/` tree of `.kt` source files.
+    Build {
+        /// Path to the library root (the directory holding
+        /// `klio.toml`).
+        dir: PathBuf,
+        /// Output path for the produced pack. Defaults to
+        /// `target/packs/<library-id>.klio-pack`.
+        #[arg(long = "out")]
+        out: Option<PathBuf>,
+    },
     /// Build a pack from the in-process Kotlin standard library. With
     /// `--bindings-only`, no AST / resolved / typecheck sections are
     /// emitted; only the manifest, symbol index, and binding table.
@@ -107,6 +118,16 @@ fn main() -> ExitCode {
 
 fn run_pack(cmd: PackCmd) -> ExitCode {
     match cmd {
+        PackCmd::Build { dir, out } => match build_library_pack(&dir, out.as_deref()) {
+            Ok(path) => {
+                eprintln!("wrote {}", path.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
         PackCmd::Stdlib { out, bindings_only, compress_symbols } => {
             if !bindings_only {
                 eprintln!("--bindings-only is the only supported mode in the MVP");
@@ -148,6 +169,171 @@ fn run_pack(cmd: PackCmd) -> ExitCode {
 
 fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, String> {
     klio_stdlib::build_stdlib_pack(compress_symbols).map_err(|e| e.to_string())
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct LibraryToml {
+    library: LibraryHeader,
+    #[serde(default)]
+    deps: Vec<DepEntry>,
+    /// Map of FQN -> host_symbol. Each entry is registered as a
+    /// `BindingKind::Function` with the FQN as both the key and the
+    /// host symbol when the value omits the colon-shaped explicit
+    /// form.
+    #[serde(default)]
+    bindings: std::collections::BTreeMap<String, BindingValue>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct LibraryHeader {
+    id: String,
+    version: String,
+    #[serde(default = "default_abi")]
+    abi: u32,
+    #[serde(default)]
+    implicit_packages: Vec<String>,
+    /// Optional list of glob-like relative paths (under the library
+    /// root) the builder walks for `.kt` source files. Defaults to
+    /// `["src"]`.
+    #[serde(default)]
+    source_roots: Vec<String>,
+}
+
+fn default_abi() -> u32 {
+    1
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct DepEntry {
+    id: String,
+    #[serde(default)]
+    min_version: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[serde(untagged)]
+enum BindingValue {
+    Symbol(String),
+    Detailed {
+        host_symbol: String,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default = "default_true")]
+        overrides_interpreter: bool,
+        #[serde(default)]
+        platform_actual: bool,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn build_library_pack(
+    dir: &std::path::Path,
+    out: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    use klio_pack::schema::{
+        encode, Binding, BindingKind, BindingManifest, PackDependency, PackManifest, Purity,
+        SourceBundle, SourceFile,
+    };
+    use klio_pack::{section_names, Compression, PackWriter};
+
+    let toml_path = dir.join("klio.toml");
+    let toml_str = std::fs::read_to_string(&toml_path)
+        .map_err(|e| format!("read {}: {e}", toml_path.display()))?;
+    let cfg: LibraryToml = toml::from_str(&toml_str)
+        .map_err(|e| format!("parse {}: {e}", toml_path.display()))?;
+
+    // Source files.
+    let source_roots = if cfg.library.source_roots.is_empty() {
+        vec!["src".to_string()]
+    } else {
+        cfg.library.source_roots.clone()
+    };
+    let mut files: Vec<SourceFile> = Vec::new();
+    for root in &source_roots {
+        let root_path = dir.join(root);
+        if !root_path.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&root_path).sort_by_file_name() {
+            let entry = entry.map_err(|e| format!("walk {}: {e}", root_path.display()))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let p = entry.path();
+            if p.extension().map(|e| e == "kt").unwrap_or(false) {
+                let bytes = std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+                let rel = p
+                    .strip_prefix(dir)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .into_owned();
+                files.push(SourceFile { rel_path: rel, bytes });
+            }
+        }
+    }
+    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    // Manifest.
+    let manifest = PackManifest {
+        library_id: cfg.library.id.clone(),
+        library_version: cfg.library.version.clone(),
+        abi_version: cfg.library.abi,
+        implicit_packages: cfg.library.implicit_packages.clone(),
+        dependencies: cfg
+            .deps
+            .into_iter()
+            .map(|d| PackDependency { library_id: d.id, min_version: d.min_version })
+            .collect(),
+    };
+    let manifest_bytes = encode(&manifest).map_err(|e| e.to_string())?;
+
+    // Bindings.
+    let mut bindings: Vec<Binding> = Vec::new();
+    for (fqn, value) in cfg.bindings {
+        let (host_symbol, overrides_interpreter, _kind, platform_actual) = match value {
+            BindingValue::Symbol(s) => (s, true, None, false),
+            BindingValue::Detailed {
+                host_symbol,
+                kind,
+                overrides_interpreter,
+                platform_actual,
+            } => (host_symbol, overrides_interpreter, kind, platform_actual),
+        };
+        bindings.push(Binding {
+            fqn,
+            kind: BindingKind::Function,
+            host_symbol,
+            overrides_interpreter,
+            purity: Purity::Effectful,
+            min_arity: 0,
+            max_arity: u8::MAX,
+        });
+        let _ = platform_actual;
+    }
+    bindings.sort_by(|a, b| a.fqn.cmp(&b.fqn));
+    let bindings_bytes = encode(&BindingManifest { bindings }).map_err(|e| e.to_string())?;
+
+    // Sources (zstd-compressed; common case is many KB of Kotlin text).
+    let sources_bytes = encode(&SourceBundle { files }).map_err(|e| e.to_string())?;
+
+    let mut writer = PackWriter::new();
+    writer.add_raw(section_names::MANIFEST, manifest_bytes);
+    writer.add_raw(section_names::BINDINGS, bindings_bytes);
+    writer.add_section(section_names::SOURCES, sources_bytes, Compression::Zstd);
+    let pack_bytes = writer.finish().map_err(|e| e.to_string())?;
+
+    let out_path = match out {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(format!("target/packs/{}.klio-pack", cfg.library.id)),
+    };
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&out_path, &pack_bytes).map_err(|e| e.to_string())?;
+    Ok(out_path)
 }
 
 fn write_pack(out: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -430,6 +616,98 @@ fn install_embedded_stdlib(interp: &mut Interpreter) {
     };
     let host = klio_stdlib::HostBindings::with_stdlib_defaults();
     let _ = interp.install_pack(&pack, &host);
+    install_extra_packs(interp);
+}
+
+/// Load every pack listed in `KLIO_PACKS` (colon-separated paths) and
+/// every `.klio-pack` file inside `~/.klio/packs`. Source-bearing
+/// packs are parsed and registered as additional sibling files so
+/// their top-level declarations are visible to the user program.
+fn install_extra_packs(interp: &mut Interpreter) {
+    let host = klio_stdlib::HostBindings::with_stdlib_defaults();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(env) = std::env::var("KLIO_PACKS") {
+        for p in env.split(':') {
+            if p.is_empty() {
+                continue;
+            }
+            paths.push(PathBuf::from(p));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let cache = PathBuf::from(home).join(".klio").join("packs");
+        if let Ok(entries) = std::fs::read_dir(&cache) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().map(|x| x == "klio-pack").unwrap_or(false) {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        if let Err(e) = install_one_extra_pack(interp, &path, &host) {
+            eprintln!("warning: skipped {}: {e}", path.display());
+        }
+    }
+}
+
+fn install_one_extra_pack(
+    interp: &mut Interpreter,
+    path: &std::path::Path,
+    host: &klio_stdlib::HostBindings,
+) -> Result<(), String> {
+    use klio_pack::schema::{decode, SourceBundle};
+    use klio_pack::{section_names, PackReader};
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let pack = PackReader::from_bytes(bytes).map_err(|e| e.to_string())?;
+    interp.install_pack(&pack, host).map_err(|e| e.to_string())?;
+    // Sources, when present, get parsed and registered as sibling
+    // module files. Diagnostics are surfaced but do not abort the
+    // load — packs may legitimately ship partial source coverage.
+    if let Some(payload) = pack.read_section(section_names::SOURCES).map_err(|e| e.to_string())? {
+        let bundle: SourceBundle = decode(&payload).map_err(|e| e.to_string())?;
+        if !bundle.files.is_empty() {
+            register_pack_sources(interp, path, &bundle.files)?;
+        }
+    }
+    Ok(())
+}
+
+fn register_pack_sources(
+    interp: &mut Interpreter,
+    pack_path: &std::path::Path,
+    files: &[klio_pack::schema::SourceFile],
+) -> Result<(), String> {
+    use klio_diagnostics::DiagnosticSink;
+    let mut map = SourceMap::new();
+    let mut asts: Vec<klio_ast::KotlinFile> = Vec::with_capacity(files.len());
+    let mut all = DiagnosticSink::new();
+    for f in files {
+        let label = format!("{}!{}", pack_path.display(), f.rel_path);
+        let id = map.add(&label, String::from_utf8_lossy(&f.bytes).into_owned());
+        let src = map.get(id).source.clone();
+        let lexed = klio_lexer::Lexer::new(id, &src).tokenize();
+        for d in lexed.diagnostics.diagnostics() {
+            all.emit(d.clone());
+        }
+        if lexed.diagnostics.has_errors() {
+            continue;
+        }
+        let (ast, diags) = klio_parser::Parser::new(id, &src, &lexed.tokens).parse_file();
+        for d in diags.diagnostics() {
+            all.emit(d.clone());
+        }
+        if diags.has_errors() {
+            continue;
+        }
+        asts.push(ast);
+    }
+    let mut out = klio_runtime::StdoutOutput;
+    interp.register_pack_sources(&asts, &mut out).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn run_repl() -> ExitCode {
