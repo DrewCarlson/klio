@@ -5790,19 +5790,13 @@ impl<'r> Checker<'r> {
                 }
             }
             Expr::If { cond, then_branch, else_branch, .. } => {
-                let cond_narrow = self.check_condition(cond);
+                let _ = self.check_condition(cond);
                 let before = self.assigned.clone();
                 self.push_frame();
-                // Cross-variable reference-equality narrowings from
-                // `a === b` and the like are produced by
-                // check_condition and not yet modelled by the CFG.
-                // The Frame.narrowings path still owns them.
-                for (n, t) in &cond_narrow.true_branch {
-                    self.current_frame().narrowings.insert(n.clone(), t.clone());
-                }
-                for (n, cn) in &cond_narrow.true_class {
-                    self.current_frame().narrowing_class.insert(n.clone(), cn.clone());
-                }
+                // All branch narrowings now flow through the CFG:
+                // `is` / `null` / cross-var ref equality / `&&` / `||`
+                // each emit an Assume node on the right arm during
+                // lowering and the smart-cast analysis picks them up.
                 let then_ty = self.check_expr(then_branch, expected);
                 let then_diverges = matches!(then_ty, Type::Nothing);
                 let after_then = self.assigned.clone();
@@ -5810,12 +5804,6 @@ impl<'r> Checker<'r> {
                 self.assigned = before.clone();
                 let (else_ty, after_else, else_present, else_diverges) = if let Some(e) = else_branch {
                     self.push_frame();
-                    for (n, t) in &cond_narrow.false_branch {
-                        self.current_frame().narrowings.insert(n.clone(), t.clone());
-                    }
-                    for (n, cn) in &cond_narrow.false_class {
-                        self.current_frame().narrowing_class.insert(n.clone(), cn.clone());
-                    }
                     let t = self.check_expr(e, expected);
                     let diverges = matches!(t, Type::Nothing);
                     let after = self.assigned.clone();
@@ -5859,21 +5847,11 @@ impl<'r> Checker<'r> {
                 // control flows past the `if` only through the surviving branch.
                 // Push the condition narrowings from that surviving side into
                 // the enclosing frame so subsequent statements see them.
-                if then_diverges && !else_diverges {
-                    for (n, t) in &cond_narrow.false_branch {
-                        self.current_frame().narrowings.insert(n.clone(), t.clone());
-                    }
-                    for (n, cn) in &cond_narrow.false_class {
-                        self.current_frame().narrowing_class.insert(n.clone(), cn.clone());
-                    }
-                } else if else_present && else_diverges && !then_diverges {
-                    for (n, t) in &cond_narrow.true_branch {
-                        self.current_frame().narrowings.insert(n.clone(), t.clone());
-                    }
-                    for (n, cn) in &cond_narrow.true_class {
-                        self.current_frame().narrowing_class.insert(n.clone(), cn.clone());
-                    }
-                }
+                // Single-divergent-branch lift: the CFG already
+                // makes the unreachable branch unreachable, so the
+                // surviving-side smart-cast facts flow through the
+                // join state naturally.
+                let _ = (then_diverges, else_diverges, else_present);
                 lub(&then_ty, &else_ty)
             }
             Expr::While { cond, body, .. } => {
@@ -7940,43 +7918,12 @@ impl<'r> Checker<'r> {
 
     fn check_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) -> Type {
         let l = self.check_expr(lhs, None);
-        // Spec §14.1: smart-cast narrowings established by the lhs of
-        // `&&` / `||` must apply when checking the rhs. For `&&` use the
-        // true-branch narrowings (rhs runs only when lhs was true); for
-        // `||` use the false-branch narrowings.
-        let (saved_narrowings, saved_classes) = if matches!(op, BinOp::And | BinOp::Or) {
-            let nar = self.check_condition(lhs);
-            let saved_n = self.current_frame().narrowings.clone();
-            let saved_c = self.current_frame().narrowing_class.clone();
-            let branch = if matches!(op, BinOp::And) {
-                &nar.true_branch
-            } else {
-                &nar.false_branch
-            };
-            let branch_classes = if matches!(op, BinOp::And) {
-                &nar.true_class
-            } else {
-                &nar.false_class
-            };
-            // Cross-variable reference-equality narrowings from
-            // check_condition are not yet modelled by the CFG; the
-            // Frame.narrowings path still carries them through the
-            // rhs of && / ||.
-            for (k, v) in branch {
-                self.current_frame().narrowings.insert(k.clone(), v.clone());
-            }
-            for (k, v) in branch_classes {
-                self.current_frame().narrowing_class.insert(k.clone(), v.clone());
-            }
-            (Some(saved_n), Some(saved_c))
-        } else {
-            (None, None)
-        };
+        // `&&` / `||` narrowing flow is handled by the CFG: the
+        // lowering emits AssumeIs / AssumeNull / AssumeRefEq on the
+        // rhs block before the rhs expression evaluates, so smart-
+        // cast queries at rhs spans see lhs's truthy facts.
+        let _ = op;
         let r = self.check_expr(rhs, None);
-        if let (Some(n), Some(c)) = (saved_narrowings, saved_classes) {
-            self.current_frame().narrowings = n;
-            self.current_frame().narrowing_class = c;
-        }
         // Spec ch.9: dispatch-site `operator` modifier check. Binary arith
         // / range / comparison dispatches on the LHS class; `in` / `!in`
         // dispatches on the RHS class.
@@ -8251,19 +8198,14 @@ impl<'r> Checker<'r> {
             }
             "check" | "require" if (1..=2).contains(&args.len()) => {
                 let cond = &args[0];
-                let nar = self.check_condition(cond);
+                let _ = self.check_condition(cond);
                 for a in &args[1..] {
                     self.check_expr(a, None);
                 }
-                // Cross-variable equality narrowings stay on the
-                // Frame path; the CFA's contracts hookup handles
-                // `is` and `!= null` cases via AssumeIs / AssumeNull.
-                for (n, t) in &nar.true_branch {
-                    self.current_frame().narrowings.insert(n.clone(), t.clone());
-                }
-                for (n, cn) in &nar.true_class {
-                    self.current_frame().narrowing_class.insert(n.clone(), cn.clone());
-                }
+                // The CFG's contract effect emits Assume nodes for
+                // `check` / `require` after the call, picking up
+                // every refinement the lowering tracked on the
+                // condition register.
                 Some(Type::Unit)
             }
             _ => None,
@@ -8803,14 +8745,20 @@ impl<'r> Checker<'r> {
             .span_to_pos
             .get(&(query_span.start, query_span.end))
             .copied()?;
-        let entry = smartcast::solve(&lowered.cfg, &lowered.reg_to_place)
-            .into_iter()
-            .nth(bid.0 as usize)?;
-        let states = smartcast::states_within_block(
+        let declared = self.cfg_declared_types();
+        let entry = smartcast::solve_with_declared(
+            &lowered.cfg,
+            &lowered.reg_to_place,
+            Some(&declared),
+        )
+        .into_iter()
+        .nth(bid.0 as usize)?;
+        let states = smartcast::states_within_block_with_declared(
             &lowered.cfg,
             bid,
             entry,
             &lowered.reg_to_place,
+            Some(&declared),
         );
         let state = states.get(pos)?;
         let mut place = klio_cfa::Place::Local(klio_cfa::Symbol(name.to_string()));
@@ -8854,6 +8802,23 @@ impl<'r> Checker<'r> {
         None
     }
 
+    /// Per-place declared-type map drawn from every binding visible
+    /// in the active frames. Fed into the smart-cast pass so
+    /// `AssumeRefEq` can narrow each side to the other's declared
+    /// type when no prior fact applies.
+    fn cfg_declared_types(&self) -> std::collections::HashMap<klio_cfa::Place, Type> {
+        let mut out = std::collections::HashMap::new();
+        for frame in &self.frames {
+            for (name, binding) in &frame.bindings {
+                out.insert(
+                    klio_cfa::Place::Local(klio_cfa::Symbol(name.clone())),
+                    binding.ty.clone(),
+                );
+            }
+        }
+        out
+    }
+
     /// CFG-derived class-name narrowing for `name` at `query_span`.
     /// Parallels `cfg_narrowed_at` for the user-class branch.
     fn cfg_narrowed_class_at(&self, name: &str, query_span: Span) -> Option<String> {
@@ -8864,14 +8829,20 @@ impl<'r> Checker<'r> {
             .get(&(query_span.start, query_span.end))
             .copied()?;
         use klio_cfa::analyses::smartcast;
-        let entry = smartcast::solve(&lowered.cfg, &lowered.reg_to_place)
-            .into_iter()
-            .nth(bid.0 as usize)?;
-        let states = smartcast::states_within_block(
+        let declared = self.cfg_declared_types();
+        let entry = smartcast::solve_with_declared(
+            &lowered.cfg,
+            &lowered.reg_to_place,
+            Some(&declared),
+        )
+        .into_iter()
+        .nth(bid.0 as usize)?;
+        let states = smartcast::states_within_block_with_declared(
             &lowered.cfg,
             bid,
             entry,
             &lowered.reg_to_place,
+            Some(&declared),
         );
         let state = states.get(pos)?;
         let mut place = klio_cfa::Place::Local(klio_cfa::Symbol(name.to_string()));

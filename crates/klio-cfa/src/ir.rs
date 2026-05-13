@@ -92,6 +92,12 @@ pub enum Node {
     /// `AssumeIs Nothing?` because nullability is its own axis on
     /// the smart-cast lattice.
     AssumeNull { reg: Reg, eq_null: bool, span: Span },
+    /// Assume that two registers refer to the same runtime value.
+    /// Produced by `a === b` (and the structural-equality form when
+    /// at least one side is non-nullable) and consumed by smart-
+    /// cast: both registers' places narrow to the intersection of
+    /// their facts on the truthy branch.
+    AssumeRefEq { reg_a: Reg, reg_b: Reg, polarity: bool, span: Span },
     /// Assert `reg` is true; if it is not, control diverges (the
     /// containing block ends in `Terminator::Unreachable` along the
     /// false edge). Used for `!!`, `as`, and contract `require`.

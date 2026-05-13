@@ -86,6 +86,10 @@ struct TryFrame {
 enum Refinement {
     Is { reg: Reg, ty: Type, class_name: Option<String>, polarity: bool, span: Span },
     NullEq { reg: Reg, span: Span, eq_null: bool },
+    /// Reference-equality of two registers, both of which hold a
+    /// `Place`. Used to narrow each place to the intersection of
+    /// the two on the truthy branch.
+    RefEq { reg_a: Reg, reg_b: Reg, span: Span },
     /// `!cond` flips polarity of every contained refinement.
     Not(Box<Refinement>),
     /// `&&` of multiple refinements — all hold on the true branch.
@@ -177,6 +181,17 @@ impl Lowering {
                 let effective = *eq_null == truth;
                 self.b
                     .push(blk, Node::AssumeNull { reg: *reg, eq_null: effective, span: *span });
+            }
+            Refinement::RefEq { reg_a, reg_b, span } => {
+                self.b.push(
+                    blk,
+                    Node::AssumeRefEq {
+                        reg_a: *reg_a,
+                        reg_b: *reg_b,
+                        polarity: truth,
+                        span: *span,
+                    },
+                );
             }
             Refinement::Not(inner) => self.emit_refinement(blk, inner, !truth),
             Refinement::And(parts) => {
@@ -577,6 +592,19 @@ impl Lowering {
                         result,
                         Refinement::NullEq { reg: r, span, eq_null: eq_op },
                     );
+                } else if self.reg_to_place.contains_key(&l)
+                    && self.reg_to_place.contains_key(&r)
+                {
+                    // Cross-variable reference equality on two
+                    // place expressions. Negation flips at branch
+                    // emission time via `emit_refinement(truth=...)`.
+                    let refinement = Refinement::RefEq { reg_a: l, reg_b: r, span };
+                    let wrapped = if eq_op {
+                        refinement
+                    } else {
+                        Refinement::Not(Box::new(refinement))
+                    };
+                    self.pending_refinements.insert(result, wrapped);
                 }
                 result
             }

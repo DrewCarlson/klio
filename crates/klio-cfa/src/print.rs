@@ -82,6 +82,12 @@ fn format_node(n: &Node) -> String {
             reg.0,
             if *eq_null { "==" } else { "!=" }
         ),
+        Node::AssumeRefEq { reg_a, reg_b, polarity, .. } => format!(
+            "assume r{} {} r{}",
+            reg_a.0,
+            if *polarity { "===" } else { "!==" },
+            reg_b.0
+        ),
         Node::Assert { reg, .. } => format!("assert r{}", reg.0),
         Node::KillDataFlow { place } => format!("kill {}", format_place(place)),
         Node::Backedge { loop_id } => format!("backedge l{}", loop_id.0),

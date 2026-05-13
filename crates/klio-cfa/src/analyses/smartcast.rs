@@ -140,6 +140,38 @@ impl Lattice for SmartCastFact {
     }
 }
 
+/// Intersect two smart-cast facts: the narrowed type is the GLB
+/// of both sides (with `None` treated as "no narrowing" so the
+/// other side dominates); class-name agreement survives; the
+/// nullability axis is the stronger of the two.
+fn intersect_facts(a: &SmartCastFact, b: &SmartCastFact) -> SmartCastFact {
+    let narrowed = match (a.narrowed.clone(), b.narrowed.clone()) {
+        (Some(x), Some(y)) => Some(intersect(x, y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    };
+    let narrowed_class = match (&a.narrowed_class, &b.narrowed_class) {
+        (Some(x), Some(y)) if x == y => Some(x.clone()),
+        (Some(x), None) | (None, Some(x)) => Some(x.clone()),
+        _ => None,
+    };
+    let null = match (a.null, b.null) {
+        (Nullability::NonNull, _) | (_, Nullability::NonNull) => Nullability::NonNull,
+        (Nullability::DefinitelyNull, _) | (_, Nullability::DefinitelyNull) => {
+            Nullability::DefinitelyNull
+        }
+        _ => Nullability::Unknown,
+    };
+    let mut not_types: Vec<Type> = a.not_types.clone();
+    for t in &b.not_types {
+        if !not_types.iter().any(|x| x == t) {
+            not_types.push(t.clone());
+        }
+    }
+    SmartCastFact { narrowed, narrowed_class, not_types, null }
+}
+
 /// Intersection of two types, materialised as `Type::Intersection`
 /// when both sides are non-trivial. Mirrors the typechecker's
 /// existing intersection construction.
@@ -166,6 +198,31 @@ pub type SmartCastLattice = MapLattice<Place, SmartCastFact>;
 
 pub struct SmartCastTransfer<'a> {
     pub reg_to_place: &'a HashMap<Reg, Place>,
+    /// Declared types per place, supplied by the typechecker before
+    /// the analysis runs. Used by `AssumeRefEq` to seed each side
+    /// with its declaration when no prior narrowing has refined it.
+    pub declared_types: Option<&'a HashMap<Place, Type>>,
+}
+
+impl<'a> SmartCastTransfer<'a> {
+    fn fact_or_declared(&self, place: &Place, state: &SmartCastLattice) -> SmartCastFact {
+        let mut fact = state
+            .map
+            .get(place)
+            .cloned()
+            .unwrap_or_else(SmartCastFact::unknown);
+        if fact.narrowed.is_none() {
+            if let Some(decl_map) = self.declared_types {
+                if let Some(t) = decl_map.get(place) {
+                    fact.narrowed = Some(t.clone());
+                    // Nullable declared types get no automatic
+                    // nullability axis — the explicit AssumeNull
+                    // nodes carry that signal.
+                }
+            }
+        }
+        fact
+    }
 }
 
 impl<'a> ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'a> {
@@ -193,6 +250,20 @@ impl<'a> ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'a> {
                     state.put(place.clone(), fact);
                 }
             }
+            Node::AssumeRefEq { reg_a, reg_b, polarity, .. } => {
+                if !*polarity {
+                    return;
+                }
+                let place_a = self.reg_to_place.get(reg_a).cloned();
+                let place_b = self.reg_to_place.get(reg_b).cloned();
+                if let (Some(pa), Some(pb)) = (place_a, place_b) {
+                    let fa = self.fact_or_declared(&pa, state);
+                    let fb = self.fact_or_declared(&pb, state);
+                    let merged = intersect_facts(&fa, &fb);
+                    state.put(pa, merged.clone());
+                    state.put(pb, merged);
+                }
+            }
             Node::Assign { lhs, .. } => {
                 let mut fact = SmartCastFact::unknown();
                 fact.reset();
@@ -212,10 +283,21 @@ impl<'a> ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'a> {
 /// states; the caller queries facts at the entry of the block
 /// containing a given AST span.
 pub fn solve(cfg: &Cfg, reg_to_place: &HashMap<Reg, Place>) -> Vec<SmartCastLattice> {
+    solve_with_declared(cfg, reg_to_place, None)
+}
+
+/// Like `solve`, but also seeded with a per-place declared-type map
+/// that `AssumeRefEq` consults to bridge cross-variable narrowings
+/// when neither side has a prior fact.
+pub fn solve_with_declared(
+    cfg: &Cfg,
+    reg_to_place: &HashMap<Reg, Place>,
+    declared_types: Option<&HashMap<Place, Type>>,
+) -> Vec<SmartCastLattice> {
     solve_forward(
         cfg,
         SmartCastLattice::new(),
-        SmartCastTransfer { reg_to_place },
+        SmartCastTransfer { reg_to_place, declared_types },
     )
 }
 
@@ -227,10 +309,20 @@ pub fn states_within_block(
     entry: SmartCastLattice,
     reg_to_place: &HashMap<Reg, Place>,
 ) -> Vec<SmartCastLattice> {
+    states_within_block_with_declared(cfg, block, entry, reg_to_place, None)
+}
+
+pub fn states_within_block_with_declared(
+    cfg: &Cfg,
+    block: crate::ir::BlockId,
+    entry: SmartCastLattice,
+    reg_to_place: &HashMap<Reg, Place>,
+    declared_types: Option<&HashMap<Place, Type>>,
+) -> Vec<SmartCastLattice> {
     let mut out: Vec<SmartCastLattice> = Vec::with_capacity(cfg.block(block).nodes.len() + 1);
     let mut s = entry;
     out.push(s.clone());
-    let mut t = SmartCastTransfer { reg_to_place };
+    let mut t = SmartCastTransfer { reg_to_place, declared_types };
     for node in &cfg.block(block).nodes {
         t.transfer_node(node, &mut s);
         out.push(s.clone());
