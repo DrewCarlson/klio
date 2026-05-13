@@ -192,7 +192,8 @@ fn check_paths(label: &'static str, paths: &[PathBuf]) {
 
     let mut stats = SweepStats::default();
 
-    for (idx, (path, fqcn)) in build.classes.iter().enumerate() {
+    for (idx, entry) in build.classes.iter().enumerate() {
+        let path = &entry.original;
         let rel = path
             .strip_prefix(workspace_root())
             .map(|r| r.display().to_string())
@@ -201,7 +202,7 @@ fn check_paths(label: &'static str, paths: &[PathBuf]) {
 
         // Stage 2: java -cp jar <fqcn>
         let jar = build.jar.clone();
-        let fqcn_for_thread = fqcn.clone();
+        let fqcn_for_thread = entry.fqcn.clone();
         let kotlinc_stdout = match time_stage(timeout, move || {
             klio_parity::run_class(&jar, &fqcn_for_thread).map_err(|e| e.to_string())
         }) {
@@ -236,9 +237,11 @@ fn check_paths(label: &'static str, paths: &[PathBuf]) {
             }
         };
 
-        // Stage 3: klio interp
-        let path_for_thread = path.to_path_buf();
-        match time_stage(timeout, move || klio_parity::run_with_ktc(&path_for_thread)) {
+        // Stage 3: klio interp — feed the *staged* source so klio sees the
+        // same synthesized `package` decl kotlinc did; otherwise FQ class
+        // names diverge purely from the harness, not from real interp behavior.
+        let staged_for_thread = entry.staged.clone();
+        match time_stage(timeout, move || klio_parity::run_with_ktc(&staged_for_thread)) {
             StageOutcome::Ok(klio_stdout, elapsed) => {
                 let matched = kotlinc_stdout == klio_stdout;
                 if matched {

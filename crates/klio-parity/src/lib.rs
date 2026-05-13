@@ -544,12 +544,25 @@ pub fn run_class(jar: &Path, fqcn: &str) -> Result<(String, Option<i32>), Parity
 
 /// Output of a one-shot `kotlinc` compile over an entire corpus: a single jar
 /// holding every file's `main`, each in its own `klio_parity.<label>.<stem>`
-/// package, plus the mapping from original `.kt` path to the JVM FQCN of its
-/// `main` class.
+/// package, plus the mapping from original `.kt` path to the staged source
+/// (with the synthesized `package` line) and JVM FQCN of its `main` class.
+///
+/// The staged source is what we should feed the klio interpreter too — running
+/// it against the original would silently drop the staged package, so klio's
+/// FQ class names (used by default `toString` and the `Enum.valueOf` error
+/// message) would diverge from kotlinc's purely as a harness artifact.
 #[derive(Debug, Clone)]
 pub struct CorpusBuild {
     pub jar: PathBuf,
-    pub classes: Vec<(PathBuf, String)>,
+    pub stage_dir: PathBuf,
+    pub classes: Vec<CorpusEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorpusEntry {
+    pub original: PathBuf,
+    pub staged: PathBuf,
+    pub fqcn: String,
 }
 
 /// Compile a whole list of `.kt` files in one `kotlinc` invocation. Each file
@@ -568,6 +581,11 @@ pub fn compile_corpus(label: &str, files: &[PathBuf]) -> Result<CorpusBuild, Par
     let jar = cache.join(format!("corpus-{label}-{key}.jar"));
     let stage = cache.join(format!("stage-{label}-{key}"));
 
+    // Always (re)stage. The writes are cheap (~50 KB total for the whole
+    // corpus) and the staged sources double as the klio interpreter's input,
+    // so they must be present even on a cache hit for the jar.
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage)?;
     let mut classes = Vec::with_capacity(files.len());
     for file in files {
         let stem = file
@@ -577,24 +595,20 @@ pub fn compile_corpus(label: &str, files: &[PathBuf]) -> Result<CorpusBuild, Par
         let pkg_seg = sanitize_pkg_segment(stem);
         let pkg = format!("klio_parity.{label}.{pkg_seg}");
         let fqcn = format!("{pkg}.{}Kt", capitalize_first(stem));
-        classes.push((file.clone(), fqcn));
-    }
-
-    if jar.is_file() {
-        return Ok(CorpusBuild { jar, classes });
-    }
-
-    // Re-stage from scratch — cheap, and avoids stale shims when the cache key
-    // changed but the stage dir from a prior run still exists.
-    let _ = fs::remove_dir_all(&stage);
-    fs::create_dir_all(&stage)?;
-    for (file, fqcn) in &classes {
-        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap();
-        let pkg = fqcn.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
         let src = fs::read_to_string(file)?;
         let rewritten = inject_jvm_inline(&src);
         let shimmed = format!("package {pkg}\n\n{rewritten}");
-        fs::write(stage.join(format!("{stem}.kt")), shimmed)?;
+        let staged = stage.join(format!("{stem}.kt"));
+        fs::write(&staged, shimmed)?;
+        classes.push(CorpusEntry {
+            original: file.clone(),
+            staged,
+            fqcn,
+        });
+    }
+
+    if jar.is_file() {
+        return Ok(CorpusBuild { jar, stage_dir: stage, classes });
     }
 
     // kotlinc picks output kind from the `-d` extension: `.jar` → jar file,
@@ -620,9 +634,7 @@ pub fn compile_corpus(label: &str, files: &[PathBuf]) -> Result<CorpusBuild, Par
         )));
     }
     fs::rename(&tmp, &jar)?;
-    // Stage dir is no longer needed; leaving it would just bloat target/.
-    let _ = fs::remove_dir_all(&stage);
-    Ok(CorpusBuild { jar, classes })
+    Ok(CorpusBuild { jar, stage_dir: stage, classes })
 }
 
 fn corpus_cache_key(label: &str, files: &[PathBuf]) -> String {
