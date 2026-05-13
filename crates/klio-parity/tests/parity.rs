@@ -114,6 +114,44 @@ where
     }
 }
 
+/// klio's `Math.pow` matches Kotlin/Native; JVM `StrictMath.pow` differs in the
+/// last bit on some inputs (e.g. `pow(8.0, 1.5)` → `11.31370849898476` on JVM
+/// vs `11.313708498984761` everywhere else). The intentional native-conformance
+/// behavior is documented; we tolerate the JVM ULP-1 diff per file so the rest
+/// of the file's lines still get compared.
+///
+/// The match is conservative: two outputs are "equal modulo ULP-1 doubles"
+/// only when every diverging line, after parsing as `f64`, agrees to within
+/// one ULP of the kotlinc value. Anything else still fails.
+fn known_jvm_float_diff(path: &Path, kotlinc_out: &str, klio_out: &str) -> bool {
+    const FILES: &[&str] = &["double_pow.kt"];
+    let basename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if !FILES.contains(&basename) {
+        return false;
+    }
+    let a: Vec<&str> = kotlinc_out.lines().collect();
+    let b: Vec<&str> = klio_out.lines().collect();
+    if a.len() != b.len() {
+        return false;
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x == y {
+            continue;
+        }
+        let (Ok(xd), Ok(yd)) = (x.parse::<f64>(), y.parse::<f64>()) else {
+            return false;
+        };
+        // Tolerate up to one ULP between the printed doubles.
+        let xb = xd.to_bits();
+        let yb = yd.to_bits();
+        let dist = xb.max(yb) - xb.min(yb);
+        if dist > 1 {
+            return false;
+        }
+    }
+    true
+}
+
 fn collect_kt(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
@@ -243,7 +281,8 @@ fn check_paths(label: &'static str, paths: &[PathBuf]) {
         let staged_for_thread = entry.staged.clone();
         match time_stage(timeout, move || klio_parity::run_with_ktc(&staged_for_thread)) {
             StageOutcome::Ok(klio_stdout, elapsed) => {
-                let matched = kotlinc_stdout == klio_stdout;
+                let matched =
+                    kotlinc_stdout == klio_stdout || known_jvm_float_diff(path, &kotlinc_stdout, &klio_stdout);
                 if matched {
                     log_progress(
                         &mut log,
