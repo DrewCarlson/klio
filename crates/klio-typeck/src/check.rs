@@ -680,9 +680,6 @@ struct Checker<'a> {
     /// to `Unresolved`, so this side map carries the identity that
     /// sealed-`when`, member access, and smart casts need.
     expr_class: HashMap<Span, String>,
-    /// Names of locals that are definitely assigned at the current
-    /// program point. Drives the T0020 definite-assignment check.
-    assigned: HashSet<String>,
     /// Inferred element type for an expression whose runtime value is a
     /// `List<T>`. The plain `Type` enum has no generic `List` variant, so
     /// chains like `listOf(1).map { it * 2 }.fold(0) { a, b -> a + b }`
@@ -822,7 +819,6 @@ impl<'a> Checker<'a> {
             resolution,
             types: HashMap::new(),
             expr_class: HashMap::new(),
-            assigned: HashSet::new(),
             list_elem: HashMap::new(),
             diagnostics: DiagnosticSink::new(),
             frames: vec![Frame::default()],
@@ -3240,7 +3236,6 @@ impl<'r> Checker<'r> {
                             return_class: cn,
                         });
                 } else {
-                    self.assigned.insert(p.name.name.clone());
                     self.frames[0].bindings.insert(
                         p.name.name.clone(),
                         Binding { ty, mutable: p.mutable, decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name: None },
@@ -3274,7 +3269,6 @@ impl<'r> Checker<'r> {
                     info.supertypes.push(s.name.name.clone());
                 }
                 self.classes.insert(o.name.name.clone(), info);
-                self.assigned.insert(o.name.name.clone());
                 // Bind the singleton name itself so `Foo.bar` reads pass.
                 self.frames[0].bindings.insert(
                     o.name.name.clone(),
@@ -3885,7 +3879,6 @@ impl<'r> Checker<'r> {
         self.check_anonymous_object_escape(f);
         self.check_operator_signature(f);
         self.check_circular_bounds(&f.type_params, &f.where_bounds);
-        let saved_assigned = self.assigned.clone();
         self.push_frame();
         for p in &f.params {
             let ty = convert_type_ref_lossy(&p.ty);
@@ -3898,7 +3891,6 @@ impl<'r> Checker<'r> {
             self.current_frame()
                 .bindings
                 .insert(p.name.name.clone(), Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name });
-            self.assigned.insert(p.name.name.clone());
             if let Some(default) = &p.default {
                 let dty = self.check_expr(default, Some(&convert_type_ref_lossy(&p.ty)));
                 self.check_assignable(&dty, &convert_type_ref_lossy(&p.ty), default.span());
@@ -3980,7 +3972,6 @@ impl<'r> Checker<'r> {
         self.reified_type_params.pop();
         self.type_params_in_scope.pop();
         self.pop_frame();
-        self.assigned = saved_assigned;
         if f.body.is_some() {
             self.cfg_fn_stack.pop();
         }
@@ -4564,7 +4555,6 @@ impl<'r> Checker<'r> {
             }
         }
 
-        let class_saved_assigned = self.assigned.clone();
         self.push_frame();
         // Bind primary-ctor params (and the `this` members for any param).
         for p in &c.primary_params {
@@ -4574,7 +4564,6 @@ impl<'r> Checker<'r> {
                 p.name.name.clone(),
                 Binding { ty, mutable: p.property == Some(true), decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name: None },
             );
-            self.assigned.insert(p.name.name.clone());
             if let Some(default) = &p.default {
                 let dty = self.check_expr(default, Some(&convert_type_ref_lossy(&p.ty)));
                 self.check_assignable(&dty, &convert_type_ref_lossy(&p.ty), default.span());
@@ -4703,33 +4692,18 @@ impl<'r> Checker<'r> {
         for sc in &c.secondary_ctors {
             self.check_secondary_ctor(sc);
         }
-        // Method bodies run after construction, so every property is
-        // definitely assigned by some ctor path. Seed `assigned` with all
-        // declared property names so reads inside methods don't trip the
-        // VIA check (the post-init guard above already validated that the
-        // primary-ctor path assigns the needs-init set).
-        let method_assigned_saved = self.assigned.clone();
-        for m in &c.members {
-            if let Decl::Property(p) = m {
-                self.assigned.insert(p.name.name.clone());
-            }
-        }
-        for p in &c.primary_params {
-            if p.property.is_some() {
-                self.assigned.insert(p.name.name.clone());
-            }
-        }
+        // Method bodies run after construction, so the class-init
+        // CFG built above has already validated that every needs-
+        // init property is definitely assigned by some ctor path.
         for m in &c.members {
             if let Decl::Function(f) = m {
                 self.check_function(f);
             }
         }
-        self.assigned = method_assigned_saved;
         for entry in &c.enum_entries {
             self.check_enum_entry(entry);
         }
         self.pop_frame();
-        self.assigned = class_saved_assigned;
         self.class_stack.pop();
         self.type_params_in_scope.pop();
         self.reified_type_params.pop();
@@ -5286,14 +5260,12 @@ impl<'r> Checker<'r> {
     }
 
     fn check_accessor(&mut self, a: &Accessor) {
-        let saved = self.assigned.clone();
         self.push_frame();
         for p in &a.params {
             self.current_frame().bindings.insert(
                 p.name.clone(),
                 Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(p.span), class_name: None, needs_init: false, decl_type_name: None },
             );
-            self.assigned.insert(p.name.clone());
         }
         match &a.body {
             FunctionBody::Block(b) => {
@@ -5304,11 +5276,9 @@ impl<'r> Checker<'r> {
             }
         }
         self.pop_frame();
-        self.assigned = saved;
     }
 
     fn check_secondary_ctor(&mut self, sc: &SecondaryCtor) {
-        let saved = self.assigned.clone();
         self.push_frame();
         for p in &sc.params {
             let ty = convert_type_ref_lossy(&p.ty);
@@ -5317,7 +5287,6 @@ impl<'r> Checker<'r> {
                 p.name.name.clone(),
                 Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name: None },
             );
-            self.assigned.insert(p.name.name.clone());
         }
         match &sc.delegation {
             CtorDelegation::This(args) | CtorDelegation::Super(args) => {
@@ -5331,11 +5300,9 @@ impl<'r> Checker<'r> {
             self.check_block(b, None);
         }
         self.pop_frame();
-        self.assigned = saved;
     }
 
     fn check_object(&mut self, o: &ObjectDecl) {
-        let saved = self.assigned.clone();
         self.class_stack.push(o.name.name.clone());
         self.check_supertype_validity(&o.name.name, &o.supertypes);
         self.push_frame();
@@ -5356,7 +5323,6 @@ impl<'r> Checker<'r> {
             }
         }
         self.pop_frame();
-        self.assigned = saved;
         self.class_stack.pop();
     }
 
@@ -5421,7 +5387,6 @@ impl<'r> Checker<'r> {
                             mutable: *mutable,
                             decl_span: Some(n.span), class_name: None, needs_init: false, decl_type_name: None },
                     );
-                    self.assigned.insert(n.name.clone());
                 }
                 Type::Unit
             }
@@ -5453,7 +5418,6 @@ impl<'r> Checker<'r> {
                 let has_init = p.init.is_some() || p.delegate.is_some();
                 let needs_init = !has_init && !p.is_lateinit;
                 if !needs_init {
-                    self.assigned.insert(p.name.name.clone());
                 }
                 self.current_frame().bindings.insert(
                     p.name.name.clone(),
@@ -5502,7 +5466,6 @@ impl<'r> Checker<'r> {
                     f.name.name.clone(),
                     Binding { ty: fn_ty, mutable: false, decl_span: Some(f.name.span), class_name: None, needs_init: false, decl_type_name: None },
                 );
-                self.assigned.insert(f.name.name.clone());
                 self.fns.entry(f.name.name.clone()).or_default().push(sig);
                 self.check_function(f);
             }
@@ -5585,7 +5548,6 @@ impl<'r> Checker<'r> {
                     }
                     let got = self.check_expr(value, Some(&want));
                     self.check_assignable(&got, &want, value.span());
-                    self.assigned.insert(name.clone());
                     // killDataFlow lives in the CFG: Node::KillDataFlow
                     // at every loop head invalidates narrowings on
                     // reassigned places.
@@ -5852,87 +5814,35 @@ impl<'r> Checker<'r> {
             }
             Expr::If { cond, then_branch, else_branch, .. } => {
                 let _ = self.check_expr(cond, Some(&Type::Boolean));
-                let before = self.assigned.clone();
                 self.push_frame();
-                // All branch narrowings now flow through the CFG:
-                // `is` / `null` / cross-var ref equality / `&&` / `||`
-                // each emit an Assume node on the right arm during
-                // lowering and the smart-cast analysis picks them up.
+                // All branch narrowings and definite-assignment
+                // joins flow through the CFG: each arm contributes
+                // an Assume on the right branch and the smart-cast
+                // / VIA analyses join at the if's join block.
                 let then_ty = self.check_expr(then_branch, expected);
-                let then_diverges = matches!(then_ty, Type::Nothing);
-                let after_then = self.assigned.clone();
                 self.pop_frame();
-                self.assigned = before.clone();
-                let (else_ty, after_else, else_present, else_diverges) = if let Some(e) = else_branch {
+                let else_ty = if let Some(e) = else_branch {
                     self.push_frame();
                     let t = self.check_expr(e, expected);
-                    let diverges = matches!(t, Type::Nothing);
-                    let after = self.assigned.clone();
                     self.pop_frame();
-                    self.assigned = before.clone();
-                    (t, after, true, diverges)
+                    t
                 } else {
-                    (Type::Unit, before.clone(), false, false)
+                    Type::Unit
                 };
-                // Merge: a name is definitely assigned after the `if` iff
-                // it's assigned on every non-diverging branch.
-                let mut merged: HashSet<String> = before.clone();
-                let then_contrib: Option<&HashSet<String>> = if then_diverges { None } else { Some(&after_then) };
-                let else_contrib: Option<&HashSet<String>> = if !else_present {
-                    Some(&before)
-                } else if else_diverges {
-                    None
-                } else {
-                    Some(&after_else)
-                };
-                match (then_contrib, else_contrib) {
-                    (Some(t), Some(e)) => {
-                        for n in t.intersection(e) {
-                            merged.insert(n.clone());
-                        }
-                    }
-                    (Some(t), None) => {
-                        for n in t {
-                            merged.insert(n.clone());
-                        }
-                    }
-                    (None, Some(e)) => {
-                        for n in e {
-                            merged.insert(n.clone());
-                        }
-                    }
-                    (None, None) => {}
-                }
-                self.assigned = merged;
-                // Spec §14.1: when exactly one branch diverges (Type::Nothing),
-                // control flows past the `if` only through the surviving branch.
-                // Push the condition narrowings from that surviving side into
-                // the enclosing frame so subsequent statements see them.
-                // Single-divergent-branch lift: the CFG already
-                // makes the unreachable branch unreachable, so the
-                // surviving-side smart-cast facts flow through the
-                // join state naturally.
-                let _ = (then_diverges, else_diverges, else_present);
                 lub(&then_ty, &else_ty)
             }
             Expr::While { cond, body, .. } => {
                 self.check_expr(cond, Some(&Type::Boolean));
-                let before = self.assigned.clone();
                 // Spec §14.1.4 propagation of body smart-cast facts
-                // to the surrounding scope flows through the CFG:
-                // killDataFlow invalidates only reassigned places,
-                // so unchanged facts cross the back-edge naturally.
+                // to the surrounding scope flows through the CFG.
                 self.check_expr(body, None);
-                self.assigned = before;
                 Type::Unit
             }
             Expr::DoWhile { body, cond, .. } => {
-                let before = self.assigned.clone();
                 if let Some(b) = body {
                     self.check_expr(b, None);
                 }
                 self.check_expr(cond, Some(&Type::Boolean));
-                self.assigned = before;
                 Type::Unit
             }
             Expr::For { vars, iter, body, span, .. } => {
@@ -5943,18 +5853,15 @@ impl<'r> Checker<'r> {
                 // tracked, so the check is best-effort on `iterator`.
                 let cls = self.expr_class.get(&iter.span()).cloned();
                 self.check_user_operator_keyword(cls.as_deref(), "iterator", *span);
-                let before = self.assigned.clone();
                 self.push_frame();
                 for v in vars {
                     self.current_frame().bindings.insert(
                         v.name.clone(),
                         Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(v.span), class_name: None, needs_init: false, decl_type_name: None },
                     );
-                    self.assigned.insert(v.name.clone());
                 }
                 self.check_expr(body, None);
                 self.pop_frame();
-                self.assigned = before;
                 Type::Unit
             }
             Expr::Return { value, label, span } => {
@@ -6061,11 +5968,8 @@ impl<'r> Checker<'r> {
                 Type::Nothing
             }
             Expr::Try { body, catches, finally, .. } => {
-                let before = self.assigned.clone();
                 let body_ty = self.check_block(body, expected);
-                let after_body = self.assigned.clone();
                 let mut acc = body_ty;
-                let mut common: HashSet<String> = after_body.clone();
                 for c in catches {
                     // Spec §15.1: exception types in `catch` must be
                     // runtime-available. A non-reified type parameter is
@@ -6105,7 +6009,6 @@ impl<'r> Checker<'r> {
                             );
                         }
                     }
-                    self.assigned = before.clone();
                     self.push_frame();
                     self.current_frame().bindings.insert(
                         c.binding.name.clone(),
@@ -6114,14 +6017,10 @@ impl<'r> Checker<'r> {
                             mutable: false,
                             decl_span: Some(c.binding.span), class_name: None, needs_init: false, decl_type_name: None },
                     );
-                    self.assigned.insert(c.binding.name.clone());
                     let cty = self.check_block(&c.body, expected);
-                    let after_catch = self.assigned.clone();
                     self.pop_frame();
-                    common = common.intersection(&after_catch).cloned().collect();
                     acc = lub(&acc, &cty);
                 }
-                self.assigned = common;
                 // Spec §12.1.1 finally(1): evaluated after body+catch
                 // along the normal continuation. If finally diverges
                 // (return / throw inside), the try expression itself
@@ -6230,14 +6129,11 @@ impl<'r> Checker<'r> {
                             decl_type_name: None,
                         },
                     );
-                    self.assigned.insert(b.name.name.clone());
                     true
                 } else {
                     false
                 };
-                let before = self.assigned.clone();
                 let mut has_else = false;
-                let mut branch_assigned: Vec<Option<HashSet<String>>> = Vec::new();
                 let mut acc: Option<Type> = None;
                 // Spec §14.1: the subject of a `when` is a smart-cast sink for
                 // each branch when an `is` pattern matches. Resolve the sink
@@ -6261,7 +6157,6 @@ impl<'r> Checker<'r> {
                     if b.patterns.iter().any(|p| matches!(p.kind, WhenPatternKind::Else)) {
                         has_else = true;
                     }
-                    self.assigned = before.clone();
                     // Narrow the subject inside this branch if it's a single
                     // `is T` pattern. Multiple patterns or any `!is` / value
                     // patterns mean the branch body cannot rely on a single
@@ -6273,34 +6168,12 @@ impl<'r> Checker<'r> {
                     // without an extra frame push.
                     let _ = &subject_key;
                     let t = self.check_expr(&b.body, expected);
-                    let after = if matches!(t, Type::Nothing) {
-                        None
-                    } else {
-                        Some(self.assigned.clone())
-                    };
-                    branch_assigned.push(after);
                     acc = Some(match acc {
                         None => t,
                         Some(a) => lub(&a, &t),
                     });
                 }
-                // Merge branches when exhaustive (else present). Otherwise
-                // the `when` may fall through with the pre-when state.
-                if has_else && !branch_assigned.is_empty() {
-                    let live: Vec<HashSet<String>> = branch_assigned
-                        .into_iter()
-                        .flatten()
-                        .collect();
-                    self.assigned = if live.is_empty() {
-                        before
-                    } else {
-                        let mut iter = live.into_iter();
-                        let first = iter.next().unwrap();
-                        iter.fold(first, |acc, s| acc.intersection(&s).cloned().collect())
-                    };
-                } else {
-                    self.assigned = before;
-                }
+                let _ = has_else;
                 if let Some(cn) = subj_class {
                     self.check_when_exhaustive(&cn, branches, *span);
                 }
@@ -6438,7 +6311,6 @@ impl<'r> Checker<'r> {
                 }
             }
             Expr::AnonFun { params, return_ty, body, is_suspend, .. } => {
-                let saved = self.assigned.clone();
                 self.push_frame();
                 for p in params {
                     let pty = convert_type_ref_lossy(&p.ty);
@@ -6457,7 +6329,6 @@ impl<'r> Checker<'r> {
                             },
                         },
                     );
-                    self.assigned.insert(p.name.name.clone());
                 }
                 let ret_expected = return_ty
                     .as_ref()
@@ -6474,7 +6345,6 @@ impl<'r> Checker<'r> {
                     }
                 }
                 self.pop_frame();
-                self.assigned = saved;
                 let params_out = params
                     .iter()
                     .map(|p| convert_type_ref_lossy(&p.ty))
@@ -6555,7 +6425,6 @@ impl<'r> Checker<'r> {
                         self.check_expr(a, None);
                     }
                 }
-                let saved = self.assigned.clone();
                 for m in members {
                     match m {
                         Decl::Function(f) => self.check_function(f),
@@ -6568,7 +6437,6 @@ impl<'r> Checker<'r> {
                         _ => {}
                     }
                 }
-                self.assigned = saved;
                 Type::Unresolved
             }
         }
@@ -8454,7 +8322,6 @@ impl<'r> Checker<'r> {
                     decl_type_name: None,
                 },
             );
-            self.assigned.insert("it".to_string());
         } else {
             for p in params {
                 self.current_frame().bindings.insert(
@@ -8468,7 +8335,6 @@ impl<'r> Checker<'r> {
                         decl_type_name: None,
                     },
                 );
-                self.assigned.insert(p.name.clone());
             }
         }
         if let Some((this_ty, this_cls)) = this_binding {
@@ -8525,7 +8391,6 @@ impl<'r> Checker<'r> {
                 false,
             ),
         };
-        let saved = self.assigned.clone();
         self.push_frame();
         // Spec §18.1: a lambda assigned to a `suspend (…) -> R` slot
         // becomes a suspending lambda. Push the bit so calls inside the
@@ -8553,7 +8418,6 @@ impl<'r> Checker<'r> {
                     mutable: false,
                     decl_span: None, class_name: None, needs_init: false, decl_type_name: None },
             );
-            self.assigned.insert("it".to_string());
         } else if !effective_empty {
             for (i, p) in params.iter().enumerate() {
                 self.current_frame().bindings.insert(
@@ -8563,13 +8427,11 @@ impl<'r> Checker<'r> {
                         mutable: false,
                         decl_span: Some(p.span), class_name: None, needs_init: false, decl_type_name: None },
                 );
-                self.assigned.insert(p.name.clone());
             }
         }
         let actual_ret = self.check_block(body, Some(&ret_expected));
         self.suspend_context_stack.pop();
         self.pop_frame();
-        self.assigned = saved;
         let return_type = if matches!(ret_expected, Type::Unresolved) {
             actual_ret
         } else {
