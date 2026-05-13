@@ -9278,6 +9278,47 @@ fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value, RuntimeError> {
                 .collect();
             Ok(List { items: Rc::new(RefCell::new(result)), mutable: false, enum_class: None })
         }
+        // `Map<K, V>.plus(other: Map<K, V>): Map<K, V>` and
+        // `Map<K, V>.plus(pair: Pair<K, V>): Map<K, V>` — stdlib operators.
+        (Add, Map { entries: a, .. }, Map { entries: b, .. }) => {
+            let mut out: Vec<(Value, Value)> = a.borrow().clone();
+            for (k, v) in b.borrow().iter() {
+                if let Some(pos) = out.iter().position(|(ok, _)| Value::structural_eq(ok, k)) {
+                    out[pos].1 = v.clone();
+                } else {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+            Ok(Map { entries: Rc::new(RefCell::new(out)), mutable: false })
+        }
+        (Add, Map { entries, .. }, Pair(first, second)) => {
+            let mut out: Vec<(Value, Value)> = entries.borrow().clone();
+            let k = (**first).clone();
+            let v = (**second).clone();
+            if let Some(pos) = out.iter().position(|(ok, _)| Value::structural_eq(ok, &k)) {
+                out[pos].1 = v;
+            } else {
+                out.push((k, v));
+            }
+            Ok(Map { entries: Rc::new(RefCell::new(out)), mutable: false })
+        }
+        // `Set<T>.plus(other: Set<T> | T): Set<T>`.
+        (Add, Set { items: a, .. }, Set { items: b, .. }) => {
+            let mut out: Vec<Value> = a.borrow().clone();
+            for v in b.borrow().iter() {
+                if !out.iter().any(|x| Value::structural_eq(x, v)) {
+                    out.push(v.clone());
+                }
+            }
+            Ok(Set { items: Rc::new(RefCell::new(out)), mutable: false })
+        }
+        (Add, Set { items, .. }, other) => {
+            let mut out: Vec<Value> = items.borrow().clone();
+            if !out.iter().any(|x| Value::structural_eq(x, other)) {
+                out.push((*other).clone());
+            }
+            Ok(Set { items: Rc::new(RefCell::new(out)), mutable: false })
+        }
 
         (Eq, a, b) => Ok(Bool(Value::structural_eq(a, b))),
         (Neq, a, b) => Ok(Bool(!Value::structural_eq(a, b))),
