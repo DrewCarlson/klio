@@ -157,6 +157,15 @@ pub struct Binding {
     pub purity: Purity,
     pub min_arity: u8,
     pub max_arity: u8,
+    /// True when this binding is the `actual` half of an `expect /
+    /// actual` declaration: the library ships an `expect` declaration
+    /// in its common sources, and this binding's Rust function is the
+    /// platform-specific implementation. Defaults to false. The
+    /// interpreter treats `expect`-shaped declarations as
+    /// non-instantiable unless an `actual` binding (here) is
+    /// installed.
+    #[serde(default)]
+    pub platform_actual: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -278,6 +287,7 @@ mod tests {
                 purity: Purity::Effectful,
                 min_arity: 0,
                 max_arity: 1,
+                platform_actual: false,
             }],
         };
         let bytes = encode(&manifest).unwrap();

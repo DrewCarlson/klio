@@ -12684,6 +12684,7 @@ mod tests {
                 purity: Purity::Effectful,
                 min_arity: 0,
                 max_arity: 1,
+                platform_actual: false,
             }],
         };
         let mut w = PackWriter::new();

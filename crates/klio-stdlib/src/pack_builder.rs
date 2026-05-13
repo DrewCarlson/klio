@@ -56,6 +56,7 @@ pub fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, PackError> {
             purity: Purity::Effectful,
             min_arity: max_arity,
             max_arity,
+            platform_actual: false,
         });
     }
     bindings.sort_by(|a, b| a.fqn.cmp(&b.fqn));

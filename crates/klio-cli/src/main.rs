@@ -75,6 +75,18 @@ enum PackCmd {
         #[arg(long = "compress-symbols", default_value_t = true)]
         compress_symbols: bool,
     },
+    /// Copy a `.klio-pack` into `~/.klio/packs/<library-id>-<version>.klio-pack`
+    /// so the interpreter picks it up automatically on subsequent runs.
+    Install { pack: PathBuf },
+    /// List every pack in `~/.klio/packs/`, with library id, version,
+    /// declared dependencies, and binding/source counts.
+    List,
+    /// Remove `~/.klio/packs/<library-id>-<version>.klio-pack`.
+    Remove {
+        library_id: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Inspect a pack: print the manifest, section list, and counts
     /// from the symbol index / binding manifest.
     Inspect { pack: PathBuf },
@@ -146,6 +158,35 @@ fn run_pack(cmd: PackCmd) -> ExitCode {
                 },
                 Err(e) => {
                     eprintln!("pack build failed: {e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        PackCmd::Install { pack } => match install_pack_into_cache(&pack) {
+            Ok(dest) => {
+                eprintln!("installed {}", dest.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        PackCmd::List => match list_cache_packs() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        PackCmd::Remove { library_id, version } => {
+            match remove_cache_pack(&library_id, version.as_deref()) {
+                Ok(p) => {
+                    eprintln!("removed {}", p.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
                     ExitCode::from(2)
                 }
             }
@@ -310,8 +351,8 @@ fn build_library_pack(
             purity: Purity::Effectful,
             min_arity: 0,
             max_arity: u8::MAX,
+            platform_actual,
         });
-        let _ = platform_actual;
     }
     bindings.sort_by(|a, b| a.fqn.cmp(&b.fqn));
     let bindings_bytes = encode(&BindingManifest { bindings }).map_err(|e| e.to_string())?;
@@ -341,6 +382,104 @@ fn write_pack(out: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(out, bytes)
+}
+
+fn klio_cache_dir() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or("HOME env var unset")?;
+    Ok(PathBuf::from(home).join(".klio").join("packs"))
+}
+
+fn read_pack_manifest(path: &std::path::Path) -> Result<klio_pack::schema::PackManifest, String> {
+    use klio_pack::schema::{decode, PackManifest};
+    use klio_pack::{section_names, PackReader};
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let pack = PackReader::from_bytes(bytes).map_err(|e| e.to_string())?;
+    let payload = pack
+        .read_section(section_names::MANIFEST)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{}: missing manifest section", path.display()))?;
+    let m: PackManifest = decode(&payload).map_err(|e| e.to_string())?;
+    Ok(m)
+}
+
+fn install_pack_into_cache(src: &std::path::Path) -> Result<PathBuf, String> {
+    let manifest = read_pack_manifest(src)?;
+    let cache = klio_cache_dir()?;
+    std::fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let dest = cache.join(format!(
+        "{}-{}.klio-pack",
+        manifest.library_id, manifest.library_version
+    ));
+    std::fs::copy(src, &dest).map_err(|e| format!("copy: {e}"))?;
+    Ok(dest)
+}
+
+fn list_cache_packs() -> Result<(), String> {
+    let cache = klio_cache_dir()?;
+    let Ok(entries) = std::fs::read_dir(&cache) else {
+        eprintln!("(no packs installed at {})", cache.display());
+        return Ok(());
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "klio-pack").unwrap_or(false))
+        .collect();
+    paths.sort();
+    for path in paths {
+        match read_pack_manifest(&path) {
+            Ok(m) => {
+                let deps = if m.dependencies.is_empty() {
+                    "—".to_string()
+                } else {
+                    m.dependencies
+                        .iter()
+                        .map(|d| format!("{}{}", d.library_id, format_min(&d.min_version)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!(
+                    "{:<32}  {:<10}  abi {}  deps {}",
+                    m.library_id, m.library_version, m.abi_version, deps,
+                );
+            }
+            Err(e) => {
+                println!("{}: ! {}", path.display(), e);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_min(min: &str) -> String {
+    if min.is_empty() {
+        String::new()
+    } else {
+        format!(" (>={min})")
+    }
+}
+
+fn remove_cache_pack(library_id: &str, version: Option<&str>) -> Result<PathBuf, String> {
+    let cache = klio_cache_dir()?;
+    let entries = std::fs::read_dir(&cache).map_err(|e| e.to_string())?;
+    for e in entries.flatten() {
+        let p = e.path();
+        let manifest = match read_pack_manifest(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if manifest.library_id != library_id {
+            continue;
+        }
+        if let Some(v) = version {
+            if manifest.library_version != v {
+                continue;
+            }
+        }
+        std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+        return Ok(p);
+    }
+    Err(format!("no pack matching {library_id} found in cache"))
 }
 
 fn inspect_pack(path: &std::path::Path) -> Result<(), String> {
@@ -647,11 +786,86 @@ fn install_extra_packs(interp: &mut Interpreter) {
     }
     paths.sort();
     paths.dedup();
+    // Topological order: a pack that lists another pack in its
+    // `dependencies` loads after the dependency. The stdlib pack is
+    // always installed by the caller before this point so any pack
+    // depending on `stdlib` is satisfied.
+    let mut entries: Vec<(PathBuf, klio_pack::schema::PackManifest)> = Vec::new();
     for path in paths {
-        if let Err(e) = install_one_extra_pack(interp, &path, &host) {
-            eprintln!("warning: skipped {}: {e}", path.display());
+        match read_pack_manifest(&path) {
+            Ok(m) => entries.push((path, m)),
+            Err(e) => eprintln!("warning: skipped {}: {e}", path.display()),
         }
     }
+    let ordered = topo_sort_packs(&entries);
+    let mut loaded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loaded.insert("stdlib".to_string());
+    for idx in ordered {
+        let (path, manifest) = &entries[idx];
+        for d in &manifest.dependencies {
+            if !loaded.contains(&d.library_id) {
+                eprintln!(
+                    "warning: pack {} depends on `{}` which is not loaded; loading anyway",
+                    path.display(),
+                    d.library_id,
+                );
+            }
+        }
+        if let Err(e) = install_one_extra_pack(interp, path, &host) {
+            eprintln!("warning: skipped {}: {e}", path.display());
+            continue;
+        }
+        loaded.insert(manifest.library_id.clone());
+    }
+}
+
+/// Sort the supplied packs so a pack appears after every pack it
+/// declares as a dependency. Ties broken by library id for
+/// determinism. Cycles produce an arbitrary stable order — pack-load
+/// failures surface the cycle indirectly through binding lookups.
+fn topo_sort_packs(packs: &[(PathBuf, klio_pack::schema::PackManifest)]) -> Vec<usize> {
+    use std::collections::HashMap;
+    let mut id_to_idx: HashMap<&str, usize> = HashMap::new();
+    for (i, (_, m)) in packs.iter().enumerate() {
+        id_to_idx.insert(m.library_id.as_str(), i);
+    }
+    let n = packs.len();
+    let mut indeg = vec![0usize; n];
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, (_, m)) in packs.iter().enumerate() {
+        for d in &m.dependencies {
+            if let Some(&j) = id_to_idx.get(d.library_id.as_str()) {
+                adj[j].push(i);
+                indeg[i] += 1;
+            }
+        }
+    }
+    let mut order = Vec::with_capacity(n);
+    let mut queue: std::collections::BTreeSet<(String, usize)> = std::collections::BTreeSet::new();
+    for (i, d) in indeg.iter().enumerate() {
+        if *d == 0 {
+            queue.insert((packs[i].1.library_id.clone(), i));
+        }
+    }
+    while let Some(item) = queue.iter().next().cloned() {
+        queue.remove(&item);
+        let i = item.1;
+        order.push(i);
+        for &j in &adj[i] {
+            indeg[j] -= 1;
+            if indeg[j] == 0 {
+                queue.insert((packs[j].1.library_id.clone(), j));
+            }
+        }
+    }
+    if order.len() < n {
+        // Cycle: append remaining in stable id order.
+        let remaining: Vec<usize> = (0..n).filter(|i| !order.contains(i)).collect();
+        let mut by_id: Vec<usize> = remaining;
+        by_id.sort_by(|a, b| packs[*a].1.library_id.cmp(&packs[*b].1.library_id));
+        order.extend(by_id);
+    }
+    order
 }
 
 fn install_one_extra_pack(
