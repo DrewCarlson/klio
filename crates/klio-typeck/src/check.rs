@@ -7980,6 +7980,17 @@ impl<'r> Checker<'r> {
                 }
                 Some(Type::Unresolved)
             }
+            "buildString" if args.len() == 1 => {
+                if let Expr::Lambda { params, body, .. } = &args[0] {
+                    self.check_lambda_in_place(
+                        params,
+                        body,
+                        None,
+                        Some((Type::Unresolved, Some("StringBuilder".to_string()))),
+                    );
+                }
+                Some(Type::String)
+            }
             "check" | "require" if (1..=2).contains(&args.len()) => {
                 let cond = &args[0];
                 let nar = self.check_condition(cond);
