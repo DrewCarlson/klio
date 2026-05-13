@@ -1148,13 +1148,12 @@ fn simple_name(callee: &Expr) -> Option<&str> {
 }
 
 impl Lowering {
-    /// Apply spec §12.2.5 contract effects for the stdlib calls we
-    /// recognise by name. Today: `requireNotNull(x)` / `checkNotNull(x)`
-    /// narrow `x` to non-null on the post-call path; `require(c)` /
-    /// `check(c)` propagate the condition's refinement after the
-    /// call returns. User contracts via `kotlin.contracts.contract { }`
-    /// remain handled by the typechecker until the dedicated
-    /// contracts analysis lands.
+    /// Apply spec §12.2.5 contract effects to the post-call block.
+    /// The effect catalogue lives in
+    /// [`crate::analyses::contracts::stdlib_contract`]; the lowering
+    /// just translates each `ContractEffect` into the corresponding
+    /// `Assume*` node and replays any pending refinement on the
+    /// predicate register.
     fn apply_contract_effects(
         &mut self,
         callee: &Expr,
@@ -1163,25 +1162,27 @@ impl Lowering {
         cur: BlockId,
         span: Span,
     ) {
+        use crate::analyses::contracts::{stdlib_contract, ContractEffect};
         let Some(name) = simple_name(callee) else { return };
-        match name {
-            "requireNotNull" | "checkNotNull" => {
-                if let (Some(r), Some(_)) = (arg_regs.first(), args.first()) {
-                    self.b.push(
-                        cur,
-                        Node::AssumeNull { reg: *r, eq_null: false, span },
-                    );
+        for effect in stdlib_contract(name) {
+            match effect {
+                ContractEffect::AssumeNonNull { arg_idx } => {
+                    if let (Some(r), Some(_)) = (arg_regs.get(*arg_idx), args.get(*arg_idx)) {
+                        self.b.push(
+                            cur,
+                            Node::AssumeNull { reg: *r, eq_null: false, span },
+                        );
+                    }
                 }
-            }
-            "require" | "check" => {
-                if let (Some(r), Some(_)) = (arg_regs.first(), args.first()) {
-                    self.b.push(cur, Node::Assume { reg: *r, polarity: true });
-                    if let Some(refinement) = self.pending_refinements.get(r).cloned() {
-                        self.emit_refinement(cur, &refinement, true);
+                ContractEffect::AssumePredicate { arg_idx } => {
+                    if let (Some(r), Some(_)) = (arg_regs.get(*arg_idx), args.get(*arg_idx)) {
+                        self.b.push(cur, Node::Assume { reg: *r, polarity: true });
+                        if let Some(refinement) = self.pending_refinements.get(r).cloned() {
+                            self.emit_refinement(cur, &refinement, true);
+                        }
                     }
                 }
             }
-            _ => {}
         }
     }
 }
