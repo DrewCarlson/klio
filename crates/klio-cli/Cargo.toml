@@ -25,6 +25,7 @@ klio-kotlinx-atomicfu = { workspace = true }
 klio-kotlinx-io       = { workspace = true }
 klio-kotlinx-datetime = { workspace = true }
 klio-kotlinx-coroutines = { workspace = true }
+klio-ktor-client = { workspace = true }
 klio-runtime     = { workspace = true }
 serde            = { workspace = true }
 toml             = "0.9"
