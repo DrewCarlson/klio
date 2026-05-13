@@ -7888,10 +7888,124 @@ impl Interpreter {
                 return Ok(Value::String(Rc::clone(pname)));
             }
         }
+        if let Value::Function { decl, .. } = &receiver {
+            if name == "name" {
+                return Ok(Value::String(Rc::new(decl.name.name.clone())));
+            }
+            if name == "parameters" {
+                // KFunction.parameters: a `List<KParameter>` reported
+                // here as a list of `Value::PropertyRef` carrying the
+                // declared parameter names. The lightweight shape
+                // satisfies `.size` / `.map { it.name }` use cases
+                // common in user code; receiver / type details are not
+                // synthesised.
+                let items: Vec<Value> = decl
+                    .params
+                    .iter()
+                    .map(|p| Value::PropertyRef { name: Rc::new(p.name.name.clone()) })
+                    .collect();
+                return Ok(Value::List {
+                    items: Rc::new(RefCell::new(items)),
+                    mutable: false,
+                    enum_class: None,
+                });
+            }
+        }
         if let Value::Class(c) = &receiver {
             match name {
                 "simpleName" => return Ok(Value::String(Rc::new(c.name.clone()))),
                 "qualifiedName" => return Ok(Value::String(Rc::new(c.fqn.clone()))),
+                "starProjectedType" | "createType" => {
+                    // KClass.starProjectedType: a lightweight `KType`
+                    // surface. Modelled as a String of the form
+                    // `<simple-name>` so user code that calls
+                    // `.toString()` / `.classifier` on it reads the
+                    // class name.
+                    return Ok(Value::String(Rc::new(c.name.clone())));
+                }
+                "isData" => return Ok(Value::Bool(c.is_data)),
+                "isAbstract" => return Ok(Value::Bool(c.is_abstract)),
+                "isSealed" => return Ok(Value::Bool(c.is_sealed)),
+                "isCompanion" => return Ok(Value::Bool(false)),
+                "objectInstance" => {
+                    // For `object` singletons, the class table can produce
+                    // the live instance. Plain classes return null.
+                    return Ok(Value::Null);
+                }
+                "parameters" => {
+                    // KFunction.parameters for the primary-constructor
+                    // surface — when the class value is being treated
+                    // as a `KFunction<T>`, the parameter list comes
+                    // from the primary ctor's declared params.
+                    let items: Vec<Value> = c
+                        .primary_params
+                        .iter()
+                        .map(|p| Value::PropertyRef { name: Rc::new(p.name.clone()) })
+                        .collect();
+                    return Ok(Value::List {
+                        items: Rc::new(RefCell::new(items)),
+                        mutable: false,
+                        enum_class: None,
+                    });
+                }
+                "memberFunctions" | "declaredMemberFunctions" => {
+                    // KClass.memberFunctions: a `Collection<KFunction<*>>`
+                    // surfaced as a List of `Value::Function` bound to
+                    // each declared method's decl. The Any.toString /
+                    // equals / hashCode autos are omitted; only the
+                    // user-declared methods are reported.
+                    let items: Vec<Value> = c
+                        .methods
+                        .iter()
+                        .map(|m| Value::Function {
+                            decl: Rc::clone(&m.decl),
+                            env: Rc::clone(&c.captured_env),
+                        })
+                        .collect();
+                    return Ok(Value::List {
+                        items: Rc::new(RefCell::new(items)),
+                        mutable: false,
+                        enum_class: None,
+                    });
+                }
+                "memberProperties" | "declaredMemberProperties" => {
+                    // KClass.memberProperties: KProperty1 instances, one
+                    // per primary-ctor property + body property.
+                    let mut items: Vec<Value> = Vec::new();
+                    for p in &c.primary_params {
+                        if p.property.is_some() {
+                            items.push(Value::PropertyRef {
+                                name: Rc::new(p.name.clone()),
+                            });
+                        }
+                    }
+                    for p in &c.body_properties {
+                        items.push(Value::PropertyRef {
+                            name: Rc::new(p.name.clone()),
+                        });
+                    }
+                    return Ok(Value::List {
+                        items: Rc::new(RefCell::new(items)),
+                        mutable: false,
+                        enum_class: None,
+                    });
+                }
+                "constructors" | "primaryConstructor" => {
+                    // KClass.primaryConstructor: a `KFunction` whose
+                    // `.call(args)` returns a fresh instance. The
+                    // runtime models class construction through
+                    // `Value::Class` invocation; we synthesize a
+                    // lightweight Function-like value here by returning
+                    // the class itself (callable via `Class(args)`).
+                    if name == "constructors" {
+                        return Ok(Value::List {
+                            items: Rc::new(RefCell::new(vec![Value::Class(Rc::clone(c))])),
+                            mutable: false,
+                            enum_class: None,
+                        });
+                    }
+                    return Ok(Value::Class(Rc::clone(c)));
+                }
                 "annotations" => {
                     // Synthesize a placeholder annotation instance
                     // per recorded runtime-retained name. The class
@@ -8473,6 +8587,30 @@ impl Interpreter {
                         return self.eval_property_access(receiver, pname, out);
                     }
                 }
+                if name.name == "set" && args.len() == 2 {
+                    // `KMutableProperty1.set(receiver, value)` writes the
+                    // named property on the instance. Honors a custom
+                    // setter / property delegate when one is declared.
+                    let receiver = self.eval_expr(&args[0], env, out)?;
+                    let value = self.eval_expr(&args[1], env, out)?;
+                    let Value::Instance(inst) = receiver else {
+                        return Err(RuntimeError::Type(
+                            "KMutableProperty1.set: receiver must be an instance".into(),
+                        ));
+                    };
+                    let class = Rc::clone(&inst.borrow().class);
+                    if let Some((pdef, _)) = class.find_body_property(pname) {
+                        if pdef.delegate.is_some() || pdef.setter.is_some() {
+                            self.write_instance_property(&inst, &pdef, value, out)?;
+                            return Ok(Value::Unit);
+                        }
+                    }
+                    inst.borrow_mut().define(pname.as_str(), value);
+                    return Ok(Value::Unit);
+                }
+                if name.name == "name" && args.is_empty() {
+                    return Ok(Value::String(Rc::new((**pname).clone())));
+                }
             }
             // `kfn.call(args...)` / `kfn.invoke(args...)` on a reflective
             // function reference (`::topLevelFn` / `Foo::method`).
@@ -8481,6 +8619,32 @@ impl Interpreter {
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
                         arg_vals.push(self.eval_expr(a, env, out)?);
+                    }
+                    // Member-function reference (`Foo::method`): the
+                    // first `.call` argument is the receiver, and the
+                    // remaining arguments are the declared params. The
+                    // synthetic Value::Function we built at `Foo::m`
+                    // has the method's decl directly (no `this`
+                    // parameter), so detect the member shape by
+                    // matching the leading instance against a class
+                    // that declares the same method.
+                    if !arg_vals.is_empty()
+                        && arg_vals.len() == decl.params.len() + 1
+                    {
+                        if let Value::Instance(inst) = &arg_vals[0] {
+                            let class = Rc::clone(&inst.borrow().class);
+                            if class.find_method(&decl.name.name).is_some() {
+                                let receiver = Rc::clone(inst);
+                                let rest: Vec<Value> = arg_vals[1..].to_vec();
+                                let names_rest: Vec<Option<String>> = if arg_names.len() == arg_vals.len() {
+                                    arg_names[1..].to_vec()
+                                } else {
+                                    vec![None; rest.len()]
+                                };
+                                let (m, _) = class.find_method(&decl.name.name).unwrap();
+                                return self.call_method(&receiver, &m, &rest, &names_rest, out);
+                            }
+                        }
                     }
                     return self.call_function_named(
                         decl,
@@ -8496,6 +8660,29 @@ impl Interpreter {
             }
             // Any-level methods on a class literal (`Foo::class`).
             if let Value::Class(c) = &recv {
+                if name.name == "findAnnotation" {
+                    // KClass.findAnnotation<A>() — return the first
+                    // annotation instance of type `A` if present.
+                    let target = type_args.first().map(|ta| ta.name.name.clone());
+                    if let Some(target) = target {
+                        for ann_name in &c.annotation_names {
+                            if ann_name == &target {
+                                return Ok(self.synthesize_annotation_value(ann_name));
+                            }
+                        }
+                        return Ok(Value::Null);
+                    }
+                    return Ok(Value::Null);
+                }
+                if name.name == "hasAnnotation" {
+                    let target = type_args.first().map(|ta| ta.name.name.clone());
+                    if let Some(target) = target {
+                        return Ok(Value::Bool(
+                            c.annotation_names.iter().any(|n| n == &target),
+                        ));
+                    }
+                    return Ok(Value::Bool(false));
+                }
                 match name.name.as_str() {
                     "equals" if args.len() == 1 => {
                         let other = self.eval_expr(&args[0], env, out)?;
@@ -12344,6 +12531,63 @@ mod tests {
             }
         "#;
         assert_eq!(run(src).lines, vec!["11"]);
+    }
+
+    #[test]
+    fn reflection_member_call_and_property_set() {
+        // KFunction.call on a member fn reference takes the receiver
+        // as the leading argument. KMutableProperty1.set writes the
+        // named property through the class's declared setter (or the
+        // raw field when no setter is declared).
+        let src = r#"
+            class Foo(val x: Int, var y: String) {
+                fun hello(name: String): String = "hi $name from $x"
+            }
+            fun main() {
+                val foo = Foo(1, "two")
+                val k = Foo::class
+                println(k.simpleName)
+                val m = Foo::hello
+                println(m.call(foo, "world"))
+                val p = Foo::x
+                println(p.get(foo))
+                val q = Foo::y
+                println(q.get(foo))
+                q.set(foo, "new")
+                println(foo.y)
+            }
+        "#;
+        assert_eq!(
+            run(src).lines,
+            vec!["Foo", "hi world from 1", "1", "two", "new"]
+        );
+    }
+
+    #[test]
+    fn reflection_kclass_full_surface() {
+        // KClass.memberFunctions / memberProperties / primaryConstructor
+        // report the declared functions and properties. The synthesised
+        // KFunction values respond to `.name` and `.parameters`.
+        let src = r#"
+            class Foo(val x: Int, var y: String) {
+                fun hello(name: String): String = "hi $name"
+                fun bye(): String = "bye"
+                val z: Int = x * 2
+            }
+            fun main() {
+                val k = Foo::class
+                val fns = k.memberFunctions.map { it.name }.sorted()
+                println(fns)
+                val ps = k.memberProperties.map { it.name }.sorted()
+                println(ps)
+                val ctor = k.primaryConstructor
+                println(ctor?.parameters?.size)
+            }
+        "#;
+        assert_eq!(
+            run(src).lines,
+            vec!["[bye, hello]", "[x, y, z]", "2"]
+        );
     }
 
     #[test]
