@@ -4502,11 +4502,28 @@ impl<'r> Checker<'r> {
         for sc in &c.secondary_ctors {
             self.check_secondary_ctor(sc);
         }
+        // Method bodies run after construction, so every property is
+        // definitely assigned by some ctor path. Seed `assigned` with all
+        // declared property names so reads inside methods don't trip the
+        // VIA check (the post-init guard above already validated that the
+        // primary-ctor path assigns the needs-init set).
+        let method_assigned_saved = self.assigned.clone();
+        for m in &c.members {
+            if let Decl::Property(p) = m {
+                self.assigned.insert(p.name.name.clone());
+            }
+        }
+        for p in &c.primary_params {
+            if p.property.is_some() {
+                self.assigned.insert(p.name.name.clone());
+            }
+        }
         for m in &c.members {
             if let Decl::Function(f) = m {
                 self.check_function(f);
             }
         }
+        self.assigned = method_assigned_saved;
         for entry in &c.enum_entries {
             self.check_enum_entry(entry);
         }
