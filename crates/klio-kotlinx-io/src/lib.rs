@@ -7,21 +7,25 @@
 //! manipulation so each operation runs in O(1) amortised time.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use klio_runtime::{CallCtx, PrimitiveArrayKind, RuntimeError, Value};
 use klio_stdlib::HostBindings;
 
 thread_local! {
-    /// Per-instance byte queue keyed by `InstanceData::identity`.
-    /// Bytes are pushed at the back and read from the front, so the
-    /// queue models the kotlinx.io Buffer FIFO semantics directly.
-    static BUFFERS: RefCell<HashMap<u64, Vec<u8>>> = RefCell::new(HashMap::new());
+    /// Per-instance byte queue keyed by `InstanceData::identity`. The
+    /// kotlinx.io Buffer is FIFO: writes append at the back, reads
+    /// drain from the front. `VecDeque` gives O(1) amortised
+    /// pop_front so a 1 MB write/read loop stays linear instead of
+    /// quadratic. Upstream kotlinx.io uses a segmented linked list
+    /// for the same reason; `VecDeque` is the cheap equivalent that
+    /// satisfies the API contract until segmenting matters.
+    static BUFFERS: RefCell<HashMap<u64, VecDeque<u8>>> = RefCell::new(HashMap::new());
 }
 
 fn with_buffer<R>(
     ctx: &CallCtx,
-    f: impl FnOnce(&mut Vec<u8>) -> Result<R, RuntimeError>,
+    f: impl FnOnce(&mut VecDeque<u8>) -> Result<R, RuntimeError>,
 ) -> Result<R, RuntimeError> {
     let id = receiver_id(ctx)?;
     BUFFERS.with(|map| {
@@ -112,7 +116,7 @@ fn buffer_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn buffer_write_byte(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = arg_int(ctx, 1)?;
     with_buffer(ctx, |buf| {
-        buf.push(v as u8);
+        buf.push_back(v as u8);
         Ok(Value::Unit)
     })
 }
@@ -120,7 +124,9 @@ fn buffer_write_byte(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn buffer_write_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = arg_int(ctx, 1)? as i32;
     with_buffer(ctx, |buf| {
-        buf.extend_from_slice(&v.to_be_bytes());
+        for b in v.to_be_bytes() {
+            buf.push_back(b);
+        }
         Ok(Value::Unit)
     })
 }
@@ -128,7 +134,9 @@ fn buffer_write_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn buffer_write_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = arg_int(ctx, 1)?;
     with_buffer(ctx, |buf| {
-        buf.extend_from_slice(&v.to_be_bytes());
+        for b in v.to_be_bytes() {
+            buf.push_back(b);
+        }
         Ok(Value::Unit)
     })
 }
@@ -136,7 +144,9 @@ fn buffer_write_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn buffer_write_short(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = arg_int(ctx, 1)? as i16;
     with_buffer(ctx, |buf| {
-        buf.extend_from_slice(&v.to_be_bytes());
+        for b in v.to_be_bytes() {
+            buf.push_back(b);
+        }
         Ok(Value::Unit)
     })
 }
@@ -144,12 +154,14 @@ fn buffer_write_short(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn buffer_write_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = arg_string(ctx, 1)?;
     with_buffer(ctx, |buf| {
-        buf.extend_from_slice(s.as_bytes());
+        for b in s.as_bytes() {
+            buf.push_back(*b);
+        }
         Ok(Value::Unit)
     })
 }
 
-fn drain_front(buf: &mut Vec<u8>, n: usize) -> Result<Vec<u8>, RuntimeError> {
+fn drain_front(buf: &mut VecDeque<u8>, n: usize) -> Result<Vec<u8>, RuntimeError> {
     if buf.len() < n {
         return Err(RuntimeError::Type(format!(
             "kotlinx.io.Buffer: not enough bytes ({} available, {n} requested)",
@@ -192,7 +204,10 @@ fn buffer_read_short(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn buffer_read_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     with_buffer(ctx, |buf| {
-        let bytes: Vec<u8> = std::mem::take(buf);
+        // VecDeque can be split into two slices; collect to a Vec
+        // before UTF-8 decoding so the borrow on `buf` clears
+        // before the result is constructed.
+        let bytes: Vec<u8> = buf.drain(..).collect();
         let s = String::from_utf8(bytes).map_err(|e| {
             RuntimeError::Type(format!("kotlinx.io.Buffer.readString: invalid UTF-8: {e}"))
         })?;
@@ -224,7 +239,7 @@ fn buffer_copy_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     BUFFERS.with(|map| {
         let mut map = map.borrow_mut();
-        let src_bytes: Vec<u8> = map.get(&src_id).cloned().unwrap_or_default();
+        let src_bytes: VecDeque<u8> = map.get(&src_id).cloned().unwrap_or_default();
         map.entry(sink_id).or_default().extend(src_bytes);
         Ok(Value::Unit)
     })
