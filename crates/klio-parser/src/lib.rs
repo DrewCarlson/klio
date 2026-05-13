@@ -2311,7 +2311,35 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 }
                 // Anonymous-function expression statement: `fun(...) ...`
                 // or `fun <T>(...) ...`. No name follows the `fun` keyword.
-                if matches!(next, Some(TokenKind::LParen) | Some(TokenKind::Lt)) {
+                // For `fun <...> Ident(...)`, this is a local generic
+                // function declaration — fall through to `parse_fun`.
+                let after_generics = if matches!(next, Some(TokenKind::Lt)) {
+                    // Skip a balanced generic param list to peek at what
+                    // follows: `(` → anonymous; `Ident` → local fn.
+                    let mut depth = 1i32;
+                    let mut i = self.pos + 2;
+                    while let Some(tok) = self.tokens.get(i) {
+                        match &tok.kind {
+                            TokenKind::Lt => depth += 1,
+                            TokenKind::Gt => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            TokenKind::Eof => break,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    self.tokens.get(i).map(|t| &t.kind)
+                } else {
+                    None
+                };
+                let is_anon = matches!(next, Some(TokenKind::LParen))
+                    || matches!(after_generics, Some(TokenKind::LParen));
+                if is_anon {
                     self.pos = save;
                     return self.parse_expr_or_assign_stmt();
                 }
