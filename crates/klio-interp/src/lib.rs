@@ -902,6 +902,26 @@ impl Interpreter {
                 }
             }
         }
+        // Generic extension fallback: `fun <T> T.foo(...)` registers under
+        // the type-parameter name `T`. Match any receiver when no concrete
+        // key has answered first.
+        if chosen.is_none() {
+            for (key, list) in &self.extensions {
+                for ext in list {
+                    let is_generic_receiver = ext.decl.type_params.iter().any(|tp| tp.name.name == *key);
+                    if is_generic_receiver
+                        && ext.decl.name.name == name
+                        && args.len() <= ext.decl.params.len()
+                    {
+                        chosen = Some(ext.clone());
+                        break;
+                    }
+                }
+                if chosen.is_some() {
+                    break;
+                }
+            }
+        }
         let Some(ext) = chosen else { return Ok(None) };
         let mut arg_vals = Vec::with_capacity(args.len());
         for a in args {
