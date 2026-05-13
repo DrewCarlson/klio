@@ -2870,6 +2870,13 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             let span = star.span.join(e.span());
             return Some(Expr::Spread { expr: Box::new(e), span });
         }
+        // A `{ ... }` value-argument is always a lambda literal, even
+        // without an explicit `->` header (binds an implicit `it`).
+        if matches!(self.peek_kind(), TokenKind::LBrace) {
+            let lam = self.parse_lambda_literal()?;
+            self.reject_trailing_assignment();
+            return Some(lam);
+        }
         let e = self.parse_expr()?;
         self.reject_trailing_assignment();
         Some(e)
@@ -3670,8 +3677,6 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     }
 
     /// `{` is at the cursor. Decide whether this is a lambda (has `->` at
-    /// depth 1) or a block. A lambda must be detected before block parsing
-    /// at expression position.
     fn looks_like_lambda(&self) -> bool {
         if !matches!(self.peek_kind(), TokenKind::LBrace) {
             return false;

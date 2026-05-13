@@ -2453,7 +2453,12 @@ impl Interpreter {
         absorb_return: bool,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
-        if args.len() > params.len() {
+        // Implicit `it` parameter: a lambda literal without an arrow
+        // header that takes exactly one argument binds the argument as
+        // `it`. Anonymous functions never go through this path (their
+        // declared param list is always explicit).
+        let bind_it = params.is_empty() && args.len() == 1 && !absorb_return;
+        if !bind_it && args.len() > params.len() {
             return Err(RuntimeError::Arity(format!(
                 "lambda expects at most {} arguments, got {}",
                 params.len(),
@@ -2464,6 +2469,9 @@ impl Interpreter {
         for (i, name) in params.iter().enumerate() {
             let v = args.get(i).cloned().unwrap_or(Value::Null);
             frame.borrow_mut().define(name.clone(), v);
+        }
+        if bind_it {
+            frame.borrow_mut().define("it".to_string(), args[0].clone());
         }
         if let Some(this_val) = this_binding {
             frame.borrow_mut().define("this", this_val);
