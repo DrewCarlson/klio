@@ -5544,10 +5544,13 @@ impl<'r> Checker<'r> {
                     // `val x: T` followed by `x = …` later in scope:
                     // CFG VIA reports `x` as Unassigned at the assignment
                     // span, marking this as the binding's first (and
-                    // only legal) write.
+                    // only legal) write. Outside any CFG-tracked
+                    // span we conservatively allow the write — the
+                    // caller is responsible for a separate scope
+                    // check (constructor body etc.).
                     let cfg_first = self
                         .cfg_via_unassigned_at(name, *span)
-                        .unwrap_or_else(|| !self.assigned.contains(name));
+                        .unwrap_or(true);
                     let is_first_write = needs_init && cfg_first;
                     // §7.1.2: a compound assignment to a `val` is permitted
                     // when the LHS type carries a matching `*Assign` operator
@@ -5647,15 +5650,15 @@ impl<'r> Checker<'r> {
                         }
                         // Definite-assignment check via the CFG's
                         // VIA analysis. Lambda-call-in-place CFA
-                        // inlines `run { x = 4 }` and friends so
-                        // body assignments reach the surrounding
-                        // VIA state. The legacy `assigned` set is
-                        // consulted only as a fallback for spans
-                        // the CFG never visited (top-level
-                        // properties outside any function body).
+                        // inlines EXACTLY_ONCE bodies so the VIA
+                        // state sees assignments performed inside
+                        // them. Outside any CFG-tracked span we
+                        // assume the binding is assigned — the
+                        // typechecker emits T0020 only against the
+                        // CFG verdict, never against a guess.
                         let via_unassigned = self
                             .cfg_via_unassigned_at(name, *span)
-                            .unwrap_or_else(|| needs_init && !self.assigned.contains(name));
+                            .unwrap_or(false);
                         if needs_init && via_unassigned {
                             self.diagnostics.emit(
                                 Diagnostic::error(
