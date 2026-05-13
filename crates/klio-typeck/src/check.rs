@@ -5287,19 +5287,19 @@ impl<'r> Checker<'r> {
     fn check_block(&mut self, block: &Block, expected: Option<&Type>) -> Type {
         self.push_frame();
         let mut last = Type::Unit;
-        let mut diverged = false;
         let mut warned = false;
         for (i, s) in block.stmts.iter().enumerate() {
             let is_last = i + 1 == block.stmts.len();
-            // Spec §12.1.5 unreachable code: fires when either the
-            // type-level Nothing tracker or the CFG's reachability
-            // analysis says this statement is dead. The CFG catches
-            // patterns Nothing-tracking misses (e.g. unconditional
-            // break / continue inside a non-Nothing-typed loop body).
+            // Spec §12.1.5: W0002 unreachable code fires when the
+            // CFG's reachability analysis classifies the block
+            // containing this statement as dead. The typed
+            // reachability variant picks up Nothing-returning
+            // expressions in earlier statements (return / throw /
+            // error("...") / TODO()).
             let cfg_dead = self
                 .cfg_is_unreachable_at(stmt_span(s))
                 .unwrap_or(false);
-            if (diverged || cfg_dead) && !warned {
+            if cfg_dead && !warned {
                 self.diagnostics.emit(
                     Diagnostic::warning("Unreachable code".to_string(), stmt_span(s))
                         .with_code(codes::WARN_UNREACHABLE_CODE)
@@ -5310,9 +5310,6 @@ impl<'r> Checker<'r> {
                 warned = true;
             }
             last = self.check_stmt(s, if is_last { expected } else { None });
-            if !diverged && matches!(last, Type::Nothing) && !is_last {
-                diverged = true;
-            }
         }
         self.pop_frame();
         last
