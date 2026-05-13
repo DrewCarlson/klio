@@ -517,6 +517,7 @@ name = "klio-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "klio-ast",
  "klio-diagnostics",
  "klio-interp",
  "klio-lexer",
