@@ -87,7 +87,7 @@ pub fn is_known_package(package_path: &str) -> bool {
         return true;
     }
     let prefix = format!("{package_path}.");
-    generated::STDLIB_SYMBOLS
+    generated::stdlib_symbols()
         .iter()
         .any(|e| e.package == package_path || e.fqn.starts_with(&prefix))
 }
@@ -198,13 +198,13 @@ pub struct SymbolEntry {
 /// table is a trivial follow-up if profiling demands it.
 #[must_use]
 pub fn lookup(fqn: &str) -> Option<&'static SymbolEntry> {
-    generated::STDLIB_SYMBOLS.iter().find(|e| e.fqn == fqn)
+    generated::stdlib_symbols().iter().find(|e| e.fqn == fqn)
 }
 
 /// Iterate every registered stdlib symbol FQN. Used by import resolution
 /// to expand wildcard imports (`import kotlin.math.*`).
 pub fn all_symbol_names() -> impl Iterator<Item = &'static str> {
-    let registry = generated::STDLIB_SYMBOLS.iter().map(|e| e.fqn);
+    let registry = generated::stdlib_symbols().iter().map(|e| e.fqn);
     let hand = implementations::all_fqns();
     registry.chain(hand)
 }
@@ -228,8 +228,8 @@ impl Coverage {
 
 #[must_use]
 pub fn coverage() -> Coverage {
-    let total = generated::STDLIB_SYMBOLS.len();
-    let registry_count = generated::STDLIB_SYMBOLS
+    let total = generated::stdlib_symbols().len();
+    let registry_count = generated::stdlib_symbols()
         .iter()
         .filter(|e| e.impl_fn.is_some())
         .count();
@@ -272,7 +272,7 @@ impl HostBindings {
                 out.register(fqn, f);
             }
         }
-        for entry in generated::STDLIB_SYMBOLS {
+        for entry in generated::stdlib_symbols() {
             if let Some(f) = entry.impl_fn {
                 out.register(entry.fqn, f);
             }
@@ -345,7 +345,7 @@ fn direct_param_lookup(fqn: &str) -> Option<&'static [&'static str]> {
     // per overload / receiver). Their parameter-name lists are
     // overwhelmingly identical, so the first non-empty hit is correct for
     // the common case.
-    generated::STDLIB_SYMBOLS
+    generated::stdlib_symbols()
         .iter()
         .find(|e| e.fqn == fqn && !e.param_names.is_empty())
         .map(|e| e.param_names)
@@ -360,13 +360,13 @@ mod tests {
         // The generated registry should contain at least the seed symbols
         // committed in `generated/symbols.rs`. Real builds replace this with
         // the full mined surface.
-        assert!(!generated::STDLIB_SYMBOLS.is_empty(), "empty registry");
+        assert!(!generated::stdlib_symbols().is_empty(), "empty registry");
     }
 
     #[test]
     fn coverage_consistent_with_total() {
         let c = coverage();
-        assert_eq!(c.total, generated::STDLIB_SYMBOLS.len());
+        assert_eq!(c.total, generated::stdlib_symbols().len());
         assert!(c.implemented <= c.total);
     }
 

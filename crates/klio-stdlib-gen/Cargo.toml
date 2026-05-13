@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 clap = { workspace = true }
 klio-stdlib = { workspace = true }
+klio-pack   = { workspace = true }
 
 [lints]
 workspace = true

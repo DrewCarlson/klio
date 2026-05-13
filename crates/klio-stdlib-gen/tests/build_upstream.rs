@@ -30,10 +30,11 @@ fn mines_upstream_stdlib() {
     let written = emit_generated(&tmp, &files).expect("emit failed");
     assert!(written > 500, "expected > 500 symbols written, got {}", written);
 
-    // The generated files should be syntactically valid Rust. We don't run
-    // rustc here (slow), but a coarse sanity check on the symbols.rs shape
-    // catches the most common emit bugs.
-    let symbols = std::fs::read_to_string(tmp.join("symbols.rs")).unwrap();
-    assert!(symbols.contains("pub static STDLIB_SYMBOLS"));
-    assert!(symbols.matches("SymbolEntry {").count() == written);
+    // The generated artefact is now a postcard byte stream. Round-trip
+    // it through klio_pack::schema to verify the encoded shape matches
+    // what the runtime crate expects.
+    let bytes = std::fs::read(tmp.join("symbols.postcard")).unwrap();
+    let index: klio_pack::schema::SymbolIndex =
+        klio_pack::schema::decode(&bytes).expect("decode symbols.postcard");
+    assert_eq!(index.entries.len(), written, "round-trip count");
 }

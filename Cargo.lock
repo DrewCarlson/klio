@@ -764,6 +764,7 @@ name = "klio-stdlib-gen"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "klio-pack",
  "klio-stdlib",
 ]
 

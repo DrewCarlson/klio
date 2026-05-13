@@ -30,7 +30,7 @@ pub fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, PackError> {
     };
     let manifest_bytes = encode(&manifest)?;
 
-    let mut sym_entries: Vec<SymbolRecord> = generated::STDLIB_SYMBOLS
+    let mut sym_entries: Vec<SymbolRecord> = generated::stdlib_symbols()
         .iter()
         .map(symbol_entry_to_record)
         .collect();
