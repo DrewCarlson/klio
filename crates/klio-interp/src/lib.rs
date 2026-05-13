@@ -7849,11 +7849,9 @@ impl Interpreter {
                                     return Ok(v.clone());
                                 }
                             }
-                            // Kotlin: IllegalArgumentException with this message text.
-                            // Kotlin/Native's Enum.valueOf throws with this
-                            // exact message text (the JVM uses a different
-                            // form — we target Native here).
-                            let msg = format!("Invalid enum value name: {}", needle);
+                            // Match JVM Kotlin's
+                            // `IllegalArgumentException("No enum constant <fqn>.<name>")`.
+                            let msg = format!("No enum constant {}.{}", class.fqn, needle);
                             return Err(RuntimeError::Thrown(Value::Exception {
                                 fqn: Rc::new(
                                     "kotlin.IllegalArgumentException".to_string(),
