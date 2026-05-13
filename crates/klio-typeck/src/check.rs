@@ -5541,8 +5541,14 @@ impl<'r> Checker<'r> {
                     .lookup(name)
                     .map(|b| (b.ty.clone(), b.mutable, b.needs_init));
                 if let Some((want, mutable, needs_init)) = info {
-                    let already_assigned = self.assigned.contains(name);
-                    let is_first_write = needs_init && !already_assigned;
+                    // `val x: T` followed by `x = …` later in scope:
+                    // CFG VIA reports `x` as Unassigned at the assignment
+                    // span, marking this as the binding's first (and
+                    // only legal) write.
+                    let cfg_first = self
+                        .cfg_via_unassigned_at(name, *span)
+                        .unwrap_or_else(|| !self.assigned.contains(name));
+                    let is_first_write = needs_init && cfg_first;
                     // §7.1.2: a compound assignment to a `val` is permitted
                     // when the LHS type carries a matching `*Assign` operator
                     // (the operator-function path mutates in place, never
