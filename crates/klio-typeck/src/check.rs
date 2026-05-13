@@ -6069,6 +6069,29 @@ impl<'r> Checker<'r> {
                                 }
                             }
                         }
+                    } else if subject.is_none()
+                        && b.patterns.len() == 1
+                    {
+                        // Subject-free `when { cond -> body }`: the
+                        // condition `cond` may narrow names which apply
+                        // inside `body`.
+                        if let WhenPatternKind::Value(cond) = &b.patterns[0].kind {
+                            let nar = self.check_condition(cond);
+                            if !nar.true_branch.is_empty() || !nar.true_class.is_empty() {
+                                self.push_frame();
+                                branch_frame_pushed = true;
+                                for (k, t) in &nar.true_branch {
+                                    self.current_frame()
+                                        .narrowings
+                                        .insert(k.clone(), t.clone());
+                                }
+                                for (k, c) in &nar.true_class {
+                                    self.current_frame()
+                                        .narrowing_class
+                                        .insert(k.clone(), c.clone());
+                                }
+                            }
+                        }
                     }
                     let t = self.check_expr(&b.body, expected);
                     if branch_frame_pushed {
