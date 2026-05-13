@@ -7570,11 +7570,30 @@ impl Interpreter {
             // Instance method dispatch (user classes).
             if let Value::Instance(inst) = &recv {
                 let class = Rc::clone(&inst.borrow().class);
-                if let Some((m, _owner)) = class.find_method(&name.name) {
+                let same_name_count = class.methods.iter().filter(|m| m.name == name.name).count();
+                let mut arg_vals_opt: Option<Vec<Value>> = None;
+                let first_arg_type = if same_name_count > 1 && !args.is_empty() {
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for a in args {
                         arg_vals.push(self.eval_expr(a, env, out)?);
                     }
+                    let t = arg_vals.first().map(value_runtime_type_name);
+                    arg_vals_opt = Some(arg_vals);
+                    t
+                } else {
+                    None
+                };
+                if let Some((m, _owner)) = class.find_method_for_arg(&name.name, first_arg_type.as_deref()) {
+                    let mut arg_vals = if let Some(v) = arg_vals_opt {
+                        v
+                    } else {
+                        let mut tmp = Vec::with_capacity(args.len());
+                        for a in args {
+                            tmp.push(self.eval_expr(a, env, out)?);
+                        }
+                        tmp
+                    };
+                    let _ = &mut arg_vals;
                     // Reified type args: if the method is `inline fun
                     // <reified T> ...`, push a per-call frame so `T::class`
                     // / `x is T` inside the body see the call-site type.
