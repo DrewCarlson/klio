@@ -250,6 +250,67 @@ impl Interpreter {
         cur
     }
 
+    /// True when `name` refers to an erased (non-reified) generic
+    /// type parameter at this point in the program — i.e. it does
+    /// not resolve to any built-in, user class, object, or type
+    /// alias the runtime knows about. `as T` against such a name
+    /// is the spec's unchecked-cast form and must pass through at
+    /// runtime; the static diagnostic side (T0083) lives in the
+    /// typechecker.
+    fn is_erased_type_param(&self, name: &str) -> bool {
+        if klio_types::builtin_by_name(name).is_some() {
+            return false;
+        }
+        if self.type_aliases.contains_key(name) {
+            return false;
+        }
+        if self.globals.borrow().lookup(name).is_some() {
+            // A binding exists at this name — it's a class, object,
+            // or value reference, not an erased param.
+            return false;
+        }
+        // Match common stdlib generic container names so we don't
+        // treat them as erased.
+        !matches!(
+            name,
+            "List"
+                | "MutableList"
+                | "Collection"
+                | "MutableCollection"
+                | "Set"
+                | "MutableSet"
+                | "Map"
+                | "MutableMap"
+                | "Iterable"
+                | "MutableIterable"
+                | "Iterator"
+                | "MutableIterator"
+                | "Sequence"
+                | "Array"
+                | "ByteArray"
+                | "ShortArray"
+                | "IntArray"
+                | "LongArray"
+                | "FloatArray"
+                | "DoubleArray"
+                | "BooleanArray"
+                | "CharArray"
+                | "Pair"
+                | "Triple"
+                | "Result"
+                | "Comparable"
+                | "Comparator"
+                | "Throwable"
+                | "Exception"
+                | "RuntimeException"
+                | "Error"
+                | "Function"
+                | "Function0"
+                | "Function1"
+                | "Function2"
+        )
+    }
+
     /// Resolve a type name through the active reified-type frame. Returns
     /// the original name unchanged when no rebinding is active.
     /// Synthesize a `Value::Class` for a Kotlin built-in type name when one
@@ -2317,6 +2378,13 @@ impl Interpreter {
                     Ok(v)
                 } else if *safe {
                     Ok(Value::Null)
+                } else if self.is_erased_type_param(&resolved) {
+                    // Spec §15.1: `as T` where T is a non-reified
+                    // type parameter is an unchecked cast — the
+                    // runtime cannot verify it because T is erased,
+                    // so the value passes through. T0083 covers the
+                    // static diagnostic at the typechecker side.
+                    Ok(v)
                 } else {
                     let actual = if matches!(v, Value::Null) {
                         "null".to_string()
