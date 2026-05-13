@@ -1,0 +1,12 @@
+[submodule "third-party/kotlinx/kotlinx-datetime"]
+	path = third-party/kotlinx/kotlinx-datetime
+	url = https://github.com/Kotlin/kotlinx-datetime
+[submodule "third-party/kotlinx/kotlinx-coroutines"]
+	path = third-party/kotlinx/kotlinx-coroutines
+	url = https://github.com/Kotlin/kotlinx.coroutines
+[submodule "third-party/kotlinx/kotlinx-atomicfu"]
+	path = third-party/kotlinx/kotlinx-atomicfu
+	url = https://github.com/Kotlin/kotlinx-atomicfu
+[submodule "third-party/kotlinx/kotlinx-io"]
+	path = third-party/kotlinx/kotlinx-io
+	url = https://github.com/Kotlin/kotlinx-io
