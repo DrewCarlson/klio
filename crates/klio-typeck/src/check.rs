@@ -474,6 +474,11 @@ struct Binding {
     /// by an unconditional write on every control-flow path; otherwise the
     /// definite-assignment check (T0020) fires.
     needs_init: bool,
+    /// Original declared-type name when the binding was annotated with a
+    /// bare identifier (e.g. `t: T` for a type parameter). Lets
+    /// runtime-availability checks recover the spelling that
+    /// `convert_type_ref_lossy` collapsed to `Type::Unresolved`.
+    decl_type_name: Option<String>,
 }
 
 
@@ -3132,7 +3137,7 @@ impl<'r> Checker<'r> {
                     self.assigned.insert(p.name.name.clone());
                     self.frames[0].bindings.insert(
                         p.name.name.clone(),
-                        Binding { ty, mutable: p.mutable, decl_span: Some(p.name.span), class_name: cn, needs_init: false },
+                        Binding { ty, mutable: p.mutable, decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name: None },
                     );
                     self.prop_visibility
                         .insert(p.name.name.clone(), (p.visibility, p.name.span.file));
@@ -3171,7 +3176,7 @@ impl<'r> Checker<'r> {
                         ty: Type::Unresolved,
                         mutable: false,
                         decl_span: Some(o.name.span),
-                        class_name: Some(o.name.name.clone()), needs_init: false },
+                        class_name: Some(o.name.name.clone()), needs_init: false, decl_type_name: None },
                 );
             }
             Decl::TypeAlias(a) => {
@@ -3727,9 +3732,14 @@ impl<'r> Checker<'r> {
         for p in &f.params {
             let ty = convert_type_ref_lossy(&p.ty);
             let cn = class_name_from_typeref(&p.ty);
+            let decl_type_name = if klio_types::builtin_by_name(&p.ty.name.name).is_none() {
+                Some(p.ty.name.name.clone())
+            } else {
+                None
+            };
             self.current_frame()
                 .bindings
-                .insert(p.name.name.clone(), Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, needs_init: false });
+                .insert(p.name.name.clone(), Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name });
             self.assigned.insert(p.name.name.clone());
             if let Some(default) = &p.default {
                 let dty = self.check_expr(default, Some(&convert_type_ref_lossy(&p.ty)));
@@ -4388,7 +4398,7 @@ impl<'r> Checker<'r> {
             let cn = class_name_from_typeref(&p.ty);
             self.current_frame().bindings.insert(
                 p.name.name.clone(),
-                Binding { ty, mutable: p.property == Some(true), decl_span: Some(p.name.span), class_name: cn, needs_init: false },
+                Binding { ty, mutable: p.property == Some(true), decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name: None },
             );
             self.assigned.insert(p.name.name.clone());
             if let Some(default) = &p.default {
@@ -4425,6 +4435,7 @@ impl<'r> Checker<'r> {
                                 decl_span: Some(p.name.span),
                                 class_name: p.ty.as_ref().and_then(class_name_from_typeref),
                                 needs_init: true,
+                    decl_type_name: None,
                             },
                         );
                         needs_init_props.push((p.name.name.clone(), p.name.span, p.mutable, p.name.span));
@@ -5090,7 +5101,7 @@ impl<'r> Checker<'r> {
         for p in &a.params {
             self.current_frame().bindings.insert(
                 p.name.clone(),
-                Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(p.span), class_name: None, needs_init: false },
+                Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(p.span), class_name: None, needs_init: false, decl_type_name: None },
             );
             self.assigned.insert(p.name.clone());
         }
@@ -5114,7 +5125,7 @@ impl<'r> Checker<'r> {
             let cn = class_name_from_typeref(&p.ty);
             self.current_frame().bindings.insert(
                 p.name.name.clone(),
-                Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, needs_init: false },
+                Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, needs_init: false, decl_type_name: None },
             );
             self.assigned.insert(p.name.name.clone());
         }
@@ -5253,7 +5264,7 @@ impl<'r> Checker<'r> {
                         Binding {
                             ty: Type::Unresolved,
                             mutable: *mutable,
-                            decl_span: Some(n.span), class_name: None, needs_init: false },
+                            decl_span: Some(n.span), class_name: None, needs_init: false, decl_type_name: None },
                     );
                     self.assigned.insert(n.name.clone());
                 }
@@ -5297,6 +5308,11 @@ impl<'r> Checker<'r> {
                         decl_span: Some(p.name.span),
                         class_name: cn,
                         needs_init,
+                        decl_type_name: p
+                            .ty
+                            .as_ref()
+                            .filter(|t| klio_types::builtin_by_name(&t.name.name).is_none())
+                            .map(|t| t.name.name.clone()),
                     },
                 );
                 // Spec §14.1.5: tie `val b = a` to its source for bound
@@ -5334,7 +5350,7 @@ impl<'r> Checker<'r> {
                 };
                 self.current_frame().bindings.insert(
                     f.name.name.clone(),
-                    Binding { ty: fn_ty, mutable: false, decl_span: Some(f.name.span), class_name: None, needs_init: false },
+                    Binding { ty: fn_ty, mutable: false, decl_span: Some(f.name.span), class_name: None, needs_init: false, decl_type_name: None },
                 );
                 self.assigned.insert(f.name.name.clone());
                 self.fns.entry(f.name.name.clone()).or_default().push(sig);
@@ -5788,7 +5804,7 @@ impl<'r> Checker<'r> {
                 for v in vars {
                     self.current_frame().bindings.insert(
                         v.name.clone(),
-                        Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(v.span), class_name: None, needs_init: false },
+                        Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(v.span), class_name: None, needs_init: false, decl_type_name: None },
                     );
                     self.assigned.insert(v.name.clone());
                 }
@@ -5861,6 +5877,43 @@ impl<'r> Checker<'r> {
                         .with_code(codes::TYPE_THROW_NON_THROWABLE),
                     );
                 }
+                // Spec §16.2: the throw operand must be a value of a
+                // runtime-available type. When the operand is a bare local
+                // whose declared type names a non-reified type parameter,
+                // the static type is erased at runtime and the throw is
+                // unsafe.
+                if let Expr::Path { segments, .. } = value.as_ref() {
+                    if segments.len() == 1 {
+                        let name = &segments[0].name;
+                        let decl_ty_name = self
+                            .frames
+                            .iter()
+                            .rev()
+                            .find_map(|f| f.bindings.get(name))
+                            .and_then(|b| b.decl_type_name.clone());
+                        if let Some(tname) = decl_ty_name {
+                            let is_type_param = self
+                                .type_params_in_scope
+                                .iter()
+                                .any(|s| s.contains(&tname));
+                            let is_reified = self
+                                .reified_type_params
+                                .iter()
+                                .any(|s| s.contains(&tname));
+                            if is_type_param && !is_reified {
+                                self.diagnostics.emit(
+                                    Diagnostic::error(
+                                        format!(
+                                            "Cannot throw a value of erased type parameter `{tname}` — the type must be runtime-available. Mark `{tname}` as `reified` on an `inline fun` or throw a concrete exception type."
+                                        ),
+                                        *span,
+                                    )
+                                    .with_code(codes::TYPE_RUNTIME_UNAVAILABLE_CATCH_TYPE),
+                                );
+                            }
+                        }
+                    }
+                }
                 Type::Nothing
             }
             Expr::Try { body, catches, finally, .. } => {
@@ -5915,7 +5968,7 @@ impl<'r> Checker<'r> {
                         Binding {
                             ty: convert_type_ref_lossy(&c.ty),
                             mutable: false,
-                            decl_span: Some(c.binding.span), class_name: None, needs_init: false },
+                            decl_span: Some(c.binding.span), class_name: None, needs_init: false, decl_type_name: None },
                     );
                     self.assigned.insert(c.binding.name.clone());
                     let cty = self.check_block(&c.body, expected);
@@ -6030,6 +6083,7 @@ impl<'r> Checker<'r> {
                             decl_span: Some(b.name.span),
                             class_name,
                             needs_init: false,
+                            decl_type_name: None,
                         },
                     );
                     self.assigned.insert(b.name.name.clone());
@@ -6298,6 +6352,11 @@ impl<'r> Checker<'r> {
                             decl_span: Some(p.span),
                             class_name: None,
                             needs_init: false,
+                            decl_type_name: if klio_types::builtin_by_name(&p.ty.name.name).is_none() {
+                                Some(p.ty.name.name.clone())
+                            } else {
+                                None
+                            },
                         },
                     );
                     self.assigned.insert(p.name.name.clone());
@@ -8024,6 +8083,7 @@ impl<'r> Checker<'r> {
                     decl_span: None,
                     class_name: it_cls,
                     needs_init: false,
+                    decl_type_name: None,
                 },
             );
             self.assigned.insert("it".to_string());
@@ -8037,6 +8097,7 @@ impl<'r> Checker<'r> {
                         decl_span: Some(p.span),
                         class_name: None,
                         needs_init: false,
+                        decl_type_name: None,
                     },
                 );
                 self.assigned.insert(p.name.clone());
@@ -8051,6 +8112,7 @@ impl<'r> Checker<'r> {
                     decl_span: None,
                     class_name: this_cls.clone(),
                     needs_init: false,
+                    decl_type_name: None,
                 },
             );
             if let Some(cn) = this_cls {
@@ -8114,7 +8176,7 @@ impl<'r> Checker<'r> {
                 Binding {
                     ty: param_tys.first().cloned().unwrap_or(Type::Unresolved),
                     mutable: false,
-                    decl_span: None, class_name: None, needs_init: false },
+                    decl_span: None, class_name: None, needs_init: false, decl_type_name: None },
             );
             self.assigned.insert("it".to_string());
         } else if !effective_empty {
@@ -8124,7 +8186,7 @@ impl<'r> Checker<'r> {
                     Binding {
                         ty: param_tys.get(i).cloned().unwrap_or(Type::Unresolved),
                         mutable: false,
-                        decl_span: Some(p.span), class_name: None, needs_init: false },
+                        decl_span: Some(p.span), class_name: None, needs_init: false, decl_type_name: None },
                 );
                 self.assigned.insert(p.name.clone());
             }

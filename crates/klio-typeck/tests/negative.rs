@@ -966,6 +966,15 @@ fn neg_catch_type_args() {
 }
 
 #[test]
+fn neg_throw_type_param() {
+    assert!(
+        type_codes_for("neg_throw_type_param.kt")
+            .iter()
+            .any(|c| c == "T0105")
+    );
+}
+
+#[test]
 fn neg_value_equality_distinct() {
     assert!(
         type_codes_for("neg_value_equality_distinct.kt")
