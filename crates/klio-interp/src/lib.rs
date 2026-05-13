@@ -9621,6 +9621,16 @@ fn eval_binop(op: BinOp, l: Value, r: Value) -> Result<Value, RuntimeError> {
                 klio_runtime::RangeKind::Int
             },
         }),
+        // Char arithmetic: `c1 - c2 -> Int`, `c + n -> Char`, `c - n -> Char`.
+        (Sub, Char(a), Char(b)) => Ok(Int(*a as i32 - *b as i32)),
+        (Add, Char(c), n) if n.is_integral() => {
+            let next = (*c as i64).saturating_add(n.as_i64().unwrap_or(0));
+            Ok(char::from_u32(next as u32).map(Char).unwrap_or(Null))
+        }
+        (Sub, Char(c), n) if n.is_integral() => {
+            let next = (*c as i64).saturating_sub(n.as_i64().unwrap_or(0));
+            Ok(char::from_u32(next as u32).map(Char).unwrap_or(Null))
+        }
         (Range, Char(a), Char(b)) => Ok(Value::Range {
             start: *a as i64,
             end: *b as i64,
