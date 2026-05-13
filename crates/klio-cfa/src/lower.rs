@@ -381,14 +381,39 @@ impl Lowering {
             }
 
             Expr::Call { callee, args, span, .. } => {
-                let _ = self.lower_expr(callee, cur);
+                // Spec §12.2.5 callsInPlace(EXACTLY_ONCE): if the
+                // callee is one of the stdlib scope functions and
+                // the last argument is a lambda literal, inline the
+                // lambda body into the current block before any
+                // contract effects so subsequent statements see the
+                // body's assignments and narrowings.
+                let exactly_once = lambda_calls_in_place(callee, args);
                 let mut arg_regs: Vec<Reg> = Vec::with_capacity(args.len());
-                for a in args {
-                    arg_regs.push(self.lower_expr(a, cur));
+                let _ = self.lower_expr(callee, cur);
+                if exactly_once {
+                    // Lower all non-lambda args normally; the trailing
+                    // lambda body is inlined directly into `cur`.
+                    let lambda_idx = args.len() - 1;
+                    for (i, a) in args.iter().enumerate() {
+                        if i == lambda_idx {
+                            break;
+                        }
+                        arg_regs.push(self.lower_expr(a, cur));
+                    }
+                    if let Expr::Lambda { body, .. } = &args[lambda_idx] {
+                        let _ = self.lower_block(body, cur);
+                    }
+                    let result = self.emit_eval(*cur, *span);
+                    self.apply_contract_effects(callee, &arg_regs, args, *cur, *span);
+                    result
+                } else {
+                    for a in args {
+                        arg_regs.push(self.lower_expr(a, cur));
+                    }
+                    let result = self.emit_eval(*cur, *span);
+                    self.apply_contract_effects(callee, &arg_regs, args, *cur, *span);
+                    result
                 }
-                let result = self.emit_eval(*cur, *span);
-                self.apply_contract_effects(callee, &arg_regs, args, *cur, *span);
-                result
             }
             Expr::Index { receiver, args, span } => {
                 let _ = self.lower_expr(receiver, cur);
@@ -1144,6 +1169,33 @@ fn simple_name(callee: &Expr) -> Option<&str> {
     match callee {
         Expr::Path { segments, .. } if segments.len() == 1 => Some(&segments[0].name),
         _ => None,
+    }
+}
+
+/// True when `callee` is a stdlib scope function whose contract
+/// invokes the trailing lambda argument exactly once on the normal
+/// path. Per spec §12.2.5 the body's effects (assignments,
+/// narrowings, declarations) propagate to the caller scope and the
+/// CFG should inline them inline so VIA and smart-cast see them
+/// without crossing a lambda boundary.
+fn lambda_calls_in_place(callee: &Expr, args: &[Expr]) -> bool {
+    let Some(last) = args.last() else { return false };
+    if !matches!(last, Expr::Lambda { .. }) {
+        return false;
+    }
+    match callee {
+        // `recv.let/run/apply/also { ... }` — member-form. `with` is
+        // top-level but takes a receiver as a positional argument.
+        Expr::Member { name, safe: false, .. } => matches!(
+            name.name.as_str(),
+            "let" | "run" | "apply" | "also"
+        ),
+        // `run { ... }` / `with(x) { ... }` — top-level scope fns.
+        Expr::Path { segments, .. } if segments.len() == 1 => matches!(
+            segments[0].name.as_str(),
+            "run" | "with"
+        ),
+        _ => false,
     }
 }
 

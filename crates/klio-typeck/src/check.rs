@@ -5639,21 +5639,18 @@ impl<'r> Checker<'r> {
                             let anns = self.prop_annotations.get(name).cloned().unwrap_or_default();
                             self.check_published_api_use(name, v, &anns, *span);
                         }
-                        // Definite-assignment check: a place is
-                        // flagged only when *both* the CFG's VIA
-                        // analysis and the legacy `assigned` set
-                        // agree it is unassigned. The legacy set
-                        // sees lambda-callback contract effects
-                        // (`run { x = 4 }`) that the CFG cannot yet
-                        // trace into; the CFG sees branch joins the
-                        // legacy set approximates. Their intersection
-                        // matches the existing T0020 behaviour.
-                        let legacy_unassigned =
-                            needs_init && !self.assigned.contains(name);
+                        // Definite-assignment check via the CFG's
+                        // VIA analysis. Lambda-call-in-place CFA
+                        // inlines `run { x = 4 }` and friends so
+                        // body assignments reach the surrounding
+                        // VIA state. The legacy `assigned` set is
+                        // consulted only as a fallback for spans
+                        // the CFG never visited (top-level
+                        // properties outside any function body).
                         let via_unassigned = self
                             .cfg_via_unassigned_at(name, *span)
-                            .unwrap_or(legacy_unassigned);
-                        if legacy_unassigned && via_unassigned {
+                            .unwrap_or_else(|| needs_init && !self.assigned.contains(name));
+                        if needs_init && via_unassigned {
                             self.diagnostics.emit(
                                 Diagnostic::error(
                                     format!(
