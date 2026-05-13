@@ -4309,53 +4309,22 @@ impl Interpreter {
             self.insertion_sort_values(&mut items, descending, out)?;
             return Ok(Value::List { items: Rc::new(RefCell::new(items)), mutable: false, enum_class: None });
         }
-        let mut keyed: Vec<(Vec<Value>, Value)> = Vec::with_capacity(items.len());
-        for v in items.drain(..) {
-            let mut keys = Vec::with_capacity(steps.len());
-            for (sel, _) in steps.iter() {
-                let Value::Lambda { params, body, env: captured, .. } = sel else {
-                    return Err(RuntimeError::Type("comparator selector must be a lambda".into()));
-                };
-                let k = self.call_lambda(params, body, captured, std::slice::from_ref(&v), out)?;
-                keys.push(k);
-            }
-            keyed.push((keys, v));
-        }
         // Insertion sort lets us call back into the interpreter (`&mut self`)
         // from within comparisons, which is required when a step's keys are
         // user `Value::Instance`s that override `compareTo`.
-        for i in 1..keyed.len() {
+        for i in 1..items.len() {
             let mut j = i;
             while j > 0 {
-                let mut ord = std::cmp::Ordering::Equal;
-                let mut err: Option<RuntimeError> = None;
-                let steps_iter = keyed[j - 1].0.iter().zip(keyed[j].0.iter()).zip(steps.iter()).map(|((a, b), s)| (a.clone(), b.clone(), s.1));
-                let pairs: Vec<(Value, Value, bool)> = steps_iter.collect();
-                for (k1, k2, step_desc) in &pairs {
-                    match self.compare_with_user(k1, k2, out) {
-                        Ok(std::cmp::Ordering::Equal) => continue,
-                        Ok(mut o) => {
-                            if *step_desc { o = o.reverse(); }
-                            if descending { o = o.reverse(); }
-                            ord = o;
-                            break;
-                        }
-                        Err(e) => { err = Some(e); break; }
-                    }
-                }
-                if let Some(e) = err {
-                    return Err(e);
-                }
+                let ord = self.compare_with_comparator(&steps, descending, &items[j - 1], &items[j], out)?;
                 if matches!(ord, std::cmp::Ordering::Greater) {
-                    keyed.swap(j - 1, j);
+                    items.swap(j - 1, j);
                     j -= 1;
                 } else {
                     break;
                 }
             }
         }
-        let out_items: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
-        Ok(Value::List { items: Rc::new(RefCell::new(out_items)), mutable: false, enum_class: None })
+        Ok(Value::List { items: Rc::new(RefCell::new(items)), mutable: false, enum_class: None })
     }
 
     /// Comparator-shaped methods on a `Value::Comparator` receiver:
@@ -4411,18 +4380,19 @@ impl Interpreter {
                 };
                 Ok(Some(Value::Int(n)))
             }
-            "thenComparing" => {
+            "thenComparing" | "then" | "thenDescending" | "thenComparator" => {
                 if args.len() != 1 {
-                    return Err(RuntimeError::Arity(
-                        "Comparator.thenComparing expects one argument".into(),
-                    ));
+                    return Err(RuntimeError::Arity(format!(
+                        "Comparator.{name} expects one argument"
+                    )));
                 }
+                let invert = name == "thenDescending";
                 let other = self.eval_expr(&args[0], env, out)?;
                 match other {
                     Value::Comparator { steps: other_steps, descending: other_desc } => {
                         let mut chain: Vec<(Value, bool)> = (**steps).clone();
                         for (sel, d) in other_steps.iter() {
-                            chain.push((sel.clone(), *d ^ other_desc));
+                            chain.push((sel.clone(), *d ^ other_desc ^ invert));
                         }
                         Ok(Some(Value::Comparator {
                             steps: Rc::new(chain),
@@ -4431,15 +4401,15 @@ impl Interpreter {
                     }
                     Value::Lambda { .. } => {
                         let mut chain: Vec<(Value, bool)> = (**steps).clone();
-                        chain.push((other, false));
+                        chain.push((other, invert));
                         Ok(Some(Value::Comparator {
                             steps: Rc::new(chain),
                             descending: *descending,
                         }))
                     }
-                    _ => Err(RuntimeError::Type(
-                        "Comparator.thenComparing expects a Comparator or selector lambda".into(),
-                    )),
+                    _ => Err(RuntimeError::Type(format!(
+                        "Comparator.{name} expects a Comparator or selector lambda"
+                    ))),
                 }
             }
             _ => Ok(None),
@@ -4462,12 +4432,7 @@ impl Interpreter {
             return Ok(ord);
         }
         for (sel, step_desc) in steps.iter() {
-            let Value::Lambda { params, body, env: captured, .. } = sel else {
-                return Err(RuntimeError::Type("comparator selector must be a lambda".into()));
-            };
-            let ka = self.call_lambda(params, body, captured, std::slice::from_ref(a), out)?;
-            let kb = self.call_lambda(params, body, captured, std::slice::from_ref(b), out)?;
-            let mut ord = self.compare_with_user(&ka, &kb, out)?;
+            let mut ord = self.apply_comparator_step(sel, a, b, out)?;
             if *step_desc {
                 ord = ord.reverse();
             }
@@ -4479,6 +4444,40 @@ impl Interpreter {
             }
         }
         Ok(std::cmp::Ordering::Equal)
+    }
+
+    /// A comparator step is either a key-selector (1-arg lambda returning a
+    /// `Comparable` key) or a direct comparison (2-arg lambda returning Int).
+    /// `thenComparator { a, b -> ... }` stores the latter; `compareBy` /
+    /// `thenBy` store the former.
+    fn apply_comparator_step(
+        &mut self,
+        sel: &Value,
+        a: &Value,
+        b: &Value,
+        out: &mut dyn Output,
+    ) -> Result<std::cmp::Ordering, RuntimeError> {
+        let Value::Lambda { params, body, env: captured, .. } = sel else {
+            return Err(RuntimeError::Type("comparator selector must be a lambda".into()));
+        };
+        if params.len() >= 2 {
+            let pair = [a.clone(), b.clone()];
+            let v = self.call_lambda(params, body, captured, &pair, out)?;
+            let Value::Int(n) = v else {
+                return Err(RuntimeError::Type(
+                    "comparator lambda must return Int".into(),
+                ));
+            };
+            return Ok(n.cmp(&0));
+        }
+        let ka = self.call_lambda(params, body, captured, std::slice::from_ref(a), out)?;
+        let kb = self.call_lambda(params, body, captured, std::slice::from_ref(b), out)?;
+        match (matches!(ka, Value::Null), matches!(kb, Value::Null)) {
+            (true, true) => Ok(std::cmp::Ordering::Equal),
+            (true, false) => Ok(std::cmp::Ordering::Less),
+            (false, true) => Ok(std::cmp::Ordering::Greater),
+            (false, false) => self.compare_with_user(&ka, &kb, out),
+        }
     }
 
     /// Lambda-bearing members on a `Value::Result` receiver. The pure
@@ -7494,6 +7493,53 @@ impl Interpreter {
                     steps.push((v, per_step_descending));
                 }
                 return Ok(Value::Comparator { steps: Rc::new(steps), descending: false });
+            }
+            if name == "compareValues" && args.len() == 2 {
+                let a = self.eval_expr(&args[0], env, out)?;
+                let b = self.eval_expr(&args[1], env, out)?;
+                let n: i32 = match (
+                    matches!(a, Value::Null),
+                    matches!(b, Value::Null),
+                ) {
+                    (true, true) => 0,
+                    (true, false) => -1,
+                    (false, true) => 1,
+                    (false, false) => match self.compare_with_user(&a, &b, out)? {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    },
+                };
+                return Ok(Value::Int(n));
+            }
+            if name == "compareValuesBy" && args.len() >= 3 {
+                let a = self.eval_expr(&args[0], env, out)?;
+                let b = self.eval_expr(&args[1], env, out)?;
+                for sel in &args[2..] {
+                    let lam = self.eval_expr(sel, env, out)?;
+                    let Value::Lambda { params, body, env: captured, .. } = &lam else {
+                        return Err(RuntimeError::Type(
+                            "compareValuesBy expects key-selector lambdas".into(),
+                        ));
+                    };
+                    let ka = self.call_lambda(params, body, captured, std::slice::from_ref(&a), out)?;
+                    let kb = self.call_lambda(params, body, captured, std::slice::from_ref(&b), out)?;
+                    let ord = match (matches!(ka, Value::Null), matches!(kb, Value::Null)) {
+                        (true, true) => std::cmp::Ordering::Equal,
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        (false, false) => self.compare_with_user(&ka, &kb, out)?,
+                    };
+                    if !matches!(ord, std::cmp::Ordering::Equal) {
+                        let n: i32 = match ord {
+                            std::cmp::Ordering::Less => -1,
+                            std::cmp::Ordering::Greater => 1,
+                            std::cmp::Ordering::Equal => 0,
+                        };
+                        return Ok(Value::Int(n));
+                    }
+                }
+                return Ok(Value::Int(0));
             }
         }
 
