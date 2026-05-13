@@ -2,4 +2,5 @@
 
 pub mod finally;
 pub mod reachable;
+pub mod smartcast;
 pub mod via;

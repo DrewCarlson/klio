@@ -29,12 +29,12 @@ use klio_types::Type;
 
 /// Lowered output: the CFG plus a per-source-span register map so
 /// downstream analyses can find the register holding an expression's
-/// value. The same span may appear multiple times (e.g. an `if`
-/// branch evaluated twice through different paths); the last write
-/// wins, which matches how the typechecker reasons.
+/// value, and a per-register place map so smart-cast can map an
+/// `AssumeIs(reg, T)` back onto the `Place` whose type was refined.
 pub struct Lowered {
     pub cfg: Cfg,
     pub reg_for_span: std::collections::HashMap<(u32, u32), Reg>,
+    pub reg_to_place: std::collections::HashMap<Reg, Place>,
 }
 
 struct LoopFrame {
@@ -65,12 +65,33 @@ struct TryFrame {
     finally_entry: Option<BlockId>,
 }
 
+/// Refinement implied by the truthiness of a boolean-typed register.
+/// Carried in `pending_refinements` so `lower_if` / `lower_when` /
+/// `lower_short_circuit` can emit the matching `AssumeIs` or
+/// `AssumeNull` on the correct branch arm.
+#[derive(Debug, Clone)]
+enum Refinement {
+    Is { reg: Reg, ty: Type, polarity: bool, span: Span },
+    NullEq { reg: Reg, span: Span, eq_null: bool },
+    /// `!cond` flips polarity of every contained refinement.
+    Not(Box<Refinement>),
+    /// `&&` of multiple refinements — all hold on the true branch.
+    And(Vec<Refinement>),
+    /// `||` of multiple refinements — only the intersection holds on
+    /// the true branch, and the union on the false branch. For now we
+    /// only emit the symmetric facts; broader handling lives in the
+    /// constraint-system milestone.
+    Or(Vec<Refinement>),
+}
+
 pub struct Lowering {
     b: CfgBuilder,
     loop_stack: Vec<LoopFrame>,
     label_stack: Vec<LabelFrame>,
     try_stack: Vec<TryFrame>,
     reg_for_span: std::collections::HashMap<(u32, u32), Reg>,
+    reg_to_place: std::collections::HashMap<Reg, Place>,
+    pending_refinements: std::collections::HashMap<Reg, Refinement>,
 }
 
 impl Lowering {
@@ -81,6 +102,8 @@ impl Lowering {
             label_stack: Vec::new(),
             try_stack: Vec::new(),
             reg_for_span: std::collections::HashMap::new(),
+            reg_to_place: std::collections::HashMap::new(),
+            pending_refinements: std::collections::HashMap::new(),
         }
     }
 
@@ -103,7 +126,53 @@ impl Lowering {
         self.b.set_terminator(cur, Terminator::Goto(exit));
         self.b.set_terminator(exit, Terminator::Return(None));
         let cfg = self.b.finish(entry, vec![exit], source);
-        Lowered { cfg, reg_for_span: self.reg_for_span }
+        Lowered {
+            cfg,
+            reg_for_span: self.reg_for_span,
+            reg_to_place: self.reg_to_place,
+        }
+    }
+
+    /// Emit the `AssumeIs` / `AssumeNull` nodes implied by a
+    /// refinement onto `blk`. `truth` is the polarity to interpret
+    /// the refinement under: `true` for the then-arm, `false` for
+    /// the else-arm.
+    fn emit_refinement(&mut self, blk: BlockId, refinement: &Refinement, truth: bool) {
+        match refinement {
+            Refinement::Is { reg, ty, polarity, span } => {
+                let effective = *polarity == truth;
+                self.b.push(
+                    blk,
+                    Node::AssumeIs { reg: *reg, ty: ty.clone(), polarity: effective, span: *span },
+                );
+            }
+            Refinement::NullEq { reg, span, eq_null } => {
+                // `x == null` true on then; the refinement is "x == null".
+                // Truth=true keeps eq_null; truth=false flips it.
+                let effective = *eq_null == truth;
+                self.b
+                    .push(blk, Node::AssumeNull { reg: *reg, eq_null: effective, span: *span });
+            }
+            Refinement::Not(inner) => self.emit_refinement(blk, inner, !truth),
+            Refinement::And(parts) => {
+                if truth {
+                    for p in parts {
+                        self.emit_refinement(blk, p, true);
+                    }
+                }
+                // On the false arm of `a && b`, neither part is
+                // individually known — we drop refinements.
+            }
+            Refinement::Or(parts) => {
+                if !truth {
+                    for p in parts {
+                        self.emit_refinement(blk, p, false);
+                    }
+                }
+                // On the true arm of `a || b`, neither part is
+                // individually known — we drop refinements.
+            }
+        }
     }
 
     fn lower_block(&mut self, block: &Block, cur: &mut BlockId) -> Option<Reg> {
@@ -231,11 +300,21 @@ impl Lowering {
             Expr::Path { span, .. }
             | Expr::This { span, .. }
             | Expr::Super { span, .. }
-            | Expr::PropertyRef { span, .. } => self.emit_eval(*cur, *span),
+            | Expr::PropertyRef { span, .. } => {
+                let reg = self.emit_eval(*cur, *span);
+                if let Some(place) = self.expr_to_place(expr) {
+                    self.reg_to_place.insert(reg, place);
+                }
+                reg
+            }
 
             Expr::Member { receiver, span, .. } => {
                 let _ = self.lower_expr(receiver, cur);
-                self.emit_eval(*cur, *span)
+                let reg = self.emit_eval(*cur, *span);
+                if let Some(place) = self.expr_to_place(expr) {
+                    self.reg_to_place.insert(reg, place);
+                }
+                reg
             }
             Expr::MemberRef { receiver, span, .. } => {
                 let _ = self.lower_expr(receiver, cur);
@@ -270,7 +349,14 @@ impl Lowering {
                         self.b.push(*cur, Node::Assign { lhs: place, rhs: inner, span: *span });
                     }
                 }
-                self.emit_eval(*cur, *span)
+                let result = self.emit_eval(*cur, *span);
+                if matches!(op, UnOp::Not) {
+                    if let Some(r) = self.pending_refinements.get(&inner).cloned() {
+                        self.pending_refinements
+                            .insert(result, Refinement::Not(Box::new(r)));
+                    }
+                }
+                result
             }
 
             Expr::Postfix { op, expr, span } => match op {
@@ -373,7 +459,11 @@ impl Lowering {
                     *cur,
                     Node::Eval { reg: result, expr: ExprRef { span: *span, ty: Type::Boolean } },
                 );
-                let _ = (r, ty, negated);
+                let ty_t = klio_types::convert_type_ref_lossy(ty);
+                self.pending_refinements.insert(
+                    result,
+                    Refinement::Is { reg: r, ty: ty_t, polarity: !*negated, span: *span },
+                );
                 self.record_reg(*span, result)
             }
             Expr::As { expr, ty, safe, span } => {
@@ -403,6 +493,24 @@ impl Lowering {
             BinOp::And => self.lower_short_circuit(lhs, rhs, span, cur, /*short_on_false=*/ true),
             BinOp::Or => self.lower_short_circuit(lhs, rhs, span, cur, /*short_on_false=*/ false),
             BinOp::Elvis => self.lower_elvis(lhs, rhs, span, cur),
+            BinOp::Eq | BinOp::Neq | BinOp::IdentEq | BinOp::IdentNeq => {
+                let l = self.lower_expr(lhs, cur);
+                let r = self.lower_expr(rhs, cur);
+                let result = self.emit_eval(*cur, span);
+                let eq_op = matches!(op, BinOp::Eq | BinOp::IdentEq);
+                if is_null_lit(rhs) {
+                    self.pending_refinements.insert(
+                        result,
+                        Refinement::NullEq { reg: l, span, eq_null: eq_op },
+                    );
+                } else if is_null_lit(lhs) {
+                    self.pending_refinements.insert(
+                        result,
+                        Refinement::NullEq { reg: r, span, eq_null: eq_op },
+                    );
+                }
+                result
+            }
             _ => {
                 let _ = self.lower_expr(lhs, cur);
                 let _ = self.lower_expr(rhs, cur);
@@ -422,6 +530,7 @@ impl Lowering {
         short_on_false: bool,
     ) -> Reg {
         let l = self.lower_expr(lhs, cur);
+        let lhs_refinement = self.pending_refinements.get(&l).cloned();
         let rhs_blk = self.b.new_block();
         let join = self.b.new_block();
         let (then_blk, else_blk) = if short_on_false { (rhs_blk, join) } else { (join, rhs_blk) };
@@ -430,15 +539,35 @@ impl Lowering {
             rhs_blk,
             Node::Assume { reg: l, polarity: short_on_false },
         );
+        if let Some(r) = &lhs_refinement {
+            // On the rhs-eval block, lhs's truth-polarity matches
+            // `short_on_false` (for `&&` we evaluate rhs when lhs is
+            // true; for `||` when lhs is false).
+            self.emit_refinement(rhs_blk, r, short_on_false);
+        }
         let mut rhs_cur = rhs_blk;
-        let _ = self.lower_expr(rhs, &mut rhs_cur);
+        let r_reg = self.lower_expr(rhs, &mut rhs_cur);
+        let rhs_refinement = self.pending_refinements.get(&r_reg).cloned();
         self.b.set_terminator(rhs_cur, Terminator::Goto(join));
         self.b.push(
             join,
             Node::Assume { reg: l, polarity: !short_on_false },
         );
+        let combined = match (lhs_refinement, rhs_refinement) {
+            (Some(a), Some(b)) => Some(if short_on_false {
+                Refinement::And(vec![a, b])
+            } else {
+                Refinement::Or(vec![a, b])
+            }),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
         *cur = join;
-        self.emit_eval(*cur, span)
+        let result = self.emit_eval(*cur, span);
+        if let Some(r) = combined {
+            self.pending_refinements.insert(result, r);
+        }
+        result
     }
 
     /// `a ?: b` => evaluate `a`; if non-null, that's the result; if
@@ -481,17 +610,24 @@ impl Lowering {
         cur: &mut BlockId,
     ) -> Reg {
         let c = self.lower_expr(cond, cur);
+        let refinement = self.pending_refinements.get(&c).cloned();
         let then_blk = self.b.new_block();
         let else_blk = self.b.new_block();
         let join = self.b.new_block();
         self.b.set_terminator(*cur, Terminator::Branch { cond: c, then_blk, else_blk });
 
         self.b.push(then_blk, Node::Assume { reg: c, polarity: true });
+        if let Some(r) = &refinement {
+            self.emit_refinement(then_blk, r, true);
+        }
         let mut then_cur = then_blk;
         let _ = self.lower_expr(then_branch, &mut then_cur);
         self.b.set_terminator(then_cur, Terminator::Goto(join));
 
         self.b.push(else_blk, Node::Assume { reg: c, polarity: false });
+        if let Some(r) = &refinement {
+            self.emit_refinement(else_blk, r, false);
+        }
         let mut else_cur = else_blk;
         if let Some(e) = else_branch {
             let _ = self.lower_expr(e, &mut else_cur);
@@ -890,6 +1026,10 @@ impl Default for Lowering {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn is_null_lit(e: &Expr) -> bool {
+    matches!(e, Expr::NullLit { .. })
 }
 
 /// Convenience entry point: lower a function body into a CFG.
