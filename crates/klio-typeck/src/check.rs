@@ -8053,11 +8053,7 @@ impl<'r> Checker<'r> {
             // type-check; this is the language-side contract that lets
             // our synchronous coroutine runtime in klio-interp drive
             // the lambda.
-            "runBlocking" | "suspendCoroutine"
-            | "suspendCoroutineUninterceptedOrReturn"
-            | "suspendCancellableCoroutine"
-                if args.len() == 1 =>
-            {
+            "runBlocking" if args.len() == 1 => {
                 if let Expr::Lambda { params, body, .. } = &args[0] {
                     self.suspend_context_stack.push(true);
                     let ty = self.check_lambda_in_place(params, body, None, None);
@@ -8068,6 +8064,25 @@ impl<'r> Checker<'r> {
                     });
                 }
                 None
+            }
+            // `suspendCoroutine<T> { cont -> … }` returns T, not the
+            // lambda's body type (Unit). The lambda is invoked once
+            // with a `Continuation<T>` whose `resume(v)` provides
+            // the call's result. We don't have a generic-arg-aware
+            // path here, so leave the call's result type
+            // unresolved — assignment context drives the binding
+            // type, and our solver-side handling propagates.
+            "suspendCoroutine"
+            | "suspendCoroutineUninterceptedOrReturn"
+            | "suspendCancellableCoroutine"
+                if args.len() == 1 =>
+            {
+                if let Expr::Lambda { params, body, .. } = &args[0] {
+                    self.suspend_context_stack.push(true);
+                    let _ = self.check_lambda_in_place(params, body, None, None);
+                    self.suspend_context_stack.pop();
+                }
+                Some(Type::Unresolved)
             }
             "with" if args.len() == 2 => {
                 let recv = self.check_expr(&args[0], None);

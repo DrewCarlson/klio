@@ -17,6 +17,8 @@ pub use klio_runtime::{
 use std::cell::RefCell;
 use std::rc::Rc;
 
+pub mod suspend_lower;
+
 /// Short-name → FQN aliases for stdlib symbols a Kotlin program may
 /// reference without an explicit import. Mirrors the implicit imports the
 /// real Kotlin compiler installs.
@@ -92,6 +94,15 @@ pub struct Interpreter {
     /// is called. Drained by the suspending-call site after the
     /// lambda returns to produce its result.
     coroutine_continuations: Vec<Rc<RefCell<ContinuationSlot>>>,
+    /// Stack of currently-driving suspend frames. Pushed when a
+    /// suspend body's state machine starts running, popped on
+    /// return or suspension. The top frame is the one a captured
+    /// continuation would resume.
+    active_suspend_frames: Vec<Rc<RefCell<klio_runtime::SuspendFrame>>>,
+    /// Names registered as suspending functions, populated at
+    /// top-level decl registration so the suspend-body lowering
+    /// recognises calls to user-declared `suspend fun foo()`.
+    suspend_function_names: suspend_lower::SuspendNameSet,
     /// Monotonic counter for synthesizing unique names for anonymous-object
     /// `ClassDef`s. Only surfaces in diagnostic-style debug output.
     anon_class_counter: usize,
@@ -220,6 +231,8 @@ impl Interpreter {
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
+            active_suspend_frames: Vec::new(),
+            suspend_function_names: suspend_lower::SuspendNameSet::with_intrinsics(),
             anon_class_counter: 0,
             instance_id_counter: 0,
             extensions: std::collections::HashMap::new(),
@@ -679,6 +692,9 @@ impl Interpreter {
         for d in &file.decls {
             if let Decl::Function(f) = d {
                 let decl = Rc::new(f.clone());
+                if f.is_suspend {
+                    self.suspend_function_names.insert(f.name.name.clone());
+                }
                 if let Some(recv) = &f.receiver_type {
                     self.extensions
                         .entry(recv.name.name.clone())
@@ -813,6 +829,14 @@ impl Interpreter {
         args: &[Value],
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
+        // Suspend functions go through the state-machine driver so
+        // suspendCoroutine calls inside the body can pause /
+        // resume. Non-suspending functions use the direct call
+        // path.
+        if decl.is_suspend && matches!(decl.body.as_ref(), Some(klio_ast::FunctionBody::Block(_))) {
+            let rc = Rc::new(decl.clone());
+            return self.drive_suspend_function(&rc, captured_env, args, out);
+        }
         self.call_function_named(decl, captured_env, args, &[], out)
     }
 
@@ -4856,6 +4880,186 @@ impl Interpreter {
         }
     }
 
+    /// Host bridge: drive a `runBlocking { … }` lambda to
+    /// completion. The lambda's body is lowered as if it were a
+    /// suspend fun's body and driven through the state machine.
+    /// If the body suspends, we keep the frame alive — its
+    /// captured continuation must eventually be resumed by user
+    /// code (or the call will hang).
+    fn run_blocking(
+        &mut self,
+        lam: &Value,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        let Value::Lambda { params, body, env: captured, .. } = lam else {
+            return Err(RuntimeError::Type(
+                "runBlocking expects a lambda".into(),
+            ));
+        };
+        // Synthesise an AST Function out of the lambda so the
+        // suspend-body lowering can partition it. The synthetic
+        // function takes no parameters and uses the lambda's
+        // body verbatim.
+        let synth = Rc::new(klio_ast::Function {
+            name: klio_ast::Ident {
+                name: "<runBlocking>".to_string(),
+                span: body.span,
+            },
+            receiver_type: None,
+            type_params: Vec::new(),
+            where_bounds: Vec::new(),
+            params: Vec::new(),
+            return_type: None,
+            body: Some(klio_ast::FunctionBody::Block((**body).clone())),
+            is_open: false,
+            is_override: false,
+            is_abstract: false,
+            is_operator: false,
+            is_inline: false,
+            is_infix: false,
+            is_tailrec: false,
+            is_suspend: true,
+            visibility: klio_ast::Visibility::Public,
+            annotations: Vec::new(),
+            span: body.span,
+        });
+        // We don't care about the lambda's params here because
+        // runBlocking's outer lambda is zero-arity in our model.
+        // The captured env is the closure env for the body.
+        let _ = params;
+        let result = self.drive_suspend_function(&synth, captured, &[], out)?;
+        if !matches!(result, Value::CoroutineSuspended(_)) {
+            return Ok(result);
+        }
+        // The lambda suspended. The captured continuation is held
+        // by whatever async machinery user code wired up; it must
+        // eventually call resume(...) for our driver loop to
+        // re-enter. Since we have no scheduler, the only way
+        // forward is for the user code to have synchronously
+        // arranged a resume — but at this point the synchronous
+        // path already returned without doing so. Surface a
+        // diagnostic rather than hang silently.
+        Err(RuntimeError::Type(
+            "runBlocking { … } suspended without a synchronous resume path. \
+             Real async dispatching lives in kotlinx.coroutines, which is out of scope; \
+             ensure every suspendCoroutine inside this block calls cont.resume \
+             before its lambda returns, or chain captured continuations through \
+             additional suspendCoroutine calls that do."
+                .into(),
+        ))
+    }
+
+    /// Lower a suspend `fun foo()`'s body to a SuspendBody and run
+    /// its state machine. Returns the final value when the body
+    /// completes synchronously, or `Value::CoroutineSuspended(frame)`
+    /// when execution paused mid-state. Caller handles either.
+    fn drive_suspend_function(
+        &mut self,
+        decl: &Rc<klio_ast::Function>,
+        captured_env: &Rc<RefCell<Env>>,
+        args: &[Value],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        let Some(body) = suspend_lower::lower(decl, &self.suspend_function_names) else {
+            return Err(RuntimeError::Type(format!(
+                "suspend fun `{}` has no block body",
+                decl.name.name
+            )));
+        };
+        // Set up a fresh env for the suspend body. Param bindings
+        // live in this env; the state machine reads/writes the
+        // locals slot for cross-state values.
+        let frame_env = Rc::new(RefCell::new(Env::with_parent(Rc::clone(captured_env))));
+        for (p, v) in decl.params.iter().zip(args.iter()) {
+            frame_env.borrow_mut().define(p.name.name.clone(), v.clone());
+        }
+        let frame = Rc::new(RefCell::new(klio_runtime::SuspendFrame {
+            decl: Rc::clone(decl),
+            body: Rc::new(body),
+            env: frame_env,
+            locals: Vec::new(),
+            state: 0,
+            caller: None,
+        }));
+        self.drive_suspend_frame(&frame, None, out)
+    }
+
+    /// Run a suspend frame until its body either completes
+    /// (returns a value) or pauses (returns
+    /// `Value::CoroutineSuspended`). `resumed_value` is bound to
+    /// the entry state's resume_target before execution.
+    fn drive_suspend_frame(
+        &mut self,
+        frame: &Rc<RefCell<klio_runtime::SuspendFrame>>,
+        mut resumed_value: Option<Value>,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        self.active_suspend_frames.push(Rc::clone(frame));
+        let result = (|| {
+            loop {
+                let (body, state_idx) = {
+                    let f = frame.borrow();
+                    (Rc::clone(&f.body), f.state)
+                };
+                let state = body
+                    .states
+                    .get(state_idx)
+                    .cloned()
+                    .ok_or_else(|| {
+                        RuntimeError::Type(
+                            "suspend state machine ran off the end".into(),
+                        )
+                    })?;
+                // Bind resume target before the state's stmts run.
+                // When the previous state ended at a suspending
+                // call whose result needs to flow into the *return*
+                // value (no explicit target), `resumed_value` is
+                // threaded directly into `last`.
+                let mut last = match &state.resume_target {
+                    Some(target) => {
+                        let value = resumed_value.take().unwrap_or(Value::Unit);
+                        frame.borrow().env.borrow_mut().define(target.clone(), value);
+                        Value::Unit
+                    }
+                    None => resumed_value.take().unwrap_or(Value::Unit),
+                };
+                // Execute the state's stmts against the frame's env.
+                let env = Rc::clone(&frame.borrow().env);
+                for stmt in &state.stmts {
+                    let v = self.eval_stmt(stmt, &env, out)?;
+                    if matches!(v, Value::CoroutineSuspended(_)) {
+                        return Ok(v);
+                    }
+                    last = v;
+                }
+                match state.transition {
+                    klio_runtime::SuspendTransition::Return => {
+                        return Ok(last);
+                    }
+                    klio_runtime::SuspendTransition::Goto(next) => {
+                        // After a suspending call the last expression's
+                        // value becomes the resume value for the next
+                        // state. If we're here without a real suspension,
+                        // the suspendCoroutine call resumed synchronously
+                        // and `last` holds the resumed value.
+                        resumed_value = Some(last);
+                        frame.borrow_mut().state = next;
+                    }
+                    klio_runtime::SuspendTransition::Branch { then_state, else_state } => {
+                        let next = if matches!(last, Value::Bool(true)) {
+                            then_state
+                        } else {
+                            else_state
+                        };
+                        frame.borrow_mut().state = next;
+                    }
+                }
+            }
+        })();
+        self.active_suspend_frames.pop();
+        result
+    }
+
     /// Spec §18.2 `suspendCoroutine` / `suspendCoroutineUninterceptedOrReturn`.
     /// Allocates a continuation slot, builds a synthetic
     /// `Continuation` value bound to it, invokes the user lambda,
@@ -4880,19 +5084,41 @@ impl Interpreter {
         self.coroutine_continuations.push(Rc::clone(&slot));
         let cont = self.make_continuation_value(Rc::clone(&slot));
         let lambda_result = self.call_lambda(params, body, captured, &[cont], out);
-        self.coroutine_continuations.pop();
-        // If the lambda completed normally we honour the
-        // continuation's recorded resume value. If it threw, that
-        // propagates as-is. The intrinsic-return value (when the
-        // lambda returns a normal value rather than calling
-        // resume) is the suspend-or-return shortcut — return it
-        // directly, matching the "Uninterceptedy" semantics.
-        let direct = lambda_result?;
+        let direct = match lambda_result {
+            Ok(v) => v,
+            Err(e) => {
+                self.coroutine_continuations.pop();
+                return Err(e);
+            }
+        };
         let slot_state = slot.borrow().clone();
         match slot_state {
-            ContinuationSlot::Resumed(v) => Ok(v),
-            ContinuationSlot::Failed(e) => Err(RuntimeError::Thrown(e)),
-            ContinuationSlot::Pending => Ok(direct),
+            ContinuationSlot::Resumed(v) => {
+                self.coroutine_continuations.pop();
+                Ok(v)
+            }
+            ContinuationSlot::Failed(e) => {
+                self.coroutine_continuations.pop();
+                Err(RuntimeError::Thrown(e))
+            }
+            ContinuationSlot::Pending => {
+                // The lambda didn't resume synchronously: a real
+                // suspension. The driving suspend frame's state
+                // machine will pause here; if no frame is active
+                // (raw `suspendCoroutine` outside a state machine)
+                // fall back to the previous "return the direct
+                // value" behavior for the spec's
+                // "Uninterceptedy"-shortcut case.
+                if let Some(frame) = self.active_suspend_frames.last().cloned() {
+                    // Don't pop the continuation slot — it lives
+                    // on past this call so the captured cont can
+                    // resume the frame later.
+                    Ok(Value::CoroutineSuspended(frame))
+                } else {
+                    self.coroutine_continuations.pop();
+                    Ok(direct)
+                }
+            }
         }
     }
 
@@ -7985,12 +8211,7 @@ impl Interpreter {
             match name {
                 "runBlocking" if args.len() == 1 => {
                     let lam = self.eval_expr(&args[0], env, out)?;
-                    if let Value::Lambda { params, body, env: captured, .. } = &lam {
-                        return self.call_lambda(params, body, captured, &[], out);
-                    }
-                    return Err(RuntimeError::Type(
-                        "runBlocking expects a lambda".into(),
-                    ));
+                    return self.run_blocking(&lam, out);
                 }
                 "suspendCoroutine"
                 | "suspendCoroutineUninterceptedOrReturn"

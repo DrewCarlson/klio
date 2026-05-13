@@ -27,6 +27,12 @@ pub struct CallCtx<'a> {
 #[derive(Clone)]
 pub enum Value {
     Unit,
+    /// Spec §18.2 sentinel `kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED`.
+    /// Returned from a suspending call site when the underlying
+    /// state machine elected to pause; the carried frame is the
+    /// continuation entry point that, when resumed, will drive
+    /// execution forward.
+    CoroutineSuspended(Rc<RefCell<SuspendFrame>>),
     Int(i32),
     Long(i64),
     Short(i16),
@@ -317,6 +323,74 @@ pub enum DelegateKind {
     /// `Delegates.notNull<T>()`. Reads before the first write throw
     /// `IllegalStateException`.
     NotNull { value: Option<Value>, name: String },
+}
+
+/// State-machine representation of a `suspend fun` body. Built once
+/// when a suspend function is registered and consulted whenever the
+/// interpreter enters / resumes the body.
+#[derive(Debug, Clone)]
+pub struct SuspendBody {
+    pub states: Vec<SuspendState>,
+}
+
+/// One "basic block" in a state machine: a contiguous run of
+/// statements with at most one suspending operation, ending in a
+/// transition.
+#[derive(Debug, Clone)]
+pub struct SuspendState {
+    /// Optional local to bind the resumed value to *before* the
+    /// statements run. `None` for the initial state (state 0).
+    pub resume_target: Option<String>,
+    /// Statements to execute in order. The interpreter walks these
+    /// against the frame's locals + captured env. If an expression
+    /// in here suspends (returns Value::CoroutineSuspended), the
+    /// frame is saved at this state and the suspension bubbles up.
+    pub stmts: Vec<klio_ast::Stmt>,
+    /// What to do after the last stmt finishes.
+    pub transition: SuspendTransition,
+}
+
+#[derive(Debug, Clone)]
+pub enum SuspendTransition {
+    /// Move to the named state, optionally carrying a value (e.g.
+    /// the result of the last expression in this state).
+    Goto(usize),
+    /// Function returns. The value comes from the last expression
+    /// of `stmts` (Unit for an empty / non-expression tail).
+    Return,
+    /// Branch on a boolean register produced by the last stmt:
+    /// jump to `then_state` if true, `else_state` otherwise.
+    Branch { then_state: usize, else_state: usize },
+}
+
+/// A live `suspend fun` invocation. Holds enough state to resume
+/// the body after a pause: the function decl, the captured env
+/// (params + closure), the locals introduced so far, the next
+/// state to run, and the caller's continuation.
+#[derive(Debug)]
+pub struct SuspendFrame {
+    pub decl: Rc<klio_ast::Function>,
+    pub body: Rc<SuspendBody>,
+    pub env: Rc<RefCell<Env>>,
+    /// Locals introduced by val/var statements in earlier states.
+    /// Survives across suspensions because each state writes/reads
+    /// here instead of pushing a transient frame.
+    pub locals: Vec<(String, Value)>,
+    /// Index into `body.states` for the next state to run.
+    pub state: usize,
+    /// Bound when this frame is the active continuation: the
+    /// caller's continuation chain. Driving this frame to a Return
+    /// hands the value to `caller.resume_with(...)`.
+    pub caller: Option<SuspendCallerCont>,
+}
+
+/// Where a finished suspend frame hands its result. Either upstream
+/// to another paused suspend frame, or to a host-side slot that
+/// `runBlocking` drains.
+#[derive(Debug, Clone)]
+pub enum SuspendCallerCont {
+    Frame(Rc<RefCell<SuspendFrame>>),
+    HostSlot(Rc<RefCell<Option<Result<Value, Value>>>>),
 }
 
 /// A declared Kotlin class as the interpreter sees it at runtime.
@@ -799,6 +873,7 @@ impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unit => write!(f, "Unit"),
+            Self::CoroutineSuspended(_) => write!(f, "CoroutineSuspended"),
             Self::Int(v) => write!(f, "Int({v})"),
             Self::Long(v) => write!(f, "Long({v})"),
             Self::Short(v) => write!(f, "Short({v})"),
@@ -883,6 +958,7 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unit => write!(f, "kotlin.Unit"),
+            Self::CoroutineSuspended(_) => write!(f, "COROUTINE_SUSPENDED"),
             Self::Int(v) => write!(f, "{v}"),
             Self::Long(v) => write!(f, "{v}"),
             Self::Short(v) => write!(f, "{v}"),
@@ -1268,6 +1344,7 @@ impl Value {
     pub fn type_fqn(&self) -> &'static str {
         match self {
             Self::Unit => "kotlin.Unit",
+            Self::CoroutineSuspended(_) => "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED",
             Self::Int(_) => "kotlin.Int",
             Self::Long(_) => "kotlin.Long",
             Self::Short(_) => "kotlin.Short",
@@ -1372,6 +1449,7 @@ impl Value {
     #[must_use]
     pub fn is_runtime_type(&self, name: &str) -> bool {
         match self {
+            Value::CoroutineSuspended(_) => false,
             Value::Int(_) => matches!(name, "Int" | "Number" | "Any" | "Comparable"),
             Value::Long(_) => matches!(name, "Long" | "Number" | "Any" | "Comparable"),
             Value::Short(_) => matches!(name, "Short" | "Number" | "Any" | "Comparable"),
