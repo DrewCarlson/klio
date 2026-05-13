@@ -3612,7 +3612,9 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.skip_nl();
         self.expect(&TokenKind::Arrow, "`->`")?;
         self.skip_nl();
-        let body = self.parse_expr()?;
+        // Branch bodies are control-structure bodies: an assignment
+        // statement (`sum += item`) is allowed alongside expressions.
+        let body = self.parse_control_structure_body()?;
         let span = start.join(body.span());
         Some(WhenBranch { patterns, body, span })
     }
