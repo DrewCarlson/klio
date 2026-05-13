@@ -1,0 +1,22 @@
+[package]
+name = "klio-stdlib-pack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Runtime: no klio-stdlib dependency. The crate root re-exports a
+# byte slice that the build script wrote into OUT_DIR plus a thin
+# helper that consults `KLIO_STDLIB_PACK` for dev override.
+
+[dev-dependencies]
+klio-pack = { workspace = true }
+
+[build-dependencies]
+klio-stdlib = { workspace = true }

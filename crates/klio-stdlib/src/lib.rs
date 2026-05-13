@@ -37,6 +37,8 @@ pub mod text;
 pub use klio_runtime::StdlibFn;
 
 pub mod implementations;
+pub mod pack_builder;
+pub use pack_builder::build_stdlib_pack;
 
 // Re-export internal helpers that the interpreter's higher-order ops use
 // for comparisons. Keeps the API surface small.

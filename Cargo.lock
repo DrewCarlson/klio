@@ -632,6 +632,7 @@ dependencies = [
  "klio-runtime",
  "klio-span",
  "klio-stdlib",
+ "klio-stdlib-pack",
  "klio-typeck",
  "rustyline",
 ]
@@ -750,6 +751,7 @@ dependencies = [
  "criterion",
  "klio-interp",
  "klio-lexer",
+ "klio-pack",
  "klio-parser",
  "klio-runtime",
  "klio-span",
@@ -762,6 +764,14 @@ name = "klio-stdlib-gen"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "klio-stdlib",
+]
+
+[[package]]
+name = "klio-stdlib-pack"
+version = "0.1.0"
+dependencies = [
+ "klio-pack",
  "klio-stdlib",
 ]
 

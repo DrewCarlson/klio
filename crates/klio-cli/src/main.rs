@@ -147,104 +147,7 @@ fn run_pack(cmd: PackCmd) -> ExitCode {
 }
 
 fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, String> {
-    use klio_pack::schema::{
-        encode, Binding, BindingKind, BindingManifest, PackManifest, Purity, SymbolIndex,
-        SymbolRecord,
-    };
-    use klio_pack::{section_names, Compression, PackWriter};
-
-    let manifest = PackManifest {
-        library_id: "stdlib".into(),
-        library_version: env!("CARGO_PKG_VERSION").into(),
-        abi_version: 1,
-        implicit_packages: klio_stdlib::IMPLICITLY_IMPORTED_PACKAGES
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect(),
-        dependencies: vec![],
-    };
-    let manifest_bytes = encode(&manifest).map_err(|e| e.to_string())?;
-
-    // Symbol index: every entry from STDLIB_SYMBOLS. Sort by FQN so
-    // the encoded section is byte-deterministic.
-    let mut sym_entries: Vec<SymbolRecord> = klio_stdlib::generated::STDLIB_SYMBOLS
-        .iter()
-        .map(symbol_entry_to_record)
-        .collect();
-    sym_entries.sort_by(|a, b| a.fqn.cmp(&b.fqn));
-    let symbol_index = SymbolIndex { entries: sym_entries };
-    let symbol_bytes = encode(&symbol_index).map_err(|e| e.to_string())?;
-
-    // Bindings: every FQN with a native impl. Today that's the union
-    // of the hand-written TABLE and any STDLIB_SYMBOLS row whose
-    // `impl_fn` is `Some`.
-    let mut bindings: Vec<Binding> = Vec::new();
-    let mut seen = std::collections::BTreeSet::<String>::new();
-    for fqn in klio_stdlib::all_symbol_names() {
-        if klio_stdlib::implementation(fqn).is_none() {
-            continue;
-        }
-        if !seen.insert(fqn.to_string()) {
-            continue;
-        }
-        let (min_arity, max_arity) = arity_for_fqn(fqn);
-        bindings.push(Binding {
-            fqn: fqn.to_string(),
-            kind: BindingKind::Function,
-            host_symbol: fqn.to_string(),
-            overrides_interpreter: true,
-            purity: Purity::Effectful,
-            min_arity,
-            max_arity,
-        });
-    }
-    bindings.sort_by(|a, b| a.fqn.cmp(&b.fqn));
-    let binding_manifest = BindingManifest { bindings };
-    let binding_bytes = encode(&binding_manifest).map_err(|e| e.to_string())?;
-
-    let mut writer = PackWriter::new();
-    writer.add_raw(section_names::MANIFEST, manifest_bytes);
-    writer.add_section(
-        section_names::SYMBOLS,
-        symbol_bytes,
-        if compress_symbols { Compression::Zstd } else { Compression::None },
-    );
-    writer.add_raw(section_names::BINDINGS, binding_bytes);
-    writer.finish().map_err(|e| e.to_string())
-}
-
-fn arity_for_fqn(fqn: &str) -> (u8, u8) {
-    let pn = klio_stdlib::param_names(fqn).unwrap_or(&[]);
-    let count: u8 = pn.len().min(u8::MAX as usize) as u8;
-    (count, count)
-}
-
-fn symbol_entry_to_record(e: &klio_stdlib::SymbolEntry) -> klio_pack::schema::SymbolRecord {
-    use klio_pack::schema::{ModifierBits, SourceLoc, SymbolKind, SymbolRecord};
-    let kind = match e.kind {
-        klio_stdlib::SymbolKind::Function => SymbolKind::Function,
-        klio_stdlib::SymbolKind::Property => SymbolKind::Property,
-        klio_stdlib::SymbolKind::Class => SymbolKind::Class,
-        klio_stdlib::SymbolKind::Interface => SymbolKind::Interface,
-        klio_stdlib::SymbolKind::Object => SymbolKind::Object,
-        klio_stdlib::SymbolKind::TypeAlias => SymbolKind::TypeAlias,
-    };
-    let modifiers = ModifierBits::from_bits_truncate(e.modifiers.0);
-    SymbolRecord {
-        fqn: e.fqn.to_string(),
-        package: e.package.to_string(),
-        name: e.name.to_string(),
-        kind,
-        receiver: e.receiver.map(str::to_string),
-        signature: e.signature.to_string(),
-        param_names: e.param_names.iter().map(|s| (*s).to_string()).collect(),
-        modifiers,
-        source: Some(SourceLoc {
-            path: e.source.path.to_string(),
-            line: e.source.line,
-            column: e.source.column,
-        }),
-    }
+    klio_stdlib::build_stdlib_pack(compress_symbols).map_err(|e| e.to_string())
 }
 
 fn write_pack(out: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -341,7 +244,7 @@ fn run_smoke(pack_path: &std::path::Path, smoke: &std::path::Path) -> Result<(),
     let installed = interp
         .install_pack(&pack, &host)
         .map_err(|e| format!("install_pack: {e}"))?;
-    eprintln!("installed {installed} bindings from pack");
+    eprintln!("installed {installed} bindings from {}", pack_path.display());
 
     let mut map = SourceMap::new();
     let id = load(&mut map, smoke).ok_or_else(|| format!("cannot read {}", smoke.display()))?;
@@ -474,10 +377,9 @@ fn run_module_files(paths: &[PathBuf]) -> ExitCode {
         let _ = tc.diagnostics.render(&map, std::io::stderr());
         return ExitCode::FAILURE;
     }
-    match Interpreter::new()
-        .with_expr_types(tc.types.clone())
-        .run_module(&asts)
-    {
+    let mut interp = Interpreter::new().with_expr_types(tc.types.clone());
+    install_embedded_stdlib(&mut interp);
+    match interp.run_module(&asts) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("runtime error: {e}");
@@ -506,13 +408,28 @@ fn run_file(path: &std::path::Path) -> ExitCode {
         let _ = tc.diagnostics.render(&map, std::io::stderr());
         return ExitCode::FAILURE;
     }
-    match Interpreter::new().with_expr_types(tc.types.clone()).run(&ast) {
+    let mut interp = Interpreter::new().with_expr_types(tc.types.clone());
+    install_embedded_stdlib(&mut interp);
+    match interp.run(&ast) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("runtime error: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Install the embedded `stdlib.klio-pack` into the interpreter. Used
+/// by the default `run` paths so the canonical entry point exercises
+/// the pack-loading path; the static `klio_stdlib::implementation`
+/// table remains as a fallback for FQNs no pack has bound.
+fn install_embedded_stdlib(interp: &mut Interpreter) {
+    let bytes = klio_stdlib_pack::stdlib_pack_bytes().into_owned();
+    let Ok(pack) = klio_pack::PackReader::from_bytes(bytes) else {
+        return;
+    };
+    let host = klio_stdlib::HostBindings::with_stdlib_defaults();
+    let _ = interp.install_pack(&pack, &host);
 }
 
 fn run_repl() -> ExitCode {
