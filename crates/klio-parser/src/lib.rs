@@ -1466,8 +1466,21 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 }
             }
             // `parse_type` already consumed the `Ident` and any trailing
-            // `?`; now consume the dot before the function name.
-            self.expect(&TokenKind::Dot, "`.`")?;
+            // `?`; now consume the dot before the function name. `T?.foo`
+            // lexes the `?.` as one `QuestionDot` token — handle that case
+            // by flagging the receiver nullable and treating the same token
+            // as the separating dot.
+            if matches!(self.peek_kind(), TokenKind::QuestionDot) {
+                if let Some(ref mut t) = ty {
+                    t.nullable = true;
+                    let qd = self.bump();
+                    t.span = t.span.join(qd.span);
+                } else {
+                    self.bump();
+                }
+            } else {
+                self.expect(&TokenKind::Dot, "`.`")?;
+            }
             self.skip_nl();
             ty
         } else {
@@ -1616,6 +1629,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         if self.tokens.get(j).map(|t| t.kind.is_question()).unwrap_or(false) {
             j += 1;
         }
+        // `T?.foo` lexes the `?.` as a single `QuestionDot` token; treat it
+        // as nullable-receiver followed by the member separator.
+        if matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::QuestionDot)) {
+            return matches!(self.tokens.get(j + 1).map(|t| &t.kind), Some(TokenKind::Ident));
+        }
         matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Dot))
             && matches!(self.tokens.get(j + 1).map(|t| &t.kind), Some(TokenKind::Ident))
     }
@@ -1726,8 +1744,18 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         let mutable = matches!(kw_tok.kind, TokenKind::Keyword(Keyword::Var));
         self.skip_nl();
         let receiver_type = if self.looks_like_extension_receiver() {
-            let ty = self.parse_type();
-            self.expect(&TokenKind::Dot, "`.`")?;
+            let mut ty = self.parse_type();
+            if matches!(self.peek_kind(), TokenKind::QuestionDot) {
+                if let Some(ref mut t) = ty {
+                    t.nullable = true;
+                    let qd = self.bump();
+                    t.span = t.span.join(qd.span);
+                } else {
+                    self.bump();
+                }
+            } else {
+                self.expect(&TokenKind::Dot, "`.`")?;
+            }
             self.skip_nl();
             ty
         } else {

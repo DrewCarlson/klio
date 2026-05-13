@@ -921,6 +921,31 @@ impl Interpreter {
                 }
             }
         }
+        // Nullable-receiver fallback: when the value is null and no concrete
+        // key matched, dispatch through any extension whose declared
+        // receiver type carries a `?`. Matches `fun T?.foo()` shape.
+        if chosen.is_none() && matches!(receiver, Value::Null) {
+            for list in self.extensions.values() {
+                for ext in list {
+                    let nullable_recv = ext
+                        .decl
+                        .receiver_type
+                        .as_ref()
+                        .map(|r| r.nullable)
+                        .unwrap_or(false);
+                    if nullable_recv
+                        && ext.decl.name.name == name
+                        && args.len() <= ext.decl.params.len()
+                    {
+                        chosen = Some(ext.clone());
+                        break;
+                    }
+                }
+                if chosen.is_some() {
+                    break;
+                }
+            }
+        }
         // Generic extension fallback: `fun <T> T.foo(...)` registers under
         // the type-parameter name `T`. Match any receiver when no concrete
         // key has answered first.

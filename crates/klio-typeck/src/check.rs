@@ -7262,7 +7262,27 @@ impl<'r> Checker<'r> {
             // receiver was just typed above (its `expr_class` is now in
             // the map); walk the recv class chain looking for an
             // extension matching `name` and first-fit on arg types.
-            if let Some(cn) = self.expr_class.get(&receiver.span()).cloned() {
+            // For a nullable receiver `s: T?`, expr_class is typically not
+            // set. Derive the head-class name from the receiver type so
+            // extension lookup against `T?.foo` extensions still works.
+            let class_from_ty: Option<String> = match self.expr_class.get(&receiver.span()).cloned() {
+                Some(cn) => Some(cn),
+                None => {
+                    let recv_ty = self.check_expr(receiver, None);
+                    match recv_ty.non_null() {
+                        Type::Generic { name, .. } => Some(name.clone()),
+                        Type::String => Some("String".to_string()),
+                        Type::Int => Some("Int".to_string()),
+                        Type::Long => Some("Long".to_string()),
+                        Type::Boolean => Some("Boolean".to_string()),
+                        Type::Char => Some("Char".to_string()),
+                        Type::Double => Some("Double".to_string()),
+                        Type::Float => Some("Float".to_string()),
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(cn) = class_from_ty {
                 // Visibility check on member method calls. Runs before
                 // extension fallback so a private member on the receiver's
                 // class is flagged at the use site.
