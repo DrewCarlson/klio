@@ -13,6 +13,7 @@
 
 pub mod format;
 pub mod read;
+pub mod schema;
 pub mod write;
 
 pub use format::{

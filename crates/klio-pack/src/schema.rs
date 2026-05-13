@@ -1,0 +1,263 @@
+//! High-level pack section schemas.
+//!
+//! M0 ships the container; this module adds the typed payloads carried
+//! inside well-known section names. Every type here is `Serialize +
+//! Deserialize`; sections are stored as `postcard::to_allocvec(&value)`
+//! bytes inside the [`crate::format::SectionDirectory`] envelope.
+//!
+//! The Serde representations are stable for a given
+//! [`crate::format::FORMAT_VERSION`]. When the schema changes
+//! incompatibly, bump that constant.
+
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------
+// manifest
+// ---------------------------------------------------------------------
+
+/// Top-level pack metadata. Always present, always uncompressed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackManifest {
+    /// Library identifier, e.g. `"stdlib"`, `"kotlinx.coroutines"`, or
+    /// `"myorg.crypto"`. Used to key the pack inside the host registry.
+    pub library_id: String,
+    /// Semantic version of the library packaged here.
+    pub library_version: String,
+    /// Format-level ABI version for native bindings. Bumped when the
+    /// `StdlibFn` signature changes; readers reject packs with an ABI
+    /// they don't understand.
+    pub abi_version: u32,
+    /// Packages whose top-level entities are implicitly visible after
+    /// this pack is loaded (Kotlin language spec §10.1).
+    pub implicit_packages: Vec<String>,
+    /// Other packs this pack depends on, by `library_id`. Loader walks
+    /// these in topological order.
+    pub dependencies: Vec<PackDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackDependency {
+    pub library_id: String,
+    /// Optional minimum semantic version. Empty when any version is OK.
+    pub min_version: String,
+}
+
+// ---------------------------------------------------------------------
+// symbols
+// ---------------------------------------------------------------------
+
+/// Symbol index for the pack. One entry per public declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolIndex {
+    pub entries: Vec<SymbolRecord>,
+}
+
+/// Kind of a declared symbol. Mirrors the small enum carried in
+/// `klio-stdlib::SymbolKind`, but lives here so the schema does not
+/// depend on the stdlib crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum SymbolKind {
+    Function = 0,
+    Property = 1,
+    Class = 2,
+    Interface = 3,
+    Object = 4,
+    TypeAlias = 5,
+}
+
+bitflags::bitflags! {
+    /// Kotlin modifier bits attached to a symbol. The layout matches
+    /// the bit positions in `klio-stdlib::Modifiers` so we can
+    /// round-trip without a translation table.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+    pub struct ModifierBits: u32 {
+        const PUBLIC     = 1 << 0;
+        const INTERNAL   = 1 << 1;
+        const PROTECTED  = 1 << 2;
+        const PRIVATE    = 1 << 3;
+        const OPEN       = 1 << 4;
+        const ABSTRACT   = 1 << 5;
+        const FINAL      = 1 << 6;
+        const SEALED     = 1 << 7;
+        const INLINE     = 1 << 8;
+        const INFIX      = 1 << 9;
+        const OPERATOR   = 1 << 10;
+        const TAILREC    = 1 << 11;
+        const EXPECT     = 1 << 12;
+        const ACTUAL     = 1 << 13;
+        const EXTERNAL   = 1 << 14;
+        const SUSPEND    = 1 << 15;
+        const OVERRIDE   = 1 << 16;
+        const DATA       = 1 << 17;
+        const VALUE      = 1 << 18;
+        const ENUM       = 1 << 19;
+        const ANNOTATION = 1 << 20;
+        const COMPANION  = 1 << 21;
+        const CONST      = 1 << 22;
+    }
+}
+
+/// One declared symbol. Designed to round-trip
+/// `klio_stdlib::SymbolEntry` without information loss.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolRecord {
+    /// Fully qualified name (`kotlin.collections.listOf`).
+    pub fqn: String,
+    /// Package path (`kotlin.collections`).
+    pub package: String,
+    /// Simple name (`listOf`).
+    pub name: String,
+    pub kind: SymbolKind,
+    /// Extension receiver type as text, if any.
+    pub receiver: Option<String>,
+    /// Raw textual signature (trimmed source line).
+    pub signature: String,
+    /// Parameter names in declaration order. Empty for non-function
+    /// declarations.
+    pub param_names: Vec<String>,
+    pub modifiers: ModifierBits,
+    /// Upstream source location, for go-to-definition / tooling.
+    pub source: Option<SourceLoc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceLoc {
+    pub path: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+// ---------------------------------------------------------------------
+// bindings
+// ---------------------------------------------------------------------
+
+/// Map of FQN → native binding for the host to install at load time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingManifest {
+    pub bindings: Vec<Binding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Binding {
+    /// Kotlin FQN this binding satisfies (`kotlin.io.println`).
+    pub fqn: String,
+    pub kind: BindingKind,
+    /// Logical host-symbol key the loader uses to resolve the Rust
+    /// function pointer via [`HostBindings::resolve`]. Convention is
+    /// the FQN — same identifier on both sides — but the schema keeps
+    /// them separate so a host may register a single Rust function
+    /// under multiple Kotlin names.
+    pub host_symbol: String,
+    /// True when the binding always wins over an interpreted body for
+    /// this FQN; false when the binding is a fast path and the
+    /// interpreter may still fall through to a Kotlin implementation
+    /// shipped in the `ast` section.
+    pub overrides_interpreter: bool,
+    pub purity: Purity,
+    pub min_arity: u8,
+    pub max_arity: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum BindingKind {
+    Function = 0,
+    Property = 1,
+    ClassCtor = 2,
+    EnumEntry = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Purity {
+    Pure = 0,
+    Effectful = 1,
+    Suspend = 2,
+}
+
+// ---------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------
+
+/// Postcard-encode a value into bytes ready for the pack writer. A
+/// thin wrapper that pins us to a single serialiser at the boundary.
+pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, crate::PackError> {
+    postcard::to_allocvec(value).map_err(crate::PackError::Encode)
+}
+
+/// Postcard-decode a section payload.
+pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, crate::PackError> {
+    postcard::from_bytes(bytes).map_err(crate::PackError::Decode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{section_names, PackReader, PackWriter};
+
+    #[test]
+    fn manifest_round_trip_through_pack() {
+        let manifest = PackManifest {
+            library_id: "stdlib".into(),
+            library_version: "0.1.0".into(),
+            abi_version: 1,
+            implicit_packages: vec![
+                "kotlin".into(),
+                "kotlin.collections".into(),
+            ],
+            dependencies: vec![],
+        };
+        let bytes = encode(&manifest).unwrap();
+        let mut w = PackWriter::new();
+        w.add_raw(section_names::MANIFEST, bytes);
+        let pack = w.finish().unwrap();
+
+        let reader = PackReader::from_bytes(pack).unwrap();
+        let payload = reader.read_section(section_names::MANIFEST).unwrap().unwrap();
+        let decoded: PackManifest = decode(&payload).unwrap();
+        assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn symbol_record_round_trip() {
+        let index = SymbolIndex {
+            entries: vec![SymbolRecord {
+                fqn: "kotlin.io.println".into(),
+                package: "kotlin.io".into(),
+                name: "println".into(),
+                kind: SymbolKind::Function,
+                receiver: None,
+                signature: "public fun println(message: Any?): Unit".into(),
+                param_names: vec!["message".into()],
+                modifiers: ModifierBits::PUBLIC,
+                source: Some(SourceLoc {
+                    path: "kotlin/libraries/stdlib/src/kotlin/io/Console.kt".into(),
+                    line: 42,
+                    column: 1,
+                }),
+            }],
+        };
+        let bytes = encode(&index).unwrap();
+        let decoded: SymbolIndex = decode(&bytes).unwrap();
+        assert_eq!(decoded, index);
+    }
+
+    #[test]
+    fn binding_manifest_round_trip() {
+        let manifest = BindingManifest {
+            bindings: vec![Binding {
+                fqn: "kotlin.io.println".into(),
+                kind: BindingKind::Function,
+                host_symbol: "kotlin.io.println".into(),
+                overrides_interpreter: true,
+                purity: Purity::Effectful,
+                min_arity: 0,
+                max_arity: 1,
+            }],
+        };
+        let bytes = encode(&manifest).unwrap();
+        let decoded: BindingManifest = decode(&bytes).unwrap();
+        assert_eq!(decoded, manifest);
+    }
+}

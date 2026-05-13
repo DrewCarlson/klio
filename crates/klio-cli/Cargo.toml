@@ -18,6 +18,8 @@ klio-resolver    = { workspace = true }
 klio-typeck      = { workspace = true }
 klio-interp      = { workspace = true }
 klio-ast         = { workspace = true }
+klio-pack        = { workspace = true }
+klio-stdlib      = { workspace = true }
 clap            = { workspace = true }
 rustyline       = { workspace = true }
 
