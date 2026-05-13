@@ -5605,8 +5605,8 @@ impl<'r> Checker<'r> {
                     let name = &segments[0].name;
                     self.enforce_dsl_scope_for_member(name, *span);
                     if let Some(cn) = self
-                        .lookup_narrowed_class(name)
-                        .or_else(|| self.cfg_narrowed_class_at(name, *span))
+                        .cfg_narrowed_class_at(name, *span)
+                        .or_else(|| self.lookup_narrowed_class(name))
                     {
                         self.expr_class.insert(*span, cn);
                     }
@@ -5663,8 +5663,8 @@ impl<'r> Checker<'r> {
             Expr::Member { receiver, name, safe, span } => {
                 if let Some(key) = dot_path_key(expr) {
                     if let Some(cn) = self
-                        .lookup_narrowed_class(&key)
-                        .or_else(|| self.cfg_narrowed_class_at(&key, *span))
+                        .cfg_narrowed_class_at(&key, *span)
+                        .or_else(|| self.lookup_narrowed_class(&key))
                     {
                         self.expr_class.insert(*span, cn);
                     }
@@ -8794,16 +8794,15 @@ impl<'r> Checker<'r> {
     }
 
     /// Narrowed type at the expression located at `query_span`.
-    /// Consults the existing `Frame.narrowings` (still the source of
-    /// truth) and falls back to the CFG when the frames have nothing
-    /// to say. This is the wiring point for the M-CFA migration:
-    /// once the CFG covers every case the frames do, the fallback
-    /// becomes the primary and the frames drop out.
+    /// CFG-derived narrowings take primacy; the legacy frame stack
+    /// remains as a safety net for scope-function receiver narrowings
+    /// and a handful of other cases the CFG does not yet cover.
+    /// Once the CFG covers every gap the frames drop out entirely.
     fn lookup_narrowed_at(&self, name: &str, query_span: Span) -> Option<Type> {
-        if let Some(t) = self.lookup_narrowed(name) {
+        if let Some(t) = self.cfg_narrowed_at(name, query_span) {
             return Some(t);
         }
-        self.cfg_narrowed_at(name, query_span)
+        self.lookup_narrowed(name)
     }
 
     /// CFG-derived narrowed type for `name` at `query_span`. Walks
