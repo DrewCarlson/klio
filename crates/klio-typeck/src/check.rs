@@ -774,6 +774,23 @@ struct Checker<'a> {
     /// Stack of currently-active function spans so per-expression
     /// queries know which CFG to read.
     cfg_fn_stack: Vec<Span>,
+    /// Active multi-call inference session, if any. When `Some`,
+    /// a nested generic call defers its solve and contributes its
+    /// fresh inference vars and bounds to this session; the root
+    /// call solves and substitutes once.
+    inference_session: Option<InferenceSession>,
+}
+
+/// Shared constraint system threaded through every generic call in a
+/// single source-level expression. Replaces the per-call one-shot
+/// solve when a call is nested inside another generic call's
+/// arguments, so the outer call can incorporate constraints derived
+/// from the inner one's return type before any variable is fixed.
+struct InferenceSession {
+    cs: klio_types::constraints::ConstraintSystem,
+    /// True when a nested call is currently using the session.
+    /// The outermost entry resets to `false` on exit and solves.
+    depth: u32,
 }
 
 /// Description of a user-declared `typealias`.
@@ -824,6 +841,7 @@ impl<'a> Checker<'a> {
             cfgs: HashMap::new(),
             lowerings: HashMap::new(),
             cfg_fn_stack: Vec::new(),
+            inference_session: None,
         }
     }
 
@@ -7630,13 +7648,11 @@ impl<'r> Checker<'r> {
         self.infer_call_return_with_args(sig, arg_tys, &[], call_span)
     }
 
-    /// Same as `infer_call_return` but also re-types every lambda
-    /// argument once the surrounding inference resolves any of the
-    /// callee's type parameters (M-Constraints Phase 4: postponed
-    /// lambda body checking). The re-pass updates `self.types` with
-    /// the body's refined types and feeds the resulting return type
-    /// back into the constraint system so the call-site return type
-    /// reflects the body's contribution.
+    /// Spec §13 inference, run inside a multi-call session so nested
+    /// generic calls in `args` contribute to a single solver. The
+    /// outermost call solves once and substitutes; inner calls
+    /// return their fresh-var-bearing return type for the outer to
+    /// continue constraining.
     fn infer_call_return_with_args(
         &mut self,
         sig: &FnSig,
@@ -7650,93 +7666,121 @@ impl<'r> Checker<'r> {
         if sig.type_param_count == 0 || sig.type_param_names.is_empty() {
             return sig.return_ty.clone();
         }
-        let mut cs = ConstraintSystem::new();
-        let mut subst: std::collections::HashMap<String, Type> =
+        let is_root = self.inference_session.is_none();
+        if is_root {
+            self.inference_session = Some(InferenceSession {
+                cs: ConstraintSystem::new(),
+                depth: 0,
+            });
+        }
+        let mut local_subst: std::collections::HashMap<String, Type> =
             std::collections::HashMap::new();
         let mut vars: Vec<klio_types::constraints::InferenceVar> = Vec::new();
-        for name in &sig.type_param_names {
-            let (v, t) = cs.fresh(name);
-            cs.set_preference(v, SolutionPreference::PullUp);
-            subst.insert(name.clone(), t);
-            vars.push(v);
-        }
-        for (i, p) in sig.params.iter().enumerate() {
-            if let Some(at) = arg_tys.get(i) {
-                if matches!(at, Type::Unresolved) {
-                    continue;
-                }
-                let p_with_vars = substitute_type_params(p, &subst);
-                cs.add_constraint_with(
-                    at.clone(),
-                    p_with_vars,
-                    ConstraintKind::Subtype,
-                    Provenance::CallSite { span: call_span, arg_idx: i },
-                );
+        {
+            let session = self.inference_session.as_mut().unwrap();
+            session.depth += 1;
+            for name in &sig.type_param_names {
+                let unique = format!("{name}@{}-{}", call_span.start, call_span.end);
+                let (v, t) = session.cs.fresh(&unique);
+                session.cs.set_preference(v, SolutionPreference::PullUp);
+                local_subst.insert(name.clone(), t);
+                vars.push(v);
             }
-        }
-        if let Err(_e) = cs.solve_to_fixpoint() {
-            let mut msg = "type inference failed for this call".to_string();
-            if let Some((_err, prov)) = cs.last_error() {
-                if let Provenance::CallSite { arg_idx, .. } = prov {
-                    msg = format!(
-                        "type inference failed for this call; argument {} does not satisfy the inferred parameter type",
-                        arg_idx + 1
+            for (i, p) in sig.params.iter().enumerate() {
+                if let Some(at) = arg_tys.get(i) {
+                    if matches!(at, Type::Unresolved) {
+                        continue;
+                    }
+                    let p_with_vars = substitute_type_params(p, &local_subst);
+                    session.cs.add_constraint_with(
+                        at.clone(),
+                        p_with_vars,
+                        ConstraintKind::Subtype,
+                        Provenance::CallSite { span: call_span, arg_idx: i },
                     );
                 }
             }
-            self.diagnostics
-                .emit(Diagnostic::error(msg, call_span).with_code(codes::TYPE_INFERENCE_FAILED));
-            return sig.return_ty.clone();
         }
-        let staged = cs.solve_staged();
-        let legacy = cs.solve();
-        let mut final_subst: std::collections::HashMap<String, Type> =
-            std::collections::HashMap::new();
-        for (i, name) in sig.type_param_names.iter().enumerate() {
-            if let Some(v) = vars.get(i) {
-                let pick = staged.get(v).or_else(|| legacy.get(v));
-                if let Some(t) = pick {
-                    if !matches!(t, Type::Nothing) {
-                        final_subst.insert(name.clone(), t.clone());
+        // The return type carries our fresh inference vars. Outer
+        // call resolution (and Phase 4 lambda re-typing) sees them
+        // as `TypeParam(...)` which downstream checks treat
+        // permissively. When we are the root call, we solve below
+        // and replace them with the concrete substitution.
+        let mut returned = substitute_type_params(&sig.return_ty, &local_subst);
+        // Phase 4: re-check lambda args with substituted expected
+        // types when the outer call has begun to refine them.
+        // Works without a final solution because the partial
+        // substitution maps every TypeParam(name) we own to its
+        // session var, and the smart-cast walk through cfg_narrowed_at
+        // returns concrete types where it can.
+        let mut final_subst = local_subst.clone();
+        if is_root {
+            let session = self.inference_session.as_mut().unwrap();
+            if let Err(_e) = session.cs.solve_to_fixpoint() {
+                let mut msg = "type inference failed for this call".to_string();
+                if let Some((_err, prov)) = session.cs.last_error() {
+                    if let Provenance::CallSite { arg_idx, .. } = prov {
+                        msg = format!(
+                            "type inference failed for this call; argument {} does not satisfy the inferred parameter type",
+                            arg_idx + 1
+                        );
+                    }
+                }
+                self.diagnostics
+                    .emit(Diagnostic::error(msg, call_span).with_code(codes::TYPE_INFERENCE_FAILED));
+                session.depth -= 1;
+                if session.depth == 0 {
+                    self.inference_session = None;
+                }
+                return sig.return_ty.clone();
+            }
+            let staged = session.cs.solve_staged();
+            let legacy = session.cs.solve();
+            for (i, name) in sig.type_param_names.iter().enumerate() {
+                if let Some(v) = vars.get(i) {
+                    let pick = staged.get(v).or_else(|| legacy.get(v));
+                    if let Some(t) = pick {
+                        if !matches!(t, Type::Nothing) {
+                            final_subst.insert(name.clone(), t.clone());
+                        }
                     }
                 }
             }
         }
-        // Phase 4: re-type each lambda argument with the substituted
-        // expected type. The body then sees concrete parameter types
-        // and contributes its actual return type back to the
-        // solution. This is the postponed-lambda mechanism flattened
-        // into a single re-pass — sufficient for non-chained
-        // builder-style inference.
-        let mut return_substituted = substitute_type_params(&sig.return_ty, &final_subst);
-        for (i, arg) in args.iter().enumerate() {
-            if !matches!(arg, Expr::Lambda { .. }) {
-                continue;
-            }
-            let Some(param_ty) = sig.params.get(i) else { continue };
-            let expected = substitute_type_params(param_ty, &final_subst);
-            if !expected_changed(param_ty, &expected) {
-                continue;
-            }
-            let refined = self.check_expr(arg, Some(&expected));
-            // If the lambda's return type contributed a previously
-            // unresolved part of the call's return type, fold the
-            // refinement into the substitution and rebuild the
-            // return type.
-            if let (
-                Type::Function { return_type: r_expected, .. },
-                Type::Function { return_type: r_refined, .. },
-            ) = (&expected, &refined)
-            {
-                if let Type::TypeParam(name) = r_expected.as_ref() {
-                    if !matches!(**r_refined, Type::Unresolved | Type::Nothing) {
-                        final_subst.insert(name.clone(), (**r_refined).clone());
+        // Phase 4 lambda re-typing — only meaningful at the root,
+        // since the substitution carries the fully-solved types.
+        if is_root {
+            for (i, arg) in args.iter().enumerate() {
+                if !matches!(arg, Expr::Lambda { .. }) {
+                    continue;
+                }
+                let Some(param_ty) = sig.params.get(i) else { continue };
+                let expected = substitute_type_params(param_ty, &final_subst);
+                if !expected_changed(param_ty, &expected) {
+                    continue;
+                }
+                let refined = self.check_expr(arg, Some(&expected));
+                if let (
+                    Type::Function { return_type: r_expected, .. },
+                    Type::Function { return_type: r_refined, .. },
+                ) = (&expected, &refined)
+                {
+                    if let Type::TypeParam(name) = r_expected.as_ref() {
+                        if !matches!(**r_refined, Type::Unresolved | Type::Nothing) {
+                            final_subst.insert(name.clone(), (**r_refined).clone());
+                        }
                     }
                 }
             }
-            return_substituted = substitute_type_params(&sig.return_ty, &final_subst);
+            returned = substitute_type_params(&sig.return_ty, &final_subst);
         }
-        return_substituted
+        let session = self.inference_session.as_mut().unwrap();
+        session.depth -= 1;
+        if is_root {
+            // The root closes the session after substitution.
+            self.inference_session = None;
+        }
+        returned
     }
 
     fn check_arity_and_args(&mut self, sig: &FnSig, args: &[Expr], call_span: Span) {
