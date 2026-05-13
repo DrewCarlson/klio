@@ -7793,6 +7793,10 @@ impl Interpreter {
                         out,
                     );
                 }
+                if let Some(out_val) = self.try_eval_scoping_member(&recv, &name.name, args, env, out)?
+                {
+                    return Ok(out_val);
+                }
                 return Err(RuntimeError::Unimplemented(format!(
                     "{}.{}",
                     class.fqn, name.name
