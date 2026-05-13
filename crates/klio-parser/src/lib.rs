@@ -3002,7 +3002,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.skip_nl();
         let kind = self.peek_kind().clone();
         match kind {
-            TokenKind::IntLiteral { base, suffix: _ } => Some(self.parse_int_literal(base)),
+            TokenKind::IntLiteral { base, suffix } => Some(self.parse_int_literal(base, suffix)),
             TokenKind::FloatLiteral { suffix: _ } => Some(self.parse_float_literal()),
             TokenKind::BoolLiteral(v) => {
                 let tok = self.bump();
@@ -3130,7 +3130,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         }
     }
 
-    fn parse_int_literal(&mut self, base: klio_lexer::NumBase) -> Expr {
+    fn parse_int_literal(
+        &mut self,
+        base: klio_lexer::NumBase,
+        suffix: klio_lexer::IntSuffix,
+    ) -> Expr {
         let tok = self.bump();
         let raw_text = self.text(tok.span);
         let (digits, radix): (&str, u32) = match base {
@@ -3146,16 +3150,16 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 2,
             ),
         };
-        let has_l_suffix = raw_text.ends_with('L');
         let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
         let value: i64 = i64::from_str_radix(&cleaned, radix).unwrap_or_else(|_| {
             self.error("E0010", "integer literal out of range", tok.span);
             0
         });
-        let kind = if has_l_suffix {
-            klio_ast::IntLitKind::Long
-        } else {
-            klio_ast::IntLitKind::Int
+        let kind = match suffix {
+            klio_lexer::IntSuffix::Long => klio_ast::IntLitKind::Long,
+            klio_lexer::IntSuffix::UInt => klio_ast::IntLitKind::UInt,
+            klio_lexer::IntSuffix::ULong => klio_ast::IntLitKind::ULong,
+            klio_lexer::IntSuffix::None => klio_ast::IntLitKind::Int,
         };
         Expr::IntLit { value, kind, span: tok.span }
     }

@@ -5565,15 +5565,29 @@ impl<'r> Checker<'r> {
     fn compute_expr_ty(&mut self, expr: &Expr, expected: Option<&Type>) -> Type {
         match expr {
             Expr::IntLit { kind, .. } => {
-                // Suffix-typed `1L` is unconditionally Long. An unsuffixed
-                // integer literal coerces to any narrow integer / Long when
-                // an expected type drives the call site (kotlinc-native
-                // semantics for constant operands).
-                if matches!(kind, klio_ast::IntLitKind::Long) {
-                    return Type::Long;
+                // Suffix-typed literals pin their type unconditionally:
+                // `1L` is Long, `1u` is UInt, `1uL` is ULong. An
+                // unsuffixed integer literal coerces to any narrow
+                // integer / Long / unsigned variant when an expected
+                // type drives the call site.
+                match kind {
+                    klio_ast::IntLitKind::Long => return Type::Long,
+                    klio_ast::IntLitKind::UInt => return Type::UInt,
+                    klio_ast::IntLitKind::ULong => return Type::ULong,
+                    klio_ast::IntLitKind::Int => {}
                 }
                 if let Some(t) = expected {
-                    if matches!(t.non_null(), Type::Long | Type::Short | Type::Byte | Type::Int) {
+                    if matches!(
+                        t.non_null(),
+                        Type::Long
+                            | Type::Short
+                            | Type::Byte
+                            | Type::Int
+                            | Type::UInt
+                            | Type::ULong
+                            | Type::UShort
+                            | Type::UByte
+                    ) {
                         return t.non_null().clone();
                     }
                 }

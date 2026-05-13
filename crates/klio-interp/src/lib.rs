@@ -1593,6 +1593,8 @@ impl Interpreter {
             Expr::IntLit { value, kind, .. } => match kind {
                 klio_ast::IntLitKind::Long => Ok(Value::Long(*value)),
                 klio_ast::IntLitKind::Int => Ok(Value::new_int(*value as i32)),
+                klio_ast::IntLitKind::UInt => Ok(Value::UInt(*value as u32)),
+                klio_ast::IntLitKind::ULong => Ok(Value::ULong(*value as u64)),
             },
             Expr::BoolLit { value, .. } => Ok(Value::Bool(*value)),
             Expr::NullLit { .. } => Ok(Value::Null),
@@ -3447,6 +3449,10 @@ impl Interpreter {
             "byteArrayOf" => Some(PrimitiveArrayKind::Byte),
             "booleanArrayOf" => Some(PrimitiveArrayKind::Boolean),
             "charArrayOf" => Some(PrimitiveArrayKind::Char),
+            "uintArrayOf" => Some(PrimitiveArrayKind::UInt),
+            "ulongArrayOf" => Some(PrimitiveArrayKind::ULong),
+            "ushortArrayOf" => Some(PrimitiveArrayKind::UShort),
+            "ubyteArrayOf" => Some(PrimitiveArrayKind::UByte),
             _ => None,
         };
         if let Some(k) = variadic_prim_kind {
@@ -3464,6 +3470,10 @@ impl Interpreter {
             | PrimitiveArrayKind::Long
             | PrimitiveArrayKind::Short
             | PrimitiveArrayKind::Byte => Value::Int(0),
+            PrimitiveArrayKind::UInt => Value::UInt(0),
+            PrimitiveArrayKind::ULong => Value::ULong(0),
+            PrimitiveArrayKind::UShort => Value::UShort(0),
+            PrimitiveArrayKind::UByte => Value::UByte(0),
             PrimitiveArrayKind::Double | PrimitiveArrayKind::Float => Value::Double(0.0),
             PrimitiveArrayKind::Boolean => Value::Bool(false),
             PrimitiveArrayKind::Char => Value::Char('\u{0}'),
@@ -9830,10 +9840,13 @@ fn eval_numeric_arith(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value, R
     let lr = l.numeric_rank().unwrap();
     let rr = r.numeric_rank().unwrap();
     let mut rank = lr.max(rr);
-    // Byte / Short arithmetic promotes to Int (Kotlin spec): the result of
-    // `b1 + b2` for two Bytes is an Int.
+    // Byte / Short arithmetic promotes to Int per Kotlin spec; UByte /
+    // UShort promote to UInt by the same rule.
     if matches!(rank, NumericRank::Byte | NumericRank::Short) {
         rank = NumericRank::Int;
+    }
+    if matches!(rank, NumericRank::UByte | NumericRank::UShort) {
+        rank = NumericRank::UInt;
     }
     Some(match rank {
         NumericRank::Int | NumericRank::Long => {
@@ -9867,6 +9880,37 @@ fn eval_numeric_arith(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value, R
             };
             Ok(Value::wrap_integer(rank, wide_result))
         }
+        NumericRank::UInt | NumericRank::ULong => {
+            let a = l.as_u64().unwrap();
+            let b = r.as_u64().unwrap();
+            let wide_result: u64 = match op {
+                BinOp::Add => a.wrapping_add(b),
+                BinOp::Sub => a.wrapping_sub(b),
+                BinOp::Mul => a.wrapping_mul(b),
+                BinOp::Div => {
+                    if b == 0 {
+                        return Some(Err(RuntimeError::Thrown(Value::Exception {
+                            fqn: Rc::new("kotlin.ArithmeticException".to_string()),
+                            message: Some(Rc::new("/ by zero".to_string())),
+                            cause: None,
+                        })));
+                    }
+                    a.wrapping_div(b)
+                }
+                BinOp::Rem => {
+                    if b == 0 {
+                        return Some(Err(RuntimeError::Thrown(Value::Exception {
+                            fqn: Rc::new("kotlin.ArithmeticException".to_string()),
+                            message: Some(Rc::new("/ by zero".to_string())),
+                            cause: None,
+                        })));
+                    }
+                    a.wrapping_rem(b)
+                }
+                _ => return None,
+            };
+            Ok(Value::wrap_unsigned(rank, wide_result))
+        }
         NumericRank::Float => {
             let a = l.as_f32().unwrap();
             let b = r.as_f32().unwrap();
@@ -9893,7 +9937,9 @@ fn eval_numeric_arith(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value, R
             };
             Ok(Value::Double(v))
         }
-        NumericRank::Byte | NumericRank::Short => unreachable!("promoted above"),
+        NumericRank::Byte | NumericRank::Short | NumericRank::UByte | NumericRank::UShort => {
+            unreachable!("promoted above")
+        }
     })
 }
 
@@ -9910,6 +9956,9 @@ fn eval_numeric_compare(op: BinOp, l: &Value, r: &Value) -> Option<bool> {
     let ord = match rank {
         NumericRank::Byte | NumericRank::Short | NumericRank::Int | NumericRank::Long => {
             l.as_i64().unwrap().cmp(&r.as_i64().unwrap())
+        }
+        NumericRank::UByte | NumericRank::UShort | NumericRank::UInt | NumericRank::ULong => {
+            l.as_u64().unwrap().cmp(&r.as_u64().unwrap())
         }
         NumericRank::Float => l.as_f32().unwrap().partial_cmp(&r.as_f32().unwrap())?,
         NumericRank::Double => l.as_f64().unwrap().partial_cmp(&r.as_f64().unwrap())?,

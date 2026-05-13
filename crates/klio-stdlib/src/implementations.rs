@@ -146,6 +146,76 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Byte.toShort", int_to_short),
     ("kotlin.Byte.toString", int_to_string),
 
+    // ----- toU* on signed integer receivers (cross-sign conversions) -----
+    ("kotlin.Int.toUByte", to_ubyte),
+    ("kotlin.Int.toUShort", to_ushort),
+    ("kotlin.Int.toUInt", to_uint),
+    ("kotlin.Int.toULong", to_ulong),
+    ("kotlin.Long.toUByte", to_ubyte),
+    ("kotlin.Long.toUShort", to_ushort),
+    ("kotlin.Long.toUInt", to_uint),
+    ("kotlin.Long.toULong", to_ulong),
+    ("kotlin.Short.toUByte", to_ubyte),
+    ("kotlin.Short.toUShort", to_ushort),
+    ("kotlin.Short.toUInt", to_uint),
+    ("kotlin.Short.toULong", to_ulong),
+    ("kotlin.Byte.toUByte", to_ubyte),
+    ("kotlin.Byte.toUShort", to_ushort),
+    ("kotlin.Byte.toUInt", to_uint),
+    ("kotlin.Byte.toULong", to_ulong),
+
+    // ----- UInt -----
+    ("kotlin.UInt.toByte", unsigned_to_byte),
+    ("kotlin.UInt.toShort", unsigned_to_short),
+    ("kotlin.UInt.toInt", unsigned_to_int),
+    ("kotlin.UInt.toLong", unsigned_to_long),
+    ("kotlin.UInt.toUByte", to_ubyte),
+    ("kotlin.UInt.toUShort", to_ushort),
+    ("kotlin.UInt.toUInt", to_uint),
+    ("kotlin.UInt.toULong", to_ulong),
+    ("kotlin.UInt.toDouble", unsigned_to_double),
+    ("kotlin.UInt.toFloat", unsigned_to_float),
+    ("kotlin.UInt.toString", unsigned_to_string),
+
+    // ----- ULong -----
+    ("kotlin.ULong.toByte", unsigned_to_byte),
+    ("kotlin.ULong.toShort", unsigned_to_short),
+    ("kotlin.ULong.toInt", unsigned_to_int),
+    ("kotlin.ULong.toLong", unsigned_to_long),
+    ("kotlin.ULong.toUByte", to_ubyte),
+    ("kotlin.ULong.toUShort", to_ushort),
+    ("kotlin.ULong.toUInt", to_uint),
+    ("kotlin.ULong.toULong", to_ulong),
+    ("kotlin.ULong.toDouble", unsigned_to_double),
+    ("kotlin.ULong.toFloat", unsigned_to_float),
+    ("kotlin.ULong.toString", unsigned_to_string),
+
+    // ----- UShort -----
+    ("kotlin.UShort.toByte", unsigned_to_byte),
+    ("kotlin.UShort.toShort", unsigned_to_short),
+    ("kotlin.UShort.toInt", unsigned_to_int),
+    ("kotlin.UShort.toLong", unsigned_to_long),
+    ("kotlin.UShort.toUByte", to_ubyte),
+    ("kotlin.UShort.toUShort", to_ushort),
+    ("kotlin.UShort.toUInt", to_uint),
+    ("kotlin.UShort.toULong", to_ulong),
+    ("kotlin.UShort.toDouble", unsigned_to_double),
+    ("kotlin.UShort.toFloat", unsigned_to_float),
+    ("kotlin.UShort.toString", unsigned_to_string),
+
+    // ----- UByte -----
+    ("kotlin.UByte.toByte", unsigned_to_byte),
+    ("kotlin.UByte.toShort", unsigned_to_short),
+    ("kotlin.UByte.toInt", unsigned_to_int),
+    ("kotlin.UByte.toLong", unsigned_to_long),
+    ("kotlin.UByte.toUByte", to_ubyte),
+    ("kotlin.UByte.toUShort", to_ushort),
+    ("kotlin.UByte.toUInt", to_uint),
+    ("kotlin.UByte.toULong", to_ulong),
+    ("kotlin.UByte.toDouble", unsigned_to_double),
+    ("kotlin.UByte.toFloat", unsigned_to_float),
+    ("kotlin.UByte.toString", unsigned_to_string),
+
     // ----- Double -----
     ("kotlin.Double.compareTo", double_compare_to),
     ("kotlin.Double.isFinite", double_is_finite),
@@ -1582,6 +1652,47 @@ fn long_to_double(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn long_to_float(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Float(recv_int(ctx.args, "Long.toFloat")? as f32))
+}
+
+fn recv_unsigned(args: &[Value], what: &str) -> Result<u64, RuntimeError> {
+    args.first()
+        .and_then(Value::as_u64)
+        .ok_or_else(|| RuntimeError::Type(format!("{what} requires an integer receiver")))
+}
+
+fn to_ubyte(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::UByte(recv_unsigned(ctx.args, "toUByte")? as u8))
+}
+fn to_ushort(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::UShort(recv_unsigned(ctx.args, "toUShort")? as u16))
+}
+fn to_uint(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::UInt(recv_unsigned(ctx.args, "toUInt")? as u32))
+}
+fn to_ulong(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::ULong(recv_unsigned(ctx.args, "toULong")?))
+}
+fn unsigned_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::new_int(recv_unsigned(ctx.args, "toInt")? as i64))
+}
+fn unsigned_to_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Long(recv_unsigned(ctx.args, "toLong")? as i64))
+}
+fn unsigned_to_short(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::new_short(recv_unsigned(ctx.args, "toShort")? as i64))
+}
+fn unsigned_to_byte(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::new_byte(recv_unsigned(ctx.args, "toByte")? as i64))
+}
+fn unsigned_to_double(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(recv_unsigned(ctx.args, "toDouble")? as f64))
+}
+fn unsigned_to_float(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Float(recv_unsigned(ctx.args, "toFloat")? as f32))
+}
+fn unsigned_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let v = recv_unsigned(ctx.args, "toString")?;
+    Ok(Value::String(std::rc::Rc::new(v.to_string())))
 }
 
 // Float receiver conversions.

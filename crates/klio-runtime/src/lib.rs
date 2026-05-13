@@ -31,6 +31,15 @@ pub enum Value {
     Long(i64),
     Short(i16),
     Byte(i8),
+    /// Unsigned integer. Kotlin's `UInt` / `ULong` / `UShort` /
+    /// `UByte` types are inline value classes wrapping the signed
+    /// integer; at the runtime level we store them as the matching
+    /// unsigned native and rely on the `kind` to pick the right
+    /// arithmetic + print semantics.
+    UInt(u32),
+    ULong(u64),
+    UShort(u16),
+    UByte(u8),
     Double(f64),
     /// Kotlin `Float`. Stored as `f32` so single-precision rounding matches
     /// kotlinc-native byte-identically.
@@ -232,8 +241,12 @@ pub enum NumericRank {
     Short = 1,
     Int = 2,
     Long = 3,
-    Float = 4,
-    Double = 5,
+    UByte = 4,
+    UShort = 5,
+    UInt = 6,
+    ULong = 7,
+    Float = 8,
+    Double = 9,
 }
 
 /// Identifies the typed Kotlin primitive-array variants so member
@@ -249,6 +262,10 @@ pub enum PrimitiveArrayKind {
     Byte,
     Boolean,
     Char,
+    UInt,
+    ULong,
+    UShort,
+    UByte,
 }
 
 impl PrimitiveArrayKind {
@@ -263,6 +280,10 @@ impl PrimitiveArrayKind {
             Self::Byte => "kotlin.ByteArray",
             Self::Boolean => "kotlin.BooleanArray",
             Self::Char => "kotlin.CharArray",
+            Self::UInt => "kotlin.UIntArray",
+            Self::ULong => "kotlin.ULongArray",
+            Self::UShort => "kotlin.UShortArray",
+            Self::UByte => "kotlin.UByteArray",
         }
     }
 
@@ -277,6 +298,10 @@ impl PrimitiveArrayKind {
             Self::Byte => "Byte",
             Self::Boolean => "Boolean",
             Self::Char => "Char",
+            Self::UInt => "UInt",
+            Self::ULong => "ULong",
+            Self::UShort => "UShort",
+            Self::UByte => "UByte",
         }
     }
 }
@@ -772,6 +797,10 @@ impl fmt::Debug for Value {
             Self::Long(v) => write!(f, "Long({v})"),
             Self::Short(v) => write!(f, "Short({v})"),
             Self::Byte(v) => write!(f, "Byte({v})"),
+            Self::UInt(v) => write!(f, "UInt({v})"),
+            Self::ULong(v) => write!(f, "ULong({v})"),
+            Self::UShort(v) => write!(f, "UShort({v})"),
+            Self::UByte(v) => write!(f, "UByte({v})"),
             Self::Double(v) => write!(f, "Double({v})"),
             Self::Float(v) => write!(f, "Float({v})"),
             Self::Bool(v) => write!(f, "Bool({v})"),
@@ -852,6 +881,10 @@ impl fmt::Display for Value {
             Self::Long(v) => write!(f, "{v}"),
             Self::Short(v) => write!(f, "{v}"),
             Self::Byte(v) => write!(f, "{v}"),
+            Self::UInt(v) => write!(f, "{v}"),
+            Self::ULong(v) => write!(f, "{v}"),
+            Self::UShort(v) => write!(f, "{v}"),
+            Self::UByte(v) => write!(f, "{v}"),
             Self::Double(v) => write!(f, "{}", kotlin_double_to_string(*v)),
             Self::Float(v) => write!(f, "{}", kotlin_float_to_string(*v)),
             Self::Bool(v) => write!(f, "{v}"),
@@ -1028,7 +1061,25 @@ fn write_collection_element(f: &mut fmt::Formatter<'_>, v: &Value) -> fmt::Resul
 impl Value {
     #[must_use]
     pub fn is_integral(&self) -> bool {
-        matches!(self, Self::Int(_) | Self::Long(_) | Self::Short(_) | Self::Byte(_))
+        matches!(
+            self,
+            Self::Int(_)
+                | Self::Long(_)
+                | Self::Short(_)
+                | Self::Byte(_)
+                | Self::UInt(_)
+                | Self::ULong(_)
+                | Self::UShort(_)
+                | Self::UByte(_)
+        )
+    }
+
+    #[must_use]
+    pub fn is_unsigned(&self) -> bool {
+        matches!(
+            self,
+            Self::UInt(_) | Self::ULong(_) | Self::UShort(_) | Self::UByte(_)
+        )
     }
 
     #[must_use]
@@ -1050,6 +1101,27 @@ impl Value {
             Self::Long(v) => Some(*v),
             Self::Short(v) => Some(i64::from(*v)),
             Self::Byte(v) => Some(i64::from(*v)),
+            Self::UInt(v) => Some(i64::from(*v)),
+            Self::ULong(v) => Some(*v as i64),
+            Self::UShort(v) => Some(i64::from(*v)),
+            Self::UByte(v) => Some(i64::from(*v)),
+            _ => None,
+        }
+    }
+
+    /// Widen any integral variant to `u64`. Mirrors `as_i64` for the
+    /// unsigned-arithmetic path. Negative signed values wrap.
+    #[must_use]
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Int(v) => Some(*v as u64),
+            Self::Long(v) => Some(*v as u64),
+            Self::Short(v) => Some(*v as u64),
+            Self::Byte(v) => Some(*v as u64),
+            Self::UInt(v) => Some(u64::from(*v)),
+            Self::ULong(v) => Some(*v),
+            Self::UShort(v) => Some(u64::from(*v)),
+            Self::UByte(v) => Some(u64::from(*v)),
             _ => None,
         }
     }
@@ -1062,6 +1134,10 @@ impl Value {
             Self::Long(v) => Some(*v as f64),
             Self::Short(v) => Some(f64::from(*v)),
             Self::Byte(v) => Some(f64::from(*v)),
+            Self::UInt(v) => Some(f64::from(*v)),
+            Self::ULong(v) => Some(*v as f64),
+            Self::UShort(v) => Some(f64::from(*v)),
+            Self::UByte(v) => Some(f64::from(*v)),
             Self::Double(v) => Some(*v),
             Self::Float(v) => Some(f64::from(*v)),
             _ => None,
@@ -1076,6 +1152,10 @@ impl Value {
             Self::Long(v) => Some(*v as f32),
             Self::Short(v) => Some(f32::from(*v)),
             Self::Byte(v) => Some(f32::from(*v)),
+            Self::UInt(v) => Some(*v as f32),
+            Self::ULong(v) => Some(*v as f32),
+            Self::UShort(v) => Some(f32::from(*v)),
+            Self::UByte(v) => Some(f32::from(*v)),
             Self::Double(v) => Some(*v as f32),
             Self::Float(v) => Some(*v),
             _ => None,
@@ -1115,6 +1195,10 @@ impl Value {
             Self::Short(_) => Some(NumericRank::Short),
             Self::Int(_) => Some(NumericRank::Int),
             Self::Long(_) => Some(NumericRank::Long),
+            Self::UByte(_) => Some(NumericRank::UByte),
+            Self::UShort(_) => Some(NumericRank::UShort),
+            Self::UInt(_) => Some(NumericRank::UInt),
+            Self::ULong(_) => Some(NumericRank::ULong),
             Self::Float(_) => Some(NumericRank::Float),
             Self::Double(_) => Some(NumericRank::Double),
             _ => None,
@@ -1132,6 +1216,10 @@ impl Value {
             NumericRank::Short => self.as_i64().map(|v| Value::Short(v as i16)),
             NumericRank::Int => self.as_i64().map(|v| Value::Int(v as i32)),
             NumericRank::Long => self.as_i64().map(Value::Long),
+            NumericRank::UByte => self.as_u64().map(|v| Value::UByte(v as u8)),
+            NumericRank::UShort => self.as_u64().map(|v| Value::UShort(v as u16)),
+            NumericRank::UInt => self.as_u64().map(|v| Value::UInt(v as u32)),
+            NumericRank::ULong => self.as_u64().map(Value::ULong),
             NumericRank::Float => self.as_f32().map(Value::Float),
             NumericRank::Double => self.as_f64().map(Value::Double),
         }
@@ -1147,7 +1235,24 @@ impl Value {
             NumericRank::Short => Value::Short(v as i16),
             NumericRank::Int => Value::Int(v as i32),
             NumericRank::Long => Value::Long(v),
+            NumericRank::UByte => Value::UByte(v as u8),
+            NumericRank::UShort => Value::UShort(v as u16),
+            NumericRank::UInt => Value::UInt(v as u32),
+            NumericRank::ULong => Value::ULong(v as u64),
             _ => Value::Long(v),
+        }
+    }
+
+    /// Wrap a `u64` arithmetic result into the unsigned variant
+    /// matching `rank`. Truncates on narrowing.
+    #[must_use]
+    pub fn wrap_unsigned(rank: NumericRank, v: u64) -> Value {
+        match rank {
+            NumericRank::UByte => Value::UByte(v as u8),
+            NumericRank::UShort => Value::UShort(v as u16),
+            NumericRank::UInt => Value::UInt(v as u32),
+            NumericRank::ULong => Value::ULong(v),
+            _ => Value::ULong(v),
         }
     }
 
@@ -1161,6 +1266,10 @@ impl Value {
             Self::Long(_) => "kotlin.Long",
             Self::Short(_) => "kotlin.Short",
             Self::Byte(_) => "kotlin.Byte",
+            Self::UInt(_) => "kotlin.UInt",
+            Self::ULong(_) => "kotlin.ULong",
+            Self::UShort(_) => "kotlin.UShort",
+            Self::UByte(_) => "kotlin.UByte",
             Self::Double(_) => "kotlin.Double",
             Self::Float(_) => "kotlin.Float",
             Self::Bool(_) => "kotlin.Boolean",
@@ -1222,6 +1331,10 @@ impl Value {
                 Some(PrimitiveArrayKind::Byte) => "kotlin.collections.ByteIterator",
                 Some(PrimitiveArrayKind::Boolean) => "kotlin.collections.BooleanIterator",
                 Some(PrimitiveArrayKind::Char) => "kotlin.collections.CharIterator",
+                Some(PrimitiveArrayKind::UInt) => "kotlin.collections.UIntIterator",
+                Some(PrimitiveArrayKind::ULong) => "kotlin.collections.ULongIterator",
+                Some(PrimitiveArrayKind::UShort) => "kotlin.collections.UShortIterator",
+                Some(PrimitiveArrayKind::UByte) => "kotlin.collections.UByteIterator",
                 None => "kotlin.collections.Iterator",
             },
             // User classes/instances live outside the stdlib dispatch path
@@ -1257,6 +1370,10 @@ impl Value {
             Value::Long(_) => matches!(name, "Long" | "Number" | "Any" | "Comparable"),
             Value::Short(_) => matches!(name, "Short" | "Number" | "Any" | "Comparable"),
             Value::Byte(_) => matches!(name, "Byte" | "Number" | "Any" | "Comparable"),
+            Value::UInt(_) => matches!(name, "UInt" | "Number" | "Any" | "Comparable"),
+            Value::ULong(_) => matches!(name, "ULong" | "Number" | "Any" | "Comparable"),
+            Value::UShort(_) => matches!(name, "UShort" | "Number" | "Any" | "Comparable"),
+            Value::UByte(_) => matches!(name, "UByte" | "Number" | "Any" | "Comparable"),
             Value::Double(_) => matches!(name, "Double" | "Number" | "Any" | "Comparable"),
             Value::Float(_) => matches!(name, "Float" | "Number" | "Any" | "Comparable"),
             Value::Bool(_) => matches!(name, "Boolean" | "Any" | "Comparable"),
@@ -1407,6 +1524,10 @@ impl Value {
                     Some(PrimitiveArrayKind::Byte) => name == "ByteArray",
                     Some(PrimitiveArrayKind::Boolean) => name == "BooleanArray",
                     Some(PrimitiveArrayKind::Char) => name == "CharArray",
+                    Some(PrimitiveArrayKind::UInt) => name == "UIntArray",
+                    Some(PrimitiveArrayKind::ULong) => name == "ULongArray",
+                    Some(PrimitiveArrayKind::UShort) => name == "UShortArray",
+                    Some(PrimitiveArrayKind::UByte) => name == "UByteArray",
                     None => name == "Array",
                 }
             }

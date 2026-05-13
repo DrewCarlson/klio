@@ -500,14 +500,17 @@ pub enum AssignOp {
     Rem,
 }
 
-/// Suffix-derived kind of an integer literal. `1` is `Int`; `1L` is `Long`.
-/// Drives both the runtime variant chosen by the interpreter and the
-/// literal's static type in the type checker.
+/// Suffix-derived kind of an integer literal. `1` is `Int`, `1L` is
+/// `Long`, `1u` is `UInt`, `1uL` is `ULong`. Drives both the runtime
+/// variant chosen by the interpreter and the literal's static type
+/// in the type checker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IntLitKind {
     #[default]
     Int,
     Long,
+    UInt,
+    ULong,
 }
 
 /// Suffix-derived kind of a floating-point literal. `1.0` is `Double`;
