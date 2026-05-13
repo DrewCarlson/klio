@@ -2572,6 +2572,44 @@ impl Interpreter {
         Err(RuntimeError::Unbound(name.to_string()))
     }
 
+    /// Invoke any callable `Value` (Lambda, Function, Intrinsic, bound
+    /// method) with positional/named arguments. Used by member-call
+    /// dispatch when a property holds a callable.
+    fn invoke_callable_value(
+        &mut self,
+        callee: &Value,
+        args: &[Value],
+        arg_names: &[Option<String>],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        match callee {
+            Value::Lambda { params, body, env, absorb_return } => {
+                self.call_lambda_with_this(params, body, env, args, None, *absorb_return, out)
+            }
+            Value::Function { decl, env } => {
+                self.call_function_named(decl, env, args, arg_names, out)
+            }
+            Value::Intrinsic { func, .. } => {
+                let mut ctx = CallCtx { args, out };
+                func(&mut ctx)
+            }
+            Value::BoundMethod { fqn, func, receiver } => {
+                let mut all = Vec::with_capacity(args.len() + 1);
+                all.push((**receiver).clone());
+                all.extend_from_slice(args);
+                let user_args = reorder_intrinsic_args(fqn, all, arg_names)?;
+                let mut ctx = CallCtx { args: &user_args, out };
+                func(&mut ctx)
+            }
+            Value::BoundUserMethod { receiver, method } => {
+                self.call_method(receiver, method, args, arg_names, out)
+            }
+            _ => Err(RuntimeError::Type(format!(
+                "value is not callable: {callee:?}"
+            ))),
+        }
+    }
+
     pub fn invoke_lambda(
         &mut self,
         lambda: &Value,
@@ -7327,6 +7365,17 @@ impl Interpreter {
                     self.try_extension_call(&recv, &name.name, args, arg_names, env, out)?
                 {
                     return Ok(v);
+                }
+                // Property holding a callable — `inst.fn(args)` where
+                // `fn` is a `val fn: (T) -> R` field.
+                if let Some(v) = inst.borrow().get(&name.name) {
+                    if matches!(v, Value::Lambda { .. } | Value::Function { .. } | Value::Intrinsic { .. } | Value::BoundMethod { .. } | Value::BoundUserMethod { .. }) {
+                        let mut arg_vals = Vec::with_capacity(args.len());
+                        for a in args {
+                            arg_vals.push(self.eval_expr(a, env, out)?);
+                        }
+                        return self.invoke_callable_value(&v, &arg_vals, arg_names, out);
+                    }
                 }
                 // A function-typed value in scope (e.g. a parameter of type
                 // `T.(...) -> R`) may be invoked as `recv.name(args)`. The
