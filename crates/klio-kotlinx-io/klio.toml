@@ -1,0 +1,11 @@
+[library]
+id = "kotlinx.io"
+version = "0.9.0"
+abi = 1
+implicit_packages = []
+source_roots = [
+    "../../third-party/kotlinx/kotlinx-io/core/common/src",
+]
+
+[[deps]]
+id = "stdlib"

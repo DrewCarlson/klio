@@ -1,0 +1,11 @@
+[library]
+id = "kotlinx.datetime"
+version = "0.8.0"
+abi = 1
+implicit_packages = []
+source_roots = [
+    "../../third-party/kotlinx/kotlinx-datetime/core/common/src",
+]
+
+[[deps]]
+id = "stdlib"

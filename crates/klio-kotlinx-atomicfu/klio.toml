@@ -1,0 +1,11 @@
+[library]
+id = "kotlinx.atomicfu"
+version = "0.32.1"
+abi = 1
+implicit_packages = []
+source_roots = [
+    "../../third-party/kotlinx/kotlinx-atomicfu/atomicfu/src/commonMain/kotlin",
+]
+
+[[deps]]
+id = "stdlib"

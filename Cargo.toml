@@ -15,6 +15,10 @@ members = [
     "crates/klio-stdlib",
     "crates/klio-stdlib-pack",
     "crates/klio-stdlib-gen",
+    "crates/klio-kotlinx-coroutines",
+    "crates/klio-kotlinx-atomicfu",
+    "crates/klio-kotlinx-datetime",
+    "crates/klio-kotlinx-io",
     "crates/klio-interp",
     "crates/klio-cli",
     "crates/klio-parity",
@@ -43,6 +47,10 @@ klio-cfa         = { path = "crates/klio-cfa" }
 klio-pack        = { path = "crates/klio-pack" }
 klio-stdlib      = { path = "crates/klio-stdlib" }
 klio-stdlib-pack = { path = "crates/klio-stdlib-pack" }
+klio-kotlinx-coroutines = { path = "crates/klio-kotlinx-coroutines" }
+klio-kotlinx-atomicfu   = { path = "crates/klio-kotlinx-atomicfu" }
+klio-kotlinx-datetime   = { path = "crates/klio-kotlinx-datetime" }
+klio-kotlinx-io         = { path = "crates/klio-kotlinx-io" }
 klio-interp      = { path = "crates/klio-interp" }
 
 thiserror      = "2"

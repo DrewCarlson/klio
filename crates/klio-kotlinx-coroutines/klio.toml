@@ -1,0 +1,11 @@
+[library]
+id = "kotlinx.coroutines"
+version = "1.11.0"
+abi = 1
+implicit_packages = []
+source_roots = [
+    "../../third-party/kotlinx/kotlinx-coroutines/kotlinx-coroutines-core/common/src",
+]
+
+[[deps]]
+id = "stdlib"
