@@ -7705,7 +7705,9 @@ impl<'r> Checker<'r> {
     /// the sig has no type parameters or the return type doesn't
     /// reference any of them.
     fn infer_call_return(&mut self, sig: &FnSig, arg_tys: &[Type], call_span: Span) -> Type {
-        use klio_types::constraints::{ConstraintSystem, SolutionPreference};
+        use klio_types::constraints::{
+            ConstraintKind, ConstraintSystem, Provenance, SolutionPreference,
+        };
         if sig.type_param_count == 0 || sig.type_param_names.is_empty() {
             return sig.return_ty.clone();
         }
@@ -7721,34 +7723,44 @@ impl<'r> Checker<'r> {
         }
         for (i, p) in sig.params.iter().enumerate() {
             if let Some(at) = arg_tys.get(i) {
-                // Skip non-resolved arg types so the solver doesn't pin
-                // a variable to `Unresolved` and lose precision.
                 if matches!(at, Type::Unresolved) {
                     continue;
                 }
                 let p_with_vars = substitute_type_params(p, &subst);
-                cs.add_constraint(at.clone(), p_with_vars);
+                cs.add_constraint_with(
+                    at.clone(),
+                    p_with_vars,
+                    ConstraintKind::Subtype,
+                    Provenance::CallSite { span: call_span, arg_idx: i },
+                );
             }
         }
         if let Err(_e) = cs.solve_to_fixpoint() {
-            self.diagnostics.emit(
-                Diagnostic::error(
-                    "type inference failed for this call",
-                    call_span,
-                )
-                .with_code(codes::TYPE_INFERENCE_FAILED),
-            );
+            let mut msg = "type inference failed for this call".to_string();
+            if let Some((_err, prov)) = cs.last_error() {
+                if let Provenance::CallSite { arg_idx, .. } = prov {
+                    msg = format!(
+                        "type inference failed for this call; argument {} does not satisfy the inferred parameter type",
+                        arg_idx + 1
+                    );
+                }
+            }
+            self.diagnostics
+                .emit(Diagnostic::error(msg, call_span).with_code(codes::TYPE_INFERENCE_FAILED));
             return sig.return_ty.clone();
         }
-        let sol = cs.solve();
+        // Phase 3 of M-Constraints: stage fixation by SCC so dependent
+        // type parameters resolve after their dependencies. Falls back
+        // to the legacy single-stage solve when staging yields no
+        // additional information.
+        let staged = cs.solve_staged();
+        let legacy = cs.solve();
         let mut final_subst: std::collections::HashMap<String, Type> =
             std::collections::HashMap::new();
         for (i, name) in sig.type_param_names.iter().enumerate() {
             if let Some(v) = vars.get(i) {
-                if let Some(t) = sol.get(v) {
-                    // `Nothing` results from a variable with no concrete
-                    // lower bound; keep it as TypeParam so callers don't
-                    // pin to bottom prematurely.
+                let pick = staged.get(v).or_else(|| legacy.get(v));
+                if let Some(t) = pick {
                     if !matches!(t, Type::Nothing) {
                         final_subst.insert(name.clone(), t.clone());
                     }
