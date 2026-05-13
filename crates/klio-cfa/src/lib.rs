@@ -6,6 +6,7 @@
 //! top of this without touching the types here.
 
 pub mod builder;
+pub mod dataflow;
 pub mod ir;
 pub mod lower;
 pub mod print;
