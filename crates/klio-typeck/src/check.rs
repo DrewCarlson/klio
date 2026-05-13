@@ -5266,33 +5266,6 @@ impl<'r> Checker<'r> {
 
     // ---- statements & blocks --------------------------------------------
 
-    /// Spec §14.1.4: when a loop body is definitely executed at least once
-    /// (`while (true) { ... }` or `do { ... } while (cond)`), smart-cast
-    /// narrowings established inside the body — typically via early-return
-    /// patterns like `if (x == null) return` — survive past the loop. Run
-    /// the body in a temporary inner frame, then lift any narrowings whose
-    /// key already binds in some outer frame up to the nearest such frame.
-    fn check_loop_body_propagating(&mut self, body: &Expr) {
-        self.push_frame();
-        // The loop body is almost always an `Expr::Block`. We need its
-        // statements to run in OUR frame (not a fresh nested one) so any
-        // narrowings established by an if-divergent branch inside the body
-        // stay reachable when the body ends. For a non-block body, check it
-        // directly — it has no inner frame of its own.
-        if let Expr::Block(b) = body {
-            for s in &b.stmts {
-                self.check_stmt(s, None);
-            }
-        } else {
-            self.check_expr(body, None);
-        }
-        // Narrowings established inside a definitely-executed loop body
-        // are propagated to the outer scope via the CFG: the killDataFlow
-        // pass invalidates only re-assigned places, so unmodified facts
-        // survive the back-edge naturally.
-        self.pop_frame();
-    }
-
     fn check_block(&mut self, block: &Block, expected: Option<&Type>) -> Type {
         self.push_frame();
         let mut last = Type::Unit;
@@ -5824,26 +5797,18 @@ impl<'r> Checker<'r> {
             Expr::While { cond, body, .. } => {
                 self.check_expr(cond, Some(&Type::Boolean));
                 let before = self.assigned.clone();
-                // Spec §14.1.4: `while (true) { ... }` is treated as
-                // definitely executed at least once, so smart-cast facts
-                // established inside the body propagate to the containing
-                // scope. Run the body in a temporary inner frame, then copy
-                // its narrowings up to the parent before pop.
-                let definite = matches!(**cond, Expr::BoolLit { value: true, .. });
-                if definite {
-                    self.check_loop_body_propagating(body);
-                } else {
-                    self.check_expr(body, None);
-                }
+                // Spec §14.1.4 propagation of body smart-cast facts
+                // to the surrounding scope flows through the CFG:
+                // killDataFlow invalidates only reassigned places,
+                // so unchanged facts cross the back-edge naturally.
+                self.check_expr(body, None);
                 self.assigned = before;
                 Type::Unit
             }
             Expr::DoWhile { body, cond, .. } => {
-                // Spec §14.1.4: `do { ... } while (cond)` is definitely
-                // executed at least once. Propagate body narrowings up.
                 let before = self.assigned.clone();
                 if let Some(b) = body {
-                    self.check_loop_body_propagating(b);
+                    self.check_expr(b, None);
                 }
                 self.check_expr(cond, Some(&Type::Boolean));
                 self.assigned = before;
