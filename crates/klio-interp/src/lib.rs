@@ -12694,11 +12694,17 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         for (n, v) in captured_names.iter().zip(captures.iter()) {
             env.borrow_mut().define(n.clone(), v.clone());
         }
-        let result = self.interp.eval_expr(ast, &env, self.out).map_err(ir_err)?;
-        // Read back post-eval values of each captured name. Closure
-        // mutations on outer-fn locals — `count++` inside a
-        // `.forEach { … }` body — flow up to the IR's registers
-        // through this writeback step.
+        // Non-local returns: a bare `return` inside a nested lambda
+        // throws RuntimeError::Return up through tree walker's call
+        // chain. When we're evaluating an enclosing function's body,
+        // the Return is meant to be the function's result. Catch
+        // it at this boundary so it doesn't bubble all the way up
+        // as "internal: return".
+        let result = match self.interp.eval_expr(ast, &env, self.out) {
+            Ok(v) => v,
+            Err(klio_runtime::RuntimeError::Return(v)) => v,
+            Err(e) => return Err(ir_err(e)),
+        };
         let updated: Vec<klio_runtime::Value> = captured_names
             .iter()
             .map(|n| env.borrow().lookup(n).unwrap_or(klio_runtime::Value::Unit))
