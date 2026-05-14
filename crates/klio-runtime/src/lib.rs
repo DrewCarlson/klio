@@ -1846,6 +1846,22 @@ impl Value {
     /// True iff this is an equal value (structural equality for primitives
     /// and strings; identity-ish for callables).
     #[must_use]
+    /// Same as `structural_eq` but compares `Float` / `Double`
+    /// bitwise (NaN == NaN, +0.0 != -0.0). Used by the IR
+    /// `BoxedEq` / `BoxedNotEq` ops when an operand came through
+    /// an `as Any` cast or its static type is `Any` — per spec
+    /// boxed-number equality is identity-based rather than IEEE.
+    pub fn structural_eq_boxed(a: &Value, b: &Value) -> bool {
+        use Value::*;
+        match (a, b) {
+            (Double(x), Double(y)) => x.to_bits() == y.to_bits(),
+            (Float(x), Float(y)) => x.to_bits() == y.to_bits(),
+            (Double(x), Float(y)) => x.to_bits() == (*y as f64).to_bits(),
+            (Float(x), Double(y)) => (*x as f64).to_bits() == y.to_bits(),
+            _ => Value::structural_eq(a, b),
+        }
+    }
+
     pub fn structural_eq(a: &Value, b: &Value) -> bool {
         use Value::*;
         // Cross-type numeric equality follows Kotlin's `equals` semantics for

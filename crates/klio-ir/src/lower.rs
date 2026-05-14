@@ -476,21 +476,17 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         {
             // `==` on a boxed `Any` operand uses bitwise equality
             // for Double/Float (NaN == NaN true, +0.0 != -0.0)
-            // per spec. Route through EvalAst to reuse the tree
-            // walker's typed-equality dispatch.
-            let outer_names: std::collections::HashSet<String> = b.visible_names();
-            let captured_names: Vec<String> = outer_names.iter().cloned().collect();
-            let captures: Vec<Reg> = captured_names
-                .iter()
-                .filter_map(|n| b.resolve(n))
-                .collect();
+            // per spec. Emit the dedicated `BoxedEq` / `BoxedNotEq`
+            // BinOp so the evaluator picks bitwise FP comparison.
+            let l = lower_expr(b, lhs);
+            let r = lower_expr(b, rhs);
             let dst = b.alloc_reg();
-            b.push(Inst::EvalAst {
-                dst,
-                ast: Box::new(expr.clone()),
-                captured_names,
-                captures,
-            });
+            let ir_op = match op {
+                AstBinOp::Eq => BinOp::BoxedEq,
+                AstBinOp::Neq => BinOp::BoxedNotEq,
+                _ => unreachable!(),
+            };
+            b.push(Inst::BinOp { dst, op: ir_op, lhs: l, rhs: r });
             return dst;
         }
         Expr::Binary { op, lhs, rhs, .. } => {

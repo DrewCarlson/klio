@@ -1019,6 +1019,8 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::Div, Double(a), Double(b)) => Ok(Double(a / b)),
         (BinOp::Eq, a, b) => Ok(Bool(Value::structural_eq(a, b))),
         (BinOp::NotEq, a, b) => Ok(Bool(!Value::structural_eq(a, b))),
+        (BinOp::BoxedEq, a, b) => Ok(Bool(Value::structural_eq_boxed(a, b))),
+        (BinOp::BoxedNotEq, a, b) => Ok(Bool(!Value::structural_eq_boxed(a, b))),
         (BinOp::Less, Int(a), Int(b)) => Ok(Bool(a < b)),
         (BinOp::LessEq, Int(a), Int(b)) => Ok(Bool(a <= b)),
         (BinOp::Greater, Int(a), Int(b)) => Ok(Bool(a > b)),

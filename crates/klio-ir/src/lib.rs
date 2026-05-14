@@ -218,6 +218,10 @@ pub enum Inst {
 pub enum BinOp {
     Add, Sub, Mul, Div, Mod, Pow,
     Eq, NotEq, Less, LessEq, Greater, GreaterEq,
+    /// Equality on a value that came through an `as Any` cast or
+    /// a statically-Any-typed path. Uses bitwise comparison for
+    /// `Double` / `Float` so NaN == NaN and +0.0 != -0.0.
+    BoxedEq, BoxedNotEq,
     And, Or, Xor, Shl, Shr, UShr,
     RangeTo, RangeUntil, DownTo,
     Elvis,
