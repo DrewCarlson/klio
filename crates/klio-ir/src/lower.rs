@@ -321,16 +321,14 @@ pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::Cl
     let mut methods: Vec<crate::FuncId> = Vec::new();
     for m in &c.members {
         if let klio_ast::Decl::Function(f) = m {
-            let id = crate::FuncId(module.funcs.len() as u32);
-            let mut func = lower_function(module, f);
-            func.id = id;
-            // Pop the function back out of `lower_function`'s
-            // append-on-finish path: lower_function already pushed
-            // the func onto module.funcs with a fresh id, so we
-            // just record its FuncId.
+            // Lower the method body with `this` as the implicit
+            // first param so field reads (`this.x` →
+            // `GetField`) and member calls (`this.method()` →
+            // `CallMember`) resolve through the bound receiver
+            // reg rather than failing as free globals.
+            let _ = lower_method(module, f);
             let last_id = crate::FuncId((module.funcs.len() - 1) as u32);
             methods.push(last_id);
-            let _ = id; // synthesised id above; the real id is last_id
         }
     }
     let class = crate::Class {
@@ -363,8 +361,22 @@ pub fn lower_function(module: &mut crate::Module, f: &klio_ast::Function) -> cra
 }
 
 fn lower_function_body(module: &mut crate::Module, f: &klio_ast::Function) -> crate::Func {
+    lower_function_body_with_implicit(module, f, &[])
+}
+
+/// Lower a function body, prepending implicit parameters (typically
+/// `this` for instance methods). The implicit names bind to the
+/// first registers before the declared params, so `this.x` reads
+/// through `b.resolve("this")` → instance reg → `GetField`.
+fn lower_function_body_with_implicit(
+    module: &mut crate::Module,
+    f: &klio_ast::Function,
+    implicit_params: &[&str],
+) -> crate::Func {
     let mut b = FuncBuilder::new(module);
-    let names: Vec<&str> = f.params.iter().map(|p| p.name.name.as_str()).collect();
+    let mut names: Vec<&str> = Vec::with_capacity(implicit_params.len() + f.params.len());
+    names.extend_from_slice(implicit_params);
+    names.extend(f.params.iter().map(|p| p.name.name.as_str()));
     bind_params(&mut b, &names);
 
     let result = match &f.body {
@@ -376,18 +388,38 @@ fn lower_function_body(module: &mut crate::Module, f: &klio_ast::Function) -> cr
     let fqn = f.name.name.clone();
     let mut func = b.finish(f.name.name.clone(), fqn, crate::TypeRef::unit());
     // Parameter metadata for downstream consumers; types are
-    // unresolved at this stage.
-    func.params = f
-        .params
+    // unresolved at this stage. Implicit params (e.g. `this`) are
+    // listed first so the param-index → name mapping matches the
+    // bind_params order.
+    let mut params: Vec<crate::Param> = implicit_params
         .iter()
-        .map(|p| crate::Param {
-            name: p.name.name.clone(),
+        .map(|n| crate::Param {
+            name: (*n).to_string(),
             ty: crate::TypeRef::unit(),
             default: None,
         })
         .collect();
+    params.extend(f.params.iter().map(|p| crate::Param {
+        name: p.name.name.clone(),
+        ty: crate::TypeRef::unit(),
+        default: None,
+    }));
+    func.params = params;
     func.is_suspend = f.is_suspend;
     func
+}
+
+/// Lower a method body with `this` bound as the implicit first
+/// parameter. Used by `lower_class` so method bodies' references
+/// to `this`, `this.x`, etc. resolve correctly in the IR.
+pub fn lower_method(module: &mut crate::Module, f: &klio_ast::Function) -> crate::Func {
+    let func = lower_function_body_with_implicit(module, f, &["this"]);
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.func_index.push((f.name.name.clone(), id));
+    module.funcs.push(placed.clone());
+    placed
 }
 
 /// Lower one expression into the current block. Returns the
