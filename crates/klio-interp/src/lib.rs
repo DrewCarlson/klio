@@ -430,7 +430,7 @@ impl Interpreter {
         self.top_level_props.contains_key(name)
     }
 
-    pub fn assign_top_level_pub(
+    fn assign_top_level_pub(
         &mut self,
         name: &str,
         value: klio_runtime::Value,
@@ -450,7 +450,7 @@ impl Interpreter {
         Ok(())
     }
 
-    pub fn read_top_level_property_pub(
+    fn read_top_level_property_pub(
         &mut self,
         name: &str,
         out: &mut dyn Output,
@@ -7642,16 +7642,6 @@ impl Interpreter {
         Ok(v)
     }
 
-    pub fn write_instance_property_pub(
-        &mut self,
-        inst: &Rc<RefCell<klio_runtime::InstanceData>>,
-        pdef: &klio_runtime::PropertyDef,
-        new_value: klio_runtime::Value,
-        out: &mut dyn Output,
-    ) -> Result<(), RuntimeError> {
-        self.write_instance_property(inst, pdef, new_value, out)
-    }
-
     fn write_instance_property(
         &mut self,
         inst: &Rc<RefCell<InstanceData>>,
@@ -8569,7 +8559,7 @@ impl Interpreter {
         Err(RuntimeError::Unbound(fqn))
     }
 
-    pub fn eval_property_access(
+    fn eval_property_access(
         &mut self,
         receiver: Value,
         name: &str,
@@ -8924,7 +8914,7 @@ impl Interpreter {
         Ok(Some(v))
     }
 
-    pub fn try_extension_property_set(
+    fn try_extension_property_set(
         &mut self,
         receiver: &Value,
         name: &str,
@@ -12672,7 +12662,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 if let Some(p) = pdef {
                     return self
                         .interp
-                        .write_instance_property_pub(inst, &p, value, self.out)
+                        .write_instance_property(inst, &p, value, self.out)
                         .map_err(ir_err);
                 }
                 inst.borrow_mut().define(name, value);
