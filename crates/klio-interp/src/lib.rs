@@ -8363,7 +8363,11 @@ impl Interpreter {
                 continue;
             }
             let v = if let Some(e) = &p.init {
-                self.eval_expr(e, ctor_env, out)?
+                match self.eval_property_init_via_ir(e, out) {
+                    Some(Ok(v)) => v,
+                    Some(Err(err)) => return Err(err),
+                    None => self.eval_expr(e, ctor_env, out)?,
+                }
             } else if p.is_lateinit {
                 make_lateinit_sentinel(&p.name)
             } else if p.getter.is_some() && p.init.is_none() {
