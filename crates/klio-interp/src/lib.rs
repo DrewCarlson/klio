@@ -12761,6 +12761,15 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         if matches!(value, klio_runtime::Value::Null) {
             return ty.nullable;
         }
+        // Erased generic type parameter — tree walker treats casts
+        // to a bare `T` as unchecked (the JVM's erasure), so we
+        // mirror that here. Single uppercase letter heuristic
+        // covers `T`, `U`, `R` etc.
+        if ty.name.len() == 1
+            && ty.name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+        {
+            return true;
+        }
         // User exception classes — open class MyErr : RuntimeException()
         // — should answer `is Exception` / `is Throwable` true even
         // though those types aren't named in the runtime's
