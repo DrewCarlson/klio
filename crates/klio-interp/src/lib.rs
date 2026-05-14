@@ -12765,6 +12765,18 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // Skips the tree-walker construct_instance_with_outer
         // pipeline.
         if let Some(cls) = self.interp.class_table.get(&name).cloned() {
+            // Body properties are allowed in the fast-path only
+            // when none of them carries an initializer, custom
+            // accessor, or delegate — those require running the
+            // tree walker's init pipeline. Pure-shape bodies (`val
+            // computed: Int`-style without bodies) leave fields
+            // undefined just like the tree walker would.
+            let body_props_ok = cls.body_properties.iter().all(|p| {
+                p.init.is_none()
+                    && p.getter.is_none()
+                    && p.setter.is_none()
+                    && p.delegate.is_none()
+            });
             let simple = !cls.is_inner
                 && !cls.is_anonymous
                 && !cls.is_abstract
@@ -12776,7 +12788,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 && cls.parent_ctor_args.is_empty()
                 && cls.supertype_delegates.borrow().is_empty()
                 && cls.delegate_forwarders.borrow().is_empty()
-                && cls.body_properties.is_empty()
+                && body_props_ok
                 && cls.parent.borrow().is_none()
                 && args.len() == cls.primary_params.len();
             if simple {
