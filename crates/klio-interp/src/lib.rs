@@ -12066,6 +12066,38 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 }
             }
         }
+        // Class-static dispatch through a constructor receiver
+        // (`Regex.escape(s)`, `StringBuilder.serialVersionUID`, …).
+        // The stdlib registers companion-style statics as
+        // `<package>.<ClassName>.<member>` FQN intrinsics. We also
+        // probe `<fqn>.Companion.<member>` for Kotlin's anonymous
+        // companion form. Works whether the constructor is stashed
+        // as `Value::Intrinsic` (typical stdlib wiring) or
+        // `Value::Function` (pack-source shim).
+        let static_probes: Vec<String> = match receiver {
+            klio_runtime::Value::Intrinsic { fqn, .. } => vec![
+                format!("{fqn}.{name}"),
+                format!("{fqn}.Companion.{name}"),
+            ],
+            klio_runtime::Value::Function { decl, .. } => {
+                let cname = &decl.name.name;
+                vec![
+                    format!("{cname}.{name}"),
+                    format!("kotlin.text.{cname}.{name}"),
+                    format!("kotlin.text.{cname}.Companion.{name}"),
+                    format!("kotlin.collections.{cname}.{name}"),
+                    format!("kotlin.{cname}.{name}"),
+                    format!("kotlin.{cname}.Companion.{name}"),
+                ]
+            }
+            _ => Vec::new(),
+        };
+        for probe in &static_probes {
+            if let Some(func) = self.interp.lookup_intrinsic(probe) {
+                let mut ctx = CallCtx { args, out: self.out };
+                return func(&mut ctx).map_err(ir_err);
+            }
+        }
         // Last resort: synthesise the call through the tree
         // walker's full member-dispatch path, which picks up
         // extension functions, named args, and `vararg` /
@@ -12096,6 +12128,43 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Companion-style static access on an Intrinsic constructor:
+        // `Regex.escape` reads through `kotlin.text.Regex.escape` /
+        // `kotlin.text.Regex.Companion.<name>` registered as
+        // separate intrinsic FQNs.
+        if let klio_runtime::Value::Intrinsic { fqn, .. } = receiver {
+            let probes = [
+                format!("{fqn}.{name}"),
+                format!("{fqn}.Companion.{name}"),
+            ];
+            for probe in &probes {
+                if let Some(f) = self.interp.lookup_intrinsic(probe) {
+                    let leaked: &'static str = Box::leak(probe.clone().into_boxed_str());
+                    return Ok(klio_runtime::Value::Intrinsic { fqn: leaked, func: f });
+                }
+            }
+        }
+        // Constructor-shaped Function (e.g. tree walker's synthetic
+        // wrapper for `Regex`). Probe the same stdlib namespaces we
+        // use for class-prefixed FQN lookups.
+        if let klio_runtime::Value::Function { decl, .. } = receiver {
+            let cname = &decl.name.name;
+            let probes = [
+                format!("{cname}.{name}"),
+                format!("kotlin.text.{cname}.{name}"),
+                format!("kotlin.text.{cname}.Companion.{name}"),
+                format!("kotlin.collections.{cname}.{name}"),
+                format!("kotlin.collections.{cname}.Companion.{name}"),
+                format!("kotlin.{cname}.{name}"),
+                format!("kotlin.{cname}.Companion.{name}"),
+            ];
+            for probe in &probes {
+                if let Some(f) = self.interp.lookup_intrinsic(probe) {
+                    let leaked: &'static str = Box::leak(probe.clone().into_boxed_str());
+                    return Ok(klio_runtime::Value::Intrinsic { fqn: leaked, func: f });
+                }
+            }
+        }
         // Route through eval_property_access so getter properties
         // (`val size get() = ...`), delegated props, and
         // extension props all fire correctly.
