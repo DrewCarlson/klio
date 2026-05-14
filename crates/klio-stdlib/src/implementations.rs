@@ -745,6 +745,15 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Pair.toList", pair_to_list),
 
     // ----- Result -----
+    ("kotlin.Result.Companion.success", result_success),
+    ("kotlin.Result.Companion.failure", result_failure),
+    ("kotlin.runCatching", result_run_catching),
+    ("kotlin.Result.runCatching", result_run_catching),
+    ("kotlin.Result.fold", result_fold),
+    ("kotlin.Result.map", result_map),
+    ("kotlin.Result.mapCatching", result_map_catching),
+    ("kotlin.Result.onSuccess", result_on_success),
+    ("kotlin.Result.onFailure", result_on_failure),
     ("kotlin.Result.isSuccess", result_is_success),
     ("kotlin.Result.isFailure", result_is_failure),
     ("kotlin.Result.getOrNull", result_get_or_null),
@@ -5144,6 +5153,125 @@ fn recv_result<'a>(args: &'a [Value], what: &str) -> Result<(bool, &'a Value), R
         Some(Value::Result { ok, payload }) => Ok((*ok, payload.as_ref())),
         _ => Err(RuntimeError::Type(format!("{what} requires a Result receiver"))),
     }
+}
+
+fn result_success(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let v = ctx.args.first().cloned().unwrap_or(Value::Unit);
+    Ok(Value::Result { ok: true, payload: Box::new(v) })
+}
+
+fn result_failure(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let v = ctx.args.first().cloned().unwrap_or(Value::Unit);
+    Ok(Value::Result { ok: false, payload: Box::new(v) })
+}
+
+fn run_catching_impl(block: Value, ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let CallCtx { out, host, .. } = ctx;
+    match host.invoke_callable(&block, &[], *out) {
+        Ok(v) => Ok(Value::Result { ok: true, payload: Box::new(v) }),
+        Err(RuntimeError::Thrown(e)) => Ok(Value::Result { ok: false, payload: Box::new(e) }),
+        Err(e) => Err(e),
+    }
+}
+
+fn result_run_catching(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    // Two forms:
+    //   runCatching { … }    -> 1 arg (block)
+    //   x.runCatching { … }  -> 2 args (receiver, block); receiver bound as `this`
+    if ctx.args.len() == 1 {
+        let block = ctx.args[0].clone();
+        return run_catching_impl(block, ctx);
+    }
+    if ctx.args.len() == 2 {
+        let recv = ctx.args[0].clone();
+        let block = ctx.args[1].clone();
+        let CallCtx { out, host, .. } = ctx;
+        return match host.invoke_callable_with_this(&block, &[], &recv, *out) {
+            Ok(v) => Ok(Value::Result { ok: true, payload: Box::new(v) }),
+            Err(RuntimeError::Thrown(e)) => Ok(Value::Result { ok: false, payload: Box::new(e) }),
+            Err(e) => Err(e),
+        };
+    }
+    Err(RuntimeError::Arity("runCatching expects (block) or (receiver, block)".into()))
+}
+
+fn result_fold(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 3 {
+        return Err(RuntimeError::Arity("Result.fold expects (receiver, onSuccess, onFailure)".into()));
+    }
+    let (ok, payload) = recv_result(ctx.args, "Result.fold")?;
+    let payload = payload.clone();
+    let on_success = ctx.args[1].clone();
+    let on_failure = ctx.args[2].clone();
+    let CallCtx { out, host, .. } = ctx;
+    if ok {
+        host.invoke_callable(&on_success, std::slice::from_ref(&payload), *out)
+    } else {
+        host.invoke_callable(&on_failure, std::slice::from_ref(&payload), *out)
+    }
+}
+
+fn result_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("Result.map expects (receiver, block)".into()));
+    }
+    let (ok, payload) = recv_result(ctx.args, "Result.map")?;
+    let payload = payload.clone();
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    if !ok {
+        return Ok(Value::Result { ok: false, payload: Box::new(payload) });
+    }
+    let v = host.invoke_callable(&block, std::slice::from_ref(&payload), *out)?;
+    Ok(Value::Result { ok: true, payload: Box::new(v) })
+}
+
+fn result_map_catching(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("Result.mapCatching expects (receiver, block)".into()));
+    }
+    let (ok, payload) = recv_result(ctx.args, "Result.mapCatching")?;
+    let payload = payload.clone();
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    if !ok {
+        return Ok(Value::Result { ok: false, payload: Box::new(payload) });
+    }
+    match host.invoke_callable(&block, std::slice::from_ref(&payload), *out) {
+        Ok(v) => Ok(Value::Result { ok: true, payload: Box::new(v) }),
+        Err(RuntimeError::Thrown(e)) => Ok(Value::Result { ok: false, payload: Box::new(e) }),
+        Err(e) => Err(e),
+    }
+}
+
+fn result_on_success(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("Result.onSuccess expects (receiver, block)".into()));
+    }
+    let recv = ctx.args[0].clone();
+    let (ok, payload) = recv_result(ctx.args, "Result.onSuccess")?;
+    let payload = payload.clone();
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    if ok {
+        host.invoke_callable(&block, std::slice::from_ref(&payload), *out)?;
+    }
+    Ok(recv)
+}
+
+fn result_on_failure(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("Result.onFailure expects (receiver, block)".into()));
+    }
+    let recv = ctx.args[0].clone();
+    let (ok, payload) = recv_result(ctx.args, "Result.onFailure")?;
+    let payload = payload.clone();
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    if !ok {
+        host.invoke_callable(&block, std::slice::from_ref(&payload), *out)?;
+    }
+    Ok(recv)
 }
 
 fn result_is_success(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

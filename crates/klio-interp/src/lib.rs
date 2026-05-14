@@ -5441,6 +5441,27 @@ impl Interpreter {
         let Value::Result { ok, payload } = receiver else {
             return Ok(None);
         };
+        {
+            let expected = match name {
+                "fold" => Some(2),
+                "map" | "mapCatching" | "onSuccess" | "onFailure" => Some(1),
+                _ => None,
+            };
+            if let Some(n) = expected {
+                if args.len() == n {
+                    let fqn = format!("kotlin.Result.{name}");
+                    if let Some(func) = klio_stdlib::implementation(&fqn) {
+                        let mut arg_vals = vec![receiver.clone()];
+                        for a in args {
+                            arg_vals.push(self.eval_expr(a, env, out)?);
+                        }
+                        let mut __interp_host = InterpHostRef { interp: self };
+                        let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                        return Ok(Some(func(&mut ctx)?));
+                    }
+                }
+            }
+        }
         match name {
             "fold" if args.len() == 2 => {
                 let on_success = self.eval_expr(&args[0], env, out)?;
@@ -9416,6 +9437,13 @@ impl Interpreter {
         // Throwables as a `Result.failure(e)`; otherwise `Result.success(v)`.
         if let Some(name) = simple_callee_name(callee) {
             if name == "runCatching" && args.len() == 1 {
+                if let Some(func) = klio_stdlib::implementation("kotlin.runCatching") {
+                    let lam = self.eval_expr(&args[0], env, out)?;
+                    let arg_vals = [lam];
+                    let mut __interp_host = InterpHostRef { interp: self };
+                    let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                    return func(&mut ctx);
+                }
                 let lam = self.eval_expr(&args[0], env, out)?;
                 return self.eval_run_catching(&lam, None, out);
             }
@@ -9449,16 +9477,19 @@ impl Interpreter {
         if let Expr::Member { receiver, name, safe: false, .. } = callee {
             if let Some(rname) = simple_callee_name(receiver) {
                 if rname == "Result" {
-                    match name.name.as_str() {
-                        "success" if args.len() == 1 => {
+                    let fqn = match name.name.as_str() {
+                        "success" if args.len() == 1 => Some("kotlin.Result.Companion.success"),
+                        "failure" if args.len() == 1 => Some("kotlin.Result.Companion.failure"),
+                        _ => None,
+                    };
+                    if let Some(fqn) = fqn {
+                        if let Some(func) = klio_stdlib::implementation(fqn) {
                             let v = self.eval_expr(&args[0], env, out)?;
-                            return Ok(Value::Result { ok: true, payload: Box::new(v) });
+                            let arg_vals = [v];
+                            let mut __interp_host = InterpHostRef { interp: self };
+                            let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                            return func(&mut ctx);
                         }
-                        "failure" if args.len() == 1 => {
-                            let v = self.eval_expr(&args[0], env, out)?;
-                            return Ok(Value::Result { ok: false, payload: Box::new(v) });
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -10135,6 +10166,13 @@ impl Interpreter {
             // the receiver bound and captures any thrown Throwable as a
             // `Result.failure`.
             if name.name == "runCatching" && args.len() == 1 {
+                if let Some(func) = klio_stdlib::implementation("kotlin.Result.runCatching") {
+                    let lam = self.eval_expr(&args[0], env, out)?;
+                    let arg_vals = [recv, lam];
+                    let mut __interp_host = InterpHostRef { interp: self };
+                    let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                    return func(&mut ctx);
+                }
                 let lam = self.eval_expr(&args[0], env, out)?;
                 return self.eval_run_catching(&lam, Some(recv), out);
             }
