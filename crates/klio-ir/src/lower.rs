@@ -406,7 +406,13 @@ pub fn lower_class_with_file(
         for entry in &c.enum_entries {
             own_member_names.insert(entry.name.name.clone());
         }
+        // Built-in members on every enum entry: synthesised
+        // `name` (entry simple name) and `ordinal` (declaration
+        // index). Bare access from method bodies resolves to
+        // `this.name` / `this.ordinal`.
         own_member_names.insert("entries".to_string());
+        own_member_names.insert("name".to_string());
+        own_member_names.insert("ordinal".to_string());
     }
     // Companion-object members are visible under their bare
     // names inside this class's method bodies.
