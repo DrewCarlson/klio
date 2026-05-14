@@ -235,6 +235,43 @@ pub struct Interpreter {
     pack_known_packages: std::collections::HashSet<String>,
 }
 
+/// Read-only view over the interpreter's registry surface — the set
+/// of name → callable / property / class lookups + binding overrides
+/// that the IR host consults during dispatch. Holds a borrow rather
+/// than its own fields so the existing Interpreter storage stays the
+/// single source of truth; future passes can swap the backing fields
+/// onto this struct directly without churning every call site.
+pub struct ModuleRegistry<'a> {
+    interp: &'a Interpreter,
+}
+
+impl<'a> ModuleRegistry<'a> {
+    #[must_use]
+    pub fn has_top_level_overloads(&self, name: &str) -> bool {
+        self.interp.has_top_level_overloads(name)
+    }
+    #[must_use]
+    pub fn has_top_level_default(&self, name: &str) -> bool {
+        self.interp.has_top_level_default(name)
+    }
+    #[must_use]
+    pub fn has_top_level_vararg(&self, name: &str) -> bool {
+        self.interp.has_top_level_vararg(name)
+    }
+    #[must_use]
+    pub fn has_top_level_property(&self, name: &str) -> bool {
+        self.interp.has_top_level_property(name)
+    }
+    #[must_use]
+    pub fn lookup_global_callable(&self, name: &str) -> Option<klio_runtime::Value> {
+        self.interp.lookup_global_callable(name)
+    }
+    #[must_use]
+    pub fn binding_override(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
+        self.interp.binding_override(fqn)
+    }
+}
+
 /// Holder a `Continuation<T>` writes into when its `resume` /
 /// `resumeWith` / `resumeWithException` is called inside a
 /// `suspendCoroutine { cont -> … }` block. The enclosing
@@ -600,6 +637,11 @@ impl Interpreter {
     #[must_use]
     pub fn is_pack_known_package(&self, package_path: &str) -> bool {
         self.pack_known_packages.contains(package_path)
+    }
+
+    #[must_use]
+    pub fn registry(&self) -> ModuleRegistry<'_> {
+        ModuleRegistry { interp: self }
     }
 
     /// Compose `<file-package>.<simple>` for a top-level user-declared class.
