@@ -20,6 +20,18 @@ pub struct FuncBuilder<'a> {
     /// bindings; lowering pushes a fresh frame per block expression
     /// so val/var declarations are popped correctly.
     scopes: Vec<std::collections::HashMap<String, Reg>>,
+    /// Loop context stack. Each frame names the loop's continue
+    /// target (header / latch) and break target (exit). The frame's
+    /// optional `label` matches an explicit `break@label` /
+    /// `continue@label`; bare jumps target the innermost frame.
+    loops: Vec<LoopFrame>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopFrame {
+    pub label: Option<String>,
+    pub continue_target: BlockId,
+    pub break_target: BlockId,
 }
 
 impl<'a> FuncBuilder<'a> {
@@ -35,6 +47,27 @@ impl<'a> FuncBuilder<'a> {
             cur: BlockId(0),
             next_reg: 0,
             scopes: vec![std::collections::HashMap::new()],
+            loops: Vec::new(),
+        }
+    }
+
+    pub fn push_loop(&mut self, label: Option<String>, cont_t: BlockId, brk_t: BlockId) {
+        self.loops.push(LoopFrame {
+            label,
+            continue_target: cont_t,
+            break_target: brk_t,
+        });
+    }
+
+    pub fn pop_loop(&mut self) {
+        self.loops.pop();
+    }
+
+    #[must_use]
+    pub fn loop_for(&self, label: Option<&str>) -> Option<&LoopFrame> {
+        match label {
+            None => self.loops.last(),
+            Some(l) => self.loops.iter().rev().find(|f| f.label.as_deref() == Some(l)),
         }
     }
 

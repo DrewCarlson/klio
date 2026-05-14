@@ -162,7 +162,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.terminate(Terminator::Branch { cond: c, t: body_blk, f: exit });
 
             b.switch_to(body_blk);
+            b.push_loop(None, header, exit);
             let _ = lower_expr(b, body);
+            b.pop_loop();
             b.terminate(Terminator::Goto(header));
 
             b.switch_to(exit);
@@ -243,9 +245,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.terminate(Terminator::Goto(body_blk));
 
             b.switch_to(body_blk);
+            b.push_loop(None, body_blk, exit);
             if let Some(body) = body {
                 let _ = lower_expr(b, body);
             }
+            b.pop_loop();
             let c = lower_expr(b, cond);
             b.terminate(Terminator::Branch { cond: c, t: body_blk, f: exit });
 
@@ -272,6 +276,108 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.switch_to(dead);
             b.emit_const(Const::Unit)
         }
+        Expr::When { subject, branches, .. } => {
+            lower_when(b, subject.as_deref(), branches, expr_span(expr))
+        }
+        Expr::Break { label, .. } => {
+            if let Some(frame) = b.loop_for(label.as_ref().map(|i| i.name.as_str())).cloned() {
+                b.terminate(Terminator::Goto(frame.break_target));
+                let dead = b.alloc_block();
+                b.switch_to(dead);
+            } else {
+                b.push(Inst::Trace { span: expr_span(expr) });
+            }
+            b.emit_const(Const::Unit)
+        }
+        Expr::Continue { label, .. } => {
+            if let Some(frame) = b.loop_for(label.as_ref().map(|i| i.name.as_str())).cloned() {
+                b.terminate(Terminator::Goto(frame.continue_target));
+                let dead = b.alloc_block();
+                b.switch_to(dead);
+            } else {
+                b.push(Inst::Trace { span: expr_span(expr) });
+            }
+            b.emit_const(Const::Unit)
+        }
+        Expr::For { vars, iter, body, .. } => lower_for(b, vars, iter, body),
+        Expr::IsCheck { expr: inner, ty, negated, .. } => {
+            let s = lower_expr(b, inner);
+            let dst = b.alloc_reg();
+            b.push(Inst::InstanceOf {
+                dst,
+                src: s,
+                ty: crate::TypeRef {
+                    name: ty.name.name.clone(),
+                    nullable: ty.nullable,
+                    args: Vec::new(),
+                },
+            });
+            if *negated {
+                let neg = b.alloc_reg();
+                b.push(Inst::Not { dst: neg, src: dst });
+                neg
+            } else {
+                dst
+            }
+        }
+        Expr::As { expr: inner, ty, safe, .. } => {
+            let s = lower_expr(b, inner);
+            let dst = b.alloc_reg();
+            b.push(Inst::Cast {
+                dst,
+                src: s,
+                ty: crate::TypeRef {
+                    name: ty.name.name.clone(),
+                    nullable: ty.nullable,
+                    args: Vec::new(),
+                },
+                safe: *safe,
+            });
+            dst
+        }
+        Expr::Postfix { op, expr: inner, .. } => match op {
+            klio_ast::PostfixOp::NotNull => {
+                let s = lower_expr(b, inner);
+                let dst = b.alloc_reg();
+                b.push(Inst::NotNullAssert { dst, src: s });
+                dst
+            }
+            klio_ast::PostfixOp::Inc | klio_ast::PostfixOp::Dec => {
+                let s = lower_expr(b, inner);
+                let op = match op {
+                    klio_ast::PostfixOp::Inc => UnOp::Inc,
+                    klio_ast::PostfixOp::Dec => UnOp::Dec,
+                    _ => unreachable!(),
+                };
+                let new = b.alloc_reg();
+                b.push(Inst::UnOp { dst: new, op, operand: s });
+                if let Expr::Path { segments, .. } = inner.as_ref() {
+                    if segments.len() == 1 {
+                        b.bind(segments[0].name.clone(), new);
+                    }
+                }
+                s
+            }
+        },
+        Expr::Labeled { label, expr: inner, .. } => match inner.as_ref() {
+            Expr::While { cond, body, .. } => {
+                let header = b.alloc_block();
+                let body_blk = b.alloc_block();
+                let exit = b.alloc_block();
+                b.terminate(Terminator::Goto(header));
+                b.switch_to(header);
+                let c = lower_expr(b, cond);
+                b.terminate(Terminator::Branch { cond: c, t: body_blk, f: exit });
+                b.switch_to(body_blk);
+                b.push_loop(Some(label.name.clone()), header, exit);
+                let _ = lower_expr(b, body);
+                b.pop_loop();
+                b.terminate(Terminator::Goto(header));
+                b.switch_to(exit);
+                b.emit_const(Const::Unit)
+            }
+            _ => lower_expr(b, inner),
+        },
         _ => {
             // Remaining expression forms not yet lowered. Emit a
             // placeholder Trace so the gap is visible in printouts
@@ -280,6 +386,88 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.emit_const(Const::Unit)
         }
     }
+}
+
+fn lower_for(
+    b: &mut FuncBuilder<'_>,
+    vars: &[klio_ast::Ident],
+    iter: &Expr,
+    body: &Expr,
+) -> Reg {
+    let recv = lower_expr(b, iter);
+    let it_reg = b.alloc_reg();
+    let zero = b.alloc_reg();
+    b.push(Inst::Move { dst: zero, src: recv });
+    let name = b.module.intern_const(Const::String("iterator".into()));
+    let args_start = b.alloc_reg();
+    b.push(Inst::CallMember {
+        dst: it_reg,
+        receiver: zero,
+        name,
+        args: args_start,
+        n_args: 0,
+    });
+    let header = b.alloc_block();
+    let body_blk = b.alloc_block();
+    let exit = b.alloc_block();
+    b.terminate(Terminator::Goto(header));
+
+    b.switch_to(header);
+    let has_next = b.alloc_reg();
+    let hn_name = b.module.intern_const(Const::String("hasNext".into()));
+    let hn_args = b.alloc_reg();
+    b.push(Inst::CallMember {
+        dst: has_next,
+        receiver: it_reg,
+        name: hn_name,
+        args: hn_args,
+        n_args: 0,
+    });
+    b.terminate(Terminator::Branch {
+        cond: has_next,
+        t: body_blk,
+        f: exit,
+    });
+
+    b.switch_to(body_blk);
+    b.push_scope();
+    let next_reg = b.alloc_reg();
+    let next_name = b.module.intern_const(Const::String("next".into()));
+    let nargs = b.alloc_reg();
+    b.push(Inst::CallMember {
+        dst: next_reg,
+        receiver: it_reg,
+        name: next_name,
+        args: nargs,
+        n_args: 0,
+    });
+    if vars.len() == 1 {
+        b.bind(vars[0].name.clone(), next_reg);
+    } else {
+        for (i, v) in vars.iter().enumerate() {
+            let comp = b.alloc_reg();
+            let nm = b
+                .module
+                .intern_const(Const::String(format!("component{}", i + 1)));
+            let cargs = b.alloc_reg();
+            b.push(Inst::CallMember {
+                dst: comp,
+                receiver: next_reg,
+                name: nm,
+                args: cargs,
+                n_args: 0,
+            });
+            b.bind(v.name.clone(), comp);
+        }
+    }
+    b.push_loop(None, header, exit);
+    let _ = lower_expr(b, body);
+    b.pop_loop();
+    b.pop_scope();
+    b.terminate(Terminator::Goto(header));
+
+    b.switch_to(exit);
+    b.emit_const(Const::Unit)
 }
 
 fn lower_when(
