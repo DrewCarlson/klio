@@ -12131,6 +12131,47 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             (klio_runtime::Value::MapEntry { value, .. }, "value") => {
                 return Ok((**value).clone());
             }
+            (klio_runtime::Value::Map { entries, .. }, "contains" | "containsKey") if args.len() == 1 => {
+                let key = &args[0];
+                let found = entries
+                    .borrow()
+                    .iter()
+                    .any(|(k, _)| klio_runtime::Value::structural_eq(k, key));
+                return Ok(klio_runtime::Value::Bool(found));
+            }
+            (klio_runtime::Value::Map { entries, .. }, "containsValue") if args.len() == 1 => {
+                let val = &args[0];
+                let found = entries
+                    .borrow()
+                    .iter()
+                    .any(|(_, v)| klio_runtime::Value::structural_eq(v, val));
+                return Ok(klio_runtime::Value::Bool(found));
+            }
+            (klio_runtime::Value::List { items, .. }, "contains") if args.len() == 1 => {
+                let val = &args[0];
+                let found = items
+                    .borrow()
+                    .iter()
+                    .any(|v| klio_runtime::Value::structural_eq(v, val));
+                return Ok(klio_runtime::Value::Bool(found));
+            }
+            (klio_runtime::Value::Set { items, .. }, "contains") if args.len() == 1 => {
+                let val = &args[0];
+                let found = items
+                    .borrow()
+                    .iter()
+                    .any(|v| klio_runtime::Value::structural_eq(v, val));
+                return Ok(klio_runtime::Value::Bool(found));
+            }
+            (klio_runtime::Value::String(s), "contains") if args.len() == 1 => {
+                if let klio_runtime::Value::Char(c) = args[0] {
+                    return Ok(klio_runtime::Value::Bool(s.contains(c)));
+                }
+                if let klio_runtime::Value::String(needle) = &args[0] {
+                    return Ok(klio_runtime::Value::Bool(s.contains(needle.as_str())));
+                }
+                return Ok(klio_runtime::Value::Bool(false));
+            }
             (klio_runtime::Value::Map { entries, .. }, "iterator") => {
                 // `for (e in map)` walks the entries; each `e` is a
                 // Pair-style two-field instance carrying `key` / `value`.
@@ -12599,6 +12640,11 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
     }
 
     fn instance_of(&mut self, value: &klio_runtime::Value, ty: &klio_ir::TypeRef) -> bool {
+        // `null` matches every nullable type (`null is String?` is
+        // true; `null is String` is false).
+        if matches!(value, klio_runtime::Value::Null) {
+            return ty.nullable;
+        }
         // Route through the runtime's nominal-type machinery so
         // throw/catch and is/as semantics see subtype hierarchies
         // (RuntimeException is-a Exception is-a Throwable) and
