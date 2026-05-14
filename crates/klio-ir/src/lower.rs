@@ -251,15 +251,68 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
 }
 
 fn lower_block(b: &mut FuncBuilder<'_>, block: &AstBlock) -> Reg {
+    b.push_scope();
     let mut last: Option<Reg> = None;
     for stmt in &block.stmts {
-        if let Stmt::Expr(e) = stmt {
-            last = Some(lower_expr(b, e));
-        } else {
-            // Declarations & non-expr stmts not yet lowered.
-        }
+        last = lower_stmt(b, stmt);
     }
-    last.unwrap_or_else(|| b.emit_const(Const::Unit))
+    let result = last.unwrap_or_else(|| b.emit_const(Const::Unit));
+    b.pop_scope();
+    result
+}
+
+fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
+    match stmt {
+        Stmt::Expr(e) => Some(lower_expr(b, e)),
+        Stmt::Decl(klio_ast::Decl::Property(p)) => {
+            // `val x = expr` / `var x = expr`. The init is lowered
+            // into a fresh register and bound in the current scope;
+            // mutability is enforced by typeck, not the IR.
+            let init = match &p.init {
+                Some(e) => lower_expr(b, e),
+                None => b.emit_const(Const::Unit),
+            };
+            b.bind(p.name.name.clone(), init);
+            None
+        }
+        Stmt::Assign { target, op, value, .. } => {
+            let v = lower_expr(b, value);
+            let combined = match op {
+                klio_ast::AssignOp::Assign => v,
+                klio_ast::AssignOp::Add | klio_ast::AssignOp::Sub
+                | klio_ast::AssignOp::Mul | klio_ast::AssignOp::Div
+                | klio_ast::AssignOp::Rem => {
+                    let cur = lower_expr(b, target);
+                    let bin = match op {
+                        klio_ast::AssignOp::Add => BinOp::Add,
+                        klio_ast::AssignOp::Sub => BinOp::Sub,
+                        klio_ast::AssignOp::Mul => BinOp::Mul,
+                        klio_ast::AssignOp::Div => BinOp::Div,
+                        klio_ast::AssignOp::Rem => BinOp::Mod,
+                        klio_ast::AssignOp::Assign => unreachable!(),
+                    };
+                    let dst = b.alloc_reg();
+                    b.push(Inst::BinOp { dst, op: bin, lhs: cur, rhs: v });
+                    dst
+                }
+            };
+            match target {
+                Expr::Path { segments, .. } if segments.len() == 1 => {
+                    b.bind(segments[0].name.clone(), combined);
+                }
+                Expr::Member { receiver, name, .. } => {
+                    let recv = lower_expr(b, receiver);
+                    let field = b.module.intern_const(Const::String(name.name.clone()));
+                    b.push(Inst::SetField { receiver: recv, field, value: combined });
+                }
+                _ => {
+                    b.push(Inst::Trace { span: expr_span(target) });
+                }
+            }
+            None
+        }
+        Stmt::Decl(_) | Stmt::DestructuringDecl { .. } => None,
+    }
 }
 
 fn ast_binop(op: AstBinOp) -> BinOp {
