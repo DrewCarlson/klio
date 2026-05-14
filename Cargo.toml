@@ -68,7 +68,12 @@ serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Default to deny so individual crates that need unsafe (notably the
+# mmap-backed PackReader in klio-pack) can opt in with a
+# crate-local `#![allow(unsafe_code)]`. The forbid level is too
+# strict — it cannot be relaxed locally, which forces us to drop
+# mmap support entirely.
+unsafe_code = "deny"
 unused_must_use = "deny"
 
 [workspace.lints.clippy]

@@ -989,8 +989,17 @@ fn install_one_extra_pack(
 ) -> Result<(), String> {
     use klio_pack::schema::{decode, SourceBundle};
     use klio_pack::{section_names, PackReader};
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let pack = PackReader::from_bytes(bytes).map_err(|e| e.to_string())?;
+    // mmap when available so cold startup does not pay the full
+    // `std::fs::read` allocation per cached pack. Fall back to a
+    // bytes-only path on read errors (mmap can fail on weird
+    // filesystems).
+    let pack = match PackReader::from_path_mmap(path) {
+        Ok(p) => p,
+        Err(_) => {
+            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            PackReader::from_bytes(bytes).map_err(|e| e.to_string())?
+        }
+    };
     interp.install_pack(&pack, host).map_err(|e| e.to_string())?;
     // Frozen AST takes precedence: when the pack carries a
     // pre-parsed AST bundle, feed those KotlinFiles directly into

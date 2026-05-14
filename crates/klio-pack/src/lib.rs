@@ -1,3 +1,9 @@
+// memmap2-backed PackReader::from_path_mmap is the sole reason this
+// crate needs unsafe. The contract is read-only: the map is borrowed
+// for the reader's lifetime, no `as_mut` happens. Every other crate
+// in the workspace stays under the `deny(unsafe_code)` default.
+#![allow(unsafe_code)]
+
 //! `klio-pack` — on-disk module format for the klio interpreter.
 //!
 //! A pack bundles a library's parsed AST, resolved symbols, type-check
