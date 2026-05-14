@@ -1435,6 +1435,73 @@ impl Interpreter {
                             }
                         }
                         // Delegated instance property: synthesize
+                        // `this.__delegate$name.setValue(this, ::name, value)`
+                        // for the setter side. Mirrors the getter
+                        // synthesis below.
+                        if p.delegate.is_some() && p.setter.is_none() && p.mutable {
+                            use klio_ast::{Expr, Ident};
+                            use klio_span::{FileId, Span};
+                            let dummy = Span::new(FileId(0), 0, 0);
+                            let body = Expr::Call {
+                                callee: Box::new(Expr::Member {
+                                    receiver: Box::new(Expr::Member {
+                                        receiver: Box::new(Expr::Path {
+                                            segments: vec![Ident {
+                                                name: "this".into(),
+                                                span: dummy,
+                                            }],
+                                            span: dummy,
+                                        }),
+                                        name: Ident {
+                                            name: format!("__delegate${}", p.name.name),
+                                            span: dummy,
+                                        },
+                                        safe: false,
+                                        span: dummy,
+                                    }),
+                                    name: Ident { name: "setValue".into(), span: dummy },
+                                    safe: false,
+                                    span: dummy,
+                                }),
+                                args: vec![
+                                    Expr::Path {
+                                        segments: vec![Ident {
+                                            name: "this".into(),
+                                            span: dummy,
+                                        }],
+                                        span: dummy,
+                                    },
+                                    Expr::PropertyRef {
+                                        name: Ident { name: p.name.name.clone(), span: dummy },
+                                        span: dummy,
+                                    },
+                                    Expr::Path {
+                                        segments: vec![Ident {
+                                            name: "value".into(),
+                                            span: dummy,
+                                        }],
+                                        span: dummy,
+                                    },
+                                ],
+                                arg_names: vec![None, None, None],
+                                type_args: Vec::new(),
+                                is_infix: false,
+                                span: dummy,
+                            };
+                            let id = klio_ir::lower::lower_accessor_expr(
+                                &mut module,
+                                &c.name.name,
+                                &own_members,
+                                &["this", "value"],
+                                &body,
+                                &format!("__set_delegated__{}.{}", c.name.name, p.name.name),
+                            );
+                            self.module_registry.class_ir.instance_prop_setters.insert(
+                                (c.name.name.clone(), p.name.name.clone()),
+                                id,
+                            );
+                        }
+                        // Delegated instance property: synthesize
                         // `this.__delegate$name.getValue(this, ::name)`.
                         if p.delegate.is_some() && p.getter.is_none() {
                             use klio_ast::{Expr, Ident};
@@ -1513,6 +1580,53 @@ impl Interpreter {
                         );
                         self.module_registry.class_ir.top_level_prop_getters.insert(p.name.name.clone(), id);
                     }
+                }
+                // Delegated top-level setter: synthesize a 1-arg
+                // setter `__delegate$name.setValue(null, ::name, value)`
+                // so IrHost::store_global dispatches through IR.
+                if p.delegate.is_some() && p.setter.is_none() && p.mutable {
+                    use klio_ast::{Expr, Ident};
+                    use klio_span::{FileId, Span};
+                    let dummy = Span::new(FileId(0), 0, 0);
+                    let body = Expr::Call {
+                        callee: Box::new(Expr::Member {
+                            receiver: Box::new(Expr::Path {
+                                segments: vec![Ident {
+                                    name: format!("__delegate${}", p.name.name),
+                                    span: dummy,
+                                }],
+                                span: dummy,
+                            }),
+                            name: Ident { name: "setValue".into(), span: dummy },
+                            safe: false,
+                            span: dummy,
+                        }),
+                        args: vec![
+                            Expr::NullLit { span: dummy },
+                            Expr::PropertyRef {
+                                name: Ident { name: p.name.name.clone(), span: dummy },
+                                span: dummy,
+                            },
+                            Expr::Path {
+                                segments: vec![Ident {
+                                    name: "value".into(),
+                                    span: dummy,
+                                }],
+                                span: dummy,
+                            },
+                        ],
+                        arg_names: vec![None, None, None],
+                        type_args: Vec::new(),
+                        is_infix: false,
+                        span: dummy,
+                    };
+                    let id = klio_ir::lower::lower_unary_expr_as_thunk(
+                        &mut module,
+                        "value",
+                        &body,
+                        &format!("__set_delegated__{}", p.name.name),
+                    );
+                    self.module_registry.class_ir.top_level_prop_setters.insert(p.name.name.clone(), id);
                 }
                 // Delegated top-level property: synthesize a getter
                 // expression `__delegate$name.getValue(null, ::name)`
