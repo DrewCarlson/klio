@@ -11535,6 +11535,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         &mut self,
         name: &str,
     ) -> Result<Option<klio_runtime::Value>, klio_ir::eval::EvalError> {
+        // Honour `import path.X as Y` — bare `X` is unresolved
+        // when an alias hides it.
+        if let Some(alias) = self.interp.import_renames.get(name).cloned() {
+            return Err(klio_ir::eval::EvalError::Unbound(format!(
+                "{name} (renamed to `{alias}` by an import in this file)"
+            )));
+        }
         if let Some(v) = self.interp.lookup_global_callable(name) {
             return Ok(Some(v));
         }
