@@ -11745,38 +11745,16 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // (the println/print Instance→toString rewrite, reorder
         // by intrinsic param names, spread flattening) fires.
         if let klio_runtime::Value::Intrinsic { fqn, func } = callee {
-            // Skip the sentinel FQNs handled in call_value below.
             if !fqn.starts_with("__klio_intrinsic_") {
-                // Reconstruct a simple-name dispatch through
-                // invoke_named_intrinsic_with_names. We pick the
-                // last path-segment after the final '.' as the
-                // dispatch name so kotlin.io.println → println.
-                let simple = fqn.rsplit('.').next().unwrap_or(*fqn);
-                let result = self.interp.invoke_named_intrinsic_with_names(
-                    simple, args, arg_names, self.out,
-                );
-                match result {
-                    Ok(v) => return Ok(v),
-                    Err(e) => {
-                        // Fall back to calling the stdlib fn directly
-                        // when the simple-name dispatch can't find a
-                        // matching binding — covers FQNs like
-                        // `kotlin.math.abs` whose last segment isn't
-                        // re-exported as a bare top-level name.
-                        if fqn.contains('.') {
-                            let mut __interp_host = InterpHostRef { interp: self.interp };
-                            let mut ctx = klio_runtime::CallCtx {
-                                args,
-                                out: self.out,
-                                host: &mut __interp_host,
-                            };
-                            return func(&mut ctx).map_err(|e2| {
-                                klio_ir::eval::EvalError::Type(e2.to_string())
-                            });
-                        }
-                        return Err(klio_ir::eval::EvalError::Type(e.to_string()));
-                    }
-                }
+                let reordered = reorder_intrinsic_args(fqn, args.to_vec(), arg_names)
+                    .map_err(ir_err)?;
+                let mut __interp_host = InterpHostRef { interp: self.interp };
+                let mut ctx = klio_runtime::CallCtx {
+                    args: &reordered,
+                    out: self.out,
+                    host: &mut __interp_host,
+                };
+                return func(&mut ctx).map_err(ir_err);
             }
         }
         let _ = arg_names;
