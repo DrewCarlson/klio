@@ -12,7 +12,13 @@ import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.statement.HttpResponse
 import io.ktor.http.HttpMethod
 
-class HttpClient {
+class HttpClientConfig {
+    var timeoutMillis: Long = 60_000L
+    var connectTimeoutMillis: Long = -1L
+    var tlsInsecure: Boolean = false
+}
+
+class HttpClient(val config: HttpClientConfig) {
     fun close() {}
 
     suspend fun request(builder: HttpRequestBuilder): HttpResponse {
@@ -20,8 +26,23 @@ class HttpClient {
             throw IllegalArgumentException("HttpRequestBuilder.url is empty")
         }
         val headers = builder.headers
-        val flat = Array(headers.size * 2) { "" }
+        // Prepend the per-client config knobs as reserved-key
+        // headers; the engine strips them before sending.
+        val configHeaders = HashMap<String, String>()
+        configHeaders["__klio_cfg_timeout_ms"] = config.timeoutMillis.toString()
+        if (config.connectTimeoutMillis >= 0L) {
+            configHeaders["__klio_cfg_connect_timeout_ms"] = config.connectTimeoutMillis.toString()
+        }
+        if (config.tlsInsecure) {
+            configHeaders["__klio_cfg_tls_insecure"] = "true"
+        }
+        val total = headers.size + configHeaders.size
+        val flat = Array(total * 2) { "" }
         var i = 0
+        for ((k, v) in configHeaders) {
+            flat[i] = k; i += 1
+            flat[i] = v; i += 1
+        }
         for ((k, v) in headers) {
             flat[i] = k; i += 1
             flat[i] = v; i += 1
@@ -55,7 +76,13 @@ class HttpClient {
     }
 }
 
-fun HttpClient(): HttpClient = HttpClient()
+fun HttpClient(): HttpClient = HttpClient(HttpClientConfig())
+
+fun HttpClient(configure: HttpClientConfig.() -> Unit): HttpClient {
+    val cfg = HttpClientConfig()
+    cfg.configure()
+    return HttpClient(cfg)
+}
 
 // DSL form: `client.get(url) { header(...); accept(...) }`. The
 // configure lambda runs against a fresh HttpRequestBuilder before

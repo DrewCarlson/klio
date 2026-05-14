@@ -62,11 +62,48 @@ fn make_string_array(values: Vec<String>) -> Value {
 }
 
 fn perform(method: &str, url: &str, body: &str, headers: &[String]) -> Vec<String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(60))
-        .build();
-    let mut req = agent.request(method, url);
+    // Extract per-request config from reserved header keys before
+    // they hit the agent. `__klio_cfg_*` keys are stripped; the
+    // remainder are forwarded verbatim.
+    let mut timeout_ms: u64 = 60_000;
+    let mut tls_insecure: bool = false;
+    let mut connect_timeout_ms: Option<u64> = None;
+    let mut user_headers: Vec<String> = Vec::new();
     let mut hi = headers.iter();
+    while let (Some(k), Some(v)) = (hi.next(), hi.next()) {
+        match k.as_str() {
+            "__klio_cfg_timeout_ms" => {
+                timeout_ms = v.parse().unwrap_or(timeout_ms);
+            }
+            "__klio_cfg_connect_timeout_ms" => {
+                connect_timeout_ms = v.parse().ok();
+            }
+            "__klio_cfg_tls_insecure" => {
+                tls_insecure = v == "true";
+            }
+            _ => {
+                user_headers.push(k.clone());
+                user_headers.push(v.clone());
+            }
+        }
+    }
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_millis(timeout_ms));
+    if let Some(ms) = connect_timeout_ms {
+        builder = builder.timeout_connect(std::time::Duration::from_millis(ms));
+    }
+    if tls_insecure {
+        // ureq's `tls_connector` slot accepts any rustls / native-tls
+        // ClientConfig. Building a permissive rustls config from
+        // scratch requires the danger API and a custom verifier;
+        // ureq's "tls" feature wires rustls-platform-verifier by
+        // default. Surface the request explicitly so users know it
+        // was honored.
+        eprintln!("warning: __klio_cfg_tls_insecure requested; insecure mode is a no-op until a custom rustls verifier is wired");
+    }
+    let agent = builder.build();
+    let mut req = agent.request(method, url);
+    let mut hi = user_headers.iter();
     while let (Some(k), Some(v)) = (hi.next(), hi.next()) {
         req = req.set(k, v);
     }
