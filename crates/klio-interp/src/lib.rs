@@ -12488,6 +12488,32 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // IR-native fast-path: when the receiver is a user-class
+        // instance and the named property is a plain stored field
+        // (no custom getter, no delegate, no extension property),
+        // read it directly from `InstanceData.fields`. Skips the
+        // tree-walker `eval_property_access` round-trip.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let plain_field = {
+                let i = inst.borrow();
+                let has_custom = i
+                    .class
+                    .body_properties
+                    .iter()
+                    .find(|p| p.name == name)
+                    .map_or(false, |p| {
+                        p.getter.is_some() || p.delegate.is_some()
+                    });
+                if has_custom {
+                    None
+                } else {
+                    i.get(name)
+                }
+            };
+            if let Some(v) = plain_field {
+                return Ok(v);
+            }
+        }
         // Companion-style static access on an Intrinsic constructor:
         // `Regex.escape` reads through `kotlin.text.Regex.escape` /
         // `kotlin.text.Regex.Companion.<name>` registered as
