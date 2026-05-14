@@ -8299,8 +8299,21 @@ impl Interpreter {
                 if name == comp.borrow().class.name {
                     return Ok(Value::Instance(Rc::clone(comp)));
                 }
-                if let Some(v) = comp.borrow().get(name) {
-                    return Ok(v);
+                // Route through the Instance branch so getter-only
+                // properties (`val Foo get() = ...`) dispatch through
+                // their getter instead of bottoming out at a missing
+                // backing field. find_body_property + read_instance_property
+                // walk the companion's class members, which is exactly
+                // the same machinery a plain instance access uses.
+                let comp_class = Rc::clone(&comp.borrow().class);
+                if comp_class.find_body_property(name).is_some()
+                    || comp.borrow().get(name).is_some()
+                {
+                    return self.eval_property_access(
+                        Value::Instance(Rc::clone(comp)),
+                        name,
+                        out,
+                    );
                 }
             }
             // `Foo.Bar` — nested class (only the non-inner kind is reachable
