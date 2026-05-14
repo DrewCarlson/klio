@@ -81,6 +81,9 @@ pub struct Interpreter {
     /// the accessor through IR instead of bouncing through
     /// `read_top_level_property_pub`.
     top_level_prop_getters: std::collections::HashMap<String, klio_ir::FuncId>,
+    /// Same idea as `top_level_prop_getters` but for setters. The
+    /// FuncId names a 1-arg accessor that receives the new value.
+    top_level_prop_setters: std::collections::HashMap<String, klio_ir::FuncId>,
     /// `@Retention` value declared on each annotation class (`SOURCE`,
     /// `BINARY`, or `RUNTIME`). Populated when an `annotation class`
     /// is registered. Drives whether the annotation surfaces through
@@ -280,6 +283,7 @@ impl Interpreter {
             globals: Rc::new(RefCell::new(env)),
             top_level_props: std::collections::HashMap::new(),
             top_level_prop_getters: std::collections::HashMap::new(),
+            top_level_prop_setters: std::collections::HashMap::new(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
@@ -1050,6 +1054,22 @@ impl Interpreter {
                             &format!("__get__{}", p.name.name),
                         );
                         self.top_level_prop_getters.insert(p.name.name.clone(), id);
+                    }
+                }
+                if let Some(setter) = &p.setter {
+                    let param = setter
+                        .params
+                        .first()
+                        .map(|i| i.name.clone())
+                        .unwrap_or_else(|| "value".into());
+                    if let Some(body) = getter_body_expr(setter) {
+                        let id = klio_ir::lower::lower_unary_expr_as_thunk(
+                            &mut module,
+                            &param,
+                            &body,
+                            &format!("__set__{}", p.name.name),
+                        );
+                        self.top_level_prop_setters.insert(p.name.name.clone(), id);
                     }
                 }
             }
@@ -13671,6 +13691,12 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // walker's assign_top_level_pub round-trip.
         if !self.interp.top_level_props.contains_key(name) {
             self.interp.globals.borrow_mut().define(name, value);
+            return Ok(());
+        }
+        if let Some(fid) = self.interp.top_level_prop_setters.get(name).copied() {
+            let module = std::rc::Rc::clone(&self.module);
+            let func = module.funcs[fid.0 as usize].clone();
+            klio_ir::eval::eval_with(&module, &func, vec![value], self)?;
             return Ok(());
         }
         self.interp

@@ -327,6 +327,27 @@ pub fn lower_expr_as_thunk(
     id
 }
 
+/// Lower an expression as a 1-arg synthetic function whose single
+/// parameter is bound under `param_name`. Used to model property
+/// setter bodies whose source form is `set(v) = field.assign(v)`.
+pub fn lower_unary_expr_as_thunk(
+    module: &mut crate::Module,
+    param_name: &str,
+    expr: &Expr,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    bind_params(&mut b, &[param_name]);
+    let v = lower_expr(&mut b, expr);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
 pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
     for (i, name) in names.iter().enumerate() {
         let dst = b.alloc_reg();
