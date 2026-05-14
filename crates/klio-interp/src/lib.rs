@@ -12148,6 +12148,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     prim: None,
                 });
             }
+            (klio_runtime::Value::Set { items, .. }, "iterator") => {
+                return Ok(klio_runtime::Value::Iterator {
+                    items: std::rc::Rc::clone(items),
+                    pos: std::rc::Rc::new(std::cell::RefCell::new(0)),
+                    prim: None,
+                });
+            }
             (klio_runtime::Value::List { items, .. }, "iterator") => {
                 return Ok(klio_runtime::Value::Iterator {
                     items: std::rc::Rc::clone(items),

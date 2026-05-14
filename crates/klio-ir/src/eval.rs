@@ -842,6 +842,14 @@ fn render_value(v: &Value) -> String {
     }
 }
 
+fn arith_exc(msg: &str) -> EvalError {
+    EvalError::Throw(Value::Exception {
+        fqn: std::rc::Rc::new("kotlin.ArithmeticException".into()),
+        message: Some(std::rc::Rc::new(msg.into())),
+        cause: None,
+    })
+}
+
 fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
     use Value::{Bool, Double, Int, Long};
     match (op, l, r) {
@@ -855,10 +863,22 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::Add, Long(a), Long(b)) => Ok(Long(a.wrapping_add(*b))),
         (BinOp::Sub, Long(a), Long(b)) => Ok(Long(a.wrapping_sub(*b))),
         (BinOp::Mul, Long(a), Long(b)) => Ok(Long(a.wrapping_mul(*b))),
-        (BinOp::Div, Long(a), Long(b)) => Ok(Long(a.wrapping_div(*b))),
-        (BinOp::Mod, Long(a), Long(b)) => Ok(Long(a.wrapping_rem(*b))),
-        (BinOp::Div, Int(a), Int(b)) => Ok(Int(a.wrapping_div(*b))),
-        (BinOp::Mod, Int(a), Int(b)) => Ok(Int(a.wrapping_rem(*b))),
+        (BinOp::Div, Long(a), Long(b)) => {
+            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            Ok(Long(a.wrapping_div(*b)))
+        }
+        (BinOp::Mod, Long(a), Long(b)) => {
+            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            Ok(Long(a.wrapping_rem(*b)))
+        }
+        (BinOp::Div, Int(a), Int(b)) => {
+            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            Ok(Int(a.wrapping_div(*b)))
+        }
+        (BinOp::Mod, Int(a), Int(b)) => {
+            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            Ok(Int(a.wrapping_rem(*b)))
+        }
         // Mixed Int/Long arithmetic — widen the Int operand to Long
         // and apply Long arithmetic. Matches Kotlin's numeric tower.
         (BinOp::Add, Long(a), Int(b)) => Ok(Long(a.wrapping_add(*b as i64))),

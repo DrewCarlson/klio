@@ -1542,6 +1542,45 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             }
             None
         }
+        Stmt::Assign { target, op, value, .. }
+            if matches!(target, Expr::Member { safe: true, .. }) =>
+        {
+            // `obj?.field = v` (or compound `?.field += v`):
+            //   if obj is null → skip the assignment entirely.
+            //   otherwise → fall through to the regular non-safe
+            //              assign path with the safe flag cleared.
+            let Expr::Member { receiver, name, span, .. } = target else { unreachable!() };
+            let recv_r = lower_expr(b, receiver);
+            let null_r = b.emit_const(Const::Null);
+            let is_null = b.alloc_reg();
+            b.push(Inst::BinOp { dst: is_null, op: BinOp::Eq, lhs: recv_r, rhs: null_r });
+            let skip = b.alloc_block();
+            let do_set = b.alloc_block();
+            let join = b.alloc_block();
+            b.terminate(Terminator::Branch { cond: is_null, t: skip, f: do_set });
+            b.switch_to(do_set);
+            // Synthesize an equivalent non-safe assign and recurse
+            // through Stmt::Assign so compound semantics, setters,
+            // and class property setters reuse the existing path.
+            let inner_target = Expr::Member {
+                receiver: receiver.clone(),
+                name: name.clone(),
+                safe: false,
+                span: *span,
+            };
+            let synth = Stmt::Assign {
+                target: inner_target,
+                op: *op,
+                value: value.clone(),
+                span: *span,
+            };
+            lower_stmt(b, &synth);
+            b.terminate(Terminator::Goto(join));
+            b.switch_to(skip);
+            b.terminate(Terminator::Goto(join));
+            b.switch_to(join);
+            return None;
+        }
         Stmt::Assign { target, op, value, .. } => {
             let v = lower_expr(b, value);
             // Compound assigns first try `<op>Assign` as a member
