@@ -47,6 +47,36 @@ that the shim rebuilds into `HttpResponse`. Returning primitives
 from native bindings avoids the cost (and bugs) of constructing
 Kotlin class instances directly from Rust.
 
+### Replacing the engine
+
+Any crate that calls `HostBindings::register(
+"io.ktor.client.engine.__kktor_request", my_fn,
+)` shadows the default engine. To wire it in, add the crate to
+`klio-cli`'s `merged_host_bindings()` *after* `klio_ktor_client::host_bindings()`
+— later registrations win. Common motivations:
+
+- Swapping to async via `reqwest` + a thread-pool runtime.
+- Routing through an in-memory mock during tests.
+- Intercepting for logging or distributed tracing.
+
+The engine contract is the
+`fn(&mut CallCtx) -> Result<Value, RuntimeError>` shape every
+host binding shares; arguments are `[method, url, body, headers]`
+and the return is the flat string array described above.
+
+## DSL form
+
+`getWith` / `postWith` / `requestWith` accept a builder lambda:
+
+```kotlin
+val resp = runBlocking {
+    client.getWith("https://httpbin.org/get") {
+        accept("application/json")
+        header("X-Source", "klio")
+    }
+}
+```
+
 ## Install
 
 ```sh

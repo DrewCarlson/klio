@@ -56,3 +56,37 @@ class HttpClient {
 }
 
 fun HttpClient(): HttpClient = HttpClient()
+
+// DSL form: `client.get(url) { header(...); accept(...) }`. The
+// configure lambda runs against a fresh HttpRequestBuilder before
+// the request is dispatched. Mirrors upstream ktor's builder DSL.
+
+suspend fun HttpClient.getWith(
+    url: String,
+    configure: HttpRequestBuilder.() -> Unit,
+): HttpResponse {
+    val b = HttpRequestBuilder()
+    b.method = HttpMethod.Get
+    b.url = url
+    b.configure()
+    return request(b)
+}
+
+suspend fun HttpClient.postWith(
+    url: String,
+    configure: HttpRequestBuilder.() -> Unit,
+): HttpResponse {
+    val b = HttpRequestBuilder()
+    b.method = HttpMethod.Post
+    b.url = url
+    b.configure()
+    return request(b)
+}
+
+suspend fun HttpClient.requestWith(
+    configure: HttpRequestBuilder.() -> Unit,
+): HttpResponse {
+    val b = HttpRequestBuilder()
+    b.configure()
+    return request(b)
+}
