@@ -12251,6 +12251,57 @@ impl<'a> IrHost<'a> {
             is_infix: false,
             span: dummy_span,
         };
+        // Try lowering the synthesized Call as an N-arg IR thunk and
+        // run it via klio_ir::eval — the IR-native path picks up
+        // named args + vararg + default values through ordinary
+        // dispatch. Fall back to the tree walker on IR Unsupported.
+        let mut local_module = klio_ir::Module::default();
+        let mut param_names: Vec<String> = Vec::with_capacity(args.len() + 1);
+        param_names.push("__ir_self".to_string());
+        for i in 0..args.len() {
+            param_names.push(format!("__ir_arg_{i}"));
+        }
+        let name_refs: Vec<&str> = param_names.iter().map(|s| s.as_str()).collect();
+        let fid = klio_ir::lower::lower_expr_as_param_thunk(
+            &mut local_module,
+            &name_refs,
+            &call,
+            "__dispatch_member__",
+        );
+        let module_rc = std::rc::Rc::new(local_module);
+        let func = module_rc.funcs[fid.0 as usize].clone();
+        let class_names: Vec<String> =
+            module_rc.classes.iter().map(|c| c.name.clone()).collect();
+        let method_index = IrHost::build_method_index(&module_rc);
+        let mut thunk_args: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
+        thunk_args.push(receiver.clone());
+        thunk_args.extend_from_slice(args);
+        let mut child = IrHost {
+            interp: self.interp,
+            out: self.out,
+            class_names,
+            closures: Vec::new(),
+            module: std::rc::Rc::clone(&module_rc),
+            method_index,
+        };
+        match klio_ir::eval::eval_with(&module_rc, &func, thunk_args, &mut child) {
+            Ok(v) => return Ok(v),
+            Err(klio_ir::eval::EvalError::Unsupported(_)) => {}
+            Err(klio_ir::eval::EvalError::Throw(v)) => {
+                return Err(klio_runtime::RuntimeError::Thrown(v));
+            }
+            Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => return Ok(v),
+            Err(klio_ir::eval::EvalError::Arity(s)) => {
+                return Err(klio_runtime::RuntimeError::Arity(s));
+            }
+            Err(klio_ir::eval::EvalError::Unbound(s)) => {
+                return Err(klio_runtime::RuntimeError::Unbound(s));
+            }
+            Err(klio_ir::eval::EvalError::Unimplemented(s)) => {
+                return Err(klio_runtime::RuntimeError::Unimplemented(s));
+            }
+            Err(e) => return Err(klio_runtime::RuntimeError::Type(format!("{e}"))),
+        }
         self.interp.eval_expr(&call, &env, self.out)
     }
 }
