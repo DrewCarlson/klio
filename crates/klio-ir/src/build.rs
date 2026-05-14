@@ -389,6 +389,7 @@ impl<'a> FuncBuilder<'a> {
             blocks: self.blocks,
             entry: BlockId(0),
         is_suspend: false,
+        is_tailrec: self.tailrec_self.is_some(),
         }
     }
 }

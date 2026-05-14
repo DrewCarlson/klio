@@ -937,12 +937,43 @@ impl Interpreter {
                 let _ = klio_ir::lower::lower_class_with_file(&mut module, c, &file_classes);
             }
         }
+        // Pre-pass: register a stub Func for every top-level function so
+        // Call-site lowering can resolve forward references (mutually
+        // recursive tailrec, calls to a fn declared later in the file).
+        let mut stub_ids: std::collections::HashMap<String, klio_ir::FuncId> =
+            std::collections::HashMap::new();
+        for d in &file.decls {
+            if let Decl::Function(f) = d {
+                let id = klio_ir::FuncId(module.funcs.len() as u32);
+                module.funcs.push(klio_ir::Func {
+                    id,
+                    name: f.name.name.clone(),
+                    fqn: f.name.name.clone(),
+                    params: Vec::new(),
+                    return_ty: klio_ir::TypeRef::unit(),
+                    n_locals: 0,
+                    blocks: Vec::new(),
+                    entry: klio_ir::BlockId(0),
+                    is_suspend: false,
+                    is_tailrec: f.is_tailrec,
+                });
+                module.func_index.push((f.name.name.clone(), id));
+                if f.is_tailrec {
+                    module.tailrec_fn_names.push(f.name.name.clone());
+                }
+                stub_ids.insert(f.name.name.clone(), id);
+            }
+        }
         let mut main_id: Option<klio_ir::FuncId> = None;
         for d in &file.decls {
             if let Decl::Function(f) = d {
-                let func = klio_ir::lower::lower_function_with_file(&mut module, f, &file_classes);
+                let func = klio_ir::lower::lower_function_body_into(&mut module, f, &file_classes);
+                let id = *stub_ids.get(&f.name.name).expect("stub registered above");
+                let mut placed = func;
+                placed.id = id;
+                module.funcs[id.0 as usize] = placed;
                 if f.name.name == "main" {
-                    main_id = Some(func.id);
+                    main_id = Some(id);
                 }
             }
         }
@@ -970,6 +1001,7 @@ impl Interpreter {
             Ok(v) => Ok(v),
             Err(klio_ir::eval::EvalError::Throw(v)) => Err(RuntimeError::Thrown(v)),
             Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => Ok(v),
+            Err(klio_ir::eval::EvalError::LabeledReturn(l, v)) => Err(RuntimeError::LabeledReturn(l, v)),
             Err(klio_ir::eval::EvalError::Arity(s)) => Err(RuntimeError::Arity(s)),
             Err(klio_ir::eval::EvalError::Unbound(s)) => Err(RuntimeError::Unbound(s)),
             Err(klio_ir::eval::EvalError::Unimplemented(s)) => Err(RuntimeError::Unimplemented(s)),
@@ -11378,6 +11410,7 @@ fn ir_err(e: klio_runtime::RuntimeError) -> klio_ir::eval::EvalError {
     match e {
         klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
         klio_runtime::RuntimeError::Return(v) => klio_ir::eval::EvalError::NonLocalReturn(v),
+        klio_runtime::RuntimeError::LabeledReturn(l, v) => klio_ir::eval::EvalError::LabeledReturn(l, v),
         klio_runtime::RuntimeError::Arity(s) => klio_ir::eval::EvalError::Arity(s),
         klio_runtime::RuntimeError::Unbound(s) => klio_ir::eval::EvalError::Unbound(s),
         klio_runtime::RuntimeError::Unimplemented(s) => klio_ir::eval::EvalError::Unimplemented(s),
@@ -11552,6 +11585,26 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         if let Some(v) = self.interp.lookup_global_callable(name) {
             return Some(v);
+        }
+        // Reified type parameter: resolve through the active reified
+        // stack and retry the lookup against the substituted name.
+        let resolved = self.interp.resolve_reified(name);
+        if resolved != name {
+            if let Some(v) = self.interp.lookup_global_callable(&resolved) {
+                return Some(v);
+            }
+            if let Some(v) = self.interp.synth_primitive_class(&resolved) {
+                return Some(v);
+            }
+        }
+        if matches!(
+            name,
+            "Int" | "Long" | "Short" | "Byte" | "Float" | "Double" | "Boolean" | "Char"
+            | "Unit" | "String" | "Any" | "Nothing" | "Number" | "CharSequence"
+        ) {
+            if let Some(v) = self.interp.synth_primitive_class(name) {
+                return Some(v);
+            }
         }
         // Top-level property with a delegate / custom getter — route
         // the read through the tree walker so the getter (e.g.
@@ -11971,9 +12024,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 if let Some(fid) = module.func_id(&name) {
                     let func = module.funcs[fid.0 as usize].clone();
                     if func.params.len() == args.len() {
-                        match klio_ir::eval::eval_with(&module, &func, args.to_vec(), self) {
+                        self.interp.implicit_lambda_label_stack.push(name.clone());
+                        let r = klio_ir::eval::eval_with(&module, &func, args.to_vec(), self);
+                        self.interp.implicit_lambda_label_stack.pop();
+                        match r {
                             Ok(v) => return Ok(v),
                             Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => return Ok(v),
+                            Err(klio_ir::eval::EvalError::LabeledReturn(l, v)) if l == name => return Ok(v),
                             Err(klio_ir::eval::EvalError::Unsupported(_)) => {
                                 // Body used an IR construct the
                                 // host can't service yet — fall
@@ -12302,6 +12359,46 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         self.call_func_named(module, func, args, &[])
     }
 
+    fn call_func_typed(
+        &mut self,
+        module: &klio_ir::Module,
+        func: klio_ir::FuncId,
+        args: Vec<klio_runtime::Value>,
+        arg_names: &[Option<String>],
+        type_args: &[String],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let f = module
+            .funcs
+            .get(func.0 as usize)
+            .ok_or_else(|| klio_ir::eval::EvalError::Type(format!("unknown FuncId {}", func.0)))?;
+        let name = f.name.clone();
+        let pushed = if !type_args.is_empty() {
+            let decl_opt = match self.interp.globals.borrow().lookup(&name) {
+                Some(klio_runtime::Value::Function { decl, .. }) => Some(decl),
+                _ => None,
+            };
+            if let Some(decl) = decl_opt {
+                if decl.is_inline {
+                    let mut frame: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    for (i, tp) in decl.type_params.iter().enumerate() {
+                        if !tp.is_reified { continue; }
+                        if let Some(arg) = type_args.get(i) {
+                            frame.insert(tp.name.name.clone(), arg.clone());
+                        }
+                    }
+                    self.interp.reified_stack.push(frame);
+                    true
+                } else { false }
+            } else { false }
+        } else { false };
+        let r = self.call_func_named(module, func, args, arg_names);
+        if pushed {
+            self.interp.reified_stack.pop();
+        }
+        r
+    }
+
     fn call_func_named(
         &mut self,
         module: &klio_ir::Module,
@@ -12350,7 +12447,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             module: std::rc::Rc::clone(&self.module),
             method_index: self.method_index.clone(),
         };
-        klio_ir::eval::eval_with(module, &f, args, &mut child)
+        child.interp.implicit_lambda_label_stack.push(name.clone());
+        let r = klio_ir::eval::eval_with(module, &f, args, &mut child);
+        child.interp.implicit_lambda_label_stack.pop();
+        match r {
+            Err(klio_ir::eval::EvalError::LabeledReturn(l, v)) if l == name => Ok(v),
+            other => other,
+        }
     }
 
     fn call_member(
@@ -13574,7 +13677,20 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         if ty.name.len() == 1
             && ty.name.chars().next().map_or(false, |c| c.is_ascii_uppercase())
         {
-            return true;
+            let resolved = self.interp.resolve_reified(&ty.name);
+            if resolved != ty.name {
+                let resolved_ty = klio_ir::TypeRef {
+                    name: resolved,
+                    nullable: ty.nullable,
+                    args: ty.args.clone(),
+                };
+                return self.instance_of(value, &resolved_ty);
+            }
+            // No user-class binding for this single-letter name →
+            // treat as an erased generic and answer true (JVM erasure).
+            if !self.interp.class_table.contains_key(&ty.name) {
+                return true;
+            }
         }
         // User exception classes — open class MyErr : RuntimeException()
         // — should answer `is Exception` / `is Throwable` true even

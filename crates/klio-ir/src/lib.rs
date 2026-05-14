@@ -103,6 +103,12 @@ pub enum Inst {
         n_args: u8,
         #[serde(default)]
         arg_names: Vec<Option<ConstId>>,
+        /// Call-site type arguments, in declaration order. Each entry
+        /// is the interned simple type name (or fully-qualified name)
+        /// the source wrote. Consumed by reified type-parameter
+        /// dispatch when the callee is an `inline fun <reified T>`.
+        #[serde(default)]
+        type_args: Vec<ConstId>,
     },
     /// `receiver.lambda(args)` — invoke a callable with a
     /// receiver bound as `this` inside the body. Used for
@@ -327,6 +333,12 @@ pub enum Terminator {
     /// from this contiguous register run and restarts execution
     /// without pushing a new call frame.
     TailJump { args: Reg, n_args: u8 },
+    /// Cross-function tail call: replace the current frame's function
+    /// with `func`, rebind its params from the contiguous register run
+    /// at `args`, and restart the new entry block. Lowered for tail
+    /// calls between two `tailrec` functions so mutual recursion stays
+    /// in a single host frame.
+    TailCallFunc { func: FuncId, args: Reg, n_args: u8 },
 }
 
 /// Catch handler frame attached to a try-body block. When a Throw
@@ -371,6 +383,8 @@ pub struct Func {
     pub blocks: Vec<Block>,
     pub entry: BlockId,
     pub is_suspend: bool,
+    #[serde(default)]
+    pub is_tailrec: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +425,12 @@ pub struct Module {
     pub func_index: Vec<(String, FuncId)>,
     /// Package path for FQN qualification.
     pub package: Option<String>,
+    /// Top-level function names declared `tailrec`. Populated by the
+    /// driver before bodies are lowered so a tailrec caller's lower
+    /// pass can emit `TailCallFunc` for a tail-position call into
+    /// another tailrec function whose body hasn't been lowered yet.
+    #[serde(default)]
+    pub tailrec_fn_names: Vec<String>,
 }
 
 impl Module {

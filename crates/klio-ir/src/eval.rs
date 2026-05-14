@@ -311,6 +311,19 @@ pub trait Host {
     ) -> Result<Value, EvalError> {
         self.call_func(module, func, args)
     }
+    /// Variant that carries call-site type arguments (e.g. for
+    /// `inline fun <reified T> foo<Int>()`). The default ignores
+    /// them; klio's interp host pushes a reified frame.
+    fn call_func_typed(
+        &mut self,
+        module: &Module,
+        func: FuncId,
+        args: Vec<Value>,
+        arg_names: &[Option<String>],
+        _type_args: &[String],
+    ) -> Result<Value, EvalError> {
+        self.call_func_named(module, func, args, arg_names)
+    }
 }
 
 /// No-op host for unit tests and IR-shape exercises.
@@ -332,6 +345,11 @@ pub enum EvalError {
     /// return value.
     #[error("non-local return inside IR evaluator")]
     NonLocalReturn(Value),
+    /// `return@label value` whose target is a named function/lambda
+    /// frame. `eval_with_captures` catches this when the active
+    /// frame's `func.name` matches the label.
+    #[error("labeled return inside IR evaluator")]
+    LabeledReturn(String, Value),
     /// Arity mismatch — caller passed wrong number of args.
     #[error("arity mismatch: {0}")]
     Arity(String),
@@ -527,6 +545,20 @@ pub fn eval_with_captures(
                 cur = frame.func.entry;
                 continue;
             }
+            Terminator::TailCallFunc { func, args, n_args } => {
+                let mut new_params: Vec<Value> = Vec::with_capacity(n_args as usize);
+                for i in 0..n_args {
+                    new_params.push(frame.read(Reg(args.0 + i as u32)));
+                }
+                let new_func = &module.funcs[func.0 as usize];
+                frame.func = new_func;
+                frame.params = new_params;
+                frame.regs.clear();
+                frame.regs.resize(new_func.n_locals as usize, Value::Unit);
+                try_stack.clear();
+                cur = new_func.entry;
+                continue;
+            }
             Terminator::Switch { reg, arms, default } => {
                 let v = frame.read(reg);
                 let next = arms
@@ -662,10 +694,17 @@ fn exec_inst(
             };
             host.set_field(&r, &name, v)?;
         }
-        Inst::Call { dst, func, args, n_args, arg_names } => {
+        Inst::Call { dst, func, args, n_args, arg_names, type_args } => {
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
-            let result = host.call_func_named(frame.module, *func, arg_values, &names)?;
+            let ta: Vec<String> = type_args
+                .iter()
+                .map(|c| match &frame.module.consts[c.0 as usize] {
+                    crate::Const::String(s) => s.clone(),
+                    _ => String::new(),
+                })
+                .collect();
+            let result = host.call_func_typed(frame.module, *func, arg_values, &names, &ta)?;
             frame.write(*dst, result);
         }
         Inst::CallValue { dst, callee, args, n_args, arg_names } => {

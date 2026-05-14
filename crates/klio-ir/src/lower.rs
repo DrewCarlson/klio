@@ -294,6 +294,19 @@ fn intern_arg_names(
         .collect()
 }
 
+fn intern_type_args(
+    module: &mut crate::Module,
+    type_args: &[klio_ast::TypeRef],
+) -> Vec<crate::ConstId> {
+    if type_args.is_empty() {
+        return Vec::new();
+    }
+    type_args
+        .iter()
+        .map(|t| module.intern_const(Const::String(t.name.name.clone())))
+        .collect()
+}
+
 pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
     for (i, name) in names.iter().enumerate() {
         let dst = b.alloc_reg();
@@ -501,6 +514,18 @@ pub fn lower_function_with_file(
     module.func_index.push((f.name.name.clone(), id));
     module.funcs.push(placed.clone());
     placed
+}
+
+/// Lower a function body without registering it in `module.func_index`.
+/// Used by the interpreter's pre-pass-then-fill driver so a function's
+/// FuncId is reserved before its body is lowered (enabling forward
+/// references and mutual recursion).
+pub fn lower_function_body_into(
+    module: &mut crate::Module,
+    f: &klio_ast::Function,
+    file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
+) -> crate::Func {
+    lower_function_body(module, f, file_classes)
 }
 
 fn lower_function_body(
@@ -1173,7 +1198,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             }
             return dst;
         }
-        Expr::Call { callee, args, arg_names: ast_arg_names, .. }
+        Expr::Call { callee, args, arg_names: ast_arg_names, type_args: ast_type_args, .. }
             if args.iter().any(|a| lambda_writes_outer_var(b, a))
                 && matches!(callee.as_ref(), Expr::Path { .. }) =>
         {
@@ -1202,12 +1227,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let Expr::Path { segments, .. } = callee.as_ref() else { unreachable!() };
             if segments.len() == 1 {
                 if let Some(func_id) = b.module.func_id(&segments[0].name) {
+                    let type_args = intern_type_args(b.module, ast_type_args);
                     b.push(Inst::Call {
                         dst,
                         func: func_id,
                         args: args_start,
                         n_args: args.len() as u8,
                         arg_names,
+                        type_args,
                     });
                 } else {
                     let callee_r = lower_expr(b, callee);
@@ -1281,7 +1308,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             });
             dst
         }
-        Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. } => {
+        Expr::Call { callee, args, arg_names: ast_arg_names, type_args: ast_type_args, is_infix, .. } => {
             // Infix call `a fn b` lowers as `a.fn(b)` — the
             // dispatch site is a member call on the receiver
             // even when `fn` is a top-level extension.
@@ -1340,8 +1367,26 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
                     if let Some(func_id) = b.module.func_id(&segments[0].name) {
+                        let callee_is_tailrec = b
+                            .module
+                            .funcs
+                            .get(func_id.0 as usize)
+                            .map_or(false, |f| f.is_tailrec)
+                            || b.module.tailrec_fn_names.iter().any(|n| n == &segments[0].name);
+                        if b.tailrec_self().is_some() && callee_is_tailrec && ast_arg_names.iter().all(|n| n.is_none()) {
+                            let (args_start, count) = lower_arg_run(b, args);
+                            b.terminate(Terminator::TailCallFunc {
+                                func: func_id,
+                                args: args_start,
+                                n_args: count,
+                            });
+                            let dead = b.alloc_block();
+                            b.switch_to(dead);
+                            return b.emit_const(Const::Unit);
+                        }
                         let (args_start, count) = lower_arg_run(b, args);
                         let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let type_args = intern_type_args(b.module, ast_type_args);
                         let dst = b.alloc_reg();
                         b.push(Inst::Call {
                             dst,
@@ -1349,6 +1394,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             args: args_start,
                             n_args: count,
                             arg_names,
+                            type_args,
                         });
                         return dst;
                     }
