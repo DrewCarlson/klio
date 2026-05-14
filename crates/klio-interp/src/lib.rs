@@ -12054,6 +12054,11 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         let has_overloads = self.interp.has_top_level_overloads(&name);
         let has_vararg = self.interp.has_top_level_vararg(&name);
         if has_names || has_defaults || has_overloads || has_vararg || arg_names.len() == args.len() && args.len() < f.params.len() {
+            match self.interp.dispatch_top_level_overload(&name, &args, arg_names, self.out) {
+                Ok(Some(v)) => return Ok(v),
+                Ok(None) => {}
+                Err(e) => return Err(ir_err(e)),
+            }
             return self
                 .interp
                 .invoke_named_intrinsic_with_names(&name, &args, arg_names, self.out)
