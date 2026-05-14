@@ -11362,6 +11362,28 @@ impl<'a> IrHost<'a> {
             .construct_instance_with_outer(&class, args, arg_names, None, self.out)
     }
 
+    /// Look up an IR-lowered method `FuncId` on the active module
+    /// for a given class FQN + method name. Returns `None` when
+    /// the class isn't in the module (e.g. pack-loaded class) or
+    /// the method wasn't lowered. Used as the entry point for
+    /// IR-native instance-method dispatch once the receiver's
+    /// runtime ClassDef is matched to an IR Class.
+    #[allow(dead_code)]
+    fn lookup_ir_method(
+        &self,
+        class_fqn: &str,
+        method_name: &str,
+    ) -> Option<klio_ir::FuncId> {
+        let class = self.module.classes.iter().find(|c| c.fqn == class_fqn || c.name == class_fqn)?;
+        for fid in &class.methods {
+            let func = &self.module.funcs[fid.0 as usize];
+            if func.name == method_name {
+                return Some(*fid);
+            }
+        }
+        None
+    }
+
     /// Synthesize and dispatch a member call through the tree
     /// walker's `eval_expr` so extension-function lookup, named-arg
     /// reorder, vararg packing, and default-value filling all fire.
