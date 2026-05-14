@@ -13166,6 +13166,39 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             name: Ident { name: name.to_string(), span: dummy_span },
             span: dummy_span,
         };
+        // Try the IR-native route first.
+        {
+            let mut local_module = klio_ir::Module::default();
+            let fid = klio_ir::lower::lower_expr_as_param_thunk(
+                &mut local_module,
+                &["__ir_self"],
+                &expr,
+                "__member_ref__",
+            );
+            let module_rc = std::rc::Rc::new(local_module);
+            let func = module_rc.funcs[fid.0 as usize].clone();
+            let class_names: Vec<String> =
+                module_rc.classes.iter().map(|c| c.name.clone()).collect();
+            let method_index = IrHost::build_method_index(&module_rc);
+            let mut child = IrHost {
+                interp: self.interp,
+                out: self.out,
+                class_names,
+                closures: Vec::new(),
+                module: std::rc::Rc::clone(&module_rc),
+                method_index,
+            };
+            match klio_ir::eval::eval_with(
+                &module_rc,
+                &func,
+                vec![receiver.clone()],
+                &mut child,
+            ) {
+                Ok(v) => return Ok(v),
+                Err(klio_ir::eval::EvalError::Unsupported(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         self.interp.eval_expr(&expr, &env, self.out).map_err(ir_err)
     }
 
