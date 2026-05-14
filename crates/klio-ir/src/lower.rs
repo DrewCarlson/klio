@@ -380,6 +380,16 @@ pub fn lower_class_with_file(
     }
     let mut seen_for_collect: std::collections::HashSet<String> = std::collections::HashSet::new();
     collect_members(c, file_classes, &mut own_member_names, &mut seen_for_collect);
+    // Enum entry names are visible under their bare names
+    // inside the enum's method bodies (e.g. `RED` in a
+    // `Color.hex()` method). `entries` resolves to the
+    // built-in synthesized list of all entries.
+    if c.is_enum {
+        for entry in &c.enum_entries {
+            own_member_names.insert(entry.name.name.clone());
+        }
+        own_member_names.insert("entries".to_string());
+    }
     // Companion-object members are visible under their bare
     // names inside this class's method bodies.
     for m in &c.members {

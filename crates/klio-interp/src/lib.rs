@@ -12973,6 +12973,41 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             if let Some(v) = plain_field {
                 return Ok(v);
             }
+            // Enum-entry / entries access from inside an enum
+            // method body: `RED` resolves to the entry value;
+            // `entries` resolves to the synthesized list of all
+            // entries in declaration order.
+            let enum_value: Option<klio_runtime::Value> = {
+                let i = inst.borrow();
+                if i.class.is_enum {
+                    if name == "entries" {
+                        let items: Vec<klio_runtime::Value> = i
+                            .class
+                            .enum_entries
+                            .borrow()
+                            .iter()
+                            .map(|(_, v)| v.clone())
+                            .collect();
+                        Some(klio_runtime::Value::List {
+                            items: std::rc::Rc::new(std::cell::RefCell::new(items)),
+                            mutable: false,
+                            enum_class: Some(std::rc::Rc::new(i.class.name.clone())),
+                        })
+                    } else {
+                        i.class
+                            .enum_entries
+                            .borrow()
+                            .iter()
+                            .find(|(n, _)| n == name)
+                            .map(|(_, v)| v.clone())
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(v) = enum_value {
+                return Ok(v);
+            }
             // Companion-object access from an instance: `this.PI`
             // inside a class method body, where `PI` lives in
             // the companion. Walk class + parents for a
