@@ -11971,6 +11971,55 @@ impl<'a> klio_runtime::IntrinsicHost for InterpHostRef<'a> {
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, RuntimeError> {
         let names: Vec<Option<String>> = vec![None; args.len()];
+        // IR-native dispatch first: ask the host's call_value via a
+        // borrowed IrHost so callables backed by an IR FuncId
+        // (IrClosure, Value::Function on a registered top-level fn)
+        // run through klio_ir::eval without bouncing through the
+        // tree walker's invoke_callable_value.
+        if matches!(
+            callable,
+            klio_runtime::Value::IrClosure { .. }
+                | klio_runtime::Value::Function { .. }
+                | klio_runtime::Value::Intrinsic { .. }
+        ) {
+            let module_rc = self.interp.current_module.clone();
+            if let Some(module_rc) = module_rc {
+                let class_names: Vec<String> =
+                    module_rc.classes.iter().map(|c| c.name.clone()).collect();
+                let method_index = IrHost::build_method_index(&module_rc);
+                let mut child = IrHost {
+                    interp: self.interp,
+                    out,
+                    class_names,
+                    closures: Vec::new(),
+                    module: std::rc::Rc::clone(&module_rc),
+                    method_index,
+                };
+                match <IrHost as klio_ir::eval::Host>::call_value_named(
+                    &mut child,
+                    callable,
+                    args,
+                    &names,
+                ) {
+                    Ok(v) => return Ok(v),
+                    Err(klio_ir::eval::EvalError::Unsupported(_)) => {}
+                    Err(klio_ir::eval::EvalError::Throw(v)) => {
+                        return Err(RuntimeError::Thrown(v));
+                    }
+                    Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => return Ok(v),
+                    Err(klio_ir::eval::EvalError::Arity(s)) => {
+                        return Err(RuntimeError::Arity(s));
+                    }
+                    Err(klio_ir::eval::EvalError::Unbound(s)) => {
+                        return Err(RuntimeError::Unbound(s));
+                    }
+                    Err(klio_ir::eval::EvalError::Unimplemented(s)) => {
+                        return Err(RuntimeError::Unimplemented(s));
+                    }
+                    Err(e) => return Err(RuntimeError::Type(format!("{e}"))),
+                }
+            }
+        }
         self.interp.invoke_callable_value(callable, args, &names, out)
     }
 
