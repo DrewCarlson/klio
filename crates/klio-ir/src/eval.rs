@@ -43,6 +43,24 @@ pub trait Host {
     fn new_instance(&mut self, _class: crate::ClassId, _args: &[Value]) -> Result<Value, EvalError> {
         Err(EvalError::Unsupported("Host::new_instance"))
     }
+    /// Read a property on the receiver. Default for instances is
+    /// the raw field lookup via `InstanceData::get`; concrete
+    /// hosts route through the tree walker's
+    /// `eval_property_access` so getters / delegates / extension
+    /// properties fire.
+    fn get_field(
+        &mut self,
+        receiver: &Value,
+        name: &str,
+    ) -> Result<Value, EvalError> {
+        match receiver {
+            Value::Instance(inst) => Ok(inst.borrow().get(name).unwrap_or(Value::Null)),
+            _ => Err(EvalError::Type(format!(
+                "GetField on non-instance: {receiver:?}"
+            ))),
+        }
+    }
+
     /// Test whether `value` is an instance of `ty`. The default
     /// implementation handles the primitive nominal types via
     /// `Value::type_fqn`; complex types defer to the host.
@@ -297,6 +315,16 @@ fn exec_inst(
         Inst::BinOp { dst, op, lhs, rhs } => {
             let l = frame.read(*lhs);
             let r = frame.read(*rhs);
+            // StringConcat over a Value::Instance routes the
+            // instance through toString so user-defined overrides
+            // fire (e.g. `Instant.toString()` → ISO-8601).
+            if matches!(op, BinOp::StringConcat) {
+                let ls = stringify(host, &l)?;
+                let rs = stringify(host, &r)?;
+                let combined = format!("{ls}{rs}");
+                frame.write(*dst, Value::String(std::rc::Rc::new(combined)));
+                return Ok(());
+            }
             // User-class operator dispatch: when an operand is a
             // Value::Instance, route through the host's
             // call_member for the matching operator method
@@ -342,10 +370,7 @@ fn exec_inst(
                 Const::String(s) => s.clone(),
                 _ => return Err(EvalError::Type("GetField: name not a string const".into())),
             };
-            let v = match r {
-                Value::Instance(inst) => inst.borrow().get(&name).unwrap_or(Value::Null),
-                _ => return Err(EvalError::Type(format!("GetField on non-instance: {r:?}"))),
-            };
+            let v = host.get_field(&r, &name)?;
             frame.write(*dst, v);
         }
         Inst::SetField { receiver, field, value } => {
@@ -509,6 +534,21 @@ fn apply_unop(op: UnOp, v: &Value) -> Result<Value, EvalError> {
         (UnOp::Dec, Value::Long(l)) => Ok(Value::Long(l.wrapping_sub(1))),
         _ => Err(EvalError::Type(format!("UnOp::{op:?} on {v:?}"))),
     }
+}
+
+/// Render a Value to its Kotlin string representation. For
+/// Value::Instance, dispatches `toString()` through the host so
+/// user-defined overrides fire; primitives use `render_value`'s
+/// fast path.
+fn stringify(host: &mut dyn Host, v: &Value) -> Result<String, EvalError> {
+    if let Value::Instance(_) = v {
+        let result = host.call_member(v, "toString", &[])?;
+        if let Value::String(s) = result {
+            return Ok(s.as_str().to_string());
+        }
+        return Ok(render_value(&result));
+    }
+    Ok(render_value(v))
 }
 
 fn value_to_i64(v: &Value) -> Option<i64> {

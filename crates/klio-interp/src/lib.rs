@@ -8282,7 +8282,7 @@ impl Interpreter {
         Err(RuntimeError::Unbound(fqn))
     }
 
-    fn eval_property_access(
+    pub fn eval_property_access(
         &mut self,
         receiver: Value,
         name: &str,
@@ -11229,6 +11229,20 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         if let klio_runtime::Value::Instance(inst) = receiver {
+            // Pack-installed binding override takes precedence over
+            // the shim's default Kotlin body. Matches the tree
+            // walker's dispatch order (binding_override consulted
+            // before class.find_method).
+            let cls_fqn = inst.borrow().class.fqn.clone();
+            let fqn = format!("{cls_fqn}.{name}");
+            if let Some(func) = self.interp.binding_override(&fqn) {
+                let mut all = Vec::with_capacity(args.len() + 1);
+                all.push(receiver.clone());
+                all.extend_from_slice(args);
+                let mut ctx = CallCtx { args: &all, out: self.out };
+                return func(&mut ctx)
+                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+            }
             let class = Rc::clone(&inst.borrow().class);
             // Use arg-type-aware overload pick when the first
             // arg's runtime type is known — same routing the tree
@@ -11242,17 +11256,6 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 return self
                     .interp
                     .call_method(inst, &method, args, &names, self.out)
-                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
-            }
-            // Pack-installed binding override (`Buffer.size`, etc.).
-            let cls_fqn = inst.borrow().class.fqn.clone();
-            let fqn = format!("{cls_fqn}.{name}");
-            if let Some(func) = self.interp.binding_override(&fqn) {
-                let mut all = Vec::with_capacity(args.len() + 1);
-                all.push(receiver.clone());
-                all.extend_from_slice(args);
-                let mut ctx = CallCtx { args: &all, out: self.out };
-                return func(&mut ctx)
                     .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
             }
         }
@@ -11305,6 +11308,19 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 "IR Host: member call `{name}` on {type_fqn} not resolved: {e}"
             ))),
         }
+    }
+
+    fn get_field(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Route through eval_property_access so getter properties
+        // (`val size get() = ...`), delegated props, and
+        // extension props all fire correctly.
+        self.interp
+            .eval_property_access(receiver.clone(), name, self.out)
+            .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
     }
 
     fn instance_of(&mut self, value: &klio_runtime::Value, ty: &klio_ir::TypeRef) -> bool {
