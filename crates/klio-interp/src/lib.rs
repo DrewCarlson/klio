@@ -75,6 +75,12 @@ pub struct Interpreter {
     /// Top-level properties keyed by simple name. Used to dispatch reads
     /// and writes through custom getters/setters or property delegates.
     top_level_props: std::collections::HashMap<String, PropertyDef>,
+    /// IR FuncId of each top-level property's getter / setter body
+    /// when one was declared in source. Populated by the
+    /// decl-registration pass so `IrHost::lookup_global` can call
+    /// the accessor through IR instead of bouncing through
+    /// `read_top_level_property_pub`.
+    top_level_prop_getters: std::collections::HashMap<String, klio_ir::FuncId>,
     /// `@Retention` value declared on each annotation class (`SOURCE`,
     /// `BINARY`, or `RUNTIME`). Populated when an `annotation class`
     /// is registered. Drives whether the annotation surfaces through
@@ -273,6 +279,7 @@ impl Interpreter {
         Self {
             globals: Rc::new(RefCell::new(env)),
             top_level_props: std::collections::HashMap::new(),
+            top_level_prop_getters: std::collections::HashMap::new(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
@@ -1024,6 +1031,26 @@ impl Interpreter {
                 module.funcs[id.0 as usize] = placed;
                 if f.name.name == "main" {
                     main_id = Some(id);
+                }
+            }
+        }
+        // Lower each top-level property's custom getter body to its
+        // own 0-arg IR func so IR-host reads can dispatch through the
+        // accessor without bouncing through `eval_property_access`.
+        for d in &file.decls {
+            if let Decl::Property(p) = d {
+                if p.receiver_type.is_some() {
+                    continue;
+                }
+                if let Some(getter) = &p.getter {
+                    if let Some(body) = getter_body_expr(getter) {
+                        let id = klio_ir::lower::lower_expr_as_thunk(
+                            &mut module,
+                            &body,
+                            &format!("__get__{}", p.name.name),
+                        );
+                        self.top_level_prop_getters.insert(p.name.name.clone(), id);
+                    }
                 }
             }
         }
@@ -11475,6 +11502,13 @@ fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
     h.finish() as i32
 }
 
+fn getter_body_expr(acc: &klio_ast::Accessor) -> Option<klio_ast::Expr> {
+    match &acc.body {
+        klio_ast::FunctionBody::Expr(e) => Some(e.clone()),
+        klio_ast::FunctionBody::Block(_) => None,
+    }
+}
+
 fn ir_err(e: klio_runtime::RuntimeError) -> klio_ir::eval::EvalError {
     match e {
         klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
@@ -11654,6 +11688,15 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         if let Some(v) = self.interp.lookup_global_callable(name) {
             return Some(v);
+        }
+        // Top-level property with an IR-lowered getter: invoke the
+        // accessor through klio_ir::eval rather than the tree walker.
+        if let Some(fid) = self.interp.top_level_prop_getters.get(name).copied() {
+            let module = std::rc::Rc::clone(&self.module);
+            let func = module.funcs[fid.0 as usize].clone();
+            if let Ok(v) = klio_ir::eval::eval_with(&module, &func, Vec::new(), self) {
+                return Some(v);
+            }
         }
         // Reified type parameter: resolve through the active reified
         // stack and retry the lookup against the substituted name.
