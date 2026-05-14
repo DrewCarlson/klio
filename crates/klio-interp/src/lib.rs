@@ -11718,6 +11718,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // kotlin.comparisons + ranges helpers
             | "compareBy" | "compareByDescending" | "naturalOrder" | "reverseOrder"
             | "thenBy" | "thenByDescending"
+            | "compareValues" | "compareValuesBy" | "Comparator"
             // Sequence builders + common range helpers
             | "sequenceOf" | "sequence" | "generateSequence" | "emptySequence"
             | "emptyList" | "emptyMap" | "emptySet"
