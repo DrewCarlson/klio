@@ -398,7 +398,7 @@ impl Interpreter {
         f(&mut ctx)
     }
 
-    pub fn lookup_global_callable(&self, name: &str) -> Option<klio_runtime::Value> {
+    fn lookup_global_callable(&self, name: &str) -> Option<klio_runtime::Value> {
         // Primitive companion constants — `Int.MAX_VALUE`,
         // `Double.NaN`, etc. — surface as bare dotted FQNs through
         // the IR's Member-chain flattening. Intercept them here so
@@ -426,7 +426,7 @@ impl Interpreter {
     /// can then route through `read_top_level_property_pub` so
     /// `val cached by lazy {…}` reads fire the delegate.
     #[must_use]
-    pub fn has_top_level_property(&self, name: &str) -> bool {
+    fn has_top_level_property(&self, name: &str) -> bool {
         self.top_level_props.contains_key(name)
     }
 
@@ -465,7 +465,7 @@ impl Interpreter {
     /// tree walker's eval_call so overload resolution picks the
     /// right arity / arg-type match rather than the single Value
     /// stashed in globals.
-    pub fn has_top_level_overloads(&self, name: &str) -> bool {
+    fn has_top_level_overloads(&self, name: &str) -> bool {
         self.top_level_overloads
             .get(name)
             .map_or(false, |v| v.len() > 1)
@@ -504,7 +504,7 @@ impl Interpreter {
     /// (`*args`) is handled in `invoke_named_intrinsic` rather than
     /// in IR lowering, so call sites route through the tree walker
     /// whenever this returns true.
-    pub fn has_top_level_vararg(&self, name: &str) -> bool {
+    fn has_top_level_vararg(&self, name: &str) -> bool {
         let Some(overloads) = self.top_level_overloads.get(name) else {
             return false;
         };
@@ -515,7 +515,7 @@ impl Interpreter {
     /// declares a parameter with a default value. The IR's
     /// `Func.params[…].default` field isn't populated yet, so call
     /// sites consult the AST overload table instead.
-    pub fn has_top_level_default(&self, name: &str) -> bool {
+    fn has_top_level_default(&self, name: &str) -> bool {
         let Some(overloads) = self.top_level_overloads.get(name) else {
             return false;
         };
@@ -593,7 +593,7 @@ impl Interpreter {
     /// pack-installed native impl shadow a baked-in fallback
     /// (intrinsic alias / BoundMethod / shim Kotlin body / etc.).
     #[must_use]
-    pub fn binding_override(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
+    fn binding_override(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
         self.installed_bindings.get(fqn).copied()
     }
 
@@ -5460,7 +5460,7 @@ impl Interpreter {
         Ok(Some(frame))
     }
 
-    pub fn run_blocking(
+    fn run_blocking(
         &mut self,
         lam: &Value,
         out: &mut dyn Output,
@@ -5664,7 +5664,7 @@ impl Interpreter {
     /// of scope; what we provide here is the language-level
     /// machinery that lets a synchronous `suspendCoroutine { cont ->
     /// cont.resume(v) }` produce `v`.
-    pub fn eval_suspend_coroutine(
+    fn eval_suspend_coroutine(
         &mut self,
         lam: &Value,
         out: &mut dyn Output,
