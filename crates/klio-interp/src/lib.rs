@@ -11188,7 +11188,25 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         args: &[klio_runtime::Value],
         arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        let _ = arg_names; // routed below via invoke_callable_value
+        // Route Value::Intrinsic calls through the tree walker's
+        // eval_call path so its intrinsic-specific preprocessing
+        // (the println/print Instance→toString rewrite, reorder
+        // by intrinsic param names, spread flattening) fires.
+        if let klio_runtime::Value::Intrinsic { fqn, .. } = callee {
+            // Skip the sentinel FQNs handled in call_value below.
+            if !fqn.starts_with("__klio_intrinsic_") {
+                // Reconstruct a simple-name dispatch through
+                // invoke_named_intrinsic_with_names. We pick the
+                // last path-segment after the final '.' as the
+                // dispatch name so kotlin.io.println → println.
+                let simple = fqn.rsplit('.').next().unwrap_or(*fqn);
+                return self
+                    .interp
+                    .invoke_named_intrinsic_with_names(simple, args, arg_names, self.out)
+                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+            }
+        }
+        let _ = arg_names;
         self.call_value(callee, args)
     }
 

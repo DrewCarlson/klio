@@ -359,6 +359,20 @@ fn exec_inst(
         }
         Inst::UnOp { dst, op, operand } => {
             let v = frame.read(*operand);
+            // User-class operator dispatch for unary +/-/inc/dec.
+            if matches!(v, Value::Instance(_)) {
+                let method = match op {
+                    UnOp::Neg => Some("unaryMinus"),
+                    UnOp::Plus => Some("unaryPlus"),
+                    UnOp::Inc => Some("inc"),
+                    UnOp::Dec => Some("dec"),
+                };
+                if let Some(m) = method {
+                    let result = host.call_member(&v, m, &[])?;
+                    frame.write(*dst, result);
+                    return Ok(());
+                }
+            }
             let out = apply_unop(*op, &v)?;
             frame.write(*dst, out);
         }
