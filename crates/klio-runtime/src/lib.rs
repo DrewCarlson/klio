@@ -697,6 +697,12 @@ pub struct MethodDef {
     /// instance found under `field_key` on the receiver, dispatching the
     /// same method name on the delegate.
     pub delegate_field: Option<String>,
+    /// IR FuncId of the lowered method body (with `this` as the
+    /// implicit first param). Set by class registration when the
+    /// method body has been lowered into the active IR module;
+    /// `None` for abstract / SAM-replaced / delegate-forwarder
+    /// methods that have no IR body of their own.
+    pub ir_fn_id: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

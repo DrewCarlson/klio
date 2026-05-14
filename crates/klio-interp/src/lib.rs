@@ -6614,6 +6614,7 @@ impl Interpreter {
                     is_abstract: f.is_abstract,
                     sam_lambda: None,
                     delegate_field: None,
+                    ir_fn_id: None,
                 }),
                 Decl::Property(p) => body_properties.push(PropertyDef {
                     name: p.name.name.clone(),
@@ -6846,6 +6847,7 @@ impl Interpreter {
                     is_abstract: false,
                     sam_lambda: None,
                     delegate_field: Some(delegate.field_key.clone()),
+                    ir_fn_id: None,
                 });
             }
         }
@@ -6902,8 +6904,9 @@ impl Interpreter {
                                 is_open: f.is_open,
                                 is_override: f.is_override,
                                 is_abstract: f.is_abstract,
-                    sam_lambda: None,
-                    delegate_field: None,
+                                sam_lambda: None,
+                                delegate_field: None,
+                                ir_fn_id: None,
                             };
                             if let Some(slot) =
                                 methods.iter_mut().find(|m| m.name == f.name.name)
@@ -6997,6 +7000,7 @@ impl Interpreter {
                     is_abstract: f.is_abstract,
                     sam_lambda: None,
                     delegate_field: None,
+                    ir_fn_id: None,
                 }),
                 Decl::Property(p) => body_properties.push(PropertyDef {
                     name: p.name.name.clone(),
