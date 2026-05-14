@@ -3565,7 +3565,7 @@ impl Interpreter {
         self.call_lambda_with_this(params, body, captured_env, args, None, false, out)
     }
 
-    fn call_lambda_with_this(
+    pub fn call_lambda_with_this(
         &mut self,
         params: &[String],
         body: &klio_ast::Block,
@@ -4002,54 +4002,27 @@ impl Interpreter {
         env: &Rc<RefCell<Env>>,
         out: &mut dyn Output,
     ) -> Result<Option<Value>, RuntimeError> {
-        let kind = match name {
-            "let" | "also" | "apply" | "run" | "takeIf" | "takeUnless" => name,
+        match name {
+            "let" | "also" | "apply" | "run" | "takeIf" | "takeUnless" => {}
             _ => return Ok(None),
-        };
+        }
         if args.len() != 1 {
             return Err(RuntimeError::Arity(format!(
-                "`.{kind}` expects exactly one lambda argument"
+                "`.{name}` expects exactly one lambda argument"
             )));
         }
         let lam = self.eval_expr(&args[0], env, out)?;
-        let Value::Lambda { params, body, env: captured, .. } = &lam else {
-            return Err(RuntimeError::Type(format!(
-                "`.{kind}` requires a lambda argument, got {lam:?}"
-            )));
+        // Route through the stdlib binding so the scope-function
+        // semantics live in `klio-stdlib`, not here.
+        let fqn = format!("kotlin.{name}");
+        let Some(func) = klio_stdlib::implementation(&fqn) else {
+            return Ok(None);
         };
-        // Lambdas with implicit `it` get the receiver bound as their sole
-        // parameter; lambdas declared with an explicit `->` head obey their
-        // own param list. For `apply` / `run` we instead bind `this`.
-        let use_this = matches!(kind, "apply" | "run");
-        let (lam_args, this_binding): (&[Value], Option<Value>) = if use_this {
-            (&[], Some(receiver.clone()))
-        } else {
-            (std::slice::from_ref(receiver), None)
-        };
-        let result = self.call_lambda_with_this(params, body, captured, lam_args, this_binding, false, out)?;
-        Ok(Some(match kind {
-            "let" | "run" => result,
-            "also" | "apply" => receiver.clone(),
-            "takeIf" => match result {
-                Value::Bool(true) => receiver.clone(),
-                Value::Bool(false) => Value::Null,
-                other => {
-                    return Err(RuntimeError::Type(format!(
-                        "`takeIf` predicate must return Bool, got {other:?}"
-                    )))
-                }
-            },
-            "takeUnless" => match result {
-                Value::Bool(false) => receiver.clone(),
-                Value::Bool(true) => Value::Null,
-                other => {
-                    return Err(RuntimeError::Type(format!(
-                        "`takeUnless` predicate must return Bool, got {other:?}"
-                    )))
-                }
-            },
-            _ => unreachable!(),
-        }))
+        let pair = [receiver.clone(), lam];
+        let mut __interp_host = InterpHostRef { interp: self };
+        let mut ctx = CallCtx { args: &pair, out, host: &mut __interp_host };
+        let v = func(&mut ctx)?;
+        Ok(Some(v))
     }
 
     /// `joinToString(sep?, prefix?, postfix?, limit?, truncated?)` with an
@@ -11611,6 +11584,33 @@ impl<'a> klio_runtime::IntrinsicHost for InterpHostRef<'a> {
     ) -> Result<klio_runtime::Value, RuntimeError> {
         let names: Vec<Option<String>> = vec![None; args.len()];
         self.interp.invoke_callable_value(callable, args, &names, out)
+    }
+
+    fn invoke_callable_with_this(
+        &mut self,
+        callable: &klio_runtime::Value,
+        args: &[klio_runtime::Value],
+        this_value: &klio_runtime::Value,
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, RuntimeError> {
+        let Value::Lambda { params, body, env, absorb_return } = callable else {
+            // Non-lambda callables can't accept a `this` binding —
+            // fall back to a plain invoke so the binding still
+            // works (e.g. function-reference passed to `apply`).
+            let names: Vec<Option<String>> = vec![None; args.len()];
+            return self
+                .interp
+                .invoke_callable_value(callable, args, &names, out);
+        };
+        self.interp.call_lambda_with_this(
+            params,
+            body,
+            env,
+            args,
+            Some(this_value.clone()),
+            *absorb_return,
+            out,
+        )
     }
 }
 

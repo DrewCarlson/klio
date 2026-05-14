@@ -51,6 +51,18 @@ pub trait IntrinsicHost {
         args: &[Value],
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError>;
+
+    /// Like `invoke_callable` but binds `this` inside the lambda
+    /// body to `this_value` for the duration of the call. Used by
+    /// `apply { … }` / `run { … }` / `with(x) { … }` — the
+    /// receiver-bound scope functions.
+    fn invoke_callable_with_this(
+        &mut self,
+        callable: &Value,
+        args: &[Value],
+        this_value: &Value,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError>;
 }
 
 /// Cooperative scheduler the runtime exposes to anything called

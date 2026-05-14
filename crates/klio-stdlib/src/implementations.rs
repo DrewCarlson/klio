@@ -17,6 +17,16 @@ use std::rc::Rc;
 use klio_runtime::{CallCtx, RuntimeError, StdlibFn, Value};
 
 const TABLE: &[(&str, StdlibFn)] = &[
+    // ----- scope functions (lambda-driven) -----
+    ("kotlin.let", scope_let),
+    ("kotlin.run", scope_run),
+    ("kotlin.apply", scope_apply),
+    ("kotlin.also", scope_also),
+    ("kotlin.with", scope_with),
+    ("kotlin.takeIf", scope_take_if),
+    ("kotlin.takeUnless", scope_take_unless),
+    ("kotlin.repeat", scope_repeat),
+
     // ----- io -----
     ("kotlin.io.print", io_print),
     ("kotlin.io.println", io_println),
@@ -744,6 +754,105 @@ const PARAM_NAMES: &[(&str, &[&str])] = &[
     // Result.
     ("kotlin.Result.getOrDefault", &["defaultValue"]),
 ];
+
+// ===== scope functions =====
+//
+// All scope functions dispatch the user's lambda via
+// `ctx.host.invoke_callable`. The intrinsic doesn't see the lambda's
+// body — the host wires that back into the interpreter's
+// `invoke_callable_value` path.
+
+fn split_receiver_and_block(ctx: &CallCtx) -> Result<(Value, Value), RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity(
+            "scope-fn expects (receiver, block)".into(),
+        ));
+    }
+    Ok((ctx.args[0].clone(), ctx.args[1].clone()))
+}
+
+fn split_block(ctx: &CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 1 {
+        return Err(RuntimeError::Arity("scope-fn expects (block)".into()));
+    }
+    Ok(ctx.args[0].clone())
+}
+
+fn scope_let(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (recv, block) = split_receiver_and_block(ctx)?;
+    let CallCtx { out, host, .. } = ctx;
+    host.invoke_callable(&block, std::slice::from_ref(&recv), *out)
+}
+
+fn scope_run(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() == 2 {
+        let (recv, block) = split_receiver_and_block(ctx)?;
+        let CallCtx { out, host, .. } = ctx;
+        host.invoke_callable_with_this(&block, &[], &recv, *out)
+    } else {
+        let block = split_block(ctx)?;
+        let CallCtx { out, host, .. } = ctx;
+        host.invoke_callable(&block, &[], *out)
+    }
+}
+
+fn scope_apply(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (recv, block) = split_receiver_and_block(ctx)?;
+    let CallCtx { out, host, .. } = ctx;
+    host.invoke_callable_with_this(&block, &[], &recv, *out)?;
+    Ok(recv)
+}
+
+fn scope_also(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (recv, block) = split_receiver_and_block(ctx)?;
+    let CallCtx { out, host, .. } = ctx;
+    host.invoke_callable(&block, std::slice::from_ref(&recv), *out)?;
+    Ok(recv)
+}
+
+fn scope_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (recv, block) = split_receiver_and_block(ctx)?;
+    let CallCtx { out, host, .. } = ctx;
+    host.invoke_callable_with_this(&block, &[], &recv, *out)
+}
+
+fn scope_take_if(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (recv, block) = split_receiver_and_block(ctx)?;
+    let CallCtx { out, host, .. } = ctx;
+    let pred = host.invoke_callable(&block, std::slice::from_ref(&recv), *out)?;
+    Ok(if matches!(pred, Value::Bool(true)) {
+        recv
+    } else {
+        Value::Null
+    })
+}
+
+fn scope_take_unless(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (recv, block) = split_receiver_and_block(ctx)?;
+    let CallCtx { out, host, .. } = ctx;
+    let pred = host.invoke_callable(&block, std::slice::from_ref(&recv), *out)?;
+    Ok(if matches!(pred, Value::Bool(false)) {
+        recv
+    } else {
+        Value::Null
+    })
+}
+
+fn scope_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("repeat expects (times, block)".into()));
+    }
+    let times = ctx.args[0]
+        .as_i64()
+        .ok_or_else(|| RuntimeError::Type("repeat: first arg must be Int".into()))?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for i in 0..times {
+        let arg = Value::new_int(i);
+        host.invoke_callable(&block, std::slice::from_ref(&arg), *out)?;
+    }
+    Ok(Value::Unit)
+}
 
 #[must_use]
 pub fn lookup_param_names(fqn: &str) -> Option<&'static [&'static str]> {
