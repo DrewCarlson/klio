@@ -740,6 +740,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Map.getOrElse", map_get_or_else),
     ("kotlin.collections.MutableMap.getOrElse", map_get_or_else),
     ("kotlin.collections.MutableMap.getOrPut", map_get_or_put),
+    ("kotlin.comparisons.compareBy", cmp_compare_by),
+    ("kotlin.comparisons.compareByDescending", cmp_compare_by_descending),
+    ("kotlin.comparisons.compareValues", cmp_compare_values),
 
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
@@ -1623,6 +1626,41 @@ fn map_get_or_put(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let new_v = host.invoke_callable(&block, &[], *out)?;
     entries_rc.borrow_mut().push((key, new_v.clone()));
     Ok(new_v)
+}
+
+fn cmp_compare_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let mut steps: Vec<(Value, bool)> = Vec::with_capacity(ctx.args.len());
+    for a in ctx.args {
+        steps.push((a.clone(), false));
+    }
+    Ok(Value::Comparator { steps: Rc::new(steps), descending: false })
+}
+
+fn cmp_compare_by_descending(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let mut steps: Vec<(Value, bool)> = Vec::with_capacity(ctx.args.len());
+    for a in ctx.args {
+        steps.push((a.clone(), true));
+    }
+    Ok(Value::Comparator { steps: Rc::new(steps), descending: false })
+}
+
+fn cmp_compare_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("compareValues expects two arguments".into()));
+    }
+    let a = &ctx.args[0];
+    let b = &ctx.args[1];
+    let n: i32 = match (matches!(a, Value::Null), matches!(b, Value::Null)) {
+        (true, true) => 0,
+        (true, false) => -1,
+        (false, true) => 1,
+        (false, false) => match compare_values(a, b)? {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        },
+    };
+    Ok(Value::new_int(n as i64))
 }
 
 fn coll_iter_find(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

@@ -9363,36 +9363,32 @@ impl Interpreter {
                 ));
             }
             if name == "compareBy" || name == "compareByDescending" {
-                let per_step_descending = name == "compareByDescending";
-                let mut steps: Vec<(Value, bool)> = Vec::with_capacity(args.len());
-                for a in args {
-                    let v = self.eval_expr(a, env, out)?;
-                    if !matches!(v, Value::Lambda { .. }) {
-                        return Err(RuntimeError::Type(format!(
-                            "{name} expects key-selector lambdas"
-                        )));
+                let fqn = format!("kotlin.comparisons.{name}");
+                if let Some(func) = klio_stdlib::implementation(&fqn) {
+                    let mut arg_vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        let v = self.eval_expr(a, env, out)?;
+                        if !matches!(v, Value::Lambda { .. }) {
+                            return Err(RuntimeError::Type(format!(
+                                "{name} expects key-selector lambdas"
+                            )));
+                        }
+                        arg_vals.push(v);
                     }
-                    steps.push((v, per_step_descending));
+                    let mut __interp_host = InterpHostRef { interp: self };
+                    let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                    return func(&mut ctx);
                 }
-                return Ok(Value::Comparator { steps: Rc::new(steps), descending: false });
             }
             if name == "compareValues" && args.len() == 2 {
-                let a = self.eval_expr(&args[0], env, out)?;
-                let b = self.eval_expr(&args[1], env, out)?;
-                let n: i32 = match (
-                    matches!(a, Value::Null),
-                    matches!(b, Value::Null),
-                ) {
-                    (true, true) => 0,
-                    (true, false) => -1,
-                    (false, true) => 1,
-                    (false, false) => match self.compare_with_user(&a, &b, out)? {
-                        std::cmp::Ordering::Less => -1,
-                        std::cmp::Ordering::Equal => 0,
-                        std::cmp::Ordering::Greater => 1,
-                    },
-                };
-                return Ok(Value::Int(n));
+                if let Some(func) = klio_stdlib::implementation("kotlin.comparisons.compareValues") {
+                    let a = self.eval_expr(&args[0], env, out)?;
+                    let b = self.eval_expr(&args[1], env, out)?;
+                    let arg_vals = [a, b];
+                    let mut __interp_host = InterpHostRef { interp: self };
+                    let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                    return func(&mut ctx);
+                }
             }
             if name == "compareValuesBy" && args.len() >= 3 {
                 let a = self.eval_expr(&args[0], env, out)?;
