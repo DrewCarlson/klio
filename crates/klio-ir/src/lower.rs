@@ -895,6 +895,83 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             return dst;
         }
         Expr::Call { callee, args, arg_names: ast_arg_names, .. }
+            if args.iter().any(|a| lambda_writes_outer_var(b, a))
+                && matches!(callee.as_ref(), Expr::Path { .. }) =>
+        {
+            // Top-level fn call passing a closure-mutating lambda.
+            // Lower as Call{func}/CallValue against the resolved
+            // callable, then emit WritebackCaptures for each
+            // mutating lambda arg.
+            let mut arg_regs: Vec<Reg> = Vec::with_capacity(args.len());
+            for a in args {
+                let r = lower_expr(b, a);
+                arg_regs.push(r);
+            }
+            let args_start = if arg_regs.is_empty() {
+                Reg(0)
+            } else {
+                let start = b.alloc_reg();
+                b.push(Inst::Move { dst: start, src: arg_regs[0] });
+                for r in &arg_regs[1..] {
+                    let slot = b.alloc_reg();
+                    b.push(Inst::Move { dst: slot, src: *r });
+                }
+                start
+            };
+            let arg_names = intern_arg_names(b.module, ast_arg_names);
+            let dst = b.alloc_reg();
+            let Expr::Path { segments, .. } = callee.as_ref() else { unreachable!() };
+            if segments.len() == 1 {
+                if let Some(func_id) = b.module.func_id(&segments[0].name) {
+                    b.push(Inst::Call {
+                        dst,
+                        func: func_id,
+                        args: args_start,
+                        n_args: args.len() as u8,
+                        arg_names,
+                    });
+                } else {
+                    let callee_r = lower_expr(b, callee);
+                    b.push(Inst::CallValue {
+                        dst,
+                        callee: callee_r,
+                        args: args_start,
+                        n_args: args.len() as u8,
+                        arg_names,
+                    });
+                }
+            } else {
+                let callee_r = lower_expr(b, callee);
+                b.push(Inst::CallValue {
+                    dst,
+                    callee: callee_r,
+                    args: args_start,
+                    n_args: args.len() as u8,
+                    arg_names,
+                });
+            }
+            for (i, a) in args.iter().enumerate() {
+                let mutated = lambda_mutated_outer_vars(b, a);
+                if mutated.is_empty() {
+                    continue;
+                }
+                let lambda_reg = arg_regs[i];
+                let mut names: Vec<crate::ConstId> = Vec::with_capacity(mutated.len());
+                let mut dsts: Vec<Reg> = Vec::with_capacity(mutated.len());
+                for name in &mutated {
+                    if let Some(src_reg) = b.resolve(name) {
+                        let n = b.module.intern_const(Const::String(name.clone()));
+                        names.push(n);
+                        dsts.push(src_reg);
+                    }
+                }
+                if !names.is_empty() {
+                    b.push(Inst::WritebackCaptures { lambda: lambda_reg, names, dsts });
+                }
+            }
+            return dst;
+        }
+        Expr::Call { callee, args, arg_names: ast_arg_names, .. }
             if args.iter().any(|a| matches!(a, Expr::Spread { .. })) =>
         {
             // Calls containing a `*spread` argument: emit a
