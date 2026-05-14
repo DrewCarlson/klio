@@ -307,6 +307,26 @@ fn intern_type_args(
         .collect()
 }
 
+/// Lower an arbitrary expression as a 0-arg synthetic function whose
+/// body returns the expression's value. The synthetic function is
+/// pushed onto the module so a downstream caller can invoke it via
+/// `eval_with` against `module.funcs[id]`.
+pub fn lower_expr_as_thunk(
+    module: &mut crate::Module,
+    expr: &Expr,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    let v = lower_expr(&mut b, expr);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
 pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
     for (i, name) in names.iter().enumerate() {
         let dst = b.alloc_reg();

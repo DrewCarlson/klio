@@ -933,6 +933,42 @@ impl Interpreter {
         return self.run_main(module_rc, main_id, out);
     }
 
+    fn eval_property_init_via_ir(
+        &mut self,
+        init: &klio_ast::Expr,
+        out: &mut dyn Output,
+    ) -> Option<Result<klio_runtime::Value, RuntimeError>> {
+        // Constrain to the conservatively-supported shapes for now —
+        // any IR-untranslatable construct (suspend, super, reified
+        // type params) falls back to `eval_expr`.
+        let mut module = klio_ir::Module::default();
+        let id = klio_ir::lower::lower_expr_as_thunk(&mut module, init, "__init__");
+        let module_rc = std::rc::Rc::new(module);
+        let func = module_rc.funcs[id.0 as usize].clone();
+        let class_names: Vec<String> = module_rc.classes.iter().map(|c| c.name.clone()).collect();
+        let method_index = IrHost::build_method_index(&module_rc);
+        let mut host = IrHost {
+            interp: self,
+            out,
+            class_names,
+            closures: Vec::new(),
+            module: std::rc::Rc::clone(&module_rc),
+            method_index,
+        };
+        match klio_ir::eval::eval_with(&module_rc, &func, Vec::new(), &mut host) {
+            Ok(v) => Some(Ok(v)),
+            Err(klio_ir::eval::EvalError::Unsupported(_)) => None,
+            Err(klio_ir::eval::EvalError::Throw(v)) => Some(Err(RuntimeError::Thrown(v))),
+            Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => Some(Ok(v)),
+            Err(klio_ir::eval::EvalError::Arity(s)) => Some(Err(RuntimeError::Arity(s))),
+            Err(klio_ir::eval::EvalError::Unbound(s)) => Some(Err(RuntimeError::Unbound(s))),
+            Err(klio_ir::eval::EvalError::Unimplemented(s)) => {
+                Some(Err(RuntimeError::Unimplemented(s)))
+            }
+            Err(_) => None,
+        }
+    }
+
     fn build_ir_module_for_file(&mut self, file: &KotlinFile) -> Result<(), RuntimeError> {
         let mut module = klio_ir::Module::default();
         // Pre-build a name → AST map of every class in the
@@ -1301,7 +1337,15 @@ impl Interpreter {
                         .borrow_mut()
                         .define(format!("__delegate${}", p.name.name), dval);
                 } else if let Some(init) = &pdef.init {
-                    let v = self.eval_expr(init, &file_env, out)?;
+                    // Lower the initializer to a 0-arg IR thunk and run
+                    // it through the IR evaluator; falls back to the
+                    // tree-walker eval if IR can't lower the shape yet
+                    // (rare — most initializers are plain expressions).
+                    let v = match self.eval_property_init_via_ir(init, out) {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => return Err(e),
+                        None => self.eval_expr(init, &file_env, out)?,
+                    };
                     file_env.borrow_mut().define(p.name.name.clone(), v);
                 } else if pdef.is_lateinit {
                     file_env
