@@ -403,6 +403,52 @@ impl Interpreter {
         .map_err(|e| RuntimeError::Type(e.to_string()))
     }
 
+    /// Synthesize and dispatch a member call from pre-evaluated
+    /// values. Used by the IR host so extension-function lookup
+    /// + arg-type-aware dispatch + named-arg reordering fire
+    /// through the existing eval_call machinery rather than the
+    /// IR host's narrower call_member path.
+    pub fn invoke_named_member_call(
+        &mut self,
+        receiver: &Value,
+        name: &str,
+        args: &[Value],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        use klio_ast::{Expr, Ident};
+        use klio_span::{FileId, Span};
+        let dummy_span = Span::new(FileId(0), 0, 0);
+        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.globals))));
+        env.borrow_mut().define("__ir_self".to_string(), receiver.clone());
+        let mut arg_exprs: Vec<Expr> = Vec::with_capacity(args.len());
+        for (i, v) in args.iter().enumerate() {
+            let slot = format!("__ir_arg_{i}");
+            env.borrow_mut().define(slot.clone(), v.clone());
+            arg_exprs.push(Expr::Path {
+                segments: vec![Ident { name: slot, span: dummy_span }],
+                span: dummy_span,
+            });
+        }
+        let arg_count = arg_exprs.len();
+        let call = Expr::Call {
+            callee: Box::new(Expr::Member {
+                receiver: Box::new(Expr::Path {
+                    segments: vec![Ident { name: "__ir_self".into(), span: dummy_span }],
+                    span: dummy_span,
+                }),
+                name: Ident { name: name.to_string(), span: dummy_span },
+                safe: false,
+                span: dummy_span,
+            }),
+            args: arg_exprs,
+            arg_names: vec![None; arg_count],
+            type_args: Vec::new(),
+            is_infix: false,
+            span: dummy_span,
+        };
+        self.eval_expr(&call, &env, out)
+    }
+
     /// Invoke a name-dispatched intrinsic (`repeat`, `let`, `apply`,
     /// `listOf`, …) that the tree walker recognises by simple name
     /// inside `eval_call`. Used by the IR host to route these forms
@@ -11184,7 +11230,14 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class = Rc::clone(&inst.borrow().class);
-            if let Some((method, _)) = class.find_method(name) {
+            // Use arg-type-aware overload pick when the first
+            // arg's runtime type is known — same routing the tree
+            // walker uses for operator dispatch on user classes.
+            let first_arg_type = args.first().map(value_runtime_type_name);
+            let lookup = class
+                .find_method_for_arg(name, first_arg_type.as_deref())
+                .or_else(|| class.find_method(name));
+            if let Some((method, _)) = lookup {
                 let names: Vec<Option<String>> = vec![None; args.len()];
                 return self
                     .interp
@@ -11242,9 +11295,16 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             return func(&mut ctx)
                 .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
         }
-        Err(klio_ir::eval::EvalError::Type(format!(
-            "IR Host: member call `{name}` on {type_fqn} not resolved"
-        )))
+        // Last resort: synthesise the call through the tree
+        // walker's full member-dispatch path, which picks up
+        // extension functions, named args, and `vararg` /
+        // default-value handling.
+        match self.interp.invoke_named_member_call(receiver, name, args, self.out) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(klio_ir::eval::EvalError::Type(format!(
+                "IR Host: member call `{name}` on {type_fqn} not resolved: {e}"
+            ))),
+        }
     }
 
     fn instance_of(&mut self, value: &klio_runtime::Value, ty: &klio_ir::TypeRef) -> bool {
