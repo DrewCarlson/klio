@@ -840,10 +840,6 @@ impl Interpreter {
         self.instance_id_counter
     }
 
-    pub fn run(&mut self, file: &KotlinFile) -> Result<Value, RuntimeError> {
-        self.run_with_output(file, &mut StdoutOutput)
-    }
-
     /// Run a multi-file module. Each file's top-level declarations
     /// register into the shared globals first, then the file
     /// containing `fun main` is run with its own imports applied.
@@ -946,51 +942,6 @@ impl Interpreter {
                 let s = format!("{e}");
                 s.strip_prefix("IR type error: ").map(|x| x.to_string()).unwrap_or(s)
             })
-    }
-
-    pub fn run_module(
-        &mut self,
-        files: &[KotlinFile],
-    ) -> Result<Value, RuntimeError> {
-        self.run_module_with_output(files, &mut StdoutOutput)
-    }
-
-    pub fn run_module_with_output(
-        &mut self,
-        files: &[KotlinFile],
-        out: &mut dyn Output,
-    ) -> Result<Value, RuntimeError> {
-        if files.is_empty() {
-            return Err(RuntimeError::NoMain);
-        }
-        // Walk every file first to populate the shared globals with
-        // every cross-file class / function / property declaration.
-        // We do this by feeding each non-main file through
-        // run_with_output, which registers its top-level decls and
-        // returns without invoking `main` (because the file doesn't
-        // have one). Then run the main file.
-        let main_idx = files.iter().position(|f| {
-            f.decls.iter().any(|d| {
-                matches!(d, klio_ast::Decl::Function(f) if f.name.name == "main")
-            })
-        });
-        for (i, file) in files.iter().enumerate() {
-            if Some(i) == main_idx {
-                continue;
-            }
-            // Non-main file: register top-level decls into the
-            // shared globals (persist=true), don't call main
-            // (invoke_main=false).
-            self.run_with_output_impl(file, out, false, true)?;
-        }
-        if let Some(idx) = main_idx {
-            // The main file's decls also persist into globals so
-            // they survive any subsequent invocation against the
-            // same Interpreter instance.
-            self.run_with_output_impl(&files[idx], out, true, true)
-        } else {
-            Err(RuntimeError::NoMain)
-        }
     }
 
     fn globals_ref(&self) -> Rc<RefCell<Env>> {
