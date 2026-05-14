@@ -923,7 +923,14 @@ impl Interpreter {
             closures: Vec::new(),
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host)
-            .map_err(|e| format!("ir eval: {e}"))
+            .map_err(|e| {
+                // Strip the "IR type error: " prefix the evaluator
+                // adds so the message format matches the tree
+                // walker byte-for-byte. Both paths surface the same
+                // semantic error.
+                let s = format!("{e}");
+                s.strip_prefix("IR type error: ").map(|x| x.to_string()).unwrap_or(s)
+            })
     }
 
     pub fn run_module(
