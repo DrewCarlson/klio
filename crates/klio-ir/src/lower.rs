@@ -32,7 +32,17 @@ use crate::{BinOp, BlockId, Const, Inst, Reg, Terminator, UnOp};
 /// lowercase heads keeps `Status.Active` / `Foo.Companion` member
 /// access routed through GetField on the actual class value.
 fn is_package_head(name: &str) -> bool {
-    name.chars().next().map_or(false, |c| c.is_lowercase())
+    if name.chars().next().map_or(false, |c| c.is_lowercase()) {
+        return true;
+    }
+    // Primitive types' companion accesses (`Int.MAX_VALUE`, …)
+    // also flatten through the FQN-flattening path so the host
+    // can dispatch them via primitive_companion_const.
+    matches!(
+        name,
+        "Int" | "Long" | "Short" | "Byte" | "UInt" | "ULong" | "UShort" | "UByte"
+            | "Float" | "Double" | "Char" | "Boolean" | "String"
+    )
 }
 
 /// Flatten a `Member{receiver: Member{...,Path}}` chain into a

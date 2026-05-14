@@ -363,6 +363,16 @@ impl Interpreter {
     /// Used by the IR Host to resolve bare top-level identifiers
     /// (`println`, user `fun foo`) to a callable Value.
     pub fn lookup_global_callable(&self, name: &str) -> Option<klio_runtime::Value> {
+        // Primitive companion constants — `Int.MAX_VALUE`,
+        // `Double.NaN`, etc. — surface as bare dotted FQNs through
+        // the IR's Member-chain flattening. Intercept them here so
+        // they read as their actual values without needing a
+        // synthetic class.
+        if let Some((ty, prop)) = name.split_once('.') {
+            if let Some(v) = primitive_companion_const(ty, prop) {
+                return Some(v);
+            }
+        }
         // Prefer the class table over the globals env. Some
         // top-level classes (`Regex`, `Throwable`, …) also have a
         // synthetic constructor `Value::Function` registered in
