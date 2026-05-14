@@ -13075,6 +13075,19 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 }
             };
             if let Some(v) = plain_field {
+                // lateinit uninitialized sentinel — throw the
+                // proper `UninitializedPropertyAccessException`
+                // instead of returning the sentinel value.
+                if let Some(prop_name) = lateinit_sentinel_name(&v) {
+                    let exc = klio_runtime::Value::Exception {
+                        fqn: std::rc::Rc::new("kotlin.UninitializedPropertyAccessException".to_string()),
+                        message: Some(std::rc::Rc::new(format!(
+                            "lateinit property {prop_name} has not been initialized"
+                        ))),
+                        cause: None,
+                    };
+                    return Err(klio_ir::eval::EvalError::Throw(exc));
+                }
                 return Ok(v);
             }
             // Enum-entry / entries access from inside an enum
