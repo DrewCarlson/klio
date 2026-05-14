@@ -65,6 +65,12 @@ pub struct FuncBuilder<'a> {
     /// lowered as `Terminator::TailJump` to keep the stack
     /// flat across recursion.
     tailrec_self: Option<String>,
+    /// Names bound as parameters at the function entry (set by
+    /// `bind_params`). Used by call-site lowering to recognise
+    /// when an identifier-as-callee is a function-typed param
+    /// (e.g. a builder lambda) rather than a member of the
+    /// receiver.
+    param_names: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +105,7 @@ impl<'a> FuncBuilder<'a> {
             owner_class: None,
             own_members: std::collections::HashSet::new(),
             tailrec_self: None,
+            param_names: std::collections::HashSet::new(),
         }
     }
 
@@ -243,6 +250,12 @@ impl<'a> FuncBuilder<'a> {
     }
     pub fn tailrec_self(&self) -> Option<&str> {
         self.tailrec_self.as_deref()
+    }
+    pub fn mark_param(&mut self, name: &str) {
+        self.param_names.insert(name.to_string());
+    }
+    pub fn is_param(&self, name: &str) -> bool {
+        self.param_names.contains(name)
     }
 
     pub fn resolve(&self, name: &str) -> Option<Reg> {

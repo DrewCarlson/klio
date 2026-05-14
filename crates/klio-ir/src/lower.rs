@@ -299,6 +299,7 @@ pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
         let dst = b.alloc_reg();
         b.push(Inst::LoadParam { dst, idx: i as u16 });
         b.bind(*name, dst);
+        b.mark_param(name);
     }
 }
 
@@ -1489,30 +1490,45 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // where `block: T.() -> R` is a local. Lower
                     // as CallValueWithThis so the host binds the
                     // receiver as `this` inside the lambda body.
-                    if let Some(local_reg) = b.resolve(&name.name) {
-                        let recv = lower_expr(b, receiver);
-                        let n = args.len();
-                        let args_start = if n > 0 { b.alloc_reg() } else { Reg(0) };
-                        if n > 0 {
-                            let mut arg_slots: Vec<Reg> = vec![args_start];
-                            for _ in 1..n {
-                                arg_slots.push(b.alloc_reg());
+                    // Gated tight so stdlib member calls like
+                    // `xs.sorted()` aren't hijacked by a shared
+                    // name.
+                    // Only fire when the local name is bound AND
+                    // the local has a function-like type. We
+                    // can't check types at IR-lowering time, but
+                    // most class methods aren't shadowed by
+                    // locals — gate the arm narrowly on "name is
+                    // a known param of the enclosing fn".
+                    let is_enclosing_param = b
+                        .resolve(&name.name)
+                        .is_some()
+                        && b.is_param(&name.name);
+                    if is_enclosing_param {
+                        if let Some(local_reg) = b.resolve(&name.name) {
+                            let recv = lower_expr(b, receiver);
+                            let n = args.len();
+                            let args_start = if n > 0 { b.alloc_reg() } else { Reg(0) };
+                            if n > 0 {
+                                let mut arg_slots: Vec<Reg> = vec![args_start];
+                                for _ in 1..n {
+                                    arg_slots.push(b.alloc_reg());
+                                }
+                                for (slot, a) in arg_slots.iter().zip(args.iter()) {
+                                    let r = lower_expr(b, a);
+                                    b.push(Inst::Move { dst: *slot, src: r });
+                                }
                             }
-                            for (slot, a) in arg_slots.iter().zip(args.iter()) {
-                                let r = lower_expr(b, a);
-                                b.push(Inst::Move { dst: *slot, src: r });
-                            }
+                            let dst = b.alloc_reg();
+                            b.push(Inst::CallValueWithThis {
+                                dst,
+                                callee: local_reg,
+                                receiver: recv,
+                                args: args_start,
+                                n_args: n as u8,
+                                arg_names: Vec::new(),
+                            });
+                            return dst;
                         }
-                        let dst = b.alloc_reg();
-                        b.push(Inst::CallValueWithThis {
-                            dst,
-                            callee: local_reg,
-                            receiver: recv,
-                            args: args_start,
-                            n_args: n as u8,
-                            arg_names: Vec::new(),
-                        });
-                        return dst;
                     }
                     // `super.method(...)` — emit `CallSuper` so the
                     // host walks the parent class chain rather
