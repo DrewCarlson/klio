@@ -32,6 +32,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.TODO", contract_todo),
     ("kotlin.requireNotNull", contract_require_not_null),
     ("kotlin.checkNotNull", contract_check_not_null),
+    ("kotlin.collections.buildList", builders_build_list),
+    ("kotlin.collections.buildSet", builders_build_set),
+    ("kotlin.collections.buildMap", builders_build_map),
+    ("kotlin.text.buildString", builders_build_string),
 
     // ----- io -----
     ("kotlin.io.print", io_print),
@@ -1769,6 +1773,79 @@ fn coll_iter_filter_not(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
     }
     Ok(make_list(result, false))
+}
+
+fn builders_build_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.is_empty() || ctx.args.len() > 2 {
+        return Err(RuntimeError::Arity("buildList expects (block) or (capacity, block)".into()));
+    }
+    let block = ctx.args[ctx.args.len() - 1].clone();
+    let buildable = Value::List {
+        items: Rc::new(RefCell::new(Vec::new())),
+        mutable: true,
+        enum_class: None,
+    };
+    {
+        let CallCtx { out, host, .. } = ctx;
+        host.invoke_callable_with_this(&block, &[], &buildable, *out)?;
+    }
+    let Value::List { items, .. } = buildable else { unreachable!() };
+    Ok(Value::List { items, mutable: false, enum_class: None })
+}
+
+fn builders_build_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.is_empty() || ctx.args.len() > 2 {
+        return Err(RuntimeError::Arity("buildSet expects (block) or (capacity, block)".into()));
+    }
+    let block = ctx.args[ctx.args.len() - 1].clone();
+    let buildable = Value::List {
+        items: Rc::new(RefCell::new(Vec::new())),
+        mutable: true,
+        enum_class: None,
+    };
+    {
+        let CallCtx { out, host, .. } = ctx;
+        host.invoke_callable_with_this(&block, &[], &buildable, *out)?;
+    }
+    let Value::List { items, .. } = buildable else { unreachable!() };
+    let mut deduped: Vec<Value> = Vec::new();
+    for v in items.borrow().iter() {
+        if !deduped.iter().any(|x| Value::structural_eq(x, v)) {
+            deduped.push(v.clone());
+        }
+    }
+    Ok(Value::Set { items: Rc::new(RefCell::new(deduped)), mutable: false })
+}
+
+fn builders_build_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.is_empty() || ctx.args.len() > 2 {
+        return Err(RuntimeError::Arity("buildMap expects (block) or (capacity, block)".into()));
+    }
+    let block = ctx.args[ctx.args.len() - 1].clone();
+    let buildable = Value::Map {
+        entries: Rc::new(RefCell::new(Vec::new())),
+        mutable: true,
+    };
+    {
+        let CallCtx { out, host, .. } = ctx;
+        host.invoke_callable_with_this(&block, &[], &buildable, *out)?;
+    }
+    let Value::Map { entries, .. } = buildable else { unreachable!() };
+    Ok(Value::Map { entries, mutable: false })
+}
+
+fn builders_build_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 1 {
+        return Err(RuntimeError::Arity("buildString expects (block)".into()));
+    }
+    let block = ctx.args[0].clone();
+    let sb = Value::StringBuilder(Rc::new(RefCell::new(String::new())));
+    {
+        let CallCtx { out, host, .. } = ctx;
+        host.invoke_callable_with_this(&block, &[], &sb, *out)?;
+    }
+    let Value::StringBuilder(s) = sb else { unreachable!() };
+    Ok(Value::String(Rc::new(s.borrow().clone())))
 }
 
 fn contract_msg(ctx: &mut CallCtx, default: &str) -> Result<String, RuntimeError> {
