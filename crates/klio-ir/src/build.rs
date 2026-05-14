@@ -49,6 +49,8 @@ impl<'a> FuncBuilder<'a> {
             id: BlockId(0),
             insts: Vec::new(),
             terminator: Terminator::Return(None),
+            catches: Vec::new(),
+            finally: None,
         };
         Self {
             module,
@@ -150,6 +152,20 @@ impl<'a> FuncBuilder<'a> {
         None
     }
 
+    /// Attach catch handlers + an optional finally id to a block.
+    /// Used by Try lowering to wire the exception-edge metadata
+    /// onto the body's entry block.
+    pub fn attach_catches(
+        &mut self,
+        block: BlockId,
+        catches: Vec<crate::CatchHandler>,
+        finally: Option<BlockId>,
+    ) {
+        let cur = block.0 as usize;
+        self.blocks[cur].catches = catches;
+        self.blocks[cur].finally = finally;
+    }
+
     /// Snapshot every register currently bound in any live scope.
     /// Used by lambda lowering to record the closure environment
     /// at construction time.
@@ -208,6 +224,8 @@ impl<'a> FuncBuilder<'a> {
             id,
             insts: Vec::new(),
             terminator: Terminator::Unreachable,
+            catches: Vec::new(),
+            finally: None,
         });
         id
     }

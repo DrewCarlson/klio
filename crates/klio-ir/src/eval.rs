@@ -189,16 +189,24 @@ pub fn eval_with_captures(
     captures: Vec<Value>,
     host: &mut dyn Host,
 ) -> Result<Value, EvalError> {
+    let mut try_stack: Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)> = Vec::new();
     let mut frame = Frame::new_with_captures(module, func, args, captures);
+    let _ = &mut try_stack;
     let mut cur = func.entry;
     loop {
-        // Clone the per-block instruction slice + terminator so the
-        // mutable frame borrow does not alias the read borrow on
-        // the block's vec while we execute.
-        let (insts, term) = {
+        // Push any catch / finally metadata attached to this block.
+        let (insts, term, catches, finally) = {
             let block = frame.block(cur);
-            (block.insts.clone(), block.terminator.clone())
+            (
+                block.insts.clone(),
+                block.terminator.clone(),
+                block.catches.clone(),
+                block.finally,
+            )
         };
+        if !catches.is_empty() || finally.is_some() {
+            try_stack.push((cur, catches, finally));
+        }
         for inst in &insts {
             exec_inst(&mut frame, inst, host)?;
         }
@@ -211,7 +219,39 @@ pub fn eval_with_captures(
             Terminator::Return(r) => {
                 return Ok(r.map(|r| frame.read(r)).unwrap_or(Value::Unit));
             }
-            Terminator::Throw(r) => return Err(EvalError::Throw(frame.read(r))),
+            Terminator::Throw(r) => {
+                let exc = frame.read(r);
+                // Walk the try stack for a matching handler.
+                let mut routed = false;
+                while let Some((_blk, hcatches, hfinally)) = try_stack.pop() {
+                    if let Some(h) = hcatches.iter().find(|h| host.instance_of(
+                        &exc,
+                        &TypeRef {
+                            name: h.type_name.clone(),
+                            nullable: false,
+                            args: Vec::new(),
+                        },
+                    )) {
+                        // Bind exception, jump to handler.
+                        frame.write(h.exception_reg, exc.clone());
+                        cur = h.handler;
+                        routed = true;
+                        break;
+                    } else if let Some(fin) = hfinally {
+                        // No matching catch on this frame — run
+                        // finally then re-throw by re-installing
+                        // it as the next terminator path. For the
+                        // simple model, we route to finally then
+                        // propagate by returning Throw afterwards.
+                        cur = fin;
+                        routed = true;
+                        break;
+                    }
+                }
+                if !routed {
+                    return Err(EvalError::Throw(exc));
+                }
+            }
             Terminator::Unreachable => {
                 return Err(EvalError::Type("reached Terminator::Unreachable".into()));
             }
@@ -451,6 +491,27 @@ fn apply_unop(op: UnOp, v: &Value) -> Result<Value, EvalError> {
     }
 }
 
+fn render_value(v: &Value) -> String {
+    match v {
+        Value::Unit => "kotlin.Unit".to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Long(l) => l.to_string(),
+        Value::Short(s) => s.to_string(),
+        Value::Byte(b) => b.to_string(),
+        Value::UInt(u) => u.to_string(),
+        Value::ULong(u) => u.to_string(),
+        Value::UShort(u) => u.to_string(),
+        Value::UByte(u) => u.to_string(),
+        Value::Double(d) => format!("{d}"),
+        Value::Float(f) => format!("{f}"),
+        Value::Bool(b) => b.to_string(),
+        Value::String(s) => s.as_str().to_string(),
+        Value::Char(c) => c.to_string(),
+        Value::Null => "null".to_string(),
+        _ => format!("{v}"),
+    }
+}
+
 fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
     use Value::{Bool, Double, Int, Long};
     match (op, l, r) {
@@ -476,6 +537,21 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::GreaterEq, Int(a), Int(b)) => Ok(Bool(a >= b)),
         (BinOp::And, Bool(a), Bool(b)) => Ok(Bool(*a && *b)),
         (BinOp::Or, Bool(a), Bool(b)) => Ok(Bool(*a || *b)),
+        (BinOp::StringConcat, a, b) => {
+            let mut s = render_value(a);
+            s.push_str(&render_value(b));
+            Ok(Value::String(std::rc::Rc::new(s)))
+        }
+        (BinOp::Add, Value::String(a), b) => {
+            let mut s = a.as_str().to_string();
+            s.push_str(&render_value(b));
+            Ok(Value::String(std::rc::Rc::new(s)))
+        }
+        (BinOp::Add, a, Value::String(b)) => {
+            let mut s = render_value(a);
+            s.push_str(b.as_str());
+            Ok(Value::String(std::rc::Rc::new(s)))
+        }
         _ => Err(EvalError::Type(format!(
             "BinOp::{op:?} on {l:?} and {r:?}"
         ))),

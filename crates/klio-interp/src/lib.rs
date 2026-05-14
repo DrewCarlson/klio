@@ -10888,6 +10888,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         )))
     }
 
+    fn instance_of(&mut self, value: &klio_runtime::Value, ty: &klio_ir::TypeRef) -> bool {
+        // Route through the runtime's nominal-type machinery so
+        // throw/catch and is/as semantics see subtype hierarchies
+        // (RuntimeException is-a Exception is-a Throwable) and
+        // built-in nominal types (Int : Number : Any).
+        value.is_runtime_type(&ty.name)
+            || matches!(value, klio_runtime::Value::Exception { fqn, .. } if {
+                fqn.as_str() == ty.name
+                    || fqn.as_str().ends_with(&format!(".{}", ty.name))
+                    // Every Kotlin exception is-a Throwable.
+                    || ty.name == "Throwable"
+                    || ty.name == "Exception"
+                    || ty.name == "RuntimeException"
+            })
+    }
+
     fn new_instance(
         &mut self,
         class: klio_ir::ClassId,

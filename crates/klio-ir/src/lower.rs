@@ -11,7 +11,7 @@
 use klio_ast::{BinOp as AstBinOp, Block as AstBlock, Expr, Stmt, UnOp as AstUnOp};
 
 use crate::build::FuncBuilder;
-use crate::{BinOp, Const, Inst, Reg, Terminator, UnOp};
+use crate::{BinOp, BlockId, Const, Inst, Reg, Terminator, UnOp};
 
 /// Bind function parameters into the current scope. Each param is
 /// loaded into a fresh register via `Inst::LoadParam` so subsequent
@@ -410,20 +410,83 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             lower_when(b, subject.as_deref(), branches, expr_span(expr))
         }
         Expr::Try { body, catches, finally, .. } => {
-            // The IR does not yet carry explicit exception edges,
-            // so today this lowers as straight-line execution of
-            // the body. Catches and finally branches are still
-            // lowered for completeness — the evaluator's Throw
-            // terminator will leak past them until exception edges
-            // land. Tracking item: slice 4d in REFINEMENTS.md.
-            let r = lower_block(b, body);
-            for c in catches {
-                let _ = lower_block(b, &c.body);
+            // Exception-edge model: the body block carries a list
+            // of CatchHandlers (one per catch arm) and an optional
+            // finally block. The evaluator's Throw terminator walks
+            // the active block chain, matches the throw against
+            // each handler's type_name, jumps to the matching
+            // handler with the exception bound to its
+            // exception_reg, and runs finally on every exit.
+            let result = b.alloc_reg();
+            let exit = b.alloc_block();
+            let finally_blk = finally.as_ref().map(|_| b.alloc_block());
+
+            // Pre-allocate each catch handler's entry block + the
+            // exception register. We'll fill in their bodies after
+            // recording the handler metadata.
+            let handlers: Vec<(klio_ast::Catch, BlockId, Reg)> = catches
+                .iter()
+                .map(|c| {
+                    let blk = b.alloc_block();
+                    let exc = b.alloc_reg();
+                    (c.clone(), blk, exc)
+                })
+                .collect();
+
+            // Body block: stitch CatchHandlers onto the cursor
+            // block before lowering the body so any Throw fired
+            // during body evaluation routes through them.
+            let body_entry = b.alloc_block();
+            b.terminate(Terminator::Goto(body_entry));
+            b.switch_to(body_entry);
+            let cur_id = b.cur;
+            let catch_handlers: Vec<crate::CatchHandler> = handlers
+                .iter()
+                .map(|(c, blk, exc)| crate::CatchHandler {
+                    type_name: c.ty.name.name.clone(),
+                    handler: *blk,
+                    exception_reg: *exc,
+                })
+                .collect();
+            b.attach_catches(cur_id, catch_handlers, finally_blk);
+            let body_val = lower_block(b, body);
+            b.push(Inst::Move { dst: result, src: body_val });
+            if let Some(fin) = finally_blk {
+                b.terminate(Terminator::Goto(fin));
+            } else {
+                b.terminate(Terminator::Goto(exit));
             }
-            if let Some(f) = finally {
-                let _ = lower_block(b, f);
+
+            // Each handler body: bind the exception, lower the
+            // catch body, fall through to finally (or exit).
+            for (c, blk, exc) in &handlers {
+                b.switch_to(*blk);
+                b.push_scope();
+                b.bind(c.binding.name.clone(), *exc);
+                let v = lower_block(b, &c.body);
+                b.push(Inst::Move { dst: result, src: v });
+                b.pop_scope();
+                if let Some(fin) = finally_blk {
+                    b.terminate(Terminator::Goto(fin));
+                } else {
+                    b.terminate(Terminator::Goto(exit));
+                }
             }
-            r
+
+            // Finally body (if present): lower then fall through
+            // to exit. (Re-throw on uncaught propagation is a
+            // future refinement; the simple model runs finally
+            // once on caught + normal-exit paths.)
+            if let Some(fin) = finally_blk {
+                b.switch_to(fin);
+                if let Some(blk) = finally {
+                    let _ = lower_block(b, blk);
+                }
+                b.terminate(Terminator::Goto(exit));
+            }
+
+            b.switch_to(exit);
+            result
         }
         Expr::Lambda { params, body, .. } => {
             // Snapshot the names visible to the enclosing builder

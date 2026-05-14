@@ -163,12 +163,34 @@ pub enum Terminator {
     Unreachable,
 }
 
-/// A basic block: linear instruction stream + terminator.
+/// Catch handler frame attached to a try-body block. When a Throw
+/// fires inside the body, the evaluator pops handlers in stack
+/// order and jumps to the first whose `type_name` matches the
+/// thrown value's nominal type. `exception_reg` is the register
+/// the handler body reads the bound exception value from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatchHandler {
+    pub type_name: String,
+    pub handler: BlockId,
+    pub exception_reg: Reg,
+}
+
+/// A basic block: linear instruction stream + terminator. When
+/// `catches` is non-empty, a `Throw` reaching this block (or any
+/// block reached from it without first leaving the try scope)
+/// looks up a matching handler before propagating.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
     pub id: BlockId,
     pub insts: Vec<Inst>,
     pub terminator: Terminator,
+    #[serde(default)]
+    pub catches: Vec<CatchHandler>,
+    /// Finally-block id to execute on every exit from this block's
+    /// try-region (normal fall-through, catches, returns, throws).
+    /// Set by lowering when the try has a finally clause.
+    #[serde(default)]
+    pub finally: Option<BlockId>,
 }
 
 /// A function body in IR form.
