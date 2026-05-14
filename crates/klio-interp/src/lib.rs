@@ -11319,7 +11319,6 @@ impl<'a> IrHost<'a> {
     /// the method wasn't lowered. Used as the entry point for
     /// IR-native instance-method dispatch once the receiver's
     /// runtime ClassDef is matched to an IR Class.
-    #[allow(dead_code)]
     fn lookup_ir_method(
         &self,
         class_fqn: &str,
@@ -11906,6 +11905,40 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // IR-native instance method dispatch: when the receiver is
+        // a user-class instance whose class has an IR-lowered
+        // method matching `name`, call its FuncId directly through
+        // the IR evaluator. The method body was lowered with
+        // `this` bound as the implicit first param. Falls back to
+        // the host's tree-walker dispatch (further below) when the
+        // class isn't in the active IR module or the lookup misses.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let class_name = inst.borrow().class.name.clone();
+            let class_fqn = inst.borrow().class.fqn.clone();
+            let fid = self
+                .lookup_ir_method(&class_fqn, name)
+                .or_else(|| self.lookup_ir_method(&class_name, name));
+            if let Some(fid) = fid {
+                let module = std::rc::Rc::clone(&self.module);
+                let func = module.funcs[fid.0 as usize].clone();
+                let expected_params = func.params.len();
+                if expected_params == args.len() + 1 {
+                    let mut all_args: Vec<klio_runtime::Value> = Vec::with_capacity(expected_params);
+                    all_args.push(receiver.clone());
+                    all_args.extend_from_slice(args);
+                    match klio_ir::eval::eval_with(&module, &func, all_args, self) {
+                        Ok(v) => return Ok(v),
+                        Err(klio_ir::eval::EvalError::Unsupported(_)) => {
+                            // Body used an IR construct the host
+                            // can't service through this dispatch
+                            // path — fall back to the tree walker.
+                        }
+                        Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => return Ok(v),
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
         // Iterator-protocol primitives for ranges, arrays, lists,
         // maps and sets. The tree walker's `for-in` is special-
         // cased in eval_call; the IR lowers For to explicit
