@@ -919,6 +919,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "klio-ir"
+version = "0.1.0"
+dependencies = [
+ "klio-ast",
+ "klio-diagnostics",
+ "klio-runtime",
+ "klio-span",
+ "klio-types",
+ "serde",
+]
+
+[[package]]
 name = "klio-kotlinx-atomicfu"
 version = "0.1.0"
 dependencies = [
