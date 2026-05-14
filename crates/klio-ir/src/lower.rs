@@ -762,6 +762,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 body_ast: body.clone(),
                 captures,
                 captured_names,
+                absorb_return: false,
             });
             dst
         }
@@ -951,6 +952,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 body_ast: body_block,
                 captures,
                 captured_names,
+                absorb_return: true,
             });
             dst
         }
@@ -1333,6 +1335,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     body_ast: body,
                     captures,
                     captured_names,
+                    absorb_return: true,
                 });
                 b.bind(f.name.name.clone(), dst);
             }

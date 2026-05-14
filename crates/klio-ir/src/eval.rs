@@ -185,6 +185,22 @@ pub trait Host {
         Err(EvalError::Unsupported("Host::build_ast_lambda"))
     }
 
+    /// Variant of `build_ast_lambda` that threads the
+    /// `absorb_return` flag through. Anonymous-fn expressions
+    /// (`fun(x): T = …`) set `true` so `return` inside the body
+    /// stops at the fn boundary; ordinary `{ … }` lambdas use the
+    /// default `false`.
+    fn build_ast_lambda_with_flag(
+        &mut self,
+        params: &[String],
+        body: &klio_ast::Block,
+        captured_names: &[String],
+        captures: Vec<Value>,
+        _absorb_return: bool,
+    ) -> Result<Value, EvalError> {
+        self.build_ast_lambda(params, body, captured_names, captures)
+    }
+
     /// Resolve a function call by FuncId. The default routes
     /// through `eval()` recursively, so a single-module IR program
     /// stays self-contained.
@@ -587,9 +603,9 @@ fn exec_inst(
             let v = host.build_closure(frame.module, *body_func, cap_values)?;
             frame.write(*dst, v);
         }
-        Inst::AstLambda { dst, params, body_ast, captures, captured_names } => {
+        Inst::AstLambda { dst, params, body_ast, captures, captured_names, absorb_return } => {
             let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
-            let v = host.build_ast_lambda(params, body_ast, captured_names, cap_values)?;
+            let v = host.build_ast_lambda_with_flag(params, body_ast, captured_names, cap_values, *absorb_return)?;
             frame.write(*dst, v);
         }
         Inst::EvalAst { dst, ast, captured_names, captures } => {

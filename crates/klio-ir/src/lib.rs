@@ -195,6 +195,12 @@ pub enum Inst {
         body_ast: klio_ast::Block,
         captures: Vec<Reg>,
         captured_names: Vec<String>,
+        /// `true` for anonymous function expressions (`fun(x): T = …`)
+        /// where `return` is a local return out of the fn rather
+        /// than a non-local one. `false` for ordinary `{ x -> … }`
+        /// lambdas — the enclosing function is the return target.
+        #[serde(default)]
+        absorb_return: bool,
     },
 }
 

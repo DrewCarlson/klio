@@ -348,6 +348,15 @@ impl Interpreter {
     /// Used by the IR Host to resolve bare top-level identifiers
     /// (`println`, user `fun foo`) to a callable Value.
     pub fn lookup_global_callable(&self, name: &str) -> Option<klio_runtime::Value> {
+        // Prefer the class table over the globals env. Some
+        // top-level classes (`Regex`, `Throwable`, …) also have a
+        // synthetic constructor `Value::Function` registered in
+        // globals; returning the Class lets reflection / companion
+        // access (`Regex.escape(...)`, `Foo::class`) reach the
+        // class object directly instead of the bare constructor.
+        if let Some(c) = self.class_table.get(name) {
+            return Some(klio_runtime::Value::Class(Rc::clone(c)));
+        }
         self.globals.borrow().lookup(name)
     }
 
@@ -11590,10 +11599,17 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         captured_names: &[String],
         captures: Vec<klio_runtime::Value>,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        // Materialise a Value::Lambda whose captured env contains
-        // the names → values snapshot. The tree walker's
-        // call_lambda path then dispatches the body exactly like
-        // any other lambda.
+        self.build_ast_lambda_with_flag(params, body, captured_names, captures, false)
+    }
+
+    fn build_ast_lambda_with_flag(
+        &mut self,
+        params: &[String],
+        body: &klio_ast::Block,
+        captured_names: &[String],
+        captures: Vec<klio_runtime::Value>,
+        absorb_return: bool,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.interp.globals))));
         for (name, value) in captured_names.iter().zip(captures.iter()) {
             env.borrow_mut().define(name.clone(), value.clone());
@@ -11602,7 +11618,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             params: Rc::new(params.to_vec()),
             body: Rc::new(body.clone()),
             env,
-            absorb_return: false,
+            absorb_return,
         })
     }
 
