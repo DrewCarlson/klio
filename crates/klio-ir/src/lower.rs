@@ -1034,12 +1034,60 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 dst
             }
             klio_ast::PostfixOp::Inc | klio_ast::PostfixOp::Dec => {
-                let s = lower_expr(b, inner);
                 let op = match op {
                     klio_ast::PostfixOp::Inc => UnOp::Inc,
                     klio_ast::PostfixOp::Dec => UnOp::Dec,
                     _ => unreachable!(),
                 };
+                // For Index targets, evaluate receiver + keys ONCE,
+                // read via get(...), inc/dec, write via set(...),
+                // returning the snapshot. Otherwise fall through to
+                // the generic "evaluate inner once, write back via
+                // Path / Member" path.
+                if let Expr::Index { receiver, args: idx_args, .. } = inner.as_ref() {
+                    let recv = lower_expr(b, receiver);
+                    let n_keys = idx_args.len();
+                    let key_start = b.alloc_reg();
+                    let mut key_slots: Vec<Reg> = vec![key_start];
+                    for _ in 1..n_keys {
+                        key_slots.push(b.alloc_reg());
+                    }
+                    // Reserve val slot for the write-back contig.
+                    let val_slot = b.alloc_reg();
+                    for (slot, arg) in key_slots.iter().zip(idx_args.iter()) {
+                        let r = lower_expr(b, arg);
+                        b.push(Inst::Move { dst: *slot, src: r });
+                    }
+                    // Read current: get(key…) into `old`.
+                    let old = b.alloc_reg();
+                    let get_nm = b.module.intern_const(Const::String("get".into()));
+                    b.push(Inst::CallMember {
+                        dst: old,
+                        receiver: recv,
+                        name: get_nm,
+                        args: key_start,
+                        n_args: n_keys as u8,
+                        arg_names: Vec::new(),
+                    });
+                    // new = unop(old)
+                    let new = b.alloc_reg();
+                    b.push(Inst::UnOp { dst: new, op, operand: old });
+                    b.push(Inst::Move { dst: val_slot, src: new });
+                    // Write back: set(key…, new). Reuses the SAME
+                    // key slots so idx() isn't called twice.
+                    let set_dst = b.alloc_reg();
+                    let set_nm = b.module.intern_const(Const::String("set".into()));
+                    b.push(Inst::CallMember {
+                        dst: set_dst,
+                        receiver: recv,
+                        name: set_nm,
+                        args: key_start,
+                        n_args: (n_keys as u8) + 1,
+                        arg_names: Vec::new(),
+                    });
+                    return old;
+                }
+                let s = lower_expr(b, inner);
                 // Snapshot the old value into a fresh reg before
                 // mutating the storage slot — `c++` returns the
                 // pre-increment value, and for a `var` local `s` is

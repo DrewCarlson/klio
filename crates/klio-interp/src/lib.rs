@@ -11719,6 +11719,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             | "compareBy" | "compareByDescending" | "naturalOrder" | "reverseOrder"
             | "thenBy" | "thenByDescending"
             | "compareValues" | "compareValuesBy" | "Comparator"
+            | "runCatching" | "Result"
             // Sequence builders + common range helpers
             | "sequenceOf" | "sequence" | "generateSequence" | "emptySequence"
             | "emptyList" | "emptyMap" | "emptySet"
