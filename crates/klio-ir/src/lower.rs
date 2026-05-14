@@ -710,6 +710,33 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                 }
             }
+            // `Result.success(x)` / `Result.failure(e)` and a few
+            // other built-in classes the tree walker dispatches at
+            // call site rather than through method tables. Route
+            // the whole call through EvalAst so the existing
+            // tree-walker code paths handle them.
+            if let Expr::Member { receiver, .. } = callee.as_ref() {
+                if let Expr::Path { segments, .. } = receiver.as_ref() {
+                    if segments.len() == 1
+                        && matches!(segments[0].name.as_str(), "Result")
+                    {
+                        let outer_names: std::collections::HashSet<String> = b.visible_names();
+                        let captured_names: Vec<String> = outer_names.iter().cloned().collect();
+                        let captures: Vec<Reg> = captured_names
+                            .iter()
+                            .filter_map(|n| b.resolve(n))
+                            .collect();
+                        let dst = b.alloc_reg();
+                        b.push(Inst::EvalAst {
+                            dst,
+                            ast: Box::new(expr.clone()),
+                            captured_names,
+                            captures,
+                        });
+                        return dst;
+                    }
+                }
+            }
             // Fully-qualified callee like `kotlin.math.abs(x)` →
             // resolve the FQN as a global and CallValue against the
             // resulting intrinsic / function value. Avoids the
