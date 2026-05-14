@@ -5518,10 +5518,24 @@ impl Interpreter {
             // via `__kxco_spawn`. Loop because draining one launch
             // can spawn more.
             let mut pending = klio_kotlinx_coroutines::drain_pending_launches();
-            if pending.is_empty() && self.launch_queue.is_empty() {
+            let mut resumes = klio_kotlinx_coroutines::drain_pending_resumes();
+            if pending.is_empty() && resumes.is_empty() && self.launch_queue.is_empty() {
                 return Ok(());
             }
             self.launch_queue.append(&mut pending);
+            // Fire any parked continuations from a previous round.
+            // Each parked cont is a synthetic Continuation instance
+            // — calling its `resume(Unit)` method lets the scheduler
+            // unblock the corresponding suspendCoroutine site so
+            // that frame can advance.
+            for cont in resumes.drain(..) {
+                let _ = self.invoke_named_member_call(
+                    &cont,
+                    "resume",
+                    &[klio_runtime::Value::Unit],
+                    out,
+                );
+            }
             while let Some(lam) = self.launch_queue.first().cloned() {
                 self.launch_queue.remove(0);
                 self.run_blocking(&lam, out)?;

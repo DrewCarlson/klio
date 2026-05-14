@@ -34,6 +34,7 @@ internal fun __kxco_schedulerDrainCount(): Int = 0
 // klio-kotlinx-coroutines; the host pumps the queue after the
 // runBlocking body returns.
 internal fun __kxco_spawn(block: () -> Unit): Unit = Unit
+internal fun __kxco_scheduleResume(cont: Any): Unit = Unit
 
 class CancellationException(message: String) : Throwable(message)
 

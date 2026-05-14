@@ -29,6 +29,11 @@ thread_local! {
     static NEXT_TOKEN: RefCell<i64> = const { RefCell::new(1) };
     static SCHED_QUEUE: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
     static PENDING_LAUNCHES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+    /// Tasks parked on `delay()` waiting for the scheduler to fire
+    /// their resumption. Each entry is the continuation Value the
+    /// host fills via cont.resume(Unit). Drained in FIFO order by
+    /// the runBlocking pump between scheduling rounds.
+    static PENDING_RESUMES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
 }
 
 klio_stdlib::host_bindings! {
@@ -41,6 +46,7 @@ klio_stdlib::host_bindings! {
         "kotlinx.coroutines.__kxco_schedulerEnqueue"   => scheduler_enqueue,
         "kotlinx.coroutines.__kxco_schedulerDrainCount" => scheduler_drain_count,
         "kotlinx.coroutines.__kxco_spawn"               => spawn_launch_block,
+        "kotlinx.coroutines.__kxco_scheduleResume"      => schedule_resume,
     }
 }
 
@@ -130,6 +136,25 @@ fn spawn_launch_block(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// pump launches without re-entering the shim path.
 pub fn drain_pending_launches() -> Vec<Value> {
     PENDING_LAUNCHES.with(|q| std::mem::take(&mut *q.borrow_mut()))
+}
+
+/// Park the active `suspendCoroutine` continuation on the pending
+/// resume queue. The scheduler picks it back up between rounds to
+/// fire `cont.resume(Unit)`, advancing the parked task.
+fn schedule_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let Some(cont) = ctx.args.first().cloned() else {
+        return Err(RuntimeError::Type(
+            "__kxco_scheduleResume: expected the continuation arg".into(),
+        ));
+    };
+    PENDING_RESUMES.with(|q| q.borrow_mut().push(cont));
+    Ok(Value::Unit)
+}
+
+/// Take the queue of parked continuations for the scheduler to
+/// resume in FIFO order.
+pub fn drain_pending_resumes() -> Vec<Value> {
+    PENDING_RESUMES.with(|q| std::mem::take(&mut *q.borrow_mut()))
 }
 
 fn scheduler_drain_count(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
