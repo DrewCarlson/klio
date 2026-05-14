@@ -12153,6 +12153,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // method on any of the receiver's classes (the leaf and
             // its supertypes). The IR module's class index keys by
             // both FQN and simple name; check both at every level.
+            // After exhausting the parent chain, walk implemented
+            // interfaces so default methods inherited from an
+            // interface route through IR too.
             let mut fid: Option<klio_ir::FuncId> = None;
             let mut cur_class = Some(std::rc::Rc::clone(&inst.borrow().class));
             while let Some(c) = cur_class {
@@ -12161,6 +12164,18 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     .or_else(|| self.lookup_ir_method(&c.name, name))
                 {
                     fid = Some(f);
+                    break;
+                }
+                for iface in c.interfaces.borrow().iter() {
+                    if let Some(f) = self
+                        .lookup_ir_method(&iface.fqn, name)
+                        .or_else(|| self.lookup_ir_method(&iface.name, name))
+                    {
+                        fid = Some(f);
+                        break;
+                    }
+                }
+                if fid.is_some() {
                     break;
                 }
                 cur_class = c.parent.borrow().clone();
