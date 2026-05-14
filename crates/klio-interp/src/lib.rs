@@ -72,9 +72,7 @@ const IMPLICIT_ALIASES: &[(&str, &str)] = &[
 
 pub struct Interpreter {
     globals: Rc<RefCell<Env>>,
-    /// Top-level properties keyed by simple name. Used to dispatch reads
-    /// and writes through custom getters/setters or property delegates.
-    top_level_props: std::collections::HashMap<String, PropertyDef>,
+    // top_level_props has moved onto `module_registry.top_level_props`.
     /// Module-scoped registry — owns the IR side-tables populated
     /// during decl registration. Reads/writes from the rest of the
     /// interpreter and from IrHost go through this field.
@@ -240,6 +238,7 @@ pub struct Interpreter {
 #[derive(Default)]
 pub(crate) struct ModuleRegistryOwned {
     pub class_ir: ClassIrTables,
+    pub top_level_props: std::collections::HashMap<String, PropertyDef>,
 }
 
 /// Per-class IR side-tables produced during decl registration.
@@ -355,7 +354,6 @@ impl Interpreter {
         }
         Self {
             globals: Rc::new(RefCell::new(env)),
-            top_level_props: std::collections::HashMap::new(),
             module_registry: ModuleRegistryOwned::default(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
@@ -491,7 +489,7 @@ impl Interpreter {
     /// `val cached by lazy {…}` reads fire the delegate.
     #[must_use]
     fn has_top_level_property(&self, name: &str) -> bool {
-        self.top_level_props.contains_key(name)
+        self.module_registry.top_level_props.contains_key(name)
     }
 
     fn assign_top_level_pub(
@@ -503,7 +501,7 @@ impl Interpreter {
         // Top-level delegated / setter-bearing property — route the
         // write through the tree walker's setter machinery so the
         // delegate's `setValue` fires.
-        if let Some(pdef) = self.top_level_props.get(name).cloned() {
+        if let Some(pdef) = self.module_registry.top_level_props.get(name).cloned() {
             if pdef.delegate.is_some() || pdef.setter.is_some() {
                 let env = Rc::clone(&self.globals);
                 return self.write_top_level_property(&pdef, value, &env, out);
@@ -519,7 +517,7 @@ impl Interpreter {
         name: &str,
         out: &mut dyn Output,
     ) -> Option<Result<klio_runtime::Value, RuntimeError>> {
-        let pdef = self.top_level_props.get(name).cloned()?;
+        let pdef = self.module_registry.top_level_props.get(name).cloned()?;
         let env = Rc::clone(&self.globals);
         Some(self.read_top_level_property(&pdef, &env, out))
     }
@@ -1759,7 +1757,7 @@ impl Interpreter {
                 } else if pdef.getter.is_none() {
                     file_env.borrow_mut().define(p.name.name.clone(), Value::Null);
                 }
-                self.top_level_props.insert(p.name.name.clone(), pdef);
+                self.module_registry.top_level_props.insert(p.name.name.clone(), pdef);
             }
         }
 
@@ -2757,7 +2755,7 @@ impl Interpreter {
                 let name = &segments[0].name;
                 // Top-level property write — route through delegate /
                 // custom setter if declared.
-                let tlp = self.top_level_props.get(name).cloned();
+                let tlp = self.module_registry.top_level_props.get(name).cloned();
                 if let Some(pdef) = &tlp {
                     if pdef.delegate.is_some() || pdef.setter.is_some() {
                         let current = if matches!(op, AssignOp::Assign) {
@@ -2908,7 +2906,7 @@ impl Interpreter {
                     // A top-level property with a delegate or custom
                     // accessor takes precedence over a plain env lookup
                     // so reads route through `getValue` / the getter.
-                    if let Some(pdef) = self.top_level_props.get(name).cloned() {
+                    if let Some(pdef) = self.module_registry.top_level_props.get(name).cloned() {
                         if pdef.delegate.is_some() || pdef.getter.is_some() {
                             return self.read_top_level_property(&pdef, env, out);
                         }
@@ -14243,7 +14241,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // var (not registered as a delegated / setter-bearing
         // property), write straight to globals. Skips the tree-
         // walker's assign_top_level_pub round-trip.
-        if !self.interp.top_level_props.contains_key(name) {
+        if !self.interp.module_registry.top_level_props.contains_key(name) {
             self.interp.globals.borrow_mut().define(name, value);
             return Ok(());
         }
