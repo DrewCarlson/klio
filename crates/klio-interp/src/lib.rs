@@ -3243,7 +3243,7 @@ impl Interpreter {
         // regular instance pipeline so a `: Parent(args)` clause runs the
         // parent ctor chain; mark the class as object-like so display
         // matches the kotlinc-native shape for trivial cases.
-        let v = self.construct_instance(&class, &[], &[], out)?;
+        let v = self.construct_instance_with_outer(&class, &[], &[], None, out)?;
         Ok(v)
     }
 
@@ -3584,8 +3584,8 @@ impl Interpreter {
             Value::Class(class) => {
                 // Construct against the resolved ClassDef directly
                 // — nested classes aren't necessarily in the global
-                // class_table, so construct_by_name would fail.
-                self.construct_instance(class, args, arg_names, out)
+                // class_table, so a name-keyed lookup would fail.
+                self.construct_instance_with_outer(class, args, arg_names, None, out)
             }
             Value::BoundInnerClass { class, outer } => self.construct_instance_with_outer(
                 class,
@@ -7066,7 +7066,7 @@ impl Interpreter {
             };
             // Construct the instance against the entry class.
             let arg_names: Vec<Option<String>> = vec![None; arg_vals.len()];
-            let v = self.construct_instance(&entry_class, &arg_vals, &arg_names, out)?;
+            let v = self.construct_instance_with_outer(&entry_class, &arg_vals, &arg_names, None, out)?;
             // Augment with `name` / `ordinal`.
             if let Value::Instance(inst) = &v {
                 inst.borrow_mut().define(
@@ -7190,46 +7190,6 @@ impl Interpreter {
     /// Construct a regular class instance from constructor args. Walks the
     /// parent chain top-down so a parent's primary ctor + init blocks run
     /// before the child's, matching Kotlin's construction order.
-    pub fn construct_instance(
-        &mut self,
-        class: &Rc<ClassDef>,
-        args: &[Value],
-        arg_names: &[Option<String>],
-        out: &mut dyn Output,
-    ) -> Result<Value, RuntimeError> {
-        self.construct_instance_with_outer(class, args, arg_names, None, out)
-    }
-
-    /// Public wrapper so the IR Host can construct user-class
-    /// instances by name (looked up through the class table).
-    pub fn construct_by_name(
-        &mut self,
-        class_name: &str,
-        args: &[Value],
-        out: &mut dyn Output,
-    ) -> Result<Value, RuntimeError> {
-        let names: Vec<Option<String>> = vec![None; args.len()];
-        self.construct_by_name_with_names(class_name, args, &names, out)
-    }
-
-    /// Construct an instance honouring named args + default values.
-    /// Used by the IR Host's new_instance_named callback so
-    /// `Foo(y = 99)` reorders correctly against `class Foo(x: Int = 1, y: Int = 2)`.
-    pub fn construct_by_name_with_names(
-        &mut self,
-        class_name: &str,
-        args: &[Value],
-        arg_names: &[Option<String>],
-        out: &mut dyn Output,
-    ) -> Result<Value, RuntimeError> {
-        let class = self
-            .class_table
-            .get(class_name)
-            .cloned()
-            .ok_or_else(|| RuntimeError::Type(format!("unknown class `{class_name}`")))?;
-        self.construct_instance(&class, args, arg_names, out)
-    }
-
     fn construct_instance_with_outer(
         &mut self,
         class: &Rc<ClassDef>,
@@ -8569,7 +8529,7 @@ impl Interpreter {
             ctor_names.push(Some(p.name.clone()));
         }
         drop(inst);
-        self.construct_instance(&class, &ctor_args, &ctor_names, out)
+        self.construct_instance_with_outer(&class, &ctor_args, &ctor_names, None, out)
     }
 
     fn eval_path(
@@ -9870,7 +9830,7 @@ impl Interpreter {
                         for a in args {
                             arg_vals.push(self.eval_expr(a, env, out)?);
                         }
-                        return self.construct_instance(&nc, &arg_vals, arg_names, out);
+                        return self.construct_instance_with_outer(&nc, &arg_vals, arg_names, None, out);
                     }
                 }
                 // Extension functions on the class or its companion —
@@ -10123,7 +10083,7 @@ impl Interpreter {
                     let lambda = arg_vals.into_iter().next().unwrap();
                     return self.sam_construct(&class, lambda, out);
                 }
-                self.construct_instance(&class, &arg_vals, arg_names, out)
+                self.construct_instance_with_outer(&class, &arg_vals, arg_names, None, out)
             }
             Value::BoundInnerClass { class, outer } => {
                 self.construct_instance_with_outer(
@@ -11457,6 +11417,27 @@ struct IrClosureSlot {
 }
 
 impl<'a> IrHost<'a> {
+    /// Look up a class in the interp's table by simple name and run
+    /// its primary/secondary ctor pipeline. Inlines the previous
+    /// `construct_by_name` wrappers.
+    fn construct_by_name(
+        &mut self,
+        class_name: &str,
+        args: &[klio_runtime::Value],
+        arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        let class = self
+            .interp
+            .class_table
+            .get(class_name)
+            .cloned()
+            .ok_or_else(|| {
+                klio_runtime::RuntimeError::Type(format!("unknown class `{class_name}`"))
+            })?;
+        self.interp
+            .construct_instance_with_outer(&class, args, arg_names, None, self.out)
+    }
+
     /// Synthesize and dispatch a member call through the tree
     /// walker's `eval_expr` so extension-function lookup, named-arg
     /// reorder, vararg packing, and default-value filling all fire.
@@ -11720,9 +11701,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // NullPointerException via the tree walker so catch arms see
         // a real Throwable instance.
         if class.0 == u32::MAX {
+            let empty = vec![None; args.len()];
             return self
-                .interp
-                .construct_by_name("NullPointerException", args, self.out)
+                .construct_by_name("NullPointerException", args, &empty)
                 .map_err(ir_err);
         }
         let name = self
@@ -11735,10 +11716,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 ))
             })?
             .clone();
-        match self
-            .interp
-            .construct_by_name_with_names(&name, args, arg_names, self.out)
-        {
+        match self.construct_by_name(&name, args, arg_names) {
             Ok(v) => Ok(v),
             Err(e) => {
                 // SAM conversion: `IntPredicate { x -> … }` invokes
@@ -11832,9 +11810,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // pack-imported classes (Buffer, Instant, HttpClient) that
         // the IR module's class_index doesn't see.
         if let klio_runtime::Value::Class(class) = callee {
+            let empty = vec![None; args.len()];
             return self
-                .interp
-                .construct_by_name(&class.name, args, self.out)
+                .construct_by_name(&class.name, args, &empty)
                 .map_err(ir_err);
         }
         // IrClosure callees dispatch back into the IR evaluator
@@ -12414,7 +12392,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     let names: Vec<Option<String>> = vec![None; args.len()];
                     return self
                         .interp
-                        .construct_instance(&nc, args, &names, self.out)
+                        .construct_instance_with_outer(&nc, args, &names, None, self.out)
                         .map_err(ir_err);
                 }
             }
@@ -12782,9 +12760,8 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 ))
             })?
             .clone();
-        self.interp
-            .construct_by_name(&name, args, self.out)
-            .map_err(ir_err)
+        let empty = vec![None; args.len()];
+        self.construct_by_name(&name, args, &empty).map_err(ir_err)
     }
 }
 
