@@ -146,6 +146,16 @@ pub enum Inst {
     },
     /// Build a `List` from a range of registers.
     NewList { dst: Reg, args: Reg, n_args: u8 },
+    /// After calling a lambda that mutates outer-scope `var`s,
+    /// read each captured name back from the lambda's env and
+    /// write the updated value into the source reg in the
+    /// caller's frame. Pairs with `Inst::AstLambda` whose
+    /// captured names mirror the writeback list.
+    WritebackCaptures {
+        lambda: Reg,
+        names: Vec<ConstId>,
+        dsts: Vec<Reg>,
+    },
     /// `::name` — produce a `KProperty`-shaped reference value
     /// carrying the property name. Reflection target.
     PropertyRef { dst: Reg, name: ConstId },

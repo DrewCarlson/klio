@@ -57,6 +57,91 @@ fn is_boxed_to_any_form(e: &Expr) -> bool {
     }
 }
 
+/// Collect every outer-scope variable name a lambda's body
+/// directly mutates (assignment / `++` / `--`). Returns an empty
+/// vec for non-lambda args. Used by the closure-mutation
+/// writeback path to know which captured names to sync back to
+/// the caller's regs after a HOF call returns.
+fn lambda_mutated_outer_vars(b: &FuncBuilder<'_>, arg: &Expr) -> Vec<String> {
+    let Expr::Lambda { body, .. } = arg else { return Vec::new(); };
+    let visible = b.visible_names();
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    fn walk(
+        stmt: &klio_ast::Stmt,
+        visible: &std::collections::HashSet<String>,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        match stmt {
+            klio_ast::Stmt::Assign { target, .. } => {
+                if let Expr::Path { segments, .. } = target {
+                    if segments.len() == 1 && visible.contains(&segments[0].name) {
+                        out.insert(segments[0].name.clone());
+                    }
+                }
+            }
+            klio_ast::Stmt::Expr(e) => walk_expr(e, visible, out),
+            _ => {}
+        }
+    }
+    fn visit_path(
+        e: &Expr,
+        visible: &std::collections::HashSet<String>,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        if let Expr::Path { segments, .. } = e {
+            if segments.len() == 1 && visible.contains(&segments[0].name) {
+                out.insert(segments[0].name.clone());
+            }
+        }
+    }
+    fn walk_expr(
+        e: &Expr,
+        visible: &std::collections::HashSet<String>,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        match e {
+            Expr::Postfix { op, expr, .. } => {
+                if matches!(op, klio_ast::PostfixOp::Inc | klio_ast::PostfixOp::Dec) {
+                    visit_path(expr, visible, out);
+                }
+            }
+            Expr::Unary { op, expr, .. } => {
+                if matches!(op, klio_ast::UnOp::PreInc | klio_ast::UnOp::PreDec) {
+                    visit_path(expr, visible, out);
+                }
+            }
+            Expr::Block(b) => { for s in &b.stmts { walk(s, visible, out); } }
+            Expr::If { cond, then_branch, else_branch, .. } => {
+                walk_expr(cond, visible, out);
+                walk_expr(then_branch, visible, out);
+                if let Some(e) = else_branch { walk_expr(e, visible, out); }
+            }
+            Expr::While { cond, body, .. } => {
+                walk_expr(cond, visible, out);
+                walk_expr(body, visible, out);
+            }
+            Expr::DoWhile { body, cond, .. } => {
+                if let Some(b) = body { walk_expr(b, visible, out); }
+                walk_expr(cond, visible, out);
+            }
+            Expr::For { body, .. } => walk_expr(body, visible, out),
+            Expr::When { branches, .. } => {
+                for br in branches { walk_expr(&br.body, visible, out); }
+            }
+            Expr::Try { body, catches, finally, .. } => {
+                for s in &body.stmts { walk(s, visible, out); }
+                for c in catches { for s in &c.body.stmts { walk(s, visible, out); } }
+                if let Some(b) = finally { for s in &b.stmts { walk(s, visible, out); } }
+            }
+            _ => {}
+        }
+    }
+    for s in &body.stmts {
+        walk(s, &visible, &mut out);
+    }
+    out.into_iter().collect()
+}
+
 fn lambda_writes_outer_var(b: &FuncBuilder<'_>, arg: &Expr) -> bool {
     let body = match arg {
         Expr::Lambda { body, .. } => body,
@@ -742,27 +827,71 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             });
             dst
         }
-        Expr::Call { args, .. }
-            if args.iter().any(|a| lambda_writes_outer_var(b, a)) =>
+        Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. }
+            if args.iter().any(|a| lambda_writes_outer_var(b, a))
+                && matches!(callee.as_ref(), Expr::Member { .. })
+                && !*is_infix =>
         {
             // Call passing a lambda that assigns to an outer-scope
-            // variable. The IR's value-snapshot captures wouldn't
-            // surface those writes; route the whole call through
-            // tree-walker EvalAst so its Env chain propagates the
-            // mutation back to the enclosing fn.
-            let outer_names: std::collections::HashSet<String> = b.visible_names();
-            let captured_names: Vec<String> = outer_names.iter().cloned().collect();
-            let captures: Vec<Reg> = captured_names
-                .iter()
-                .filter_map(|n| b.resolve(n))
-                .collect();
+            // variable. Emit a normal CallMember and a
+            // WritebackCaptures Inst for each closure-mutating
+            // lambda so the env's mutations are synced back to
+            // the caller's regs after the call returns.
+            let Expr::Member { receiver, name, .. } = callee.as_ref() else { unreachable!() };
+            let recv = lower_expr(b, receiver);
+            // Lower args individually so we can remember each
+            // lambda's reg for writeback.
+            let mut arg_regs: Vec<Reg> = Vec::with_capacity(args.len());
+            for a in args {
+                let r = lower_expr(b, a);
+                arg_regs.push(r);
+            }
+            // Compact into a contiguous run for the CallMember
+            // arg-slot convention.
+            let args_start = if arg_regs.is_empty() {
+                Reg(0)
+            } else {
+                let start = b.alloc_reg();
+                b.push(Inst::Move { dst: start, src: arg_regs[0] });
+                for r in &arg_regs[1..] {
+                    let slot = b.alloc_reg();
+                    b.push(Inst::Move { dst: slot, src: *r });
+                }
+                start
+            };
+            let arg_names = intern_arg_names(b.module, ast_arg_names);
             let dst = b.alloc_reg();
-            b.push(Inst::EvalAst {
+            let nm = b.module.intern_const(Const::String(name.name.clone()));
+            b.push(Inst::CallMember {
                 dst,
-                ast: Box::new(expr.clone()),
-                captured_names,
-                captures,
+                receiver: recv,
+                name: nm,
+                args: args_start,
+                n_args: args.len() as u8,
+                arg_names,
             });
+            // Emit writebacks for each closure-mutating lambda
+            // argument: read the captured names back out of the
+            // lambda's env into the caller's source regs.
+            for (i, a) in args.iter().enumerate() {
+                let mutated = lambda_mutated_outer_vars(b, a);
+                if mutated.is_empty() {
+                    continue;
+                }
+                let lambda_reg = arg_regs[i];
+                let mut names: Vec<crate::ConstId> = Vec::with_capacity(mutated.len());
+                let mut dsts: Vec<Reg> = Vec::with_capacity(mutated.len());
+                for name in &mutated {
+                    if let Some(src_reg) = b.resolve(name) {
+                        let n = b.module.intern_const(Const::String(name.clone()));
+                        names.push(n);
+                        dsts.push(src_reg);
+                    }
+                }
+                if !names.is_empty() {
+                    b.push(Inst::WritebackCaptures { lambda: lambda_reg, names, dsts });
+                }
+            }
             return dst;
         }
         Expr::Call { callee, args, arg_names: ast_arg_names, .. }

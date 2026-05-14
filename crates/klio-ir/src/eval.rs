@@ -197,6 +197,17 @@ pub trait Host {
     /// module; concrete hosts build a `Value::Lambda` (or
     /// equivalent) wrapping the body + env so it can be invoked
     /// through `call_value`.
+    /// Read a captured variable's current value out of a
+    /// `Value::Lambda`'s env. Used after closure-mutating calls
+    /// to sync writes back into the caller's regs.
+    fn read_lambda_capture(
+        &mut self,
+        _lambda: &Value,
+        _name: &str,
+    ) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::read_lambda_capture"))
+    }
+
     /// Resolve `receiver::name` to a callable reference value.
     /// Concrete hosts dispatch through the receiver's class table
     /// to produce a `BoundMethod` / intrinsic / property-ref shape.
@@ -763,6 +774,19 @@ fn exec_inst(
                     enum_class: None,
                 },
             );
+        }
+        Inst::WritebackCaptures { lambda, names, dsts } => {
+            let lam = frame.read(*lambda);
+            for (name_id, dst) in names.iter().zip(dsts.iter()) {
+                let name_str = match &frame.module.consts[name_id.0 as usize] {
+                    Const::String(s) => s.clone(),
+                    _ => return Err(EvalError::Type(
+                        "WritebackCaptures: name not a string const".into(),
+                    )),
+                };
+                let v = host.read_lambda_capture(&lam, &name_str)?;
+                frame.write(*dst, v);
+            }
         }
         Inst::PropertyRef { dst, name } => {
             let name_str = match &frame.module.consts[name.0 as usize] {

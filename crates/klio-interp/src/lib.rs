@@ -11801,6 +11801,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         })
     }
 
+    fn read_lambda_capture(
+        &mut self,
+        lambda: &klio_runtime::Value,
+        name: &str,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        match lambda {
+            klio_runtime::Value::Lambda { env, .. } => {
+                Ok(env.borrow().lookup(name).unwrap_or(klio_runtime::Value::Unit))
+            }
+            _ => Err(klio_ir::eval::EvalError::Type(format!(
+                "read_lambda_capture: callee is not a lambda (got `{}`)",
+                lambda.type_fqn()
+            ))),
+        }
+    }
+
     fn member_ref(
         &mut self,
         receiver: &klio_runtime::Value,
