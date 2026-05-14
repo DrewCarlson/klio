@@ -7961,7 +7961,12 @@ impl Interpreter {
                 let mut parent_args: Vec<Value> =
                     Vec::with_capacity(class.parent_ctor_args.len());
                 for e in &class.parent_ctor_args {
-                    parent_args.push(self.eval_expr(e, &ctor_env, out)?);
+                    let v = match self.eval_property_init_via_ir(e, out) {
+                        Some(Ok(v)) => v,
+                        Some(Err(err)) => return Err(err),
+                        None => self.eval_expr(e, &ctor_env, out)?,
+                    };
+                    parent_args.push(v);
                 }
                 let parent_arg_names: Vec<Option<String>> = vec![None; parent_args.len()];
                 self.run_ctor_chain(&parent, &inst, &parent_args, &parent_arg_names, out)?;
@@ -8088,7 +8093,12 @@ impl Interpreter {
                 let mut parent_args: Vec<Value> =
                     Vec::with_capacity(class.parent_ctor_args.len());
                 for e in &class.parent_ctor_args {
-                    parent_args.push(self.eval_expr(e, &ctor_env, out)?);
+                    let v = match self.eval_property_init_via_ir(e, out) {
+                        Some(Ok(v)) => v,
+                        Some(Err(err)) => return Err(err),
+                        None => self.eval_expr(e, &ctor_env, out)?,
+                    };
+                    parent_args.push(v);
                 }
                 if let Some(msg) = parent_args.first() {
                     if !matches!(msg, Value::Null) {
