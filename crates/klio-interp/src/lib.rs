@@ -11641,11 +11641,24 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // by intrinsic param names, spread flattening) fires.
         if let klio_runtime::Value::Intrinsic { fqn, func } = callee {
             if !fqn.starts_with("__klio_intrinsic_") {
-                let reordered = reorder_intrinsic_args(fqn, args.to_vec(), arg_names)
-                    .map_err(ir_err)?;
+                // Skip the reorder pass when every arg is
+                // positional — the most common case, and the
+                // reorder walks the arg list even when there's
+                // nothing to do.
+                let needs_reorder = arg_names.iter().any(|n| n.is_some());
                 let mut __interp_host = InterpHostRef { interp: self.interp };
+                if needs_reorder {
+                    let reordered = reorder_intrinsic_args(fqn, args.to_vec(), arg_names)
+                        .map_err(ir_err)?;
+                    let mut ctx = klio_runtime::CallCtx {
+                        args: &reordered,
+                        out: self.out,
+                        host: &mut __interp_host,
+                    };
+                    return func(&mut ctx).map_err(ir_err);
+                }
                 let mut ctx = klio_runtime::CallCtx {
-                    args: &reordered,
+                    args,
                     out: self.out,
                     host: &mut __interp_host,
                 };
