@@ -11913,11 +11913,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // the host's tree-walker dispatch (further below) when the
         // class isn't in the active IR module or the lookup misses.
         if let klio_runtime::Value::Instance(inst) = receiver {
-            let class_name = inst.borrow().class.name.clone();
-            let class_fqn = inst.borrow().class.fqn.clone();
-            let fid = self
-                .lookup_ir_method(&class_fqn, name)
-                .or_else(|| self.lookup_ir_method(&class_name, name));
+            // Walk the runtime class chain looking for an IR-lowered
+            // method on any of the receiver's classes (the leaf and
+            // its supertypes). The IR module's class index keys by
+            // both FQN and simple name; check both at every level.
+            let mut fid: Option<klio_ir::FuncId> = None;
+            let mut cur_class = Some(std::rc::Rc::clone(&inst.borrow().class));
+            while let Some(c) = cur_class {
+                if let Some(f) = self
+                    .lookup_ir_method(&c.fqn, name)
+                    .or_else(|| self.lookup_ir_method(&c.name, name))
+                {
+                    fid = Some(f);
+                    break;
+                }
+                cur_class = c.parent.borrow().clone();
+            }
             if let Some(fid) = fid {
                 let module = std::rc::Rc::clone(&self.module);
                 let func = module.funcs[fid.0 as usize].clone();
