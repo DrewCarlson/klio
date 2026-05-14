@@ -201,7 +201,7 @@ pub struct Interpreter {
     /// stamp fully-qualified names onto user-declared classes and enums so the
     /// default `Any.toString` and `Enum.valueOf` failure messages match JVM
     /// Kotlin's `<package>.<simple-name>` form.
-    current_package: Option<String>,
+    // current_package moved onto module_registry.
     /// FQN → native binding installed from a loaded pack. Wins over
     /// the static `klio_stdlib::implementation` lookup so a pack can
     /// shadow or augment the in-process stdlib.
@@ -242,6 +242,7 @@ pub(crate) struct ModuleRegistryOwned {
         std::collections::HashMap<String, Vec<(Rc<klio_ast::Function>, Rc<RefCell<Env>>)>>,
     pub installed_bindings: std::collections::HashMap<String, klio_runtime::StdlibFn>,
     pub class_table: std::collections::HashMap<String, Rc<ClassDef>>,
+    pub current_package: Option<String>,
 }
 
 /// Per-class IR side-tables produced during decl registration.
@@ -379,7 +380,6 @@ impl Interpreter {
             tailrec_stack: Vec::new(),
             expr_types: std::collections::HashMap::new(),
             import_renames: std::collections::HashMap::new(),
-            current_package: None,
             pack_implicit_packages: Vec::new(),
             pack_known_packages: std::collections::HashSet::new(),
         }
@@ -674,7 +674,7 @@ impl Interpreter {
     /// Compose `<file-package>.<simple>` for a top-level user-declared class.
     /// When the file has no `package` header, returns the simple name unchanged.
     fn qualify_simple_name(&self, simple: &str) -> String {
-        match &self.current_package {
+        match &self.module_registry.current_package {
             Some(pkg) if !pkg.is_empty() => format!("{pkg}.{simple}"),
             _ => simple.to_string(),
         }
@@ -1524,7 +1524,7 @@ impl Interpreter {
         // Record the file's package so user-declared classes get a fully-
         // qualified `<package>.<simple-name>` FQN, matching JVM Kotlin's
         // `Any.toString` and `Enum.valueOf` failure-message conventions.
-        self.current_package = file.package.as_ref().map(|p| {
+        self.module_registry.current_package = file.package.as_ref().map(|p| {
             p.path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(".")
         });
 
@@ -1633,7 +1633,7 @@ impl Interpreter {
                 // top-level FQN (`<package>.<fn-name>`), bind the
                 // simple name to the intrinsic so the shim's default
                 // Kotlin body doesn't shadow the binding.
-                let value = if let Some(pkg) = self.current_package.as_deref() {
+                let value = if let Some(pkg) = self.module_registry.current_package.as_deref() {
                     let fqn = format!("{pkg}.{}", f.name.name);
                     if let Some(func) = self.binding_override(&fqn) {
                         let fqn_static: &'static str = leak_fqn(&fqn);
