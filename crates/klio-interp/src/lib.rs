@@ -1456,6 +1456,47 @@ impl Interpreter {
                         self.module_registry.class_ir.top_level_prop_getters.insert(p.name.name.clone(), id);
                     }
                 }
+                // Delegated top-level property: synthesize a getter
+                // expression `__delegate$name.getValue(null, ::name)`
+                // and lower it as a 0-arg thunk so IrHost lookup_global
+                // dispatches through IR rather than tree-walker
+                // read_top_level_property_pub.
+                if p.delegate.is_some() && p.getter.is_none() {
+                    use klio_ast::{Expr, Ident};
+                    use klio_span::{FileId, Span};
+                    let dummy = Span::new(FileId(0), 0, 0);
+                    let body = Expr::Call {
+                        callee: Box::new(Expr::Member {
+                            receiver: Box::new(Expr::Path {
+                                segments: vec![Ident {
+                                    name: format!("__delegate${}", p.name.name),
+                                    span: dummy,
+                                }],
+                                span: dummy,
+                            }),
+                            name: Ident { name: "getValue".into(), span: dummy },
+                            safe: false,
+                            span: dummy,
+                        }),
+                        args: vec![
+                            Expr::NullLit { span: dummy },
+                            Expr::PropertyRef {
+                                name: Ident { name: p.name.name.clone(), span: dummy },
+                                span: dummy,
+                            },
+                        ],
+                        arg_names: vec![None, None],
+                        type_args: Vec::new(),
+                        is_infix: false,
+                        span: dummy,
+                    };
+                    let id = klio_ir::lower::lower_expr_as_thunk(
+                        &mut module,
+                        &body,
+                        &format!("__get_delegated__{}", p.name.name),
+                    );
+                    self.module_registry.class_ir.top_level_prop_getters.insert(p.name.name.clone(), id);
+                }
                 if let Some(setter) = &p.setter {
                     let param = setter
                         .params
