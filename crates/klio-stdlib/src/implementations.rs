@@ -729,6 +729,14 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.filterIndexed", coll_iter_filter_indexed),
     ("kotlin.collections.Set.filterIndexed", coll_iter_filter_indexed),
     ("kotlin.collections.MutableSet.filterIndexed", coll_iter_filter_indexed),
+    ("kotlin.collections.Map.filterKeys", map_filter_keys),
+    ("kotlin.collections.MutableMap.filterKeys", map_filter_keys),
+    ("kotlin.collections.Map.filterValues", map_filter_values),
+    ("kotlin.collections.MutableMap.filterValues", map_filter_values),
+    ("kotlin.collections.Map.mapKeys", map_map_keys),
+    ("kotlin.collections.MutableMap.mapKeys", map_map_keys),
+    ("kotlin.collections.Map.mapValues", map_map_values),
+    ("kotlin.collections.MutableMap.mapValues", map_map_values),
 
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
@@ -1496,6 +1504,79 @@ fn coll_iter_filter_indexed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
     }
     Ok(make_list(result, false))
+}
+
+fn map_entries_clone(v: &Value, what: &str) -> Result<Vec<(Value, Value)>, RuntimeError> {
+    match v {
+        Value::Map { entries, .. } => Ok(entries.borrow().clone()),
+        _ => Err(RuntimeError::Type(format!("{what} requires a Map receiver"))),
+    }
+}
+
+fn map_filter_keys(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("filterKeys expects (receiver, block)".into()));
+    }
+    let entries = map_entries_clone(&ctx.args[0], "filterKeys")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    for (k, v) in entries {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&k), *out)?;
+        if matches!(r, Value::Bool(true)) {
+            result.push((k, v));
+        }
+    }
+    Ok(make_map(result, false))
+}
+
+fn map_filter_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("filterValues expects (receiver, block)".into()));
+    }
+    let entries = map_entries_clone(&ctx.args[0], "filterValues")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    for (k, v) in entries {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if matches!(r, Value::Bool(true)) {
+            result.push((k, v));
+        }
+    }
+    Ok(make_map(result, false))
+}
+
+fn map_map_keys(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("mapKeys expects (receiver, block)".into()));
+    }
+    let entries = map_entries_clone(&ctx.args[0], "mapKeys")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    for (k, v) in entries {
+        let entry = Value::MapEntry { key: Box::new(k.clone()), value: Box::new(v.clone()) };
+        let new_k = host.invoke_callable(&block, std::slice::from_ref(&entry), *out)?;
+        result.push((new_k, v));
+    }
+    Ok(make_map(result, false))
+}
+
+fn map_map_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("mapValues expects (receiver, block)".into()));
+    }
+    let entries = map_entries_clone(&ctx.args[0], "mapValues")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    for (k, v) in entries {
+        let entry = Value::MapEntry { key: Box::new(k.clone()), value: Box::new(v.clone()) };
+        let new_v = host.invoke_callable(&block, std::slice::from_ref(&entry), *out)?;
+        result.push((k, new_v));
+    }
+    Ok(make_map(result, false))
 }
 
 fn coll_iter_find(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
