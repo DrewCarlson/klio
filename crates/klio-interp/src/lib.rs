@@ -11728,6 +11728,37 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     Err(e) => return Err(ir_err(e)),
                 }
             }
+            // IR-native top-level fn call: when there's a single
+            // overload, no defaults / vararg, and the function
+            // was lowered into the active IR module, dispatch
+            // through its FuncId directly. Tree-walker handles
+            // the more complex cases below.
+            let no_defaults = decl.params.iter().all(|p| p.default.is_none());
+            let no_vararg = decl.params.iter().all(|p| !p.is_vararg);
+            let no_extension = decl.receiver_type.is_none();
+            if no_defaults
+                && no_vararg
+                && no_extension
+                && !self.interp.has_top_level_overloads(&name)
+                && args.len() == decl.params.len()
+            {
+                let module = std::rc::Rc::clone(&self.module);
+                if let Some(fid) = module.func_id(&name) {
+                    let func = module.funcs[fid.0 as usize].clone();
+                    if func.params.len() == args.len() {
+                        match klio_ir::eval::eval_with(&module, &func, args.to_vec(), self) {
+                            Ok(v) => return Ok(v),
+                            Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => return Ok(v),
+                            Err(klio_ir::eval::EvalError::Unsupported(_)) => {
+                                // Body used an IR construct the
+                                // host can't service yet — fall
+                                // through to tree walker.
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            }
         }
         // Value::Class callee → constructor call. Dispatch through
         // construct_by_name with the class's simple name. Covers
