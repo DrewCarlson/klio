@@ -19,25 +19,18 @@ use std::rc::Rc;
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use klio_runtime::{CallCtx, PrimitiveArrayKind, RuntimeError, Value};
-use klio_stdlib::HostBindings;
 
-#[must_use]
-pub fn host_bindings() -> HostBindings {
-    let mut b = HostBindings::new();
-    let bindings: &[(&'static str, klio_runtime::StdlibFn)] = &[
-        ("kotlinx.datetime.__kxdt_currentTimeMillis", current_time_millis),
-        ("kotlinx.datetime.__kxdt_currentNanosOfSecond", current_nanos_of_second),
-        ("kotlinx.datetime.__kxdt_currentSystemTimeZoneId", current_system_tz_id),
-        ("kotlinx.datetime.__kxdt_instantToLocalParts", instant_to_local_parts),
-        ("kotlinx.datetime.__kxdt_localToInstant", local_to_instant),
-        ("kotlinx.datetime.__kxdt_instantToString", instant_to_string),
-        ("kotlinx.datetime.__kxdt_parseInstant", parse_instant),
-        ("kotlinx.datetime.__kxdt_validateTimeZone", validate_time_zone),
-    ];
-    for (k, f) in bindings {
-        b.register(k, *f);
+klio_stdlib::host_bindings! {
+    pub fn host_bindings() {
+        "kotlinx.datetime.__kxdt_currentTimeMillis"       => current_time_millis,
+        "kotlinx.datetime.__kxdt_currentNanosOfSecond"    => current_nanos_of_second,
+        "kotlinx.datetime.__kxdt_currentSystemTimeZoneId" => current_system_tz_id,
+        "kotlinx.datetime.__kxdt_instantToLocalParts"     => instant_to_local_parts,
+        "kotlinx.datetime.__kxdt_localToInstant"          => local_to_instant,
+        "kotlinx.datetime.__kxdt_instantToString"         => instant_to_string,
+        "kotlinx.datetime.__kxdt_parseInstant"            => parse_instant,
+        "kotlinx.datetime.__kxdt_validateTimeZone"        => validate_time_zone,
     }
-    b
 }
 
 fn current_time_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

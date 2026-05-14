@@ -309,6 +309,36 @@ impl HostBindings {
     }
 }
 
+/// Declarative builder for a [`HostBindings`] registry. Each entry is
+/// a `"fqn" => function` pair; the macro expands to a function returning
+/// a populated registry. Cuts ~one line of boilerplate per binding.
+///
+/// ```ignore
+/// klio_stdlib::host_bindings! {
+///     pub fn host_bindings() {
+///         "com.example.foo" => foo_impl,
+///         "com.example.bar" => bar_impl,
+///     }
+/// }
+/// ```
+#[macro_export]
+macro_rules! host_bindings {
+    (
+        $vis:vis fn $name:ident() {
+            $( $fqn:literal => $func:path ),* $(,)?
+        }
+    ) => {
+        #[must_use]
+        $vis fn $name() -> $crate::HostBindings {
+            let mut b = $crate::HostBindings::new();
+            $(
+                b.register($fqn, $func);
+            )*
+            b
+        }
+    };
+}
+
 /// Look up the declared parameter names for a function FQN. The interpreter
 /// uses this to reorder named-argument calls before dispatching the
 /// intrinsic. Returns `None` when no entry exists (e.g. our hand-written

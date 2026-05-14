@@ -16,21 +16,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use klio_runtime::{CallCtx, PrimitiveArrayKind, RuntimeError, Value};
-use klio_stdlib::HostBindings;
 
-#[must_use]
-pub fn host_bindings() -> HostBindings {
-    let mut b = HostBindings::new();
-    let bindings: &[(&'static str, klio_runtime::StdlibFn)] = &[
-        ("io.ktor.client.engine.__kktor_request", request),
-        ("io.ktor.client.engine.__kktor_get", get),
-        ("io.ktor.client.engine.__kktor_post", post),
-        ("io.ktor.client.engine.__kktor_setHeader", set_header),
-    ];
-    for (k, f) in bindings {
-        b.register(k, *f);
+klio_stdlib::host_bindings! {
+    pub fn host_bindings() {
+        "io.ktor.client.engine.__kktor_request"   => request,
+        "io.ktor.client.engine.__kktor_get"       => get,
+        "io.ktor.client.engine.__kktor_post"      => post,
+        "io.ktor.client.engine.__kktor_setHeader" => set_header,
     }
-    b
 }
 
 fn arg_string(ctx: &CallCtx, idx: usize) -> Result<String, RuntimeError> {

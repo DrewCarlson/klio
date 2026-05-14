@@ -17,7 +17,6 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use klio_runtime::{CallCtx, InstanceData, PrimitiveArrayKind, RuntimeError, Value};
-use klio_stdlib::HostBindings;
 
 /// Discriminator the kotlinx.io binding uses to mark `NativeState`
 /// it owns. Other host bindings on the same instance would carry a
@@ -70,33 +69,27 @@ fn arg_string(ctx: &CallCtx, idx: usize) -> Result<String, RuntimeError> {
     }
 }
 
-#[must_use]
-pub fn host_bindings() -> HostBindings {
-    let mut b = HostBindings::new();
-    let bindings: &[(&'static str, klio_runtime::StdlibFn)] = &[
-        ("kotlinx.io.Buffer.size", buffer_size),
-        ("kotlinx.io.Buffer.isEmpty", buffer_is_empty),
-        ("kotlinx.io.Buffer.isNotEmpty", buffer_is_not_empty),
-        ("kotlinx.io.Buffer.clear", buffer_clear),
-        ("kotlinx.io.Buffer.writeByte", buffer_write_byte),
-        ("kotlinx.io.Buffer.writeInt", buffer_write_int),
-        ("kotlinx.io.Buffer.writeLong", buffer_write_long),
-        ("kotlinx.io.Buffer.writeShort", buffer_write_short),
-        ("kotlinx.io.Buffer.writeString", buffer_write_string),
-        ("kotlinx.io.Buffer.readByte", buffer_read_byte),
-        ("kotlinx.io.Buffer.readInt", buffer_read_int),
-        ("kotlinx.io.Buffer.readLong", buffer_read_long),
-        ("kotlinx.io.Buffer.readShort", buffer_read_short),
-        ("kotlinx.io.Buffer.readString", buffer_read_string),
-        ("kotlinx.io.Buffer.snapshot", buffer_snapshot),
-        ("kotlinx.io.Buffer.copyTo", buffer_copy_to),
-        ("kotlinx.io.ByteString.decodeToString", byte_string_decode_to_string),
-        ("kotlinx.io.encodeToByteString", string_encode_to_byte_string),
-    ];
-    for (k, f) in bindings {
-        b.register(k, *f);
+klio_stdlib::host_bindings! {
+    pub fn host_bindings() {
+        "kotlinx.io.Buffer.size"               => buffer_size,
+        "kotlinx.io.Buffer.isEmpty"            => buffer_is_empty,
+        "kotlinx.io.Buffer.isNotEmpty"         => buffer_is_not_empty,
+        "kotlinx.io.Buffer.clear"              => buffer_clear,
+        "kotlinx.io.Buffer.writeByte"          => buffer_write_byte,
+        "kotlinx.io.Buffer.writeInt"           => buffer_write_int,
+        "kotlinx.io.Buffer.writeLong"          => buffer_write_long,
+        "kotlinx.io.Buffer.writeShort"         => buffer_write_short,
+        "kotlinx.io.Buffer.writeString"        => buffer_write_string,
+        "kotlinx.io.Buffer.readByte"           => buffer_read_byte,
+        "kotlinx.io.Buffer.readInt"            => buffer_read_int,
+        "kotlinx.io.Buffer.readLong"           => buffer_read_long,
+        "kotlinx.io.Buffer.readShort"          => buffer_read_short,
+        "kotlinx.io.Buffer.readString"         => buffer_read_string,
+        "kotlinx.io.Buffer.snapshot"           => buffer_snapshot,
+        "kotlinx.io.Buffer.copyTo"             => buffer_copy_to,
+        "kotlinx.io.ByteString.decodeToString" => byte_string_decode_to_string,
+        "kotlinx.io.encodeToByteString"        => string_encode_to_byte_string,
     }
-    b
 }
 
 fn buffer_size(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
