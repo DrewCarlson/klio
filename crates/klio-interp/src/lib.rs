@@ -11481,6 +11481,18 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // for-loop runs against built-in collection shapes without
         // each shape needing its own member-method registration.
         match (receiver, name) {
+            (klio_runtime::Value::Range { start, end, step, kind }, "contains") if args.len() == 1 => {
+                let v = args[0].as_i64().unwrap_or(i64::MIN);
+                let inside = if *step > 0 {
+                    let _ = kind;
+                    v >= *start && v <= *end
+                } else if *step < 0 {
+                    v <= *start && v >= *end
+                } else {
+                    false
+                };
+                return Ok(klio_runtime::Value::Bool(inside));
+            }
             (klio_runtime::Value::Range { start, end, step, kind }, "iterator") => {
                 let items: Vec<klio_runtime::Value> =
                     materialise_range_items(*start, *end, *step, *kind);

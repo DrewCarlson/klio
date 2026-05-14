@@ -711,6 +711,21 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::GreaterEq, Int(a), Int(b)) => Ok(Bool(a >= b)),
         (BinOp::And, Bool(a), Bool(b)) => Ok(Bool(*a && *b)),
         (BinOp::Or, Bool(a), Bool(b)) => Ok(Bool(*a || *b)),
+        (BinOp::RangeTo, Int(a), Int(b)) => Ok(Value::Range {
+            start: *a as i64,
+            end: *b as i64,
+            step: 1,
+            kind: klio_runtime::RangeKind::Int,
+        }),
+        (BinOp::RangeUntil, Int(a), Int(b)) => Ok(Value::Range {
+            start: *a as i64,
+            end: (*b as i64) - 1,
+            step: 1,
+            kind: klio_runtime::RangeKind::Int,
+        }),
+        (BinOp::RangeTo, Long(a), Long(b)) => Ok(Value::Range {
+            start: *a, end: *b, step: 1, kind: klio_runtime::RangeKind::Long,
+        }),
         (BinOp::StringConcat, a, b) => {
             let mut s = render_value(a);
             s.push_str(&render_value(b));

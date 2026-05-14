@@ -878,9 +878,57 @@ fn lower_when(
                         });
                         dst
                     }
+                    klio_ast::WhenPatternKind::NotIsType(ty) => {
+                        let raw = b.alloc_reg();
+                        b.push(Inst::InstanceOf {
+                            dst: raw,
+                            src: subj,
+                            ty: crate::TypeRef {
+                                name: ty.name.name.clone(),
+                                nullable: ty.nullable,
+                                args: Vec::new(),
+                            },
+                        });
+                        let neg = b.alloc_reg();
+                        b.push(Inst::Not { dst: neg, src: raw });
+                        neg
+                    }
+                    klio_ast::WhenPatternKind::InRange(e) => {
+                        // `in r` lowers to r.contains(subject).
+                        let range_r = lower_expr(b, e);
+                        let args_start = b.alloc_reg();
+                        b.push(Inst::Move { dst: args_start, src: subj });
+                        let dst = b.alloc_reg();
+                        let nm = b.module.intern_const(Const::String("contains".into()));
+                        b.push(Inst::CallMember {
+                            dst,
+                            receiver: range_r,
+                            name: nm,
+                            args: args_start,
+                            n_args: 1,
+                            arg_names: Vec::new(),
+                        });
+                        dst
+                    }
+                    klio_ast::WhenPatternKind::NotInRange(e) => {
+                        let range_r = lower_expr(b, e);
+                        let args_start = b.alloc_reg();
+                        b.push(Inst::Move { dst: args_start, src: subj });
+                        let raw = b.alloc_reg();
+                        let nm = b.module.intern_const(Const::String("contains".into()));
+                        b.push(Inst::CallMember {
+                            dst: raw,
+                            receiver: range_r,
+                            name: nm,
+                            args: args_start,
+                            n_args: 1,
+                            arg_names: Vec::new(),
+                        });
+                        let neg = b.alloc_reg();
+                        b.push(Inst::Not { dst: neg, src: raw });
+                        neg
+                    }
                     _ => {
-                        // InRange/NotInRange/NotIsType need operator dispatch
-                        // that's not yet wired. Trace + emit always-false.
                         b.push(Inst::Trace { span: p.span });
                         b.emit_const(Const::Bool(false))
                     }
