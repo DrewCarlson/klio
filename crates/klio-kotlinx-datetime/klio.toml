@@ -4,17 +4,7 @@ version = "0.8.0"
 abi = 1
 implicit_packages = []
 source_roots = ["shim"]
+auto_bindings = true
 
 [[deps]]
 id = "stdlib"
-
-[bindings]
-"kotlinx.datetime.__kxdt_currentTimeMillis"       = "kotlinx.datetime.__kxdt_currentTimeMillis"
-"kotlinx.datetime.__kxdt_currentNanosOfSecond"    = "kotlinx.datetime.__kxdt_currentNanosOfSecond"
-"kotlinx.datetime.__kxdt_currentSystemTimeZoneId" = "kotlinx.datetime.__kxdt_currentSystemTimeZoneId"
-"kotlinx.datetime.__kxdt_instantToLocalParts"     = "kotlinx.datetime.__kxdt_instantToLocalParts"
-"kotlinx.datetime.__kxdt_localToInstant"          = "kotlinx.datetime.__kxdt_localToInstant"
-"kotlinx.datetime.__kxdt_instantToString"         = "kotlinx.datetime.__kxdt_instantToString"
-"kotlinx.datetime.__kxdt_parseInstant"            = "kotlinx.datetime.__kxdt_parseInstant"
-"kotlinx.datetime.__kxdt_validateTimeZone"        = "kotlinx.datetime.__kxdt_validateTimeZone"
-"kotlinx.datetime.__kxdt_addPeriod"               = "kotlinx.datetime.__kxdt_addPeriod"

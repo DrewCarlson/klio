@@ -4,9 +4,7 @@ version = "1.11.0"
 abi = 1
 implicit_packages = []
 source_roots = ["shim"]
+auto_bindings = true
 
 [[deps]]
 id = "stdlib"
-
-[bindings]
-"kotlinx.coroutines.__kxco_delayMillis" = "kotlinx.coroutines.__kxco_delayMillis"

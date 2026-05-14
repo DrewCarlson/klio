@@ -4,16 +4,10 @@ version = "3.2.0"
 abi = 1
 implicit_packages = []
 source_roots = ["shim"]
+auto_bindings = true
+# ktor's engine helpers live under io.ktor.client.engine — that
+# subpackage matches `<id>.` so the auto-binding prefix derived
+# from `id` picks them up.
 
 [[deps]]
 id = "stdlib"
-
-# klio-ktor-client is an opt-in pack. It is NOT installed by the
-# default `merged_host_bindings` table; instead a program that wants
-# HTTP support must `klio pack install` this pack into its cache.
-
-[bindings]
-"io.ktor.client.engine.__kktor_get"       = "io.ktor.client.engine.__kktor_get"
-"io.ktor.client.engine.__kktor_post"      = "io.ktor.client.engine.__kktor_post"
-"io.ktor.client.engine.__kktor_request"   = "io.ktor.client.engine.__kktor_request"
-"io.ktor.client.engine.__kktor_setHeader" = "io.ktor.client.engine.__kktor_setHeader"

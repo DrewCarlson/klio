@@ -373,6 +373,16 @@ struct LibraryHeader {
     /// `["src"]`.
     #[serde(default)]
     source_roots: Vec<String>,
+    /// When true, every host_symbol in `merged_host_bindings`
+    /// whose FQN starts with one of the prefixes in
+    /// `binding_auto_prefixes` (or with `<id>.` when the prefix
+    /// list is empty) is included in the emitted binding
+    /// manifest. Lets a crate ship its bindings purely in Rust
+    /// and skip the duplicate `[bindings]` table.
+    #[serde(default)]
+    auto_bindings: bool,
+    #[serde(default)]
+    binding_auto_prefixes: Vec<String>,
 }
 
 fn default_abi() -> u32 {
@@ -488,6 +498,42 @@ fn build_library_pack(
             max_arity: u8::MAX,
             platform_actual,
         });
+    }
+    // Auto-emit: pull every entry from `merged_host_bindings`
+    // whose FQN matches a configured prefix. Drops the klio.toml
+    // [bindings] duplication for the common case where the host
+    // crate already lists every binding.
+    if cfg.library.auto_bindings {
+        let prefixes: Vec<String> = if cfg.library.binding_auto_prefixes.is_empty() {
+            vec![format!("{}.", cfg.library.id)]
+        } else {
+            cfg.library
+                .binding_auto_prefixes
+                .iter()
+                .map(|p| if p.ends_with('.') { p.clone() } else { format!("{p}.") })
+                .collect()
+        };
+        let host = merged_host_bindings();
+        let known: std::collections::HashSet<String> =
+            bindings.iter().map(|b| b.fqn.clone()).collect();
+        for (host_symbol, _) in host.entries() {
+            if !prefixes.iter().any(|p| host_symbol.starts_with(p)) {
+                continue;
+            }
+            if known.contains(host_symbol) {
+                continue;
+            }
+            bindings.push(Binding {
+                fqn: host_symbol.to_string(),
+                kind: BindingKind::Function,
+                host_symbol: host_symbol.to_string(),
+                overrides_interpreter: true,
+                purity: Purity::Effectful,
+                min_arity: 0,
+                max_arity: u8::MAX,
+                platform_actual: false,
+            });
+        }
     }
     bindings.sort_by(|a, b| a.fqn.cmp(&b.fqn));
     let bindings_bytes = encode(&BindingManifest { bindings }).map_err(|e| e.to_string())?;
