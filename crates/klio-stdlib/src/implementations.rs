@@ -717,6 +717,18 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.mapNotNull", coll_iter_map_not_null),
     ("kotlin.collections.Set.mapNotNull", coll_iter_map_not_null),
     ("kotlin.collections.MutableSet.mapNotNull", coll_iter_map_not_null),
+    ("kotlin.collections.List.mapIndexed", coll_iter_map_indexed),
+    ("kotlin.collections.MutableList.mapIndexed", coll_iter_map_indexed),
+    ("kotlin.collections.Set.mapIndexed", coll_iter_map_indexed),
+    ("kotlin.collections.MutableSet.mapIndexed", coll_iter_map_indexed),
+    ("kotlin.collections.List.forEachIndexed", coll_iter_for_each_indexed),
+    ("kotlin.collections.MutableList.forEachIndexed", coll_iter_for_each_indexed),
+    ("kotlin.collections.Set.forEachIndexed", coll_iter_for_each_indexed),
+    ("kotlin.collections.MutableSet.forEachIndexed", coll_iter_for_each_indexed),
+    ("kotlin.collections.List.filterIndexed", coll_iter_filter_indexed),
+    ("kotlin.collections.MutableList.filterIndexed", coll_iter_filter_indexed),
+    ("kotlin.collections.Set.filterIndexed", coll_iter_filter_indexed),
+    ("kotlin.collections.MutableSet.filterIndexed", coll_iter_filter_indexed),
 
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
@@ -1434,6 +1446,53 @@ fn coll_iter_map_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
         if !matches!(r, Value::Null) {
             result.push(r);
+        }
+    }
+    Ok(make_list(result, false))
+}
+
+fn coll_iter_map_indexed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("mapIndexed expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "mapIndexed")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::with_capacity(items.len());
+    for (i, v) in items.into_iter().enumerate() {
+        let lam_args = [Value::new_int(i as i64), v];
+        result.push(host.invoke_callable(&block, &lam_args, *out)?);
+    }
+    Ok(make_list(result, false))
+}
+
+fn coll_iter_for_each_indexed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("forEachIndexed expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "forEachIndexed")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for (i, v) in items.into_iter().enumerate() {
+        let lam_args = [Value::new_int(i as i64), v];
+        host.invoke_callable(&block, &lam_args, *out)?;
+    }
+    Ok(Value::Unit)
+}
+
+fn coll_iter_filter_indexed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("filterIndexed expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "filterIndexed")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    for (i, v) in items.into_iter().enumerate() {
+        let lam_args = [Value::new_int(i as i64), v.clone()];
+        let r = host.invoke_callable(&block, &lam_args, *out)?;
+        if matches!(r, Value::Bool(true)) {
+            result.push(v);
         }
     }
     Ok(make_list(result, false))

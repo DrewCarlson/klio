@@ -6099,14 +6099,33 @@ impl Interpreter {
         env: &Rc<RefCell<Env>>,
         out: &mut dyn Output,
     ) -> Result<Option<Value>, RuntimeError> {
-        let items: Vec<Value> = match receiver {
-            Value::List { items, .. } | Value::Set { items, .. } => items.borrow().clone(),
-            _ => return Ok(None),
-        };
         match name {
             "mapIndexed" | "forEachIndexed" | "filterIndexed" => {}
             _ => return Ok(None),
         }
+        if args.len() == 1 {
+            let kind = match receiver {
+                Value::List { mutable: true, .. } => Some("MutableList"),
+                Value::List { .. } => Some("List"),
+                Value::Set { mutable: true, .. } => Some("MutableSet"),
+                Value::Set { .. } => Some("Set"),
+                _ => None,
+            };
+            if let Some(k) = kind {
+                let fqn = format!("kotlin.collections.{k}.{name}");
+                if let Some(func) = klio_stdlib::implementation(&fqn) {
+                    let lam = self.eval_expr(&args[0], env, out)?;
+                    let arg_vals = [receiver.clone(), lam];
+                    let mut __interp_host = InterpHostRef { interp: self };
+                    let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                    return Ok(Some(func(&mut ctx)?));
+                }
+            }
+        }
+        let items: Vec<Value> = match receiver {
+            Value::List { items, .. } | Value::Set { items, .. } => items.borrow().clone(),
+            _ => return Ok(None),
+        };
         let lam_expr = args.last().ok_or_else(|| {
             RuntimeError::Arity(format!("{name} requires a lambda argument"))
         })?;
