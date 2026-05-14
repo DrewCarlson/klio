@@ -678,9 +678,17 @@ impl Interpreter {
         file: &KotlinFile,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, String> {
-        // Build the IR module: lower every class and every
-        // top-level function in declaration order. Classes go
-        // first so Path→NewInstance routing sees them.
+        // Use the existing tree-walker as the bootstrap pass so
+        // class shells, top-level fns, and stdlib bindings are
+        // available to the IR Host. The walker registers everything
+        // into the interpreter's globals and class_table before we
+        // dispatch through the IR.
+        self.run_with_output_impl(file, out, /*invoke_main=*/ false, /*persist=*/ true)
+            .map_err(|e| format!("bootstrap: {e}"))?;
+
+        // Now lower the file's classes / top-level fns into an IR
+        // module. Classes go first so Path→NewInstance routing
+        // sees them.
         let mut module = klio_ir::Module::default();
         for d in &file.decls {
             if let Decl::Class(c) = d {
@@ -698,7 +706,15 @@ impl Interpreter {
         }
         let main_id = main_id.ok_or_else(|| "no `fun main` in file".to_string())?;
         let func = module.funcs[main_id.0 as usize].clone();
-        let mut host = IrHost { interp: self, out };
+        // Pre-stash class names indexed by IR ClassId so the Host
+        // can resolve NewInstance(class_id, args) without re-walking
+        // the module.
+        let class_names: Vec<String> = module
+            .classes
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let mut host = IrHost { interp: self, out, class_names };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host)
             .map_err(|e| format!("ir eval: {e}"))
     }
@@ -6710,6 +6726,23 @@ impl Interpreter {
         self.construct_instance_with_outer(class, args, arg_names, None, out)
     }
 
+    /// Public wrapper so the IR Host can construct user-class
+    /// instances by name (looked up through the class table).
+    pub fn construct_by_name(
+        &mut self,
+        class_name: &str,
+        args: &[Value],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        let class = self
+            .class_table
+            .get(class_name)
+            .cloned()
+            .ok_or_else(|| RuntimeError::Type(format!("unknown class `{class_name}`")))?;
+        let names: Vec<Option<String>> = vec![None; args.len()];
+        self.construct_instance(&class, args, &names, out)
+    }
+
     fn construct_instance_with_outer(
         &mut self,
         class: &Rc<ClassDef>,
@@ -10722,6 +10755,10 @@ fn lookup_nested_class(cls: &Rc<ClassDef>, name: &str) -> Option<Rc<ClassDef>> {
 struct IrHost<'a> {
     interp: &'a mut Interpreter,
     out: &'a mut dyn Output,
+    /// Class names indexed by ClassId so NewInstance can resolve
+    /// against the interpreter's class_table without re-walking
+    /// the IR module.
+    class_names: Vec<String>,
 }
 
 impl<'a> klio_ir::eval::Host for IrHost<'a> {
@@ -10770,12 +10807,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
 
     fn new_instance(
         &mut self,
-        _class: klio_ir::ClassId,
-        _args: &[klio_runtime::Value],
+        class: klio_ir::ClassId,
+        args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        Err(klio_ir::eval::EvalError::Unsupported(
-            "IrHost::new_instance — class-table bridge pending",
-        ))
+        let name = self
+            .class_names
+            .get(class.0 as usize)
+            .ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "IR ClassId {} not in module index",
+                    class.0
+                ))
+            })?
+            .clone();
+        self.interp
+            .construct_by_name(&name, args, self.out)
+            .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
     }
 }
 
