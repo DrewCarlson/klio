@@ -11932,13 +11932,30 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             | klio_runtime::Value::BoundMethod { .. }
         ));
         if !any_callable {
-            if let Some(func) = self.interp.lookup_intrinsic(&intr_fqn) {
-                let mut all = Vec::with_capacity(args.len() + 1);
-                all.push(receiver.clone());
-                all.extend_from_slice(args);
-                let mut ctx = CallCtx { args: &all, out: self.out };
-                return func(&mut ctx)
-                    .map_err(ir_err);
+            // Order probes by argument shape. For 0-arg calls (a
+            // property read), prefer the type-prefixed intrinsic
+            // (`kotlin.ranges.IntRange.step` reads the step field).
+            // For 1+-arg calls, prefer the package-scoped extension
+            // (`kotlin.ranges.step` creates a new ranged progression).
+            // Both variants exist for the same simple name and would
+            // collide if we always probed type-first.
+            let pkg_step = format!("kotlin.ranges.{name}");
+            let pkg_text = format!("kotlin.text.{name}");
+            let probes_arg = [
+                pkg_step.clone(),
+                pkg_text.clone(),
+                intr_fqn.clone(),
+            ];
+            let probes_no_arg = [intr_fqn.clone(), pkg_step, pkg_text];
+            let probes: &[String] = if args.is_empty() { &probes_no_arg } else { &probes_arg };
+            for probe in probes {
+                if let Some(func) = self.interp.lookup_intrinsic(probe) {
+                    let mut all = Vec::with_capacity(args.len() + 1);
+                    all.push(receiver.clone());
+                    all.extend_from_slice(args);
+                    let mut ctx = CallCtx { args: &all, out: self.out };
+                    return func(&mut ctx).map_err(ir_err);
+                }
             }
         }
         // Last resort: synthesise the call through the tree

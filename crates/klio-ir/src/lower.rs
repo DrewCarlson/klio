@@ -893,7 +893,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             }
             _ => lower_expr(b, inner),
         },
-        Expr::ObjectExpr { .. } => {
+        Expr::PropertyRef { .. }
+        | Expr::MemberRef { .. }
+        | Expr::Spread { .. }
+        | Expr::ObjectExpr { .. } => {
             // Anonymous-object expressions (`object { … }` /
             // `object : Foo { … }`) carry rich AST shape (a body of
             // declarations, supertypes, init blocks) that the IR
