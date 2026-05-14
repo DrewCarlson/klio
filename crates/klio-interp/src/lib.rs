@@ -12955,6 +12955,28 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             if let Some(v) = plain_field {
                 return Ok(v);
             }
+            // Companion-object access from an instance: `this.PI`
+            // inside a class method body, where `PI` lives in
+            // the companion. Walk class + parents for a
+            // companion that has the field.
+            let companion_val: Option<klio_runtime::Value> = {
+                let mut cur = Some(std::rc::Rc::clone(&inst.borrow().class));
+                let mut found = None;
+                while let Some(c) = cur {
+                    let comp_opt = c.companion.borrow().clone();
+                    if let Some(comp) = comp_opt {
+                        if let Some(v) = comp.borrow().get(name) {
+                            found = Some(v);
+                            break;
+                        }
+                    }
+                    cur = c.parent.borrow().clone();
+                }
+                found
+            };
+            if let Some(v) = companion_val {
+                return Ok(v);
+            }
             // Lazy-delegate cached fast-path: after the first read
             // the `Lazy` delegate has cached the produced value.
             // Return it directly without the tree-walker getValue
