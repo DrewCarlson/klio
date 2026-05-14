@@ -472,6 +472,31 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             });
             dst
         }
+        Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. }
+            if args.iter().any(|a| matches!(a, Expr::Spread { .. })) =>
+        {
+            // Calls containing a `*spread` argument route through
+            // EvalAst — the tree walker handles vararg packing +
+            // spread flattening end-to-end. Pure lowering tweak; no
+            // new Inst variant needed.
+            let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let captured_names: Vec<String> = outer_names.iter().cloned().collect();
+            let captures: Vec<Reg> = captured_names
+                .iter()
+                .filter_map(|n| b.resolve(n))
+                .collect();
+            let dst = b.alloc_reg();
+            b.push(Inst::EvalAst {
+                dst,
+                ast: Box::new(expr.clone()),
+                captured_names,
+                captures,
+            });
+            // Silence the unused-warning chain for the matched fields
+            // when this guard fires.
+            let _ = (callee, args, ast_arg_names, is_infix);
+            dst
+        }
         Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. } => {
             // Infix call `a fn b` lowers as `a.fn(b)` — the
             // dispatch site is a member call on the receiver
