@@ -1946,6 +1946,10 @@ impl Interpreter {
         for class in &all_classes {
             self.resolve_parent_link(class);
         }
+        // Build the IR module before constructing enum entries and
+        // object singletons so their ctors hit the lowered fast-path
+        // when their class qualifies.
+        self.build_ir_module_for_file(file)?;
         // Construct enum entries (each may invoke its enum class's ctor).
         for (class, idx) in pending_enums {
             if let Decl::Class(c) = &file.decls[idx] {
@@ -2022,11 +2026,6 @@ impl Interpreter {
             }
         }
 
-        // Build the IR module from the file's classes + top-level fns
-        // so by the time the run loop wakes up, every dispatch target
-        // has a FuncId / ClassId in the module the host already
-        // consults.
-        self.build_ir_module_for_file(file)?;
         Ok(())
     }
 
