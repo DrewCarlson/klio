@@ -1458,7 +1458,7 @@ fn install_one_extra_pack(
                 bundle.files.into_iter().map(|f| f.kotlin_file).collect();
             let mut out = klio_runtime::StdoutOutput;
             interp
-                .register_pack_sources(&asts, &mut out)
+                .register_pack_classes(&asts, &mut out)
                 .map_err(|e| e.to_string())?;
             return Ok(());
         }
@@ -1467,13 +1467,13 @@ fn install_one_extra_pack(
     if let Some(payload) = pack.read_section(section_names::SOURCES).map_err(|e| e.to_string())? {
         let bundle: SourceBundle = decode(&payload).map_err(|e| e.to_string())?;
         if !bundle.files.is_empty() {
-            register_pack_sources(interp, path, &bundle.files)?;
+            register_pack_classes(interp, path, &bundle.files)?;
         }
     }
     Ok(())
 }
 
-fn register_pack_sources(
+fn register_pack_classes(
     interp: &mut Interpreter,
     pack_path: &std::path::Path,
     files: &[klio_pack::schema::SourceFile],
@@ -1503,7 +1503,7 @@ fn register_pack_sources(
         asts.push(ast);
     }
     let mut out = klio_runtime::StdoutOutput;
-    interp.register_pack_sources(&asts, &mut out).map_err(|e| e.to_string())?;
+    interp.register_pack_classes(&asts, &mut out).map_err(|e| e.to_string())?;
     Ok(())
 }
 

@@ -356,7 +356,7 @@ impl Interpreter {
     /// declarations land directly in the shared globals so subsequent
     /// `run` / `run_module` invocations can see them. `main` functions
     /// inside pack sources are intentionally not invoked.
-    pub fn register_pack_sources(
+    pub fn register_pack_classes(
         &mut self,
         files: &[KotlinFile],
         out: &mut dyn Output,

@@ -215,7 +215,7 @@ pub struct SourceFile {
 
 /// Frozen front-end output. When present, the interpreter skips the
 /// parse pass at install time and feeds the carried `KotlinFile`
-/// directly into `register_pack_sources`. The pack still ships the
+/// directly into `register_pack_classes`. The pack still ships the
 /// raw source bytes in `sources` for diagnostic spans and re-parse
 /// fallback.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
