@@ -445,23 +445,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // Honour the literal's declared kind (`1L`, `1U`, `1uL`)
             // rather than letting the value range pick. The suffix
             // is what tells `is Long` apart from `is Int` for small
-            // values. Unsigned literals route through EvalAst so
-            // the IR doesn't need ULong/UInt Const variants — the
-            // tree walker produces Value::ULong / Value::UInt and
-            // unsigned arithmetic flows through the existing
-            // intrinsic paths.
-            if matches!(kind, klio_ast::IntLitKind::UInt | klio_ast::IntLitKind::ULong) {
-                let dst = b.alloc_reg();
-                b.push(Inst::EvalAst {
-                    dst,
-                    ast: Box::new(expr.clone()),
-                    captured_names: Vec::new(),
-                    captures: Vec::new(),
-                });
-                return dst;
-            }
+            // values.
             match kind {
                 klio_ast::IntLitKind::Long => b.emit_const(Const::Long(*value)),
+                klio_ast::IntLitKind::UInt => b.emit_const(Const::UInt(*value as u32)),
+                klio_ast::IntLitKind::ULong => b.emit_const(Const::ULong(*value as u64)),
                 klio_ast::IntLitKind::Int => {
                     if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 {
                         b.emit_const(Const::Int(*value as i32))
@@ -469,7 +457,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         b.emit_const(Const::Long(*value))
                     }
                 }
-                _ => unreachable!(),
             }
         }
         Expr::FloatLit { value, kind, .. } => match kind {
