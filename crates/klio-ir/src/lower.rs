@@ -362,6 +362,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 Expr::Member { receiver, name, .. } => {
                     let recv = lower_expr(b, receiver);
                     let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
                     let dst = b.alloc_reg();
                     let nm = b.module.intern_const(Const::String(name.name.clone()));
                     b.push(Inst::CallMember {
@@ -370,20 +371,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         name: nm,
                         args: args_start,
                         n_args: count,
-                        arg_names: Vec::new(),
+                        arg_names,
                     });
                     dst
                 }
                 _ => {
                     let callee_r = lower_expr(b, callee);
                     let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
                     let dst = b.alloc_reg();
                     b.push(Inst::CallValue {
                         dst,
                         callee: callee_r,
                         args: args_start,
                         n_args: count,
-                        arg_names: Vec::new(),
+                        arg_names,
                     });
                     dst
                 }

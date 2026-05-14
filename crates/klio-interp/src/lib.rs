@@ -11163,6 +11163,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             | "Array"
             // Pair / Triple / `to` infix
             | "Pair" | "Triple" | "to"
+            // kotlin.comparisons + ranges helpers
+            | "compareBy" | "compareByDescending" | "naturalOrder" | "reverseOrder"
+            | "thenBy" | "thenByDescending"
             // Sequence builders + common range helpers
             | "sequenceOf" | "sequence" | "emptyList" | "emptyMap" | "emptySet"
             | "lazyOf" | "lazy" | "buildList" | "buildSet" | "buildMap" | "buildString"
@@ -11217,9 +11220,6 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         args: &[klio_runtime::Value],
         arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        // When any name is present, dispatch through the tree
-        // walker's full call path so reorder + default-arg fill
-        // fire correctly. Pre-evaluated args go into temp slots.
         if arg_names.iter().any(|n| n.is_some()) {
             return self
                 .interp
@@ -11590,9 +11590,19 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             }
         }
         if args.is_empty() {
-            return self
+            // Try property access first (getters / fields).
+            if let Ok(v) = self
                 .interp
                 .eval_property_access(receiver.clone(), name, self.out)
+            {
+                return Ok(v);
+            }
+            // Fall through to method-call synthesis so auto-generated
+            // data-class members (componentN, copy without args, etc.)
+            // and extension fns reachable via eval_call fire.
+            return self
+                .interp
+                .invoke_named_member_call(receiver, name, args, self.out)
                 .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
         }
         // Extension-style intrinsic on a value type.
