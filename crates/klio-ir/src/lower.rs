@@ -435,6 +435,14 @@ pub fn lower_class_with_file(
     let mut methods: Vec<crate::FuncId> = Vec::new();
     for m in &c.members {
         if let klio_ast::Decl::Function(f) = m {
+            // Skip bodyless methods (abstract decls in
+            // interfaces / abstract classes). They'd lower to a
+            // func that just returns Unit; the IR-native member
+            // dispatch must fall through to the real override
+            // on a concrete subclass, not the abstract slot.
+            if f.body.is_none() {
+                continue;
+            }
             let _ = lower_method(module, f, &c.name.name, &own_member_names);
             let last_id = crate::FuncId((module.funcs.len() - 1) as u32);
             methods.push(last_id);
