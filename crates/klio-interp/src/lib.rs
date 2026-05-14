@@ -925,11 +925,10 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, RuntimeError> {
         self.register_file_decls(file, out)?;
-        self.build_ir_module_for_file(file)?;
         let module_rc = self
             .current_module
             .clone()
-            .expect("current_module set by build_ir_module_for_file");
+            .expect("current_module set by register_file_decls");
         let main_id = self.current_main_id.ok_or(RuntimeError::NoMain)?;
         return self.run_main(module_rc, main_id, out);
     }
@@ -1315,6 +1314,11 @@ impl Interpreter {
             }
         }
 
+        // Build the IR module from the file's classes + top-level fns
+        // so by the time the run loop wakes up, every dispatch target
+        // has a FuncId / ClassId in the module the host already
+        // consults.
+        self.build_ir_module_for_file(file)?;
         Ok(())
     }
 
