@@ -11714,6 +11714,23 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     prim: None,
                 });
             }
+            (klio_runtime::Value::Map { entries, .. }, "iterator") => {
+                // `for (e in map)` walks the entries; each `e` is a
+                // Pair-style two-field instance carrying `key` / `value`.
+                let items: Vec<klio_runtime::Value> = entries
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| klio_runtime::Value::MapEntry {
+                        key: Box::new(k.clone()),
+                        value: Box::new(v.clone()),
+                    })
+                    .collect();
+                return Ok(klio_runtime::Value::Iterator {
+                    items: std::rc::Rc::new(std::cell::RefCell::new(items)),
+                    pos: std::rc::Rc::new(std::cell::RefCell::new(0)),
+                    prim: None,
+                });
+            }
             (klio_runtime::Value::List { items, .. }, "iterator") => {
                 return Ok(klio_runtime::Value::Iterator {
                     items: std::rc::Rc::clone(items),
@@ -11884,16 +11901,31 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 .invoke_named_member_call(receiver, name, args, self.out)
                 .map_err(ir_err);
         }
-        // Extension-style intrinsic on a value type.
+        // Extension-style intrinsic on a value type. Skipped when
+        // any argument is a callable (Lambda / IrClosure / Intrinsic
+        // / PropertyRef / Function), because the no-predicate
+        // intrinsic forms (`kotlin.collections.List.count` etc.)
+        // would silently drop the lambda — the HOF dispatch in the
+        // tree walker's eval_call is what handles the predicate.
         let type_fqn = receiver.type_fqn();
         let intr_fqn = format!("{type_fqn}.{name}");
-        if let Some(func) = self.interp.lookup_intrinsic(&intr_fqn) {
-            let mut all = Vec::with_capacity(args.len() + 1);
-            all.push(receiver.clone());
-            all.extend_from_slice(args);
-            let mut ctx = CallCtx { args: &all, out: self.out };
-            return func(&mut ctx)
-                .map_err(ir_err);
+        let any_callable = args.iter().any(|a| matches!(a,
+            klio_runtime::Value::Lambda { .. }
+            | klio_runtime::Value::IrClosure { .. }
+            | klio_runtime::Value::Intrinsic { .. }
+            | klio_runtime::Value::PropertyRef { .. }
+            | klio_runtime::Value::Function { .. }
+            | klio_runtime::Value::BoundMethod { .. }
+        ));
+        if !any_callable {
+            if let Some(func) = self.interp.lookup_intrinsic(&intr_fqn) {
+                let mut all = Vec::with_capacity(args.len() + 1);
+                all.push(receiver.clone());
+                all.extend_from_slice(args);
+                let mut ctx = CallCtx { args: &all, out: self.out };
+                return func(&mut ctx)
+                    .map_err(ir_err);
+            }
         }
         // Last resort: synthesise the call through the tree
         // walker's full member-dispatch path, which picks up
@@ -11901,9 +11933,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // default-value handling.
         match self.interp.invoke_named_member_call(receiver, name, args, self.out) {
             Ok(v) => Ok(v),
-            Err(e) => Err(klio_ir::eval::EvalError::Type(format!(
-                "IR Host: member call `{name}` on {type_fqn} not resolved: {e}"
-            ))),
+            Err(e) => {
+                // Final fallback: try the bare top-level intrinsic
+                // dispatch with `(receiver, args…)`. Covers `infix
+                // fun to` and other `a name b` shapes where `name`
+                // is a top-level fn (or name-dispatched intrinsic
+                // like `to` / `compareBy`) rather than a member.
+                let mut all = Vec::with_capacity(args.len() + 1);
+                all.push(receiver.clone());
+                all.extend_from_slice(args);
+                if let Ok(v) = self.interp.invoke_named_intrinsic(name, &all, self.out) {
+                    return Ok(v);
+                }
+                Err(klio_ir::eval::EvalError::Type(format!(
+                    "IR Host: member call `{name}` on {type_fqn} not resolved: {e}"
+                )))
+            }
         }
     }
 
