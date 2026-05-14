@@ -12430,6 +12430,20 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     return self.call_value(&lam, args);
                 }
             }
+            // When the receiver's leaf class declares its own
+            // `name` method directly (not inherited), prefer
+            // dispatching that — IR-native walk could find an
+            // ancestor's body and miss a runtime-synthesized
+            // override (e.g. on an anonymous-object class).
+            let leaf_owns_method = inst
+                .borrow()
+                .class
+                .methods
+                .iter()
+                .any(|m| m.name == name);
+            if leaf_owns_method {
+                // Skip IR-native; fall through to tree-walker.
+            } else {
             // Walk classes and interfaces breadth-first. Robot
             // -> Being / [FormalGreeter] -> FormalGreeter
             // -> [Greeter] -> Greeter, etc. — so default
@@ -12480,6 +12494,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     }
                 }
             }
+            } // end else (leaf_owns_method false)
         }
         // Iterator-protocol primitives for ranges, arrays, lists,
         // maps and sets. The tree walker's `for-in` is special-
