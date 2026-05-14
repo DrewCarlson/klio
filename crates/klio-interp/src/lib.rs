@@ -11667,6 +11667,26 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // by intrinsic param names, spread flattening) fires.
         if let klio_runtime::Value::Intrinsic { fqn, func } = callee {
             if !fqn.starts_with("__klio_intrinsic_") {
+                // println / print on user Value::Instance calls
+                // the receiver's `toString()` so the override
+                // shows up in stdout. Mirrors the tree walker's
+                // pre-pass for intrinsic dispatch.
+                let print_rewrite = matches!(*fqn, "kotlin.io.println" | "kotlin.io.print");
+                let rewritten: Vec<klio_runtime::Value> = if print_rewrite {
+                    let mut out = Vec::with_capacity(args.len());
+                    for v in args {
+                        if matches!(v, klio_runtime::Value::Instance(_)) {
+                            let s = self.interp.format_value(v, self.out).map_err(ir_err)?;
+                            out.push(klio_runtime::Value::String(std::rc::Rc::new(s)));
+                        } else {
+                            out.push(v.clone());
+                        }
+                    }
+                    out
+                } else {
+                    args.to_vec()
+                };
+                let args: &[klio_runtime::Value] = &rewritten;
                 // Skip the reorder pass when every arg is
                 // positional — the most common case, and the
                 // reorder walks the arg list even when there's

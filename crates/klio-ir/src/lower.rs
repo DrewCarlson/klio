@@ -318,40 +318,38 @@ pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::Cl
             default: None,
         })
         .collect();
+    // Register the class shell first so the class name resolves
+    // inside its own method bodies (`class Foo { fun copy() = Foo(...) }`).
+    let class_id = module.add_class(crate::Class {
+        id: crate::ClassId(0),
+        name: c.name.name.clone(),
+        fqn: c.name.name.clone(),
+        primary_params,
+        methods: Vec::new(),
+        init_block: None,
+        companion: None,
+        supertypes: Vec::new(),
+    });
     let mut methods: Vec<crate::FuncId> = Vec::new();
     for m in &c.members {
         if let klio_ast::Decl::Function(f) = m {
-            // Lower the method body with `this` as the implicit
-            // first param so field reads (`this.x` →
-            // `GetField`) and member calls (`this.method()` →
-            // `CallMember`) resolve through the bound receiver
-            // reg rather than failing as free globals.
             let _ = lower_method(module, f, &c.name.name);
             let last_id = crate::FuncId((module.funcs.len() - 1) as u32);
             methods.push(last_id);
         }
     }
-    // Resolve declared supertypes to ClassIds when they're
-    // already in the module. Forward-referenced classes (declared
-    // later in the file) won't resolve here — the host's
-    // tree-walker fallback handles those via the runtime class
-    // table.
     let supertypes: Vec<crate::ClassId> = c
         .supertypes
         .iter()
         .filter_map(|t| module.class_id(&t.name.name))
         .collect();
-    let class = crate::Class {
-        id: crate::ClassId(0), // set by add_class
-        name: c.name.name.clone(),
-        fqn: c.name.name.clone(),
-        primary_params,
-        methods,
-        init_block: None,
-        companion: None,
-        supertypes,
-    };
-    module.add_class(class)
+    // Patch the registered class with its now-known method list
+    // and resolved supertypes.
+    if let Some(slot) = module.classes.get_mut(class_id.0 as usize) {
+        slot.methods = methods;
+        slot.supertypes = supertypes;
+    }
+    class_id
 }
 
 /// Lower one AST function into an IR Func. The function body is
