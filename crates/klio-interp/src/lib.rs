@@ -11929,6 +11929,31 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     }
                 }
             }
+            // Data-class auto-generated `toString()`: only fire
+            // when the class hasn't overridden it with a user-
+            // declared body (otherwise the IR-native method
+            // dispatch path above would have taken over).
+            if args.is_empty() && name == "toString" {
+                let i = inst.borrow();
+                if i.class.is_data
+                    && !i.class.methods.iter().any(|m| m.name == "toString")
+                {
+                    let mut s = String::new();
+                    s.push_str(&i.class.name);
+                    s.push('(');
+                    for (idx, p) in i.class.primary_params.iter().enumerate() {
+                        if idx > 0 {
+                            s.push_str(", ");
+                        }
+                        s.push_str(&p.name);
+                        s.push('=');
+                        let v = i.get(&p.name).unwrap_or(klio_runtime::Value::Null);
+                        s.push_str(&format!("{}", v));
+                    }
+                    s.push(')');
+                    return Ok(klio_runtime::Value::String(std::rc::Rc::new(s)));
+                }
+            }
         }
         if let klio_runtime::Value::Instance(inst) = receiver {
             // Walk the runtime class chain looking for an IR-lowered
