@@ -431,12 +431,15 @@ fn lower_function_body_with_implicit(
 /// Lower a method body with `this` bound as the implicit first
 /// parameter. Used by `lower_class` so method bodies' references
 /// to `this`, `this.x`, etc. resolve correctly in the IR.
+/// Unlike `lower_function`, this does NOT register the func in
+/// `func_index` — method names live in the class's method table,
+/// not the top-level fn namespace, so a top-level Path-callee
+/// lookup must not surface a class method.
 pub fn lower_method(module: &mut crate::Module, f: &klio_ast::Function) -> crate::Func {
     let func = lower_function_body_with_implicit(module, f, &["this"]);
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
     placed.id = id;
-    module.func_index.push((f.name.name.clone(), id));
     module.funcs.push(placed.clone());
     placed
 }
@@ -707,6 +710,24 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     b.bind(segments[0].name.clone(), dst);
                     return dst;
                 }
+                // Inside a method / extension fn body `this` is
+                // bound as the implicit first param. An unqualified
+                // identifier that didn't resolve as a local /
+                // capture / known outer is most likely a field
+                // read on the instance — try `this.<name>` via
+                // GetField before falling through to LoadGlobal.
+                // (Method calls on `this` are handled separately
+                // at the Call match arm so they emit CallMember.)
+                if let Some(this_reg) = b.resolve("this") {
+                    let dst = b.alloc_reg();
+                    let nm = b.module.intern_const(Const::String(segments[0].name.clone()));
+                    b.push(Inst::GetField {
+                        dst,
+                        receiver: this_reg,
+                        field: nm,
+                    });
+                    return dst;
+                }
                 // Not a local and not a known capture — emit
                 // LoadGlobal so the host resolves against the
                 // interpreter's globals env.
@@ -772,6 +793,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             let dst = b.alloc_reg();
                             b.push(Inst::LoadCapture { dst, idx });
                             b.bind(ident.name.clone(), dst);
+                            dst
+                        } else if let Some(this_reg) = b.resolve("this") {
+                            // Inside a method body, unqualified
+                            // `$name` resolves through `this.name`.
+                            let dst = b.alloc_reg();
+                            let nm = b.module.intern_const(Const::String(ident.name.clone()));
+                            b.push(Inst::GetField { dst, receiver: this_reg, field: nm });
                             dst
                         } else {
                             let dst = b.alloc_reg();
@@ -1120,6 +1148,36 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         b.push(Inst::NewInstance {
                             dst,
                             class: class_id,
+                            args: args_start,
+                            n_args: count,
+                            arg_names,
+                        });
+                        return dst;
+                    }
+                }
+            }
+            // Inside a method/extension body: unqualified `name(...)`
+            // that didn't match a local / top-level fn / class is
+            // most likely a method call on `this`. Emit
+            // `this.name(args)` via CallMember so the receiver's
+            // class dispatch (including IR-native FuncId lookup)
+            // fires.
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1
+                    && b.resolve(&segments[0].name).is_none()
+                    && !b.knows_outer(&segments[0].name)
+                {
+                    if let Some(this_reg) = b.resolve("this") {
+                        let (args_start, count) = lower_arg_run(b, args);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let dst = b.alloc_reg();
+                        let nm = b
+                            .module
+                            .intern_const(Const::String(segments[0].name.clone()));
+                        b.push(Inst::CallMember {
+                            dst,
+                            receiver: this_reg,
+                            name: nm,
                             args: args_start,
                             n_args: count,
                             arg_names,
