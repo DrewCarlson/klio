@@ -146,6 +146,14 @@ pub enum Inst {
     },
     /// Build a `List` from a range of registers.
     NewList { dst: Reg, args: Reg, n_args: u8 },
+    /// `::name` — produce a `KProperty`-shaped reference value
+    /// carrying the property name. Reflection target.
+    PropertyRef { dst: Reg, name: ConstId },
+    /// `Receiver::name` — bind a callable reference to the
+    /// receiver value. The host resolves the right shape
+    /// (BoundMethod, intrinsic, PropertyRef) from the receiver's
+    /// class table.
+    MemberRef { dst: Reg, receiver: Reg, name: ConstId },
     /// Binary primitive operation. Operands are guaranteed to be
     /// the right type by typeck.
     BinOp { dst: Reg, op: BinOp, lhs: Reg, rhs: Reg },

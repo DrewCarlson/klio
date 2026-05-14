@@ -11801,6 +11801,27 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         })
     }
 
+    fn member_ref(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        use klio_ast::{Expr, Ident};
+        use klio_span::{FileId, Span};
+        let dummy_span = Span::new(FileId(0), 0, 0);
+        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.interp.globals))));
+        env.borrow_mut().define("__ir_self".to_string(), receiver.clone());
+        let expr = Expr::MemberRef {
+            receiver: Box::new(Expr::Path {
+                segments: vec![Ident { name: "__ir_self".into(), span: dummy_span }],
+                span: dummy_span,
+            }),
+            name: Ident { name: name.to_string(), span: dummy_span },
+            span: dummy_span,
+        };
+        self.interp.eval_expr(&expr, &env, self.out).map_err(ir_err)
+    }
+
     fn build_closure(
         &mut self,
         module: &klio_ir::Module,

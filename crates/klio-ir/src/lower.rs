@@ -1314,9 +1314,20 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             }
             _ => lower_expr(b, inner),
         },
-        Expr::PropertyRef { .. }
-        | Expr::MemberRef { .. }
-        | Expr::Spread { .. }
+        Expr::PropertyRef { name, .. } => {
+            let dst = b.alloc_reg();
+            let nm = b.module.intern_const(Const::String(name.name.clone()));
+            b.push(Inst::PropertyRef { dst, name: nm });
+            dst
+        }
+        Expr::MemberRef { receiver, name, .. } => {
+            let recv = lower_expr(b, receiver);
+            let dst = b.alloc_reg();
+            let nm = b.module.intern_const(Const::String(name.name.clone()));
+            b.push(Inst::MemberRef { dst, receiver: recv, name: nm });
+            dst
+        }
+        Expr::Spread { .. }
         | Expr::ObjectExpr { .. } => {
             // Anonymous-object expressions (`object { … }` /
             // `object : Foo { … }`) carry rich AST shape (a body of

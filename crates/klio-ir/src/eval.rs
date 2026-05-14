@@ -197,6 +197,17 @@ pub trait Host {
     /// module; concrete hosts build a `Value::Lambda` (or
     /// equivalent) wrapping the body + env so it can be invoked
     /// through `call_value`.
+    /// Resolve `receiver::name` to a callable reference value.
+    /// Concrete hosts dispatch through the receiver's class table
+    /// to produce a `BoundMethod` / intrinsic / property-ref shape.
+    fn member_ref(
+        &mut self,
+        _receiver: &Value,
+        _name: &str,
+    ) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::member_ref"))
+    }
+
     fn build_closure(
         &mut self,
         _module: &Module,
@@ -752,6 +763,25 @@ fn exec_inst(
                     enum_class: None,
                 },
             );
+        }
+        Inst::PropertyRef { dst, name } => {
+            let name_str = match &frame.module.consts[name.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type("PropertyRef: name not a string const".into())),
+            };
+            frame.write(
+                *dst,
+                Value::PropertyRef { name: std::rc::Rc::new(name_str) },
+            );
+        }
+        Inst::MemberRef { dst, receiver, name } => {
+            let recv = frame.read(*receiver);
+            let name_str = match &frame.module.consts[name.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type("MemberRef: name not a string const".into())),
+            };
+            let v = host.member_ref(&recv, &name_str)?;
+            frame.write(*dst, v);
         }
     }
     Ok(())
