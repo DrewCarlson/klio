@@ -11242,6 +11242,15 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         args: &[klio_runtime::Value],
         arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Sentinel ClassId from eval-side `!!` lowering — construct a
+        // NullPointerException via the tree walker so catch arms see
+        // a real Throwable instance.
+        if class.0 == u32::MAX {
+            return self
+                .interp
+                .construct_by_name("NullPointerException", args, self.out)
+                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+        }
         let name = self
             .class_names
             .get(class.0 as usize)

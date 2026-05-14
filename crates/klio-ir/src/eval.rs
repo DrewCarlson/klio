@@ -275,8 +275,40 @@ pub fn eval_with_captures(
         if !catches.is_empty() || finally.is_some() {
             try_stack.push((cur, catches, finally));
         }
+        let mut thrown: Option<Value> = None;
         for inst in &insts {
-            exec_inst(&mut frame, inst, host)?;
+            match exec_inst(&mut frame, inst, host) {
+                Ok(()) => {}
+                Err(EvalError::Throw(v)) => { thrown = Some(v); break; }
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(exc) = thrown {
+            // Mid-block throw — same try-stack walk as Terminator::Throw.
+            let mut routed = false;
+            while let Some((_blk, hcatches, hfinally)) = try_stack.pop() {
+                if let Some(h) = hcatches.iter().find(|h| host.instance_of(
+                    &exc,
+                    &TypeRef {
+                        name: h.type_name.clone(),
+                        nullable: false,
+                        args: Vec::new(),
+                    },
+                )) {
+                    frame.write(h.exception_reg, exc.clone());
+                    cur = h.handler;
+                    routed = true;
+                    break;
+                } else if let Some(fin) = hfinally {
+                    cur = fin;
+                    routed = true;
+                    break;
+                }
+            }
+            if !routed {
+                return Err(EvalError::Throw(exc));
+            }
+            continue;
         }
         match term {
             Terminator::Goto(next) => cur = next,
@@ -424,7 +456,12 @@ fn exec_inst(
         Inst::NotNullAssert { dst, src } => {
             let v = frame.read(*src);
             if matches!(v, Value::Null) {
-                return Err(EvalError::Type("null-pointer assertion failed".into()));
+                let exc = Value::Exception {
+                    fqn: std::rc::Rc::new("kotlin.NullPointerException".into()),
+                    message: None,
+                    cause: None,
+                };
+                return Err(EvalError::Throw(exc));
             }
             frame.write(*dst, v);
         }

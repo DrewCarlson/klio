@@ -691,6 +691,42 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             }
             _ => lower_expr(b, inner),
         },
+        Expr::AnonFun { params, body, .. } => {
+            // Lower an anonymous function the same way as a lambda:
+            // synthesise an AstLambda with the body packed into a
+            // `Block`. `fun (x): T = expr` carries `FunctionBody::Expr`
+            // — wrap that as a single-statement block whose last
+            // expression is the return value.
+            let body_block: klio_ast::Block = match body.as_deref() {
+                Some(klio_ast::FunctionBody::Block(blk)) => blk.clone(),
+                Some(klio_ast::FunctionBody::Expr(e)) => klio_ast::Block {
+                    stmts: vec![klio_ast::Stmt::Expr(e.clone())],
+                    span: expr_span(expr),
+                },
+                None => klio_ast::Block { stmts: Vec::new(), span: expr_span(expr) },
+            };
+            let param_names: Vec<String> =
+                params.iter().map(|p| p.name.name.clone()).collect();
+            let param_idents: Vec<klio_ast::Ident> =
+                params.iter().map(|p| p.name.clone()).collect();
+            let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let (_body_func, captured_names) = lower_lambda_body_capturing(
+                b.module, &param_idents, &body_block, outer_names,
+            );
+            let captures: Vec<Reg> = captured_names
+                .iter()
+                .filter_map(|n| b.resolve(n))
+                .collect();
+            let dst = b.alloc_reg();
+            b.push(Inst::AstLambda {
+                dst,
+                params: param_names,
+                body_ast: body_block,
+                captures,
+                captured_names,
+            });
+            dst
+        }
         _ => {
             // Remaining expression forms not yet lowered. Emit a
             // placeholder Trace so the gap is visible in printouts
@@ -998,15 +1034,20 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                 Some(e) => lower_expr(b, e),
                 None => b.emit_const(Const::Unit),
             };
-            if p.mutable {
-                // Allocate a permanent home reg and Move the init
-                // value into it. Reads bind to the home reg so
-                // later writes (compound assign, postfix inc/dec)
-                // can Move new values into the same slot.
+            // Allocate a "home" register and Move the init value
+            // into it for `var`, or for `val` declared without an
+            // initializer (deferred init — multiple branches assign
+            // before the first read). This gives reads through the
+            // home reg slot semantics under the flat block IR.
+            // For a `val foo = expr` the binding is fixed at decl
+            // time and can skip the slot.
+            if p.mutable || p.init.is_none() {
                 let home = b.alloc_reg();
                 b.push(Inst::Move { dst: home, src: init });
                 b.set_mutable_home(&p.name.name, home);
-                b.mark_mutable(&p.name.name);
+                if p.mutable {
+                    b.mark_mutable(&p.name.name);
+                }
                 b.bind(p.name.name.clone(), home);
             } else {
                 b.bind(p.name.name.clone(), init);
