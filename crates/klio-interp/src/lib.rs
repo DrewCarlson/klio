@@ -374,6 +374,19 @@ impl Interpreter {
         overloads.iter().any(|(f, _)| f.params.iter().any(|p| p.is_vararg))
     }
 
+    /// True when any registered top-level overload for `name`
+    /// declares a parameter with a default value. The IR's
+    /// `Func.params[…].default` field isn't populated yet, so call
+    /// sites consult the AST overload table instead.
+    pub fn has_top_level_default(&self, name: &str) -> bool {
+        let Some(overloads) = self.top_level_overloads.get(name) else {
+            return false;
+        };
+        overloads
+            .iter()
+            .any(|(f, _)| f.params.iter().any(|p| p.default.is_some()))
+    }
+
     /// Re-enter the IR evaluator against a stashed closure with a
     /// full IrHost so member calls / new-instance / etc. work.
     /// Looked up by invoke_callable_value when it encounters a
@@ -11510,7 +11523,8 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // still benefit from the IR's tight loop.
         let name = f.name.clone();
         let has_names = arg_names.iter().any(|n| n.is_some());
-        let has_defaults = f.params.iter().any(|p| p.default.is_some());
+        let has_defaults = f.params.iter().any(|p| p.default.is_some())
+            || self.interp.has_top_level_default(&name);
         let has_overloads = self.interp.has_top_level_overloads(&name);
         let has_vararg = self.interp.has_top_level_vararg(&name);
         if has_names || has_defaults || has_overloads || has_vararg || arg_names.len() == args.len() && args.len() < f.params.len() {

@@ -212,6 +212,31 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         Expr::CharLit { value, .. } => b.emit_const(Const::Char(*value)),
 
         Expr::Binary { op, lhs, rhs, .. } => {
+            // `x in haystack` / `x !in haystack` desugar to
+            // `haystack.contains(x)` (negated for !in). The right
+            // operand is the haystack so dispatch through CallMember.
+            if matches!(op, AstBinOp::In | AstBinOp::NotIn) {
+                let recv = lower_expr(b, rhs);
+                let arg_slot = b.alloc_reg();
+                let l = lower_expr(b, lhs);
+                b.push(Inst::Move { dst: arg_slot, src: l });
+                let contains = b.alloc_reg();
+                let nm = b.module.intern_const(Const::String("contains".into()));
+                b.push(Inst::CallMember {
+                    dst: contains,
+                    receiver: recv,
+                    name: nm,
+                    args: arg_slot,
+                    n_args: 1,
+                    arg_names: Vec::new(),
+                });
+                if matches!(op, AstBinOp::NotIn) {
+                    let dst = b.alloc_reg();
+                    b.push(Inst::Not { dst, src: contains });
+                    return dst;
+                }
+                return contains;
+            }
             let l = lower_expr(b, lhs);
             let r = lower_expr(b, rhs);
             let dst = b.alloc_reg();
@@ -798,8 +823,15 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     klio_ast::PostfixOp::Dec => UnOp::Dec,
                     _ => unreachable!(),
                 };
+                // Snapshot the old value into a fresh reg before
+                // mutating the storage slot — `c++` returns the
+                // pre-increment value, and for a `var` local `s` is
+                // the home reg, so a later Move into home would
+                // overwrite the value we want to return.
+                let old = b.alloc_reg();
+                b.push(Inst::Move { dst: old, src: s });
                 let new = b.alloc_reg();
-                b.push(Inst::UnOp { dst: new, op, operand: s });
+                b.push(Inst::UnOp { dst: new, op, operand: old });
                 if let Expr::Path { segments, .. } = inner.as_ref() {
                     if segments.len() == 1 {
                         if let Some(home) = b.mutable_home(&segments[0].name) {
@@ -809,7 +841,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         }
                     }
                 }
-                s
+                old
             }
         },
         Expr::Labeled { label, expr: inner, .. } => match inner.as_ref() {
