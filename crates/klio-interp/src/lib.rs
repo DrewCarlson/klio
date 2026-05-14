@@ -435,6 +435,19 @@ impl Interpreter {
             .any(|(f, _)| f.params.iter().any(|p| p.default.is_some()))
     }
 
+    /// True when any registered top-level overload declares a
+    /// `reified` type parameter. Reified types live in the tree
+    /// walker's call-site type_args path, so IR call sites route
+    /// the call through invoke_named_intrinsic when this fires.
+    pub fn has_top_level_reified(&self, name: &str) -> bool {
+        let Some(overloads) = self.top_level_overloads.get(name) else {
+            return false;
+        };
+        overloads
+            .iter()
+            .any(|(f, _)| f.type_params.iter().any(|p| p.is_reified))
+    }
+
     /// Re-enter the IR evaluator against a stashed closure with a
     /// full IrHost so member calls / new-instance / etc. work.
     /// Looked up by invoke_callable_value when it encounters a
@@ -6524,9 +6537,28 @@ impl Interpreter {
         class: &klio_ast::Class,
         out: &mut dyn Output,
     ) -> Result<(), RuntimeError> {
-        let env = Rc::clone(&self.globals);
+        self.register_class_decl_with_env(class, &[], Vec::new(), out)
+    }
+
+    pub fn register_class_decl_with_env(
+        &mut self,
+        class: &klio_ast::Class,
+        captured_names: &[String],
+        captures: Vec<klio_runtime::Value>,
+        out: &mut dyn Output,
+    ) -> Result<(), RuntimeError> {
+        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.globals))));
+        for (n, v) in captured_names.iter().zip(captures.iter()) {
+            env.borrow_mut().define(n.clone(), v.clone());
+        }
         let cls = self.build_class_shell(class, &env, out)?;
         self.class_table.insert(class.name.name.clone(), Rc::clone(&cls));
+        env.borrow_mut().define(
+            class.name.name.clone(),
+            klio_runtime::Value::Class(Rc::clone(&cls)),
+        );
+        // Also stash in globals so plain Path lookups (LoadGlobal)
+        // resolve the class.
         self.globals.borrow_mut().define(
             class.name.name.clone(),
             klio_runtime::Value::Class(Rc::clone(&cls)),
@@ -12046,6 +12078,17 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
     ) -> Result<(), klio_ir::eval::EvalError> {
         self.interp
             .register_class_decl(class, self.out)
+            .map_err(ir_err)
+    }
+
+    fn register_class_captured(
+        &mut self,
+        class: &klio_ast::Class,
+        captured_names: &[String],
+        captures: Vec<klio_runtime::Value>,
+    ) -> Result<(), klio_ir::eval::EvalError> {
+        self.interp
+            .register_class_decl_with_env(class, captured_names, captures, self.out)
             .map_err(ir_err)
     }
 

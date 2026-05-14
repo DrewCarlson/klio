@@ -154,6 +154,19 @@ pub trait Host {
         Err(EvalError::Unsupported("Host::register_class"))
     }
 
+    /// Register a local class declaration with captured outer
+    /// locals so the class methods can read names from the
+    /// enclosing function's scope. Default ignores captures and
+    /// routes to `register_class`.
+    fn register_class_captured(
+        &mut self,
+        class: &klio_ast::Class,
+        _captured_names: &[String],
+        _captures: Vec<Value>,
+    ) -> Result<(), EvalError> {
+        self.register_class(class)
+    }
+
     fn eval_ast(
         &mut self,
         _ast: &klio_ast::Expr,
@@ -614,8 +627,9 @@ fn exec_inst(
             let v = host.build_ast_lambda_with_flag(params, body_ast, captured_names, cap_values, *absorb_return)?;
             frame.write(*dst, v);
         }
-        Inst::RegisterClass { class } => {
-            host.register_class(class)?;
+        Inst::RegisterClass { class, captured_names, captures } => {
+            let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
+            host.register_class_captured(class, captured_names, cap_values)?;
         }
         Inst::EvalAst { dst, ast, captured_names, captures } => {
             let captured_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();

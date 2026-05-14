@@ -171,7 +171,13 @@ pub enum Inst {
     /// Register a class declaration encountered inside a function
     /// body. Local classes live for the duration of the call (the
     /// tree walker re-registers them on each entry).
-    RegisterClass { class: Box<klio_ast::Class> },
+    RegisterClass {
+        class: Box<klio_ast::Class>,
+        /// Capture-name slots so the class methods see the enclosing
+        /// function's locals (`val factor = 10; class Scaled { … n * factor … }`).
+        captured_names: Vec<String>,
+        captures: Vec<Reg>,
+    },
     EvalAst {
         dst: Reg,
         ast: Box<klio_ast::Expr>,

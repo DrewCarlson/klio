@@ -472,6 +472,27 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             });
             dst
         }
+        Expr::Call { type_args, .. } if !type_args.is_empty() => {
+            // Explicit type arguments (`foo<String>(x)`) propagate
+            // through the tree walker's call path so `reified T`
+            // resolves to the call-site type. Pure routing fallback —
+            // structural lowering can ignore type_args once reified
+            // params are gone.
+            let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let captured_names: Vec<String> = outer_names.iter().cloned().collect();
+            let captures: Vec<Reg> = captured_names
+                .iter()
+                .filter_map(|n| b.resolve(n))
+                .collect();
+            let dst = b.alloc_reg();
+            b.push(Inst::EvalAst {
+                dst,
+                ast: Box::new(expr.clone()),
+                captured_names,
+                captures,
+            });
+            dst
+        }
         Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. }
             if args.iter().any(|a| matches!(a, Expr::Spread { .. })) =>
         {
@@ -1499,11 +1520,20 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             None
         }
         Stmt::Decl(klio_ast::Decl::Class(c)) => {
-            // Local class declaration inside a function body. Emit a
-            // RegisterClass inst that hands the AST to the host so
-            // construct_by_name / NewInstance can find it during this
-            // call's execution.
-            b.push(Inst::RegisterClass { class: Box::new(c.clone()) });
+            // Local class declaration inside a function body. Capture
+            // the visible scope so the class methods can read names
+            // from the enclosing fn (`val factor = 10; class Scaled { … n * factor … }`).
+            let visible: std::collections::HashSet<String> = b.visible_names();
+            let captured_names: Vec<String> = visible.iter().cloned().collect();
+            let captures: Vec<Reg> = captured_names
+                .iter()
+                .filter_map(|n| b.resolve(n))
+                .collect();
+            b.push(Inst::RegisterClass {
+                class: Box::new(c.clone()),
+                captured_names,
+                captures,
+            });
             None
         }
         Stmt::Decl(_) | Stmt::DestructuringDecl { .. } => None,
