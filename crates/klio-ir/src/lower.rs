@@ -361,7 +361,16 @@ pub fn lower_function(module: &mut crate::Module, f: &klio_ast::Function) -> cra
 }
 
 fn lower_function_body(module: &mut crate::Module, f: &klio_ast::Function) -> crate::Func {
-    lower_function_body_with_implicit(module, f, &[])
+    // Extension functions (`fun T.foo(...)`) need `this` bound
+    // as the implicit first param so the body's references to
+    // `this` and `this.x` resolve through the receiver reg
+    // rather than as a free global. Plain top-level functions
+    // have no receiver, so no implicit params.
+    if f.receiver_type.is_some() {
+        lower_function_body_with_implicit(module, f, &["this"])
+    } else {
+        lower_function_body_with_implicit(module, f, &[])
+    }
 }
 
 /// Lower a function body, prepending implicit parameters (typically
