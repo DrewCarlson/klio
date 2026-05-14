@@ -12383,17 +12383,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 {
                     let mut s = String::new();
                     s.push_str(&i.class.name);
-                    s.push('(');
-                    for (idx, p) in i.class.primary_params.iter().enumerate() {
-                        if idx > 0 {
-                            s.push_str(", ");
+                    // `data object Foo` toString is just `Foo`
+                    // (no parens / fields). Regular data classes
+                    // format as `Foo(a=1, b=2)`.
+                    if !i.class.is_object {
+                        s.push('(');
+                        for (idx, p) in i.class.primary_params.iter().enumerate() {
+                            if idx > 0 {
+                                s.push_str(", ");
+                            }
+                            s.push_str(&p.name);
+                            s.push('=');
+                            let v = i.get(&p.name).unwrap_or(klio_runtime::Value::Null);
+                            s.push_str(&format!("{}", v));
                         }
-                        s.push_str(&p.name);
-                        s.push('=');
-                        let v = i.get(&p.name).unwrap_or(klio_runtime::Value::Null);
-                        s.push_str(&format!("{}", v));
+                        s.push(')');
                     }
-                    s.push(')');
                     return Ok(klio_runtime::Value::String(std::rc::Rc::new(s)));
                 }
             }
