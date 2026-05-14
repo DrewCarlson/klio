@@ -11929,6 +11929,40 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     }
                 }
             }
+            // Data-class auto-generated `equals(other)`: structural
+            // equality across the primary-ctor fields. Same class
+            // identity required; non-instance returns false.
+            if args.len() == 1 && name == "equals" {
+                let i = inst.borrow();
+                if i.class.is_data
+                    && !i.class.methods.iter().any(|m| m.name == "equals")
+                {
+                    let class_fqn = i.class.fqn.clone();
+                    let primary_names: Vec<String> = i
+                        .class
+                        .primary_params
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect();
+                    drop(i);
+                    let same = matches!(&args[0],
+                        klio_runtime::Value::Instance(o) if o.borrow().class.fqn == class_fqn);
+                    if !same {
+                        return Ok(klio_runtime::Value::Bool(false));
+                    }
+                    let klio_runtime::Value::Instance(o) = &args[0] else { unreachable!() };
+                    let lhs = inst.borrow();
+                    let rhs = o.borrow();
+                    for name in &primary_names {
+                        let a = lhs.get(name).unwrap_or(klio_runtime::Value::Null);
+                        let b = rhs.get(name).unwrap_or(klio_runtime::Value::Null);
+                        if !klio_runtime::Value::structural_eq(&a, &b) {
+                            return Ok(klio_runtime::Value::Bool(false));
+                        }
+                    }
+                    return Ok(klio_runtime::Value::Bool(true));
+                }
+            }
             // Data-class auto-generated `toString()`: only fire
             // when the class hasn't overridden it with a user-
             // declared body (otherwise the IR-native method
