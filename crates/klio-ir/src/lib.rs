@@ -167,6 +167,19 @@ pub enum Inst {
         body_func: FuncId,
         captures: Vec<Reg>,
     },
+    /// Construct a `Value::Lambda` directly from a stashed AST
+    /// `Block` plus a snapshot of captured registers indexed by
+    /// name. Used so tree-walker-style dispatch paths (`repeat`,
+    /// `let`, `with`, `Result.map`, …) that pattern-match on
+    /// `Value::Lambda` can call IR-lowered lambdas without each
+    /// site needing a separate IrClosure branch.
+    AstLambda {
+        dst: Reg,
+        params: Vec<String>,
+        body_ast: klio_ast::Block,
+        captures: Vec<Reg>,
+        captured_names: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

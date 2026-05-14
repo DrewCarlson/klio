@@ -510,23 +510,38 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             result
         }
         Expr::Lambda { params, body, .. } => {
-            // Snapshot the names visible to the enclosing builder
-            // so the lambda lowering can flag free references as
-            // captures.
+            // Lower a Kotlin lambda to a tree-walker-compatible
+            // Value::Lambda by emitting Inst::AstLambda. The host
+            // (klio-interp's IrHost) populates the captured env
+            // from the snapshotted reg values + names — letting
+            // existing dispatch paths (call_lambda, invoke_lambda)
+            // call IR-lowered lambdas without each pattern-match
+            // site adding a separate IrClosure branch.
+            //
+            // Free-variable analysis: collect every local name
+            // visible in the enclosing scope, then walk the
+            // lambda body via lower_lambda_body_capturing's
+            // FuncBuilder to discover which ones get referenced.
+            // Names not bound in the outer scope (top-level fns /
+            // stdlib intrinsics) fall through to the tree walker's
+            // global lookup at call time.
             let outer_names: std::collections::HashSet<String> = b.visible_names();
-            let (body_func, captured_names) =
+            let (_body_func, captured_names) =
                 lower_lambda_body_capturing(b.module, params, body, outer_names);
-            // Resolve each captured name back to the *outer* reg.
-            // Names that the outer builder doesn't have locally
-            // bound (top-level globals, intrinsics) are dropped
-            // from the capture list — the lambda body will load
-            // them via LoadGlobal at call time.
             let captures: Vec<Reg> = captured_names
                 .iter()
                 .filter_map(|n| b.resolve(n))
                 .collect();
+            let param_names: Vec<String> =
+                params.iter().map(|p| p.name.clone()).collect();
             let dst = b.alloc_reg();
-            b.push(Inst::Lambda { dst, body_func, captures });
+            b.push(Inst::AstLambda {
+                dst,
+                params: param_names,
+                body_ast: body.clone(),
+                captures,
+                captured_names,
+            });
             dst
         }
         Expr::Break { label, .. } => {
@@ -638,6 +653,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
     }
 }
 
+#[allow(dead_code)]
 fn lower_lambda_body(
     module: &mut crate::Module,
     params: &[klio_ast::Ident],

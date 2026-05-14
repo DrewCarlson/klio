@@ -10940,6 +10940,45 @@ fn lookup_nested_class(cls: &Rc<ClassDef>, name: &str) -> Option<Rc<ClassDef>> {
     None
 }
 
+/// Materialise a `Value::Range` into a flat Vec the IR's
+/// iterator protocol can drive.
+fn materialise_range_items(
+    start: i64,
+    end: i64,
+    step: i64,
+    kind: klio_runtime::RangeKind,
+) -> Vec<klio_runtime::Value> {
+    use klio_runtime::{RangeKind, Value};
+    let mut out: Vec<Value> = Vec::new();
+    let mut cur = start;
+    if step > 0 {
+        while cur <= end {
+            match kind {
+                RangeKind::Int => out.push(Value::new_int(cur)),
+                RangeKind::Long => out.push(Value::Long(cur)),
+                RangeKind::Char => out.push(Value::Char(cur as u8 as char)),
+            }
+            cur = cur.saturating_add(step);
+            if cur > end && step > 0 {
+                break;
+            }
+        }
+    } else if step < 0 {
+        while cur >= end {
+            match kind {
+                RangeKind::Int => out.push(Value::new_int(cur)),
+                RangeKind::Long => out.push(Value::Long(cur)),
+                RangeKind::Char => out.push(Value::Char(cur as u8 as char)),
+            }
+            cur = cur.saturating_add(step);
+            if cur < end {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Sentinel `StdlibFn` for IR coroutine intrinsics — never invoked
 /// directly because `IrHost::call_value` intercepts the matching
 /// FQN before falling through to the function pointer.
@@ -11075,7 +11114,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             | "takeIf" | "takeUnless" | "require" | "check"
             | "requireNotNull" | "checkNotNull" | "error" | "TODO"
             | "listOf" | "mutableListOf" | "arrayOf" | "setOf"
-            | "mapOf" | "mutableMapOf" | "mutableSetOf" => {
+            | "mapOf" | "mutableMapOf" | "mutableSetOf"
+            // Built-in array constructors (one-arg + init-lambda forms).
+            | "IntArray" | "LongArray" | "ShortArray" | "ByteArray"
+            | "DoubleArray" | "FloatArray" | "BooleanArray" | "CharArray"
+            | "UIntArray" | "ULongArray" | "UShortArray" | "UByteArray"
+            | "Array"
+            // Pair / Triple / `to` infix
+            | "Pair" | "Triple" | "to"
+            // Sequence builders + common range helpers
+            | "sequenceOf" | "sequence" | "emptyList" | "emptyMap" | "emptySet"
+            | "lazyOf" | "lazy" | "buildList" | "buildSet" | "buildMap" | "buildString"
+            | "println" | "print" | "readLine"
+            | "minOf" | "maxOf" | "abs"
+            | "synchronized"
+            | "tailrec"
+            | "objects" => {
                 let leaked: &'static str =
                     Box::leak(format!("__klio_intrinsic_name:{name}").into_boxed_str());
                 Some(klio_runtime::Value::Intrinsic {
@@ -11249,6 +11303,29 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
     }
 
+    fn build_ast_lambda(
+        &mut self,
+        params: &[String],
+        body: &klio_ast::Block,
+        captured_names: &[String],
+        captures: Vec<klio_runtime::Value>,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Materialise a Value::Lambda whose captured env contains
+        // the names → values snapshot. The tree walker's
+        // call_lambda path then dispatches the body exactly like
+        // any other lambda.
+        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.interp.globals))));
+        for (name, value) in captured_names.iter().zip(captures.iter()) {
+            env.borrow_mut().define(name.clone(), value.clone());
+        }
+        Ok(klio_runtime::Value::Lambda {
+            params: Rc::new(params.to_vec()),
+            body: Rc::new(body.clone()),
+            env,
+            absorb_return: false,
+        })
+    }
+
     fn build_closure(
         &mut self,
         module: &klio_ir::Module,
@@ -11309,6 +11386,76 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Iterator-protocol primitives for ranges, arrays, lists,
+        // maps and sets. The tree walker's `for-in` is special-
+        // cased in eval_call; the IR lowers For to explicit
+        // iterator/hasNext/next CallMember insts so the same dispatch
+        // applies. Implement the protocol here so the IR-side
+        // for-loop runs against built-in collection shapes without
+        // each shape needing its own member-method registration.
+        match (receiver, name) {
+            (klio_runtime::Value::Range { start, end, step, kind }, "iterator") => {
+                let items: Vec<klio_runtime::Value> =
+                    materialise_range_items(*start, *end, *step, *kind);
+                return Ok(klio_runtime::Value::Iterator {
+                    items: std::rc::Rc::new(std::cell::RefCell::new(items)),
+                    pos: std::rc::Rc::new(std::cell::RefCell::new(0)),
+                    prim: None,
+                });
+            }
+            (klio_runtime::Value::List { items, .. }, "iterator") => {
+                return Ok(klio_runtime::Value::Iterator {
+                    items: std::rc::Rc::clone(items),
+                    pos: std::rc::Rc::new(std::cell::RefCell::new(0)),
+                    prim: None,
+                });
+            }
+            (klio_runtime::Value::Array { items, prim }, "iterator") => {
+                return Ok(klio_runtime::Value::Iterator {
+                    items: std::rc::Rc::clone(items),
+                    pos: std::rc::Rc::new(std::cell::RefCell::new(0)),
+                    prim: *prim,
+                });
+            }
+            (klio_runtime::Value::Iterator { items, pos, .. }, "hasNext") => {
+                let has = *pos.borrow() < items.borrow().len();
+                return Ok(klio_runtime::Value::Bool(has));
+            }
+            (klio_runtime::Value::Iterator { items, pos, .. }, "next") => {
+                let i = *pos.borrow();
+                *pos.borrow_mut() = i + 1;
+                let v = items.borrow().get(i).cloned().unwrap_or(klio_runtime::Value::Unit);
+                return Ok(v);
+            }
+            (klio_runtime::Value::Array { items, .. }, "get") if args.len() == 1 => {
+                let i = args[0].as_i64().unwrap_or(0) as usize;
+                let v = items.borrow().get(i).cloned().unwrap_or(klio_runtime::Value::Unit);
+                return Ok(v);
+            }
+            (klio_runtime::Value::List { items, .. }, "get") if args.len() == 1 => {
+                let i = args[0].as_i64().unwrap_or(0) as usize;
+                let v = items.borrow().get(i).cloned().unwrap_or(klio_runtime::Value::Unit);
+                return Ok(v);
+            }
+            (klio_runtime::Value::Array { items, .. }, "set") if args.len() == 2 => {
+                let i = args[0].as_i64().unwrap_or(0) as usize;
+                let mut v = items.borrow_mut();
+                while v.len() <= i { v.push(klio_runtime::Value::Unit); }
+                v[i] = args[1].clone();
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::List { items, .. }, "set") if args.len() == 2 => {
+                let i = args[0].as_i64().unwrap_or(0) as usize;
+                let mut v = items.borrow_mut();
+                while v.len() <= i { v.push(klio_runtime::Value::Unit); }
+                v[i] = args[1].clone();
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::Array { items, .. }, "size") | (klio_runtime::Value::List { items, .. }, "size") => {
+                return Ok(klio_runtime::Value::new_int(items.borrow().len() as i64));
+            }
+            _ => {}
+        }
         if let klio_runtime::Value::Instance(inst) = receiver {
             // Pack-installed binding override takes precedence over
             // the shim's default Kotlin body. Matches the tree

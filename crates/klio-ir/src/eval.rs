@@ -120,6 +120,20 @@ pub trait Host {
         Err(EvalError::Unsupported("Host::build_closure"))
     }
 
+    /// Build a `Value::Lambda`-compatible closure straight from an
+    /// AST block. Concrete hosts populate the captured env from
+    /// `captures` and produce a Value the tree walker's lambda
+    /// dispatch (call_lambda etc.) can consume directly.
+    fn build_ast_lambda(
+        &mut self,
+        _params: &[String],
+        _body: &klio_ast::Block,
+        _captured_names: &[String],
+        _captures: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::build_ast_lambda"))
+    }
+
     /// Resolve a function call by FuncId. The default routes
     /// through `eval()` recursively, so a single-module IR program
     /// stays self-contained.
@@ -474,6 +488,11 @@ fn exec_inst(
         Inst::Lambda { dst, body_func, captures } => {
             let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
             let v = host.build_closure(frame.module, *body_func, cap_values)?;
+            frame.write(*dst, v);
+        }
+        Inst::AstLambda { dst, params, body_ast, captures, captured_names } => {
+            let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
+            let v = host.build_ast_lambda(params, body_ast, captured_names, cap_values)?;
             frame.write(*dst, v);
         }
         Inst::LoadGlobal { dst, name } => {
