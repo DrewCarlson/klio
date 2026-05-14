@@ -93,6 +93,24 @@ impl<'a> FuncBuilder<'a> {
         None
     }
 
+    /// Snapshot every register currently bound in any live scope.
+    /// Used by lambda lowering to record the closure environment
+    /// at construction time.
+    #[must_use]
+    pub fn captured_regs(&self) -> Vec<Reg> {
+        let mut out: Vec<Reg> = Vec::new();
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for frame in &self.scopes {
+            for (_, r) in frame {
+                if seen.insert(r.0) {
+                    out.push(*r);
+                }
+            }
+        }
+        out.sort_by_key(|r| r.0);
+        out
+    }
+
     /// Push a fresh scope (`{` opens a block, lambdas open their
     /// own scope, etc.).
     pub fn push_scope(&mut self) {

@@ -120,6 +120,15 @@ pub enum Inst {
     NotNullAssert { dst: Reg, src: Reg },
     /// Marker for the evaluator's debugger / tracing hook.
     Trace { span: Span },
+    /// Materialise a lambda value capturing the current scope's
+    /// registers. The captures are listed as a `Vec<Reg>`; the
+    /// evaluator snapshots the live values into a closure env.
+    /// `body_func` is the lambda body lowered as a separate Func.
+    Lambda {
+        dst: Reg,
+        body_func: FuncId,
+        captures: Vec<Reg>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

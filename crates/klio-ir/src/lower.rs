@@ -279,6 +279,34 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         Expr::When { subject, branches, .. } => {
             lower_when(b, subject.as_deref(), branches, expr_span(expr))
         }
+        Expr::Try { body, catches, finally, .. } => {
+            // The IR does not yet carry explicit exception edges,
+            // so today this lowers as straight-line execution of
+            // the body. Catches and finally branches are still
+            // lowered for completeness — the evaluator's Throw
+            // terminator will leak past them until exception edges
+            // land. Tracking item: slice 4d in REFINEMENTS.md.
+            let r = lower_block(b, body);
+            for c in catches {
+                let _ = lower_block(b, &c.body);
+            }
+            if let Some(f) = finally {
+                let _ = lower_block(b, f);
+            }
+            r
+        }
+        Expr::Lambda { params, body, .. } => {
+            // Lower the lambda body as its own Func added to the
+            // enclosing module. The Lambda inst at the call site
+            // carries the produced FuncId plus the captured-reg
+            // list; the evaluator snapshots the values at the
+            // capture site.
+            let captures: Vec<Reg> = b.captured_regs();
+            let body_func = lower_lambda_body(b.module, params, body);
+            let dst = b.alloc_reg();
+            b.push(Inst::Lambda { dst, body_func, captures });
+            dst
+        }
         Expr::Break { label, .. } => {
             if let Some(frame) = b.loop_for(label.as_ref().map(|i| i.name.as_str())).cloned() {
                 b.terminate(Terminator::Goto(frame.break_target));
@@ -386,6 +414,24 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.emit_const(Const::Unit)
         }
     }
+}
+
+fn lower_lambda_body(
+    module: &mut crate::Module,
+    params: &[klio_ast::Ident],
+    body: &klio_ast::Block,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+    bind_params(&mut b, &names);
+    let result = lower_block(&mut b, body);
+    b.terminate(Terminator::Return(Some(result)));
+    let func = b.finish("<lambda>", "<lambda>", crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
 }
 
 fn lower_for(
