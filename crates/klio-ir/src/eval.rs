@@ -176,6 +176,22 @@ pub trait Host {
         Err(EvalError::Unsupported("Host::eval_ast"))
     }
 
+    /// Variant of `eval_ast` that also returns the post-eval value
+    /// of every captured name so the caller can write back any
+    /// mutations the AST performed on outer locals (closure-mutable
+    /// workaround). Default forwards to `eval_ast` and reports the
+    /// original capture snapshot as unchanged.
+    fn eval_ast_with_writeback(
+        &mut self,
+        ast: &klio_ast::Expr,
+        captured_names: &[String],
+        captures: Vec<Value>,
+    ) -> Result<(Value, Vec<Value>), EvalError> {
+        let snapshot = captures.clone();
+        let v = self.eval_ast(ast, captured_names, captures)?;
+        Ok((v, snapshot))
+    }
+
     /// Materialise a closure value capturing the supplied snapshot
     /// of register values. `body_func` is a FuncId in the active
     /// module; concrete hosts build a `Value::Lambda` (or
@@ -647,7 +663,13 @@ fn exec_inst(
         }
         Inst::EvalAst { dst, ast, captured_names, captures } => {
             let captured_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
-            let v = host.eval_ast(ast, captured_names, captured_values)?;
+            let (v, updated) = host.eval_ast_with_writeback(ast, captured_names, captured_values)?;
+            // Write back any mutations the AST performed on captured
+            // outer locals — closure-mutable shim for HOFs whose
+            // lambdas assign to enclosing-scope vars.
+            for (reg, value) in captures.iter().zip(updated.into_iter()) {
+                frame.write(*reg, value);
+            }
             frame.write(*dst, v);
         }
         Inst::StoreGlobal { name, value } => {
