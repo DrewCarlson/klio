@@ -923,6 +923,19 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                 }
             }
+            // `suspend { … }` builder — the `suspend` keyword in
+            // expression position is just a marker that the lambda
+            // is suspending. Lower the lambda as-is; the IR's
+            // existing lambda evaluator handles suspend bodies.
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1
+                    && segments[0].name == "suspend"
+                    && args.len() == 1
+                    && matches!(args[0], Expr::Lambda { .. })
+                {
+                    return lower_expr(b, &args[0]);
+                }
+            }
             // Path-callee with a registered top-level fn → Call{func}.
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
