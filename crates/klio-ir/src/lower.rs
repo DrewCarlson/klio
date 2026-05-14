@@ -2570,6 +2570,19 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                         let this_reg = b.resolve("this").unwrap();
                         let field = b.module.intern_const(Const::String(segments[0].name.clone()));
                         b.push(Inst::SetField { receiver: this_reg, field, value: combined });
+                    } else if b.knows_outer(&segments[0].name) {
+                        // Assign target is an outer-scope name
+                        // captured by this lambda. Record it as a
+                        // capture so the host's `build_ast_lambda`
+                        // pre-defines it in the env, then store
+                        // back via StoreGlobal which the tree
+                        // walker's eval_stmt routes through the
+                        // env chain. The enclosing call site's
+                        // `WritebackCaptures` syncs the value
+                        // back to the caller's reg.
+                        let _ = b.record_capture(&segments[0].name);
+                        let n = b.module.intern_const(Const::String(segments[0].name.clone()));
+                        b.push(Inst::StoreGlobal { name: n, value: combined });
                     } else {
                         // Top-level binding: route through StoreGlobal so
                         // the tree-walker setter / delegate fires.
