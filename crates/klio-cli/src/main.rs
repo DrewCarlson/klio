@@ -29,13 +29,12 @@ enum Cmd {
     /// invoked from whichever file declares it.
     Run {
         files: Vec<PathBuf>,
-        /// Route execution through the IR evaluator instead of the
-        /// tree walker. Today this covers a subset of Kotlin —
-        /// programs using class construction or features the IR
-        /// hasn't lowered yet fall through to runtime errors.
-        /// Parity work tracked in plans/REFINEMENTS.md.
-        #[arg(long = "ir-eval", default_value_t = false)]
-        ir_eval: bool,
+        /// Route execution through the legacy tree walker. The IR
+        /// evaluator is the default — pass `--tree-walker` only to
+        /// reproduce a regression or compare paths during the
+        /// post-cutover stabilisation window.
+        #[arg(long = "tree-walker", default_value_t = false)]
+        tree_walker: bool,
     },
     /// Type-check `.kt` files and emit diagnostics. Exit 1 on any error.
     Check {
@@ -187,13 +186,13 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Lex { file } => run_lex(&file),
         Cmd::Parse { file } => run_parse(&file),
-        Cmd::Run { files, ir_eval } => match files.as_slice() {
+        Cmd::Run { files, tree_walker } => match files.as_slice() {
             [] => {
                 eprintln!("usage: klio run <file.kt> [<file2.kt> ...]");
                 ExitCode::from(2)
             }
-            [single] if ir_eval => run_file_ir(single),
-            [single] => run_file(single),
+            [single] if tree_walker => run_file(single),
+            [single] => run_file_ir(single),
             many => run_module_files(many),
         },
         Cmd::Check { files, format } => run_check(&files, format),
