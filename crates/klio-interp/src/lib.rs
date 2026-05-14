@@ -11945,11 +11945,10 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // User class that implements a function type (e.g.
         // `class Adder : (Int) -> Int { override fun invoke(...) }`).
         // Kotlin calls the `invoke` member when the value is used as
-        // a callable.
-        if let klio_runtime::Value::Instance(inst) = callee {
-            if let Some((_m, _)) = inst.borrow().class.find_method("invoke") {
-                return self.call_member(callee, "invoke", args);
-            }
+        // a callable. Also routes through extension-fn dispatch so
+        // `operator fun Counter.invoke()` fires for `c()`.
+        if let klio_runtime::Value::Instance(_) = callee {
+            return self.call_member(callee, "invoke", args);
         }
         let names: Vec<Option<String>> = vec![None; args.len()];
         self.interp
