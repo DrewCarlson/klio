@@ -97,6 +97,11 @@ pub struct Interpreter {
     /// the child class's primary-ctor params in declaration order
     /// and returns the value for one parent ctor arg.
     class_parent_ctor_args: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    /// Per-class body-property initializer thunks. Keyed by
+    /// (class name, prop name) → FuncId of an N-arg thunk whose
+    /// params are the class's primary-ctor param names.
+    class_body_prop_inits:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// `@Retention` value declared on each annotation class (`SOURCE`,
     /// `BINARY`, or `RUNTIME`). Populated when an `annotation class`
     /// is registered. Drives whether the annotation surfaces through
@@ -338,6 +343,7 @@ impl Interpreter {
             instance_prop_setters: std::collections::HashMap::new(),
             class_init_blocks: std::collections::HashMap::new(),
             class_parent_ctor_args: std::collections::HashMap::new(),
+            class_body_prop_inits: std::collections::HashMap::new(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
@@ -1148,6 +1154,40 @@ impl Interpreter {
                     }
                     self.class_parent_ctor_args
                         .insert(c.name.name.clone(), fids);
+                }
+                // Body-property initializers: lower each `val x = e`
+                // declaration's `e` to an N-arg thunk parameterised
+                // on the class's primary-ctor param names so the
+                // fast-path can populate fields with arbitrary
+                // expressions (not just literals).
+                {
+                    let params_ref: Vec<&str> =
+                        primary_param_names.iter().map(|s| s.as_str()).collect();
+                    for m in &c.members {
+                        if let Decl::Property(p) = m {
+                            if p.receiver_type.is_some() {
+                                continue;
+                            }
+                            if p.getter.is_some()
+                                || p.setter.is_some()
+                                || p.delegate.is_some()
+                            {
+                                continue;
+                            }
+                            if let Some(init) = &p.init {
+                                let id = klio_ir::lower::lower_expr_as_param_thunk(
+                                    &mut module,
+                                    &params_ref,
+                                    init,
+                                    &format!("__init__{}.{}", c.name.name, p.name.name),
+                                );
+                                self.class_body_prop_inits.insert(
+                                    (c.name.name.clone(), p.name.name.clone()),
+                                    id,
+                                );
+                            }
+                        }
+                    }
                 }
                 // Init blocks: each `init { ... }` becomes its own
                 // 1-arg IR func taking `this`. The new_instance
@@ -14172,16 +14212,16 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 .map(|p| p.name.clone())
                 .collect();
             let body_props_ok = cls.body_properties.iter().all(|p| {
-                p.getter.is_none()
-                    && p.setter.is_none()
-                    && p.delegate.is_none()
-                    && p.init.as_ref().map_or(true, |e| {
-                        let e: &klio_ast::Expr = e;
-                        simple_literal_value(e).is_some()
-                            || matches!(e, klio_ast::Expr::Path { segments, .. }
-                                if segments.len() == 1
-                                    && primary_names.contains(&segments[0].name))
-                    })
+                if p.delegate.is_some() {
+                    return false;
+                }
+                // Accessors are handled by IR FuncIds elsewhere; the
+                // fast-path is fine with them present.
+                if p.init.is_none() {
+                    return true;
+                }
+                let key = (name.clone(), p.name.clone());
+                self.interp.class_body_prop_inits.contains_key(&key)
             });
             // Allow a parent class only when it's itself trivially
             // constructible — no primary params, no init blocks,
@@ -14254,31 +14294,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 for (p, v) in cls.primary_params.iter().zip(args.iter()) {
                     fields.push((p.name.clone(), v.clone()));
                 }
-                for p in &cls.body_properties {
-                    let v = match &p.init {
-                        Some(e) => {
-                            let e: &klio_ast::Expr = e;
-                            if let Some(lit) = simple_literal_value(e) {
-                                lit
-                            } else if let klio_ast::Expr::Path { segments, .. } = e {
-                                if segments.len() == 1 {
-                                    // Look up by name in already-bound fields
-                                    fields
-                                        .iter()
-                                        .find(|(n, _)| n == &segments[0].name)
-                                        .map(|(_, v)| v.clone())
-                                        .unwrap_or(klio_runtime::Value::Null)
-                                } else {
-                                    klio_runtime::Value::Null
-                                }
-                            } else {
-                                klio_runtime::Value::Null
-                            }
-                        }
-                        None => continue,
-                    };
-                    fields.push((p.name.clone(), v));
-                }
+                // Body-property fields are filled after instance
+                // allocation below — they may reference primary args
+                // via the lowered IR thunks.
                 let inst = std::rc::Rc::new(std::cell::RefCell::new(
                     klio_runtime::InstanceData {
                         class: std::rc::Rc::clone(&cls),
@@ -14290,6 +14308,27 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 ));
                 let inst_val = klio_runtime::Value::Instance(inst);
                 let module = std::rc::Rc::clone(&self.module);
+                // Body-property initializers run with the primary
+                // args bound under their declared names.
+                for p in &cls.body_properties {
+                    if p.init.is_none() {
+                        continue;
+                    }
+                    let key = (name.clone(), p.name.clone());
+                    let Some(fid) = self.interp.class_body_prop_inits.get(&key).copied() else {
+                        continue;
+                    };
+                    let func = module.funcs[fid.0 as usize].clone();
+                    let v = klio_ir::eval::eval_with(
+                        &module,
+                        &func,
+                        args.to_vec(),
+                        self,
+                    )?;
+                    if let klio_runtime::Value::Instance(inst_rc) = &inst_val {
+                        inst_rc.borrow_mut().define(p.name.clone(), v);
+                    }
+                }
                 // Populate parent primary-ctor fields from lowered
                 // parent-arg thunks (when the leaf class declared
                 // `: Parent(arg, arg, …)` and Parent has primary
