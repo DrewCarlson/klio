@@ -123,6 +123,30 @@ fn body_has_non_local_return(f: &klio_ast::Function) -> bool {
     }
 }
 
+/// True when `e` is `expr as Any` (or transitively wraps one through
+/// trivial parens / binding) — mirrors tree walker's
+/// `is_boxed_to_any_form` heuristic.
+fn is_any_typed_path(b: &FuncBuilder<'_>, e: &Expr) -> bool {
+    matches!(e, Expr::Path { segments, .. } if segments.len() == 1 && b.is_any_typed(&segments[0].name))
+}
+
+fn is_boxed_to_any_form(e: &Expr) -> bool {
+    fn is_any_name(name: &str) -> bool {
+        matches!(name, "Any")
+    }
+    match e {
+        Expr::As { ty, .. } => is_any_name(&ty.name.name),
+        Expr::Path { segments, .. } => {
+            // A var binding annotated `: Any` — handled at use site
+            // via expr_types in tree walker; the IR lowering can't
+            // see types here, so just be conservative.
+            let _ = segments;
+            false
+        }
+        _ => false,
+    }
+}
+
 fn lambda_writes_outer_var(b: &FuncBuilder<'_>, arg: &Expr) -> bool {
     let body = match arg {
         Expr::Lambda { body, .. } => body,
@@ -456,6 +480,32 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         Expr::NullLit { .. } => b.emit_const(Const::Null),
         Expr::CharLit { value, .. } => b.emit_const(Const::Char(*value)),
 
+        Expr::Binary { op, lhs, rhs, .. }
+            if matches!(op, AstBinOp::Eq | AstBinOp::Neq)
+                && (is_boxed_to_any_form(lhs)
+                    || is_boxed_to_any_form(rhs)
+                    || is_any_typed_path(b, lhs)
+                    || is_any_typed_path(b, rhs)) =>
+        {
+            // `==` on a boxed `Any` operand uses bitwise equality
+            // for Double/Float (NaN == NaN true, +0.0 != -0.0)
+            // per spec. Route through EvalAst to reuse the tree
+            // walker's typed-equality dispatch.
+            let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let captured_names: Vec<String> = outer_names.iter().cloned().collect();
+            let captures: Vec<Reg> = captured_names
+                .iter()
+                .filter_map(|n| b.resolve(n))
+                .collect();
+            let dst = b.alloc_reg();
+            b.push(Inst::EvalAst {
+                dst,
+                ast: Box::new(expr.clone()),
+                captured_names,
+                captures,
+            });
+            return dst;
+        }
         Expr::Binary { op, lhs, rhs, .. } => {
             // `x in haystack` / `x !in haystack` desugar to
             // `haystack.contains(x)` (negated for !in). The right
@@ -1925,6 +1975,13 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             // home reg slot semantics under the flat block IR.
             // For a `val foo = expr` the binding is fixed at decl
             // time and can skip the slot.
+            // Track `: Any` annotations so subsequent `==` against
+            // this var routes through the boxed-equality path.
+            if let Some(ty) = &p.ty {
+                if ty.name.name == "Any" {
+                    b.mark_any_typed(&p.name.name);
+                }
+            }
             if p.mutable || p.init.is_none() {
                 let home = b.alloc_reg();
                 b.push(Inst::Move { dst: home, src: init });

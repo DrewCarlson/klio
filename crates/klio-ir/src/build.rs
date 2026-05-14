@@ -46,6 +46,11 @@ pub struct FuncBuilder<'a> {
     /// rebind inside a loop body just leaves the body's reads
     /// pointing at the pre-loop register and loops never terminate.
     mutable_homes: std::collections::HashMap<String, Reg>,
+    /// Locals declared with an `: Any` (or other erased) type
+    /// annotation — used by the `==` lowering to detect a boxed
+    /// operand the same way the tree walker does, so
+    /// `(0.0 as Any) == (-0.0 as Any)` uses bitwise compare.
+    any_typed_locals: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,7 +81,17 @@ impl<'a> FuncBuilder<'a> {
             capture_regs: std::collections::HashMap::new(),
             mutables: std::collections::HashSet::new(),
             mutable_homes: std::collections::HashMap::new(),
+            any_typed_locals: std::collections::HashSet::new(),
         }
+    }
+
+    pub fn mark_any_typed(&mut self, name: &str) {
+        self.any_typed_locals.insert(name.to_string());
+    }
+
+    #[must_use]
+    pub fn is_any_typed(&self, name: &str) -> bool {
+        self.any_typed_locals.contains(name)
     }
 
     pub fn mark_mutable(&mut self, name: &str) {
