@@ -849,6 +849,26 @@ fn render_value(v: &Value) -> String {
     }
 }
 
+/// Lexicographic compare in UTF-16 code units to match Kotlin's
+/// `String.compareTo`. Surrogates above the BMP encode as two u16
+/// units and sort accordingly — `<` on `"😀"` vs `""` differs
+/// from a UTF-8 byte compare.
+fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ai = a.encode_utf16();
+    let mut bi = b.encode_utf16();
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => match x.cmp(&y) {
+                std::cmp::Ordering::Equal => continue,
+                o => return o,
+            },
+        }
+    }
+}
+
 fn arith_exc(msg: &str) -> EvalError {
     EvalError::Throw(Value::Exception {
         fqn: std::rc::Rc::new("kotlin.ArithmeticException".into()),
@@ -924,10 +944,18 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::LessEq, Double(a), Double(b)) => Ok(Bool(a <= b)),
         (BinOp::Greater, Double(a), Double(b)) => Ok(Bool(a > b)),
         (BinOp::GreaterEq, Double(a), Double(b)) => Ok(Bool(a >= b)),
-        (BinOp::Less, Value::String(a), Value::String(b)) => Ok(Bool(a.as_str() < b.as_str())),
-        (BinOp::LessEq, Value::String(a), Value::String(b)) => Ok(Bool(a.as_str() <= b.as_str())),
-        (BinOp::Greater, Value::String(a), Value::String(b)) => Ok(Bool(a.as_str() > b.as_str())),
-        (BinOp::GreaterEq, Value::String(a), Value::String(b)) => Ok(Bool(a.as_str() >= b.as_str())),
+        (BinOp::Less, Value::String(a), Value::String(b)) => {
+            Ok(Bool(utf16_cmp(a, b) == std::cmp::Ordering::Less))
+        }
+        (BinOp::LessEq, Value::String(a), Value::String(b)) => {
+            Ok(Bool(utf16_cmp(a, b) != std::cmp::Ordering::Greater))
+        }
+        (BinOp::Greater, Value::String(a), Value::String(b)) => {
+            Ok(Bool(utf16_cmp(a, b) == std::cmp::Ordering::Greater))
+        }
+        (BinOp::GreaterEq, Value::String(a), Value::String(b)) => {
+            Ok(Bool(utf16_cmp(a, b) != std::cmp::Ordering::Less))
+        }
         (BinOp::And, Bool(a), Bool(b)) => Ok(Bool(*a && *b)),
         (BinOp::Or, Bool(a), Bool(b)) => Ok(Bool(*a || *b)),
         (BinOp::RangeTo, Int(a), Int(b)) => Ok(Value::Range {
