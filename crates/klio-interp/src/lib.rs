@@ -11703,9 +11703,8 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         if arg_names.iter().any(|n| n.is_some()) {
-            // Named args that already match the IR method's
-            // declared param order need no reordering — drop the
-            // names and dispatch positionally.
+            // Reorder named args against the IR method's declared
+            // param order, then dispatch positionally.
             if let klio_runtime::Value::Instance(inst) = receiver {
                 let class_fqn = inst.borrow().class.fqn.clone();
                 let class_name = inst.borrow().class.name.clone();
@@ -11716,14 +11715,43 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     let module = std::rc::Rc::clone(&self.module);
                     let func = module.funcs[fid.0 as usize].clone();
                     if func.params.len() == args.len() + 1 {
-                        let in_order = arg_names.iter().enumerate().all(|(i, opt)| {
-                            opt.as_deref().map_or(true, |n| {
-                                // Skip the implicit `this` slot at 0.
-                                func.params.get(i + 1).map_or(false, |p| p.name == n)
-                            })
-                        });
-                        if in_order {
-                            return self.call_member(receiver, name, args);
+                        // Build a positional arg vec by walking
+                        // the method's declared params and
+                        // matching each to the supplied name
+                        // (or its positional slot when the
+                        // caller's slot is `None`).
+                        let mut reordered: Vec<Option<klio_runtime::Value>> =
+                            vec![None; args.len()];
+                        let mut ok = true;
+                        for (i, (a, opt_name)) in args.iter().zip(arg_names.iter()).enumerate() {
+                            if let Some(target) = opt_name.as_deref() {
+                                if let Some(pos) = func
+                                    .params
+                                    .iter()
+                                    .skip(1)
+                                    .position(|p| p.name == target)
+                                {
+                                    if reordered[pos].is_none() {
+                                        reordered[pos] = Some(a.clone());
+                                    } else {
+                                        ok = false;
+                                        break;
+                                    }
+                                } else {
+                                    ok = false;
+                                    break;
+                                }
+                            } else if reordered[i].is_none() {
+                                reordered[i] = Some(a.clone());
+                            } else {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok && reordered.iter().all(|v| v.is_some()) {
+                            let positional: Vec<klio_runtime::Value> =
+                                reordered.into_iter().map(|v| v.unwrap()).collect();
+                            return self.call_member(receiver, name, &positional);
                         }
                     }
                 }
