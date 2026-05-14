@@ -467,6 +467,47 @@ impl Interpreter {
         self.eval_expr(&call, &env, out)
     }
 
+    /// Same as `invoke_named_intrinsic` but threads named args
+    /// through so default-value fill + reorder fires.
+    pub fn invoke_named_intrinsic_with_names(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        arg_names: &[Option<String>],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        use klio_ast::{Expr, Ident};
+        use klio_span::{FileId, Span};
+        let dummy_span = Span::new(FileId(0), 0, 0);
+        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.globals))));
+        let mut arg_exprs: Vec<Expr> = Vec::with_capacity(args.len());
+        for (i, v) in args.iter().enumerate() {
+            let slot = format!("__ir_arg_{i}");
+            env.borrow_mut().define(slot.clone(), v.clone());
+            arg_exprs.push(Expr::Path {
+                segments: vec![Ident { name: slot, span: dummy_span }],
+                span: dummy_span,
+            });
+        }
+        let names: Vec<Option<String>> = if arg_names.len() == args.len() {
+            arg_names.to_vec()
+        } else {
+            vec![None; args.len()]
+        };
+        let call = Expr::Call {
+            callee: Box::new(Expr::Path {
+                segments: vec![Ident { name: name.to_string(), span: dummy_span }],
+                span: dummy_span,
+            }),
+            args: arg_exprs,
+            arg_names: names,
+            type_args: Vec::new(),
+            is_infix: false,
+            span: dummy_span,
+        };
+        self.eval_expr(&call, &env, out)
+    }
+
     /// Invoke a name-dispatched intrinsic (`repeat`, `let`, `apply`,
     /// `listOf`, …) that the tree walker recognises by simple name
     /// inside `eval_call`. Used by the IR host to route these forms
@@ -11361,16 +11402,37 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         func: klio_ir::FuncId,
         args: Vec<klio_runtime::Value>,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        // Override the trait default (which calls `eval` with a
-        // NullHost) so nested function calls keep flowing through
-        // *this* IrHost — otherwise CallValue/CallMember inside
-        // the called fn would error with the default Host's
-        // "unsupported" message.
+        self.call_func_named(module, func, args, &[])
+    }
+
+    fn call_func_named(
+        &mut self,
+        module: &klio_ir::Module,
+        func: klio_ir::FuncId,
+        args: Vec<klio_runtime::Value>,
+        arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         let f = module
             .funcs
             .get(func.0 as usize)
-            .ok_or_else(|| klio_ir::eval::EvalError::Type(format!("unknown FuncId {}", func.0)))?
-            .clone();
+            .ok_or_else(|| klio_ir::eval::EvalError::Type(format!("unknown FuncId {}", func.0)))?;
+        // Route through the tree walker by simple-name dispatch when
+        // there are named args, defaults, or overloads — the IR's
+        // direct eval_with doesn't yet handle parameter defaults
+        // or overload resolution. Falls through to the eval path
+        // for nameless / arity-equal calls so simple functions
+        // still benefit from the IR's tight loop.
+        let name = f.name.clone();
+        let has_names = arg_names.iter().any(|n| n.is_some());
+        let has_defaults = f.params.iter().any(|p| p.default.is_some());
+        let has_overloads = self.interp.has_top_level_overloads(&name);
+        if has_names || has_defaults || has_overloads || arg_names.len() == args.len() && args.len() < f.params.len() {
+            return self
+                .interp
+                .invoke_named_intrinsic_with_names(&name, &args, arg_names, self.out)
+                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+        }
+        let f = f.clone();
         let mut child = IrHost {
             interp: self.interp,
             out: self.out,

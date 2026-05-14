@@ -195,14 +195,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             dst
         }
         Expr::If { cond, then_branch, else_branch, .. } => {
+            // Use a single destination register that both arms
+            // write into via Move before jumping to the join.
+            // Equivalent to a phi-node-driven SSA result without
+            // requiring SSA infrastructure: the evaluator sees the
+            // last write at the join site.
             let cond_r = lower_expr(b, cond);
             let t_block = b.alloc_block();
             let f_block = b.alloc_block();
             let join = b.alloc_block();
+            let dst = b.alloc_reg();
             b.terminate(Terminator::Branch { cond: cond_r, t: t_block, f: f_block });
             // Then arm.
             b.switch_to(t_block);
             let t_val = lower_expr(b, then_branch);
+            b.push(Inst::Move { dst, src: t_val });
             b.terminate(Terminator::Goto(join));
             // Else arm.
             b.switch_to(f_block);
@@ -210,17 +217,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 Some(e) => lower_expr(b, e),
                 None => b.emit_const(Const::Unit),
             };
+            b.push(Inst::Move { dst, src: f_val });
             b.terminate(Terminator::Goto(join));
-            // Join — pick whichever branch's value landed via a Move.
             b.switch_to(join);
-            let dst = b.alloc_reg();
-            // The evaluator picks the actually-taken branch's value;
-            // we emit a Move from both arms via the trailing copy.
-            // For the initial lowering this is approximate — the real
-            // IR needs phi nodes; until then the evaluator can
-            // reconstruct via block-predecessor inspection.
-            b.push(Inst::Move { dst, src: t_val });
-            let _ = f_val;
             dst
         }
         Expr::Block(block) => lower_block(b, block),
@@ -903,6 +902,53 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                 None => b.emit_const(Const::Unit),
             };
             b.bind(p.name.name.clone(), init);
+            None
+        }
+        Stmt::Decl(klio_ast::Decl::Function(f)) => {
+            // Local fn: lower as a closure whose body captures the
+            // enclosing scope's visible names. Bound to its
+            // declared name so subsequent calls resolve to the
+            // closure Value. Equivalent to `val name = { ... }`.
+            // Both block-body (`fun foo() { ... }`) and
+            // expression-body (`fun foo() = expr`) forms map to a
+            // synthetic Block carrying the expression as its only
+            // statement.
+            use klio_span::{FileId, Span};
+            let dummy_span = Span::new(FileId(0), 0, 0);
+            let body_block: Option<klio_ast::Block> = match f.body.as_ref() {
+                Some(klio_ast::FunctionBody::Block(b)) => Some(b.clone()),
+                Some(klio_ast::FunctionBody::Expr(e)) => Some(klio_ast::Block {
+                    stmts: vec![Stmt::Expr(e.clone())],
+                    span: dummy_span,
+                }),
+                None => None,
+            };
+            if let Some(body) = body_block {
+                let outer_names: std::collections::HashSet<String> = b.visible_names();
+                let param_idents: Vec<klio_ast::Ident> =
+                    f.params.iter().map(|p| p.name.clone()).collect();
+                let (_body_func, captured_names) = lower_lambda_body_capturing(
+                    b.module,
+                    &param_idents,
+                    &body,
+                    outer_names,
+                );
+                let captures: Vec<Reg> = captured_names
+                    .iter()
+                    .filter_map(|n| b.resolve(n))
+                    .collect();
+                let param_names: Vec<String> =
+                    f.params.iter().map(|p| p.name.name.clone()).collect();
+                let dst = b.alloc_reg();
+                b.push(Inst::AstLambda {
+                    dst,
+                    params: param_names,
+                    body_ast: body,
+                    captures,
+                    captured_names,
+                });
+                b.bind(f.name.name.clone(), dst);
+            }
             None
         }
         Stmt::Assign { target, op, value, .. } => {
