@@ -2989,6 +2989,21 @@ fn coll_list_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(borrow[i as usize].clone())
 }
 fn coll_list_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() >= 2 {
+        let items = iterable_items(&ctx.args[0], "first")?;
+        let block = ctx.args[1].clone();
+        let CallCtx { out, host, .. } = ctx;
+        for v in items {
+            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+                return Ok(v);
+            }
+        }
+        return Err(RuntimeError::Thrown(Value::Exception {
+            fqn: Rc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Rc::new("Collection contains no element matching the predicate.".into())),
+            cause: None,
+        }));
+    }
     let it = recv_list_items(ctx.args, "List.first")?;
     it.borrow().first().cloned().ok_or_else(|| {
         RuntimeError::Thrown(Value::Exception {
@@ -2999,6 +3014,22 @@ fn coll_list_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     })
 }
 fn coll_list_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() >= 2 {
+        let items = iterable_items(&ctx.args[0], "last")?;
+        let block = ctx.args[1].clone();
+        let CallCtx { out, host, .. } = ctx;
+        let mut found: Option<Value> = None;
+        for v in items {
+            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+                found = Some(v);
+            }
+        }
+        return found.ok_or_else(|| RuntimeError::Thrown(Value::Exception {
+            fqn: Rc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Rc::new("Collection contains no element matching the predicate.".into())),
+            cause: None,
+        }));
+    }
     let it = recv_list_items(ctx.args, "List.last")?;
     it.borrow().last().cloned().ok_or_else(|| {
         RuntimeError::Thrown(Value::Exception {
@@ -4469,10 +4500,33 @@ fn int_to_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 // ============================================================
 
 fn coll_list_first_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() >= 2 {
+        let items = iterable_items(&ctx.args[0], "firstOrNull")?;
+        let block = ctx.args[1].clone();
+        let CallCtx { out, host, .. } = ctx;
+        for v in items {
+            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+                return Ok(v);
+            }
+        }
+        return Ok(Value::Null);
+    }
     let it = recv_list_items(ctx.args, "List.firstOrNull")?;
     Ok(it.borrow().first().cloned().unwrap_or(Value::Null))
 }
 fn coll_list_last_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() >= 2 {
+        let items = iterable_items(&ctx.args[0], "lastOrNull")?;
+        let block = ctx.args[1].clone();
+        let CallCtx { out, host, .. } = ctx;
+        let mut found: Option<Value> = None;
+        for v in items {
+            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+                found = Some(v);
+            }
+        }
+        return Ok(found.unwrap_or(Value::Null));
+    }
     let it = recv_list_items(ctx.args, "List.lastOrNull")?;
     Ok(it.borrow().last().cloned().unwrap_or(Value::Null))
 }
@@ -4565,6 +4619,18 @@ fn coll_list_to_mutable_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn coll_list_count_no_pred(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() >= 2 {
+        let items = iterable_items(&ctx.args[0], "count")?;
+        let block = ctx.args[1].clone();
+        let CallCtx { out, host, .. } = ctx;
+        let mut n = 0i64;
+        for v in items {
+            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+                n += 1;
+            }
+        }
+        return Ok(Value::new_int(n));
+    }
     let it = recv_list_items(ctx.args, "List.count")?;
     Ok(Value::new_int(it.borrow().len()))
 }
@@ -4703,6 +4769,18 @@ fn coll_set_with_index(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn coll_set_count_no_pred(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() >= 2 {
+        let items = iterable_items(&ctx.args[0], "count")?;
+        let block = ctx.args[1].clone();
+        let CallCtx { out, host, .. } = ctx;
+        let mut n = 0i64;
+        for v in items {
+            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+                n += 1;
+            }
+        }
+        return Ok(Value::new_int(n));
+    }
     let it = recv_set_items(ctx.args, "Set.count")?;
     Ok(Value::new_int(it.borrow().len()))
 }
@@ -4773,6 +4851,18 @@ fn coll_map_to_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn coll_map_count_no_pred(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() >= 2 {
+        let items = iterable_items(&ctx.args[0], "count")?;
+        let block = ctx.args[1].clone();
+        let CallCtx { out, host, .. } = ctx;
+        let mut n = 0i64;
+        for v in items {
+            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+                n += 1;
+            }
+        }
+        return Ok(Value::new_int(n));
+    }
     let entries = recv_map_entries(ctx.args, "Map.count")?;
     Ok(Value::new_int(entries.borrow().len()))
 }
