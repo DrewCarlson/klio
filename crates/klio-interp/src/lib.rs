@@ -1753,7 +1753,11 @@ impl Interpreter {
                     is_lateinit: p.is_lateinit,
                 };
                 if let Some(delegate_expr) = &pdef.delegate {
-                    let dval = self.eval_expr(delegate_expr, &file_env, out)?;
+                    let dval = match self.eval_property_init_via_ir(delegate_expr, out) {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => return Err(e),
+                        None => self.eval_expr(delegate_expr, &file_env, out)?,
+                    };
                     // Spec ch.9: when the delegate value's class declares
                     // `operator fun provideDelegate(thisRef, property)`, the
                     // stored delegate is the call's result, not the raw
