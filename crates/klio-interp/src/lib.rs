@@ -7296,7 +7296,7 @@ impl Interpreter {
     /// Construct a regular class instance from constructor args. Walks the
     /// parent chain top-down so a parent's primary ctor + init blocks run
     /// before the child's, matching Kotlin's construction order.
-    fn construct_instance(
+    pub fn construct_instance(
         &mut self,
         class: &Rc<ClassDef>,
         args: &[Value],
@@ -12488,6 +12488,39 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     all.extend_from_slice(args);
                     let mut ctx = CallCtx { args: &all, out: self.out };
                     return func(&mut ctx).map_err(ir_err);
+                }
+            }
+        }
+        // `Outer.Nested(args)` — qualified construction of a
+        // plain nested class on the receiver Class. Nested classes
+        // aren't necessarily in the global class_table, so
+        // construct against the resolved ClassDef directly.
+        if let klio_runtime::Value::Class(class) = receiver {
+            if let Some(nc) = lookup_nested_class(class, name) {
+                if !nc.is_inner {
+                    let names: Vec<Option<String>> = vec![None; args.len()];
+                    return self
+                        .interp
+                        .construct_instance(&nc, args, &names, self.out)
+                        .map_err(ir_err);
+                }
+            }
+            // Also fall through to the synthesized member-call path
+            // when `name` is a companion method on the class —
+            // `Counter.reset()` etc.
+            let companion = class.companion.borrow().clone();
+            if let Some(comp) = companion {
+                let has_method = comp.borrow().class.find_method(name).is_some();
+                if has_method {
+                    return self
+                        .interp
+                        .invoke_named_member_call(
+                            &klio_runtime::Value::Instance(comp),
+                            name,
+                            args,
+                            self.out,
+                        )
+                        .map_err(ir_err);
                 }
             }
         }

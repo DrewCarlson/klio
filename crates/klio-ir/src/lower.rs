@@ -1639,6 +1639,47 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             None
         }
         Stmt::Assign { target, op, value, .. }
+            if matches!(target, Expr::Index { receiver, .. } if matches!(receiver.as_ref(), Expr::Member { safe: true, .. })) =>
+        {
+            // `obj?.items[i] = v` — null-guard the outer Index
+            // assignment when the receiver chain is a safe-Member.
+            let Expr::Index { receiver, args: idx_args, span } = target else { unreachable!() };
+            let Expr::Member { receiver: outer, name: mname, span: mspan, .. } = receiver.as_ref() else { unreachable!() };
+            let outer_r = lower_expr(b, outer);
+            let null_r = b.emit_const(Const::Null);
+            let is_null = b.alloc_reg();
+            b.push(Inst::BinOp { dst: is_null, op: BinOp::Eq, lhs: outer_r, rhs: null_r });
+            let skip = b.alloc_block();
+            let do_set = b.alloc_block();
+            let join = b.alloc_block();
+            b.terminate(Terminator::Branch { cond: is_null, t: skip, f: do_set });
+            b.switch_to(do_set);
+            // Synthesize the non-safe equivalent and recurse.
+            let inner_recv = Expr::Member {
+                receiver: outer.clone(),
+                name: mname.clone(),
+                safe: false,
+                span: *mspan,
+            };
+            let inner_target = Expr::Index {
+                receiver: Box::new(inner_recv),
+                args: idx_args.clone(),
+                span: *span,
+            };
+            let synth = Stmt::Assign {
+                target: inner_target,
+                op: *op,
+                value: value.clone(),
+                span: *span,
+            };
+            lower_stmt(b, &synth);
+            b.terminate(Terminator::Goto(join));
+            b.switch_to(skip);
+            b.terminate(Terminator::Goto(join));
+            b.switch_to(join);
+            return None;
+        }
+        Stmt::Assign { target, op, value, .. }
             if matches!(target, Expr::Member { safe: true, .. }) =>
         {
             // `obj?.field = v` (or compound `?.field += v`):
