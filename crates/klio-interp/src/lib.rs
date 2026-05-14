@@ -528,7 +528,7 @@ impl Interpreter {
             is_fun_interface: false,
             parent_ctor_args: Vec::new(),
             enum_entries: RefCell::new(Vec::new()),
-            companion: None,
+            companion: RefCell::new(None),
             enclosing_class: RefCell::new(None),
             nested_classes: RefCell::new(Vec::new()),
             captured_env: Rc::clone(&self.globals),
@@ -1295,7 +1295,7 @@ impl Interpreter {
                 // name, e.g. `Foo.bar()` where `bar` is declared on
                 // `Foo.Companion`. Match the registration key shape used
                 // for those extensions.
-                if let Some(comp) = &c.companion {
+                if let Some(comp) = c.companion.borrow().as_ref() {
                     let comp_name = &comp.borrow().class.name;
                     out.push(format!("{}.{}", c.name, comp_name));
                     out.push(comp_name.clone());
@@ -1796,7 +1796,8 @@ impl Interpreter {
                     // `ClassName.prop = v` — write through to the
                     // companion-object instance when the class has one.
                     if let Value::Class(class) = &recv {
-                        if let Some(comp) = &class.companion {
+                        let comp_opt = class.companion.borrow().clone();
+                        if let Some(comp) = comp_opt.as_ref() {
                             if comp.borrow().get(&name.name).is_some() {
                                 let comp_inst = Rc::clone(comp);
                                 let final_value = match op {
@@ -5348,7 +5349,7 @@ impl Interpreter {
             is_anonymous: true,
             secondary_ctors: Vec::new(),
             enum_entries: RefCell::new(Vec::new()),
-            companion: None,
+            companion: RefCell::new(None),
             enclosing_class: RefCell::new(None),
             nested_classes: RefCell::new(Vec::new()),
             captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
@@ -5390,7 +5391,7 @@ impl Interpreter {
             is_anonymous: true,
             secondary_ctors: Vec::new(),
             enum_entries: RefCell::new(Vec::new()),
-            companion: None,
+            companion: RefCell::new(None),
             enclosing_class: RefCell::new(None),
             nested_classes: RefCell::new(Vec::new()),
             captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
@@ -6147,7 +6148,11 @@ impl Interpreter {
         }
         let mut methods = Vec::new();
         let mut body_properties = Vec::new();
-        let mut companion: Option<Rc<RefCell<InstanceData>>> = None;
+        // Defer companion-object construction until after the outer
+        // class is built and bound to env so the companion's own
+        // initializers can reference the enclosing class by name
+        // (`class M { companion { val DEFAULT = M(...) } }`).
+        let mut companion_ast: Option<klio_ast::Class> = None;
         for m in &c.members {
             match m {
                 Decl::Function(f) => methods.push(MethodDef {
@@ -6171,9 +6176,7 @@ impl Interpreter {
                     is_lateinit: p.is_lateinit,
                 }),
                 Decl::Class(inner) if inner.is_companion => {
-                    let comp_class = self.build_class_shell(inner, env, out)?;
-                    let comp_inst = self.construct_object_singleton(&comp_class, out)?;
-                    companion = Some(comp_inst);
+                    companion_ast = Some(inner.clone());
                 }
                 _ => {}
             }
@@ -6263,7 +6266,7 @@ impl Interpreter {
             is_fun_interface: c.is_fun_interface,
             parent_ctor_args,
             enum_entries: RefCell::new(Vec::new()),
-            companion,
+            companion: RefCell::new(None),
             enclosing_class: RefCell::new(None),
             nested_classes: RefCell::new(Vec::new()),
             captured_env: Rc::clone(env),
@@ -6271,10 +6274,25 @@ impl Interpreter {
             delegate_forwarders: RefCell::new(Vec::new()),
             object_singleton: RefCell::new(None),
         });
+        // Bind the outer class into env *before* building the
+        // companion object so its initializers can reference the
+        // enclosing class by simple name. The same env binding
+        // happens further down for nested-class shell resolution;
+        // we hoist it here so the companion benefits too.
+        let had_self = env.borrow().lookup(&c.name.name).is_some();
+        if !had_self {
+            env.borrow_mut()
+                .define(c.name.name.clone(), Value::Class(Rc::clone(&outer_class)));
+        }
+        if let Some(ast) = companion_ast {
+            let comp_class = self.build_class_shell(&ast, env, out)?;
+            let comp_inst = self.construct_object_singleton(&comp_class, out)?;
+            *outer_class.companion.borrow_mut() = Some(comp_inst);
+        }
         // Set companion's back-link to the enclosing class so its method
         // bodies can see enum entries / `entries` when the enclosing class
         // is an enum.
-        if let Some(comp) = &outer_class.companion {
+        if let Some(comp) = outer_class.companion.borrow().as_ref() {
             *comp.borrow().class.enclosing_class.borrow_mut() =
                 Some(Rc::clone(&outer_class));
         }
@@ -6291,7 +6309,7 @@ impl Interpreter {
             // scope is ULD to the companion decl scope of the parent of
             // its parent classifier.
             *nested_class.enclosing_class.borrow_mut() = Some(Rc::clone(&outer_class));
-            if let Some(comp) = &nested_class.companion {
+            if let Some(comp) = nested_class.companion.borrow().as_ref() {
                 *comp.borrow().class.enclosing_class.borrow_mut() =
                     Some(Rc::clone(&nested_class));
             }
@@ -6304,14 +6322,6 @@ impl Interpreter {
             let nested_class = self.build_object_class(o, env, out)?;
             *nested_class.enclosing_class.borrow_mut() = Some(Rc::clone(&outer_class));
             nested_built.push((n.clone(), nested_class));
-        }
-        // Bind the outer class temporarily so nested supertypes (e.g.
-        // `sealed class S { class Inner : S() }`) can resolve through the
-        // enclosing-class name.
-        let had_self = env.borrow().lookup(&c.name.name).is_some();
-        if !had_self {
-            env.borrow_mut()
-                .define(c.name.name.clone(), Value::Class(Rc::clone(&outer_class)));
         }
         for (_, nc) in &nested_built {
             self.resolve_parent_link(nc);
@@ -6490,7 +6500,7 @@ impl Interpreter {
                     is_fun_interface: false,
                     parent_ctor_args: class.parent_ctor_args.clone(),
                     enum_entries: RefCell::new(Vec::new()),
-                    companion: class.companion.clone(),
+                    companion: RefCell::new(class.companion.borrow().clone()),
                     enclosing_class: RefCell::new(class.enclosing_class.borrow().clone()),
                     nested_classes: RefCell::new(class.nested_classes.borrow().clone()),
                     captured_env: Rc::clone(&class.captured_env),
@@ -6580,7 +6590,7 @@ impl Interpreter {
                 .map(|args| args.iter().map(|e| Rc::new(e.clone())).collect())
                 .unwrap_or_default(),
             enum_entries: RefCell::new(Vec::new()),
-            companion: None,
+            companion: RefCell::new(None),
             enclosing_class: RefCell::new(None),
             nested_classes: RefCell::new(Vec::new()),
             captured_env: Rc::clone(env),
@@ -7635,7 +7645,7 @@ impl Interpreter {
             is_fun_interface: false,
             parent_ctor_args: Vec::new(),
             enum_entries: RefCell::new(Vec::new()),
-            companion: None,
+            companion: RefCell::new(None),
             enclosing_class: RefCell::new(None),
             nested_classes: RefCell::new(Vec::new()),
             captured_env: Rc::clone(&iface.captured_env),
@@ -8275,7 +8285,8 @@ impl Interpreter {
             }
             // `Foo.NAME` — companion property, or `Foo.CompanionName` to
             // get the companion instance itself, or nested-object lookup.
-            if let Some(comp) = &class.companion {
+            let comp_opt = class.companion.borrow().clone();
+            if let Some(comp) = comp_opt.as_ref() {
                 if name == comp.borrow().class.name {
                     return Ok(Value::Instance(Rc::clone(comp)));
                 }
@@ -9167,7 +9178,8 @@ impl Interpreter {
             }
             // Companion method dispatch on `Foo.method(...)`.
             if let Value::Class(class) = &recv {
-                if let Some(comp) = &class.companion {
+                let comp_opt = class.companion.borrow().clone();
+                if let Some(comp) = comp_opt.as_ref() {
                     let comp_class = Rc::clone(&comp.borrow().class);
                     if let Some(m) = comp_class.methods.iter().find(|m| m.name == name.name) {
                         let m = m.clone();

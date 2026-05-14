@@ -461,7 +461,12 @@ pub struct ClassDef {
     /// entries can carry a `Rc<ClassDef>` back-reference.
     pub enum_entries: RefCell<Vec<(String, Value)>>,
     /// Companion object, if any. Stored as a class with `is_object: true`.
-    pub companion: Option<Rc<RefCell<InstanceData>>>,
+    /// Companion object instance. Interior mutability lets the
+    /// interpreter defer construction until after the enclosing
+    /// class is bound to the env, so `class Outer { companion {
+    /// val X = Outer() } }` can resolve `Outer` during its
+    /// companion's init. Construction sites set this once.
+    pub companion: RefCell<Option<Rc<RefCell<InstanceData>>>>,
     /// For a companion-object class (`is_object: true` built from a
     /// `companion object` declaration), this points back to the enclosing
     /// class. Lets the interpreter expose enum entries / `entries` inside
@@ -702,7 +707,7 @@ fn collect_companions_walk(
         return;
     }
     seen.push(ptr);
-    if let Some(c) = &cls.companion {
+    if let Some(c) = cls.companion.borrow().as_ref() {
         out.push(Rc::clone(c));
     }
     if let Some(parent) = cls.parent.borrow().clone() {
@@ -2079,7 +2084,7 @@ mod tests {
             is_anonymous: false,
             secondary_ctors: Vec::new(),
             enum_entries: RefCell::new(Vec::new()),
-            companion: None,
+            companion: RefCell::new(None),
             enclosing_class: RefCell::new(None),
             nested_classes: RefCell::new(Vec::new()),
             captured_env: Rc::new(RefCell::new(Env::new())),

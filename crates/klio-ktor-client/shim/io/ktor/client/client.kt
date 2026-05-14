@@ -41,14 +41,14 @@ class HttpClient {
 
     suspend fun get(url: String): HttpResponse {
         val b = HttpRequestBuilder()
-        b.method = HttpMethod.Get()
+        b.method = HttpMethod.Get
         b.url = url
         return request(b)
     }
 
     suspend fun post(url: String, body: String): HttpResponse {
         val b = HttpRequestBuilder()
-        b.method = HttpMethod.Post()
+        b.method = HttpMethod.Post
         b.url = url
         b.body = body
         return request(b)
