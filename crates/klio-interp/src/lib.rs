@@ -11259,6 +11259,47 @@ impl<'a> klio_runtime::IntrinsicHost for InterpHostRef<'a> {
     }
 }
 
+/// Evaluate an AST expression to a runtime Value when it's
+/// trivially literal (no scope lookups, no calls). Returns
+/// `None` for anything that would need the tree walker. Used by
+/// the IR-native ctor fast-path so body-property initializers
+/// like `val tag = "X"` populate the field directly.
+fn simple_literal_value(e: &klio_ast::Expr) -> Option<klio_runtime::Value> {
+    use klio_ast::Expr::*;
+    use klio_ast::IntLitKind;
+    match e {
+        IntLit { value, kind, .. } => match kind {
+            IntLitKind::Long => Some(klio_runtime::Value::Long(*value)),
+            IntLitKind::UInt => Some(klio_runtime::Value::UInt(*value as u32)),
+            IntLitKind::ULong => Some(klio_runtime::Value::ULong(*value as u64)),
+            IntLitKind::Int => {
+                if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 {
+                    Some(klio_runtime::Value::new_int(*value as i64))
+                } else {
+                    Some(klio_runtime::Value::Long(*value))
+                }
+            }
+        },
+        FloatLit { value, kind, .. } => match kind {
+            klio_ast::FloatLitKind::Float => Some(klio_runtime::Value::Float(*value as f32)),
+            klio_ast::FloatLitKind::Double => Some(klio_runtime::Value::Double(*value)),
+        },
+        BoolLit { value, .. } => Some(klio_runtime::Value::Bool(*value)),
+        CharLit { value, .. } => Some(klio_runtime::Value::Char(*value)),
+        NullLit { .. } => Some(klio_runtime::Value::Null),
+        StringTemplate { parts, .. } if parts.iter().all(|p| matches!(p, klio_ast::StringPart::Text(_))) => {
+            let mut s = String::new();
+            for p in parts {
+                if let klio_ast::StringPart::Text(lit) = p {
+                    s.push_str(lit);
+                }
+            }
+            Some(klio_runtime::Value::String(std::rc::Rc::new(s)))
+        }
+        _ => None,
+    }
+}
+
 /// Structural hash that matches `Value::structural_eq`:
 /// `a == b` implies the same hash. Used by IR-native data-class
 /// `hashCode()` so the equals/hashCode contract holds.
@@ -12908,11 +12949,17 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // tree walker's init pipeline. Pure-shape bodies (`val
             // computed: Int`-style without bodies) leave fields
             // undefined just like the tree walker would.
+            // Each body property's init must be a simple literal
+            // (or absent) for the fast-path to be safe; richer
+            // initializers (references to primary params, calls,
+            // etc.) need the tree walker's full eval pipeline.
             let body_props_ok = cls.body_properties.iter().all(|p| {
-                p.init.is_none()
-                    && p.getter.is_none()
+                p.getter.is_none()
                     && p.setter.is_none()
                     && p.delegate.is_none()
+                    && p.init
+                        .as_ref()
+                        .map_or(true, |e| simple_literal_value(e).is_some())
             });
             // Allow a parent class only when it's itself trivially
             // constructible — no primary params, no init blocks,
@@ -12956,9 +13003,16 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             if simple {
                 let identity = self.interp.next_instance_id();
                 let mut fields: Vec<(String, klio_runtime::Value)> =
-                    Vec::with_capacity(cls.primary_params.len());
+                    Vec::with_capacity(cls.primary_params.len() + cls.body_properties.len());
                 for (p, v) in cls.primary_params.iter().zip(args.iter()) {
                     fields.push((p.name.clone(), v.clone()));
+                }
+                for p in &cls.body_properties {
+                    let v = match &p.init {
+                        Some(e) => simple_literal_value(e).unwrap_or(klio_runtime::Value::Null),
+                        None => continue,
+                    };
+                    fields.push((p.name.clone(), v));
                 }
                 let inst = std::rc::Rc::new(std::cell::RefCell::new(
                     klio_runtime::InstanceData {
