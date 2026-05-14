@@ -13053,6 +13053,48 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 return func(&mut ctx).map_err(ir_err);
             }
         }
+        // IR-native extension function dispatch: walk the
+        // receiver's runtime type keys and look up an extension
+        // fn registered for that type. If found, call its IR
+        // FuncId with [receiver, ...args] so the body's `this`
+        // resolves to the implicit first param.
+        {
+            let type_keys = Interpreter::receiver_type_names(receiver);
+            for key in &type_keys {
+                let ext_fn_opt: Option<std::rc::Rc<klio_ast::Function>> = {
+                    let list = self.interp.extensions.get(key);
+                    list.and_then(|exts| {
+                        exts.iter()
+                            .find(|e| {
+                                e.decl.name.name == name
+                                    && args.len() == e.decl.params.len()
+                            })
+                            .map(|e| std::rc::Rc::clone(&e.decl))
+                    })
+                };
+                if let Some(decl) = ext_fn_opt {
+                    let _ = decl;
+                    let module = std::rc::Rc::clone(&self.module);
+                    if let Some(fid) = module.func_id(name) {
+                        let func = module.funcs[fid.0 as usize].clone();
+                        if func.params.len() == args.len() + 1 {
+                            let mut all_args: Vec<klio_runtime::Value> =
+                                Vec::with_capacity(func.params.len());
+                            all_args.push(receiver.clone());
+                            all_args.extend_from_slice(args);
+                            match klio_ir::eval::eval_with(&module, &func, all_args, self) {
+                                Ok(v) => return Ok(v),
+                                Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => return Ok(v),
+                                Err(klio_ir::eval::EvalError::Unsupported(_)) => {
+                                    // fall through
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Last resort: synthesise the call through the tree
         // walker's full member-dispatch path, which picks up
         // extension functions, named args, and `vararg` /
