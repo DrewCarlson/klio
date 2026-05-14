@@ -1239,6 +1239,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             && b.resolve(head).is_none()
                             && !b.knows_outer(head)
                             && b.module.class_id(head).is_none()
+                            // When `this` is bound (we're inside a
+                            // method body) the head could be a
+                            // field on `this`; don't treat it as a
+                            // package FQN unless that field doesn't
+                            // exist on the receiver class.
+                            && b.resolve("this").is_none()
                         {
                             let callee_r = b.alloc_reg();
                             let n = b.module.intern_const(Const::String(fqn));
