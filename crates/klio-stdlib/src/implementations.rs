@@ -3354,6 +3354,46 @@ fn coll_mut_list_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 /// Natural order for the Kotlin types we currently support as `Comparable`.
 /// Returns an `Ordering`, or an error when the types can't be compared.
+pub fn primitive_companion_const(ty: &str, name: &str) -> Option<Value> {
+    match (ty, name) {
+        ("Int", "MAX_VALUE") => Some(Value::new_int(i32::MAX as i64)),
+        ("Int", "MIN_VALUE") => Some(Value::new_int(i32::MIN as i64)),
+        ("Int", "SIZE_BITS") => Some(Value::new_int(32)),
+        ("Int", "SIZE_BYTES") => Some(Value::new_int(4)),
+        ("Long", "MAX_VALUE") => Some(Value::Long(i64::MAX)),
+        ("Long", "MIN_VALUE") => Some(Value::Long(i64::MIN)),
+        ("Long", "SIZE_BITS") => Some(Value::new_int(64)),
+        ("Long", "SIZE_BYTES") => Some(Value::new_int(8)),
+        ("Short", "MAX_VALUE") => Some(Value::Short(i16::MAX)),
+        ("Short", "MIN_VALUE") => Some(Value::Short(i16::MIN)),
+        ("Short", "SIZE_BITS") => Some(Value::new_int(16)),
+        ("Short", "SIZE_BYTES") => Some(Value::new_int(2)),
+        ("Byte", "MAX_VALUE") => Some(Value::Byte(i8::MAX)),
+        ("Byte", "MIN_VALUE") => Some(Value::Byte(i8::MIN)),
+        ("Byte", "SIZE_BITS") => Some(Value::new_int(8)),
+        ("Byte", "SIZE_BYTES") => Some(Value::new_int(1)),
+        ("Double", "MAX_VALUE") => Some(Value::Double(f64::MAX)),
+        ("Double", "MIN_VALUE") => Some(Value::Double(f64::MIN_POSITIVE)),
+        ("Double", "POSITIVE_INFINITY") => Some(Value::Double(f64::INFINITY)),
+        ("Double", "NEGATIVE_INFINITY") => Some(Value::Double(f64::NEG_INFINITY)),
+        ("Double", "NaN") => Some(Value::Double(f64::NAN)),
+        ("Double", "SIZE_BITS") => Some(Value::new_int(64)),
+        ("Double", "SIZE_BYTES") => Some(Value::new_int(8)),
+        ("Float", "MAX_VALUE") => Some(Value::Float(f32::MAX)),
+        ("Float", "MIN_VALUE") => Some(Value::Float(f32::MIN_POSITIVE)),
+        ("Float", "POSITIVE_INFINITY") => Some(Value::Float(f32::INFINITY)),
+        ("Float", "NEGATIVE_INFINITY") => Some(Value::Float(f32::NEG_INFINITY)),
+        ("Float", "NaN") => Some(Value::Float(f32::NAN)),
+        ("Float", "SIZE_BITS") => Some(Value::new_int(32)),
+        ("Float", "SIZE_BYTES") => Some(Value::new_int(4)),
+        ("Char", "MAX_VALUE") => Some(Value::Char('\u{FFFF}')),
+        ("Char", "MIN_VALUE") => Some(Value::Char('\u{0}')),
+        ("Char", "SIZE_BITS") => Some(Value::new_int(16)),
+        ("Char", "SIZE_BYTES") => Some(Value::new_int(2)),
+        _ => None,
+    }
+}
+
 pub fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, RuntimeError> {
     use std::cmp::Ordering::*;
     if a.is_numeric() && b.is_numeric() {
