@@ -331,6 +331,16 @@ pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::Cl
             methods.push(last_id);
         }
     }
+    // Resolve declared supertypes to ClassIds when they're
+    // already in the module. Forward-referenced classes (declared
+    // later in the file) won't resolve here — the host's
+    // tree-walker fallback handles those via the runtime class
+    // table.
+    let supertypes: Vec<crate::ClassId> = c
+        .supertypes
+        .iter()
+        .filter_map(|t| module.class_id(&t.name.name))
+        .collect();
     let class = crate::Class {
         id: crate::ClassId(0), // set by add_class
         name: c.name.name.clone(),
@@ -339,7 +349,7 @@ pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::Cl
         methods,
         init_block: None,
         companion: None,
-        supertypes: Vec::new(),
+        supertypes,
     };
     module.add_class(class)
 }
