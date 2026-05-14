@@ -1463,7 +1463,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // `super.method(...)` — emit `CallSuper` so the
                     // host walks the parent class chain rather
                     // than re-entering the leaf class's override.
-                    if matches!(receiver.as_ref(), Expr::Super { .. }) {
+                    // `super<Klazz>.method()` passes Klazz so the
+                    // host dispatches against that specific
+                    // supertype.
+                    if let Expr::Super { qualifier, .. } = receiver.as_ref() {
                         if let Some(this_reg) = b.resolve("this") {
                             if let Some(owner) = b.owner_class().map(|s| s.to_string()) {
                                 let (args_start, count) = lower_arg_run(b, args);
@@ -1471,10 +1474,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                 let dst = b.alloc_reg();
                                 let nm = b.module.intern_const(Const::String(name.name.clone()));
                                 let oc = b.module.intern_const(Const::String(owner));
+                                let qual_const = qualifier
+                                    .as_ref()
+                                    .map(|t| b.module.intern_const(Const::String(t.name.name.clone())));
                                 b.push(Inst::CallSuper {
                                     dst,
                                     receiver: this_reg,
                                     owner_class: oc,
+                                    qualifier: qual_const,
                                     name: nm,
                                     args: args_start,
                                     n_args: count,

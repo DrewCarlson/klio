@@ -192,6 +192,7 @@ pub trait Host {
         &mut self,
         _receiver: &Value,
         _owner_class: &str,
+        _qualifier: Option<&str>,
         _name: &str,
         _args: &[Value],
         _arg_names: &[Option<String>],
@@ -661,19 +662,23 @@ fn exec_inst(
             let result = host.call_value_named(&callee_v, &arg_values, &effective_names)?;
             frame.write(*dst, result);
         }
-        Inst::CallSuper { dst, receiver, owner_class, name, args, n_args, arg_names } => {
+        Inst::CallSuper { dst, receiver, owner_class, qualifier, name, args, n_args, arg_names } => {
             let recv = frame.read(*receiver);
             let owner_str = match &frame.module.consts[owner_class.0 as usize] {
                 Const::String(s) => s.clone(),
                 _ => return Err(EvalError::Type("CallSuper: owner not a string const".into())),
             };
+            let qual_str: Option<String> = qualifier.and_then(|id| match &frame.module.consts[id.0 as usize] {
+                Const::String(s) => Some(s.clone()),
+                _ => None,
+            });
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
                 _ => return Err(EvalError::Type("CallSuper: name not a string const".into())),
             };
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
-            let result = host.call_super(&recv, &owner_str, &name_str, &arg_values, &names)?;
+            let result = host.call_super(&recv, &owner_str, qual_str.as_deref(), &name_str, &arg_values, &names)?;
             frame.write(*dst, result);
         }
         Inst::CallMember { dst, receiver, name, args, n_args, arg_names } => {

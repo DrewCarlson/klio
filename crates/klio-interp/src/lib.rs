@@ -12042,13 +12042,11 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         &mut self,
         receiver: &klio_runtime::Value,
         owner_class: &str,
+        qualifier: Option<&str>,
         name: &str,
         args: &[klio_runtime::Value],
         _arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        // Resolve the owner class in the runtime class_table,
-        // step to its parent, find the method there, and invoke
-        // it directly so the leaf class's override is bypassed.
         let inst = match receiver {
             klio_runtime::Value::Instance(i) => i.clone(),
             _ => {
@@ -12057,6 +12055,25 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 )))
             }
         };
+        // `super<Qual>.method()` dispatches the named method
+        // directly on `Qual`. Bare `super.method()` walks the
+        // owner class's parent + interfaces.
+        if let Some(qual_name) = qualifier {
+            let target = self.interp.class_table.get(qual_name).cloned().ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "super<{qual_name}>.{name}: unknown class"
+                ))
+            })?;
+            let (method, _) = target.find_method(name).ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "super<{qual_name}>.{name}: no method `{name}` on `{qual_name}`"
+                ))
+            })?;
+            return self
+                .interp
+                .call_method_with_owner(&inst, &target, &method, args, &vec![None; args.len()], self.out)
+                .map_err(ir_err);
+        }
         let owner = self
             .interp
             .class_table
@@ -12067,26 +12084,41 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     "super.{name}: unknown owner class `{owner_class}`"
                 ))
             })?;
-        let parent = owner
-            .parent
-            .borrow()
-            .clone()
-            .ok_or_else(|| {
-                klio_ir::eval::EvalError::Type(format!(
-                    "super.{name}: `{owner_class}` has no parent"
-                ))
-            })?;
-        let (method, _owner_cls) = parent
-            .find_method(name)
-            .ok_or_else(|| {
-                klio_ir::eval::EvalError::Type(format!(
-                    "super.{name}: parent `{}` has no method `{name}`",
-                    parent.name
-                ))
-            })?;
-        self.interp
-            .call_method_with_owner(&inst, &parent, &method, args, &vec![None; args.len()], self.out)
-            .map_err(ir_err)
+        // Walk parent first, then interfaces breadth-first.
+        let mut queue: std::collections::VecDeque<std::rc::Rc<klio_runtime::ClassDef>> =
+            std::collections::VecDeque::new();
+        if let Some(p) = owner.parent.borrow().clone() {
+            queue.push_back(p);
+        }
+        for iface in owner.interfaces.borrow().iter() {
+            queue.push_back(std::rc::Rc::clone(iface));
+        }
+        let mut seen: std::collections::HashSet<*const klio_runtime::ClassDef> =
+            std::collections::HashSet::new();
+        while let Some(c) = queue.pop_front() {
+            let ptr = std::rc::Rc::as_ptr(&c);
+            if !seen.insert(ptr) {
+                continue;
+            }
+            if let Some((method, _)) = c.find_method(name) {
+                let body_present = method.decl.body.is_some();
+                if body_present {
+                    return self
+                        .interp
+                        .call_method_with_owner(&inst, &c, &method, args, &vec![None; args.len()], self.out)
+                        .map_err(ir_err);
+                }
+            }
+            for iface in c.interfaces.borrow().iter() {
+                queue.push_back(std::rc::Rc::clone(iface));
+            }
+            if let Some(p) = c.parent.borrow().clone() {
+                queue.push_back(p);
+            }
+        }
+        Err(klio_ir::eval::EvalError::Type(format!(
+            "super.{name}: no supertype of `{owner_class}` declares `{name}`"
+        )))
     }
 
     fn read_lambda_capture(

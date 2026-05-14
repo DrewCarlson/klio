@@ -128,11 +128,15 @@ pub enum Inst {
     /// receiver's value, but resolved against the parent of
     /// `owner_class` rather than the leaf class. Used inside
     /// method bodies; `owner_class` is the class whose body is
-    /// being lowered.
+    /// being lowered. When `qualifier` is `Some`, this is
+    /// `super<Qual>.method()` — the host dispatches directly on
+    /// `Qual` instead of walking to `owner_class.parent`.
     CallSuper {
         dst: Reg,
         receiver: Reg,
         owner_class: ConstId,
+        #[serde(default)]
+        qualifier: Option<ConstId>,
         name: ConstId,
         args: Reg,
         n_args: u8,
