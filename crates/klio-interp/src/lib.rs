@@ -14159,8 +14159,15 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 let mut cur = cls.parent.borrow().clone();
                 let mut ok = true;
                 while let Some(p) = cur {
+                    let parent_inits_lowered = self
+                        .interp
+                        .class_init_blocks
+                        .get(&p.name)
+                        .map_or(p.init_blocks.is_empty(), |fids| {
+                            fids.len() == p.init_blocks.len()
+                        });
                     let p_ok = p.primary_params.is_empty()
-                        && p.init_blocks.is_empty()
+                        && parent_inits_lowered
                         && p.body_properties.is_empty()
                         && p.secondary_ctors.is_empty()
                         && p.parent_ctor_args.is_empty()
@@ -14237,10 +14244,29 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     },
                 ));
                 let inst_val = klio_runtime::Value::Instance(inst);
-                // Run lowered init blocks against the freshly built
-                // instance. Each one is a 1-arg IR func taking `this`.
+                // Run parent-chain lowered init blocks first (root →
+                // child), then this class's. Each init is a 1-arg IR
+                // func taking `this`.
+                let mut parent_inits: Vec<klio_ir::FuncId> = Vec::new();
+                {
+                    let mut chain: Vec<String> = Vec::new();
+                    let mut cur = cls.parent.borrow().clone();
+                    while let Some(p) = cur {
+                        chain.push(p.name.clone());
+                        cur = p.parent.borrow().clone();
+                    }
+                    for n in chain.iter().rev() {
+                        if let Some(fids) = self.interp.class_init_blocks.get(n) {
+                            parent_inits.extend(fids.iter().copied());
+                        }
+                    }
+                }
+                let module = std::rc::Rc::clone(&self.module);
+                for fid in parent_inits {
+                    let func = module.funcs[fid.0 as usize].clone();
+                    klio_ir::eval::eval_with(&module, &func, vec![inst_val.clone()], self)?;
+                }
                 if let Some(fids) = self.interp.class_init_blocks.get(&name).cloned() {
-                    let module = std::rc::Rc::clone(&self.module);
                     for fid in fids {
                         let func = module.funcs[fid.0 as usize].clone();
                         klio_ir::eval::eval_with(
