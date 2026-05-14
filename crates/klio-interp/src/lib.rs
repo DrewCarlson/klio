@@ -1786,6 +1786,90 @@ impl Interpreter {
         Ok(())
     }
 
+    /// True when a suspend function's body contains no actual
+    /// suspension points (no `suspendCoroutine` calls, no calls into
+    /// other suspending functions). Such bodies run to completion
+    /// synchronously and can dispatch through the regular IR path
+    /// without the state-machine driver.
+    fn suspend_body_runs_inline(&self, decl: &klio_ast::Function) -> bool {
+        use klio_ast::{Expr, FunctionBody, Stmt};
+        fn expr_has_suspend(e: &Expr, names: &suspend_lower::SuspendNameSet) -> bool {
+            use Expr::*;
+            match e {
+                Call { callee, args, .. } => {
+                    if let Path { segments, .. } = callee.as_ref() {
+                        if segments.len() == 1
+                            && matches!(
+                                segments[0].name.as_str(),
+                                "suspendCoroutine"
+                                    | "suspendCancellableCoroutine"
+                                    | "suspendCoroutineUninterceptedOrReturn"
+                            )
+                        {
+                            return true;
+                        }
+                        if segments.len() == 1 && names.names.contains(&segments[0].name) {
+                            return true;
+                        }
+                    }
+                    expr_has_suspend(callee, names)
+                        || args.iter().any(|a| expr_has_suspend(a, names))
+                }
+                Member { receiver, .. } => expr_has_suspend(receiver, names),
+                Binary { lhs, rhs, .. } => {
+                    expr_has_suspend(lhs, names) || expr_has_suspend(rhs, names)
+                }
+                Unary { expr, .. } | Postfix { expr, .. } => expr_has_suspend(expr, names),
+                If { cond, then_branch, else_branch, .. } => {
+                    expr_has_suspend(cond, names)
+                        || expr_has_suspend(then_branch, names)
+                        || else_branch.as_ref().map_or(false, |e| expr_has_suspend(e, names))
+                }
+                When { subject, branches, .. } => {
+                    subject.as_ref().map_or(false, |s| expr_has_suspend(s, names))
+                        || branches.iter().any(|b| expr_has_suspend(&b.body, names))
+                }
+                Try { body, catches, finally, .. } => {
+                    body.stmts.iter().any(|s| stmt_has_suspend(s, names))
+                        || catches.iter().any(|c| {
+                            c.body.stmts.iter().any(|s| stmt_has_suspend(s, names))
+                        })
+                        || finally.as_ref().map_or(false, |f| {
+                            f.stmts.iter().any(|s| stmt_has_suspend(s, names))
+                        })
+                }
+                Index { receiver, args, .. } => {
+                    expr_has_suspend(receiver, names)
+                        || args.iter().any(|a| expr_has_suspend(a, names))
+                }
+                IsCheck { expr, .. } | As { expr, .. } => expr_has_suspend(expr, names),
+                Throw { value, .. } => expr_has_suspend(value, names),
+                Return { value, .. } => {
+                    value.as_ref().map_or(false, |e| expr_has_suspend(e, names))
+                }
+                _ => false,
+            }
+        }
+        fn stmt_has_suspend(s: &Stmt, names: &suspend_lower::SuspendNameSet) -> bool {
+            match s {
+                Stmt::Expr(e) => expr_has_suspend(e, names),
+                Stmt::Assign { target, value, .. } => {
+                    expr_has_suspend(target, names) || expr_has_suspend(value, names)
+                }
+                Stmt::Decl(klio_ast::Decl::Property(p)) => {
+                    p.init.as_ref().map_or(false, |e| expr_has_suspend(e, names))
+                }
+                _ => false,
+            }
+        }
+        let Some(body) = decl.body.as_ref() else { return false };
+        let names = &self.suspend_function_names;
+        match body {
+            FunctionBody::Block(b) => !b.stmts.iter().any(|s| stmt_has_suspend(s, names)),
+            FunctionBody::Expr(e) => !expr_has_suspend(e, names),
+        }
+    }
+
     fn call_function(
         &mut self,
         decl: &klio_ast::Function,
@@ -1798,8 +1882,13 @@ impl Interpreter {
         // resume. Non-suspending functions use the direct call
         // path.
         if decl.is_suspend && matches!(decl.body.as_ref(), Some(klio_ast::FunctionBody::Block(_))) {
-            let rc = Rc::new(decl.clone());
-            return self.drive_suspend_function(&rc, captured_env, args, out);
+            // Suspend bodies that never reach a suspension point can
+            // run through the regular call path; only those that
+            // actually pause need the state-machine driver.
+            if !self.suspend_body_runs_inline(decl) {
+                let rc = Rc::new(decl.clone());
+                return self.drive_suspend_function(&rc, captured_env, args, out);
+            }
         }
         self.call_function_named(decl, captured_env, args, &[], out)
     }
