@@ -12883,6 +12883,31 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     && p.setter.is_none()
                     && p.delegate.is_none()
             });
+            // Allow a parent class only when it's itself trivially
+            // constructible — no primary params, no init blocks,
+            // no body properties, no secondary ctors, no parent
+            // of its own. Walks the parent chain so a chain of
+            // empty bases (`open class A; open class B : A();`)
+            // still qualifies.
+            let parent_trivial = {
+                let mut cur = cls.parent.borrow().clone();
+                let mut ok = true;
+                while let Some(p) = cur {
+                    let p_ok = p.primary_params.is_empty()
+                        && p.init_blocks.is_empty()
+                        && p.body_properties.is_empty()
+                        && p.secondary_ctors.is_empty()
+                        && p.parent_ctor_args.is_empty()
+                        && p.supertype_delegates.borrow().is_empty()
+                        && p.delegate_forwarders.borrow().is_empty();
+                    if !p_ok {
+                        ok = false;
+                        break;
+                    }
+                    cur = p.parent.borrow().clone();
+                }
+                ok
+            };
             let simple = !cls.is_inner
                 && !cls.is_anonymous
                 && !cls.is_abstract
@@ -12895,7 +12920,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 && cls.supertype_delegates.borrow().is_empty()
                 && cls.delegate_forwarders.borrow().is_empty()
                 && body_props_ok
-                && cls.parent.borrow().is_none()
+                && parent_trivial
                 && args.len() == cls.primary_params.len();
             if simple {
                 let identity = self.interp.next_instance_id();
