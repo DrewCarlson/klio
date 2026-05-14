@@ -12327,9 +12327,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // `a.hashCode() == b.hashCode()`.
             if args.is_empty() && name == "hashCode" {
                 let i = inst.borrow();
-                if i.class.is_data
-                    && !i.class.methods.iter().any(|m| m.name == "hashCode")
-                {
+                if i.class.is_data && i.class.find_method("hashCode").is_none() {
                     let mut h: i32 = 0;
                     for p in &i.class.primary_params {
                         let v = i.get(&p.name).unwrap_or(klio_runtime::Value::Null);
@@ -12343,9 +12341,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // identity required; non-instance returns false.
             if args.len() == 1 && name == "equals" {
                 let i = inst.borrow();
-                if i.class.is_data
-                    && !i.class.methods.iter().any(|m| m.name == "equals")
-                {
+                if i.class.is_data && i.class.find_method("equals").is_none() {
                     let class_fqn = i.class.fqn.clone();
                     let primary_names: Vec<String> = i
                         .class
@@ -12378,9 +12374,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // dispatch path above would have taken over).
             if args.is_empty() && name == "toString" {
                 let i = inst.borrow();
-                if i.class.is_data
-                    && !i.class.methods.iter().any(|m| m.name == "toString")
-                {
+                if i.class.is_data && i.class.find_method("toString").is_none() {
                     let mut s = String::new();
                     s.push_str(&i.class.name);
                     // `data object Foo` toString is just `Foo`
