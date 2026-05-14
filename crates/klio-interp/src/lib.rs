@@ -867,8 +867,22 @@ impl Interpreter {
         files: &[KotlinFile],
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, String> {
+        match self.run_module_ir_typed(files, out) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(format!("{e}")),
+        }
+    }
+
+    /// Variant of `run_module_ir` that preserves the underlying
+    /// `RuntimeError` variant (so `Thrown(Exception)`, `Arity`,
+    /// etc. survive instead of being flattened to a message).
+    pub fn run_module_ir_typed(
+        &mut self,
+        files: &[KotlinFile],
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, RuntimeError> {
         if files.is_empty() {
-            return Err("no input files".into());
+            return Err(RuntimeError::NoMain);
         }
         let main_idx = files.iter().position(|f| {
             f.decls.iter().any(|d| {
@@ -879,11 +893,10 @@ impl Interpreter {
             if Some(i) == main_idx {
                 continue;
             }
-            self.register_file_decls(file, out)
-                .map_err(|e| format!("bootstrap: {e}"))?;
+            self.register_file_decls(file, out)?;
         }
-        let main_idx = main_idx.ok_or_else(|| "no `fun main` across the supplied files".to_string())?;
-        self.run_ir(&files[main_idx], out)
+        let main_idx = main_idx.ok_or(RuntimeError::NoMain)?;
+        self.run_ir_typed(&files[main_idx], out)
     }
 
     pub fn run_ir(
@@ -891,13 +904,18 @@ impl Interpreter {
         file: &KotlinFile,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, String> {
-        // Use the existing tree-walker as the bootstrap pass so
-        // class shells, top-level fns, and stdlib bindings are
-        // available to the IR Host. The walker registers everything
-        // into the interpreter's globals and class_table before we
-        // dispatch through the IR.
-        self.register_file_decls(file, out)
-            .map_err(|e| format!("bootstrap: {e}"))?;
+        match self.run_ir_typed(file, out) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(format!("{e}")),
+        }
+    }
+
+    pub fn run_ir_typed(
+        &mut self,
+        file: &KotlinFile,
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, RuntimeError> {
+        self.register_file_decls(file, out)?;
 
         // Now lower the file's classes / top-level fns into an IR
         // module. Classes go first so Path→NewInstance routing
@@ -928,7 +946,7 @@ impl Interpreter {
                 }
             }
         }
-        let main_id = main_id.ok_or_else(|| "no `fun main` in file".to_string())?;
+        let main_id = main_id.ok_or(RuntimeError::NoMain)?;
         let func = module.funcs[main_id.0 as usize].clone();
         // Pre-stash class names indexed by IR ClassId so the Host
         // can resolve NewInstance(class_id, args) without re-walking
@@ -948,15 +966,15 @@ impl Interpreter {
             module: std::rc::Rc::clone(&module_rc),
             method_index,
         };
-        klio_ir::eval::eval_with(&module_rc, &func, Vec::new(), &mut host)
-            .map_err(|e| {
-                // Strip the "IR type error: " prefix the evaluator
-                // adds so the message format matches the tree
-                // walker byte-for-byte. Both paths surface the same
-                // semantic error.
-                let s = format!("{e}");
-                s.strip_prefix("IR type error: ").map(|x| x.to_string()).unwrap_or(s)
-            })
+        match klio_ir::eval::eval_with(&module_rc, &func, Vec::new(), &mut host) {
+            Ok(v) => Ok(v),
+            Err(klio_ir::eval::EvalError::Throw(v)) => Err(RuntimeError::Thrown(v)),
+            Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => Ok(v),
+            Err(klio_ir::eval::EvalError::Arity(s)) => Err(RuntimeError::Arity(s)),
+            Err(klio_ir::eval::EvalError::Unbound(s)) => Err(RuntimeError::Unbound(s)),
+            Err(klio_ir::eval::EvalError::Unimplemented(s)) => Err(RuntimeError::Unimplemented(s)),
+            Err(e) => Err(RuntimeError::Type(format!("{e}"))),
+        }
     }
 
     fn globals_ref(&self) -> Rc<RefCell<Env>> {
@@ -968,7 +986,12 @@ impl Interpreter {
         file: &KotlinFile,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
-        self.run_with_output_impl(file, out, /*invoke_main=*/ true, /*persist=*/ false)
+        // Tree-walker entry-point — routes through the IR
+        // evaluator so all execution converges on one pipeline.
+        // Errors surface as `RuntimeError::Type(message)` for
+        // now; callers that need specific variants should
+        // pattern-match on the formatted message.
+        self.run_module_ir_typed(std::slice::from_ref(file), out)
     }
 
     /// Pure declaration-registration pass. Walks the file and
@@ -11366,6 +11389,9 @@ fn ir_err(e: klio_runtime::RuntimeError) -> klio_ir::eval::EvalError {
     match e {
         klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
         klio_runtime::RuntimeError::Return(v) => klio_ir::eval::EvalError::NonLocalReturn(v),
+        klio_runtime::RuntimeError::Arity(s) => klio_ir::eval::EvalError::Arity(s),
+        klio_runtime::RuntimeError::Unbound(s) => klio_ir::eval::EvalError::Unbound(s),
+        klio_runtime::RuntimeError::Unimplemented(s) => klio_ir::eval::EvalError::Unimplemented(s),
         other => klio_ir::eval::EvalError::Type(other.to_string()),
     }
 }
@@ -11857,9 +11883,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     {
                         return Ok(v);
                     }
-                    return Err(klio_ir::eval::EvalError::Type(msg));
+                    return Err(ir_err(e));
                 }
-                Err(klio_ir::eval::EvalError::Type(msg))
+                Err(ir_err(e))
             }
         }
     }
@@ -12268,6 +12294,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             || self.interp.has_top_level_default(&name);
         let has_overloads = self.interp.has_top_level_overloads(&name);
         let has_vararg = self.interp.has_top_level_vararg(&name);
+        if !has_names && !has_defaults && !has_overloads && !has_vararg && args.len() != f.params.len() {
+            return Err(klio_ir::eval::EvalError::Arity(format!(
+                "Wrong number of arguments for `{name}`: expected {}, got {}",
+                f.params.len(),
+                args.len()
+            )));
+        }
         if has_names || has_defaults || has_overloads || has_vararg || arg_names.len() == args.len() && args.len() < f.params.len() {
             if let Some(v) = self
                 .interp

@@ -318,6 +318,15 @@ pub enum EvalError {
     /// return value.
     #[error("non-local return inside IR evaluator")]
     NonLocalReturn(Value),
+    /// Arity mismatch — caller passed wrong number of args.
+    #[error("arity mismatch: {0}")]
+    Arity(String),
+    /// Unbound identifier reachable through the IR.
+    #[error("unbound identifier: {0}")]
+    Unbound(String),
+    /// Operation not yet implemented on this value.
+    #[error("not yet implemented: {0}")]
+    Unimplemented(String),
 }
 
 /// Per-call evaluation frame.
