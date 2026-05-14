@@ -136,6 +136,75 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.switch_to(exit);
             b.emit_const(Const::Unit)
         }
+        Expr::Member { receiver, name, .. } => {
+            // Bare member read. `recv.method(...)` is handled by
+            // Expr::Call below; here we treat it as a field read,
+            // which the evaluator resolves at run time against the
+            // receiver's class table.
+            let recv = lower_expr(b, receiver);
+            let dst = b.alloc_reg();
+            let field = b.module.intern_const(Const::String(name.name.clone()));
+            b.push(Inst::GetField { dst, receiver: recv, field });
+            dst
+        }
+        Expr::Call { callee, args, .. } => {
+            // Lower the callee's receiver / value separately so the
+            // dispatcher knows whether to emit CallMember or
+            // CallValue.
+            match callee.as_ref() {
+                Expr::Member { receiver, name, .. } => {
+                    let recv = lower_expr(b, receiver);
+                    let args_start = b.alloc_reg();
+                    let mut next = args_start;
+                    let mut count = 0u8;
+                    for (i, a) in args.iter().enumerate() {
+                        let r = lower_expr(b, a);
+                        if i == 0 {
+                            // First arg overwrites the reserved slot.
+                            b.push(Inst::Move { dst: args_start, src: r });
+                        } else {
+                            next = b.alloc_reg();
+                            b.push(Inst::Move { dst: next, src: r });
+                        }
+                        count += 1;
+                    }
+                    let _ = next;
+                    let dst = b.alloc_reg();
+                    let nm = b.module.intern_const(Const::String(name.name.clone()));
+                    b.push(Inst::CallMember {
+                        dst,
+                        receiver: recv,
+                        name: nm,
+                        args: args_start,
+                        n_args: count,
+                    });
+                    dst
+                }
+                _ => {
+                    let callee_r = lower_expr(b, callee);
+                    let args_start = b.alloc_reg();
+                    let mut count = 0u8;
+                    for (i, a) in args.iter().enumerate() {
+                        let r = lower_expr(b, a);
+                        if i == 0 {
+                            b.push(Inst::Move { dst: args_start, src: r });
+                        } else {
+                            let nx = b.alloc_reg();
+                            b.push(Inst::Move { dst: nx, src: r });
+                        }
+                        count += 1;
+                    }
+                    let dst = b.alloc_reg();
+                    b.push(Inst::CallValue {
+                        dst,
+                        callee: callee_r,
+                        args: args_start,
+                        n_args: count,
+                    });
+                    dst
+                }
+            }
+        }
         Expr::DoWhile { body, cond, .. } => {
             let body_blk = b.alloc_block();
             let exit = b.alloc_block();
@@ -320,6 +389,59 @@ mod tests {
         };
         let r = lower_expr(&mut b, &path);
         assert_eq!(r, p, "path should resolve to bound param register");
+    }
+
+    #[test]
+    fn lowers_member_get_field() {
+        let mut m = Module::default();
+        let mut b = FuncBuilder::new(&mut m);
+        let recv = b.alloc_reg();
+        b.bind("o", recv);
+        let expr = Expr::Member {
+            receiver: Box::new(Expr::Path {
+                segments: vec![klio_ast::Ident { name: "o".into(), span: dummy_span() }],
+                span: dummy_span(),
+            }),
+            name: klio_ast::Ident { name: "field".into(), span: dummy_span() },
+            safe: false,
+            span: dummy_span(),
+        };
+        let _ = lower_expr(&mut b, &expr);
+        let func = b.finish("f", "test.f", TypeRef::unit());
+        assert!(func.blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::GetField { .. })));
+    }
+
+    #[test]
+    fn lowers_member_call_emits_call_member() {
+        let mut m = Module::default();
+        let mut b = FuncBuilder::new(&mut m);
+        let recv = b.alloc_reg();
+        b.bind("o", recv);
+        let expr = Expr::Call {
+            callee: Box::new(Expr::Member {
+                receiver: Box::new(Expr::Path {
+                    segments: vec![klio_ast::Ident { name: "o".into(), span: dummy_span() }],
+                    span: dummy_span(),
+                }),
+                name: klio_ast::Ident { name: "doit".into(), span: dummy_span() },
+                safe: false,
+                span: dummy_span(),
+            }),
+            args: vec![int_lit(1), int_lit(2)],
+            arg_names: vec![None, None],
+            type_args: vec![],
+            is_infix: false,
+            span: dummy_span(),
+        };
+        let _ = lower_expr(&mut b, &expr);
+        let func = b.finish("f", "test.f", TypeRef::unit());
+        assert!(func.blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::CallMember { n_args: 2, .. })));
     }
 
     #[test]
