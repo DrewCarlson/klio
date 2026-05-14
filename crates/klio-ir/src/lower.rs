@@ -351,6 +351,30 @@ pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::Cl
             own_member_names.insert(p.name.name.clone());
         }
     }
+    // Companion-object members are visible under their bare
+    // names inside this class's method bodies.
+    for m in &c.members {
+        if let klio_ast::Decl::Class(inner) = m {
+            if inner.is_companion {
+                for cm in &inner.members {
+                    match cm {
+                        klio_ast::Decl::Function(f) => {
+                            own_member_names.insert(f.name.name.clone());
+                        }
+                        klio_ast::Decl::Property(p) => {
+                            own_member_names.insert(p.name.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                for p in &inner.primary_params {
+                    if p.property.is_some() {
+                        own_member_names.insert(p.name.name.clone());
+                    }
+                }
+            }
+        }
+    }
     let mut methods: Vec<crate::FuncId> = Vec::new();
     for m in &c.members {
         if let klio_ast::Decl::Function(f) = m {
