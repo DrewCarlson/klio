@@ -31,6 +31,85 @@ use crate::{BinOp, BlockId, Const, Inst, Reg, Terminator, UnOp};
 /// initials for class / object names. Limiting FQN-flattening to
 /// lowercase heads keeps `Status.Active` / `Foo.Companion` member
 /// access routed through GetField on the actual class value.
+/// True when `arg` is a lambda whose body assigns to a name that
+/// the IR's current scope shadows or knows as an outer capture.
+/// Used to detour calls that would otherwise lose mutable-capture
+/// semantics through the value-snapshot closure model.
+fn lambda_writes_outer_var(b: &FuncBuilder<'_>, arg: &Expr) -> bool {
+    let body = match arg {
+        Expr::Lambda { body, .. } => body,
+        _ => return false,
+    };
+    let visible = b.visible_names();
+    fn walk(stmt: &klio_ast::Stmt, visible: &std::collections::HashSet<String>) -> bool {
+        match stmt {
+            klio_ast::Stmt::Assign { target, .. } => {
+                if let Expr::Path { segments, .. } = target {
+                    if segments.len() == 1 && visible.contains(&segments[0].name) {
+                        return true;
+                    }
+                }
+                false
+            }
+            klio_ast::Stmt::Expr(e) => walk_expr(e, visible),
+            _ => false,
+        }
+    }
+    // Postfix `x++` / `x--` and prefix `++x` / `--x` on a Path
+    // visible from the outer scope mutate that var. Also count
+    // `return` from inside the lambda body: when the bare `return`
+    // resolves to a non-local return (e.g. `forEach` lambda
+    // returning from the enclosing function), the IR's lambda
+    // would translate it as a local return and lose the semantics.
+    fn is_path_outer(e: &Expr, visible: &std::collections::HashSet<String>) -> bool {
+        matches!(e, Expr::Path { segments, .. } if segments.len() == 1 && visible.contains(&segments[0].name))
+    }
+    fn walk_expr(e: &Expr, visible: &std::collections::HashSet<String>) -> bool {
+        match e {
+            Expr::Postfix { op, expr, .. } => {
+                matches!(op, klio_ast::PostfixOp::Inc | klio_ast::PostfixOp::Dec)
+                    && is_path_outer(expr, visible)
+            }
+            Expr::Unary { op, expr, .. } => {
+                matches!(op, klio_ast::UnOp::PreInc | klio_ast::UnOp::PreDec)
+                    && is_path_outer(expr, visible)
+            }
+            Expr::Return { .. } => {
+                // Bare `return` from inside the lambda body —
+                // upstream treats this as a non-local return.
+                // Force EvalAst fallback for the call.
+                true
+            }
+            Expr::Block(b) => b.stmts.iter().any(|s| walk(s, visible)),
+            Expr::If { cond, then_branch, else_branch, .. } => {
+                walk_expr(cond, visible)
+                    || walk_expr(then_branch, visible)
+                    || else_branch.as_ref().map_or(false, |e| walk_expr(e, visible))
+            }
+            Expr::While { cond, body, .. } => {
+                walk_expr(cond, visible) || walk_expr(body, visible)
+            }
+            Expr::DoWhile { body, cond, .. } => {
+                body.as_ref().map_or(false, |b| walk_expr(b, visible))
+                    || walk_expr(cond, visible)
+            }
+            Expr::For { body, .. } => walk_expr(body, visible),
+            Expr::When { branches, .. } => branches.iter().any(|br| walk_expr(&br.body, visible)),
+            Expr::Try { body, catches, finally, .. } => {
+                body.stmts.iter().any(|s| walk(s, visible))
+                    || catches
+                        .iter()
+                        .any(|c| c.body.stmts.iter().any(|s| walk(s, visible)))
+                    || finally
+                        .as_ref()
+                        .map_or(false, |b| b.stmts.iter().any(|s| walk(s, visible)))
+            }
+            _ => false,
+        }
+    }
+    body.stmts.iter().any(|s| walk(s, &visible))
+}
+
 fn is_package_head(name: &str) -> bool {
     if name.chars().next().map_or(false, |c| c.is_lowercase()) {
         return true;
@@ -601,6 +680,29 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 arg_names: Vec::new(),
             });
             dst
+        }
+        Expr::Call { args, .. }
+            if args.iter().any(|a| lambda_writes_outer_var(b, a)) =>
+        {
+            // Call passing a lambda that assigns to an outer-scope
+            // variable. The IR's value-snapshot captures wouldn't
+            // surface those writes; route the whole call through
+            // tree-walker EvalAst so its Env chain propagates the
+            // mutation back to the enclosing fn.
+            let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let captured_names: Vec<String> = outer_names.iter().cloned().collect();
+            let captures: Vec<Reg> = captured_names
+                .iter()
+                .filter_map(|n| b.resolve(n))
+                .collect();
+            let dst = b.alloc_reg();
+            b.push(Inst::EvalAst {
+                dst,
+                ast: Box::new(expr.clone()),
+                captured_names,
+                captures,
+            });
+            return dst;
         }
         Expr::Call { type_args, .. } if !type_args.is_empty() => {
             // Explicit type arguments (`foo<String>(x)`) propagate
