@@ -12576,11 +12576,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 // fun to` and other `a name b` shapes where `name`
                 // is a top-level fn (or name-dispatched intrinsic
                 // like `to` / `compareBy`) rather than a member.
+                // Propagate Thrown errors as IR Throws so user
+                // `catch` arms fire. Other RuntimeError variants
+                // (Unimplemented, Type, etc.) surface as the
+                // "not resolved" diagnostic.
+                if let klio_runtime::RuntimeError::Thrown(_) = &e {
+                    return Err(ir_err(e));
+                }
                 let mut all = Vec::with_capacity(args.len() + 1);
                 all.push(receiver.clone());
                 all.extend_from_slice(args);
-                if let Ok(v) = self.interp.invoke_named_intrinsic(name, &all, self.out) {
-                    return Ok(v);
+                match self.interp.invoke_named_intrinsic(name, &all, self.out) {
+                    Ok(v) => return Ok(v),
+                    Err(klio_runtime::RuntimeError::Thrown(v)) => {
+                        return Err(klio_ir::eval::EvalError::Throw(v));
+                    }
+                    Err(_) => {}
                 }
                 Err(klio_ir::eval::EvalError::Type(format!(
                     "IR Host: member call `{name}` on {type_fqn} not resolved: {e}"
