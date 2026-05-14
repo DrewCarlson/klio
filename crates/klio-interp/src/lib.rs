@@ -12533,6 +12533,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 }
             }
         }
+        // Lambda receiver acting as a SAM interface — `apply({ s -> … }, x)`
+        // where the parameter type is `fun interface Greeter { fun greet(...) }`.
+        // The IR sees `g.greet(x)` on Value::Lambda; tree walker normally
+        // SAM-wraps the lambda at the call site. Just invoke the lambda
+        // with the supplied args.
+        if matches!(
+            receiver,
+            klio_runtime::Value::Lambda { .. }
+            | klio_runtime::Value::IrClosure { .. }
+            | klio_runtime::Value::BoundMethod { .. }
+        ) {
+            return self
+                .interp
+                .invoke_callable_value(receiver, args, &[], self.out)
+                .map_err(ir_err);
+        }
         // Class-static dispatch through a constructor receiver
         // (`Regex.escape(s)`, `StringBuilder.serialVersionUID`, …).
         // The stdlib registers companion-style statics as
