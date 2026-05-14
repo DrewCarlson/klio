@@ -11233,6 +11233,20 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // shuffle the segments back through the simple-name probes.
         if name.contains('.') {
             if let Some(f) = self.interp.lookup_intrinsic(name) {
+                // Property-style intrinsic: a 0-arg constant like
+                // `kotlin.math.PI`, `Int.MAX_VALUE` is typically
+                // referenced without parens. We detect them by the
+                // final segment being all-uppercase / underscore;
+                // auto-invoke so the value flows through cleanly.
+                let last = name.rsplit('.').next().unwrap_or(name);
+                let looks_const = !last.is_empty()
+                    && last.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit());
+                if looks_const {
+                    let mut ctx = CallCtx { args: &[], out: self.out };
+                    if let Ok(v) = f(&mut ctx) {
+                        return Some(v);
+                    }
+                }
                 let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
                 return Some(klio_runtime::Value::Intrinsic {
                     fqn: leaked,
@@ -11963,6 +11977,19 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         self.interp
             .eval_property_access(receiver.clone(), name, self.out)
             .map_err(ir_err)
+    }
+
+    fn eval_ast(
+        &mut self,
+        ast: &klio_ast::Expr,
+        captured_names: &[String],
+        captures: Vec<klio_runtime::Value>,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.interp.globals))));
+        for (n, v) in captured_names.iter().zip(captures.iter()) {
+            env.borrow_mut().define(n.clone(), v.clone());
+        }
+        self.interp.eval_expr(ast, &env, self.out).map_err(ir_err)
     }
 
     fn store_global(

@@ -163,6 +163,17 @@ pub enum Inst {
     /// delegated top-level property's setter (or a plain top-level
     /// `var`) gets updated.
     StoreGlobal { name: ConstId, value: Reg },
+    /// Evaluate a stashed AST expression through the host. Used for
+    /// constructs the IR lowering doesn't yet have a structured
+    /// representation for (today: `object { … }` anonymous objects).
+    /// The host receives the AST node + the current scope snapshot
+    /// and returns the evaluated Value.
+    EvalAst {
+        dst: Reg,
+        ast: Box<klio_ast::Expr>,
+        captured_names: Vec<String>,
+        captures: Vec<Reg>,
+    },
     /// Materialise a lambda value capturing the current scope's
     /// registers. The captures are listed as a `Vec<Reg>`; the
     /// evaluator snapshots the live values into a closure env.

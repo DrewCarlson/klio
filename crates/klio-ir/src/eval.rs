@@ -144,6 +144,19 @@ pub trait Host {
         Err(EvalError::Unsupported("Host::store_global"))
     }
 
+    /// Evaluate a stashed AST expression under a snapshot of the
+    /// caller's scope. Used by `Inst::EvalAst` for constructs the
+    /// IR lowering doesn't yet model structurally (anonymous
+    /// objects today).
+    fn eval_ast(
+        &mut self,
+        _ast: &klio_ast::Expr,
+        _captured_names: &[String],
+        _captures: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::eval_ast"))
+    }
+
     /// Materialise a closure value capturing the supplied snapshot
     /// of register values. `body_func` is a FuncId in the active
     /// module; concrete hosts build a `Value::Lambda` (or
@@ -577,6 +590,11 @@ fn exec_inst(
         Inst::AstLambda { dst, params, body_ast, captures, captured_names } => {
             let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
             let v = host.build_ast_lambda(params, body_ast, captured_names, cap_values)?;
+            frame.write(*dst, v);
+        }
+        Inst::EvalAst { dst, ast, captured_names, captures } => {
+            let captured_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
+            let v = host.eval_ast(ast, captured_names, captured_values)?;
             frame.write(*dst, v);
         }
         Inst::StoreGlobal { name, value } => {

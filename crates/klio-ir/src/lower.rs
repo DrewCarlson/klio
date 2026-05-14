@@ -893,6 +893,28 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             }
             _ => lower_expr(b, inner),
         },
+        Expr::ObjectExpr { .. } => {
+            // Anonymous-object expressions (`object { … }` /
+            // `object : Foo { … }`) carry rich AST shape (a body of
+            // declarations, supertypes, init blocks) that the IR
+            // doesn't model directly. Stash the AST node and a
+            // snapshot of the visible scope so the host's tree
+            // walker can evaluate it under the same environment.
+            let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let captured_names: Vec<String> = outer_names.iter().cloned().collect();
+            let captures: Vec<Reg> = captured_names
+                .iter()
+                .filter_map(|n| b.resolve(n))
+                .collect();
+            let dst = b.alloc_reg();
+            b.push(Inst::EvalAst {
+                dst,
+                ast: Box::new(expr.clone()),
+                captured_names,
+                captures,
+            });
+            dst
+        }
         Expr::AnonFun { params, body, .. } => {
             // Lower an anonymous function the same way as a lambda:
             // synthesise an AstLambda with the body packed into a
