@@ -487,6 +487,11 @@ impl Interpreter {
         } else {
             vec![None; args.len()]
         };
+        if overloads.len() == 1 {
+            let (decl, captured) = overloads.into_iter().next().unwrap();
+            let v = self.call_function_named(&decl, &captured, args, &names, out)?;
+            return Ok(Some(v));
+        }
         let Some((decl, captured)) = select_overload(&overloads, args, &names) else {
             return Ok(None);
         };
@@ -12054,15 +12059,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         let has_overloads = self.interp.has_top_level_overloads(&name);
         let has_vararg = self.interp.has_top_level_vararg(&name);
         if has_names || has_defaults || has_overloads || has_vararg || arg_names.len() == args.len() && args.len() < f.params.len() {
-            match self.interp.dispatch_top_level_overload(&name, &args, arg_names, self.out) {
-                Ok(Some(v)) => return Ok(v),
-                Ok(None) => {}
-                Err(e) => return Err(ir_err(e)),
-            }
-            return self
+            if let Some(v) = self
                 .interp
-                .invoke_named_intrinsic_with_names(&name, &args, arg_names, self.out)
-                .map_err(ir_err);
+                .dispatch_top_level_overload(&name, &args, arg_names, self.out)
+                .map_err(ir_err)?
+            {
+                return Ok(v);
+            }
         }
         let f = f.clone();
         let mut child = IrHost {
