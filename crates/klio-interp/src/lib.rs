@@ -362,7 +362,7 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<(), RuntimeError> {
         for file in files {
-            self.run_with_output_impl(file, out, /*invoke_main=*/ false, /*persist=*/ true)?;
+            self.register_file_decls(file, out)?;
         }
         Ok(())
     }
@@ -877,7 +877,7 @@ impl Interpreter {
             if Some(i) == main_idx {
                 continue;
             }
-            self.run_with_output_impl(file, out, /*invoke_main=*/ false, /*persist=*/ true)
+            self.register_file_decls(file, out)
                 .map_err(|e| format!("bootstrap: {e}"))?;
         }
         let main_idx = main_idx.ok_or_else(|| "no `fun main` across the supplied files".to_string())?;
@@ -894,7 +894,7 @@ impl Interpreter {
         // available to the IR Host. The walker registers everything
         // into the interpreter's globals and class_table before we
         // dispatch through the IR.
-        self.run_with_output_impl(file, out, /*invoke_main=*/ false, /*persist=*/ true)
+        self.register_file_decls(file, out)
             .map_err(|e| format!("bootstrap: {e}"))?;
 
         // Now lower the file's classes / top-level fns into an IR
@@ -954,6 +954,21 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
         self.run_with_output_impl(file, out, /*invoke_main=*/ true, /*persist=*/ false)
+    }
+
+    /// Pure declaration-registration pass. Walks the file and
+    /// registers every top-level class / function / property /
+    /// typealias into the interpreter's tables and the supplied
+    /// `file_env`. Does not invoke `main`. Used by the IR run
+    /// path so all `Value::Function` / `Value::Class` references
+    /// resolve before the IR evaluator drives `fun main`.
+    fn register_file_decls(
+        &mut self,
+        file: &KotlinFile,
+        out: &mut dyn Output,
+    ) -> Result<(), RuntimeError> {
+        self.run_with_output_impl(file, out, /*invoke_main=*/ false, /*persist=*/ true)?;
+        Ok(())
     }
 
     /// Internal entry point. When `invoke_main` is true the file's
