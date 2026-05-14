@@ -3607,6 +3607,15 @@ impl Interpreter {
             Value::BoundUserMethod { receiver, method } => {
                 self.call_method(receiver, method, args, arg_names, out)
             }
+            Value::Class(class) => self
+                .construct_by_name_with_names(&class.name, args, arg_names, out),
+            Value::BoundInnerClass { class, outer } => self.construct_instance_with_outer(
+                class,
+                args,
+                arg_names,
+                Some(Value::Instance(Rc::clone(outer))),
+                out,
+            ),
             _ => Err(RuntimeError::Type(format!(
                 "value is not callable: {callee:?}"
             ))),
@@ -12008,11 +12017,30 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             }
         }
         if args.is_empty() {
-            // Try property access first (getters / fields).
+            // Try property access first (getters / fields). If it
+            // resolves to a callable (e.g. `o.Inner` → BoundInnerClass
+            // for a nested class on the outer instance), invoke it as
+            // a 0-arg call — `o.Inner()` is a constructor invocation
+            // at the source level.
             if let Ok(v) = self
                 .interp
                 .eval_property_access(receiver.clone(), name, self.out)
             {
+                if matches!(
+                    v,
+                    klio_runtime::Value::Class(_)
+                        | klio_runtime::Value::BoundInnerClass { .. }
+                        | klio_runtime::Value::Lambda { .. }
+                        | klio_runtime::Value::IrClosure { .. }
+                        | klio_runtime::Value::Intrinsic { .. }
+                        | klio_runtime::Value::Function { .. }
+                        | klio_runtime::Value::BoundMethod { .. }
+                ) {
+                    return self
+                        .interp
+                        .invoke_callable_value(&v, args, &[], self.out)
+                        .map_err(ir_err);
+                }
                 return Ok(v);
             }
             // Fall through to method-call synthesis so auto-generated
