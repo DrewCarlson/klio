@@ -922,7 +922,7 @@ impl Interpreter {
         let mut main_id: Option<klio_ir::FuncId> = None;
         for d in &file.decls {
             if let Decl::Function(f) = d {
-                let func = klio_ir::lower::lower_function(&mut module, f);
+                let func = klio_ir::lower::lower_function_with_file(&mut module, f, &file_classes);
                 if f.name.name == "main" {
                     main_id = Some(func.id);
                 }

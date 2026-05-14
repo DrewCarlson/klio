@@ -431,9 +431,16 @@ pub fn lower_class_with_file(
 /// `bind_params`; the trailing implicit return falls through to a
 /// `Return` terminator.
 pub fn lower_function(module: &mut crate::Module, f: &klio_ast::Function) -> crate::Func {
-    // Wrapper that, after lowering, appends the func to the module
-    // and assigns its id.
-    let func = lower_function_body(module, f);
+    let empty = std::collections::HashMap::new();
+    lower_function_with_file(module, f, &empty)
+}
+
+pub fn lower_function_with_file(
+    module: &mut crate::Module,
+    f: &klio_ast::Function,
+    file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
+) -> crate::Func {
+    let func = lower_function_body(module, f, file_classes);
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
     placed.id = id;
@@ -442,62 +449,63 @@ pub fn lower_function(module: &mut crate::Module, f: &klio_ast::Function) -> cra
     placed
 }
 
-fn lower_function_body(module: &mut crate::Module, f: &klio_ast::Function) -> crate::Func {
+fn lower_function_body(
+    module: &mut crate::Module,
+    f: &klio_ast::Function,
+    file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
+) -> crate::Func {
     // Extension functions (`fun T.foo(...)`) need `this` bound
     // as the implicit first param so the body's references to
     // `this` and `this.x` resolve through the receiver reg
     // rather than as a free global. Plain top-level functions
     // have no receiver, so no implicit params.
-    if f.receiver_type.is_some() {
-        lower_function_body_with_implicit(module, f, &["this"])
+    if let Some(recv) = &f.receiver_type {
+        let mut members: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(parent_cls) = file_classes.get(&recv.name.name) {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            fn collect_recv_members(
+                c: &klio_ast::Class,
+                file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
+                out: &mut std::collections::HashSet<String>,
+                seen: &mut std::collections::HashSet<String>,
+            ) {
+                if !seen.insert(c.name.name.clone()) {
+                    return;
+                }
+                for m in &c.members {
+                    match m {
+                        klio_ast::Decl::Function(f) => {
+                            out.insert(f.name.name.clone());
+                        }
+                        klio_ast::Decl::Property(p) => {
+                            out.insert(p.name.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                for p in &c.primary_params {
+                    if p.property.is_some() {
+                        out.insert(p.name.name.clone());
+                    }
+                }
+                for sup in &c.supertypes {
+                    if let Some(parent) = file_classes.get(&sup.name.name) {
+                        collect_recv_members(parent, file_classes, out, seen);
+                    }
+                }
+            }
+            collect_recv_members(parent_cls, file_classes, &mut members, &mut seen);
+        }
+        lower_function_body_with_implicit_owner(
+            module,
+            f,
+            &["this"],
+            None,
+            Some(&members),
+        )
     } else {
-        lower_function_body_with_implicit(module, f, &[])
+        lower_function_body_with_implicit_owner(module, f, &[], None, None)
     }
-}
-
-/// Lower a function body, prepending implicit parameters (typically
-/// `this` for instance methods). The implicit names bind to the
-/// first registers before the declared params, so `this.x` reads
-/// through `b.resolve("this")` → instance reg → `GetField`.
-fn lower_function_body_with_implicit(
-    module: &mut crate::Module,
-    f: &klio_ast::Function,
-    implicit_params: &[&str],
-) -> crate::Func {
-    let mut b = FuncBuilder::new(module);
-    let mut names: Vec<&str> = Vec::with_capacity(implicit_params.len() + f.params.len());
-    names.extend_from_slice(implicit_params);
-    names.extend(f.params.iter().map(|p| p.name.name.as_str()));
-    bind_params(&mut b, &names);
-
-    let result = match &f.body {
-        Some(klio_ast::FunctionBody::Block(blk)) => Some(lower_block(&mut b, blk)),
-        Some(klio_ast::FunctionBody::Expr(e)) => Some(lower_expr(&mut b, e)),
-        None => None,
-    };
-    b.terminate(Terminator::Return(result));
-    let fqn = f.name.name.clone();
-    let mut func = b.finish(f.name.name.clone(), fqn, crate::TypeRef::unit());
-    // Parameter metadata for downstream consumers; types are
-    // unresolved at this stage. Implicit params (e.g. `this`) are
-    // listed first so the param-index → name mapping matches the
-    // bind_params order.
-    let mut params: Vec<crate::Param> = implicit_params
-        .iter()
-        .map(|n| crate::Param {
-            name: (*n).to_string(),
-            ty: crate::TypeRef::unit(),
-            default: None,
-        })
-        .collect();
-    params.extend(f.params.iter().map(|p| crate::Param {
-        name: p.name.name.clone(),
-        ty: crate::TypeRef::unit(),
-        default: None,
-    }));
-    func.params = params;
-    func.is_suspend = f.is_suspend;
-    func
 }
 
 /// Lower a method body with `this` bound as the implicit first
@@ -1005,6 +1013,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         && b.resolve(head).is_none()
                         && !b.knows_outer(head)
                         && b.module.class_id(head).is_none()
+                        // Inside a method / extension body, the
+                        // head could be `this.<head>`; don't
+                        // shortcut to a global FQN.
+                        && b.resolve("this").is_none()
                     {
                         let dst = b.alloc_reg();
                         let n = b.module.intern_const(Const::String(fqn));
@@ -2529,6 +2541,16 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                         b.push(Inst::Move { dst: home, src: combined });
                     } else if b.resolve(&segments[0].name).is_some() {
                         b.rebind(&segments[0].name, combined);
+                    } else if b.has_own_member(&segments[0].name)
+                        && b.resolve("this").is_some()
+                    {
+                        // Method-body `this.field` write — route
+                        // SetField on the receiver so the bare-
+                        // name assign reaches the instance, not
+                        // a synthetic global.
+                        let this_reg = b.resolve("this").unwrap();
+                        let field = b.module.intern_const(Const::String(segments[0].name.clone()));
+                        b.push(Inst::SetField { receiver: this_reg, field, value: combined });
                     } else {
                         // Top-level binding: route through StoreGlobal so
                         // the tree-walker setter / delegate fires.
