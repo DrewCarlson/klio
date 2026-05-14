@@ -471,6 +471,29 @@ impl Interpreter {
             .map_or(false, |v| v.len() > 1)
     }
 
+    pub fn dispatch_top_level_overload(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        arg_names: &[Option<String>],
+        out: &mut dyn Output,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let overloads = match self.top_level_overloads.get(name) {
+            Some(o) if !o.is_empty() => o.clone(),
+            _ => return Ok(None),
+        };
+        let names = if arg_names.len() == args.len() {
+            arg_names.to_vec()
+        } else {
+            vec![None; args.len()]
+        };
+        let Some((decl, captured)) = select_overload(&overloads, args, &names) else {
+            return Ok(None);
+        };
+        let v = self.call_function_named(&decl, &captured, args, &names, out)?;
+        Ok(Some(v))
+    }
+
     /// True when any registered top-level overload for `name`
     /// declares a `vararg` parameter. Vararg packing + spread
     /// (`*args`) is handled in `invoke_named_intrinsic` rather than
@@ -11882,10 +11905,12 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         if let klio_runtime::Value::Function { decl, .. } = callee {
             let name = decl.name.name.clone();
             if self.interp.has_top_level_overloads(&name) {
-                return self
-                    .interp
-                    .invoke_named_intrinsic(&name, args, self.out)
-                    .map_err(ir_err);
+                let names = vec![None; args.len()];
+                match self.interp.dispatch_top_level_overload(&name, args, &names, self.out) {
+                    Ok(Some(v)) => return Ok(v),
+                    Ok(None) => {}
+                    Err(e) => return Err(ir_err(e)),
+                }
             }
         }
         // Value::Class callee → constructor call. Dispatch through
