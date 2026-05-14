@@ -414,6 +414,17 @@ pub fn lower_class_with_file(
         own_member_names.insert("name".to_string());
         own_member_names.insert("ordinal".to_string());
     }
+    // Nested class / enum / object names are visible under
+    // their bare names inside the enclosing class's method
+    // bodies (e.g. `TrafficLight.State.RED` reachable as
+    // `State.RED` from a TrafficLight method).
+    for m in &c.members {
+        if let klio_ast::Decl::Class(inner) = m {
+            if !inner.is_companion {
+                own_member_names.insert(inner.name.name.clone());
+            }
+        }
+    }
     // Companion-object members are visible under their bare
     // names inside this class's method bodies.
     for m in &c.members {
