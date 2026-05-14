@@ -31,14 +31,16 @@ struct Frame<'a> {
     module: &'a Module,
     func: &'a Func,
     regs: Vec<Value>,
+    params: Vec<Value>,
 }
 
 impl<'a> Frame<'a> {
-    fn new(module: &'a Module, func: &'a Func) -> Self {
+    fn new(module: &'a Module, func: &'a Func, params: Vec<Value>) -> Self {
         Self {
             module,
             func,
             regs: vec![Value::Unit; func.n_locals as usize],
+            params,
         }
     }
 
@@ -59,10 +61,11 @@ impl<'a> Frame<'a> {
     }
 }
 
-/// Run a function body with no arguments. Returns the value carried
-/// by the terminating `Return`, or `Unit` for a fall-off.
-pub fn eval(module: &Module, func: &Func) -> Result<Value, EvalError> {
-    let mut frame = Frame::new(module, func);
+/// Run a function body with the given positional arguments.
+/// Returns the value carried by the terminating `Return`, or
+/// `Unit` for a fall-off.
+pub fn eval(module: &Module, func: &Func, args: Vec<Value>) -> Result<Value, EvalError> {
+    let mut frame = Frame::new(module, func, args);
     let mut cur = func.entry;
     loop {
         // Clone the per-block instruction slice + terminator so the
@@ -130,6 +133,47 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst) -> Result<(), EvalError> {
             frame.write(*dst, out);
         }
         Inst::Trace { .. } => {}
+        Inst::LoadParam { dst, idx } => {
+            let v = frame
+                .params
+                .get(*idx as usize)
+                .cloned()
+                .unwrap_or(Value::Unit);
+            frame.write(*dst, v);
+        }
+        Inst::NotNullAssert { dst, src } => {
+            let v = frame.read(*src);
+            if matches!(v, Value::Null) {
+                return Err(EvalError::Type("null-pointer assertion failed".into()));
+            }
+            frame.write(*dst, v);
+        }
+        Inst::GetField { dst, receiver, field } => {
+            let r = frame.read(*receiver);
+            let name = match &frame.module.consts[field.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type("GetField: name not a string const".into())),
+            };
+            let v = match r {
+                Value::Instance(inst) => inst.borrow().get(&name).unwrap_or(Value::Null),
+                _ => return Err(EvalError::Type(format!("GetField on non-instance: {r:?}"))),
+            };
+            frame.write(*dst, v);
+        }
+        Inst::SetField { receiver, field, value } => {
+            let r = frame.read(*receiver);
+            let v = frame.read(*value);
+            let name = match &frame.module.consts[field.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type("SetField: name not a string const".into())),
+            };
+            match r {
+                Value::Instance(inst) => {
+                    inst.borrow_mut().define(&name, v);
+                }
+                _ => return Err(EvalError::Type(format!("SetField on non-instance: {r:?}"))),
+            }
+        }
         _ => return Err(EvalError::Unsupported("instruction not yet implemented")),
     }
     Ok(())
@@ -223,7 +267,7 @@ mod tests {
         let r = lit(&mut b, 7);
         b.terminate(Terminator::Return(Some(r)));
         let func = b.finish("f", "test.f", TypeRef::int());
-        let v = eval(&m, &func).unwrap();
+        let v = eval(&m, &func, Vec::new()).unwrap();
         assert!(matches!(v, Value::Int(7)));
     }
 
@@ -237,8 +281,20 @@ mod tests {
         b.push(Inst::BinOp { dst, op: BinOp::Add, lhs: l, rhs: r });
         b.terminate(Terminator::Return(Some(dst)));
         let func = b.finish("f", "test.f", TypeRef::int());
-        let v = eval(&m, &func).unwrap();
+        let v = eval(&m, &func, Vec::new()).unwrap();
         assert!(matches!(v, Value::Int(42)));
+    }
+
+    #[test]
+    fn eval_load_param() {
+        let mut m = Module::default();
+        let mut b = FuncBuilder::new(&mut m);
+        let p = b.alloc_reg();
+        b.push(Inst::LoadParam { dst: p, idx: 0 });
+        b.terminate(Terminator::Return(Some(p)));
+        let func = b.finish("f", "test.f", TypeRef::int());
+        let v = eval(&m, &func, vec![Value::Int(99)]).unwrap();
+        assert!(matches!(v, Value::Int(99)));
     }
 
     #[test]
@@ -259,7 +315,7 @@ mod tests {
         b.terminate(Terminator::Return(Some(f_val)));
 
         let func = b.finish("f", "test.f", TypeRef::int());
-        let v = eval(&m, &func).unwrap();
+        let v = eval(&m, &func, Vec::new()).unwrap();
         assert!(matches!(v, Value::Int(1)));
     }
 }
