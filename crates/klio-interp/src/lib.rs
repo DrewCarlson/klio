@@ -12756,6 +12756,48 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 ))
             })?
             .clone();
+        // IR-native ctor fast-path: when the class is a plain
+        // data/value carrier (no init blocks, no body-property
+        // initializers, no body-property delegates, no inner
+        // outer, no secondary ctors, no parent ctor args, no
+        // delegated supertypes, no SAM lambdas), allocate the
+        // instance and populate primary-ctor fields directly.
+        // Skips the tree-walker construct_instance_with_outer
+        // pipeline.
+        if let Some(cls) = self.interp.class_table.get(&name).cloned() {
+            let simple = !cls.is_inner
+                && !cls.is_anonymous
+                && !cls.is_abstract
+                && !cls.is_interface
+                && !cls.is_enum
+                && !cls.is_object
+                && cls.init_blocks.is_empty()
+                && cls.secondary_ctors.is_empty()
+                && cls.parent_ctor_args.is_empty()
+                && cls.supertype_delegates.borrow().is_empty()
+                && cls.delegate_forwarders.borrow().is_empty()
+                && cls.body_properties.is_empty()
+                && cls.parent.borrow().is_none()
+                && args.len() == cls.primary_params.len();
+            if simple {
+                let identity = self.interp.next_instance_id();
+                let mut fields: Vec<(String, klio_runtime::Value)> =
+                    Vec::with_capacity(cls.primary_params.len());
+                for (p, v) in cls.primary_params.iter().zip(args.iter()) {
+                    fields.push((p.name.clone(), v.clone()));
+                }
+                let inst = std::rc::Rc::new(std::cell::RefCell::new(
+                    klio_runtime::InstanceData {
+                        class: std::rc::Rc::clone(&cls),
+                        fields,
+                        outer: None,
+                        identity,
+                        native_state: None,
+                    },
+                ));
+                return Ok(klio_runtime::Value::Instance(inst));
+            }
+        }
         let empty = vec![None; args.len()];
         self.construct_by_name(&name, args, &empty).map_err(ir_err)
     }
