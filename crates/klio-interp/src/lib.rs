@@ -8118,7 +8118,11 @@ impl Interpreter {
         // (delegate captured once at construction).
         let delegate_descriptors = class.supertype_delegates.borrow().clone();
         for d in &delegate_descriptors {
-            let v = self.eval_expr(&d.expr, &ctor_env, out)?;
+            let v = match self.eval_property_init_via_ir(&d.expr, out) {
+                Some(Ok(v)) => v,
+                Some(Err(err)) => return Err(err),
+                None => self.eval_expr(&d.expr, &ctor_env, out)?,
+            };
             inst.borrow_mut().define(&d.field_key, v);
         }
         // After parent chain, run this class's body properties + init blocks.
