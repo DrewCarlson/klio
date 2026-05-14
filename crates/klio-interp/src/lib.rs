@@ -12631,6 +12631,26 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         if let Some(v) = self.interp.lookup_global_callable(name) {
             return Ok(Some(v));
         }
+        // IR-lowered getter wins over the tree walker route.
+        if let Some(fid) = self
+            .interp
+            .module_registry
+            .class_ir
+            .top_level_prop_getters
+            .get(name)
+            .copied()
+        {
+            let module = std::rc::Rc::clone(&self.module);
+            let func = module.funcs[fid.0 as usize].clone();
+            match klio_ir::eval::eval_with(&module, &func, Vec::new(), self) {
+                Ok(v) => return Ok(Some(v)),
+                Err(klio_ir::eval::EvalError::Throw(v)) => {
+                    return Err(klio_ir::eval::EvalError::Throw(v));
+                }
+                Err(klio_ir::eval::EvalError::Unsupported(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         if self.interp.has_top_level_property(name) {
             match self.interp.read_top_level_property_pub(name, self.out) {
                 Some(Ok(v)) => return Ok(Some(v)),
