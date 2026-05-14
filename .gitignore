@@ -5,3 +5,6 @@ Cargo.lock.bak
 kotlin-language-spec
 kotlin
 .idea
+# Internal design + roadmap notes; the public docs site lives at
+# docs/ via mkdocs.
+/plans
