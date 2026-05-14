@@ -6283,6 +6283,27 @@ impl Interpreter {
         env: &Rc<RefCell<Env>>,
         out: &mut dyn Output,
     ) -> Result<Option<Value>, RuntimeError> {
+        if matches!(name, "forEach") && args.len() == 1 {
+            let kind = match receiver {
+                Value::List { mutable: true, .. } => Some("MutableList"),
+                Value::List { .. } => Some("List"),
+                Value::Set { mutable: true, .. } => Some("MutableSet"),
+                Value::Set { .. } => Some("Set"),
+                Value::Map { mutable: true, .. } => Some("MutableMap"),
+                Value::Map { .. } => Some("Map"),
+                _ => None,
+            };
+            if let Some(k) = kind {
+                let fqn = format!("kotlin.collections.{k}.{name}");
+                if let Some(func) = klio_stdlib::implementation(&fqn) {
+                    let lam = self.eval_expr(&args[0], env, out)?;
+                    let arg_vals = [receiver.clone(), lam];
+                    let mut __interp_host = InterpHostRef { interp: self };
+                    let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                    return Ok(Some(func(&mut ctx)?));
+                }
+            }
+        }
         let (items, is_sequence) = match receiver {
             Value::List { items, .. } => (items.borrow().clone(), false),
             Value::Set { items, .. } => (items.borrow().clone(), false),

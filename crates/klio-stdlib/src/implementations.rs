@@ -594,6 +594,14 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableMap.putAll", coll_mut_map_put_all),
     ("kotlin.collections.MutableMap.set", coll_mut_map_set),
 
+    // ----- Iterable higher-order (lambda-driven) -----
+    ("kotlin.collections.List.forEach", coll_iter_for_each),
+    ("kotlin.collections.MutableList.forEach", coll_iter_for_each),
+    ("kotlin.collections.Set.forEach", coll_iter_for_each),
+    ("kotlin.collections.MutableSet.forEach", coll_iter_for_each),
+    ("kotlin.collections.Map.forEach", coll_iter_for_each),
+    ("kotlin.collections.MutableMap.forEach", coll_iter_for_each),
+
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
 
@@ -836,6 +844,36 @@ fn scope_take_unless(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     } else {
         Value::Null
     })
+}
+
+fn iterable_items(v: &Value, what: &str) -> Result<Vec<Value>, RuntimeError> {
+    match v {
+        Value::List { items, .. } | Value::Set { items, .. } => Ok(items.borrow().clone()),
+        Value::Map { entries, .. } => Ok(entries
+            .borrow()
+            .iter()
+            .map(|(k, v)| Value::MapEntry {
+                key: Box::new(k.clone()),
+                value: Box::new(v.clone()),
+            })
+            .collect()),
+        _ => Err(RuntimeError::Type(format!(
+            "{what} requires an iterable receiver"
+        ))),
+    }
+}
+
+fn coll_iter_for_each(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("forEach expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "forEach")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for v in items {
+        host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+    }
+    Ok(Value::Unit)
 }
 
 fn scope_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
