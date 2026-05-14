@@ -12949,17 +12949,27 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // tree walker's init pipeline. Pure-shape bodies (`val
             // computed: Int`-style without bodies) leave fields
             // undefined just like the tree walker would.
-            // Each body property's init must be a simple literal
-            // (or absent) for the fast-path to be safe; richer
-            // initializers (references to primary params, calls,
-            // etc.) need the tree walker's full eval pipeline.
+            // Each body property's init must be either absent,
+            // a simple literal, or a bare reference to a primary-
+            // ctor param (which we can resolve from `args` at
+            // ctor time). Richer initializers (calls, member
+            // chains, arithmetic) still need the tree walker.
+            let primary_names: Vec<String> = cls
+                .primary_params
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
             let body_props_ok = cls.body_properties.iter().all(|p| {
                 p.getter.is_none()
                     && p.setter.is_none()
                     && p.delegate.is_none()
-                    && p.init
-                        .as_ref()
-                        .map_or(true, |e| simple_literal_value(e).is_some())
+                    && p.init.as_ref().map_or(true, |e| {
+                        let e: &klio_ast::Expr = e;
+                        simple_literal_value(e).is_some()
+                            || matches!(e, klio_ast::Expr::Path { segments, .. }
+                                if segments.len() == 1
+                                    && primary_names.contains(&segments[0].name))
+                    })
             });
             // Allow a parent class only when it's itself trivially
             // constructible — no primary params, no init blocks,
@@ -13009,7 +13019,25 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 }
                 for p in &cls.body_properties {
                     let v = match &p.init {
-                        Some(e) => simple_literal_value(e).unwrap_or(klio_runtime::Value::Null),
+                        Some(e) => {
+                            let e: &klio_ast::Expr = e;
+                            if let Some(lit) = simple_literal_value(e) {
+                                lit
+                            } else if let klio_ast::Expr::Path { segments, .. } = e {
+                                if segments.len() == 1 {
+                                    // Look up by name in already-bound fields
+                                    fields
+                                        .iter()
+                                        .find(|(n, _)| n == &segments[0].name)
+                                        .map(|(_, v)| v.clone())
+                                        .unwrap_or(klio_runtime::Value::Null)
+                                } else {
+                                    klio_runtime::Value::Null
+                                }
+                            } else {
+                                klio_runtime::Value::Null
+                            }
+                        }
                         None => continue,
                     };
                     fields.push((p.name.clone(), v));
