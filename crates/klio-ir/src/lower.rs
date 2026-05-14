@@ -437,7 +437,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 }
             }
         }
-        Expr::FloatLit { value, .. } => b.emit_const(Const::Double(*value)),
+        Expr::FloatLit { value, kind, .. } => match kind {
+            klio_ast::FloatLitKind::Float => b.emit_const(Const::Float(*value as f32)),
+            klio_ast::FloatLitKind::Double => b.emit_const(Const::Double(*value)),
+        },
         Expr::BoolLit { value, .. } => b.emit_const(Const::Bool(*value)),
         Expr::NullLit { .. } => b.emit_const(Const::Null),
         Expr::CharLit { value, .. } => b.emit_const(Const::Char(*value)),
@@ -529,6 +532,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let dst = b.alloc_reg();
             b.push(Inst::BinOp { dst, op: ast_binop(*op), lhs: l, rhs: r });
             dst
+        }
+        Expr::Unary { op, expr, .. }
+            if matches!(op, AstUnOp::Neg)
+                && matches!(
+                    expr.as_ref(),
+                    Expr::IntLit { value, kind: klio_ast::IntLitKind::Int, .. }
+                        if *value == (i32::MAX as i64 + 1)
+                ) =>
+        {
+            // `-2147483648` parses as Neg(IntLit(2147483648)); the
+            // operand's value doesn't fit in i32 so general
+            // IntLit-lowering would widen to Long. Special-case
+            // Int.MIN_VALUE so it stays Int and arithmetic wraps
+            // at the 32-bit boundary.
+            b.emit_const(Const::Int(i32::MIN))
         }
         Expr::Unary { op, expr, .. } => {
             // Prefix ++ / -- need both an Inc/Dec UnOp AND a
