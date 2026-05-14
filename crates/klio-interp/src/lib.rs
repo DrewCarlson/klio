@@ -11541,6 +11541,41 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             (klio_runtime::Value::Array { items, .. }, "size") | (klio_runtime::Value::List { items, .. }, "size") => {
                 return Ok(klio_runtime::Value::new_int(items.borrow().len() as i64));
             }
+            // Mutable-collection compound-assign operators —
+            // mirror the special-cases the tree walker has in
+            // try_compound_assign_dispatch.
+            (klio_runtime::Value::List { items, mutable: true, .. }, "plusAssign") if args.len() == 1 => {
+                items.borrow_mut().push(args[0].clone());
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::Map { entries, .. }, "get") if args.len() == 1 => {
+                let key = &args[0];
+                let v = entries
+                    .borrow()
+                    .iter()
+                    .find(|(k, _)| klio_runtime::Value::structural_eq(k, key))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(klio_runtime::Value::Null);
+                return Ok(v);
+            }
+            (klio_runtime::Value::Map { entries, mutable: true, .. }, "set") if args.len() == 2 => {
+                let key = args[0].clone();
+                let value = args[1].clone();
+                let mut e = entries.borrow_mut();
+                if let Some(slot) = e.iter_mut().find(|(k, _)| klio_runtime::Value::structural_eq(k, &key)) {
+                    slot.1 = value;
+                } else {
+                    e.push((key, value));
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::List { items, mutable: true, .. }, "minusAssign") if args.len() == 1 => {
+                let mut v = items.borrow_mut();
+                if let Some(pos) = v.iter().position(|x| klio_runtime::Value::structural_eq(x, &args[0])) {
+                    v.remove(pos);
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
             _ => {}
         }
         if let klio_runtime::Value::Instance(inst) = receiver {

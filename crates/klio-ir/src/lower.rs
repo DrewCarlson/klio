@@ -319,6 +319,24 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.push(Inst::GetField { dst, receiver: recv, field });
             dst
         }
+        Expr::Index { receiver, args, .. } => {
+            // `r[a, b, ...]` → r.get(a, b, ...). Evaluator's
+            // CallMember + host.call_member route dispatches to
+            // Value::Map / List / Array / user classes uniformly.
+            let recv = lower_expr(b, receiver);
+            let (args_start, count) = lower_arg_run(b, args);
+            let dst = b.alloc_reg();
+            let nm = b.module.intern_const(Const::String("get".into()));
+            b.push(Inst::CallMember {
+                dst,
+                receiver: recv,
+                name: nm,
+                args: args_start,
+                n_args: count,
+                arg_names: Vec::new(),
+            });
+            dst
+        }
         Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. } => {
             // Infix call `a fn b` lowers as `a.fn(b)` — the
             // dispatch site is a member call on the receiver
@@ -980,6 +998,38 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
         }
         Stmt::Assign { target, op, value, .. } => {
             let v = lower_expr(b, value);
+            // Compound assigns first try `<op>Assign` as a member
+            // call on the target — covers user types declaring
+            // `operator fun plusAssign(...)` and built-in mutable
+            // collections (MutableList += elem). When the call
+            // raises (no method, immutable target), fall through
+            // to the rebind path below. Today this fires only
+            // when the target is a Path-bound local — Member /
+            // Index targets need their own routing.
+            if !matches!(op, klio_ast::AssignOp::Assign) {
+                let method_name = match op {
+                    klio_ast::AssignOp::Add => "plusAssign",
+                    klio_ast::AssignOp::Sub => "minusAssign",
+                    klio_ast::AssignOp::Mul => "timesAssign",
+                    klio_ast::AssignOp::Div => "divAssign",
+                    klio_ast::AssignOp::Rem => "remAssign",
+                    klio_ast::AssignOp::Assign => unreachable!(),
+                };
+                let recv = lower_expr(b, target);
+                let args_start = b.alloc_reg();
+                b.push(Inst::Move { dst: args_start, src: v });
+                let dst = b.alloc_reg();
+                let nm = b.module.intern_const(Const::String(method_name.into()));
+                b.push(Inst::CallMember {
+                    dst,
+                    receiver: recv,
+                    name: nm,
+                    args: args_start,
+                    n_args: 1,
+                    arg_names: Vec::new(),
+                });
+                return None;
+            }
             let combined = match op {
                 klio_ast::AssignOp::Assign => v,
                 klio_ast::AssignOp::Add | klio_ast::AssignOp::Sub
@@ -1007,6 +1057,30 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     let recv = lower_expr(b, receiver);
                     let field = b.module.intern_const(Const::String(name.name.clone()));
                     b.push(Inst::SetField { receiver: recv, field, value: combined });
+                }
+                Expr::Index { receiver, args: idx_args, .. } => {
+                    // `m[k] = v` lowers to receiver.set(k, v) so
+                    // map / mutable-list assignment dispatches
+                    // through the same call_member path that
+                    // handles built-in collection mutation.
+                    let recv = lower_expr(b, receiver);
+                    let key_args: Vec<Expr> = idx_args.clone();
+                    let (key_start, key_count) = lower_arg_run(b, &key_args);
+                    // Append `combined` as the value arg right
+                    // after the key slot(s).
+                    let val_slot = b.alloc_reg();
+                    b.push(Inst::Move { dst: val_slot, src: combined });
+                    let dst = b.alloc_reg();
+                    let nm = b.module.intern_const(Const::String("set".into()));
+                    b.push(Inst::CallMember {
+                        dst,
+                        receiver: recv,
+                        name: nm,
+                        args: key_start,
+                        n_args: key_count + 1,
+                        arg_names: Vec::new(),
+                    });
+                    let _ = val_slot;
                 }
                 _ => {
                     b.push(Inst::Trace { span: expr_span(target) });
