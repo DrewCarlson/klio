@@ -605,6 +605,28 @@ fn exec_inst(
             let result = host.call_value_named(&callee_v, &arg_values, &names)?;
             frame.write(*dst, result);
         }
+        Inst::CallSpread { dst, callee, parts, arg_names } => {
+            let callee_v = frame.read(*callee);
+            let mut arg_values: Vec<Value> = Vec::with_capacity(parts.len());
+            let mut effective_names: Vec<Option<String>> = Vec::new();
+            let in_names = resolve_arg_names(frame.module, arg_names);
+            for (i, part) in parts.iter().enumerate() {
+                let v = frame.read(part.reg);
+                let name = in_names.get(i).cloned().flatten();
+                if part.is_spread {
+                    let items = spread_items(&v)?;
+                    for item in items {
+                        arg_values.push(item);
+                        effective_names.push(None);
+                    }
+                } else {
+                    arg_values.push(v);
+                    effective_names.push(name);
+                }
+            }
+            let result = host.call_value_named(&callee_v, &arg_values, &effective_names)?;
+            frame.write(*dst, result);
+        }
         Inst::CallMember { dst, receiver, name, args, n_args, arg_names } => {
             let recv = frame.read(*receiver);
             let name_str = match &frame.module.consts[name.0 as usize] {
@@ -731,6 +753,22 @@ fn exec_inst(
 /// Pull `n_args` register values starting at `args_start` into a
 /// fresh Vec. Args are laid out contiguously by the lowering pass
 /// in a `Move`-sequence, so reading the run is straight indexing.
+/// Flatten an array / list / range / set into a Vec of its items
+/// for spread-arg dispatch. Returns an error if the value isn't
+/// iterable in a way that maps to positional args.
+fn spread_items(v: &Value) -> Result<Vec<Value>, EvalError> {
+    use Value::*;
+    match v {
+        Array { items, .. } => Ok(items.borrow().clone()),
+        List { items, .. } => Ok(items.borrow().clone()),
+        Set { items, .. } => Ok(items.borrow().clone()),
+        _ => Err(EvalError::Type(format!(
+            "spread argument: expected an array/list, got `{}`",
+            v.type_fqn()
+        ))),
+    }
+}
+
 fn read_arg_run(frame: &Frame<'_>, args_start: Reg, n: u8) -> Vec<Value> {
     let mut out = Vec::with_capacity(n as usize);
     for i in 0..n as u32 {

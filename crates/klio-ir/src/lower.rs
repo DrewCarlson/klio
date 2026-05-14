@@ -895,29 +895,35 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             });
             return dst;
         }
-        Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. }
+        Expr::Call { callee, args, arg_names: ast_arg_names, .. }
             if args.iter().any(|a| matches!(a, Expr::Spread { .. })) =>
         {
-            // Calls containing a `*spread` argument route through
-            // EvalAst — the tree walker handles vararg packing +
-            // spread flattening end-to-end. Pure lowering tweak; no
-            // new Inst variant needed.
-            let outer_names: std::collections::HashSet<String> = b.visible_names();
-            let captured_names: Vec<String> = outer_names.iter().cloned().collect();
-            let captures: Vec<Reg> = captured_names
-                .iter()
-                .filter_map(|n| b.resolve(n))
-                .collect();
+            // Calls containing a `*spread` argument: emit a
+            // `CallSpread` Inst whose `parts` list flags each arg
+            // as positional or spread. The evaluator flattens the
+            // spread sources at call time.
+            let callee_reg = lower_expr(b, callee);
+            let mut parts: Vec<crate::SpreadPart> = Vec::with_capacity(args.len());
+            for a in args {
+                match a {
+                    Expr::Spread { expr: inner, .. } => {
+                        let r = lower_expr(b, inner);
+                        parts.push(crate::SpreadPart { reg: r, is_spread: true });
+                    }
+                    _ => {
+                        let r = lower_expr(b, a);
+                        parts.push(crate::SpreadPart { reg: r, is_spread: false });
+                    }
+                }
+            }
+            let arg_names = intern_arg_names(b.module, ast_arg_names);
             let dst = b.alloc_reg();
-            b.push(Inst::EvalAst {
+            b.push(Inst::CallSpread {
                 dst,
-                ast: Box::new(expr.clone()),
-                captured_names,
-                captures,
+                callee: callee_reg,
+                parts,
+                arg_names,
             });
-            // Silence the unused-warning chain for the matched fields
-            // when this guard fires.
-            let _ = (callee, args, ast_arg_names, is_infix);
             dst
         }
         Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. } => {

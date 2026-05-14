@@ -113,6 +113,17 @@ pub enum Inst {
         #[serde(default)]
         arg_names: Vec<Option<ConstId>>,
     },
+    /// Call a callable value with a mix of positional and spread
+    /// args. Each `SpreadPart` is one source register; spread
+    /// parts are flattened (each item of the array/list becomes a
+    /// positional arg) at evaluation time.
+    CallSpread {
+        dst: Reg,
+        callee: Reg,
+        parts: Vec<SpreadPart>,
+        #[serde(default)]
+        arg_names: Vec<Option<ConstId>>,
+    },
     /// Member call on a receiver. The evaluator resolves the
     /// method through the receiver's class table at runtime.
     CallMember {
@@ -212,6 +223,12 @@ pub enum Inst {
         #[serde(default)]
         absorb_return: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpreadPart {
+    pub reg: Reg,
+    pub is_spread: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
