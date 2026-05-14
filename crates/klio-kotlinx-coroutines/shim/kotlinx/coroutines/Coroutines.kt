@@ -142,7 +142,14 @@ fun <T> CoroutineScope.async(
 }
 
 suspend fun delay(timeMillis: Long) {
-    __kxco_delayMillis(timeMillis)
+    // Suspend at this call so the scheduler can interleave sibling
+    // launches. The cont is parked on the host's pending-resume
+    // queue; runBlocking's drain pump fires `cont.resume(Unit)`
+    // between rounds, which stages a paused-resume record on the
+    // owning suspend frame so the next drive pass advances past
+    // this state.
+    suspendCoroutine<Unit> { cont -> __kxco_scheduleResume(cont) }
+    if (timeMillis > 0L) __kxco_delayMillis(0L) // keep the symbol referenced so packs don't strip it.
 }
 
 suspend fun yield() {

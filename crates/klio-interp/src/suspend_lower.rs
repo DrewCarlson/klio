@@ -43,6 +43,22 @@ impl SuspendNameSet {
         names.insert("suspendCoroutine".to_string());
         names.insert("suspendCoroutineUninterceptedOrReturn".to_string());
         names.insert("suspendCancellableCoroutine".to_string());
+        // Well-known kotlinx.coroutines suspending entry points. The
+        // shim definitions live in the pack, so the partitioner has
+        // no way to discover them from user source alone. Listing
+        // them here keeps `delay { … }` / `yield()` etc. recognised
+        // as suspension points across launched coroutines.
+        for n in [
+            "delay",
+            "yield",
+            "withContext",
+            "coroutineScope",
+            "supervisorScope",
+            "awaitAll",
+            "join",
+        ] {
+            names.insert(n.to_string());
+        }
         Self { names }
     }
 

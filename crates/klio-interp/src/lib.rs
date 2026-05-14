@@ -106,6 +106,12 @@ pub struct Interpreter {
     /// a real scheduler queue. Drained at the end of run_blocking
     /// in FIFO order.
     launch_queue: Vec<klio_runtime::Value>,
+    /// Frames that paused at a `suspendCoroutine` and haven't yet
+    /// been resumed. The drain loop fires their continuations
+    /// (via pending_resumes) and then re-drives them in FIFO
+    /// order, producing the "A1 B1 A2 B2" preemptive interleaving
+    /// shape across sibling launches.
+    paused_frames: Vec<Rc<RefCell<klio_runtime::SuspendFrame>>>,
     /// Names registered as suspending functions, populated at
     /// top-level decl registration so the suspend-body lowering
     /// recognises calls to user-declared `suspend fun foo()`.
@@ -259,6 +265,7 @@ impl Interpreter {
             coroutine_continuations: Vec::new(),
             active_suspend_frames: Vec::new(),
             launch_queue: Vec::new(),
+            paused_frames: Vec::new(),
             suspend_function_names: suspend_lower::SuspendNameSet::with_intrinsics(),
             anon_class_counter: 0,
             instance_id_counter: 0,
@@ -5519,15 +5526,20 @@ impl Interpreter {
             // can spawn more.
             let mut pending = klio_kotlinx_coroutines::drain_pending_launches();
             let mut resumes = klio_kotlinx_coroutines::drain_pending_resumes();
-            if pending.is_empty() && resumes.is_empty() && self.launch_queue.is_empty() {
+            if pending.is_empty()
+                && resumes.is_empty()
+                && self.launch_queue.is_empty()
+                && self.paused_frames.is_empty()
+            {
                 return Ok(());
             }
             self.launch_queue.append(&mut pending);
             // Fire any parked continuations from a previous round.
             // Each parked cont is a synthetic Continuation instance
-            // — calling its `resume(Unit)` method lets the scheduler
-            // unblock the corresponding suspendCoroutine site so
-            // that frame can advance.
+            // — calling its `resume(Unit)` stages a `paused_resume`
+            // on the cont's bound frame so the next drive pass
+            // skips the lambda call and consumes the resumed value
+            // directly.
             for cont in resumes.drain(..) {
                 let _ = self.invoke_named_member_call(
                     &cont,
@@ -5536,11 +5548,93 @@ impl Interpreter {
                     out,
                 );
             }
+            // Re-drive every paused frame whose resumption was just
+            // staged. Round-robin: a frame that suspends again
+            // moves to the back of the paused queue.
+            let pf = std::mem::take(&mut self.paused_frames);
+            for frame in pf {
+                let staged = frame.borrow().paused_resume.borrow().is_some();
+                if !staged {
+                    // No resume queued yet — keep parked for the
+                    // next round.
+                    self.paused_frames.push(frame);
+                    continue;
+                }
+                match self.drive_suspend_frame(&frame, None, out)? {
+                    klio_runtime::Value::CoroutineSuspended(f) => {
+                        self.paused_frames.push(f);
+                    }
+                    _ => {}
+                }
+            }
             while let Some(lam) = self.launch_queue.first().cloned() {
                 self.launch_queue.remove(0);
-                self.run_blocking(&lam, out)?;
+                // Drive the launch as a suspend frame directly so
+                // it can pause at `delay(...)` and let the
+                // scheduler interleave siblings — wrapping in
+                // run_blocking would drain each launch fully before
+                // the next gets a turn.
+                if let Some(frame) = self.build_launch_frame(&lam)? {
+                    if let klio_runtime::Value::CoroutineSuspended(f) =
+                        self.drive_suspend_frame(&frame, None, out)?
+                    {
+                        self.paused_frames.push(f);
+                    }
+                }
             }
         }
+    }
+
+    /// Build a SuspendFrame backed by a launched lambda's body.
+    /// Returns None for non-Lambda values so the caller can skip.
+    fn build_launch_frame(
+        &mut self,
+        lam: &klio_runtime::Value,
+    ) -> Result<Option<Rc<RefCell<klio_runtime::SuspendFrame>>>, RuntimeError> {
+        let klio_runtime::Value::Lambda { body, env, .. } = lam else {
+            return Ok(None);
+        };
+        // Reuse the runBlocking synthetic-function wrapper so the
+        // existing suspend-lowering produces the state machine.
+        let synth = Rc::new(klio_ast::Function {
+            name: klio_ast::Ident {
+                name: "<launch>".to_string(),
+                span: body.span,
+            },
+            receiver_type: None,
+            type_params: Vec::new(),
+            where_bounds: Vec::new(),
+            params: Vec::new(),
+            return_type: None,
+            body: Some(klio_ast::FunctionBody::Block((**body).clone())),
+            is_open: false,
+            is_override: false,
+            is_abstract: false,
+            is_operator: false,
+            is_inline: false,
+            is_infix: false,
+            is_tailrec: false,
+            is_suspend: true,
+            visibility: klio_ast::Visibility::Public,
+            annotations: Vec::new(),
+            span: body.span,
+        });
+        let Some(suspend_body) = suspend_lower::lower(&synth, &self.suspend_function_names) else {
+            return Err(RuntimeError::Type(
+                "launch: failed to lower lambda body to a suspend state machine".into(),
+            ));
+        };
+        let frame_env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(env))));
+        let frame = Rc::new(RefCell::new(klio_runtime::SuspendFrame {
+            decl: synth,
+            body: Rc::new(suspend_body),
+            env: frame_env,
+            locals: Vec::new(),
+            state: 0,
+            caller: None,
+            paused_resume: RefCell::new(None),
+        }));
+        Ok(Some(frame))
     }
 
     pub fn run_blocking(
@@ -5586,27 +5680,18 @@ impl Interpreter {
         let _ = params;
         let result = self.drive_suspend_function(&synth, captured, &[], out)?;
         if !matches!(result, Value::CoroutineSuspended(_)) {
-            // Drain any launches the body posted onto the scheduler
-            // before returning. Nested runBlocking calls drain their
-            // own scope; the top-level drain happens here.
             self.drain_launch_queue(out)?;
             return Ok(result);
         }
-        // The lambda suspended. The captured continuation is held
-        // by whatever async machinery user code wired up; it must
-        // eventually call resume(...) for our driver loop to
-        // re-enter. Since we have no scheduler, the only way
-        // forward is for the user code to have synchronously
-        // arranged a resume — but at this point the synchronous
-        // path already returned without doing so. Surface a
-        // diagnostic rather than hang silently.
-        Err(RuntimeError::Type(
-            "runBlocking { … } suspended with no continuation resumed. \
-             The block reached a suspension point and returned without any \
-             cont.resume / cont.resumeWith / cont.resumeWithException firing, \
-             so there is nothing to drive the coroutine forward."
-                .into(),
-        ))
+        // The body paused at a `suspendCoroutine` call. Stash the
+        // frame on the paused list so the scheduler's drain pump
+        // resumes it after firing parked continuations.
+        if let Value::CoroutineSuspended(frame) = result {
+            self.paused_frames.push(frame);
+        }
+        self.drain_launch_queue(out)?;
+        // Best-effort: return Unit if the paused frame never resumed.
+        Ok(Value::Unit)
     }
 
     /// Lower a suspend `fun foo()`'s body to a SuspendBody and run
@@ -5640,6 +5725,7 @@ impl Interpreter {
             locals: Vec::new(),
             state: 0,
             caller: None,
+            paused_resume: RefCell::new(None),
         }));
         self.drive_suspend_frame(&frame, None, out)
     }
@@ -5735,6 +5821,24 @@ impl Interpreter {
         lam: &Value,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
+        // Re-entry shortcut: when the active suspend frame already
+        // has a paused_resume from a previous suspension cycle,
+        // consume it here instead of re-allocating a fresh slot
+        // and re-running the user lambda. This is what lets a
+        // launched coroutine actually pause at `delay(ms)`, hand
+        // back to the scheduler, and resume cleanly on the next
+        // drain round.
+        if let Some(frame) = self.active_suspend_frames.last().cloned() {
+            let paused = frame.borrow().paused_resume.borrow_mut().take();
+            if let Some(record) = paused {
+                return match record {
+                    klio_runtime::PausedResume::Resumed(v) => Ok(v),
+                    klio_runtime::PausedResume::Failed(exc) => {
+                        Err(RuntimeError::Thrown(exc))
+                    }
+                };
+            }
+        }
         let Value::Lambda { params, body, env: captured, .. } = lam else {
             return Err(RuntimeError::Type(
                 "suspendCoroutine expects a lambda".into(),
@@ -5743,6 +5847,18 @@ impl Interpreter {
         let slot = Rc::new(RefCell::new(ContinuationSlot::Pending));
         self.coroutine_continuations.push(Rc::clone(&slot));
         let cont = self.make_continuation_value(Rc::clone(&slot));
+        // Bind the active frame onto the cont's native_state so
+        // `cont.resume(v)` called *after* this suspendCoroutine
+        // returns can find the frame and stage its `paused_resume`
+        // for next entry.
+        if let (Value::Instance(inst), Some(frame)) =
+            (&cont, self.active_suspend_frames.last().cloned())
+        {
+            let frame_clone = Rc::clone(&frame);
+            inst.borrow_mut().ensure_native_state("klio.cont.frame", move || {
+                FrameNative { frame: frame_clone }
+            });
+        }
         let lambda_result = self.call_lambda(params, body, captured, &[cont], out);
         let direct = match lambda_result {
             Ok(v) => v,
@@ -9524,11 +9640,50 @@ impl Interpreter {
                             if args.len() == 1 =>
                         {
                             let v = self.eval_expr(&args[0], env, out)?;
-                            let Some(slot) = self.coroutine_continuations.last() else {
+                            // Async resume: when the cont's owning
+                            // suspendCoroutine call already returned
+                            // (no slot on the stack), stage the
+                            // resumption on the frame stored in the
+                            // cont's native_state. The scheduler
+                            // picks it up on the next drain pass.
+                            let frame_ref: Option<Rc<RefCell<klio_runtime::SuspendFrame>>> = {
+                                let borrow = inst.borrow();
+                                borrow.native_state.as_ref().and_then(|ns| {
+                                    let data = ns.data.borrow();
+                                    data.downcast_ref::<FrameNative>().map(|f| Rc::clone(&f.frame))
+                                })
+                            };
+                            let on_stack = self.coroutine_continuations.last().cloned();
+                            if on_stack.is_none() {
+                                if let Some(frame) = frame_ref.clone() {
+                                    let record = match name.name.as_str() {
+                                        "resumeWithException" => {
+                                            klio_runtime::PausedResume::Failed(v.clone())
+                                        }
+                                        "resumeWith" => match &v {
+                                            Value::Result { ok, payload } => {
+                                                if *ok {
+                                                    klio_runtime::PausedResume::Resumed(
+                                                        (**payload).clone(),
+                                                    )
+                                                } else {
+                                                    klio_runtime::PausedResume::Failed(
+                                                        (**payload).clone(),
+                                                    )
+                                                }
+                                            }
+                                            _ => klio_runtime::PausedResume::Resumed(v.clone()),
+                                        },
+                                        _ => klio_runtime::PausedResume::Resumed(v.clone()),
+                                    };
+                                    *frame.borrow().paused_resume.borrow_mut() = Some(record);
+                                    return Ok(Value::Unit);
+                                }
                                 return Err(RuntimeError::Type(
                                     "continuation used outside an active suspendCoroutine".into(),
                                 ));
-                            };
+                            }
+                            let slot = on_stack.unwrap();
                             let mut s = slot.borrow_mut();
                             match name.name.as_str() {
                                 "resume" => *s = ContinuationSlot::Resumed(v),
@@ -11288,6 +11443,10 @@ pub fn invoke_ir_closure(
 
 /// Bridge the IR evaluator back to this interpreter for dispatch
 /// that requires the real class table / dispatch machinery.
+struct FrameNative {
+    frame: Rc<RefCell<klio_runtime::SuspendFrame>>,
+}
+
 fn ir_err(e: klio_runtime::RuntimeError) -> klio_ir::eval::EvalError {
     match e {
         klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),

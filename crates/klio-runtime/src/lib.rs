@@ -389,6 +389,23 @@ pub struct SuspendFrame {
     /// caller's continuation chain. Driving this frame to a Return
     /// hands the value to `caller.resume_with(...)`.
     pub caller: Option<SuspendCallerCont>,
+    /// When the frame is paused mid-state on an async
+    /// `suspendCoroutine`, the slot's identity-stable handle lives
+    /// here as an opaque resume-value record. The interpreter
+    /// reads it on re-entry instead of re-allocating a slot and
+    /// re-calling the user lambda.
+    pub paused_resume: std::cell::RefCell<Option<PausedResume>>,
+}
+
+/// Result of a previously-suspended `suspendCoroutine` call,
+/// stashed on the frame so the state machine can read it on its
+/// next driving pass. `Pending` is not represented here; an
+/// outstanding suspension simply leaves `paused_resume = None`
+/// and the next drive returns `CoroutineSuspended` immediately.
+#[derive(Debug, Clone)]
+pub enum PausedResume {
+    Resumed(Value),
+    Failed(Value),
 }
 
 /// Where a finished suspend frame hands its result. Either upstream
