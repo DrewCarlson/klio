@@ -16,6 +16,35 @@ use crate::{BinOp, Const, Inst, Reg, Terminator, UnOp};
 /// Bind function parameters into the current scope. Each param is
 /// loaded into a fresh register via `Inst::LoadParam` so subsequent
 /// `Path { name }` reads route through the same register.
+/// Materialise a contiguous run of argument registers for a Call /
+/// CallMember / CallValue / NewInstance instruction.
+///
+/// The lowering pass otherwise produces non-contiguous register
+/// numbering when sub-expressions allocate intermediate temporaries.
+/// We reserve `args.len()` contiguous registers up front (so the
+/// run [args_start, args_start + n_args) is dense), lower each arg
+/// into its own scratch reg, then `Move` the scratch into the
+/// matching arg slot. Returns `(args_start, n_args)`.
+fn lower_arg_run(b: &mut FuncBuilder<'_>, args: &[Expr]) -> (Reg, u8) {
+    let n = args.len();
+    if n == 0 {
+        // Reserve a sentinel slot so the n_args=0 reads do not
+        // alias an unrelated register.
+        return (b.alloc_reg(), 0);
+    }
+    let first = b.alloc_reg();
+    let mut slots = Vec::with_capacity(n);
+    slots.push(first);
+    for _ in 1..n {
+        slots.push(b.alloc_reg());
+    }
+    for (slot, arg) in slots.iter().zip(args.iter()) {
+        let r = lower_expr(b, arg);
+        b.push(Inst::Move { dst: *slot, src: r });
+    }
+    (first, n as u8)
+}
+
 pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
     for (i, name) in names.iter().enumerate() {
         let dst = b.alloc_reg();
@@ -79,6 +108,7 @@ pub fn lower_function(module: &mut crate::Module, f: &klio_ast::Function) -> cra
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
     placed.id = id;
+    module.func_index.push((f.name.name.clone(), id));
     module.funcs.push(placed.clone());
     placed
 }
@@ -183,11 +213,36 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 if let Some(r) = b.resolve(&segments[0].name) {
                     return r;
                 }
+                // Not a local — emit LoadGlobal so the host can
+                // resolve it against the interpreter's globals env.
+                let dst = b.alloc_reg();
+                let name = b.module.intern_const(Const::String(segments[0].name.clone()));
+                b.push(Inst::LoadGlobal { dst, name });
+                return dst;
             }
-            // Unresolved path — emit a Trace so the gap is visible
-            // and return Unit so the lowering pass stays total.
-            b.push(Inst::Trace { span: expr_span(expr) });
-            b.emit_const(Const::Unit)
+            // Multi-segment paths (`a.b.c`) lower as a chain of
+            // GetFields starting from a top-level lookup. The
+            // alternative — synthesize a fully-qualified LoadGlobal
+            // — is faster but requires more import-resolution
+            // context than the lowering pass has today.
+            let mut iter = segments.iter();
+            let first = iter.next().expect("Path has at least one segment");
+            let head = if let Some(r) = b.resolve(&first.name) {
+                r
+            } else {
+                let dst = b.alloc_reg();
+                let n = b.module.intern_const(Const::String(first.name.clone()));
+                b.push(Inst::LoadGlobal { dst, name: n });
+                dst
+            };
+            let mut cur = head;
+            for seg in iter {
+                let next = b.alloc_reg();
+                let field = b.module.intern_const(Const::String(seg.name.clone()));
+                b.push(Inst::GetField { dst: next, receiver: cur, field });
+                cur = next;
+            }
+            cur
         }
         Expr::StringTemplate { parts, .. } => {
             let mut cur = b.emit_const(Const::String(String::new()));
@@ -237,22 +292,27 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             dst
         }
         Expr::Call { callee, args, .. } => {
+            // Path-callee with a registered top-level fn → Call{func}.
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1 {
+                    if let Some(func_id) = b.module.func_id(&segments[0].name) {
+                        let (args_start, count) = lower_arg_run(b, args);
+                        let dst = b.alloc_reg();
+                        b.push(Inst::Call {
+                            dst,
+                            func: func_id,
+                            args: args_start,
+                            n_args: count,
+                        });
+                        return dst;
+                    }
+                }
+            }
             // Path-callee with a registered class name → NewInstance.
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
                     if let Some(class_id) = b.module.class_id(&segments[0].name) {
-                        let args_start = b.alloc_reg();
-                        let mut count = 0u8;
-                        for (i, a) in args.iter().enumerate() {
-                            let r = lower_expr(b, a);
-                            if i == 0 {
-                                b.push(Inst::Move { dst: args_start, src: r });
-                            } else {
-                                let nx = b.alloc_reg();
-                                b.push(Inst::Move { dst: nx, src: r });
-                            }
-                            count += 1;
-                        }
+                        let (args_start, count) = lower_arg_run(b, args);
                         let dst = b.alloc_reg();
                         b.push(Inst::NewInstance {
                             dst,
@@ -270,21 +330,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             match callee.as_ref() {
                 Expr::Member { receiver, name, .. } => {
                     let recv = lower_expr(b, receiver);
-                    let args_start = b.alloc_reg();
-                    let mut next = args_start;
-                    let mut count = 0u8;
-                    for (i, a) in args.iter().enumerate() {
-                        let r = lower_expr(b, a);
-                        if i == 0 {
-                            // First arg overwrites the reserved slot.
-                            b.push(Inst::Move { dst: args_start, src: r });
-                        } else {
-                            next = b.alloc_reg();
-                            b.push(Inst::Move { dst: next, src: r });
-                        }
-                        count += 1;
-                    }
-                    let _ = next;
+                    let (args_start, count) = lower_arg_run(b, args);
                     let dst = b.alloc_reg();
                     let nm = b.module.intern_const(Const::String(name.name.clone()));
                     b.push(Inst::CallMember {
@@ -298,18 +344,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 }
                 _ => {
                     let callee_r = lower_expr(b, callee);
-                    let args_start = b.alloc_reg();
-                    let mut count = 0u8;
-                    for (i, a) in args.iter().enumerate() {
-                        let r = lower_expr(b, a);
-                        if i == 0 {
-                            b.push(Inst::Move { dst: args_start, src: r });
-                        } else {
-                            let nx = b.alloc_reg();
-                            b.push(Inst::Move { dst: nx, src: r });
-                        }
-                        count += 1;
-                    }
+                    let (args_start, count) = lower_arg_run(b, args);
                     let dst = b.alloc_reg();
                     b.push(Inst::CallValue {
                         dst,

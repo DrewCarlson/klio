@@ -344,6 +344,13 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Look up an intrinsic by name through the captured global env.
+    /// Used by the IR Host to resolve bare top-level identifiers
+    /// (`println`, user `fun foo`) to a callable Value.
+    pub fn lookup_global_callable(&self, name: &str) -> Option<klio_runtime::Value> {
+        self.globals.borrow().lookup(name)
+    }
+
     /// Look up an intrinsic by FQN. Checks pack-installed bindings
     /// first, falls back to the static `klio_stdlib` table.
     #[must_use]
@@ -657,6 +664,45 @@ impl Interpreter {
     /// declarations from sibling files are visible cross-file, but
     /// each file's `import` list applies only inside that file's
     /// declarations as they execute.
+    /// Lower a single source file to IR and execute its `main`
+    /// function through `klio_ir::eval`. Returns the value of
+    /// `main` (typically `Unit`) or an evaluation error.
+    ///
+    /// This is the entry point for the IR-eval cutover work
+    /// (`--ir-eval` flag in klio-cli). The Host bridges back to
+    /// this interpreter for dispatch the IR evaluator cannot
+    /// resolve standalone — top-level fn calls, member calls,
+    /// instance construction.
+    pub fn run_ir(
+        &mut self,
+        file: &KotlinFile,
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, String> {
+        // Build the IR module: lower every class and every
+        // top-level function in declaration order. Classes go
+        // first so Path→NewInstance routing sees them.
+        let mut module = klio_ir::Module::default();
+        for d in &file.decls {
+            if let Decl::Class(c) = d {
+                let _ = klio_ir::lower::lower_class(&mut module, c);
+            }
+        }
+        let mut main_id: Option<klio_ir::FuncId> = None;
+        for d in &file.decls {
+            if let Decl::Function(f) = d {
+                let func = klio_ir::lower::lower_function(&mut module, f);
+                if f.name.name == "main" {
+                    main_id = Some(func.id);
+                }
+            }
+        }
+        let main_id = main_id.ok_or_else(|| "no `fun main` in file".to_string())?;
+        let func = module.funcs[main_id.0 as usize].clone();
+        let mut host = IrHost { interp: self, out };
+        klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host)
+            .map_err(|e| format!("ir eval: {e}"))
+    }
+
     pub fn run_module(
         &mut self,
         files: &[KotlinFile],
@@ -10669,6 +10715,68 @@ fn lookup_nested_class(cls: &Rc<ClassDef>, name: &str) -> Option<Rc<ClassDef>> {
         cur = c.parent.borrow().clone();
     }
     None
+}
+
+/// Bridge the IR evaluator back to this interpreter for dispatch
+/// that requires the real class table / dispatch machinery.
+struct IrHost<'a> {
+    interp: &'a mut Interpreter,
+    out: &'a mut dyn Output,
+}
+
+impl<'a> klio_ir::eval::Host for IrHost<'a> {
+    fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
+        self.interp.lookup_global_callable(name)
+    }
+
+    fn call_value(
+        &mut self,
+        callee: &klio_runtime::Value,
+        args: &[klio_runtime::Value],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let names: Vec<Option<String>> = vec![None; args.len()];
+        self.interp
+            .invoke_callable_value(callee, args, &names, self.out)
+            .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
+    }
+
+    fn call_member(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+        args: &[klio_runtime::Value],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let class = Rc::clone(&inst.borrow().class);
+            if let Some((method, _)) = class.find_method(name) {
+                let names: Vec<Option<String>> = vec![None; args.len()];
+                return self
+                    .interp
+                    .call_method(inst, &method, args, &names, self.out)
+                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+            }
+        }
+        if args.is_empty() {
+            return self
+                .interp
+                .eval_property_access(receiver.clone(), name, self.out)
+                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+        }
+        Err(klio_ir::eval::EvalError::Type(format!(
+            "IR Host: member call `{name}` on {} not resolved",
+            receiver.type_fqn()
+        )))
+    }
+
+    fn new_instance(
+        &mut self,
+        _class: klio_ir::ClassId,
+        _args: &[klio_runtime::Value],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        Err(klio_ir::eval::EvalError::Unsupported(
+            "IrHost::new_instance — class-table bridge pending",
+        ))
+    }
 }
 
 /// Lower `a name b` to `a.name(b)` so existing member / extension dispatch

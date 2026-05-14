@@ -52,6 +52,15 @@ pub trait Host {
         let nominal = value.type_fqn();
         nominal == ty.name || nominal.ends_with(&format!(".{}", ty.name))
     }
+    /// Resolve a bare global identifier (top-level fn, intrinsic,
+    /// imported symbol). Default returns Unit which surfaces as a
+    /// runtime "value not callable" error if the caller tries to
+    /// call it; concrete hosts route through the interpreter's
+    /// global env.
+    fn lookup_global(&mut self, _name: &str) -> Option<Value> {
+        None
+    }
+
     /// Resolve a function call by FuncId. The default routes
     /// through `eval()` recursively, so a single-module IR program
     /// stays self-contained.
@@ -297,6 +306,16 @@ fn exec_inst(
             return Err(EvalError::Unsupported(
                 "Inst::Lambda — closure construction requires host integration",
             ));
+        }
+        Inst::LoadGlobal { dst, name } => {
+            let name_str = match &frame.module.consts[name.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type("LoadGlobal: name not a string const".into())),
+            };
+            let v = host
+                .lookup_global(&name_str)
+                .ok_or_else(|| EvalError::Type(format!("unresolved global `{name_str}`")))?;
+            frame.write(*dst, v);
         }
         Inst::LoadCapture { dst, idx: _ } => {
             // Captures need host integration to materialise; for now

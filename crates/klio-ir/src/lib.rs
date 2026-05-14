@@ -120,6 +120,12 @@ pub enum Inst {
     NotNullAssert { dst: Reg, src: Reg },
     /// Marker for the evaluator's debugger / tracing hook.
     Trace { span: Span },
+    /// Resolve a bare global identifier through the Host. Used when
+    /// Path lowering cannot bind the name to a local register —
+    /// covers top-level stdlib calls (`println`, `listOf`) and any
+    /// other module-scoped reference. The Host's `lookup_global`
+    /// receives the interned name and returns the live value.
+    LoadGlobal { dst: Reg, name: ConstId },
     /// Materialise a lambda value capturing the current scope's
     /// registers. The captures are listed as a `Vec<Reg>`; the
     /// evaluator snapshots the live values into a closure env.
@@ -211,6 +217,10 @@ pub struct Module {
     /// lowering pass populates this so `Foo(args)` Calls become
     /// `NewInstance` instructions when `Foo` resolves to a class.
     pub class_index: Vec<(String, ClassId)>,
+    /// Top-level function declarations by simple name → FuncId.
+    /// Lowering routes Path-callees that match a registered name
+    /// to `Inst::Call { func }` instead of LoadGlobal+CallValue.
+    pub func_index: Vec<(String, FuncId)>,
     /// Package path for FQN qualification.
     pub package: Option<String>,
 }
@@ -220,6 +230,15 @@ impl Module {
     #[must_use]
     pub fn class_id(&self, name: &str) -> Option<ClassId> {
         self.class_index
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+    }
+
+    /// Look up a top-level function by simple name.
+    #[must_use]
+    pub fn func_id(&self, name: &str) -> Option<FuncId> {
+        self.func_index
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, id)| *id)

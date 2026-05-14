@@ -911,6 +911,7 @@ dependencies = [
  "criterion",
  "klio-ast",
  "klio-diagnostics",
+ "klio-ir",
  "klio-lexer",
  "klio-pack",
  "klio-parser",

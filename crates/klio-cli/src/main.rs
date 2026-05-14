@@ -27,7 +27,16 @@ enum Cmd {
     /// supplied, every file's top-level declarations are visible to
     /// every other file (single-module semantics), with `fun main`
     /// invoked from whichever file declares it.
-    Run { files: Vec<PathBuf> },
+    Run {
+        files: Vec<PathBuf>,
+        /// Route execution through the IR evaluator instead of the
+        /// tree walker. Today this covers a subset of Kotlin —
+        /// programs using class construction or features the IR
+        /// hasn't lowered yet fall through to runtime errors.
+        /// Parity work tracked in plans/REFINEMENTS.md.
+        #[arg(long = "ir-eval", default_value_t = false)]
+        ir_eval: bool,
+    },
     /// Type-check `.kt` files and emit diagnostics. Exit 1 on any error.
     Check {
         files: Vec<PathBuf>,
@@ -178,11 +187,12 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Lex { file } => run_lex(&file),
         Cmd::Parse { file } => run_parse(&file),
-        Cmd::Run { files } => match files.as_slice() {
+        Cmd::Run { files, ir_eval } => match files.as_slice() {
             [] => {
                 eprintln!("usage: klio run <file.kt> [<file2.kt> ...]");
                 ExitCode::from(2)
             }
+            [single] if ir_eval => run_file_ir(single),
             [single] => run_file(single),
             many => run_module_files(many),
         },
@@ -1242,6 +1252,38 @@ fn run_module_files(paths: &[PathBuf]) -> ExitCode {
     let mut interp = Interpreter::new().with_expr_types(tc.types.clone());
     install_embedded_stdlib(&mut interp);
     match interp.run_module(&asts) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("runtime error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_file_ir(path: &std::path::Path) -> ExitCode {
+    let mut map = SourceMap::new();
+    let Some(id) = load(&mut map, path) else { return ExitCode::FAILURE };
+    let src = map.get(id).source.clone();
+    let lexed = Lexer::new(id, &src).tokenize();
+    let _ = lexed.diagnostics.render(&map, std::io::stderr());
+    if lexed.diagnostics.has_errors() {
+        return ExitCode::FAILURE;
+    }
+    let (ast, diags) = Parser::new(id, &src, &lexed.tokens).parse_file();
+    let _ = diags.render(&map, std::io::stderr());
+    if diags.has_errors() {
+        return ExitCode::FAILURE;
+    }
+    let r = resolve(&ast);
+    let tc = typecheck(&ast, &r);
+    if tc.diagnostics.has_errors() {
+        let _ = tc.diagnostics.render(&map, std::io::stderr());
+        return ExitCode::FAILURE;
+    }
+    let mut interp = Interpreter::new().with_expr_types(tc.types.clone());
+    install_embedded_stdlib(&mut interp);
+    let mut stdout = klio_runtime::StdoutOutput;
+    match interp.run_ir(&ast, &mut stdout) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("runtime error: {e}");
