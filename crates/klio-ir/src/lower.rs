@@ -364,6 +364,33 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.switch_to(exit);
             b.emit_const(Const::Unit)
         }
+        Expr::Member { receiver, name, safe, .. } if *safe => {
+            // `recv?.x` — null-guard: if recv is null, the whole
+            // expression is null; otherwise read the field.
+            let recv = lower_expr(b, receiver);
+            let null_r = b.emit_const(Const::Null);
+            let is_null = b.alloc_reg();
+            b.push(Inst::BinOp { dst: is_null, op: BinOp::Eq, lhs: recv, rhs: null_r });
+            let then_b = b.alloc_block();
+            let else_b = b.alloc_block();
+            let join = b.alloc_block();
+            let dst = b.alloc_reg();
+            b.terminate(Terminator::Branch { cond: is_null, t: then_b, f: else_b });
+            // null branch: dst = null
+            b.switch_to(then_b);
+            let n = b.emit_const(Const::Null);
+            b.push(Inst::Move { dst, src: n });
+            b.terminate(Terminator::Goto(join));
+            // non-null: dst = recv.field
+            b.switch_to(else_b);
+            let field = b.module.intern_const(Const::String(name.name.clone()));
+            let v = b.alloc_reg();
+            b.push(Inst::GetField { dst: v, receiver: recv, field });
+            b.push(Inst::Move { dst, src: v });
+            b.terminate(Terminator::Goto(join));
+            b.switch_to(join);
+            dst
+        }
         Expr::Member { receiver, name, .. } => {
             // Flatten chains like `kotlin.math.PI` into a single FQN
             // lookup against the host when the head is an unresolved
