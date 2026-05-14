@@ -450,6 +450,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.ranges.IntProgression.asSequence", seq_from_range),
     ("kotlin.sequences.sequenceOf", seq_of),
     ("kotlin.sequences.emptySequence", seq_empty),
+    ("kotlin.sequences.generateSequence", seq_generate_sequence),
     ("kotlin.sequences.Sequence.toList", seq_to_list),
     ("kotlin.sequences.Sequence.toMutableList", seq_to_mutable_list),
     ("kotlin.sequences.Sequence.toSet", seq_to_set),
@@ -4195,6 +4196,36 @@ fn seq_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn seq_empty(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_sequence(Vec::new()))
+}
+
+fn seq_generate_sequence(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    use klio_runtime::{SequenceData, SequenceSource};
+    match ctx.args {
+        [lam @ Value::Lambda { .. }] => Ok(Value::Sequence(Rc::new(SequenceData {
+            source: SequenceSource::Generate {
+                seed: None,
+                next: Box::new(lam.clone()),
+            },
+            ops: Vec::new(),
+        }))),
+        [seed, lam @ Value::Lambda { .. }] => {
+            let seeded = if matches!(seed, Value::Null) {
+                None
+            } else {
+                Some(Box::new(seed.clone()))
+            };
+            Ok(Value::Sequence(Rc::new(SequenceData {
+                source: SequenceSource::Generate {
+                    seed: seeded,
+                    next: Box::new(lam.clone()),
+                },
+                ops: Vec::new(),
+            })))
+        }
+        _ => Err(RuntimeError::Type(
+            "generateSequence expects `(seed, next)` or `(next)` with `next` a lambda".into(),
+        )),
+    }
 }
 
 /// Fast-path Sequence terminal ops handle the special case of an

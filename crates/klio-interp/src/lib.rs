@@ -9340,6 +9340,15 @@ impl Interpreter {
         // top-level fns live in the interp like with/let/etc.
         if let Some(name) = simple_callee_name(callee) {
             if name == "generateSequence" {
+                if let Some(func) = klio_stdlib::implementation("kotlin.sequences.generateSequence") {
+                    let mut arg_vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        arg_vals.push(self.eval_expr(a, env, out)?);
+                    }
+                    let mut __interp_host = InterpHostRef { interp: self };
+                    let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                    return func(&mut ctx);
+                }
                 return self.eval_generate_sequence(args, env, out);
             }
             if let Some(v) = self.try_eval_array_constructor(name, args, env, out)? {
