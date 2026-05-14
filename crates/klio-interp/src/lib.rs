@@ -9229,16 +9229,13 @@ impl Interpreter {
             // accepts 2-arg lambdas in step position, so we just
             // wrap the lambda directly as the sole step.
             if name == "Comparator" && args.len() == 1 {
-                let v = self.eval_expr(&args[0], env, out)?;
-                if let Value::Lambda { .. } = &v {
-                    return Ok(Value::Comparator {
-                        steps: Rc::new(vec![(v, false)]),
-                        descending: false,
-                    });
+                if let Some(func) = klio_stdlib::implementation("kotlin.Comparator") {
+                    let v = self.eval_expr(&args[0], env, out)?;
+                    let arg_vals = [v];
+                    let mut __interp_host = InterpHostRef { interp: self };
+                    let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                    return func(&mut ctx);
                 }
-                return Err(RuntimeError::Type(
-                    "Comparator { … } expects a 2-arg comparison lambda".into(),
-                ));
             }
             if name == "compareBy" || name == "compareByDescending" {
                 let fqn = format!("kotlin.comparisons.{name}");
@@ -9269,33 +9266,15 @@ impl Interpreter {
                 }
             }
             if name == "compareValuesBy" && args.len() >= 3 {
-                let a = self.eval_expr(&args[0], env, out)?;
-                let b = self.eval_expr(&args[1], env, out)?;
-                for sel in &args[2..] {
-                    let lam = self.eval_expr(sel, env, out)?;
-                    let Value::Lambda { params, body, env: captured, .. } = &lam else {
-                        return Err(RuntimeError::Type(
-                            "compareValuesBy expects key-selector lambdas".into(),
-                        ));
-                    };
-                    let ka = self.call_lambda(params, body, captured, std::slice::from_ref(&a), out)?;
-                    let kb = self.call_lambda(params, body, captured, std::slice::from_ref(&b), out)?;
-                    let ord = match (matches!(ka, Value::Null), matches!(kb, Value::Null)) {
-                        (true, true) => std::cmp::Ordering::Equal,
-                        (true, false) => std::cmp::Ordering::Less,
-                        (false, true) => std::cmp::Ordering::Greater,
-                        (false, false) => self.compare_with_user(&ka, &kb, out)?,
-                    };
-                    if !matches!(ord, std::cmp::Ordering::Equal) {
-                        let n: i32 = match ord {
-                            std::cmp::Ordering::Less => -1,
-                            std::cmp::Ordering::Greater => 1,
-                            std::cmp::Ordering::Equal => 0,
-                        };
-                        return Ok(Value::Int(n));
+                if let Some(func) = klio_stdlib::implementation("kotlin.comparisons.compareValuesBy") {
+                    let mut arg_vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        arg_vals.push(self.eval_expr(a, env, out)?);
                     }
+                    let mut __interp_host = InterpHostRef { interp: self };
+                    let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                    return func(&mut ctx);
                 }
-                return Ok(Value::Int(0));
             }
         }
 
@@ -11754,7 +11733,6 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             "UIntArray" | "ULongArray" | "UShortArray" | "UByteArray"
             // Comparator-shaped helpers requiring lambda steps
             | "thenBy" | "thenByDescending"
-            | "compareValuesBy" | "Comparator"
             | "Result"
             | "synchronized"
             | "tailrec"

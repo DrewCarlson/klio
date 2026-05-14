@@ -756,6 +756,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.comparisons.compareBy", cmp_compare_by),
     ("kotlin.comparisons.compareByDescending", cmp_compare_by_descending),
     ("kotlin.comparisons.compareValues", cmp_compare_values),
+    ("kotlin.comparisons.compareValuesBy", cmp_compare_values_by),
+    ("kotlin.Comparator", cmp_comparator_sam),
     ("kotlin.Array", array_ctor_generic),
     ("kotlin.IntArray", array_ctor_int),
     ("kotlin.LongArray", array_ctor_long),
@@ -1708,6 +1710,55 @@ fn array_ctor_boolean(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn array_ctor_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     array_ctor_impl(ctx, "CharArray", Some(klio_runtime::PrimitiveArrayKind::Char), Value::Char('\u{0}'))
+}
+
+fn cmp_compare_values_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() < 3 {
+        return Err(RuntimeError::Arity("compareValuesBy expects (a, b, selector, ...)".into()));
+    }
+    let a = ctx.args[0].clone();
+    let b = ctx.args[1].clone();
+    let selectors: Vec<Value> = ctx.args[2..].to_vec();
+    let CallCtx { out, host, .. } = ctx;
+    for sel in selectors {
+        if !matches!(&sel, Value::Lambda { .. } | Value::IrClosure { .. }) {
+            return Err(RuntimeError::Type(
+                "compareValuesBy expects key-selector lambdas".into(),
+            ));
+        }
+        let ka = host.invoke_callable(&sel, std::slice::from_ref(&a), *out)?;
+        let kb = host.invoke_callable(&sel, std::slice::from_ref(&b), *out)?;
+        let ord = match (matches!(ka, Value::Null), matches!(kb, Value::Null)) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => compare_values(&ka, &kb)?,
+        };
+        if !matches!(ord, std::cmp::Ordering::Equal) {
+            return Ok(Value::new_int(match ord {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Equal => 0,
+            }));
+        }
+    }
+    Ok(Value::new_int(0))
+}
+
+fn cmp_comparator_sam(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 1 {
+        return Err(RuntimeError::Arity("Comparator { … } expects a 2-arg comparison lambda".into()));
+    }
+    let lam = ctx.args[0].clone();
+    if !matches!(&lam, Value::Lambda { .. } | Value::IrClosure { .. }) {
+        return Err(RuntimeError::Type(
+            "Comparator { … } expects a 2-arg comparison lambda".into(),
+        ));
+    }
+    Ok(Value::Comparator {
+        steps: Rc::new(vec![(lam, false)]),
+        descending: false,
+    })
 }
 
 fn cmp_compare_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
