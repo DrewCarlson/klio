@@ -12720,6 +12720,57 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             if let Some(v) = plain_field {
                 return Ok(v);
             }
+            // Trivial-getter fast-path: when the property has a
+            // custom getter whose body is a single Path read of
+            // another field name, resolve it to that field
+            // directly. Skips the tree-walker accessor pipeline
+            // for the common `val computed get() = field` /
+            // `val twin get() = other` shapes.
+            let trivial: Option<klio_runtime::Value> = {
+                let i = inst.borrow();
+                let pdef = i
+                    .class
+                    .body_properties
+                    .iter()
+                    .find(|p| p.name == name)
+                    .cloned();
+                pdef.and_then(|p| {
+                    if p.delegate.is_some() || p.setter.is_some() {
+                        return None;
+                    }
+                    let acc = p.getter.as_ref()?;
+                    let body_expr: Option<&klio_ast::Expr> = match &acc.body {
+                        klio_ast::FunctionBody::Expr(e) => Some(e),
+                        klio_ast::FunctionBody::Block(blk)
+                            if blk.stmts.len() == 1 =>
+                        {
+                            if let klio_ast::Stmt::Expr(e) = &blk.stmts[0] {
+                                Some(e)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    let e = body_expr?;
+                    match e {
+                        klio_ast::Expr::Path { segments, .. }
+                            if segments.len() == 1 =>
+                        {
+                            let nm = &segments[0].name;
+                            if nm == "field" {
+                                i.get(name)
+                            } else {
+                                i.get(nm)
+                            }
+                        }
+                        _ => simple_literal_value(e),
+                    }
+                })
+            };
+            if let Some(v) = trivial {
+                return Ok(v);
+            }
         }
         // Companion-style static access on an Intrinsic constructor:
         // `Regex.escape` reads through `kotlin.text.Regex.escape` /
