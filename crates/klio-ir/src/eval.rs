@@ -611,10 +611,17 @@ fn exec_inst(
             } else if *safe {
                 frame.write(*dst, Value::Null);
             } else {
-                return Err(EvalError::Type(format!(
-                    "cast to `{}` failed for value {:?}",
-                    ty.name, v
-                )));
+                // Failed unchecked cast raises ClassCastException
+                // so user `catch (e: ClassCastException)` arms fire.
+                let exc = Value::Exception {
+                    fqn: std::rc::Rc::new("kotlin.ClassCastException".into()),
+                    message: Some(std::rc::Rc::new(format!(
+                        "cast to `{}` failed",
+                        ty.name
+                    ))),
+                    cause: None,
+                };
+                return Err(EvalError::Throw(exc));
             }
         }
         Inst::Lambda { dst, body_func, captures } => {

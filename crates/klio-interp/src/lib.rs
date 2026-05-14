@@ -12537,6 +12537,15 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         name: &str,
         value: klio_runtime::Value,
     ) -> Result<(), klio_ir::eval::EvalError> {
+        // Class-side property write through the companion object
+        // (`Counter.count = 5` where `companion object { var count }`).
+        if let klio_runtime::Value::Class(class) = receiver {
+            let companion = class.companion.borrow().clone();
+            if let Some(comp) = companion {
+                comp.borrow_mut().define(name, value);
+                return Ok(());
+            }
+        }
         // Extension-property setter dispatch first; `var Holder.foo set(v){…}`
         // mutates `receiver` through its setter body.
         if let Ok(Some(())) = self

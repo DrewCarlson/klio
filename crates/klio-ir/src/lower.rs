@@ -237,6 +237,62 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 }
                 return contains;
             }
+            // Elvis `a ?: b` short-circuits — when `a` is non-null
+            // the right operand must not evaluate. Lower as a
+            // conditional branch with phi-style merge.
+            if matches!(op, AstBinOp::Elvis) {
+                let l = lower_expr(b, lhs);
+                let null_r = b.emit_const(Const::Null);
+                let is_null = b.alloc_reg();
+                b.push(Inst::BinOp { dst: is_null, op: BinOp::Eq, lhs: l, rhs: null_r });
+                let then_b = b.alloc_block();
+                let else_b = b.alloc_block();
+                let join = b.alloc_block();
+                let dst = b.alloc_reg();
+                b.terminate(Terminator::Branch { cond: is_null, t: then_b, f: else_b });
+                b.switch_to(then_b);
+                let rv = lower_expr(b, rhs);
+                b.push(Inst::Move { dst, src: rv });
+                b.terminate(Terminator::Goto(join));
+                b.switch_to(else_b);
+                b.push(Inst::Move { dst, src: l });
+                b.terminate(Terminator::Goto(join));
+                b.switch_to(join);
+                return dst;
+            }
+            // Logical `&&` / `||` short-circuit similarly.
+            if matches!(op, AstBinOp::And | AstBinOp::Or) {
+                let l = lower_expr(b, lhs);
+                let then_b = b.alloc_block();
+                let else_b = b.alloc_block();
+                let join = b.alloc_block();
+                let dst = b.alloc_reg();
+                b.terminate(Terminator::Branch { cond: l, t: then_b, f: else_b });
+                let is_and = matches!(op, AstBinOp::And);
+                // `&&`: if l is true → evaluate rhs; else → false.
+                // `||`: if l is true → true; else → evaluate rhs.
+                if is_and {
+                    b.switch_to(then_b);
+                    let rv = lower_expr(b, rhs);
+                    b.push(Inst::Move { dst, src: rv });
+                    b.terminate(Terminator::Goto(join));
+                    b.switch_to(else_b);
+                    let false_r = b.emit_const(Const::Bool(false));
+                    b.push(Inst::Move { dst, src: false_r });
+                    b.terminate(Terminator::Goto(join));
+                } else {
+                    b.switch_to(then_b);
+                    let true_r = b.emit_const(Const::Bool(true));
+                    b.push(Inst::Move { dst, src: true_r });
+                    b.terminate(Terminator::Goto(join));
+                    b.switch_to(else_b);
+                    let rv = lower_expr(b, rhs);
+                    b.push(Inst::Move { dst, src: rv });
+                    b.terminate(Terminator::Goto(join));
+                }
+                b.switch_to(join);
+                return dst;
+            }
             let l = lower_expr(b, lhs);
             let r = lower_expr(b, rhs);
             let dst = b.alloc_reg();
