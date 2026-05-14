@@ -92,15 +92,47 @@ pub enum Inst {
     /// Store at an indexed slot.
     IndexSet { receiver: Reg, index: Reg, value: Reg },
     /// Call a static function by id, with the args pulled from a
-    /// run of registers starting at `args`.
-    Call { dst: Reg, func: FuncId, args: Reg, n_args: u8 },
+    /// run of registers starting at `args`. `arg_names` carries an
+    /// optional `Option<ConstId>` per slot — `Some(name)` for
+    /// `foo(a = 1)`, `None` for positional. Empty when every arg
+    /// is positional.
+    Call {
+        dst: Reg,
+        func: FuncId,
+        args: Reg,
+        n_args: u8,
+        #[serde(default)]
+        arg_names: Vec<Option<ConstId>>,
+    },
     /// Call a callable value held in a register.
-    CallValue { dst: Reg, callee: Reg, args: Reg, n_args: u8 },
+    CallValue {
+        dst: Reg,
+        callee: Reg,
+        args: Reg,
+        n_args: u8,
+        #[serde(default)]
+        arg_names: Vec<Option<ConstId>>,
+    },
     /// Member call on a receiver. The evaluator resolves the
     /// method through the receiver's class table at runtime.
-    CallMember { dst: Reg, receiver: Reg, name: ConstId, args: Reg, n_args: u8 },
+    CallMember {
+        dst: Reg,
+        receiver: Reg,
+        name: ConstId,
+        args: Reg,
+        n_args: u8,
+        #[serde(default)]
+        arg_names: Vec<Option<ConstId>>,
+    },
     /// Instantiate a class.
-    NewInstance { dst: Reg, class: ClassId, args: Reg, n_args: u8 },
+    NewInstance {
+        dst: Reg,
+        class: ClassId,
+        args: Reg,
+        n_args: u8,
+        #[serde(default)]
+        arg_names: Vec<Option<ConstId>>,
+    },
     /// Build a `List` from a range of registers.
     NewList { dst: Reg, args: Reg, n_args: u8 },
     /// Binary primitive operation. Operands are guaranteed to be

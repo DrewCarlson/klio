@@ -415,6 +415,20 @@ impl Interpreter {
         args: &[Value],
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
+        let empty = vec![None; args.len()];
+        self.invoke_named_member_call_with_names(receiver, name, args, &empty, out)
+    }
+
+    /// Same as `invoke_named_member_call` but threads named args
+    /// through so foo(a = 1, b = 2) reorder fires.
+    pub fn invoke_named_member_call_with_names(
+        &mut self,
+        receiver: &Value,
+        name: &str,
+        args: &[Value],
+        arg_names: &[Option<String>],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
         use klio_ast::{Expr, Ident};
         use klio_span::{FileId, Span};
         let dummy_span = Span::new(FileId(0), 0, 0);
@@ -429,7 +443,11 @@ impl Interpreter {
                 span: dummy_span,
             });
         }
-        let arg_count = arg_exprs.len();
+        let names: Vec<Option<String>> = if arg_names.len() == args.len() {
+            arg_names.to_vec()
+        } else {
+            vec![None; args.len()]
+        };
         let call = Expr::Call {
             callee: Box::new(Expr::Member {
                 receiver: Box::new(Expr::Path {
@@ -441,7 +459,7 @@ impl Interpreter {
                 span: dummy_span,
             }),
             args: arg_exprs,
-            arg_names: vec![None; arg_count],
+            arg_names: names,
             type_args: Vec::new(),
             is_infix: false,
             span: dummy_span,
@@ -6893,13 +6911,26 @@ impl Interpreter {
         args: &[Value],
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
+        let names: Vec<Option<String>> = vec![None; args.len()];
+        self.construct_by_name_with_names(class_name, args, &names, out)
+    }
+
+    /// Construct an instance honouring named args + default values.
+    /// Used by the IR Host's new_instance_named callback so
+    /// `Foo(y = 99)` reorders correctly against `class Foo(x: Int = 1, y: Int = 2)`.
+    pub fn construct_by_name_with_names(
+        &mut self,
+        class_name: &str,
+        args: &[Value],
+        arg_names: &[Option<String>],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
         let class = self
             .class_table
             .get(class_name)
             .cloned()
             .ok_or_else(|| RuntimeError::Type(format!("unknown class `{class_name}`")))?;
-        let names: Vec<Option<String>> = vec![None; args.len()];
-        self.construct_instance(&class, args, &names, out)
+        self.construct_instance(&class, args, arg_names, out)
     }
 
     fn construct_instance_with_outer(
@@ -11054,6 +11085,56 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             }
             _ => None,
         }
+    }
+
+    fn call_value_named(
+        &mut self,
+        callee: &klio_runtime::Value,
+        args: &[klio_runtime::Value],
+        arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let _ = arg_names; // routed below via invoke_callable_value
+        self.call_value(callee, args)
+    }
+
+    fn call_member_named(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+        args: &[klio_runtime::Value],
+        arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // When any name is present, dispatch through the tree
+        // walker's full call path so reorder + default-arg fill
+        // fire correctly. Pre-evaluated args go into temp slots.
+        if arg_names.iter().any(|n| n.is_some()) {
+            return self
+                .interp
+                .invoke_named_member_call_with_names(receiver, name, args, arg_names, self.out)
+                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+        }
+        self.call_member(receiver, name, args)
+    }
+
+    fn new_instance_named(
+        &mut self,
+        class: klio_ir::ClassId,
+        args: &[klio_runtime::Value],
+        arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let name = self
+            .class_names
+            .get(class.0 as usize)
+            .ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "IR ClassId {} not in module index",
+                    class.0
+                ))
+            })?
+            .clone();
+        self.interp
+            .construct_by_name_with_names(&name, args, arg_names, self.out)
+            .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
     }
 
     fn call_value(

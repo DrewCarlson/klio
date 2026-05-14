@@ -28,6 +28,16 @@ pub trait Host {
     fn call_value(&mut self, _callee: &Value, _args: &[Value]) -> Result<Value, EvalError> {
         Err(EvalError::Unsupported("Host::call_value"))
     }
+    /// Same as `call_value` but with named-arg metadata. Default
+    /// drops the names and routes through `call_value`.
+    fn call_value_named(
+        &mut self,
+        callee: &Value,
+        args: &[Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<Value, EvalError> {
+        self.call_value(callee, args)
+    }
     /// Resolve a CallMember invocation against the receiver.
     fn call_member(
         &mut self,
@@ -37,11 +47,28 @@ pub trait Host {
     ) -> Result<Value, EvalError> {
         Err(EvalError::Unsupported("Host::call_member"))
     }
+    fn call_member_named(
+        &mut self,
+        receiver: &Value,
+        name: &str,
+        args: &[Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<Value, EvalError> {
+        self.call_member(receiver, name, args)
+    }
     /// Construct an instance of a class referenced by ID. The
     /// implementation looks up the corresponding ClassDef and
     /// invokes the primary constructor with the supplied args.
     fn new_instance(&mut self, _class: crate::ClassId, _args: &[Value]) -> Result<Value, EvalError> {
         Err(EvalError::Unsupported("Host::new_instance"))
+    }
+    fn new_instance_named(
+        &mut self,
+        class: crate::ClassId,
+        args: &[Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<Value, EvalError> {
+        self.new_instance(class, args)
     }
     /// Read a property on the receiver. Default for instances is
     /// the raw field lookup via `InstanceData::get`; concrete
@@ -107,6 +134,15 @@ pub trait Host {
             .get(func.0 as usize)
             .ok_or_else(|| EvalError::Type(format!("unknown FuncId {}", func.0)))?;
         eval(module, f, args)
+    }
+    fn call_func_named(
+        &mut self,
+        module: &Module,
+        func: FuncId,
+        args: Vec<Value>,
+        _arg_names: &[Option<String>],
+    ) -> Result<Value, EvalError> {
+        self.call_func(module, func, args)
     }
 }
 
@@ -387,30 +423,34 @@ fn exec_inst(
                 _ => return Err(EvalError::Type(format!("SetField on non-instance: {r:?}"))),
             }
         }
-        Inst::Call { dst, func, args, n_args } => {
+        Inst::Call { dst, func, args, n_args, arg_names } => {
             let arg_values = read_arg_run(frame, *args, *n_args);
-            let result = host.call_func(frame.module, *func, arg_values)?;
+            let names = resolve_arg_names(frame.module, arg_names);
+            let result = host.call_func_named(frame.module, *func, arg_values, &names)?;
             frame.write(*dst, result);
         }
-        Inst::CallValue { dst, callee, args, n_args } => {
+        Inst::CallValue { dst, callee, args, n_args, arg_names } => {
             let callee_v = frame.read(*callee);
             let arg_values = read_arg_run(frame, *args, *n_args);
-            let result = host.call_value(&callee_v, &arg_values)?;
+            let names = resolve_arg_names(frame.module, arg_names);
+            let result = host.call_value_named(&callee_v, &arg_values, &names)?;
             frame.write(*dst, result);
         }
-        Inst::CallMember { dst, receiver, name, args, n_args } => {
+        Inst::CallMember { dst, receiver, name, args, n_args, arg_names } => {
             let recv = frame.read(*receiver);
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
                 _ => return Err(EvalError::Type("CallMember: name not a string const".into())),
             };
             let arg_values = read_arg_run(frame, *args, *n_args);
-            let result = host.call_member(&recv, &name_str, &arg_values)?;
+            let names = resolve_arg_names(frame.module, arg_names);
+            let result = host.call_member_named(&recv, &name_str, &arg_values, &names)?;
             frame.write(*dst, result);
         }
-        Inst::NewInstance { dst, class, args, n_args } => {
+        Inst::NewInstance { dst, class, args, n_args, arg_names } => {
             let arg_values = read_arg_run(frame, *args, *n_args);
-            let result = host.new_instance(*class, &arg_values)?;
+            let names = resolve_arg_names(frame.module, arg_names);
+            let result = host.new_instance_named(*class, &arg_values, &names)?;
             frame.write(*dst, result);
         }
         Inst::InstanceOf { dst, src, ty } => {
@@ -494,6 +534,21 @@ fn read_arg_run(frame: &Frame<'_>, args_start: Reg, n: u8) -> Vec<Value> {
         out.push(frame.read(reg));
     }
     out
+}
+
+/// Resolve a per-call `arg_names: Vec<Option<ConstId>>` into a
+/// parallel `Vec<Option<String>>`. Empty input yields an empty
+/// output — callers treat that as "every arg positional".
+fn resolve_arg_names(module: &Module, names: &[Option<crate::ConstId>]) -> Vec<Option<String>> {
+    names
+        .iter()
+        .map(|opt| {
+            opt.and_then(|id| match &module.consts[id.0 as usize] {
+                Const::String(s) => Some(s.clone()),
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 fn value_truthy(v: &Value) -> Result<bool, EvalError> {

@@ -45,6 +45,22 @@ fn lower_arg_run(b: &mut FuncBuilder<'_>, args: &[Expr]) -> (Reg, u8) {
     (first, n as u8)
 }
 
+/// Intern an `arg_names` slice into a parallel `Vec<Option<ConstId>>`
+/// suitable for Inst::Call / CallMember / CallValue / NewInstance.
+/// Returns an empty vec when every entry is None (positional-only).
+fn intern_arg_names(
+    module: &mut crate::Module,
+    arg_names: &[Option<String>],
+) -> Vec<Option<crate::ConstId>> {
+    if arg_names.iter().all(|o| o.is_none()) {
+        return Vec::new();
+    }
+    arg_names
+        .iter()
+        .map(|opt| opt.as_ref().map(|s| module.intern_const(Const::String(s.clone()))))
+        .collect()
+}
+
 pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
     for (i, name) in names.iter().enumerate() {
         let dst = b.alloc_reg();
@@ -304,7 +320,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.push(Inst::GetField { dst, receiver: recv, field });
             dst
         }
-        Expr::Call { callee, args, .. } => {
+        Expr::Call { callee, args, arg_names: ast_arg_names, .. } => {
             // Path-callee with a registered top-level fn → Call{func}.
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
@@ -316,6 +332,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             func: func_id,
                             args: args_start,
                             n_args: count,
+                            arg_names: Vec::new(),
                         });
                         return dst;
                     }
@@ -326,12 +343,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 if segments.len() == 1 {
                     if let Some(class_id) = b.module.class_id(&segments[0].name) {
                         let (args_start, count) = lower_arg_run(b, args);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
                         let dst = b.alloc_reg();
                         b.push(Inst::NewInstance {
                             dst,
                             class: class_id,
                             args: args_start,
                             n_args: count,
+                            arg_names,
                         });
                         return dst;
                     }
@@ -352,6 +371,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         name: nm,
                         args: args_start,
                         n_args: count,
+                        arg_names: Vec::new(),
                     });
                     dst
                 }
@@ -364,6 +384,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         callee: callee_r,
                         args: args_start,
                         n_args: count,
+                        arg_names: Vec::new(),
                     });
                     dst
                 }
@@ -671,6 +692,7 @@ fn lower_for(
         name,
         args: args_start,
         n_args: 0,
+        arg_names: Vec::new(),
     });
     let header = b.alloc_block();
     let body_blk = b.alloc_block();
@@ -687,6 +709,7 @@ fn lower_for(
         name: hn_name,
         args: hn_args,
         n_args: 0,
+        arg_names: Vec::new(),
     });
     b.terminate(Terminator::Branch {
         cond: has_next,
@@ -705,6 +728,7 @@ fn lower_for(
         name: next_name,
         args: nargs,
         n_args: 0,
+        arg_names: Vec::new(),
     });
     if vars.len() == 1 {
         b.bind(vars[0].name.clone(), next_reg);
@@ -721,6 +745,7 @@ fn lower_for(
                 name: nm,
                 args: cargs,
                 n_args: 0,
+        arg_names: Vec::new(),
             });
             b.bind(v.name.clone(), comp);
         }
