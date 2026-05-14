@@ -26,6 +26,12 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.takeIf", scope_take_if),
     ("kotlin.takeUnless", scope_take_unless),
     ("kotlin.repeat", scope_repeat),
+    ("kotlin.require", contract_require),
+    ("kotlin.check", contract_check),
+    ("kotlin.error", contract_error),
+    ("kotlin.TODO", contract_todo),
+    ("kotlin.requireNotNull", contract_require_not_null),
+    ("kotlin.checkNotNull", contract_check_not_null),
 
     // ----- io -----
     ("kotlin.io.print", io_print),
@@ -1763,6 +1769,102 @@ fn coll_iter_filter_not(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
     }
     Ok(make_list(result, false))
+}
+
+fn contract_msg(ctx: &mut CallCtx, default: &str) -> Result<String, RuntimeError> {
+    if let Some(arg) = ctx.args.get(1).cloned() {
+        if matches!(&arg, Value::Lambda { .. } | Value::IrClosure { .. }) {
+            let CallCtx { out, host, .. } = ctx;
+            let r = host.invoke_callable(&arg, &[], *out)?;
+            return Ok(format!("{r}"));
+        }
+        return Ok(format!("{arg}"));
+    }
+    Ok(default.to_string())
+}
+
+fn contract_require(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let cond = ctx.args.first().cloned().unwrap_or(Value::Null);
+    let Value::Bool(b) = cond else {
+        return Err(RuntimeError::Type("require expects a Bool".into()));
+    };
+    if b {
+        return Ok(Value::Unit);
+    }
+    let msg = contract_msg(ctx, "Failed requirement.")?;
+    Err(RuntimeError::Thrown(Value::Exception {
+        fqn: Rc::new("kotlin.IllegalArgumentException".into()),
+        message: Some(Rc::new(msg)),
+        cause: None,
+    }))
+}
+
+fn contract_check(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let cond = ctx.args.first().cloned().unwrap_or(Value::Null);
+    let Value::Bool(b) = cond else {
+        return Err(RuntimeError::Type("check expects a Bool".into()));
+    };
+    if b {
+        return Ok(Value::Unit);
+    }
+    let msg = contract_msg(ctx, "Check failed.")?;
+    Err(RuntimeError::Thrown(Value::Exception {
+        fqn: Rc::new("kotlin.IllegalStateException".into()),
+        message: Some(Rc::new(msg)),
+        cause: None,
+    }))
+}
+
+fn contract_error(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let v = ctx.args.first().cloned().unwrap_or(Value::Null);
+    let msg = match v {
+        Value::String(s) => (*s).clone(),
+        other => format!("{other}"),
+    };
+    Err(RuntimeError::Thrown(Value::Exception {
+        fqn: Rc::new("kotlin.IllegalStateException".into()),
+        message: Some(Rc::new(msg)),
+        cause: None,
+    }))
+}
+
+fn contract_todo(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let msg = match ctx.args.first().cloned() {
+        Some(Value::String(s)) => format!("An operation is not implemented: {s}"),
+        Some(other) => format!("An operation is not implemented: {other}"),
+        None => "An operation is not implemented.".to_string(),
+    };
+    Err(RuntimeError::Thrown(Value::Exception {
+        fqn: Rc::new("kotlin.NotImplementedError".into()),
+        message: Some(Rc::new(msg)),
+        cause: None,
+    }))
+}
+
+fn contract_require_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let v = ctx.args.first().cloned().unwrap_or(Value::Null);
+    if !matches!(v, Value::Null) {
+        return Ok(v);
+    }
+    let msg = contract_msg(ctx, "Required value was null.")?;
+    Err(RuntimeError::Thrown(Value::Exception {
+        fqn: Rc::new("kotlin.IllegalArgumentException".into()),
+        message: Some(Rc::new(msg)),
+        cause: None,
+    }))
+}
+
+fn contract_check_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let v = ctx.args.first().cloned().unwrap_or(Value::Null);
+    if !matches!(v, Value::Null) {
+        return Ok(v);
+    }
+    let msg = contract_msg(ctx, "Required value was null.")?;
+    Err(RuntimeError::Thrown(Value::Exception {
+        fqn: Rc::new("kotlin.IllegalStateException".into()),
+        message: Some(Rc::new(msg)),
+        cause: None,
+    }))
 }
 
 fn scope_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

@@ -3863,132 +3863,18 @@ impl Interpreter {
                 }
                 Ok(Some(Value::Unit))
             }
-            "require" => {
-                let cond = self.eval_expr(&args[0], env, out)?;
-                let Value::Bool(b) = cond else {
-                    return Err(RuntimeError::Type("require expects a Bool".into()));
+            "require" | "check" | "error" | "TODO" | "requireNotNull" | "checkNotNull" => {
+                let fqn = format!("kotlin.{name}");
+                let Some(func) = klio_stdlib::implementation(&fqn) else {
+                    return Ok(None);
                 };
-                if !b {
-                    let msg = if let Some(a) = args.get(1) {
-                        let v = self.eval_expr(a, env, out)?;
-                        match v {
-                            Value::Lambda { params, body, env: captured, .. } => {
-                                let r = self.call_lambda(&params, &body, &captured, &[], out)?;
-                                Some(format!("{r}"))
-                            }
-                            other => Some(format!("{other}")),
-                        }
-                    } else {
-                        Some("Failed requirement.".to_string())
-                    };
-                    return Err(RuntimeError::Thrown(Value::Exception {
-                        fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-                        message: msg.map(Rc::new),
-                        cause: None,
-                    }));
+                let mut arg_vals = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_vals.push(self.eval_expr(a, env, out)?);
                 }
-                Ok(Some(Value::Unit))
-            }
-            "check" => {
-                let cond = self.eval_expr(&args[0], env, out)?;
-                let Value::Bool(b) = cond else {
-                    return Err(RuntimeError::Type("check expects a Bool".into()));
-                };
-                if !b {
-                    let msg = if let Some(a) = args.get(1) {
-                        let v = self.eval_expr(a, env, out)?;
-                        match v {
-                            Value::Lambda { params, body, env: captured, .. } => {
-                                let r = self.call_lambda(&params, &body, &captured, &[], out)?;
-                                Some(format!("{r}"))
-                            }
-                            other => Some(format!("{other}")),
-                        }
-                    } else {
-                        Some("Check failed.".to_string())
-                    };
-                    return Err(RuntimeError::Thrown(Value::Exception {
-                        fqn: Rc::new("kotlin.IllegalStateException".into()),
-                        message: msg.map(Rc::new),
-                        cause: None,
-                    }));
-                }
-                Ok(Some(Value::Unit))
-            }
-            "error" if args.len() == 1 => {
-                let v = self.eval_expr(&args[0], env, out)?;
-                let msg = match v {
-                    Value::String(s) => (*s).clone(),
-                    other => format!("{other}"),
-                };
-                Err(RuntimeError::Thrown(Value::Exception {
-                    fqn: Rc::new("kotlin.IllegalStateException".into()),
-                    message: Some(Rc::new(msg)),
-                    cause: None,
-                }))
-            }
-            "checkNotNull" => {
-                let v = self.eval_expr(&args[0], env, out)?;
-                if matches!(v, Value::Null) {
-                    let msg = if let Some(a) = args.get(1) {
-                        let lv = self.eval_expr(a, env, out)?;
-                        match lv {
-                            Value::Lambda { params, body, env: captured, .. } => {
-                                let r = self.call_lambda(&params, &body, &captured, &[], out)?;
-                                Some(format!("{r}"))
-                            }
-                            other => Some(format!("{other}")),
-                        }
-                    } else {
-                        Some("Required value was null.".to_string())
-                    };
-                    return Err(RuntimeError::Thrown(Value::Exception {
-                        fqn: Rc::new("kotlin.IllegalStateException".into()),
-                        message: msg.map(Rc::new),
-                        cause: None,
-                    }));
-                }
-                Ok(Some(v))
-            }
-            "requireNotNull" => {
-                let v = self.eval_expr(&args[0], env, out)?;
-                if matches!(v, Value::Null) {
-                    let msg = if let Some(a) = args.get(1) {
-                        let lv = self.eval_expr(a, env, out)?;
-                        match lv {
-                            Value::Lambda { params, body, env: captured, .. } => {
-                                let r = self.call_lambda(&params, &body, &captured, &[], out)?;
-                                Some(format!("{r}"))
-                            }
-                            other => Some(format!("{other}")),
-                        }
-                    } else {
-                        Some("Required value was null.".to_string())
-                    };
-                    return Err(RuntimeError::Thrown(Value::Exception {
-                        fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-                        message: msg.map(Rc::new),
-                        cause: None,
-                    }));
-                }
-                Ok(Some(v))
-            }
-            "TODO" => {
-                let msg = match args.first() {
-                    Some(a) => {
-                        let v = self.eval_expr(a, env, out)?;
-                        match v {
-                            Value::String(s) => format!("An operation is not implemented: {s}"),
-                            other => format!("An operation is not implemented: {other}"),
-                        }
-                    }
-                    None => "An operation is not implemented.".to_string(),
-                };
-                Err(RuntimeError::Thrown(Value::Exception {
-                    fqn: Rc::new("kotlin.NotImplementedError".into()),
-                    message: Some(Rc::new(msg)),
-                    cause: None,
-                }))
+                let mut __interp_host = InterpHostRef { interp: self };
+                let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                Ok(Some(func(&mut ctx)?))
             }
             _ => Ok(None),
         }
@@ -11898,9 +11784,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // rather than registered intrinsics. Return a sentinel so
         // call_value can route them through eval_via_ast below.
         match name {
-            "require" | "check" | "requireNotNull" | "checkNotNull" | "error" | "TODO"
-            // UInt variants not yet host-bound
-            | "UIntArray" | "ULongArray" | "UShortArray" | "UByteArray"
+            "UIntArray" | "ULongArray" | "UShortArray" | "UByteArray"
             // Comparator-shaped helpers requiring lambda steps
             | "thenBy" | "thenByDescending"
             | "compareValuesBy" | "Comparator"
