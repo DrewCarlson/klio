@@ -362,7 +362,7 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<(), RuntimeError> {
         for file in files {
-            self.run_with_output_mode(file, out, /*invoke_main=*/ false, /*persist=*/ true)?;
+            self.run_with_output_impl(file, out, /*invoke_main=*/ false, /*persist=*/ true)?;
         }
         Ok(())
     }
@@ -1019,13 +1019,13 @@ impl Interpreter {
             // Non-main file: register top-level decls into the
             // shared globals (persist=true), don't call main
             // (invoke_main=false).
-            self.run_with_output_mode(file, out, false, true)?;
+            self.run_with_output_impl(file, out, false, true)?;
         }
         if let Some(idx) = main_idx {
             // The main file's decls also persist into globals so
             // they survive any subsequent invocation against the
             // same Interpreter instance.
-            self.run_with_output_mode(&files[idx], out, true, true)
+            self.run_with_output_impl(&files[idx], out, true, true)
         } else {
             Err(RuntimeError::NoMain)
         }
@@ -1040,7 +1040,7 @@ impl Interpreter {
         file: &KotlinFile,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
-        self.run_with_output_mode(file, out, /*invoke_main=*/ true, /*persist=*/ false)
+        self.run_with_output_impl(file, out, /*invoke_main=*/ true, /*persist=*/ false)
     }
 
     /// Internal entry point. When `invoke_main` is true the file's
@@ -1050,17 +1050,6 @@ impl Interpreter {
     /// declarations land directly in the shared globals (so other
     /// files in the same module can see them) or in a transient
     /// file-scoped environment.
-    pub fn run_with_output_mode(
-        &mut self,
-        file: &KotlinFile,
-        out: &mut dyn Output,
-        invoke_main: bool,
-        persist: bool,
-    ) -> Result<Value, RuntimeError> {
-        let _ = (invoke_main, persist);
-        self.run_with_output_impl(file, out, invoke_main, persist)
-    }
-
     fn run_with_output_impl(
         &mut self,
         file: &KotlinFile,
