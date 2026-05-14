@@ -269,6 +269,31 @@ pub struct Interpreter {
 /// than its own fields so the existing Interpreter storage stays the
 /// single source of truth; future passes can swap the backing fields
 /// onto this struct directly without churning every call site.
+/// Owning store for the per-class IR side-tables populated by the
+/// decl-registration pass. Keeping them grouped under one type is a
+/// first step toward making `ModuleRegistry` carry its own fields
+/// instead of borrowing them off the interpreter — the larger
+/// migration is staged so the interpreter's call sites can switch
+/// over one map at a time without ever leaving the test suite red.
+#[derive(Default)]
+pub(crate) struct ClassIrTables {
+    pub init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    pub parent_ctor_args:
+        std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    pub body_prop_inits:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    pub supertype_delegates:
+        std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
+    pub secondary_ctors:
+        std::collections::HashMap<(String, usize), SecondaryCtorIr>,
+    pub instance_prop_getters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    pub instance_prop_setters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    pub top_level_prop_getters: std::collections::HashMap<String, klio_ir::FuncId>,
+    pub top_level_prop_setters: std::collections::HashMap<String, klio_ir::FuncId>,
+}
+
 /// One secondary constructor's lowered IR. `delegation_args` is
 /// `Some(thunks)` for `: this(args)` / `: super(args)` headers and
 /// `None` for implicit delegation. `body` is the ctor body run with
