@@ -14,7 +14,65 @@
 
 use klio_runtime::Value;
 
-use crate::{BinOp, BlockId, Const, Func, Inst, Module, Reg, Terminator, UnOp};
+use crate::{BinOp, BlockId, Const, Func, FuncId, Inst, Module, Reg, Terminator, TypeRef, UnOp};
+
+/// Pluggable callbacks the evaluator delegates non-trivial dispatch
+/// through. The IR is intentionally agnostic about how user
+/// classes and top-level functions are resolved; a real frontend
+/// supplies a host implementation that ties into the interpreter's
+/// class table / dispatch machinery. A default no-op `NullHost`
+/// exists for unit tests.
+pub trait Host {
+    /// Resolve a CallValue invocation against a runtime value.
+    /// Default rejects so wiring is visible.
+    fn call_value(&mut self, _callee: &Value, _args: &[Value]) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::call_value"))
+    }
+    /// Resolve a CallMember invocation against the receiver.
+    fn call_member(
+        &mut self,
+        _receiver: &Value,
+        _name: &str,
+        _args: &[Value],
+    ) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::call_member"))
+    }
+    /// Construct an instance of a class referenced by ID. The
+    /// implementation looks up the corresponding ClassDef and
+    /// invokes the primary constructor with the supplied args.
+    fn new_instance(&mut self, _class: crate::ClassId, _args: &[Value]) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::new_instance"))
+    }
+    /// Test whether `value` is an instance of `ty`. The default
+    /// implementation handles the primitive nominal types via
+    /// `Value::type_fqn`; complex types defer to the host.
+    fn instance_of(&mut self, value: &Value, ty: &TypeRef) -> bool {
+        // Primitive name-match suffices for the simple shapes the
+        // IR evaluator can reason about standalone.
+        let nominal = value.type_fqn();
+        nominal == ty.name || nominal.ends_with(&format!(".{}", ty.name))
+    }
+    /// Resolve a function call by FuncId. The default routes
+    /// through `eval()` recursively, so a single-module IR program
+    /// stays self-contained.
+    fn call_func(
+        &mut self,
+        module: &Module,
+        func: FuncId,
+        args: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        let f = module
+            .funcs
+            .get(func.0 as usize)
+            .ok_or_else(|| EvalError::Type(format!("unknown FuncId {}", func.0)))?;
+        eval(module, f, args)
+    }
+}
+
+/// No-op host for unit tests and IR-shape exercises.
+#[derive(Default)]
+pub struct NullHost;
+impl Host for NullHost {}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
@@ -63,8 +121,21 @@ impl<'a> Frame<'a> {
 
 /// Run a function body with the given positional arguments.
 /// Returns the value carried by the terminating `Return`, or
-/// `Unit` for a fall-off.
+/// `Unit` for a fall-off. Uses `NullHost` for delegated calls.
 pub fn eval(module: &Module, func: &Func, args: Vec<Value>) -> Result<Value, EvalError> {
+    let mut host = NullHost;
+    eval_with(module, func, args, &mut host)
+}
+
+/// Run a function body, routing non-trivial dispatch (CallValue /
+/// CallMember / NewInstance / InstanceOf) through the supplied
+/// host implementation.
+pub fn eval_with(
+    module: &Module,
+    func: &Func,
+    args: Vec<Value>,
+    host: &mut dyn Host,
+) -> Result<Value, EvalError> {
     let mut frame = Frame::new(module, func, args);
     let mut cur = func.entry;
     loop {
@@ -76,7 +147,7 @@ pub fn eval(module: &Module, func: &Func, args: Vec<Value>) -> Result<Value, Eva
             (block.insts.clone(), block.terminator.clone())
         };
         for inst in &insts {
-            exec_inst(&mut frame, inst)?;
+            exec_inst(&mut frame, inst, host)?;
         }
         match term {
             Terminator::Goto(next) => cur = next,
@@ -103,7 +174,11 @@ pub fn eval(module: &Module, func: &Func, args: Vec<Value>) -> Result<Value, Eva
     }
 }
 
-fn exec_inst(frame: &mut Frame<'_>, inst: &Inst) -> Result<(), EvalError> {
+fn exec_inst(
+    frame: &mut Frame<'_>,
+    inst: &Inst,
+    host: &mut dyn Host,
+) -> Result<(), EvalError> {
     match inst {
         Inst::Const { dst, value } => {
             let v = const_to_value(&frame.module.consts[value.0 as usize]);
@@ -174,9 +249,98 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst) -> Result<(), EvalError> {
                 _ => return Err(EvalError::Type(format!("SetField on non-instance: {r:?}"))),
             }
         }
-        _ => return Err(EvalError::Unsupported("instruction not yet implemented")),
+        Inst::Call { dst, func, args, n_args } => {
+            let arg_values = read_arg_run(frame, *args, *n_args);
+            let result = host.call_func(frame.module, *func, arg_values)?;
+            frame.write(*dst, result);
+        }
+        Inst::CallValue { dst, callee, args, n_args } => {
+            let callee_v = frame.read(*callee);
+            let arg_values = read_arg_run(frame, *args, *n_args);
+            let result = host.call_value(&callee_v, &arg_values)?;
+            frame.write(*dst, result);
+        }
+        Inst::CallMember { dst, receiver, name, args, n_args } => {
+            let recv = frame.read(*receiver);
+            let name_str = match &frame.module.consts[name.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type("CallMember: name not a string const".into())),
+            };
+            let arg_values = read_arg_run(frame, *args, *n_args);
+            let result = host.call_member(&recv, &name_str, &arg_values)?;
+            frame.write(*dst, result);
+        }
+        Inst::NewInstance { dst, class, args, n_args } => {
+            let arg_values = read_arg_run(frame, *args, *n_args);
+            let result = host.new_instance(*class, &arg_values)?;
+            frame.write(*dst, result);
+        }
+        Inst::InstanceOf { dst, src, ty } => {
+            let v = frame.read(*src);
+            let is = host.instance_of(&v, ty);
+            frame.write(*dst, Value::Bool(is));
+        }
+        Inst::Cast { dst, src, ty, safe } => {
+            let v = frame.read(*src);
+            if host.instance_of(&v, ty) {
+                frame.write(*dst, v);
+            } else if *safe {
+                frame.write(*dst, Value::Null);
+            } else {
+                return Err(EvalError::Type(format!(
+                    "cast to `{}` failed for value {:?}",
+                    ty.name, v
+                )));
+            }
+        }
+        Inst::Lambda { .. } => {
+            return Err(EvalError::Unsupported(
+                "Inst::Lambda — closure construction requires host integration",
+            ));
+        }
+        Inst::LoadCapture { dst, idx: _ } => {
+            // Captures need host integration to materialise; for now
+            // surface a clear error.
+            let _ = dst;
+            return Err(EvalError::Unsupported("Inst::LoadCapture"));
+        }
+        Inst::Index { dst, receiver, index } => {
+            let r = frame.read(*receiver);
+            let i = frame.read(*index);
+            let result = host.call_member(&r, "get", &[i])?;
+            frame.write(*dst, result);
+        }
+        Inst::IndexSet { receiver, index, value } => {
+            let r = frame.read(*receiver);
+            let i = frame.read(*index);
+            let v = frame.read(*value);
+            let _ = host.call_member(&r, "set", &[i, v])?;
+        }
+        Inst::NewList { dst, args, n_args } => {
+            let items: Vec<Value> = read_arg_run(frame, *args, *n_args);
+            frame.write(
+                *dst,
+                Value::List {
+                    items: std::rc::Rc::new(std::cell::RefCell::new(items)),
+                    mutable: false,
+                    enum_class: None,
+                },
+            );
+        }
     }
     Ok(())
+}
+
+/// Pull `n_args` register values starting at `args_start` into a
+/// fresh Vec. Args are laid out contiguously by the lowering pass
+/// in a `Move`-sequence, so reading the run is straight indexing.
+fn read_arg_run(frame: &Frame<'_>, args_start: Reg, n: u8) -> Vec<Value> {
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n as u32 {
+        let reg = Reg(args_start.0 + i);
+        out.push(frame.read(reg));
+    }
+    out
 }
 
 fn value_truthy(v: &Value) -> Result<bool, EvalError> {
