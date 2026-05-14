@@ -168,6 +168,10 @@ pub enum Inst {
     /// representation for (today: `object { … }` anonymous objects).
     /// The host receives the AST node + the current scope snapshot
     /// and returns the evaluated Value.
+    /// Register a class declaration encountered inside a function
+    /// body. Local classes live for the duration of the call (the
+    /// tree walker re-registers them on each entry).
+    RegisterClass { class: Box<klio_ast::Class> },
     EvalAst {
         dst: Reg,
         ast: Box<klio_ast::Expr>,

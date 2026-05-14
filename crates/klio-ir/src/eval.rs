@@ -148,6 +148,12 @@ pub trait Host {
     /// caller's scope. Used by `Inst::EvalAst` for constructs the
     /// IR lowering doesn't yet model structurally (anonymous
     /// objects today).
+    /// Register a local class declaration with the host's class
+    /// table so subsequent `NewInstance` / `lookup_global` find it.
+    fn register_class(&mut self, _class: &klio_ast::Class) -> Result<(), EvalError> {
+        Err(EvalError::Unsupported("Host::register_class"))
+    }
+
     fn eval_ast(
         &mut self,
         _ast: &klio_ast::Expr,
@@ -607,6 +613,9 @@ fn exec_inst(
             let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
             let v = host.build_ast_lambda_with_flag(params, body_ast, captured_names, cap_values, *absorb_return)?;
             frame.write(*dst, v);
+        }
+        Inst::RegisterClass { class } => {
+            host.register_class(class)?;
         }
         Inst::EvalAst { dst, ast, captured_names, captures } => {
             let captured_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();

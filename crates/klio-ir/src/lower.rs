@@ -1498,6 +1498,14 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             }
             None
         }
+        Stmt::Decl(klio_ast::Decl::Class(c)) => {
+            // Local class declaration inside a function body. Emit a
+            // RegisterClass inst that hands the AST to the host so
+            // construct_by_name / NewInstance can find it during this
+            // call's execution.
+            b.push(Inst::RegisterClass { class: Box::new(c.clone()) });
+            None
+        }
         Stmt::Decl(_) | Stmt::DestructuringDecl { .. } => None,
     }
 }

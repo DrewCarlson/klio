@@ -6519,6 +6519,21 @@ impl Interpreter {
     /// done in later passes by the caller; that ordering is what lets a
     /// subclass declared above its parent in source order still work, and
     /// lets enum-entry construction see resolved methods.
+    pub fn register_class_decl(
+        &mut self,
+        class: &klio_ast::Class,
+        out: &mut dyn Output,
+    ) -> Result<(), RuntimeError> {
+        let env = Rc::clone(&self.globals);
+        let cls = self.build_class_shell(class, &env, out)?;
+        self.class_table.insert(class.name.name.clone(), Rc::clone(&cls));
+        self.globals.borrow_mut().define(
+            class.name.name.clone(),
+            klio_runtime::Value::Class(Rc::clone(&cls)),
+        );
+        Ok(())
+    }
+
     fn build_class_shell(
         &mut self,
         c: &klio_ast::Class,
@@ -12022,6 +12037,15 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // extension props all fire correctly.
         self.interp
             .eval_property_access(receiver.clone(), name, self.out)
+            .map_err(ir_err)
+    }
+
+    fn register_class(
+        &mut self,
+        class: &klio_ast::Class,
+    ) -> Result<(), klio_ir::eval::EvalError> {
+        self.interp
+            .register_class_decl(class, self.out)
             .map_err(ir_err)
     }
 
