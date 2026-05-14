@@ -1005,24 +1005,20 @@ impl Interpreter {
         file: &KotlinFile,
         out: &mut dyn Output,
     ) -> Result<(), RuntimeError> {
-        self.run_with_output_impl(file, out, /*invoke_main=*/ false, /*persist=*/ true)?;
-        Ok(())
+        self.register_file_decls_impl(file, out, /*persist=*/ true)
     }
 
-    /// Internal entry point. When `invoke_main` is true the file's
-    /// `fun main` is called after every declaration is in scope;
-    /// when false the function returns `Unit` once all decls have
-    /// been registered. `persist` controls whether the file's
-    /// declarations land directly in the shared globals (so other
-    /// files in the same module can see them) or in a transient
-    /// file-scoped environment.
-    fn run_with_output_impl(
+    /// Pure declaration-registration pass. Walks the file, applies
+    /// imports, registers every top-level class / function /
+    /// property / typealias into the interpreter's tables, and
+    /// returns. Does not eval `main` or any block — that's the
+    /// IR evaluator's job once the registry is populated.
+    fn register_file_decls_impl(
         &mut self,
         file: &KotlinFile,
         out: &mut dyn Output,
-        invoke_main: bool,
         persist: bool,
-    ) -> Result<Value, RuntimeError> {
+    ) -> Result<(), RuntimeError> {
         // When `persist` is true, register decls directly into the
         // shared globals so sibling files in a module can see them
         // after this call returns. Otherwise (the common single-
@@ -1266,8 +1262,7 @@ impl Interpreter {
             }
         }
 
-        let _ = invoke_main;
-        Ok(Value::Unit)
+        Ok(())
     }
 
     fn call_function(
