@@ -11326,9 +11326,30 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 ))
             })?
             .clone();
-        self.interp
+        match self
+            .interp
             .construct_by_name_with_names(&name, args, arg_names, self.out)
-            .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
+        {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // SAM conversion: `IntPredicate { x -> … }` invokes
+                // an interface name with a lambda. construct_by_name
+                // refuses because the interface has no constructor.
+                // Tree walker's eval_call handles this as a regular
+                // Call(Path(name), args), so route through that.
+                let msg = e.to_string();
+                if msg.contains("interface")
+                    || msg.contains("InstantiationError")
+                    || msg.contains("abstract")
+                {
+                    return self
+                        .interp
+                        .invoke_named_intrinsic_with_names(&name, args, arg_names, self.out)
+                        .map_err(|e2| klio_ir::eval::EvalError::Type(e2.to_string()));
+                }
+                Err(klio_ir::eval::EvalError::Type(msg))
+            }
+        }
     }
 
     fn call_value(
@@ -11436,6 +11457,15 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 captures.iter().cloned().collect(),
                 &mut child,
             );
+        }
+        // User class that implements a function type (e.g.
+        // `class Adder : (Int) -> Int { override fun invoke(...) }`).
+        // Kotlin calls the `invoke` member when the value is used as
+        // a callable.
+        if let klio_runtime::Value::Instance(inst) = callee {
+            if let Some((_m, _)) = inst.borrow().class.find_method("invoke") {
+                return self.call_member(callee, "invoke", args);
+            }
         }
         let names: Vec<Option<String>> = vec![None; args.len()];
         self.interp
