@@ -1353,6 +1353,44 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                 }
             }
+            // Built-in stdlib companion shortcuts: `Result.success(x)`,
+            // `Result.failure(e)`, etc. The callee parses as
+            // Member { Path("Result"), "success" }; rewrite to a
+            // direct stdlib FQN dispatch since `Result` isn't a
+            // value in the runtime globals.
+            if let Expr::Member { receiver: recv_box, name: mname, .. } = callee.as_ref() {
+                if let Expr::Path { segments, .. } = recv_box.as_ref() {
+                    if segments.len() == 1
+                        && b.resolve(&segments[0].name).is_none()
+                        && !b.knows_outer(&segments[0].name)
+                        && b.module.class_id(&segments[0].name).is_none()
+                    {
+                        let head = &segments[0].name;
+                        let companion_fqns: &[(&str, &str, &str)] = &[
+                            ("Result", "success", "kotlin.Result.Companion.success"),
+                            ("Result", "failure", "kotlin.Result.Companion.failure"),
+                        ];
+                        for (cls, method, fqn) in companion_fqns {
+                            if head == cls && mname.name == *method {
+                                let callee_r = b.alloc_reg();
+                                let n = b.module.intern_const(Const::String((*fqn).to_string()));
+                                b.push(Inst::LoadGlobal { dst: callee_r, name: n });
+                                let (args_start, count) = lower_arg_run(b, args);
+                                let arg_names = intern_arg_names(b.module, ast_arg_names);
+                                let dst = b.alloc_reg();
+                                b.push(Inst::CallValue {
+                                    dst,
+                                    callee: callee_r,
+                                    args: args_start,
+                                    n_args: count,
+                                    arg_names,
+                                });
+                                return dst;
+                            }
+                        }
+                    }
+                }
+            }
             // Fully-qualified callee like `kotlin.math.abs(x)` →
             // resolve the FQN as a global and CallValue against the
             // resulting intrinsic / function value. Avoids the
