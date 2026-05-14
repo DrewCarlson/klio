@@ -1631,9 +1631,19 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             _ => lower_expr(b, inner),
         },
         Expr::PropertyRef { name, .. } => {
+            // `::greet` — if the name is a registered top-level
+            // function, load the function value so the result is
+            // callable. Otherwise emit a `KProperty`-shaped
+            // PropertyRef metadata value.
             let dst = b.alloc_reg();
             let nm = b.module.intern_const(Const::String(name.name.clone()));
-            b.push(Inst::PropertyRef { dst, name: nm });
+            if b.module.func_id(&name.name).is_some()
+                || b.module.class_id(&name.name).is_some()
+            {
+                b.push(Inst::LoadGlobal { dst, name: nm });
+            } else {
+                b.push(Inst::PropertyRef { dst, name: nm });
+            }
             dst
         }
         Expr::MemberRef { receiver, name, .. } => {
