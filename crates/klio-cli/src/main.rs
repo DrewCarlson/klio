@@ -136,6 +136,34 @@ enum PackCmd {
         #[arg(long = "max-size", default_value_t = 64 * 1024)]
         max_size: usize,
     },
+    /// Publish a pack into a local-filesystem registry. Today the
+    /// registry is a directory whose layout mirrors a Maven cache:
+    /// `<registry>/<library_id>/<version>/<library_id>-<version>.klio-pack`
+    /// plus an index.json that lists every published library.
+    Publish {
+        /// Pack file to publish.
+        pack: PathBuf,
+        /// Registry root directory. Defaults to `~/.klio/registry`.
+        #[arg(long = "registry")]
+        registry: Option<PathBuf>,
+    },
+    /// Search a registry's index for libraries matching `query`.
+    /// Substring match against library id; case-insensitive.
+    Search {
+        query: String,
+        #[arg(long = "registry")]
+        registry: Option<PathBuf>,
+    },
+    /// Fetch a pack from a registry into the local cache so it
+    /// becomes available to subsequent `klio run` invocations.
+    Fetch {
+        library_id: String,
+        /// Optional version. Defaults to the registry's latest.
+        #[arg(long = "version")]
+        version: Option<String>,
+        #[arg(long = "registry")]
+        registry: Option<PathBuf>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -254,6 +282,35 @@ fn run_pack(cmd: PackCmd) -> ExitCode {
                 }
             }
         }
+        PackCmd::Publish { pack, registry } => match publish_to_registry(&pack, registry.as_deref()) {
+            Ok(dest) => {
+                eprintln!("published {}", dest.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        PackCmd::Search { query, registry } => match search_registry(&query, registry.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        PackCmd::Fetch { library_id, version, registry } => {
+            match fetch_from_registry(&library_id, version.as_deref(), registry.as_deref()) {
+                Ok(dest) => {
+                    eprintln!("fetched {}", dest.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         PackCmd::TrainDict { inputs, out, max_size } => match train_zstd_dict(&inputs, &out, max_size) {
             Ok(()) => {
                 eprintln!("trained dict {}", out.display());
@@ -310,6 +367,115 @@ fn migrate_pack(input: &std::path::Path, output: &std::path::Path) -> Result<(),
     }
     std::fs::write(output, bytes).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Local-filesystem registry
+// ---------------------------------------------------------------------
+
+fn registry_dir(override_path: Option<&std::path::Path>) -> Result<PathBuf, String> {
+    if let Some(p) = override_path {
+        return Ok(p.to_path_buf());
+    }
+    let home = std::env::var_os("HOME").ok_or("HOME env var unset")?;
+    Ok(PathBuf::from(home).join(".klio").join("registry"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct RegistryEntry {
+    library_id: String,
+    version: String,
+    abi_version: u32,
+    relative_path: String,
+}
+
+fn registry_index_path(root: &std::path::Path) -> PathBuf {
+    root.join("index.json")
+}
+
+fn read_registry_index(root: &std::path::Path) -> Result<Vec<RegistryEntry>, String> {
+    let path = registry_index_path(root);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+fn write_registry_index(root: &std::path::Path, entries: &[RegistryEntry]) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(entries).map_err(|e| e.to_string())?;
+    std::fs::write(registry_index_path(root), bytes).map_err(|e| e.to_string())
+}
+
+fn publish_to_registry(
+    pack: &std::path::Path,
+    registry_override: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    let manifest = read_pack_manifest(pack)?;
+    let root = registry_dir(registry_override)?;
+    let lib_dir = root.join(&manifest.library_id).join(&manifest.library_version);
+    std::fs::create_dir_all(&lib_dir).map_err(|e| e.to_string())?;
+    let dest = lib_dir.join(format!(
+        "{}-{}.klio-pack",
+        manifest.library_id, manifest.library_version
+    ));
+    std::fs::copy(pack, &dest).map_err(|e| format!("copy: {e}"))?;
+
+    let relative = dest
+        .strip_prefix(&root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| dest.to_string_lossy().into_owned());
+    let mut index = read_registry_index(&root)?;
+    index.retain(|e| !(e.library_id == manifest.library_id && e.version == manifest.library_version));
+    index.push(RegistryEntry {
+        library_id: manifest.library_id,
+        version: manifest.library_version,
+        abi_version: manifest.abi_version,
+        relative_path: relative,
+    });
+    index.sort_by(|a, b| (a.library_id.as_str(), a.version.as_str()).cmp(&(b.library_id.as_str(), b.version.as_str())));
+    write_registry_index(&root, &index)?;
+    Ok(dest)
+}
+
+fn search_registry(query: &str, registry_override: Option<&std::path::Path>) -> Result<(), String> {
+    let root = registry_dir(registry_override)?;
+    let entries = read_registry_index(&root)?;
+    let lq = query.to_lowercase();
+    let matches: Vec<&RegistryEntry> = entries
+        .iter()
+        .filter(|e| e.library_id.to_lowercase().contains(&lq))
+        .collect();
+    if matches.is_empty() {
+        eprintln!("no packs matching `{query}` in {}", root.display());
+        return Ok(());
+    }
+    for e in matches {
+        println!(
+            "{:<32}  {:<12}  abi {}  {}",
+            e.library_id, e.version, e.abi_version, e.relative_path
+        );
+    }
+    Ok(())
+}
+
+fn fetch_from_registry(
+    library_id: &str,
+    version: Option<&str>,
+    registry_override: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    let root = registry_dir(registry_override)?;
+    let entries = read_registry_index(&root)?;
+    let candidate = entries
+        .iter()
+        .filter(|e| e.library_id == library_id)
+        .filter(|e| version.map_or(true, |v| e.version == v))
+        .max_by(|a, b| a.version.cmp(&b.version))
+        .ok_or_else(|| format!("no registry entry for `{library_id}`"))?;
+    let src = root.join(&candidate.relative_path);
+    if !src.exists() {
+        return Err(format!("registry entry points at missing file {}", src.display()));
+    }
+    install_pack_into_cache(&src)
 }
 
 /// Train a zstd dictionary from the AST + sources sections of the
