@@ -1654,17 +1654,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
     }
 }
 
-#[allow(dead_code)]
-fn lower_lambda_body(
-    module: &mut crate::Module,
-    params: &[klio_ast::Ident],
-    body: &klio_ast::Block,
-) -> crate::FuncId {
-    let (id, _) =
-        lower_lambda_body_capturing(module, params, body, std::collections::HashSet::new());
-    id
-}
-
 /// Lower a lambda body, threading the enclosing builder's
 /// visible-name set so Path references that hit it lower to
 /// `LoadCapture`. Returns the body's `FuncId` plus the ordered
