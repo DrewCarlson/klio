@@ -354,6 +354,15 @@ impl Interpreter {
         klio_stdlib::implementation(fqn)
     }
 
+    /// Single source of truth for "did a pack install a binding for
+    /// this FQN?". Use this from dispatch sites that want to let a
+    /// pack-installed native impl shadow a baked-in fallback
+    /// (intrinsic alias / BoundMethod / shim Kotlin body / etc.).
+    #[must_use]
+    pub fn binding_override(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
+        self.installed_bindings.get(fqn).copied()
+    }
+
     /// Returns the implicit-import packages contributed by loaded
     /// packs (`install_pack`). The stdlib defaults remain in
     /// `klio_stdlib::IMPLICITLY_IMPORTED_PACKAGES`; this list adds
@@ -838,7 +847,7 @@ impl Interpreter {
                 // Kotlin body doesn't shadow the binding.
                 let value = if let Some(pkg) = self.current_package.as_deref() {
                     let fqn = format!("{pkg}.{}", f.name.name);
-                    if let Some(func) = self.installed_bindings.get(&fqn).copied() {
+                    if let Some(func) = self.binding_override(&fqn) {
                         let fqn_static: &'static str = leak_fqn(&fqn);
                         Value::Intrinsic { fqn: fqn_static, func }
                     } else {
@@ -9009,7 +9018,7 @@ impl Interpreter {
             if let Value::Instance(inst) = &recv {
                 let cls_fqn = inst.borrow().class.fqn.clone();
                 let fqn = format!("{cls_fqn}.{}", name.name);
-                if let Some(func) = self.installed_bindings.get(&fqn).copied() {
+                if let Some(func) = self.binding_override(&fqn) {
                     let mut user_args = Vec::with_capacity(args.len());
                     for a in args {
                         user_args.push(self.eval_expr(a, env, out)?);
@@ -9402,7 +9411,7 @@ impl Interpreter {
                 // captured `func` so loaded bindings take effect even
                 // for intrinsics already bound at startup (implicit
                 // aliases, prior callsite caches, etc.).
-                let effective = self.installed_bindings.get(fqn).copied().unwrap_or(func);
+                let effective = self.binding_override(fqn).unwrap_or(func);
                 let mut ctx = CallCtx { args: &arg_vals, out };
                 effective(&mut ctx)
             }
@@ -9411,7 +9420,7 @@ impl Interpreter {
                 let mut all = Vec::with_capacity(user_args.len() + 1);
                 all.push(*receiver);
                 all.extend(user_args);
-                let effective = self.installed_bindings.get(fqn).copied().unwrap_or(func);
+                let effective = self.binding_override(fqn).unwrap_or(func);
                 let mut ctx = CallCtx { args: &all, out };
                 effective(&mut ctx)
             }
