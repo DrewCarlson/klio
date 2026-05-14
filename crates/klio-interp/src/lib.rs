@@ -11664,6 +11664,31 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         if arg_names.iter().any(|n| n.is_some()) {
+            // Named args that already match the IR method's
+            // declared param order need no reordering — drop the
+            // names and dispatch positionally.
+            if let klio_runtime::Value::Instance(inst) = receiver {
+                let class_fqn = inst.borrow().class.fqn.clone();
+                let class_name = inst.borrow().class.name.clone();
+                if let Some(fid) = self
+                    .lookup_ir_method(&class_fqn, name)
+                    .or_else(|| self.lookup_ir_method(&class_name, name))
+                {
+                    let module = std::rc::Rc::clone(&self.module);
+                    let func = module.funcs[fid.0 as usize].clone();
+                    if func.params.len() == args.len() + 1 {
+                        let in_order = arg_names.iter().enumerate().all(|(i, opt)| {
+                            opt.as_deref().map_or(true, |n| {
+                                // Skip the implicit `this` slot at 0.
+                                func.params.get(i + 1).map_or(false, |p| p.name == n)
+                            })
+                        });
+                        if in_order {
+                            return self.call_member(receiver, name, args);
+                        }
+                    }
+                }
+            }
             return self
                 .dispatch_member_via_ast(receiver, name, args, arg_names)
                 .map_err(ir_err);
