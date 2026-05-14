@@ -856,10 +856,7 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::Add, Int(a), Int(b)) => Ok(Int(a.wrapping_add(*b))),
         (BinOp::Sub, Int(a), Int(b)) => Ok(Int(a.wrapping_sub(*b))),
         (BinOp::Mul, Int(a), Int(b)) => Ok(Int(a.wrapping_mul(*b))),
-        (BinOp::Div, Int(_), Int(0)) => Err(EvalError::Type("division by zero".into())),
-        (BinOp::Div, Int(a), Int(b)) => Ok(Int(a.wrapping_div(*b))),
-        (BinOp::Mod, Int(_), Int(0)) => Err(EvalError::Type("mod by zero".into())),
-        (BinOp::Mod, Int(a), Int(b)) => Ok(Int(a.wrapping_rem(*b))),
+        // (Int Div/Mod handled below, after Long, with ArithmeticException throw.)
         (BinOp::Add, Long(a), Long(b)) => Ok(Long(a.wrapping_add(*b))),
         (BinOp::Sub, Long(a), Long(b)) => Ok(Long(a.wrapping_sub(*b))),
         (BinOp::Mul, Long(a), Long(b)) => Ok(Long(a.wrapping_mul(*b))),
