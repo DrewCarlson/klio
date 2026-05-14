@@ -294,6 +294,18 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.emptySet", coll_empty_set),
     ("kotlin.collections.listOf", coll_list_of),
     ("kotlin.arrayOf", coll_array_of),
+    ("kotlin.intArrayOf", coll_int_array_of),
+    ("kotlin.longArrayOf", coll_long_array_of),
+    ("kotlin.shortArrayOf", coll_short_array_of),
+    ("kotlin.byteArrayOf", coll_byte_array_of),
+    ("kotlin.doubleArrayOf", coll_double_array_of),
+    ("kotlin.floatArrayOf", coll_float_array_of),
+    ("kotlin.booleanArrayOf", coll_bool_array_of),
+    ("kotlin.charArrayOf", coll_char_array_of),
+    ("kotlin.uintArrayOf", coll_uint_array_of),
+    ("kotlin.ulongArrayOf", coll_ulong_array_of),
+    ("kotlin.ushortArrayOf", coll_ushort_array_of),
+    ("kotlin.ubyteArrayOf", coll_ubyte_array_of),
     ("kotlin.collections.mapOf", coll_map_of),
     ("kotlin.collections.mutableListOf", coll_mutable_list_of),
     ("kotlin.collections.mutableMapOf", coll_mutable_map_of),
@@ -3411,6 +3423,78 @@ fn coll_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
         items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
         prim: None,
+    })
+}
+fn coll_int_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::Int),
+    })
+}
+fn coll_long_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::Long),
+    })
+}
+fn coll_short_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::Short),
+    })
+}
+fn coll_byte_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::Byte),
+    })
+}
+fn coll_double_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::Double),
+    })
+}
+fn coll_float_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::Float),
+    })
+}
+fn coll_bool_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::Boolean),
+    })
+}
+fn coll_char_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::Char),
+    })
+}
+fn coll_uint_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::UInt),
+    })
+}
+fn coll_ulong_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::ULong),
+    })
+}
+fn coll_ushort_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::UShort),
+    })
+}
+fn coll_ubyte_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array {
+        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        prim: Some(klio_runtime::PrimitiveArrayKind::UByte),
     })
 }
 fn coll_mutable_list_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
