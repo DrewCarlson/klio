@@ -12916,6 +12916,14 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         name: &str,
         value: klio_runtime::Value,
     ) -> Result<(), klio_ir::eval::EvalError> {
+        // IR-native fast-path: when `name` is a plain top-level
+        // var (not registered as a delegated / setter-bearing
+        // property), write straight to globals. Skips the tree-
+        // walker's assign_top_level_pub round-trip.
+        if !self.interp.top_level_props.contains_key(name) {
+            self.interp.globals.borrow_mut().define(name, value);
+            return Ok(());
+        }
         self.interp
             .assign_top_level_pub(name, value, self.out)
             .map_err(ir_err)
