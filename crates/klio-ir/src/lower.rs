@@ -24,6 +24,38 @@ pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
     }
 }
 
+/// Lower one AST function into an IR Func. The function body is
+/// lowered into the entry block; parameters are bound via
+/// `bind_params`; the trailing implicit return falls through to a
+/// `Return` terminator.
+pub fn lower_function(module: &mut crate::Module, f: &klio_ast::Function) -> crate::Func {
+    let mut b = FuncBuilder::new(module);
+    let names: Vec<&str> = f.params.iter().map(|p| p.name.name.as_str()).collect();
+    bind_params(&mut b, &names);
+
+    let result = match &f.body {
+        Some(klio_ast::FunctionBody::Block(blk)) => Some(lower_block(&mut b, blk)),
+        Some(klio_ast::FunctionBody::Expr(e)) => Some(lower_expr(&mut b, e)),
+        None => None,
+    };
+    b.terminate(Terminator::Return(result));
+    let fqn = f.name.name.clone();
+    let mut func = b.finish(f.name.name.clone(), fqn, crate::TypeRef::unit());
+    // Parameter metadata for downstream consumers; types are
+    // unresolved at this stage.
+    func.params = f
+        .params
+        .iter()
+        .map(|p| crate::Param {
+            name: p.name.name.clone(),
+            ty: crate::TypeRef::unit(),
+            default: None,
+        })
+        .collect();
+    func.is_suspend = f.is_suspend;
+    func
+}
+
 /// Lower one expression into the current block. Returns the
 /// register holding the result. Statements that do not produce a
 /// value (assignments, declarations) return a synthetic `Unit`
