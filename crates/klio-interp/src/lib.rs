@@ -4729,6 +4729,14 @@ impl Interpreter {
     /// Drive the lazy pull. Sort ops break the stream into stages: when one
     /// is present we materialize the pre-sort portion, sort the buffer,
     /// then recurse with the remaining ops over an `Items` source.
+    pub fn materialize_sequence_pub(
+        &mut self,
+        data: &klio_runtime::SequenceData,
+        out: &mut dyn Output,
+    ) -> Result<Vec<klio_runtime::Value>, RuntimeError> {
+        self.materialize_sequence(data, out)
+    }
+
     fn materialize_sequence(
         &mut self,
         data: &klio_runtime::SequenceData,
@@ -11602,6 +11610,17 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             (klio_runtime::Value::Range { start, end, step, kind }, "iterator") => {
                 let items: Vec<klio_runtime::Value> =
                     materialise_range_items(*start, *end, *step, *kind);
+                return Ok(klio_runtime::Value::Iterator {
+                    items: std::rc::Rc::new(std::cell::RefCell::new(items)),
+                    pos: std::rc::Rc::new(std::cell::RefCell::new(0)),
+                    prim: None,
+                });
+            }
+            (klio_runtime::Value::Sequence(data), "iterator") => {
+                let items = self
+                    .interp
+                    .materialize_sequence_pub(data, self.out)
+                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))?;
                 return Ok(klio_runtime::Value::Iterator {
                     items: std::rc::Rc::new(std::cell::RefCell::new(items)),
                     pos: std::rc::Rc::new(std::cell::RefCell::new(0)),
