@@ -11107,6 +11107,29 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         if let Some(v) = self.interp.lookup_global_callable(name) {
             return Some(v);
         }
+        // Fully-qualified name probe — `kotlin.math.PI`, `kotlin.io.println`.
+        // Returns the intrinsic by FQN directly when it's already a
+        // package-qualified lookup so the IR path doesn't need to
+        // shuffle the segments back through the simple-name probes.
+        if name.contains('.') {
+            if let Some(f) = self.interp.lookup_intrinsic(name) {
+                let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+                return Some(klio_runtime::Value::Intrinsic {
+                    fqn: leaked,
+                    func: f,
+                });
+            }
+            // Also try the last-segment simple-name dispatch fallback —
+            // covers `kotlin.math.abs` → `abs` intrinsic registered
+            // under a different FQN, plus name-dispatched scope fns.
+            if let Some(last) = name.rsplit('.').next() {
+                if last != name {
+                    if let Some(v) = self.lookup_global(last) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
         // Special-case the interpreter's name-recognised
         // suspend / coroutine intrinsics so the IR call path can
         // route them back through the tree walker's machinery via
@@ -11202,7 +11225,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // eval_call path so its intrinsic-specific preprocessing
         // (the println/print Instance→toString rewrite, reorder
         // by intrinsic param names, spread flattening) fires.
-        if let klio_runtime::Value::Intrinsic { fqn, .. } = callee {
+        if let klio_runtime::Value::Intrinsic { fqn, func } = callee {
             // Skip the sentinel FQNs handled in call_value below.
             if !fqn.starts_with("__klio_intrinsic_") {
                 // Reconstruct a simple-name dispatch through
@@ -11210,10 +11233,27 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 // last path-segment after the final '.' as the
                 // dispatch name so kotlin.io.println → println.
                 let simple = fqn.rsplit('.').next().unwrap_or(*fqn);
-                return self
-                    .interp
-                    .invoke_named_intrinsic_with_names(simple, args, arg_names, self.out)
-                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                let result = self.interp.invoke_named_intrinsic_with_names(
+                    simple, args, arg_names, self.out,
+                );
+                match result {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        // Fall back to calling the stdlib fn directly
+                        // when the simple-name dispatch can't find a
+                        // matching binding — covers FQNs like
+                        // `kotlin.math.abs` whose last segment isn't
+                        // re-exported as a bare top-level name.
+                        if fqn.contains('.') {
+                            let mut ctx =
+                                klio_runtime::CallCtx { args, out: self.out };
+                            return func(&mut ctx).map_err(|e2| {
+                                klio_ir::eval::EvalError::Type(e2.to_string())
+                            });
+                        }
+                        return Err(klio_ir::eval::EvalError::Type(e.to_string()));
+                    }
+                }
             }
         }
         let _ = arg_names;

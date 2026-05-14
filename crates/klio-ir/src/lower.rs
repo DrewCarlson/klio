@@ -25,6 +25,42 @@ use crate::{BinOp, BlockId, Const, Inst, Reg, Terminator, UnOp};
 /// run [args_start, args_start + n_args) is dense), lower each arg
 /// into its own scratch reg, then `Move` the scratch into the
 /// matching arg slot. Returns `(args_start, n_args)`.
+/// Treat a path segment as a package-root identifier when it starts
+/// with a lowercase letter — Kotlin convention reserves lowercase
+/// roots for packages (`kotlin`, `kotlinx`, `java`, …) and capital
+/// initials for class / object names. Limiting FQN-flattening to
+/// lowercase heads keeps `Status.Active` / `Foo.Companion` member
+/// access routed through GetField on the actual class value.
+fn is_package_head(name: &str) -> bool {
+    name.chars().next().map_or(false, |c| c.is_lowercase())
+}
+
+/// Flatten a `Member{receiver: Member{...,Path}}` chain into a
+/// dotted FQN like `kotlin.math.PI`. Returns `None` when the chain
+/// is not purely identifier segments (e.g. it has a Call, Index, or
+/// arbitrary expression).
+fn collect_dotted_fqn(expr: &Expr) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expr::Member { receiver, name, .. } => {
+                parts.push(name.name.clone());
+                cur = receiver;
+            }
+            Expr::Path { segments, .. } => {
+                for s in segments.iter().rev() {
+                    parts.push(s.name.clone());
+                }
+                break;
+            }
+            _ => return None,
+        }
+    }
+    parts.reverse();
+    Some(parts.join("."))
+}
+
 fn lower_arg_run(b: &mut FuncBuilder<'_>, args: &[Expr]) -> (Reg, u8) {
     let n = args.len();
     if n == 0 {
@@ -253,6 +289,26 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // alternative — synthesize a fully-qualified LoadGlobal
             // — is faster but requires more import-resolution
             // context than the lowering pass has today.
+            // Try the full FQN first (e.g. `kotlin.math.PI`) — the
+            // host's lookup_global knows the package-resolved name
+            // for stdlib intrinsics + properties and the IR doesn't
+            // carry import context. Fall back to a chain of GetFields
+            // off a head LoadGlobal when the FQN doesn't resolve.
+            if segments.len() >= 2
+                && is_package_head(&segments[0].name)
+                && b.resolve(&segments[0].name).is_none()
+                && b.module.class_id(&segments[0].name).is_none()
+            {
+                let fqn = segments
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let dst = b.alloc_reg();
+                let n = b.module.intern_const(Const::String(fqn));
+                b.push(Inst::LoadGlobal { dst, name: n });
+                return dst;
+            }
             let mut iter = segments.iter();
             let first = iter.next().expect("Path has at least one segment");
             let head = if let Some(r) = b.resolve(&first.name) {
@@ -309,10 +365,25 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.emit_const(Const::Unit)
         }
         Expr::Member { receiver, name, .. } => {
-            // Bare member read. `recv.method(...)` is handled by
-            // Expr::Call below; here we treat it as a field read,
-            // which the evaluator resolves at run time against the
-            // receiver's class table.
+            // Flatten chains like `kotlin.math.PI` into a single FQN
+            // lookup against the host when the head is an unresolved
+            // identifier (i.e. not a local). Stdlib package roots
+            // (`kotlin`, `kotlinx`, etc.) aren't real values, so the
+            // chained-GetField fallback would fail at `kotlin` itself.
+            if let Some(fqn) = collect_dotted_fqn(expr) {
+                if let Some(head) = fqn.split('.').next() {
+                    if is_package_head(head)
+                        && b.resolve(head).is_none()
+                        && !b.knows_outer(head)
+                        && b.module.class_id(head).is_none()
+                    {
+                        let dst = b.alloc_reg();
+                        let n = b.module.intern_const(Const::String(fqn));
+                        b.push(Inst::LoadGlobal { dst, name: n });
+                        return dst;
+                    }
+                }
+            }
             let recv = lower_expr(b, receiver);
             let dst = b.alloc_reg();
             let field = b.module.intern_const(Const::String(name.name.clone()));
@@ -395,6 +466,36 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             arg_names,
                         });
                         return dst;
+                    }
+                }
+            }
+            // Fully-qualified callee like `kotlin.math.abs(x)` →
+            // resolve the FQN as a global and CallValue against the
+            // resulting intrinsic / function value. Avoids the
+            // chained-GetField that would fail at `kotlin` itself.
+            if let Expr::Member { .. } = callee.as_ref() {
+                if let Some(fqn) = collect_dotted_fqn(callee) {
+                    if let Some(head) = fqn.split('.').next() {
+                        if is_package_head(head)
+                            && b.resolve(head).is_none()
+                            && !b.knows_outer(head)
+                            && b.module.class_id(head).is_none()
+                        {
+                            let callee_r = b.alloc_reg();
+                            let n = b.module.intern_const(Const::String(fqn));
+                            b.push(Inst::LoadGlobal { dst: callee_r, name: n });
+                            let (args_start, count) = lower_arg_run(b, args);
+                            let arg_names = intern_arg_names(b.module, ast_arg_names);
+                            let dst = b.alloc_reg();
+                            b.push(Inst::CallValue {
+                                dst,
+                                callee: callee_r,
+                                args: args_start,
+                                n_args: count,
+                                arg_names,
+                            });
+                            return dst;
+                        }
                     }
                 }
             }
@@ -1229,11 +1330,23 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     // through the same call_member path that
                     // handles built-in collection mutation.
                     let recv = lower_expr(b, receiver);
-                    let key_args: Vec<Expr> = idx_args.clone();
-                    let (key_start, key_count) = lower_arg_run(b, &key_args);
-                    // Append `combined` as the value arg right
-                    // after the key slot(s).
+                    // Reserve a contiguous run of slots for keys +
+                    // value BEFORE lowering the key expressions,
+                    // since lowering each key may allocate auxiliary
+                    // registers (e.g. for Const literals) and we
+                    // need the run to stay tight so read_arg_run
+                    // picks up the value reg right after the keys.
+                    let n_keys = idx_args.len();
+                    let key_start = b.alloc_reg();
+                    let mut key_slots: Vec<Reg> = vec![key_start];
+                    for _ in 1..n_keys {
+                        key_slots.push(b.alloc_reg());
+                    }
                     let val_slot = b.alloc_reg();
+                    for (slot, arg) in key_slots.iter().zip(idx_args.iter()) {
+                        let r = lower_expr(b, arg);
+                        b.push(Inst::Move { dst: *slot, src: r });
+                    }
                     b.push(Inst::Move { dst: val_slot, src: combined });
                     let dst = b.alloc_reg();
                     let nm = b.module.intern_const(Const::String("set".into()));
@@ -1242,10 +1355,9 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                         receiver: recv,
                         name: nm,
                         args: key_start,
-                        n_args: key_count + 1,
+                        n_args: (n_keys as u8) + 1,
                         arg_names: Vec::new(),
                     });
-                    let _ = val_slot;
                 }
                 _ => {
                     b.push(Inst::Trace { span: expr_span(target) });
