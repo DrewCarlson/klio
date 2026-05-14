@@ -578,70 +578,6 @@ impl Interpreter {
         .map_err(|e| RuntimeError::Type(e.to_string()))
     }
 
-    /// Synthesize and dispatch a member call from pre-evaluated
-    /// values. Used by the IR host so extension-function lookup
-    /// + arg-type-aware dispatch + named-arg reordering fire
-    /// through the existing eval_call machinery rather than the
-    /// IR host's narrower call_member path.
-    pub fn invoke_named_member_call(
-        &mut self,
-        receiver: &Value,
-        name: &str,
-        args: &[Value],
-        out: &mut dyn Output,
-    ) -> Result<Value, RuntimeError> {
-        let empty = vec![None; args.len()];
-        self.invoke_named_member_call_with_names(receiver, name, args, &empty, out)
-    }
-
-    /// Same as `invoke_named_member_call` but threads named args
-    /// through so foo(a = 1, b = 2) reorder fires.
-    pub fn invoke_named_member_call_with_names(
-        &mut self,
-        receiver: &Value,
-        name: &str,
-        args: &[Value],
-        arg_names: &[Option<String>],
-        out: &mut dyn Output,
-    ) -> Result<Value, RuntimeError> {
-        use klio_ast::{Expr, Ident};
-        use klio_span::{FileId, Span};
-        let dummy_span = Span::new(FileId(0), 0, 0);
-        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.globals))));
-        env.borrow_mut().define("__ir_self".to_string(), receiver.clone());
-        let mut arg_exprs: Vec<Expr> = Vec::with_capacity(args.len());
-        for (i, v) in args.iter().enumerate() {
-            let slot = format!("__ir_arg_{i}");
-            env.borrow_mut().define(slot.clone(), v.clone());
-            arg_exprs.push(Expr::Path {
-                segments: vec![Ident { name: slot, span: dummy_span }],
-                span: dummy_span,
-            });
-        }
-        let names: Vec<Option<String>> = if arg_names.len() == args.len() {
-            arg_names.to_vec()
-        } else {
-            vec![None; args.len()]
-        };
-        let call = Expr::Call {
-            callee: Box::new(Expr::Member {
-                receiver: Box::new(Expr::Path {
-                    segments: vec![Ident { name: "__ir_self".into(), span: dummy_span }],
-                    span: dummy_span,
-                }),
-                name: Ident { name: name.to_string(), span: dummy_span },
-                safe: false,
-                span: dummy_span,
-            }),
-            args: arg_exprs,
-            arg_names: names,
-            type_args: Vec::new(),
-            is_infix: false,
-            span: dummy_span,
-        };
-        self.eval_expr(&call, &env, out)
-    }
-
     /// Look up an intrinsic by FQN. Checks pack-installed bindings
     /// first, falls back to the static `klio_stdlib` table.
     #[must_use]
@@ -5436,12 +5372,18 @@ impl Interpreter {
             // skips the lambda call and consumes the resumed value
             // directly.
             for cont in resumes.drain(..) {
-                let _ = self.invoke_named_member_call(
-                    &cont,
-                    "resume",
-                    &[klio_runtime::Value::Unit],
-                    out,
-                );
+                if let klio_runtime::Value::Instance(inst) = &cont {
+                    let class = Rc::clone(&inst.borrow().class);
+                    if let Some((m, _)) = class.find_method("resume") {
+                        let _ = self.call_method(
+                            inst,
+                            &m,
+                            &[klio_runtime::Value::Unit],
+                            &[None],
+                            out,
+                        );
+                    }
+                }
             }
             // Re-drive every paused frame whose resumption was just
             // staged. Round-robin: a frame that suspends again
@@ -11514,6 +11456,56 @@ struct IrClosureSlot {
     module: std::rc::Rc<klio_ir::Module>,
 }
 
+impl<'a> IrHost<'a> {
+    /// Synthesize and dispatch a member call through the tree
+    /// walker's `eval_expr` so extension-function lookup, named-arg
+    /// reorder, vararg packing, and default-value filling all fire.
+    fn dispatch_member_via_ast(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+        args: &[klio_runtime::Value],
+        arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        use klio_ast::{Expr, Ident};
+        use klio_span::{FileId, Span};
+        let dummy_span = Span::new(FileId(0), 0, 0);
+        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.interp.globals))));
+        env.borrow_mut().define("__ir_self".to_string(), receiver.clone());
+        let mut arg_exprs: Vec<Expr> = Vec::with_capacity(args.len());
+        for (i, v) in args.iter().enumerate() {
+            let slot = format!("__ir_arg_{i}");
+            env.borrow_mut().define(slot.clone(), v.clone());
+            arg_exprs.push(Expr::Path {
+                segments: vec![Ident { name: slot, span: dummy_span }],
+                span: dummy_span,
+            });
+        }
+        let names: Vec<Option<String>> = if arg_names.len() == args.len() {
+            arg_names.to_vec()
+        } else {
+            vec![None; args.len()]
+        };
+        let call = Expr::Call {
+            callee: Box::new(Expr::Member {
+                receiver: Box::new(Expr::Path {
+                    segments: vec![Ident { name: "__ir_self".into(), span: dummy_span }],
+                    span: dummy_span,
+                }),
+                name: Ident { name: name.to_string(), span: dummy_span },
+                safe: false,
+                span: dummy_span,
+            }),
+            args: arg_exprs,
+            arg_names: names,
+            type_args: Vec::new(),
+            is_infix: false,
+            span: dummy_span,
+        };
+        self.interp.eval_expr(&call, &env, self.out)
+    }
+}
+
 impl<'a> klio_ir::eval::Host for IrHost<'a> {
     fn lookup_global_throwing(
         &mut self,
@@ -11712,8 +11704,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         if arg_names.iter().any(|n| n.is_some()) {
             return self
-                .interp
-                .invoke_named_member_call_with_names(receiver, name, args, arg_names, self.out)
+                .dispatch_member_via_ast(receiver, name, args, arg_names)
                 .map_err(ir_err);
         }
         self.call_member(receiver, name, args)
@@ -12365,9 +12356,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // Fall through to method-call synthesis so auto-generated
             // data-class members (componentN, copy without args, etc.)
             // and extension fns reachable via eval_call fire.
+            let empty = vec![None; args.len()];
             return self
-                .interp
-                .invoke_named_member_call(receiver, name, args, self.out)
+                .dispatch_member_via_ast(receiver, name, args, &empty)
                 .map_err(ir_err);
         }
         // Extension-style intrinsic on a value type. Skipped when
@@ -12434,13 +12425,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             if let Some(comp) = companion {
                 let has_method = comp.borrow().class.find_method(name).is_some();
                 if has_method {
+                    let empty = vec![None; args.len()];
                     return self
-                        .interp
-                        .invoke_named_member_call(
+                        .dispatch_member_via_ast(
                             &klio_runtime::Value::Instance(comp),
                             name,
                             args,
-                            self.out,
+                            &empty,
                         )
                         .map_err(ir_err);
                 }
@@ -12498,7 +12489,8 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // walker's full member-dispatch path, which picks up
         // extension functions, named args, and `vararg` /
         // default-value handling.
-        match self.interp.invoke_named_member_call(receiver, name, args, self.out) {
+        let empty_names = vec![None; args.len()];
+        match self.dispatch_member_via_ast(receiver, name, args, &empty_names) {
             Ok(v) => Ok(v),
             Err(e) => {
                 // Final fallback: try the bare top-level intrinsic

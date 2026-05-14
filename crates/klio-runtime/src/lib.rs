@@ -106,6 +106,41 @@ impl InProcessScheduler {
     }
 }
 
+/// Bare-minimum host for unit tests of pure intrinsics (no
+/// callable invocation, no scheduling). Panics if a binding under
+/// test tries to call back through the host.
+#[derive(Default)]
+pub struct NoopHost {
+    scheduler: InProcessScheduler,
+}
+
+impl IntrinsicHost for NoopHost {
+    fn scheduler(&mut self) -> &mut dyn Scheduler {
+        &mut self.scheduler
+    }
+    fn invoke_callable(
+        &mut self,
+        _callable: &Value,
+        _args: &[Value],
+        _out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::Unimplemented(
+            "NoopHost::invoke_callable".into(),
+        ))
+    }
+    fn invoke_callable_with_this(
+        &mut self,
+        _callable: &Value,
+        _args: &[Value],
+        _this_value: &Value,
+        _out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::Unimplemented(
+            "NoopHost::invoke_callable_with_this".into(),
+        ))
+    }
+}
+
 impl Scheduler for InProcessScheduler {
     fn spawn(&mut self, block: Value) {
         self.launches.push(block);

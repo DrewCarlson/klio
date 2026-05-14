@@ -6839,7 +6839,8 @@ mod tests {
 
     fn call(fn_: StdlibFn, args: &[Value]) -> Result<Value, RuntimeError> {
         let mut out = klio_runtime::CaptureOutput::default();
-        fn_(&mut CallCtx { args, out: &mut out })
+        let mut host = klio_runtime::NoopHost::default();
+        fn_(&mut CallCtx { args, out: &mut out, host: &mut host })
     }
 
     #[test]
