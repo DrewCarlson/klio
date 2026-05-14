@@ -87,7 +87,7 @@ pub struct Interpreter {
     /// up a `ClassDef` by simple name without walking the lexical
     /// scope chain. `synthesize_annotation_value` consults this when
     /// building `KClass.annotations` instances.
-    class_table: std::collections::HashMap<String, Rc<ClassDef>>,
+    // class_table moved onto module_registry.
     /// Stack of pending coroutine continuation holders. Pushed by
     /// `suspendCoroutine` / `suspendCoroutineUninterceptedOrReturn`
     /// before the user lambda runs; the synthetic `Continuation`
@@ -205,15 +205,14 @@ pub struct Interpreter {
     /// FQN → native binding installed from a loaded pack. Wins over
     /// the static `klio_stdlib::implementation` lookup so a pack can
     /// shadow or augment the in-process stdlib.
-    installed_bindings: std::collections::HashMap<String, klio_runtime::StdlibFn>,
+    // installed_bindings moved onto module_registry.
     /// Top-level function overloads keyed by simple name. The env
     /// still holds the last-defined `Value::Function` for each name
     /// (so paths and references resolve), but this side-map carries
     /// every overload so `eval_call` can pick the most-specific
     /// candidate at a call site. Order matches source declaration
     /// order, used as a deterministic tiebreaker.
-    top_level_overloads:
-        std::collections::HashMap<String, Vec<(Rc<klio_ast::Function>, Rc<RefCell<Env>>)>>,
+    // top_level_overloads moved onto module_registry.
     /// Implicit-import packages contributed by every loaded pack.
     /// Unioned with `klio_stdlib::IMPLICITLY_IMPORTED_PACKAGES` so
     /// resolver / typeck see the same surface regardless of source.
@@ -239,6 +238,10 @@ pub struct Interpreter {
 pub(crate) struct ModuleRegistryOwned {
     pub class_ir: ClassIrTables,
     pub top_level_props: std::collections::HashMap<String, PropertyDef>,
+    pub top_level_overloads:
+        std::collections::HashMap<String, Vec<(Rc<klio_ast::Function>, Rc<RefCell<Env>>)>>,
+    pub installed_bindings: std::collections::HashMap<String, klio_runtime::StdlibFn>,
+    pub class_table: std::collections::HashMap<String, Rc<ClassDef>>,
 }
 
 /// Per-class IR side-tables produced during decl registration.
@@ -356,7 +359,6 @@ impl Interpreter {
             globals: Rc::new(RefCell::new(env)),
             module_registry: ModuleRegistryOwned::default(),
             annotation_class_retentions: std::collections::HashMap::new(),
-            class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
             active_suspend_frames: Vec::new(),
             launch_queue: Vec::new(),
@@ -378,8 +380,6 @@ impl Interpreter {
             expr_types: std::collections::HashMap::new(),
             import_renames: std::collections::HashMap::new(),
             current_package: None,
-            installed_bindings: std::collections::HashMap::new(),
-            top_level_overloads: std::collections::HashMap::new(),
             pack_implicit_packages: Vec::new(),
             pack_known_packages: std::collections::HashSet::new(),
         }
@@ -433,7 +433,7 @@ impl Interpreter {
             let manifest: BindingManifest = decode(&bytes)?;
             for b in manifest.bindings {
                 if let Some(f) = host.resolve(&b.host_symbol) {
-                    self.installed_bindings.insert(b.fqn, f);
+                    self.module_registry.installed_bindings.insert(b.fqn, f);
                     installed += 1;
                 }
             }
@@ -477,7 +477,7 @@ impl Interpreter {
         // globals; returning the Class lets reflection / companion
         // access (`Regex.escape(...)`, `Foo::class`) reach the
         // class object directly instead of the bare constructor.
-        if let Some(c) = self.class_table.get(name) {
+        if let Some(c) = self.module_registry.class_table.get(name) {
             return Some(klio_runtime::Value::Class(Rc::clone(c)));
         }
         self.globals.borrow().lookup(name)
@@ -528,7 +528,7 @@ impl Interpreter {
     /// right arity / arg-type match rather than the single Value
     /// stashed in globals.
     fn has_top_level_overloads(&self, name: &str) -> bool {
-        self.top_level_overloads
+        self.module_registry.top_level_overloads
             .get(name)
             .map_or(false, |v| v.len() > 1)
     }
@@ -540,7 +540,7 @@ impl Interpreter {
         arg_names: &[Option<String>],
         out: &mut dyn Output,
     ) -> Result<Option<Value>, RuntimeError> {
-        let overloads = match self.top_level_overloads.get(name) {
+        let overloads = match self.module_registry.top_level_overloads.get(name) {
             Some(o) if !o.is_empty() => o.clone(),
             _ => return Ok(None),
         };
@@ -567,7 +567,7 @@ impl Interpreter {
     /// in IR lowering, so call sites route through the tree walker
     /// whenever this returns true.
     fn has_top_level_vararg(&self, name: &str) -> bool {
-        let Some(overloads) = self.top_level_overloads.get(name) else {
+        let Some(overloads) = self.module_registry.top_level_overloads.get(name) else {
             return false;
         };
         overloads.iter().any(|(f, _)| f.params.iter().any(|p| p.is_vararg))
@@ -578,7 +578,7 @@ impl Interpreter {
     /// `Func.params[…].default` field isn't populated yet, so call
     /// sites consult the AST overload table instead.
     fn has_top_level_default(&self, name: &str) -> bool {
-        let Some(overloads) = self.top_level_overloads.get(name) else {
+        let Some(overloads) = self.module_registry.top_level_overloads.get(name) else {
             return false;
         };
         overloads
@@ -634,7 +634,7 @@ impl Interpreter {
     /// first, falls back to the static `klio_stdlib` table.
     #[must_use]
     fn lookup_intrinsic(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
-        if let Some(f) = self.installed_bindings.get(fqn) {
+        if let Some(f) = self.module_registry.installed_bindings.get(fqn) {
             return Some(*f);
         }
         klio_stdlib::implementation(fqn)
@@ -646,7 +646,7 @@ impl Interpreter {
     /// (intrinsic alias / BoundMethod / shim Kotlin body / etc.).
     #[must_use]
     fn binding_override(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
-        self.installed_bindings.get(fqn).copied()
+        self.module_registry.installed_bindings.get(fqn).copied()
     }
 
     /// Returns the implicit-import packages contributed by loaded
@@ -857,7 +857,7 @@ impl Interpreter {
     /// registered (e.g. references to a stdlib annotation type
     /// that isn't user-declared).
     fn synthesize_annotation_value(&self, name: &str) -> Value {
-        if let Some(c) = self.class_table.get(name) {
+        if let Some(c) = self.module_registry.class_table.get(name) {
             let inst = Rc::new(RefCell::new(InstanceData {
                 class: Rc::clone(c),
                 fields: Vec::new(),
@@ -1625,7 +1625,7 @@ impl Interpreter {
                         });
                     continue;
                 }
-                self.top_level_overloads
+                self.module_registry.top_level_overloads
                     .entry(f.name.name.clone())
                     .or_default()
                     .push((Rc::clone(&decl), Rc::clone(&file_env)));
@@ -1667,7 +1667,7 @@ impl Interpreter {
             match d {
                 Decl::Class(c) => {
                     let class = self.build_class_shell(c, &file_env, out)?;
-                    self.class_table
+                    self.module_registry.class_table
                         .insert(c.name.name.clone(), Rc::clone(&class));
                     file_env
                         .borrow_mut()
@@ -7188,7 +7188,7 @@ impl Interpreter {
             env.borrow_mut().define(n.clone(), v.clone());
         }
         let cls = self.build_class_shell(class, &env, out)?;
-        self.class_table.insert(class.name.name.clone(), Rc::clone(&cls));
+        self.module_registry.class_table.insert(class.name.name.clone(), Rc::clone(&cls));
         env.borrow_mut().define(
             class.name.name.clone(),
             klio_runtime::Value::Class(Rc::clone(&cls)),
@@ -9490,7 +9490,7 @@ impl Interpreter {
         // argument-runtime-type. Single-overload names fall through
         // to the regular env-lookup path.
         if let Some(name) = simple_callee_name(callee) {
-            if let Some(overloads) = self.top_level_overloads.get(name) {
+            if let Some(overloads) = self.module_registry.top_level_overloads.get(name) {
                 if overloads.len() >= 2 {
                     let overloads = overloads.clone();
                     let (vals, spread_mask) =
@@ -12060,7 +12060,7 @@ impl<'a> IrHost<'a> {
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
         let class = self
             .interp
-            .class_table
+            .module_registry.class_table
             .get(class_name)
             .cloned()
             .ok_or_else(|| {
@@ -12218,7 +12218,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             }
         }
         if builtin_exception_parent(name).is_some()
-            && !self.interp.class_table.contains_key(name)
+            && !self.interp.module_registry.class_table.contains_key(name)
         {
             if let Some(v) = self.interp.synth_primitive_class(name) {
                 return Some(v);
@@ -12523,7 +12523,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // matches, route through it. Resolves delegation arg thunks
         // → primary args, recurses to construct via primary, then
         // runs the secondary body with (this, args).
-        if let Some(cls) = self.interp.class_table.get(&name).cloned() {
+        if let Some(cls) = self.interp.module_registry.class_table.get(&name).cloned() {
             if !cls.is_interface
                 && !cls.is_abstract
                 && args.len() != cls.primary_params.len()
@@ -12596,7 +12596,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     if args.len() == 1
                         && matches!(&args[0], klio_runtime::Value::Lambda { .. })
                     {
-                        if let Some(cls) = self.interp.class_table.get(&name).cloned() {
+                        if let Some(cls) = self.interp.module_registry.class_table.get(&name).cloned() {
                             if cls.is_interface || cls.is_fun_interface {
                                 let v = self
                                     .interp
@@ -12726,7 +12726,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // `NullPointerException("...")` etc. — construct a
             // `Value::Exception` so throw/catch matches the right type.
             if builtin_exception_parent(&class.name).is_some()
-                && !self.interp.class_table.contains_key(&class.name)
+                && !self.interp.module_registry.class_table.contains_key(&class.name)
             {
                 let message = match args.first() {
                     Some(klio_runtime::Value::String(s)) => Some(std::rc::Rc::clone(s)),
@@ -12869,7 +12869,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // directly on `Qual`. Bare `super.method()` walks the
         // owner class's parent + interfaces.
         if let Some(qual_name) = qualifier {
-            let target = self.interp.class_table.get(qual_name).cloned().ok_or_else(|| {
+            let target = self.interp.module_registry.class_table.get(qual_name).cloned().ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!(
                     "super<{qual_name}>.{name}: unknown class"
                 ))
@@ -12886,7 +12886,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         }
         let owner = self
             .interp
-            .class_table
+            .module_registry.class_table
             .get(owner_class)
             .cloned()
             .ok_or_else(|| {
@@ -14423,7 +14423,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             }
             // No user-class binding for this single-letter name →
             // treat as an erased generic and answer true (JVM erasure).
-            if !self.interp.class_table.contains_key(&ty.name) {
+            if !self.interp.module_registry.class_table.contains_key(&ty.name) {
                 return true;
             }
         }
@@ -14484,7 +14484,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // instance and populate primary-ctor fields directly.
         // Skips the tree-walker construct_instance_with_outer
         // pipeline.
-        if let Some(cls) = self.interp.class_table.get(&name).cloned() {
+        if let Some(cls) = self.interp.module_registry.class_table.get(&name).cloned() {
             // Body properties are allowed in the fast-path only
             // when none of them carries an initializer, custom
             // accessor, or delegate — those require running the
