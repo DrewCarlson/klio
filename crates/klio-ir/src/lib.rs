@@ -76,6 +76,14 @@ pub struct ConstId(pub u32);
 pub enum Inst {
     /// Materialise a constant into a register.
     Const { dst: Reg, value: ConstId },
+    /// Suspend-resume marker for IR-lowered suspend bodies. A
+    /// `state` integer identifies which resume target the
+    /// suspending call site corresponds to so the dispatch table
+    /// at the function entry can route a resumption to the
+    /// matching block. Today this is emitted as a no-op tagged
+    /// marker; the upcoming state-machine codegen reads it during
+    /// lowering and after.
+    SuspendResumePoint { state: u32 },
     /// Load a parameter into a register.
     LoadParam { dst: Reg, idx: u16 },
     /// Load a captured variable from the enclosing env.

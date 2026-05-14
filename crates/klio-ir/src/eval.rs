@@ -577,6 +577,11 @@ fn exec_inst(
     host: &mut dyn Host,
 ) -> Result<(), EvalError> {
     match inst {
+        Inst::SuspendResumePoint { .. } => {
+            // No runtime effect on its own. Lowered state-machine
+            // dispatch interprets these markers at the function
+            // entry; mid-flow they're traversed transparently.
+        }
         Inst::Const { dst, value } => {
             let v = const_to_value(&frame.module.consts[value.0 as usize]);
             frame.write(*dst, v);
