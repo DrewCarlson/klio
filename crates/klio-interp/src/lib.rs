@@ -14329,23 +14329,32 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                         inst_rc.borrow_mut().define(p.name.clone(), v);
                     }
                 }
-                // Populate parent primary-ctor fields from lowered
-                // parent-arg thunks (when the leaf class declared
-                // `: Parent(arg, arg, …)` and Parent has primary
-                // params). Each thunk takes the child's primary
-                // args in declaration order.
-                if let Some(parent_arg_fids) =
-                    self.interp.class_parent_ctor_args.get(&name).cloned()
+                // Walk the parent chain leaf → root. At each level
+                // evaluate the lowered parent-arg thunks using the
+                // current class's primary-arg values, store the
+                // result under the parent's primary-param names,
+                // then move up.
                 {
-                    if let Some(parent) = cls.parent.borrow().clone() {
+                    let mut cur_name = name.clone();
+                    let mut cur_args: Vec<klio_runtime::Value> = args.to_vec();
+                    let mut cur_parent = cls.parent.borrow().clone();
+                    while let Some(parent) = cur_parent {
+                        let Some(arg_fids) = self
+                            .interp
+                            .class_parent_ctor_args
+                            .get(&cur_name)
+                            .cloned()
+                        else {
+                            break;
+                        };
                         let mut parent_vals: Vec<klio_runtime::Value> =
-                            Vec::with_capacity(parent_arg_fids.len());
-                        for fid in &parent_arg_fids {
+                            Vec::with_capacity(arg_fids.len());
+                        for fid in &arg_fids {
                             let func = module.funcs[fid.0 as usize].clone();
                             let v = klio_ir::eval::eval_with(
                                 &module,
                                 &func,
-                                args.to_vec(),
+                                cur_args.clone(),
                                 self,
                             )?;
                             parent_vals.push(v);
@@ -14357,6 +14366,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                                     .define(p.name.clone(), v.clone());
                             }
                         }
+                        cur_name = parent.name.clone();
+                        cur_args = parent_vals;
+                        cur_parent = parent.parent.borrow().clone();
                     }
                 }
                 // Run parent-chain lowered init blocks first (root →
