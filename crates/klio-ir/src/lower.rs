@@ -1145,6 +1145,66 @@ fn lower_for_labeled(
     b.emit_const(Const::Unit)
 }
 
+/// Try to lower a `when (subject)` as a Switch terminator. Returns
+/// the (case-arms, optional default body block, per-branch body
+/// blocks) tuple when every non-else branch carries a single
+/// literal pattern. Returns None for the general Branch-chain
+/// fallback. Each branch index in the input maps 1:1 to the
+/// per-branch body-block vec — None for the else branch (whose
+/// block is the default), Some(blk) otherwise.
+fn collect_switch_arms(
+    b: &mut FuncBuilder<'_>,
+    branches: &[klio_ast::WhenBranch],
+) -> Option<(Vec<(crate::ConstId, BlockId)>, Option<BlockId>, Vec<Option<BlockId>>)> {
+    let mut cases: Vec<(crate::ConstId, BlockId)> = Vec::new();
+    let mut body_blocks: Vec<Option<BlockId>> = Vec::with_capacity(branches.len());
+    let mut default: Option<BlockId> = None;
+    for branch in branches {
+        let blk = b.alloc_block();
+        // Else branch: take it as the default. Only one is valid.
+        if branch.patterns.len() == 1
+            && matches!(branch.patterns[0].kind, klio_ast::WhenPatternKind::Else)
+        {
+            if default.is_some() {
+                return None;
+            }
+            default = Some(blk);
+            body_blocks.push(Some(blk));
+            continue;
+        }
+        for pat in &branch.patterns {
+            let value_expr = match &pat.kind {
+                klio_ast::WhenPatternKind::Value(e) => e,
+                _ => return None,
+            };
+            let const_id = match value_expr {
+                Expr::IntLit { value, .. } if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 => {
+                    b.module.intern_const(Const::Int(*value as i32))
+                }
+                Expr::IntLit { value, .. } => b.module.intern_const(Const::Long(*value)),
+                Expr::StringTemplate { parts, .. } if parts.len() == 1 => {
+                    if let klio_ast::StringPart::Text(s) = &parts[0] {
+                        b.module.intern_const(Const::String(s.clone()))
+                    } else {
+                        return None;
+                    }
+                }
+                Expr::BoolLit { value, .. } => b.module.intern_const(Const::Bool(*value)),
+                Expr::CharLit { value, .. } => b.module.intern_const(Const::Char(*value)),
+                Expr::NullLit { .. } => b.module.intern_const(Const::Null),
+                _ => return None,
+            };
+            cases.push((const_id, blk));
+        }
+        body_blocks.push(Some(blk));
+    }
+    // Empty / trivial when expressions aren't worth a Switch.
+    if cases.is_empty() && default.is_none() {
+        return None;
+    }
+    Some((cases, default, body_blocks))
+}
+
 fn lower_when(
     b: &mut FuncBuilder<'_>,
     subject: Option<&Expr>,
@@ -1167,6 +1227,31 @@ fn lower_when(
     let subject_r = subject.map(|s| lower_expr(b, s));
     let join = b.alloc_block();
     let result = b.alloc_reg();
+    // Switch fast path: when the subject is present and every
+    // non-else branch matches a single literal pattern, emit a
+    // single Switch terminator. Avoids the cascade of Eq/Branch
+    // ops at runtime and gives sealed-when / enum-when an O(1)
+    // dispatch shape. Falls through to the Branch-chain lowering
+    // when any pattern is non-literal (Is, InRange, NotIs, etc.).
+    if let Some(subj) = subject_r {
+        if let Some(arms) = collect_switch_arms(b, branches) {
+            let (cases, default_blk, body_block_for_branch) = arms;
+            let default = default_blk.unwrap_or(join);
+            b.terminate(Terminator::Switch { reg: subj, arms: cases, default });
+            // Emit each branch body, including the optional else
+            // branch landing on default_blk.
+            for (branch, body_blk) in branches.iter().zip(body_block_for_branch.iter()) {
+                if let Some(blk) = body_blk {
+                    b.switch_to(*blk);
+                    let v = lower_expr(b, &branch.body);
+                    b.push(Inst::Move { dst: result, src: v });
+                    b.terminate(Terminator::Goto(join));
+                }
+            }
+            b.switch_to(join);
+            return result;
+        }
+    }
     for branch in branches {
         // Compose this branch's condition over its patterns.
         let body_blk = b.alloc_block();
