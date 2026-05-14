@@ -12906,6 +12906,36 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     found
                 };
                 if let Some(p) = pdef {
+                    // Trivial-setter fast-path: when the body
+                    // is a single `field = <param>` assignment
+                    // (the explicit default form) and there's no
+                    // delegate, just write the field directly.
+                    if p.delegate.is_none() {
+                        if let Some(acc) = &p.setter {
+                            let body_block = match &acc.body {
+                                klio_ast::FunctionBody::Block(b) => Some(b),
+                                _ => None,
+                            };
+                            let stmts = body_block.map(|b| &b.stmts);
+                            if let Some(stmts) = stmts {
+                                if stmts.len() == 1 {
+                                    if let klio_ast::Stmt::Assign { target, value: rhs, .. } = &stmts[0] {
+                                        let target_is_field = matches!(target,
+                                            klio_ast::Expr::Path { segments, .. }
+                                                if segments.len() == 1
+                                                    && segments[0].name == "field");
+                                        let rhs_is_param = matches!(rhs,
+                                            klio_ast::Expr::Path { segments, .. }
+                                                if segments.len() == 1);
+                                        if target_is_field && rhs_is_param {
+                                            inst.borrow_mut().define(name, value);
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     return self
                         .interp
                         .write_instance_property(inst, &p, value, self.out)
