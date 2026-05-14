@@ -57,7 +57,12 @@ class HttpClient(val config: HttpClientConfig) {
             hmap[parts[j]] = parts[j + 1]
             j += 2
         }
-        return HttpResponse(status, body, ct, hmap)
+        // Engine may signal a binary body via the reserved
+        // X-Klio-Body-Hex header; promote it onto bodyBytes when
+        // present so downstream callers see the raw bytes.
+        val rawHex = hmap["X-Klio-Body-Hex"]
+        val rawBytes = if (rawHex != null) io.ktor.http.__kktor_hexToBytes(rawHex) else ByteArray(0)
+        return HttpResponse(status, body, ct, hmap, rawBytes)
     }
 
     suspend fun get(url: String): HttpResponse {
