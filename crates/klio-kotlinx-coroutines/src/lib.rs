@@ -157,6 +157,10 @@ pub fn drain_pending_resumes() -> Vec<Value> {
     PENDING_RESUMES.with(|q| std::mem::take(&mut *q.borrow_mut()))
 }
 
+pub fn peek_pending_resumes() -> usize {
+    PENDING_RESUMES.with(|q| q.borrow().len())
+}
+
 fn scheduler_drain_count(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let count = SCHED_QUEUE.with(|q| {
         let mut b = q.borrow_mut();

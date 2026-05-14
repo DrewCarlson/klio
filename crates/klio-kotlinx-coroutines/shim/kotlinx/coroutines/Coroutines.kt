@@ -142,7 +142,10 @@ fun <T> CoroutineScope.async(
 }
 
 suspend fun delay(timeMillis: Long) {
-    __kxco_delayMillis(timeMillis)
+    // Park the calling coroutine via suspendCoroutine. The host
+    // scheduler queues the cont and fires resume(Unit) between
+    // rounds, letting sibling launches interleave at this point.
+    suspendCoroutine<Unit> { cont -> __kxco_scheduleResume(cont) }
 }
 
 suspend fun yield() {

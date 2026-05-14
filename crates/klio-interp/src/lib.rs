@@ -5520,7 +5520,16 @@ impl Interpreter {
     /// matching the in-order observable behavior the existing
     /// synchronous `launch` shim already provides.
     pub fn drain_launch_queue(&mut self, out: &mut dyn Output) -> Result<(), RuntimeError> {
+        let mut iter = 0;
         loop {
+            iter += 1;
+            if iter > 10_000 {
+                return Err(RuntimeError::Type(format!(
+                    "drain_launch_queue: too many iterations (launches={}, paused={}); coroutine scheduler deadlock?",
+                    self.launch_queue.len(),
+                    self.paused_frames.len(),
+                )));
+            }
             // Pull any pending launches the coroutines pack stashed
             // via `__kxco_spawn`. Loop because draining one launch
             // can spawn more.
@@ -5555,16 +5564,13 @@ impl Interpreter {
             for frame in pf {
                 let staged = frame.borrow().paused_resume.borrow().is_some();
                 if !staged {
-                    // No resume queued yet — keep parked for the
-                    // next round.
                     self.paused_frames.push(frame);
                     continue;
                 }
-                match self.drive_suspend_frame(&frame, None, out)? {
-                    klio_runtime::Value::CoroutineSuspended(f) => {
-                        self.paused_frames.push(f);
-                    }
-                    _ => {}
+                if let klio_runtime::Value::CoroutineSuspended(f) =
+                    self.drive_suspend_frame(&frame, None, out)?
+                {
+                    self.paused_frames.push(f);
                 }
             }
             while let Some(lam) = self.launch_queue.first().cloned() {
@@ -5789,7 +5795,17 @@ impl Interpreter {
                 for stmt in &state.stmts {
                     let v = self.eval_stmt(stmt, &env, out)?;
                     if matches!(v, Value::CoroutineSuspended(_)) {
-                        return Ok(v);
+                        // Advance our state index so re-entry runs
+                        // the resume state directly. Re-attribute
+                        // the suspension to *this* frame so the
+                        // scheduler resumes us, not a transient
+                        // inner SuspendFrame that may have been
+                        // produced by a nested suspend fn (e.g.
+                        // delay's body).
+                        if let klio_runtime::SuspendTransition::Goto(next) = &state.transition {
+                            frame.borrow_mut().state = *next;
+                        }
+                        return Ok(Value::CoroutineSuspended(Rc::clone(frame)));
                     }
                     last = v;
                 }
@@ -9670,8 +9686,31 @@ impl Interpreter {
                                     data.downcast_ref::<FrameNative>().map(|f| Rc::clone(&f.frame))
                                 })
                             };
-                            let on_stack = self.coroutine_continuations.last().cloned();
-                            if on_stack.is_none() {
+                            // Async resume: the cont's owning
+                            // suspendCoroutine already returned
+                            // CoroutineSuspended, the lambda body
+                            // has unwound, and the slot lives only
+                            // through cont's Rc. Detect this by
+                            // checking whether the cont's bound
+                            // frame is currently in a paused state
+                            // — when it is, stage `paused_resume`
+                            // on the frame so the scheduler can
+                            // re-drive it. Otherwise fall through
+                            // to the synchronous-resume path that
+                            // writes the active slot directly.
+                            let async_resume = frame_ref
+                                .as_ref()
+                                .map(|f| f.borrow().paused_resume.borrow().is_none() == true)
+                                .unwrap_or(false)
+                                && self
+                                    .active_suspend_frames
+                                    .iter()
+                                    .all(|af| {
+                                        frame_ref
+                                            .as_ref()
+                                            .map_or(true, |fr| !Rc::ptr_eq(af, fr))
+                                    });
+                            if async_resume {
                                 if let Some(frame) = frame_ref.clone() {
                                     let record = match name.name.as_str() {
                                         "resumeWithException" => {
@@ -9696,6 +9735,9 @@ impl Interpreter {
                                     *frame.borrow().paused_resume.borrow_mut() = Some(record);
                                     return Ok(Value::Unit);
                                 }
+                            }
+                            let on_stack = self.coroutine_continuations.last().cloned();
+                            if on_stack.is_none() {
                                 return Err(RuntimeError::Type(
                                     "continuation used outside an active suspendCoroutine".into(),
                                 ));
