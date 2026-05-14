@@ -619,6 +619,28 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableSet.filterNot", coll_iter_filter_not),
     ("kotlin.collections.Map.filterNot", coll_iter_filter_not),
     ("kotlin.collections.MutableMap.filterNot", coll_iter_filter_not),
+    ("kotlin.collections.List.any", coll_iter_any),
+    ("kotlin.collections.MutableList.any", coll_iter_any),
+    ("kotlin.collections.Set.any", coll_iter_any),
+    ("kotlin.collections.MutableSet.any", coll_iter_any),
+    ("kotlin.collections.Map.any", coll_iter_any),
+    ("kotlin.collections.MutableMap.any", coll_iter_any),
+    ("kotlin.collections.List.all", coll_iter_all),
+    ("kotlin.collections.MutableList.all", coll_iter_all),
+    ("kotlin.collections.Set.all", coll_iter_all),
+    ("kotlin.collections.MutableSet.all", coll_iter_all),
+    ("kotlin.collections.Map.all", coll_iter_all),
+    ("kotlin.collections.MutableMap.all", coll_iter_all),
+    ("kotlin.collections.List.none", coll_iter_none),
+    ("kotlin.collections.MutableList.none", coll_iter_none),
+    ("kotlin.collections.Set.none", coll_iter_none),
+    ("kotlin.collections.MutableSet.none", coll_iter_none),
+    ("kotlin.collections.Map.none", coll_iter_none),
+    ("kotlin.collections.MutableMap.none", coll_iter_none),
+    ("kotlin.collections.List.find", coll_iter_find),
+    ("kotlin.collections.MutableList.find", coll_iter_find),
+    ("kotlin.collections.Set.find", coll_iter_find),
+    ("kotlin.collections.MutableSet.find", coll_iter_find),
 
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
@@ -923,6 +945,66 @@ fn coll_iter_filter(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
     }
     Ok(make_list(result, false))
+}
+
+fn coll_iter_any(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "any")?;
+    if ctx.args.len() == 1 {
+        return Ok(Value::Bool(!items.is_empty()));
+    }
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for v in items {
+        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn coll_iter_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("all expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "all")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for v in items {
+        if !matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn coll_iter_none(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "none")?;
+    if ctx.args.len() == 1 {
+        return Ok(Value::Bool(items.is_empty()));
+    }
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for v in items {
+        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn coll_iter_find(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("find expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "find")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for v in items {
+        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+            return Ok(v);
+        }
+    }
+    Ok(Value::Null)
 }
 
 fn coll_iter_filter_not(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

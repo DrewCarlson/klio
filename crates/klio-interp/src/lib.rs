@@ -6283,7 +6283,7 @@ impl Interpreter {
         env: &Rc<RefCell<Env>>,
         out: &mut dyn Output,
     ) -> Result<Option<Value>, RuntimeError> {
-        if matches!(name, "forEach" | "map" | "filter" | "filterNot") && args.len() == 1 {
+        if matches!(name, "forEach" | "map" | "filter" | "filterNot" | "any" | "all" | "none" | "find") && args.len() == 1 {
             let kind = match receiver {
                 Value::List { mutable: true, .. } => Some("MutableList"),
                 Value::List { .. } => Some("List"),
