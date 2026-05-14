@@ -282,6 +282,110 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
     }
 }
 
+fn lower_when(
+    b: &mut FuncBuilder<'_>,
+    subject: Option<&Expr>,
+    branches: &[klio_ast::WhenBranch],
+    _span: klio_span::Span,
+) -> Reg {
+    // The lowering models `when` as a chain of conditional branches:
+    //
+    //     entry  ─cond0─►  body0 ─►  join
+    //       │
+    //      next ─cond1─►  body1 ─►  join
+    //       │
+    //      ...
+    //      ─else→ default_body ─► join
+    //
+    // The result register is filled by each body's `Move`-equivalent
+    // store; the join sees whichever branch ran. (Phis are an
+    // upcoming refinement; for now we leave the join's incoming
+    // wiring approximate and rely on the evaluator's reach analysis.)
+    let subject_r = subject.map(|s| lower_expr(b, s));
+    let join = b.alloc_block();
+    let result = b.alloc_reg();
+    for branch in branches {
+        // Compose this branch's condition over its patterns.
+        let body_blk = b.alloc_block();
+        let next_blk = b.alloc_block();
+        let cond = match (subject_r, branch.patterns.as_slice()) {
+            // Else branch: unconditional.
+            (_, [p]) if matches!(p.kind, klio_ast::WhenPatternKind::Else) => {
+                b.terminate(Terminator::Goto(body_blk));
+                b.switch_to(body_blk);
+                let v = lower_expr(b, &branch.body);
+                b.push(Inst::Move { dst: result, src: v });
+                b.terminate(Terminator::Goto(join));
+                b.switch_to(next_blk);
+                continue;
+            }
+            (Some(subj), patterns) => or_chain(b, |b| {
+                patterns.iter().map(|p| match &p.kind {
+                    klio_ast::WhenPatternKind::Value(e) => {
+                        let v = lower_expr(b, e);
+                        let dst = b.alloc_reg();
+                        b.push(Inst::BinOp { dst, op: BinOp::Eq, lhs: subj, rhs: v });
+                        dst
+                    }
+                    klio_ast::WhenPatternKind::IsType(ty) => {
+                        let dst = b.alloc_reg();
+                        b.push(Inst::InstanceOf {
+                            dst,
+                            src: subj,
+                            ty: crate::TypeRef {
+                                name: ty.name.name.clone(),
+                                nullable: ty.nullable,
+                                args: Vec::new(),
+                            },
+                        });
+                        dst
+                    }
+                    _ => {
+                        // InRange/NotInRange/NotIsType need operator dispatch
+                        // that's not yet wired. Trace + emit always-false.
+                        b.push(Inst::Trace { span: p.span });
+                        b.emit_const(Const::Bool(false))
+                    }
+                }).collect()
+            }),
+            (None, patterns) => or_chain(b, |b| {
+                patterns.iter().map(|p| match &p.kind {
+                    klio_ast::WhenPatternKind::Value(e) => lower_expr(b, e),
+                    _ => {
+                        b.push(Inst::Trace { span: p.span });
+                        b.emit_const(Const::Bool(false))
+                    }
+                }).collect()
+            }),
+        };
+        b.terminate(Terminator::Branch { cond, t: body_blk, f: next_blk });
+        b.switch_to(body_blk);
+        let v = lower_expr(b, &branch.body);
+        b.push(Inst::Move { dst: result, src: v });
+        b.terminate(Terminator::Goto(join));
+        b.switch_to(next_blk);
+    }
+    // Fall-through with no matching branch: leave `result` at its
+    // default. A real impl would throw NoWhenBranchMatchedException.
+    b.terminate(Terminator::Goto(join));
+    b.switch_to(join);
+    result
+}
+
+fn or_chain(b: &mut FuncBuilder<'_>, mk: impl FnOnce(&mut FuncBuilder<'_>) -> Vec<Reg>) -> Reg {
+    let regs = mk(b);
+    if regs.is_empty() {
+        return b.emit_const(Const::Bool(false));
+    }
+    let mut acc = regs[0];
+    for r in &regs[1..] {
+        let dst = b.alloc_reg();
+        b.push(Inst::BinOp { dst, op: BinOp::Or, lhs: acc, rhs: *r });
+        acc = dst;
+    }
+    acc
+}
+
 fn lower_block(b: &mut FuncBuilder<'_>, block: &AstBlock) -> Reg {
     b.push_scope();
     let mut last: Option<Reg> = None;
