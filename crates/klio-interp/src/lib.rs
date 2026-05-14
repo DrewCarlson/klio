@@ -11710,6 +11710,12 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // (the println/print Instance→toString rewrite, reorder
         // by intrinsic param names, spread flattening) fires.
         if let klio_runtime::Value::Intrinsic { fqn, func } = callee {
+            // Pack-installed bindings shadow the statically
+            // captured `func` so loaded bindings take effect
+            // even for intrinsics already bound at startup
+            // (implicit imports, prior call-site caches).
+            let func = self.interp.binding_override(fqn).unwrap_or(*func);
+            let func = &func;
             if !fqn.starts_with("__klio_intrinsic_") {
                 // println / print on user Value::Instance calls
                 // the receiver's `toString()` so the override
