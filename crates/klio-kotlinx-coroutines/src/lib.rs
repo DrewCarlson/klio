@@ -28,6 +28,7 @@ thread_local! {
     static CANCELLED_TOKENS: RefCell<HashSet<i64>> = RefCell::new(HashSet::new());
     static NEXT_TOKEN: RefCell<i64> = const { RefCell::new(1) };
     static SCHED_QUEUE: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    static PENDING_LAUNCHES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
 }
 
 klio_stdlib::host_bindings! {
@@ -39,6 +40,7 @@ klio_stdlib::host_bindings! {
         "kotlinx.coroutines.__kxco_tokenIsCancelled"   => token_is_cancelled,
         "kotlinx.coroutines.__kxco_schedulerEnqueue"   => scheduler_enqueue,
         "kotlinx.coroutines.__kxco_schedulerDrainCount" => scheduler_drain_count,
+        "kotlinx.coroutines.__kxco_spawn"               => spawn_launch_block,
     }
 }
 
@@ -107,6 +109,27 @@ fn scheduler_enqueue(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     SCHED_QUEUE.with(|q| q.borrow_mut().push(h));
     Ok(Value::Unit)
+}
+
+/// `launch { … }` builder hook: stash the block on a thread-local
+/// pending-launch queue that the enclosing `runBlocking` drains
+/// after its main body completes. Drives M31's "real scheduler"
+/// half — launches no longer run inline on the calling stack.
+fn spawn_launch_block(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let Some(lam) = ctx.args.first().cloned() else {
+        return Err(RuntimeError::Type(
+            "__kxco_spawn: expected the launch block as the first arg".into(),
+        ));
+    };
+    PENDING_LAUNCHES.with(|q| q.borrow_mut().push(lam));
+    Ok(Value::Unit)
+}
+
+/// Take a snapshot of every pending launch block and clear the
+/// queue. Used by the interpreter's `run_blocking` drain step to
+/// pump launches without re-entering the shim path.
+pub fn drain_pending_launches() -> Vec<Value> {
+    PENDING_LAUNCHES.with(|q| std::mem::take(&mut *q.borrow_mut()))
 }
 
 fn scheduler_drain_count(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

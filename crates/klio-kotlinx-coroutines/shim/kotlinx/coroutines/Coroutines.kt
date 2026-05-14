@@ -29,6 +29,12 @@ internal fun __kxco_tokenIsCancelled(id: Long): Boolean = false
 internal fun __kxco_schedulerEnqueue(handle: Long): Unit = Unit
 internal fun __kxco_schedulerDrainCount(): Int = 0
 
+// Pack hook that posts a launch-block onto the enclosing
+// runBlocking's pending-launch queue. The pack lives in
+// klio-kotlinx-coroutines; the host pumps the queue after the
+// runBlocking body returns.
+internal fun __kxco_spawn(block: () -> Unit): Unit = Unit
+
 class CancellationException(message: String) : Throwable(message)
 
 interface Job {
@@ -113,10 +119,16 @@ fun CoroutineScope.launch(
     block: suspend CoroutineScope.() -> Unit,
 ): Job {
     val job = CompletableJob()
-    runBlocking {
-        if (!job.isCancelled) block(this)
+    val scope = this
+    // Post the block onto the host's scheduler queue. The enclosing
+    // runBlocking drains the queue after its main body returns, so
+    // sibling launches no longer run inline on the calling stack.
+    __kxco_spawn {
+        if (!job.isCancelled) {
+            runBlocking { block(scope) }
+        }
+        job.markCompleted()
     }
-    job.markCompleted()
     return job
 }
 

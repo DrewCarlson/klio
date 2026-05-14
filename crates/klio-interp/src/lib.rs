@@ -99,6 +99,13 @@ pub struct Interpreter {
     /// return or suspension. The top frame is the one a captured
     /// continuation would resume.
     active_suspend_frames: Vec<Rc<RefCell<klio_runtime::SuspendFrame>>>,
+    /// Lambdas posted via `launch { … }` while a top-level
+    /// `runBlocking` is active. The launch builder enqueues the
+    /// block here instead of running it inline so a runBlocking
+    /// containing multiple `launch` siblings drives them through
+    /// a real scheduler queue. Drained at the end of run_blocking
+    /// in FIFO order.
+    launch_queue: Vec<klio_runtime::Value>,
     /// Names registered as suspending functions, populated at
     /// top-level decl registration so the suspend-body lowering
     /// recognises calls to user-declared `suspend fun foo()`.
@@ -251,6 +258,7 @@ impl Interpreter {
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
             active_suspend_frames: Vec::new(),
+            launch_queue: Vec::new(),
             suspend_function_names: suspend_lower::SuspendNameSet::with_intrinsics(),
             anon_class_counter: 0,
             instance_id_counter: 0,
@@ -5488,6 +5496,39 @@ impl Interpreter {
     /// If the body suspends, we keep the frame alive — its
     /// captured continuation must eventually be resumed by user
     /// code (or the call will hang).
+    /// Post a `launch { … }` block onto the scheduler queue. Drained
+    /// by the enclosing `runBlocking` after its body completes. The
+    /// lambda's body is later driven through the suspend
+    /// state-machine machinery so suspending calls inside it pause
+    /// the launched task correctly.
+    pub fn spawn_launch(&mut self, lambda: klio_runtime::Value) {
+        self.launch_queue.push(lambda);
+    }
+
+    /// Drain every queued `launch { … }` block in FIFO order,
+    /// running each through `run_blocking`. Called by `run_blocking`
+    /// at the end of its main body so the launches don't interfere
+    /// with the body's own task. Single-threaded by construction —
+    /// each launch runs to completion before the next starts,
+    /// matching the in-order observable behavior the existing
+    /// synchronous `launch` shim already provides.
+    pub fn drain_launch_queue(&mut self, out: &mut dyn Output) -> Result<(), RuntimeError> {
+        loop {
+            // Pull any pending launches the coroutines pack stashed
+            // via `__kxco_spawn`. Loop because draining one launch
+            // can spawn more.
+            let mut pending = klio_kotlinx_coroutines::drain_pending_launches();
+            if pending.is_empty() && self.launch_queue.is_empty() {
+                return Ok(());
+            }
+            self.launch_queue.append(&mut pending);
+            while let Some(lam) = self.launch_queue.first().cloned() {
+                self.launch_queue.remove(0);
+                self.run_blocking(&lam, out)?;
+            }
+        }
+    }
+
     pub fn run_blocking(
         &mut self,
         lam: &Value,
@@ -5531,6 +5572,10 @@ impl Interpreter {
         let _ = params;
         let result = self.drive_suspend_function(&synth, captured, &[], out)?;
         if !matches!(result, Value::CoroutineSuspended(_)) {
+            // Drain any launches the body posted onto the scheduler
+            // before returning. Nested runBlocking calls drain their
+            // own scope; the top-level drain happens here.
+            self.drain_launch_queue(out)?;
             return Ok(result);
         }
         // The lambda suspended. The captured continuation is held
