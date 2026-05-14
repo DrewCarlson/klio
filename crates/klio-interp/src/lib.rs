@@ -12257,6 +12257,56 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 items.borrow_mut().push(args[0].clone());
                 return Ok(klio_runtime::Value::Unit);
             }
+            (klio_runtime::Value::List { items, mutable: true, .. }, "minusAssign") if args.len() == 1 => {
+                let mut v = items.borrow_mut();
+                if let Some(pos) = v.iter().position(|x| klio_runtime::Value::structural_eq(x, &args[0])) {
+                    v.remove(pos);
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::Set { items, mutable: true, .. }, "plusAssign") if args.len() == 1 => {
+                let mut v = items.borrow_mut();
+                if !v.iter().any(|x| klio_runtime::Value::structural_eq(x, &args[0])) {
+                    v.push(args[0].clone());
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::Set { items, mutable: true, .. }, "minusAssign") if args.len() == 1 => {
+                let mut v = items.borrow_mut();
+                if let Some(pos) = v.iter().position(|x| klio_runtime::Value::structural_eq(x, &args[0])) {
+                    v.remove(pos);
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::Map { entries, mutable: true, .. }, "plusAssign") if args.len() == 1 => {
+                // `m += ("k" to v)` or `m += (k, v) pair`. Accepts Pair as the arg.
+                if let klio_runtime::Value::Pair(k, v) = &args[0] {
+                    let mut e = entries.borrow_mut();
+                    let key = (**k).clone();
+                    let value = (**v).clone();
+                    if let Some(slot) = e
+                        .iter_mut()
+                        .find(|(ek, _)| klio_runtime::Value::structural_eq(ek, &key))
+                    {
+                        slot.1 = value;
+                    } else {
+                        e.push((key, value));
+                    }
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::Map { entries, mutable: true, .. }, "minusAssign") if args.len() == 1 => {
+                let mut e = entries.borrow_mut();
+                if let Some(pos) = e.iter().position(|(k, _)| {
+                    klio_runtime::Value::structural_eq(k, &args[0])
+                }) {
+                    e.remove(pos);
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::Set { items, .. }, "size") => {
+                return Ok(klio_runtime::Value::new_int(items.borrow().len() as i64));
+            }
             (klio_runtime::Value::Map { entries, .. }, "get") if args.len() == 1 => {
                 let key = &args[0];
                 let v = entries
