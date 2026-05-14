@@ -12735,6 +12735,27 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             if let Some(v) = plain_field {
                 return Ok(v);
             }
+            // Lazy-delegate cached fast-path: after the first read
+            // the `Lazy` delegate has cached the produced value.
+            // Return it directly without the tree-walker getValue
+            // round-trip.
+            let cached_lazy: Option<klio_runtime::Value> = {
+                let i = inst.borrow();
+                let key = format!("__delegate${name}");
+                match i.get(&key) {
+                    Some(klio_runtime::Value::Delegate(d)) => {
+                        if let klio_runtime::DelegateKind::Lazy { cached: Some(v), .. } = &*d.borrow() {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(v) = cached_lazy {
+                return Ok(v);
+            }
             // Trivial-getter fast-path: when the property has a
             // custom getter whose body is a single Path read of
             // another field name, resolve it to that field
