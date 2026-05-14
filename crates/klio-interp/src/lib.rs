@@ -11537,6 +11537,19 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             _ => {}
         }
         if let klio_runtime::Value::Instance(inst) = receiver {
+            // Enum compareTo / equals dispatched by-ordinal so user
+            // enums comparing through `<` / `<=` / `>=` / `>` work
+            // without each enum needing an explicit compareTo
+            // declaration.
+            if inst.borrow().class.is_enum && name == "compareTo" && args.len() == 1 {
+                let lhs_ord = inst.borrow().get("ordinal").and_then(|v| v.as_i64()).unwrap_or(0);
+                let rhs_ord = if let klio_runtime::Value::Instance(other) = &args[0] {
+                    other.borrow().get("ordinal").and_then(|v| v.as_i64()).unwrap_or(0)
+                } else {
+                    0
+                };
+                return Ok(klio_runtime::Value::new_int(lhs_ord - rhs_ord));
+            }
             // Pack-installed binding override takes precedence over
             // the shim's default Kotlin body. Matches the tree
             // walker's dispatch order (binding_override consulted

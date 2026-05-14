@@ -319,7 +319,32 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.push(Inst::GetField { dst, receiver: recv, field });
             dst
         }
-        Expr::Call { callee, args, arg_names: ast_arg_names, .. } => {
+        Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. } => {
+            // Infix call `a fn b` lowers as `a.fn(b)` — the
+            // dispatch site is a member call on the receiver
+            // even when `fn` is a top-level extension.
+            if *is_infix && args.len() == 2 {
+                if let Expr::Path { segments, .. } = callee.as_ref() {
+                    if segments.len() == 1 {
+                        let recv = lower_expr(b, &args[0]);
+                        let (args_start, count) = lower_arg_run(b, &args[1..]);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let dst = b.alloc_reg();
+                        let nm = b
+                            .module
+                            .intern_const(Const::String(segments[0].name.clone()));
+                        b.push(Inst::CallMember {
+                            dst,
+                            receiver: recv,
+                            name: nm,
+                            args: args_start,
+                            n_args: count,
+                            arg_names,
+                        });
+                        return dst;
+                    }
+                }
+            }
             // Path-callee with a registered top-level fn → Call{func}.
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
