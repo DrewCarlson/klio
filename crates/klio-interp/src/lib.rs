@@ -351,6 +351,92 @@ impl Interpreter {
         self.globals.borrow().lookup(name)
     }
 
+    /// Re-enter the IR evaluator against a stashed closure with a
+    /// full IrHost so member calls / new-instance / etc. work.
+    /// Looked up by invoke_callable_value when it encounters a
+    /// `Value::IrClosure`.
+    pub fn invoke_ir_closure_with_host(
+        &mut self,
+        id: u64,
+        captures: &[Value],
+        args: &[Value],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        let slot = IR_CLOSURE_TABLE.with(|t| t.borrow().get(id as usize).cloned().flatten())
+            .ok_or_else(|| RuntimeError::Type(format!("IR closure id {id} not in registry")))?;
+        let func = slot
+            .module
+            .funcs
+            .get(slot.body_func.0 as usize)
+            .cloned()
+            .ok_or_else(|| RuntimeError::Type("IR closure body_func out of range".into()))?;
+        let class_names: Vec<String> = slot
+            .module
+            .classes
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let mut host = IrHost {
+            interp: self,
+            out,
+            class_names,
+            closures: Vec::new(),
+        };
+        klio_ir::eval::eval_with_captures(
+            &slot.module,
+            &func,
+            args.to_vec(),
+            captures.to_vec(),
+            &mut host,
+        )
+        .map_err(|e| RuntimeError::Type(e.to_string()))
+    }
+
+    /// Invoke a name-dispatched intrinsic (`repeat`, `let`, `apply`,
+    /// `listOf`, …) that the tree walker recognises by simple name
+    /// inside `eval_call`. Used by the IR host to route these forms
+    /// back through the existing machinery without forcing the IR
+    /// evaluator to reimplement them. Args are pre-evaluated values
+    /// — the wrapper synthesises a fresh AST Call from a literal
+    /// callable name and bound argument placeholders so existing
+    /// dispatch fires.
+    pub fn invoke_named_intrinsic(
+        &mut self,
+        name: &str,
+        args: &[klio_runtime::Value],
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, RuntimeError> {
+        use klio_ast::{Expr, Ident};
+        use klio_span::{FileId, Span};
+        let dummy_span = Span::new(FileId(0), 0, 0);
+        // Stash the pre-evaluated args as locals so the synthesised
+        // call's arg-Expr nodes resolve to them. We use a dedicated
+        // env layer so the names don't leak.
+        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.globals))));
+        let mut arg_exprs: Vec<Expr> = Vec::with_capacity(args.len());
+        for (i, v) in args.iter().enumerate() {
+            let slot_name = format!("__ir_arg_{i}");
+            env.borrow_mut().define(slot_name.clone(), v.clone());
+            arg_exprs.push(Expr::Path {
+                segments: vec![Ident { name: slot_name, span: dummy_span }],
+                span: dummy_span,
+            });
+        }
+        let arg_count = arg_exprs.len();
+        let call = Expr::Call {
+            callee: Box::new(Expr::Path {
+                segments: vec![Ident { name: name.to_string(), span: dummy_span }],
+                span: dummy_span,
+            }),
+            args: arg_exprs,
+            arg_names: vec![None; arg_count],
+            type_args: Vec::new(),
+            is_infix: false,
+            span: dummy_span,
+        };
+        self.eval_expr(&call, &env, out)
+    }
+
     /// Look up an intrinsic by FQN. Checks pack-installed bindings
     /// first, falls back to the static `klio_stdlib` table.
     #[must_use]
@@ -3280,7 +3366,7 @@ impl Interpreter {
     /// Invoke any callable `Value` (Lambda, Function, Intrinsic, bound
     /// method) with positional/named arguments. Used by member-call
     /// dispatch when a property holds a callable.
-    fn invoke_callable_value(
+    pub fn invoke_callable_value(
         &mut self,
         callee: &Value,
         args: &[Value],
@@ -3288,6 +3374,9 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
         match callee {
+            Value::IrClosure { id, captures } => {
+                self.invoke_ir_closure_with_host(*id, captures, args, out)
+            }
             Value::Lambda { params, body, env, absorb_return } => {
                 self.call_lambda_with_this(params, body, env, args, None, *absorb_return, out)
             }
@@ -3440,6 +3529,14 @@ impl Interpreter {
                 let Value::Int(n) = n else {
                     return Err(RuntimeError::Type("repeat requires an Int count".into()));
                 };
+                // IR closures dispatch through the IR registry;
+                // tree-walker lambdas use the existing path.
+                if let Value::IrClosure { .. } = &lam {
+                    for i in 0..n {
+                        self.invoke_callable_value(&lam, &[Value::Int(i)], &[None], out)?;
+                    }
+                    return Ok(Some(Value::Unit));
+                }
                 let Value::Lambda { params, body, env: captured, .. } = &lam else {
                     return Err(RuntimeError::Type("repeat requires a lambda".into()));
                 };
@@ -5165,7 +5262,7 @@ impl Interpreter {
     /// If the body suspends, we keep the frame alive — its
     /// captured continuation must eventually be resumed by user
     /// code (or the call will hang).
-    fn run_blocking(
+    pub fn run_blocking(
         &mut self,
         lam: &Value,
         out: &mut dyn Output,
@@ -5348,7 +5445,7 @@ impl Interpreter {
     /// of scope; what we provide here is the language-level
     /// machinery that lets a synchronous `suspendCoroutine { cont ->
     /// cont.resume(v) }` produce `v`.
-    fn eval_suspend_coroutine(
+    pub fn eval_suspend_coroutine(
         &mut self,
         lam: &Value,
         out: &mut dyn Output,
@@ -10755,6 +10852,59 @@ fn lookup_nested_class(cls: &Rc<ClassDef>, name: &str) -> Option<Rc<ClassDef>> {
     None
 }
 
+/// Sentinel `StdlibFn` for IR coroutine intrinsics — never invoked
+/// directly because `IrHost::call_value` intercepts the matching
+/// FQN before falling through to the function pointer.
+fn ir_intrinsic_stub(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Err(RuntimeError::Type(
+        "ir_intrinsic_stub invoked directly — IR host should have intercepted".into(),
+    ))
+}
+
+thread_local! {
+    /// Active IR closure registry. IrHost::build_closure stashes
+    /// the `(module, body_func)` triple per IR-closure id; the
+    /// runtime's invoke path looks it up when it encounters a
+    /// `Value::IrClosure` so the tree-walker dispatch (repeat,
+    /// let, apply, etc.) can invoke closures built by the IR.
+    static IR_CLOSURE_TABLE: RefCell<Vec<Option<IrClosureSlot>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Public hook the runtime invokes when it encounters an
+/// `Value::IrClosure`. Returns the call result by re-entering the
+/// IR evaluator against the stashed module + body func + captures.
+pub fn invoke_ir_closure(
+    id: u64,
+    captures: &[Value],
+    args: &[Value],
+    out: &mut dyn Output,
+) -> Option<Result<Value, RuntimeError>> {
+    let slot = IR_CLOSURE_TABLE.with(|t| t.borrow().get(id as usize).cloned().flatten())?;
+    let func = slot.module.funcs.get(slot.body_func.0 as usize)?.clone();
+    let interp_ptr = std::ptr::null_mut::<Interpreter>();
+    // We can't fabricate a fresh &mut Interpreter here. Callers
+    // that need full interpreter machinery use the IrHost path
+    // directly. For dispatch from inside invoke_callable_value we
+    // can synthesise a minimal NullHost — closures that only do
+    // pure arithmetic + bound captures still work, which is
+    // sufficient for the `repeat(5) { i -> ... }` shape that
+    // motivates this hook.
+    let _ = interp_ptr;
+    let mut host = klio_ir::eval::NullHost;
+    let result = klio_ir::eval::eval_with_captures(
+        &slot.module,
+        &func,
+        args.to_vec(),
+        captures.to_vec(),
+        &mut host,
+    );
+    let _ = out;
+    match result {
+        Ok(v) => Some(Ok(v)),
+        Err(e) => Some(Err(RuntimeError::Type(e.to_string()))),
+    }
+}
+
 /// Bridge the IR evaluator back to this interpreter for dispatch
 /// that requires the real class table / dispatch machinery.
 struct IrHost<'a> {
@@ -10779,7 +10929,74 @@ struct IrClosureSlot {
 
 impl<'a> klio_ir::eval::Host for IrHost<'a> {
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
-        self.interp.lookup_global_callable(name)
+        if let Some(v) = self.interp.lookup_global_callable(name) {
+            return Some(v);
+        }
+        // Special-case the interpreter's name-recognised
+        // suspend / coroutine intrinsics so the IR call path can
+        // route them back through the tree walker's machinery via
+        // a synthetic Value::Intrinsic sentinel that
+        // `call_value` intercepts below.
+        match name {
+            "runBlocking" => {
+                return Some(klio_runtime::Value::Intrinsic {
+                    fqn: "__klio_intrinsic_runBlocking",
+                    func: ir_intrinsic_stub,
+                });
+            }
+            "suspendCoroutine"
+            | "suspendCoroutineUninterceptedOrReturn"
+            | "suspendCancellableCoroutine" => {
+                return Some(klio_runtime::Value::Intrinsic {
+                    fqn: "__klio_intrinsic_suspendCoroutine",
+                    func: ir_intrinsic_stub,
+                });
+            }
+            _ => {}
+        }
+        // Probe the stdlib registry by simple name. A common idiom
+        // is `repeat(5) { ... }` / `listOf(1, 2)` / `println(...)` —
+        // these resolve to FQNs like `kotlin.repeat` /
+        // `kotlin.collections.listOf` / `kotlin.io.println`.
+        let candidate_fqns: &[String] = &[
+            format!("kotlin.{name}"),
+            format!("kotlin.io.{name}"),
+            format!("kotlin.collections.{name}"),
+            format!("kotlin.ranges.{name}"),
+            format!("kotlin.text.{name}"),
+            format!("kotlin.math.{name}"),
+        ];
+        for fqn in candidate_fqns {
+            if let Some(f) = self.interp.lookup_intrinsic(fqn) {
+                let leaked: &'static str = Box::leak(fqn.clone().into_boxed_str());
+                return Some(klio_runtime::Value::Intrinsic {
+                    fqn: leaked,
+                    func: f,
+                });
+            }
+        }
+        // Scope functions and higher-order helpers
+        // (`repeat` / `let` / `apply` / `also` / `with` / `run` /
+        // `takeIf` / `takeUnless` / `require` / `check` /
+        // `requireNotNull` / `checkNotNull` / `error` / `TODO`)
+        // are name-dispatched inside the tree walker's eval_call
+        // rather than registered intrinsics. Return a sentinel so
+        // call_value can route them through eval_via_ast below.
+        match name {
+            "repeat" | "let" | "apply" | "also" | "with" | "run"
+            | "takeIf" | "takeUnless" | "require" | "check"
+            | "requireNotNull" | "checkNotNull" | "error" | "TODO"
+            | "listOf" | "mutableListOf" | "arrayOf" | "setOf"
+            | "mapOf" | "mutableMapOf" | "mutableSetOf" => {
+                let leaked: &'static str =
+                    Box::leak(format!("__klio_intrinsic_name:{name}").into_boxed_str());
+                Some(klio_runtime::Value::Intrinsic {
+                    fqn: leaked,
+                    func: ir_intrinsic_stub,
+                })
+            }
+            _ => None,
+        }
     }
 
     fn call_value(
@@ -10787,6 +11004,58 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         callee: &klio_runtime::Value,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Interpreter-side coroutine intrinsics: detect via the
+        // sentinel FQN we stuffed into lookup_global and route to
+        // the matching tree-walker entry point. runBlocking takes
+        // exactly one lambda arg; the suspend intrinsics also take
+        // a lambda arg that runs against a continuation.
+        if let klio_runtime::Value::Intrinsic { fqn, .. } = callee {
+            // Name-dispatched scope / builder intrinsics route
+            // back through the tree walker by synthesising a Call
+            // expression and re-running it. Heavy but it lets the
+            // IR path cover stdlib surface area that lives in
+            // eval_call rather than the registered intrinsic table.
+            if let Some(simple) = fqn.strip_prefix("__klio_intrinsic_name:") {
+                return self
+                    .interp
+                    .invoke_named_intrinsic(simple, args, self.out)
+                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+            }
+            match *fqn {
+                "__klio_intrinsic_runBlocking" => {
+                    if args.len() != 1 {
+                        return Err(klio_ir::eval::EvalError::Type(
+                            "runBlocking expects one lambda".into(),
+                        ));
+                    }
+                    // IR closures need their own invocation path
+                    // (run_blocking only knows the AST-Lambda
+                    // shape). Call the closure directly — klio is
+                    // single-threaded so the body runs to
+                    // completion inline, matching the tree-walker
+                    // runBlocking semantics for synchronous bodies.
+                    if matches!(&args[0], klio_runtime::Value::IrClosure { .. }) {
+                        return self.call_value(&args[0], &[]);
+                    }
+                    return self
+                        .interp
+                        .run_blocking(&args[0], self.out)
+                        .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                }
+                "__klio_intrinsic_suspendCoroutine" => {
+                    if args.len() != 1 {
+                        return Err(klio_ir::eval::EvalError::Type(
+                            "suspendCoroutine expects one lambda".into(),
+                        ));
+                    }
+                    return self
+                        .interp
+                        .eval_suspend_coroutine(&args[0], self.out)
+                        .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                }
+                _ => {}
+            }
+        }
         // IrClosure callees dispatch back into the IR evaluator
         // with captures appended to the positional args.
         if let klio_runtime::Value::IrClosure { id, captures } = callee {
@@ -10825,9 +11094,21 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         captures: Vec<klio_runtime::Value>,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         let id = self.closures.len() as u64;
-        self.closures.push(IrClosureSlot {
+        let slot = IrClosureSlot {
             body_func,
             module: std::rc::Rc::new(module.clone()),
+        };
+        self.closures.push(slot.clone());
+        // Mirror the slot into the thread-local registry so the
+        // tree-walker's invoke_callable_value can resolve the
+        // closure when it dispatches `repeat { … }` etc. that
+        // expected a Value::Lambda but got Value::IrClosure.
+        IR_CLOSURE_TABLE.with(|t| {
+            let mut b = t.borrow_mut();
+            while b.len() <= id as usize {
+                b.push(None);
+            }
+            b[id as usize] = Some(slot);
         });
         Ok(klio_runtime::Value::IrClosure {
             id,
