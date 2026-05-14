@@ -928,6 +928,7 @@ dependencies = [
  "klio-span",
  "klio-types",
  "serde",
+ "thiserror",
 ]
 
 [[package]]

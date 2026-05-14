@@ -16,3 +16,4 @@ klio-types       = { workspace = true }
 klio-runtime     = { workspace = true }
 klio-diagnostics = { workspace = true }
 serde            = { workspace = true }
+thiserror        = "2"

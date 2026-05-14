@@ -34,6 +34,7 @@
 //!   shape `klio_runtime::Value::Lambda` already uses.
 
 pub mod build;
+pub mod eval;
 pub mod lower;
 
 use klio_span::Span;
