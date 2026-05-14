@@ -11730,13 +11730,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // rather than registered intrinsics. Return a sentinel so
         // call_value can route them through eval_via_ast below.
         match name {
-            "UIntArray" | "ULongArray" | "UShortArray" | "UByteArray"
-            // Comparator-shaped helpers requiring lambda steps
-            | "thenBy" | "thenByDescending"
-            | "Result"
-            | "synchronized"
-            | "tailrec"
-            | "objects" => {
+            "thenBy" | "thenByDescending" | "Result" => {
                 let leaked: &'static str =
                     Box::leak(format!("__klio_intrinsic_name:{name}").into_boxed_str());
                 Some(klio_runtime::Value::Intrinsic {
