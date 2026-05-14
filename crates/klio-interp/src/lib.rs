@@ -283,27 +283,51 @@ pub struct ModuleRegistry<'a> {
 impl<'a> ModuleRegistry<'a> {
     #[must_use]
     pub fn has_top_level_overloads(&self, name: &str) -> bool {
-        self.interp.has_top_level_overloads(name)
+        self.interp
+            .module_registry
+            .top_level_overloads
+            .get(name)
+            .map_or(false, |v| v.len() > 1)
     }
     #[must_use]
     pub fn has_top_level_default(&self, name: &str) -> bool {
-        self.interp.has_top_level_default(name)
+        self.interp
+            .module_registry
+            .top_level_overloads
+            .get(name)
+            .map_or(false, |v| {
+                v.iter().any(|(f, _)| f.params.iter().any(|p| p.default.is_some()))
+            })
     }
     #[must_use]
     pub fn has_top_level_vararg(&self, name: &str) -> bool {
-        self.interp.has_top_level_vararg(name)
+        self.interp
+            .module_registry
+            .top_level_overloads
+            .get(name)
+            .map_or(false, |v| {
+                v.iter().any(|(f, _)| f.params.iter().any(|p| p.is_vararg))
+            })
     }
     #[must_use]
     pub fn has_top_level_property(&self, name: &str) -> bool {
-        self.interp.has_top_level_property(name)
+        self.interp.module_registry.top_level_props.contains_key(name)
     }
     #[must_use]
     pub fn lookup_global_callable(&self, name: &str) -> Option<klio_runtime::Value> {
-        self.interp.lookup_global_callable(name)
+        if let Some((ty, prop)) = name.split_once('.') {
+            if let Some(v) = primitive_companion_const(ty, prop) {
+                return Some(v);
+            }
+        }
+        if let Some(c) = self.interp.module_registry.class_table.get(name) {
+            return Some(klio_runtime::Value::Class(Rc::clone(c)));
+        }
+        self.interp.globals.borrow().lookup(name)
     }
     #[must_use]
     pub fn binding_override(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
-        self.interp.binding_override(fqn)
+        self.interp.module_registry.installed_bindings.get(fqn).copied()
     }
 }
 
