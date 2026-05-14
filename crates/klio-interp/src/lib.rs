@@ -12565,12 +12565,26 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 let mut all = Vec::with_capacity(args.len() + 1);
                 all.push(receiver.clone());
                 all.extend_from_slice(args);
-                match self.interp.invoke_named_intrinsic(name, &all, self.out) {
-                    Ok(v) => return Ok(v),
-                    Err(klio_runtime::RuntimeError::Thrown(v)) => {
-                        return Err(klio_ir::eval::EvalError::Throw(v));
+                let candidate_fqns: [String; 6] = [
+                    format!("kotlin.{name}"),
+                    format!("kotlin.io.{name}"),
+                    format!("kotlin.collections.{name}"),
+                    format!("kotlin.comparisons.{name}"),
+                    format!("kotlin.ranges.{name}"),
+                    format!("kotlin.text.{name}"),
+                ];
+                for fqn in &candidate_fqns {
+                    if let Some(func) = self.interp.lookup_intrinsic(fqn) {
+                        let mut __interp_host = InterpHostRef { interp: self.interp };
+                        let mut ctx = CallCtx { args: &all, out: self.out, host: &mut __interp_host };
+                        match func(&mut ctx) {
+                            Ok(v) => return Ok(v),
+                            Err(klio_runtime::RuntimeError::Thrown(v)) => {
+                                return Err(klio_ir::eval::EvalError::Throw(v));
+                            }
+                            Err(_) => {}
+                        }
                     }
-                    Err(_) => {}
                 }
                 Err(klio_ir::eval::EvalError::Type(format!(
                     "IR Host: member call `{name}` on {type_fqn} not resolved: {e}"
