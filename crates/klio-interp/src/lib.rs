@@ -11721,6 +11721,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // Sequence builders + common range helpers
             | "sequenceOf" | "sequence" | "generateSequence" | "emptySequence"
             | "emptyList" | "emptyMap" | "emptySet"
+            | "intArrayOf" | "longArrayOf" | "shortArrayOf" | "byteArrayOf"
+            | "doubleArrayOf" | "floatArrayOf" | "booleanArrayOf" | "charArrayOf"
+            | "uintArrayOf" | "ulongArrayOf" | "ushortArrayOf" | "ubyteArrayOf"
             | "lazyOf" | "lazy" | "buildList" | "buildSet" | "buildMap" | "buildString"
             | "println" | "print" | "readLine"
             | "minOf" | "maxOf" | "abs"
