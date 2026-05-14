@@ -11756,8 +11756,6 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             | "thenBy" | "thenByDescending"
             | "compareValuesBy" | "Comparator"
             | "Result"
-            // Sequence builder lambda form
-            | "sequence"
             | "synchronized"
             | "tailrec"
             | "objects" => {
