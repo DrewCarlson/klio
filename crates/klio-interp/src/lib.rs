@@ -14713,12 +14713,10 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // tree walker's init pipeline. Pure-shape bodies (`val
             // computed: Int`-style without bodies) leave fields
             // undefined just like the tree walker would.
-            // Each body property's init must be either absent,
-            // a simple literal, or a bare reference to a primary-
-            // ctor param (which we can resolve from `args` at
-            // ctor time). Richer initializers (calls, member
-            // chains, arithmetic) still need the tree walker.
-            let primary_names: Vec<String> = cls
+            // The body-property fast-path now consults the
+            // lowered IR thunk for each property — see the
+            // `class_ir.body_prop_inits` lookup below.
+            let _primary_names: Vec<String> = cls
                 .primary_params
                 .iter()
                 .map(|p| p.name.clone())
