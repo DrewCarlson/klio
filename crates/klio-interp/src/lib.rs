@@ -11751,7 +11751,6 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // Comparator-shaped helpers requiring lambda steps
             | "thenBy" | "thenByDescending"
             | "compareValuesBy" | "Comparator"
-            | "naturalOrder" | "reverseOrder"
             | "Result"
             // Sequence builder lambda form
             | "sequence"
