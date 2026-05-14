@@ -401,6 +401,16 @@ impl Interpreter {
         self
     }
 
+    /// Merge additional `(span, type)` pairs into the interpreter's
+    /// per-expression type map without resetting it. Used by the
+    /// pack loader to layer in a pack's frozen `typeck` section.
+    pub fn extend_expr_types(
+        &mut self,
+        types: impl IntoIterator<Item = (klio_span::Span, klio_types::Type)>,
+    ) {
+        self.expr_types.extend(types);
+    }
+
     /// Consult per-expression static types: an operand is "boxed" if its
     /// static type is `Any` / `Any?`, OR if its AST shape is a syntactic
     /// `as Any` / `as Number` cast (fallback when typeck data is missing).

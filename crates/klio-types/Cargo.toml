@@ -10,6 +10,7 @@ klio-span        = { workspace = true }
 klio-ast         = { workspace = true }
 klio-diagnostics = { workspace = true }
 thiserror       = { workspace = true }
+serde           = { workspace = true }
 
 [lints]
 workspace = true

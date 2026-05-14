@@ -31,6 +31,7 @@ serde            = { workspace = true }
 serde_json       = { workspace = true }
 toml             = "0.9"
 zstd             = "0.13"
+klio-types       = { workspace = true }
 walkdir          = "2"
 clap            = { workspace = true }
 rustyline       = { workspace = true }

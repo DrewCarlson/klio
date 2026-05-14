@@ -882,6 +882,7 @@ dependencies = [
  "klio-stdlib",
  "klio-stdlib-pack",
  "klio-typeck",
+ "klio-types",
  "rustyline",
  "serde",
  "serde_json",
@@ -995,6 +996,8 @@ dependencies = [
  "bitflags",
  "blake3",
  "klio-ast",
+ "klio-span",
+ "klio-types",
  "memmap2",
  "postcard",
  "serde",
@@ -1114,6 +1117,7 @@ dependencies = [
  "klio-ast",
  "klio-diagnostics",
  "klio-span",
+ "serde",
  "thiserror",
 ]
 

@@ -230,6 +230,23 @@ pub struct AstFile {
 }
 
 // ---------------------------------------------------------------------
+// typeck
+// ---------------------------------------------------------------------
+
+/// Frozen type-check output. Keyed by source span so the loader can
+/// rebuild the interpreter's `expr_types` map without re-running the
+/// type checker. The schema is intentionally narrow: only the
+/// per-expression `Type` map is carried; the auxiliary side channels
+/// (`expr_class`, `list_elem`) are reserved for future fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TypeckBundle {
+    /// Pairs of `(Span, Type)` so the on-disk shape is deterministic
+    /// (HashMap is non-deterministic; a sorted Vec keeps round-trips
+    /// byte-identical).
+    pub entries: Vec<(klio_span::Span, klio_types::Type)>,
+}
+
+// ---------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------
 

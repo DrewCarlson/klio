@@ -15,7 +15,7 @@ use thiserror::Error;
 pub mod constraints;
 
 /// Variance marker on a generic instantiation argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 pub enum Variance {
     #[default]
     Invariant,
@@ -36,7 +36,7 @@ impl From<klio_ast::Variance> for Variance {
 /// A single type argument inside a `Type::Generic` instantiation, carrying
 /// the use-site projection (`out`/`in`/invariant) so subtyping can apply
 /// the right variance per pair.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct GenericArg {
     pub variance: Variance,
     /// `*` star-projection. When true, `ty` is `Type::Any` (read view).
@@ -45,7 +45,7 @@ pub struct GenericArg {
 }
 
 /// A Kotlin type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Unit,
     Boolean,

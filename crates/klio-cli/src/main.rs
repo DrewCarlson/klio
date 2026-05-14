@@ -414,6 +414,28 @@ fn build_ast_bundle(files: &[klio_pack::schema::SourceFile]) -> klio_pack::schem
     out
 }
 
+/// Run typecheck over the parsed AST bundle and produce the
+/// per-expression type map. Best-effort: any file whose typecheck
+/// reports errors is skipped silently so the resulting bundle covers
+/// only the green parts. Loader code merges these entries into the
+/// interpreter's `expr_types` map directly, skipping a second
+/// resolve + typecheck pass at install time.
+fn build_typeck_bundle(asts: &[klio_ast::KotlinFile]) -> klio_pack::schema::TypeckBundle {
+    let mut out = klio_pack::schema::TypeckBundle::default();
+    if asts.is_empty() {
+        return out;
+    }
+    let r = klio_resolver::resolve_module(asts);
+    let tc = klio_typeck::typecheck_module(asts, &r);
+    if tc.diagnostics.has_errors() {
+        return out;
+    }
+    let mut entries: Vec<(klio_span::Span, klio_types::Type)> = tc.types.into_iter().collect();
+    entries.sort_by_key(|(s, _)| (s.file.0, s.start, s.end));
+    out.entries = entries;
+    out
+}
+
 #[derive(serde::Deserialize, Debug)]
 struct LibraryToml {
     library: LibraryHeader,
@@ -615,11 +637,20 @@ fn build_library_pack(
     let ast_bundle = build_ast_bundle(&files);
     let ast_bytes = encode(&ast_bundle).map_err(|e| e.to_string())?;
 
+    // Frozen typeck: typecheck the bundle and ship the per-Span
+    // type map. Empty when typecheck reports errors; the loader
+    // re-typechecks at install time in that case.
+    let asts: Vec<klio_ast::KotlinFile> =
+        ast_bundle.files.iter().map(|f| f.kotlin_file.clone()).collect();
+    let typeck_bundle = build_typeck_bundle(&asts);
+    let typeck_bytes = encode(&typeck_bundle).map_err(|e| e.to_string())?;
+
     let mut writer = PackWriter::new();
     writer.add_raw(section_names::MANIFEST, manifest_bytes);
     writer.add_raw(section_names::BINDINGS, bindings_bytes);
     writer.add_section(section_names::SOURCES, sources_bytes, Compression::Zstd);
     writer.add_section(section_names::AST, ast_bytes, Compression::Zstd);
+    writer.add_section(section_names::TYPECK, typeck_bytes, Compression::Zstd);
     let pack_bytes = writer.finish().map_err(|e| e.to_string())?;
 
     let out_path = match out {
@@ -1236,6 +1267,16 @@ fn install_one_extra_pack(
         }
     };
     interp.install_pack(&pack, host).map_err(|e| e.to_string())?;
+    // Frozen typeck merges before source ingestion so any
+    // expression types the pack carries are visible while pack
+    // bodies are evaluated. Errors here are non-fatal: the loader
+    // simply re-typechecks at install time.
+    use klio_pack::schema::TypeckBundle;
+    if let Some(payload) = pack.read_section(section_names::TYPECK).map_err(|e| e.to_string())? {
+        if let Ok(bundle) = klio_pack::schema::decode::<TypeckBundle>(&payload) {
+            interp.extend_expr_types(bundle.entries);
+        }
+    }
     // Frozen AST takes precedence: when the pack carries a
     // pre-parsed AST bundle, feed those KotlinFiles directly into
     // the interpreter and skip the parse pass entirely. Falls back
