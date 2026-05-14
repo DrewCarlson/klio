@@ -102,6 +102,11 @@ pub struct Interpreter {
     /// params are the class's primary-ctor param names.
     class_body_prop_inits:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Per-class supertype-delegate thunks paired with their
+    /// instance field key. Each thunk takes the class's primary-
+    /// ctor params and returns the delegate value.
+    class_supertype_delegates:
+        std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
     /// `@Retention` value declared on each annotation class (`SOURCE`,
     /// `BINARY`, or `RUNTIME`). Populated when an `annotation class`
     /// is registered. Drives whether the annotation surfaces through
@@ -344,6 +349,7 @@ impl Interpreter {
             class_init_blocks: std::collections::HashMap::new(),
             class_parent_ctor_args: std::collections::HashMap::new(),
             class_body_prop_inits: std::collections::HashMap::new(),
+            class_supertype_delegates: std::collections::HashMap::new(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
@@ -1124,6 +1130,47 @@ impl Interpreter {
                 for p in &c.primary_params {
                     if p.property.is_some() {
                         own_members.insert(p.name.name.clone());
+                    }
+                }
+                // Supertype `by` delegates. Lower each delegate
+                // expression as an N-arg IR thunk parameterised on
+                // the class's primary-ctor params; the fast-path
+                // evaluates them and stores under the matching
+                // instance field key. The runtime's forwarder
+                // synthesis (`delegate_forwarders`) reads the field
+                // when dispatching the interface's methods.
+                {
+                    let primary_param_names: Vec<String> = c
+                        .primary_params
+                        .iter()
+                        .map(|p| p.name.name.clone())
+                        .collect();
+                    let params_ref: Vec<&str> =
+                        primary_param_names.iter().map(|s| s.as_str()).collect();
+                    let mut fids: Vec<(String, klio_ir::FuncId)> = Vec::new();
+                    for (idx, (ty, delegate)) in c
+                        .supertypes
+                        .iter()
+                        .zip(c.supertype_delegates.iter())
+                        .enumerate()
+                    {
+                        if let Some(expr) = delegate {
+                            let field_key = format!("__delegate__{}", ty.name.name);
+                            let id = klio_ir::lower::lower_expr_as_param_thunk(
+                                &mut module,
+                                &params_ref,
+                                expr,
+                                &format!(
+                                    "__delegate__{}.{}#{}",
+                                    c.name.name, ty.name.name, idx
+                                ),
+                            );
+                            fids.push((field_key, id));
+                        }
+                    }
+                    if !fids.is_empty() {
+                        self.class_supertype_delegates
+                            .insert(c.name.name.clone(), fids);
                     }
                 }
                 // Parent-ctor args: lower each expression as an
@@ -14273,6 +14320,17 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     .class_parent_ctor_args
                     .get(&name)
                     .map_or(false, |fids| fids.len() == cls.parent_ctor_args.len());
+            let supertype_delegates_lowered = {
+                let dels = cls.supertype_delegates.borrow();
+                if dels.is_empty() {
+                    true
+                } else {
+                    self.interp
+                        .class_supertype_delegates
+                        .get(&name)
+                        .map_or(false, |fids| fids.len() == dels.len())
+                }
+            };
             let simple = !cls.is_inner
                 && !cls.is_anonymous
                 && !cls.is_abstract
@@ -14282,8 +14340,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 && init_blocks_lowered
                 && cls.secondary_ctors.is_empty()
                 && leaf_parent_ctor_args_lowered
-                && cls.supertype_delegates.borrow().is_empty()
-                && cls.delegate_forwarders.borrow().is_empty()
+                && supertype_delegates_lowered
                 && body_props_ok
                 && parent_trivial
                 && args.len() == cls.primary_params.len();
@@ -14369,6 +14426,27 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                         cur_name = parent.name.clone();
                         cur_args = parent_vals;
                         cur_parent = parent.parent.borrow().clone();
+                    }
+                }
+                // Supertype delegate fields: evaluate each thunk
+                // with the class's primary args and store under its
+                // field key. The runtime's forwarder synthesis
+                // reads these fields when dispatching delegated
+                // interface methods.
+                if let Some(del_fids) =
+                    self.interp.class_supertype_delegates.get(&name).cloned()
+                {
+                    for (field_key, fid) in del_fids {
+                        let func = module.funcs[fid.0 as usize].clone();
+                        let v = klio_ir::eval::eval_with(
+                            &module,
+                            &func,
+                            args.to_vec(),
+                            self,
+                        )?;
+                        if let klio_runtime::Value::Instance(inst_rc) = &inst_val {
+                            inst_rc.borrow_mut().define(field_key, v);
+                        }
                     }
                 }
                 // Run parent-chain lowered init blocks first (root →
