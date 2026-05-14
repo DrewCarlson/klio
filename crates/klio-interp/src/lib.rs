@@ -7766,7 +7766,12 @@ impl Interpreter {
         for (ordinal, entry) in c.enum_entries.iter().enumerate() {
             let mut arg_vals = Vec::with_capacity(entry.args.len());
             for a in &entry.args {
-                arg_vals.push(self.eval_expr(a, env, out)?);
+                let v = match self.eval_property_init_via_ir(a, out) {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => return Err(e),
+                    None => self.eval_expr(a, env, out)?,
+                };
+                arg_vals.push(v);
             }
             // Sub-class for entries with body overrides.
             let entry_class = if entry.body_members.is_empty() {
