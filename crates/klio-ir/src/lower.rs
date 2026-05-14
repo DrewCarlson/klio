@@ -618,13 +618,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 if segments.len() == 1 {
                     if let Some(func_id) = b.module.func_id(&segments[0].name) {
                         let (args_start, count) = lower_arg_run(b, args);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
                         let dst = b.alloc_reg();
                         b.push(Inst::Call {
                             dst,
                             func: func_id,
                             args: args_start,
                             n_args: count,
-                            arg_names: Vec::new(),
+                            arg_names,
                         });
                         return dst;
                     }
