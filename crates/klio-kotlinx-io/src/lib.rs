@@ -89,7 +89,127 @@ klio_stdlib::host_bindings! {
         "kotlinx.io.Buffer.copyTo"             => buffer_copy_to,
         "kotlinx.io.ByteString.decodeToString" => byte_string_decode_to_string,
         "kotlinx.io.encodeToByteString"        => string_encode_to_byte_string,
+        "kotlinx.io.__kxio_base64Encode"       => base64_encode,
+        "kotlinx.io.__kxio_base64Decode"       => base64_decode,
+        "kotlinx.io.__kxio_hexEncode"          => hex_encode,
+        "kotlinx.io.__kxio_hexDecode"          => hex_decode,
+        "kotlinx.io.Buffer.writeVarint"        => buffer_write_varint,
+        "kotlinx.io.Buffer.readVarint"         => buffer_read_varint,
     }
+}
+
+fn arg_bytes(ctx: &CallCtx, idx: usize) -> Result<Vec<u8>, RuntimeError> {
+    match ctx.args.get(idx) {
+        Some(Value::String(s)) => Ok(s.as_bytes().to_vec()),
+        Some(Value::Array { items, .. }) => Ok(items
+            .borrow()
+            .iter()
+            .map(|v| match v {
+                Value::Byte(b) => *b as u8,
+                Value::Int(i) => (*i as i8) as u8,
+                Value::Long(l) => (*l as i8) as u8,
+                _ => 0,
+            })
+            .collect()),
+        _ => Err(RuntimeError::Type(format!(
+            "kotlinx.io: argument {idx} must be a String or byte array"
+        ))),
+    }
+}
+
+fn base64_encode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    use base64::Engine;
+    let data = arg_bytes(ctx, 0)?;
+    let s = base64::engine::general_purpose::STANDARD.encode(&data);
+    Ok(Value::String(Rc::new(s)))
+}
+
+fn base64_decode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    use base64::Engine;
+    let s = arg_string(ctx, 0)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .map_err(|e| RuntimeError::Type(format!("base64 decode: {e}")))?;
+    Ok(Value::Array {
+        items: Rc::new(RefCell::new(
+            bytes.into_iter().map(|b| Value::Byte(b as i8)).collect(),
+        )),
+        prim: Some(PrimitiveArrayKind::Byte),
+    })
+}
+
+fn hex_encode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let data = arg_bytes(ctx, 0)?;
+    let mut out = String::with_capacity(data.len() * 2);
+    for b in data {
+        out.push_str(&format!("{b:02x}"));
+    }
+    Ok(Value::String(Rc::new(out)))
+}
+
+fn hex_decode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = arg_string(ctx, 0)?;
+    if s.len() % 2 != 0 {
+        return Err(RuntimeError::Type("hex string has odd length".into()));
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    let chars: Vec<char> = s.chars().collect();
+    for pair in chars.chunks(2) {
+        let hi = pair[0].to_digit(16).ok_or_else(|| {
+            RuntimeError::Type(format!("hex: invalid digit `{}`", pair[0]))
+        })?;
+        let lo = pair[1].to_digit(16).ok_or_else(|| {
+            RuntimeError::Type(format!("hex: invalid digit `{}`", pair[1]))
+        })?;
+        bytes.push(((hi << 4) | lo) as u8);
+    }
+    Ok(Value::Array {
+        items: Rc::new(RefCell::new(
+            bytes.into_iter().map(|b| Value::Byte(b as i8)).collect(),
+        )),
+        prim: Some(PrimitiveArrayKind::Byte),
+    })
+}
+
+// Protobuf-style unsigned varint encoding.
+fn buffer_write_varint(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let mut v = arg_int(ctx, 1)? as u64;
+    with_buffer(ctx, |state| {
+        loop {
+            let mut byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                byte |= 0x80;
+                state.bytes.push_back(byte);
+            } else {
+                state.bytes.push_back(byte);
+                break;
+            }
+        }
+        Ok(Value::Unit)
+    })
+}
+
+fn buffer_read_varint(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    with_buffer(ctx, |state| {
+        let mut result: u64 = 0;
+        let mut shift: u32 = 0;
+        loop {
+            let b = state
+                .bytes
+                .pop_front()
+                .ok_or_else(|| RuntimeError::Type("varint: buffer empty mid-decode".into()))?;
+            result |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 63 {
+                return Err(RuntimeError::Type("varint too large for Long".into()));
+            }
+        }
+        Ok(Value::Long(result as i64))
+    })
 }
 
 fn buffer_size(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

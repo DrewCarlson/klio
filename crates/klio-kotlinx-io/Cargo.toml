@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 klio-stdlib  = { workspace = true }
 klio-runtime = { workspace = true }
+base64       = { version = "0.22", default-features = false, features = ["std"] }

@@ -962,6 +962,7 @@ dependencies = [
 name = "klio-kotlinx-io"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "klio-runtime",
  "klio-stdlib",
 ]

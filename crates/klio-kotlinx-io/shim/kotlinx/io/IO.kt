@@ -55,6 +55,8 @@ class Buffer : Sink, Source {
 
     fun snapshot(): ByteString = ByteString(ByteArray(0))
     fun copyTo(sink: Buffer) {}
+    fun writeVarint(value: Long) {}
+    fun readVarint(): Long = 0L
     override fun toString(): String = "Buffer(size=$size)"
 }
 
@@ -74,6 +76,21 @@ class ByteString(private val data: ByteArray) {
 }
 
 fun String.encodeToByteString(): ByteString { return ByteString(ByteArray(0)) }
+
+// --- codec helpers (host-bound) ---
+
+internal fun __kxio_base64Encode(data: ByteArray): String = ""
+internal fun __kxio_base64Decode(text: String): ByteArray = ByteArray(0)
+internal fun __kxio_hexEncode(data: ByteArray): String = ""
+internal fun __kxio_hexDecode(text: String): ByteArray = ByteArray(0)
+
+fun ByteArray.encodeBase64(): String = __kxio_base64Encode(this)
+fun String.decodeBase64(): ByteArray = __kxio_base64Decode(this)
+fun ByteArray.encodeHex(): String = __kxio_hexEncode(this)
+fun String.decodeHex(): ByteArray = __kxio_hexDecode(this)
+
+fun ByteString.encodeBase64(): String = __kxio_base64Encode(toByteArray())
+fun ByteString.encodeHex(): String = __kxio_hexEncode(toByteArray())
 
 // Adapter constructors. Both return the same `Buffer` because the
 // type implements both interfaces, matching upstream's "Buffer is a
