@@ -9184,11 +9184,15 @@ impl Interpreter {
         // interpreter so the producer lambda can be invoked at first
         // read.
         if let Some(name) = simple_callee_name(callee) {
-            if name == "lazy" && args.len() == 1 {
-                let producer = self.eval_expr(&args[0], env, out)?;
-                return Ok(Value::Delegate(Rc::new(RefCell::new(
-                    klio_runtime::DelegateKind::Lazy { producer, cached: None },
-                ))));
+            if (name == "lazy" || name == "lazyOf") && args.len() == 1 {
+                let fqn = format!("kotlin.{name}");
+                if let Some(func) = klio_stdlib::implementation(&fqn) {
+                    let v = self.eval_expr(&args[0], env, out)?;
+                    let arg_vals = [v];
+                    let mut __interp_host = InterpHostRef { interp: self };
+                    let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                    return func(&mut ctx);
+                }
             }
         }
         // `Delegates.observable(initial) { _, old, new -> … }` and
@@ -11754,7 +11758,6 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             | "Result"
             // Sequence builder lambda form
             | "sequence"
-            | "lazyOf" | "lazy"
             | "synchronized"
             | "tailrec"
             | "objects" => {

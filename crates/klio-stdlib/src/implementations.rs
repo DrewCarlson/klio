@@ -36,6 +36,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.buildSet", builders_build_set),
     ("kotlin.collections.buildMap", builders_build_map),
     ("kotlin.text.buildString", builders_build_string),
+    ("kotlin.lazy", lazy_lazy),
+    ("kotlin.lazyOf", lazy_lazy_of),
 
     // ----- io -----
     ("kotlin.io.print", io_print),
@@ -1773,6 +1775,26 @@ fn coll_iter_filter_not(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
     }
     Ok(make_list(result, false))
+}
+
+fn lazy_lazy(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 1 {
+        return Err(RuntimeError::Arity("lazy expects (block)".into()));
+    }
+    let producer = ctx.args[0].clone();
+    Ok(Value::Delegate(Rc::new(RefCell::new(
+        klio_runtime::DelegateKind::Lazy { producer, cached: None },
+    ))))
+}
+
+fn lazy_lazy_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 1 {
+        return Err(RuntimeError::Arity("lazyOf expects (value)".into()));
+    }
+    let v = ctx.args[0].clone();
+    Ok(Value::Delegate(Rc::new(RefCell::new(
+        klio_runtime::DelegateKind::Lazy { producer: Value::Null, cached: Some(v) },
+    ))))
 }
 
 fn builders_build_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
