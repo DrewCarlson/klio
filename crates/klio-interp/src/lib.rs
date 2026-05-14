@@ -11288,6 +11288,38 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // package-qualified lookup so the IR path doesn't need to
         // shuffle the segments back through the simple-name probes.
         if name.contains('.') {
+            // Class-prefixed FQNs like `Regex.escape` aren't found
+            // under that exact key; the intrinsic table has them as
+            // `kotlin.text.Regex.escape`. Probe common stdlib
+            // namespaces.
+            let probes: [String; 6] = [
+                name.to_string(),
+                format!("kotlin.text.{name}"),
+                format!("kotlin.collections.{name}"),
+                format!("kotlin.ranges.{name}"),
+                format!("kotlin.math.{name}"),
+                format!("kotlin.{name}"),
+            ];
+            for fqn in &probes {
+                if let Some(f) = self.interp.lookup_intrinsic(fqn) {
+                    let last = fqn.rsplit('.').next().unwrap_or(fqn.as_str());
+                    let looks_const = !last.is_empty()
+                        && last.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit());
+                    if looks_const {
+                        let mut ctx = CallCtx { args: &[], out: self.out };
+                        if let Ok(v) = f(&mut ctx) {
+                            return Some(v);
+                        }
+                    }
+                    let leaked: &'static str = Box::leak(fqn.clone().into_boxed_str());
+                    return Some(klio_runtime::Value::Intrinsic {
+                        fqn: leaked,
+                        func: f,
+                    });
+                }
+            }
+        }
+        if false && name.contains('.') {
             if let Some(f) = self.interp.lookup_intrinsic(name) {
                 // Property-style intrinsic: a 0-arg constant like
                 // `kotlin.math.PI`, `Int.MAX_VALUE` is typically
