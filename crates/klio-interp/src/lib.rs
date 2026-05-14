@@ -11912,6 +11912,24 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // `this` bound as the implicit first param. Falls back to
         // the host's tree-walker dispatch (further below) when the
         // class isn't in the active IR module or the lookup misses.
+        // Data-class auto-generated `componentN()`: read the N-th
+        // primary-ctor property directly off the instance. The
+        // tree walker synthesises these but we can resolve them
+        // structurally with a simple field read.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            if args.is_empty() && name.starts_with("component") {
+                if let Ok(n) = name["component".len()..].parse::<usize>() {
+                    if n >= 1 {
+                        let i = inst.borrow();
+                        if let Some(p) = i.class.primary_params.get(n - 1) {
+                            if let Some(v) = i.get(&p.name) {
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let klio_runtime::Value::Instance(inst) = receiver {
             // Walk the runtime class chain looking for an IR-lowered
             // method on any of the receiver's classes (the leaf and
