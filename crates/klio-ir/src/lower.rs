@@ -553,6 +553,9 @@ fn lower_function_body_with_implicit_owner(
     if let Some(set) = own_members {
         let _ = b.set_own_members(set.clone());
     }
+    if f.is_tailrec {
+        let _ = b.set_tailrec_self(f.name.name.clone());
+    }
     let result = match &f.body {
         Some(klio_ast::FunctionBody::Block(blk)) => Some(lower_block(&mut b, blk)),
         Some(klio_ast::FunctionBody::Expr(e)) => Some(lower_expr(&mut b, e)),
@@ -1261,6 +1264,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     && matches!(args[0], Expr::Lambda { .. })
                 {
                     return lower_expr(b, &args[0]);
+                }
+            }
+            // Self-call inside a tailrec fn → TailJump terminator
+            // instead of a regular Call. Re-binds params and
+            // restarts the function's entry block.
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1
+                    && b.tailrec_self().map_or(false, |n| n == segments[0].name)
+                {
+                    let (args_start, count) = lower_arg_run(b, args);
+                    b.terminate(Terminator::TailJump { args: args_start, n_args: count });
+                    // Start a dead block so subsequent lowering
+                    // has a valid current block (unreachable).
+                    let dead = b.alloc_block();
+                    b.switch_to(dead);
+                    return b.emit_const(Const::Unit);
                 }
             }
             // Path-callee with a registered top-level fn → Call{func}.

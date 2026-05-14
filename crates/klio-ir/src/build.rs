@@ -60,6 +60,11 @@ pub struct FuncBuilder<'a> {
     /// body lowering to know whether an unqualified `foo(...)`
     /// is `this.foo(...)` (a class member) or a global lookup.
     own_members: std::collections::HashSet<String>,
+    /// When the function is `tailrec`, the simple name of the
+    /// function itself. Self-calls (`Path("<name>")(...)`) are
+    /// lowered as `Terminator::TailJump` to keep the stack
+    /// flat across recursion.
+    tailrec_self: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +98,7 @@ impl<'a> FuncBuilder<'a> {
             any_typed_locals: std::collections::HashSet::new(),
             owner_class: None,
             own_members: std::collections::HashSet::new(),
+            tailrec_self: None,
         }
     }
 
@@ -231,6 +237,12 @@ impl<'a> FuncBuilder<'a> {
     }
     pub fn has_own_member(&self, name: &str) -> bool {
         self.own_members.contains(name)
+    }
+    pub fn set_tailrec_self(&mut self, name: String) {
+        self.tailrec_self = Some(name);
+    }
+    pub fn tailrec_self(&self) -> Option<&str> {
+        self.tailrec_self.as_deref()
     }
 
     pub fn resolve(&self, name: &str) -> Option<Reg> {

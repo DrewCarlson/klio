@@ -297,6 +297,11 @@ pub enum Terminator {
     Return(Option<Reg>),
     Throw(Reg),
     Unreachable,
+    /// Tail-recursive jump to the current function's entry with
+    /// new param values. The evaluator rebinds the param regs
+    /// from this contiguous register run and restarts execution
+    /// without pushing a new call frame.
+    TailJump { args: Reg, n_args: u8 },
 }
 
 /// Catch handler frame attached to a try-body block. When a Throw

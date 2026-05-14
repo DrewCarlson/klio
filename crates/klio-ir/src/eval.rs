@@ -478,6 +478,19 @@ pub fn eval_with_captures(
             Terminator::Unreachable => {
                 return Err(EvalError::Type("reached Terminator::Unreachable".into()));
             }
+            Terminator::TailJump { args, n_args } => {
+                let mut new_params: Vec<Value> = Vec::with_capacity(n_args as usize);
+                for i in 0..n_args {
+                    new_params.push(frame.read(Reg(args.0 + i as u32)));
+                }
+                frame.params = new_params;
+                let n = frame.regs.len();
+                frame.regs.clear();
+                frame.regs.resize(n, Value::Unit);
+                try_stack.clear();
+                cur = frame.func.entry;
+                continue;
+            }
             Terminator::Switch { reg, arms, default } => {
                 let v = frame.read(reg);
                 let next = arms
