@@ -30,6 +30,7 @@ klio_stdlib::host_bindings! {
         "kotlinx.datetime.__kxdt_instantToString"         => instant_to_string,
         "kotlinx.datetime.__kxdt_parseInstant"            => parse_instant,
         "kotlinx.datetime.__kxdt_validateTimeZone"        => validate_time_zone,
+        "kotlinx.datetime.__kxdt_addPeriod"               => add_period,
     }
 }
 
@@ -152,4 +153,55 @@ fn parse_instant(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn validate_time_zone(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let id = arg_str(ctx, 0)?;
     Ok(Value::Bool(parse_tz(&id).is_some() || id == "UTC"))
+}
+
+/// Apply a calendar period in the given tz.
+///
+/// Arguments: epochSeconds, nanos, years, months, days, hours,
+/// minutes, seconds, nanoAdjust, tzId. Returns `[epochSeconds, nanos]`.
+fn add_period(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    use chrono::Months;
+    let epoch_sec = arg_long(ctx, 0)?;
+    let nanos = arg_i32(ctx, 1)? as u32;
+    let years = arg_i32(ctx, 2)?;
+    let months = arg_i32(ctx, 3)?;
+    let days = arg_i32(ctx, 4)?;
+    let hours = arg_i32(ctx, 5)?;
+    let minutes = arg_i32(ctx, 6)?;
+    let seconds = arg_i32(ctx, 7)?;
+    let nano_adjust = arg_long(ctx, 8)?;
+    let tz_id = arg_str(ctx, 9)?;
+    let utc = Utc.timestamp_opt(epoch_sec, nanos).single().ok_or_else(|| {
+        RuntimeError::Type(format!("invalid epoch seconds: {epoch_sec}"))
+    })?;
+    let total_months = (years as i64) * 12 + (months as i64);
+    let local: chrono::DateTime<chrono::FixedOffset> = match parse_tz(&tz_id) {
+        Some(tz) => utc.with_timezone(&tz).fixed_offset(),
+        None => utc.fixed_offset(),
+    };
+    let mut shifted = local;
+    if total_months != 0 {
+        let abs = total_months.unsigned_abs();
+        let months = Months::new(abs.min(u32::MAX as u64) as u32);
+        shifted = if total_months > 0 {
+            shifted.checked_add_months(months)
+        } else {
+            shifted.checked_sub_months(months)
+        }
+        .ok_or_else(|| RuntimeError::Type("DateTimePeriod month overflow".into()))?;
+    }
+    let secs = (days as i64) * 86_400
+        + (hours as i64) * 3_600
+        + (minutes as i64) * 60
+        + (seconds as i64);
+    let total_nanos = nano_adjust + secs * 1_000_000_000;
+    let dur = chrono::Duration::nanoseconds(total_nanos);
+    shifted = shifted
+        .checked_add_signed(dur)
+        .ok_or_else(|| RuntimeError::Type("DateTimePeriod time overflow".into()))?;
+    let utc_back = shifted.with_timezone(&Utc);
+    Ok(make_long_array(&[
+        utc_back.timestamp(),
+        utc_back.timestamp_subsec_nanos() as i64,
+    ]))
 }

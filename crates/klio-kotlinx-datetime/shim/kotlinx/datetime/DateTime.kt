@@ -236,3 +236,112 @@ object SystemClock : Clock {
         Instant.fromEpochMilliseconds(__kxdt_currentTimeMillis())
             .let { Instant(it.epochSeconds, __kxdt_currentNanosOfSecond()) }
 }
+
+// ---------- DateTimePeriod ----------
+//
+// Calendar-aware delta. Used with Instant.plus(period, timeZone) so
+// month/day arithmetic respects DST and varying month lengths via
+// the host's chrono backend.
+
+class DateTimePeriod(
+    val years: Int = 0,
+    val months: Int = 0,
+    val days: Int = 0,
+    val hours: Int = 0,
+    val minutes: Int = 0,
+    val seconds: Int = 0,
+    val nanoseconds: Long = 0L,
+) {
+    val totalMonths: Int get() = years * 12 + months
+
+    override fun toString(): String {
+        val sb = StringBuilder("P")
+        if (years != 0) sb.append(years).append('Y')
+        if (months != 0) sb.append(months).append('M')
+        if (days != 0) sb.append(days).append('D')
+        val anyTime = hours != 0 || minutes != 0 || seconds != 0 || nanoseconds != 0L
+        if (anyTime) {
+            sb.append('T')
+            if (hours != 0) sb.append(hours).append('H')
+            if (minutes != 0) sb.append(minutes).append('M')
+            if (seconds != 0 || nanoseconds != 0L) {
+                sb.append(seconds)
+                if (nanoseconds != 0L) sb.append('.').append(nanoseconds.toString().padStart(9, '0'))
+                sb.append('S')
+            }
+        }
+        if (sb.length == 1) sb.append("0D")
+        return sb.toString()
+    }
+}
+
+// Native helper: returns [epochSeconds, nanos] after applying the
+// calendar period in the given tz.
+internal fun __kxdt_addPeriod(
+    epochSeconds: Long,
+    nanos: Int,
+    years: Int,
+    months: Int,
+    days: Int,
+    hours: Int,
+    minutes: Int,
+    seconds: Int,
+    nanoAdjust: Long,
+    tz: String,
+): LongArray = longArrayOf(epochSeconds, nanos.toLong())
+
+// Calendar-aware add. klio's overload resolver does not yet
+// disambiguate `Instant.plus(Duration)` (member) from
+// `Instant.plus(DateTimePeriod, TimeZone)` (extension) by signature,
+// so the extension lives under a distinct name. Functionally
+// equivalent to upstream's overloaded plus.
+fun Instant.plusPeriod(period: DateTimePeriod, timeZone: TimeZone): Instant {
+    val r = __kxdt_addPeriod(
+        epochSeconds, nanosecondsOfSecond,
+        period.years, period.months, period.days,
+        period.hours, period.minutes, period.seconds, period.nanoseconds,
+        timeZone.id,
+    )
+    return Instant(r[0], r[1].toInt())
+}
+
+fun Instant.minusPeriod(period: DateTimePeriod, timeZone: TimeZone): Instant = plusPeriod(
+    DateTimePeriod(
+        years = -period.years, months = -period.months, days = -period.days,
+        hours = -period.hours, minutes = -period.minutes, seconds = -period.seconds,
+        nanoseconds = -period.nanoseconds,
+    ),
+    timeZone,
+)
+
+// ---------- Duration extension properties on Int/Long ----------
+//
+// kotlin.time-style fluent builders: `5.seconds`, `2L.hours`, etc.
+// These return kotlinx.datetime.Duration, matching the rest of this
+// shim. kotlin.time.Duration interop is deferred until stdlib carries
+// it as a first-class type.
+
+val Int.nanoseconds: Duration get() = Duration(0L, this)
+val Int.microseconds: Duration get() = Duration(0L, this * 1_000)
+val Int.milliseconds: Duration get() = Duration.milliseconds(this.toLong())
+val Int.seconds: Duration get() = Duration.seconds(this.toLong())
+val Int.minutes: Duration get() = Duration.minutes(this.toLong())
+val Int.hours: Duration get() = Duration.hours(this.toLong())
+val Int.days: Duration get() = Duration.days(this.toLong())
+
+val Long.nanoseconds: Duration
+    get() {
+        val s = this / 1_000_000_000L
+        val n = (this % 1_000_000_000L).toInt()
+        return if (n < 0) Duration(s - 1, n + 1_000_000_000) else Duration(s, n)
+    }
+val Long.microseconds: Duration
+    get() {
+        val ns = this * 1_000L
+        return ns.nanoseconds
+    }
+val Long.milliseconds: Duration get() = Duration.milliseconds(this)
+val Long.seconds: Duration get() = Duration.seconds(this)
+val Long.minutes: Duration get() = Duration.minutes(this)
+val Long.hours: Duration get() = Duration.hours(this)
+val Long.days: Duration get() = Duration.days(this)
