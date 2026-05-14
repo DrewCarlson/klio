@@ -364,6 +364,24 @@ pub fn lower_class_with_file(
                 klio_ast::Decl::Property(p) => {
                     out.insert(p.name.name.clone());
                 }
+                klio_ast::Decl::Class(inner) if inner.is_companion => {
+                    for cm in &inner.members {
+                        match cm {
+                            klio_ast::Decl::Function(f) => {
+                                out.insert(f.name.name.clone());
+                            }
+                            klio_ast::Decl::Property(p) => {
+                                out.insert(p.name.name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    for p in &inner.primary_params {
+                        if p.property.is_some() {
+                            out.insert(p.name.name.clone());
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1795,6 +1813,15 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     Expr::Path { segments, .. } if segments.len() == 1 => {
                         if let Some(home) = b.mutable_home(&segments[0].name) {
                             b.push(Inst::Move { dst: home, src: new });
+                        } else if b.has_own_member(&segments[0].name)
+                            && b.resolve("this").is_some()
+                        {
+                            // Method-body `field++` write — route
+                            // through SetField on this so the
+                            // mutation reaches the instance.
+                            let this_reg = b.resolve("this").unwrap();
+                            let field = b.module.intern_const(Const::String(segments[0].name.clone()));
+                            b.push(Inst::SetField { receiver: this_reg, field, value: new });
                         } else {
                             b.rebind(&segments[0].name, new);
                         }

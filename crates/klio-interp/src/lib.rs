@@ -13013,9 +13013,17 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // the companion. Walk class + parents for a
             // companion that has the field.
             let companion_val: Option<klio_runtime::Value> = {
-                let mut cur = Some(std::rc::Rc::clone(&inst.borrow().class));
+                let mut queue: std::collections::VecDeque<std::rc::Rc<klio_runtime::ClassDef>> =
+                    std::collections::VecDeque::new();
+                let mut seen: std::collections::HashSet<*const klio_runtime::ClassDef> =
+                    std::collections::HashSet::new();
+                queue.push_back(std::rc::Rc::clone(&inst.borrow().class));
                 let mut found = None;
-                while let Some(c) = cur {
+                while let Some(c) = queue.pop_front() {
+                    let ptr = std::rc::Rc::as_ptr(&c);
+                    if !seen.insert(ptr) {
+                        continue;
+                    }
                     let comp_opt = c.companion.borrow().clone();
                     if let Some(comp) = comp_opt {
                         if let Some(v) = comp.borrow().get(name) {
@@ -13023,7 +13031,12 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                             break;
                         }
                     }
-                    cur = c.parent.borrow().clone();
+                    for iface in c.interfaces.borrow().iter() {
+                        queue.push_back(std::rc::Rc::clone(iface));
+                    }
+                    if let Some(p) = c.parent.borrow().clone() {
+                        queue.push_back(p);
+                    }
                 }
                 found
             };
@@ -13279,6 +13292,41 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                         .interp
                         .write_instance_property(inst, &p, value, self.out)
                         .map_err(ir_err);
+                }
+                // Companion-object write through the receiver:
+                // `n++` inside an interface default method
+                // mutates the companion's `n`.
+                let mut wrote_companion = false;
+                {
+                    let mut queue: std::collections::VecDeque<std::rc::Rc<klio_runtime::ClassDef>> =
+                        std::collections::VecDeque::new();
+                    let mut seen: std::collections::HashSet<*const klio_runtime::ClassDef> =
+                        std::collections::HashSet::new();
+                    queue.push_back(std::rc::Rc::clone(&inst.borrow().class));
+                    while let Some(c) = queue.pop_front() {
+                        let ptr = std::rc::Rc::as_ptr(&c);
+                        if !seen.insert(ptr) {
+                            continue;
+                        }
+                        let comp_opt = c.companion.borrow().clone();
+                        if let Some(comp) = comp_opt {
+                            let has = comp.borrow().get(name).is_some();
+                            if has {
+                                comp.borrow_mut().define(name, value.clone());
+                                wrote_companion = true;
+                                break;
+                            }
+                        }
+                        for iface in c.interfaces.borrow().iter() {
+                            queue.push_back(std::rc::Rc::clone(iface));
+                        }
+                        if let Some(p) = c.parent.borrow().clone() {
+                            queue.push_back(p);
+                        }
+                    }
+                }
+                if wrote_companion {
+                    return Ok(());
                 }
                 inst.borrow_mut().define(name, value);
                 Ok(())
