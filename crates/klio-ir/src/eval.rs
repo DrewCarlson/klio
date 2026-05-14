@@ -297,6 +297,26 @@ fn exec_inst(
         Inst::BinOp { dst, op, lhs, rhs } => {
             let l = frame.read(*lhs);
             let r = frame.read(*rhs);
+            // User-class operator dispatch: when an operand is a
+            // Value::Instance, route through the host's
+            // call_member for the matching operator method
+            // (plus/minus/times/div/rem/compareTo/equals/etc.).
+            if let Some(method) = operator_method(*op) {
+                if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
+                    let result = host.call_member(&l, method, std::slice::from_ref(&r))?;
+                    // compareTo wrappers (Less/LessEq/Greater/GreaterEq)
+                    // need to be reduced to a Bool.
+                    let final_val = match *op {
+                        BinOp::Less => Value::Bool(value_to_i64(&result).map_or(false, |i| i < 0)),
+                        BinOp::LessEq => Value::Bool(value_to_i64(&result).map_or(false, |i| i <= 0)),
+                        BinOp::Greater => Value::Bool(value_to_i64(&result).map_or(false, |i| i > 0)),
+                        BinOp::GreaterEq => Value::Bool(value_to_i64(&result).map_or(false, |i| i >= 0)),
+                        _ => result,
+                    };
+                    frame.write(*dst, final_val);
+                    return Ok(());
+                }
+            }
             let out = apply_binop(*op, &l, &r)?;
             frame.write(*dst, out);
         }
@@ -489,6 +509,32 @@ fn apply_unop(op: UnOp, v: &Value) -> Result<Value, EvalError> {
         (UnOp::Dec, Value::Long(l)) => Ok(Value::Long(l.wrapping_sub(1))),
         _ => Err(EvalError::Type(format!("UnOp::{op:?} on {v:?}"))),
     }
+}
+
+fn value_to_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) => Some(*i as i64),
+        Value::Long(l) => Some(*l),
+        _ => None,
+    }
+}
+
+/// Operator-name a BinOp dispatches through when one operand is a
+/// user class. Returns `None` for ops that have no operator-method
+/// counterpart (e.g. boolean short-circuits).
+fn operator_method(op: BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Add => "plus",
+        BinOp::Sub => "minus",
+        BinOp::Mul => "times",
+        BinOp::Div => "div",
+        BinOp::Mod => "rem",
+        BinOp::Eq => "equals",
+        BinOp::Less | BinOp::LessEq | BinOp::Greater | BinOp::GreaterEq => "compareTo",
+        BinOp::RangeTo => "rangeTo",
+        BinOp::RangeUntil => "rangeUntil",
+        _ => return None,
+    })
 }
 
 fn render_value(v: &Value) -> String {

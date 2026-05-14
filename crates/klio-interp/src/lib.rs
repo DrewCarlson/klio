@@ -351,6 +351,17 @@ impl Interpreter {
         self.globals.borrow().lookup(name)
     }
 
+    /// True when the named symbol has more than one top-level
+    /// overload registered. IR call sites route these through the
+    /// tree walker's eval_call so overload resolution picks the
+    /// right arity / arg-type match rather than the single Value
+    /// stashed in globals.
+    pub fn has_top_level_overloads(&self, name: &str) -> bool {
+        self.top_level_overloads
+            .get(name)
+            .map_or(false, |v| v.len() > 1)
+    }
+
     /// Re-enter the IR evaluator against a stashed closure with a
     /// full IrHost so member calls / new-instance / etc. work.
     /// Looked up by invoke_callable_value when it encounters a
@@ -11056,6 +11067,30 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 _ => {}
             }
         }
+        // Top-level Value::Function callees may be one of an
+        // overload set; the captured-name in globals only points
+        // at the most-recently-defined one. Route through the
+        // tree walker's name-based dispatch so overload
+        // resolution picks the right arity / arg-type match.
+        if let klio_runtime::Value::Function { decl, .. } = callee {
+            let name = decl.name.name.clone();
+            if self.interp.has_top_level_overloads(&name) {
+                return self
+                    .interp
+                    .invoke_named_intrinsic(&name, args, self.out)
+                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+            }
+        }
+        // Value::Class callee → constructor call. Dispatch through
+        // construct_by_name with the class's simple name. Covers
+        // pack-imported classes (Buffer, Instant, HttpClient) that
+        // the IR module's class_index doesn't see.
+        if let klio_runtime::Value::Class(class) = callee {
+            return self
+                .interp
+                .construct_by_name(&class.name, args, self.out)
+                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+        }
         // IrClosure callees dispatch back into the IR evaluator
         // with captures appended to the positional args.
         if let klio_runtime::Value::IrClosure { id, captures } = callee {
@@ -11156,6 +11191,39 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     .call_method(inst, &method, args, &names, self.out)
                     .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
             }
+            // Pack-installed binding override (`Buffer.size`, etc.).
+            let cls_fqn = inst.borrow().class.fqn.clone();
+            let fqn = format!("{cls_fqn}.{name}");
+            if let Some(func) = self.interp.binding_override(&fqn) {
+                let mut all = Vec::with_capacity(args.len() + 1);
+                all.push(receiver.clone());
+                all.extend_from_slice(args);
+                let mut ctx = CallCtx { args: &all, out: self.out };
+                return func(&mut ctx)
+                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+            }
+        }
+        // Companion / static-style call: `Foo.barMethod(args)` ―
+        // look up barMethod on Foo's companion class and dispatch.
+        if let klio_runtime::Value::Class(class) = receiver {
+            let comp = class.companion.borrow().clone();
+            if let Some(comp_inst) = comp {
+                let comp_class = Rc::clone(&comp_inst.borrow().class);
+                if let Some((method, _)) = comp_class.find_method(name) {
+                    let names: Vec<Option<String>> = vec![None; args.len()];
+                    return self
+                        .interp
+                        .call_method(&comp_inst, &method, args, &names, self.out)
+                        .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                }
+            }
+            // Top-level intrinsic registered as `<ClassFqn>.<name>`.
+            let fqn = format!("{}.{}", class.fqn, name);
+            if let Some(func) = self.interp.lookup_intrinsic(&fqn) {
+                let mut ctx = CallCtx { args, out: self.out };
+                return func(&mut ctx)
+                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+            }
         }
         if args.is_empty() {
             return self
@@ -11163,9 +11231,19 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 .eval_property_access(receiver.clone(), name, self.out)
                 .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
         }
+        // Extension-style intrinsic on a value type.
+        let type_fqn = receiver.type_fqn();
+        let intr_fqn = format!("{type_fqn}.{name}");
+        if let Some(func) = self.interp.lookup_intrinsic(&intr_fqn) {
+            let mut all = Vec::with_capacity(args.len() + 1);
+            all.push(receiver.clone());
+            all.extend_from_slice(args);
+            let mut ctx = CallCtx { args: &all, out: self.out };
+            return func(&mut ctx)
+                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+        }
         Err(klio_ir::eval::EvalError::Type(format!(
-            "IR Host: member call `{name}` on {} not resolved",
-            receiver.type_fqn()
+            "IR Host: member call `{name}` on {type_fqn} not resolved"
         )))
     }
 
