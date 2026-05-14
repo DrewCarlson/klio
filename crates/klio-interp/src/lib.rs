@@ -12905,6 +12905,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 if let klio_runtime::RuntimeError::Thrown(_) = &e {
                     return Err(ir_err(e));
                 }
+                // Non-local return surfaced from inside a HOF
+                // lambda (`items.forEach { return -1 }`). Map
+                // straight to `EvalError::NonLocalReturn` so the
+                // enclosing IR fn frame catches it.
+                if let klio_runtime::RuntimeError::Return(_) = &e {
+                    return Err(ir_err(e));
+                }
                 let mut all = Vec::with_capacity(args.len() + 1);
                 all.push(receiver.clone());
                 all.extend_from_slice(args);
