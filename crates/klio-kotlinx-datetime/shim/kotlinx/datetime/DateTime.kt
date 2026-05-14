@@ -314,6 +314,66 @@ fun Instant.minusPeriod(period: DateTimePeriod, timeZone: TimeZone): Instant = p
     timeZone,
 )
 
+// ---------- DateTimeUnit ----------
+//
+// Models units of date/time arithmetic. The sealed-class hierarchy
+// follows upstream kotlinx.datetime: DateBased for whole-day units
+// (Day/Week/Month/Year/etc.) and TimeBased for sub-day units
+// (Nanosecond/Microsecond/Millisecond/Second/Minute/Hour). The
+// shim plus host binding compose into Instant.plus(value, unit, tz)
+// — calendar-aware for date units, fixed-nanosecond for time units.
+
+// DateTimeUnit's hierarchy. The concrete TimeBasedImpl /
+// DateBasedImpl carriers are simple data carriers; the abstract
+// parents (TimeBased / DateBased) live inside DateTimeUnit as
+// nested classes so callers can write `TimeBased`
+// and `DateBased`.
+class TimeBased(val nanoseconds: Long) {
+    operator fun times(scalar: Int): TimeBased = TimeBased(nanoseconds * scalar.toLong())
+}
+class DateBased(val days: Int, val months: Int) {
+    operator fun times(scalar: Int): DateBased = DateBased(days * scalar, months * scalar)
+}
+
+object DateTimeUnit {
+    val NANOSECOND: TimeBased = TimeBased(1L)
+    val MICROSECOND: TimeBased = TimeBased(1_000L)
+    val MILLISECOND: TimeBased = TimeBased(1_000_000L)
+    val SECOND: TimeBased = TimeBased(1_000_000_000L)
+    val MINUTE: TimeBased = TimeBased(60L * 1_000_000_000L)
+    val HOUR: TimeBased = TimeBased(3_600L * 1_000_000_000L)
+    val DAY: DateBased = DateBased(1, 0)
+    val WEEK: DateBased = DateBased(7, 0)
+    val MONTH: DateBased = DateBased(0, 1)
+    val QUARTER: DateBased = DateBased(0, 3)
+    val YEAR: DateBased = DateBased(0, 12)
+}
+
+fun Instant.plusUnit(value: Long, unit: TimeBased): Instant {
+    val totalNanos = value * unit.nanoseconds
+    val nanoSec = totalNanos / 1_000_000_000L
+    val nanoRem = totalNanos % 1_000_000_000L
+    var s = epochSeconds + nanoSec
+    var n = nanosecondsOfSecond + nanoRem.toInt()
+    if (n >= 1_000_000_000) { s += 1; n -= 1_000_000_000 }
+    if (n < 0) { s -= 1; n += 1_000_000_000 }
+    return Instant(s, n)
+}
+
+fun Instant.plusDateUnit(value: Int, unit: DateBased, timeZone: TimeZone): Instant {
+    val r = __kxdt_addPeriod(
+        epochSeconds, nanosecondsOfSecond,
+        0, unit.months * value, unit.days * value,
+        0, 0, 0, 0L,
+        timeZone.id,
+    )
+    return Instant(r[0], r[1].toInt())
+}
+
+fun Instant.minusUnit(value: Long, unit: TimeBased): Instant = plusUnit(-value, unit)
+fun Instant.minusDateUnit(value: Int, unit: DateBased, timeZone: TimeZone): Instant =
+    plusDateUnit(-value, unit, timeZone)
+
 // ---------- Duration extension properties on Int/Long ----------
 //
 // kotlin.time-style fluent builders: `5.seconds`, `2L.hours`, etc.
