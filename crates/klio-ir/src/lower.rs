@@ -313,14 +313,65 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             dst
         }
         Expr::Unary { op, expr, .. } => {
+            // Prefix ++ / -- need both an Inc/Dec UnOp AND a
+            // write-back to the lvalue. Delegate to a helper that
+            // mirrors postfix's Path/Member/Index branches and
+            // returns the NEW value (not the old, per Kotlin's
+            // pre-inc/pre-dec semantics).
+            if matches!(op, AstUnOp::PreInc | AstUnOp::PreDec) {
+                let operand = lower_expr(b, expr);
+                let dst = b.alloc_reg();
+                let u = if matches!(op, AstUnOp::PreInc) { UnOp::Inc } else { UnOp::Dec };
+                b.push(Inst::UnOp { dst, op: u, operand });
+                match expr.as_ref() {
+                    Expr::Path { segments, .. } if segments.len() == 1 => {
+                        if let Some(home) = b.mutable_home(&segments[0].name) {
+                            b.push(Inst::Move { dst: home, src: dst });
+                        } else {
+                            b.rebind(&segments[0].name, dst);
+                        }
+                    }
+                    Expr::Member { receiver, name, safe: false, .. } => {
+                        let recv = lower_expr(b, receiver);
+                        let field = b.module.intern_const(Const::String(name.name.clone()));
+                        b.push(Inst::SetField { receiver: recv, field, value: dst });
+                    }
+                    Expr::Index { receiver, args: idx_args, .. } => {
+                        let recv = lower_expr(b, receiver);
+                        let n_keys = idx_args.len();
+                        let key_start = b.alloc_reg();
+                        let mut key_slots: Vec<Reg> = vec![key_start];
+                        for _ in 1..n_keys {
+                            key_slots.push(b.alloc_reg());
+                        }
+                        let val_slot = b.alloc_reg();
+                        for (slot, arg) in key_slots.iter().zip(idx_args.iter()) {
+                            let r = lower_expr(b, arg);
+                            b.push(Inst::Move { dst: *slot, src: r });
+                        }
+                        b.push(Inst::Move { dst: val_slot, src: dst });
+                        let ret = b.alloc_reg();
+                        let nm = b.module.intern_const(Const::String("set".into()));
+                        b.push(Inst::CallMember {
+                            dst: ret,
+                            receiver: recv,
+                            name: nm,
+                            args: key_start,
+                            n_args: (n_keys as u8) + 1,
+                            arg_names: Vec::new(),
+                        });
+                    }
+                    _ => {}
+                }
+                return dst;
+            }
             let operand = lower_expr(b, expr);
             let dst = b.alloc_reg();
             match op {
                 AstUnOp::Not => b.push(Inst::Not { dst, src: operand }),
                 AstUnOp::Neg => b.push(Inst::UnOp { dst, op: UnOp::Neg, operand }),
                 AstUnOp::Pos => b.push(Inst::UnOp { dst, op: UnOp::Plus, operand }),
-                AstUnOp::PreInc => b.push(Inst::UnOp { dst, op: UnOp::Inc, operand }),
-                AstUnOp::PreDec => b.push(Inst::UnOp { dst, op: UnOp::Dec, operand }),
+                AstUnOp::PreInc | AstUnOp::PreDec => unreachable!(),
             }
             dst
         }
@@ -961,14 +1012,49 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.push(Inst::Move { dst: old, src: s });
                 let new = b.alloc_reg();
                 b.push(Inst::UnOp { dst: new, op, operand: old });
-                if let Expr::Path { segments, .. } = inner.as_ref() {
-                    if segments.len() == 1 {
+                match inner.as_ref() {
+                    Expr::Path { segments, .. } if segments.len() == 1 => {
                         if let Some(home) = b.mutable_home(&segments[0].name) {
                             b.push(Inst::Move { dst: home, src: new });
                         } else {
                             b.rebind(&segments[0].name, new);
                         }
                     }
+                    Expr::Member { receiver, name, safe: false, .. } => {
+                        // `obj.field++` — write the incremented value
+                        // back through the same SetField path the
+                        // host's set_field uses for class setters.
+                        let recv = lower_expr(b, receiver);
+                        let field = b.module.intern_const(Const::String(name.name.clone()));
+                        b.push(Inst::SetField { receiver: recv, field, value: new });
+                    }
+                    Expr::Index { receiver, args: idx_args, .. } => {
+                        // `xs[i]++` — read above, write back via .set(i, new).
+                        let recv = lower_expr(b, receiver);
+                        let n_keys = idx_args.len();
+                        let key_start = b.alloc_reg();
+                        let mut key_slots: Vec<Reg> = vec![key_start];
+                        for _ in 1..n_keys {
+                            key_slots.push(b.alloc_reg());
+                        }
+                        let val_slot = b.alloc_reg();
+                        for (slot, arg) in key_slots.iter().zip(idx_args.iter()) {
+                            let r = lower_expr(b, arg);
+                            b.push(Inst::Move { dst: *slot, src: r });
+                        }
+                        b.push(Inst::Move { dst: val_slot, src: new });
+                        let dst = b.alloc_reg();
+                        let nm = b.module.intern_const(Const::String("set".into()));
+                        b.push(Inst::CallMember {
+                            dst,
+                            receiver: recv,
+                            name: nm,
+                            args: key_start,
+                            n_args: (n_keys as u8) + 1,
+                            arg_names: Vec::new(),
+                        });
+                    }
+                    _ => {}
                 }
                 old
             }
