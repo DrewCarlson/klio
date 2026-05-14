@@ -14326,6 +14326,40 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         captured_names: &[String],
         captures: Vec<klio_runtime::Value>,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Lower the captured AST as an N-arg IR thunk parameterised
+        // on the captured names; invoke via klio_ir::eval with the
+        // captured values as positional args. Falls back to the
+        // tree walker when the IR refuses to lower a shape.
+        if !captured_names.is_empty()
+            && captured_names.len() == captures.len()
+        {
+            let mut local_module = klio_ir::Module::default();
+            let name_refs: Vec<&str> = captured_names.iter().map(|s| s.as_str()).collect();
+            let fid = klio_ir::lower::lower_expr_as_param_thunk(
+                &mut local_module,
+                &name_refs,
+                ast,
+                "__build_object__",
+            );
+            let module_rc = std::rc::Rc::new(local_module);
+            let func = module_rc.funcs[fid.0 as usize].clone();
+            let class_names: Vec<String> =
+                module_rc.classes.iter().map(|c| c.name.clone()).collect();
+            let method_index = IrHost::build_method_index(&module_rc);
+            let mut child = IrHost {
+                interp: self.interp,
+                out: self.out,
+                class_names,
+                closures: Vec::new(),
+                module: std::rc::Rc::clone(&module_rc),
+                method_index,
+            };
+            match klio_ir::eval::eval_with(&module_rc, &func, captures.clone(), &mut child) {
+                Ok(v) => return Ok(v),
+                Err(klio_ir::eval::EvalError::Unsupported(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.interp.globals))));
         for (n, v) in captured_names.iter().zip(captures.iter()) {
             env.borrow_mut().define(n.clone(), v.clone());
