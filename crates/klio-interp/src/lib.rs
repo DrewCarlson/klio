@@ -75,48 +75,12 @@ pub struct Interpreter {
     /// Top-level properties keyed by simple name. Used to dispatch reads
     /// and writes through custom getters/setters or property delegates.
     top_level_props: std::collections::HashMap<String, PropertyDef>,
-    /// IR FuncId of each top-level property's getter / setter body
-    /// when one was declared in source. Populated by the
-    /// decl-registration pass so `IrHost::lookup_global` can call
-    /// the accessor through IR instead of bouncing through
-    /// `read_top_level_property_pub`.
-    top_level_prop_getters: std::collections::HashMap<String, klio_ir::FuncId>,
-    /// Same idea as `top_level_prop_getters` but for setters. The
-    /// FuncId names a 1-arg accessor that receives the new value.
-    top_level_prop_setters: std::collections::HashMap<String, klio_ir::FuncId>,
-    /// Instance-property accessor FuncIds keyed by (class name,
-    /// property name). The getter is a 1-arg fn taking `this`; the
-    /// setter is a 2-arg fn taking `this`, `value`.
-    instance_prop_getters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    instance_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    /// Per-class init-block FuncIds in source order. The IR ctor
-    /// fast-path runs each one with `this` bound to the freshly
-    /// allocated instance.
-    class_init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
-    /// Per-class lowered parent-ctor-arg thunks. Each thunk takes
-    /// the child class's primary-ctor params in declaration order
-    /// and returns the value for one parent ctor arg.
-    class_parent_ctor_args: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
-    /// Per-class body-property initializer thunks. Keyed by
-    /// (class name, prop name) → FuncId of an N-arg thunk whose
-    /// params are the class's primary-ctor param names.
-    class_body_prop_inits:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    /// Per-class supertype-delegate thunks paired with their
-    /// instance field key. Each thunk takes the class's primary-
-    /// ctor params and returns the delegate value.
-    class_supertype_delegates:
-        std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
-    /// Per-class secondary ctor entries keyed by (class name, arity).
-    /// Each value is `(delegation_arg_funcs, body_func)` where the
-    /// delegation funcs are N-arg thunks parameterised on the
-    /// secondary's params and return one primary-ctor arg, and the
-    /// body func is a 1+N-arg func (`this` + secondary params)
-    /// running the ctor body.
-    class_secondary_ctors: std::collections::HashMap<
-        (String, usize),
-        SecondaryCtorIr,
-    >,
+    /// IR side-tables populated by the decl-registration pass and
+    /// consulted by the IR host (accessor FuncIds, lowered ctor
+    /// thunks, secondary ctors, supertype delegates). Owned as one
+    /// container so the ModuleRegistry surface can claim its
+    /// backing fields incrementally.
+    class_ir: ClassIrTables,
     /// `@Retention` value declared on each annotation class (`SOURCE`,
     /// `BINARY`, or `RUNTIME`). Populated when an `annotation class`
     /// is registered. Drives whether the annotation surfaces through
@@ -388,15 +352,7 @@ impl Interpreter {
         Self {
             globals: Rc::new(RefCell::new(env)),
             top_level_props: std::collections::HashMap::new(),
-            top_level_prop_getters: std::collections::HashMap::new(),
-            top_level_prop_setters: std::collections::HashMap::new(),
-            instance_prop_getters: std::collections::HashMap::new(),
-            instance_prop_setters: std::collections::HashMap::new(),
-            class_init_blocks: std::collections::HashMap::new(),
-            class_parent_ctor_args: std::collections::HashMap::new(),
-            class_body_prop_inits: std::collections::HashMap::new(),
-            class_supertype_delegates: std::collections::HashMap::new(),
-            class_secondary_ctors: std::collections::HashMap::new(),
+            class_ir: ClassIrTables::default(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
@@ -1262,7 +1218,7 @@ impl Interpreter {
                             ),
                         )
                     };
-                    self.class_secondary_ctors.insert(
+                    self.class_ir.secondary_ctors.insert(
                         (c.name.name.clone(), sc.params.len()),
                         SecondaryCtorIr {
                             delegation_args,
@@ -1308,7 +1264,7 @@ impl Interpreter {
                         }
                     }
                     if !fids.is_empty() {
-                        self.class_supertype_delegates
+                        self.class_ir.supertype_delegates
                             .insert(c.name.name.clone(), fids);
                     }
                 }
@@ -1338,7 +1294,7 @@ impl Interpreter {
                         );
                         fids.push(id);
                     }
-                    self.class_parent_ctor_args
+                    self.class_ir.parent_ctor_args
                         .insert(c.name.name.clone(), fids);
                 }
                 // Body-property initializers: lower each `val x = e`
@@ -1367,7 +1323,7 @@ impl Interpreter {
                                     init,
                                     &format!("__init__{}.{}", c.name.name, p.name.name),
                                 );
-                                self.class_body_prop_inits.insert(
+                                self.class_ir.body_prop_inits.insert(
                                     (c.name.name.clone(), p.name.name.clone()),
                                     id,
                                 );
@@ -1391,7 +1347,7 @@ impl Interpreter {
                         );
                         fids.push(id);
                     }
-                    self.class_init_blocks.insert(c.name.name.clone(), fids);
+                    self.class_ir.init_blocks.insert(c.name.name.clone(), fids);
                 }
                 for m in &c.members {
                     if let Decl::Property(p) = m {
@@ -1405,7 +1361,7 @@ impl Interpreter {
                                     &body,
                                     &format!("__get__{}.{}", c.name.name, p.name.name),
                                 );
-                                self.instance_prop_getters.insert(
+                                self.class_ir.instance_prop_getters.insert(
                                     (c.name.name.clone(), p.name.name.clone()),
                                     id,
                                 );
@@ -1426,7 +1382,7 @@ impl Interpreter {
                                     &body,
                                     &format!("__set__{}.{}", c.name.name, p.name.name),
                                 );
-                                self.instance_prop_setters.insert(
+                                self.class_ir.instance_prop_setters.insert(
                                     (c.name.name.clone(), p.name.name.clone()),
                                     id,
                                 );
@@ -1451,7 +1407,7 @@ impl Interpreter {
                             &body,
                             &format!("__get__{}", p.name.name),
                         );
-                        self.top_level_prop_getters.insert(p.name.name.clone(), id);
+                        self.class_ir.top_level_prop_getters.insert(p.name.name.clone(), id);
                     }
                 }
                 if let Some(setter) = &p.setter {
@@ -1467,7 +1423,7 @@ impl Interpreter {
                             &body,
                             &format!("__set__{}", p.name.name),
                         );
-                        self.top_level_prop_setters.insert(p.name.name.clone(), id);
+                        self.class_ir.top_level_prop_setters.insert(p.name.name.clone(), id);
                     }
                 }
             }
@@ -12232,7 +12188,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         }
         // Top-level property with an IR-lowered getter: invoke the
         // accessor through klio_ir::eval rather than the tree walker.
-        if let Some(fid) = self.interp.top_level_prop_getters.get(name).copied() {
+        if let Some(fid) = self.interp.class_ir.top_level_prop_getters.get(name).copied() {
             let module = std::rc::Rc::clone(&self.module);
             let func = module.funcs[fid.0 as usize].clone();
             if let Ok(v) = klio_ir::eval::eval_with(&module, &func, Vec::new(), self) {
@@ -12571,7 +12527,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 && args.len() != cls.primary_params.len()
             {
                 let key = (name.clone(), args.len());
-                if let Some(entry) = self.interp.class_secondary_ctors.get(&key).cloned() {
+                if let Some(entry) = self.interp.class_ir.secondary_ctors.get(&key).cloned() {
                     let module = std::rc::Rc::clone(&self.module);
                     let primary_args: Vec<klio_runtime::Value> = match &entry.delegation_args {
                         Some(fids) => {
@@ -14004,7 +13960,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
             let key = (class_name, name.to_string());
-            if let Some(fid) = self.interp.instance_prop_getters.get(&key).copied() {
+            if let Some(fid) = self.interp.class_ir.instance_prop_getters.get(&key).copied() {
                 let module = std::rc::Rc::clone(&self.module);
                 let func = module.funcs[fid.0 as usize].clone();
                 return klio_ir::eval::eval_with(
@@ -14287,7 +14243,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             self.interp.globals.borrow_mut().define(name, value);
             return Ok(());
         }
-        if let Some(fid) = self.interp.top_level_prop_setters.get(name).copied() {
+        if let Some(fid) = self.interp.class_ir.top_level_prop_setters.get(name).copied() {
             let module = std::rc::Rc::clone(&self.module);
             let func = module.funcs[fid.0 as usize].clone();
             klio_ir::eval::eval_with(&module, &func, vec![value], self)?;
@@ -14309,7 +14265,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
             let key = (class_name, name.to_string());
-            if let Some(fid) = self.interp.instance_prop_setters.get(&key).copied() {
+            if let Some(fid) = self.interp.class_ir.instance_prop_setters.get(&key).copied() {
                 let module = std::rc::Rc::clone(&self.module);
                 let func = module.funcs[fid.0 as usize].clone();
                 klio_ir::eval::eval_with(
@@ -14553,7 +14509,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     return true;
                 }
                 let key = (name.clone(), p.name.clone());
-                self.interp.class_body_prop_inits.contains_key(&key)
+                self.interp.class_ir.body_prop_inits.contains_key(&key)
             });
             // Allow a parent class only when it's itself trivially
             // constructible — no primary params, no init blocks,
@@ -14567,7 +14523,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 while let Some(p) = cur {
                     let parent_inits_lowered = self
                         .interp
-                        .class_init_blocks
+                        .class_ir.init_blocks
                         .get(&p.name)
                         .map_or(p.init_blocks.is_empty(), |fids| {
                             fids.len() == p.init_blocks.len()
@@ -14575,7 +14531,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     let parent_ctor_args_lowered = p.parent_ctor_args.is_empty()
                         || self
                             .interp
-                            .class_parent_ctor_args
+                            .class_ir.parent_ctor_args
                             .get(&p.name)
                             .map_or(false, |fids| fids.len() == p.parent_ctor_args.len());
                     let p_ok = parent_inits_lowered
@@ -14594,7 +14550,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             };
             let init_blocks_lowered = self
                 .interp
-                .class_init_blocks
+                .class_ir.init_blocks
                 .get(&name)
                 .map_or(cls.init_blocks.is_empty(), |fids| {
                     fids.len() == cls.init_blocks.len()
@@ -14602,7 +14558,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             let leaf_parent_ctor_args_lowered = cls.parent_ctor_args.is_empty()
                 || self
                     .interp
-                    .class_parent_ctor_args
+                    .class_ir.parent_ctor_args
                     .get(&name)
                     .map_or(false, |fids| fids.len() == cls.parent_ctor_args.len());
             let supertype_delegates_lowered = {
@@ -14611,7 +14567,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     true
                 } else {
                     self.interp
-                        .class_supertype_delegates
+                        .class_ir.supertype_delegates
                         .get(&name)
                         .map_or(false, |fids| fids.len() == dels.len())
                 }
@@ -14657,7 +14613,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                         continue;
                     }
                     let key = (name.clone(), p.name.clone());
-                    let Some(fid) = self.interp.class_body_prop_inits.get(&key).copied() else {
+                    let Some(fid) = self.interp.class_ir.body_prop_inits.get(&key).copied() else {
                         continue;
                     };
                     let func = module.funcs[fid.0 as usize].clone();
@@ -14683,7 +14639,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     while let Some(parent) = cur_parent {
                         let Some(arg_fids) = self
                             .interp
-                            .class_parent_ctor_args
+                            .class_ir.parent_ctor_args
                             .get(&cur_name)
                             .cloned()
                         else {
@@ -14719,7 +14675,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 // reads these fields when dispatching delegated
                 // interface methods.
                 if let Some(del_fids) =
-                    self.interp.class_supertype_delegates.get(&name).cloned()
+                    self.interp.class_ir.supertype_delegates.get(&name).cloned()
                 {
                     for (field_key, fid) in del_fids {
                         let func = module.funcs[fid.0 as usize].clone();
@@ -14746,7 +14702,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                         cur = p.parent.borrow().clone();
                     }
                     for n in chain.iter().rev() {
-                        if let Some(fids) = self.interp.class_init_blocks.get(n) {
+                        if let Some(fids) = self.interp.class_ir.init_blocks.get(n) {
                             parent_inits.extend(fids.iter().copied());
                         }
                     }
@@ -14755,7 +14711,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     let func = module.funcs[fid.0 as usize].clone();
                     klio_ir::eval::eval_with(&module, &func, vec![inst_val.clone()], self)?;
                 }
-                if let Some(fids) = self.interp.class_init_blocks.get(&name).cloned() {
+                if let Some(fids) = self.interp.class_ir.init_blocks.get(&name).cloned() {
                     for fid in fids {
                         let func = module.funcs[fid.0 as usize].clone();
                         klio_ir::eval::eval_with(
