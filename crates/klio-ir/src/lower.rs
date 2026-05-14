@@ -349,6 +349,30 @@ pub fn lower_binary_expr_as_thunk(
     id
 }
 
+/// Lower a class init block as a 1-arg IR function whose only
+/// parameter binds `this`. Bare identifiers inside the body
+/// resolve through the supplied owner class + member set.
+pub fn lower_init_block(
+    module: &mut crate::Module,
+    owner_class: &str,
+    own_members: &std::collections::HashSet<String>,
+    block: &klio_ast::Block,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    b.set_owner_class(owner_class.to_string());
+    b.set_own_members(own_members.clone());
+    bind_params(&mut b, &["this"]);
+    let v = lower_block(&mut b, block);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
 /// Lower an instance accessor body. `owner_class` plus `own_members`
 /// teach the lowering that bare names like `first` inside the body
 /// resolve as `this.first` (rather than free globals).

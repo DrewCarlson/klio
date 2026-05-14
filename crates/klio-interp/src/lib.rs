@@ -89,6 +89,10 @@ pub struct Interpreter {
     /// setter is a 2-arg fn taking `this`, `value`.
     instance_prop_getters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Per-class init-block FuncIds in source order. The IR ctor
+    /// fast-path runs each one with `this` bound to the freshly
+    /// allocated instance.
+    class_init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     /// `@Retention` value declared on each annotation class (`SOURCE`,
     /// `BINARY`, or `RUNTIME`). Populated when an `annotation class`
     /// is registered. Drives whether the annotation surfaces through
@@ -328,6 +332,7 @@ impl Interpreter {
             top_level_prop_setters: std::collections::HashMap::new(),
             instance_prop_getters: std::collections::HashMap::new(),
             instance_prop_setters: std::collections::HashMap::new(),
+            class_init_blocks: std::collections::HashMap::new(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
@@ -1109,6 +1114,24 @@ impl Interpreter {
                     if p.property.is_some() {
                         own_members.insert(p.name.name.clone());
                     }
+                }
+                // Init blocks: each `init { ... }` becomes its own
+                // 1-arg IR func taking `this`. The new_instance
+                // fast-path runs them in source order after field
+                // population.
+                if !c.init_blocks.is_empty() {
+                    let mut fids: Vec<klio_ir::FuncId> = Vec::with_capacity(c.init_blocks.len());
+                    for (idx, blk) in c.init_blocks.iter().enumerate() {
+                        let id = klio_ir::lower::lower_init_block(
+                            &mut module,
+                            &c.name.name,
+                            &own_members,
+                            blk,
+                            &format!("__init__{}#{}", c.name.name, idx),
+                        );
+                        fids.push(id);
+                    }
+                    self.class_init_blocks.insert(c.name.name.clone(), fids);
                 }
                 for m in &c.members {
                     if let Decl::Property(p) = m {
@@ -14151,13 +14174,20 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 }
                 ok
             };
+            let init_blocks_lowered = self
+                .interp
+                .class_init_blocks
+                .get(&name)
+                .map_or(cls.init_blocks.is_empty(), |fids| {
+                    fids.len() == cls.init_blocks.len()
+                });
             let simple = !cls.is_inner
                 && !cls.is_anonymous
                 && !cls.is_abstract
                 && !cls.is_interface
                 && !cls.is_enum
                 && !cls.is_object
-                && cls.init_blocks.is_empty()
+                && init_blocks_lowered
                 && cls.secondary_ctors.is_empty()
                 && cls.parent_ctor_args.is_empty()
                 && cls.supertype_delegates.borrow().is_empty()
@@ -14206,7 +14236,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                         native_state: None,
                     },
                 ));
-                return Ok(klio_runtime::Value::Instance(inst));
+                let inst_val = klio_runtime::Value::Instance(inst);
+                // Run lowered init blocks against the freshly built
+                // instance. Each one is a 1-arg IR func taking `this`.
+                if let Some(fids) = self.interp.class_init_blocks.get(&name).cloned() {
+                    let module = std::rc::Rc::clone(&self.module);
+                    for fid in fids {
+                        let func = module.funcs[fid.0 as usize].clone();
+                        klio_ir::eval::eval_with(
+                            &module,
+                            &func,
+                            vec![inst_val.clone()],
+                            self,
+                        )?;
+                    }
+                }
+                return Ok(inst_val);
             }
         }
         let empty = vec![None; args.len()];
