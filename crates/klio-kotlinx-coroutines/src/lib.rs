@@ -28,12 +28,6 @@ thread_local! {
     static CANCELLED_TOKENS: RefCell<HashSet<i64>> = RefCell::new(HashSet::new());
     static NEXT_TOKEN: RefCell<i64> = const { RefCell::new(1) };
     static SCHED_QUEUE: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
-    static PENDING_LAUNCHES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
-    /// Tasks parked on `delay()` waiting for the scheduler to fire
-    /// their resumption. Each entry is the continuation Value the
-    /// host fills via cont.resume(Unit). Drained in FIFO order by
-    /// the runBlocking pump between scheduling rounds.
-    static PENDING_RESUMES: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
 }
 
 klio_stdlib::host_bindings! {
@@ -117,48 +111,32 @@ fn scheduler_enqueue(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Unit)
 }
 
-/// `launch { … }` builder hook: stash the block on a thread-local
-/// pending-launch queue that the enclosing `runBlocking` drains
-/// after its main body completes. Drives M31's "real scheduler"
-/// half — launches no longer run inline on the calling stack.
+/// `launch { … }` builder hook: forward the lambda to the active
+/// scheduler so the enclosing `runBlocking` pump can drive it on
+/// the next drain pass. Launches no longer run inline on the
+/// calling stack.
 fn spawn_launch_block(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(lam) = ctx.args.first().cloned() else {
         return Err(RuntimeError::Type(
             "__kxco_spawn: expected the launch block as the first arg".into(),
         ));
     };
-    PENDING_LAUNCHES.with(|q| q.borrow_mut().push(lam));
+    ctx.scheduler.spawn(lam);
     Ok(Value::Unit)
 }
 
-/// Take a snapshot of every pending launch block and clear the
-/// queue. Used by the interpreter's `run_blocking` drain step to
-/// pump launches without re-entering the shim path.
-pub fn drain_pending_launches() -> Vec<Value> {
-    PENDING_LAUNCHES.with(|q| std::mem::take(&mut *q.borrow_mut()))
-}
-
-/// Park the active `suspendCoroutine` continuation on the pending
-/// resume queue. The scheduler picks it back up between rounds to
-/// fire `cont.resume(Unit)`, advancing the parked task.
+/// Park the active `suspendCoroutine` continuation on the
+/// scheduler's resume queue. The interpreter fires `cont.resume(Unit)`
+/// on each parked continuation between rounds, advancing the
+/// corresponding paused frame.
 fn schedule_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(cont) = ctx.args.first().cloned() else {
         return Err(RuntimeError::Type(
             "__kxco_scheduleResume: expected the continuation arg".into(),
         ));
     };
-    PENDING_RESUMES.with(|q| q.borrow_mut().push(cont));
+    ctx.scheduler.schedule_resume(cont);
     Ok(Value::Unit)
-}
-
-/// Take the queue of parked continuations for the scheduler to
-/// resume in FIFO order.
-pub fn drain_pending_resumes() -> Vec<Value> {
-    PENDING_RESUMES.with(|q| std::mem::take(&mut *q.borrow_mut()))
-}
-
-pub fn peek_pending_resumes() -> usize {
-    PENDING_RESUMES.with(|q| q.borrow().len())
 }
 
 fn scheduler_drain_count(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

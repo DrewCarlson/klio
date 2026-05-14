@@ -912,7 +912,6 @@ dependencies = [
  "klio-ast",
  "klio-diagnostics",
  "klio-ir",
- "klio-kotlinx-coroutines",
  "klio-lexer",
  "klio-pack",
  "klio-parser",

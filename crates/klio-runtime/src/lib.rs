@@ -22,6 +22,68 @@ pub type StdlibFn = fn(&mut CallCtx) -> Result<Value, RuntimeError>;
 pub struct CallCtx<'a> {
     pub args: &'a [Value],
     pub out: &'a mut dyn Output,
+    /// Scheduler the call has access to. Coroutine builders post
+    /// launched bodies / parked continuations here; the
+    /// interpreter drains it between rounds. Always present —
+    /// the default `InProcessScheduler` runs everything in-order
+    /// for callers that aren't using a coroutines pack.
+    pub scheduler: &'a mut dyn Scheduler,
+}
+
+/// Cooperative scheduler the runtime exposes to anything called
+/// from inside an evaluation. A `launch { … }` builder pushes
+/// onto the queue with [`Scheduler::spawn`]; a parked
+/// `Continuation` records itself with [`Scheduler::schedule_resume`].
+/// The interpreter pulls from these queues between rounds to
+/// interleave sibling coroutines.
+pub trait Scheduler {
+    /// Post a lambda to run as a freshly-launched task. The
+    /// interpreter drives the body through the suspend state
+    /// machine on the next drain pass.
+    fn spawn(&mut self, block: Value);
+
+    /// Park a continuation so the next drain pass resumes it.
+    /// The interpreter calls `cont.resume(Unit)` on each parked
+    /// continuation and re-drives the corresponding paused
+    /// frame.
+    fn schedule_resume(&mut self, cont: Value);
+
+    /// Take and clear every queued launch. Drained FIFO.
+    fn drain_launches(&mut self) -> Vec<Value>;
+
+    /// Take and clear every parked continuation. Drained FIFO.
+    fn drain_resumes(&mut self) -> Vec<Value>;
+}
+
+/// Default scheduler — keeps spawn/resume queues in a single
+/// pair of Vecs. Suitable for single-threaded execution; alternate
+/// backends (Godot async, custom event loops) implement the trait
+/// directly.
+#[derive(Default)]
+pub struct InProcessScheduler {
+    launches: Vec<Value>,
+    resumes: Vec<Value>,
+}
+
+impl InProcessScheduler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Scheduler for InProcessScheduler {
+    fn spawn(&mut self, block: Value) {
+        self.launches.push(block);
+    }
+    fn schedule_resume(&mut self, cont: Value) {
+        self.resumes.push(cont);
+    }
+    fn drain_launches(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.launches)
+    }
+    fn drain_resumes(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.resumes)
+    }
 }
 
 #[derive(Clone)]

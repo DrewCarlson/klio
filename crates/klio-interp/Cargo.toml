@@ -14,7 +14,6 @@ klio-stdlib      = { workspace = true }
 klio-pack        = { workspace = true }
 klio-types       = { workspace = true }
 klio-ir          = { workspace = true }
-klio-kotlinx-coroutines = { workspace = true }
 
 [dev-dependencies]
 klio-lexer       = { workspace = true }
