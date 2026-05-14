@@ -1534,14 +1534,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.push(Inst::MemberRef { dst, receiver: recv, name: nm });
             dst
         }
-        Expr::Spread { .. }
-        | Expr::ObjectExpr { .. } => {
+        Expr::ObjectExpr { .. } => {
             // Anonymous-object expressions (`object { … }` /
             // `object : Foo { … }`) carry rich AST shape (a body of
             // declarations, supertypes, init blocks) that the IR
-            // doesn't model directly. Stash the AST node and a
-            // snapshot of the visible scope so the host's tree
-            // walker can evaluate it under the same environment.
+            // doesn't model structurally yet. Emit a dedicated
+            // `BuildObject` Inst whose host synthesises a fresh
+            // `ClassDef` with the snapshotted env on each call.
             let outer_names: std::collections::HashSet<String> = b.visible_names();
             let captured_names: Vec<String> = outer_names.iter().cloned().collect();
             let captures: Vec<Reg> = captured_names
@@ -1549,7 +1548,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 .filter_map(|n| b.resolve(n))
                 .collect();
             let dst = b.alloc_reg();
-            b.push(Inst::EvalAst {
+            b.push(Inst::BuildObject {
                 dst,
                 ast: Box::new(expr.clone()),
                 captured_names,

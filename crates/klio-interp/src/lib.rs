@@ -12538,7 +12538,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             .map_err(ir_err)
     }
 
-    fn eval_ast(
+    fn build_object(
         &mut self,
         ast: &klio_ast::Expr,
         captured_names: &[String],
@@ -12549,34 +12549,6 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             env.borrow_mut().define(n.clone(), v.clone());
         }
         self.interp.eval_expr(ast, &env, self.out).map_err(ir_err)
-    }
-
-    fn eval_ast_with_writeback(
-        &mut self,
-        ast: &klio_ast::Expr,
-        captured_names: &[String],
-        captures: Vec<klio_runtime::Value>,
-    ) -> Result<(klio_runtime::Value, Vec<klio_runtime::Value>), klio_ir::eval::EvalError> {
-        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.interp.globals))));
-        for (n, v) in captured_names.iter().zip(captures.iter()) {
-            env.borrow_mut().define(n.clone(), v.clone());
-        }
-        // Non-local returns: a bare `return` inside a nested lambda
-        // throws RuntimeError::Return up through tree walker's call
-        // chain. When we're evaluating an enclosing function's body,
-        // the Return is meant to be the function's result. Catch
-        // it at this boundary so it doesn't bubble all the way up
-        // as "internal: return".
-        let result = match self.interp.eval_expr(ast, &env, self.out) {
-            Ok(v) => v,
-            Err(klio_runtime::RuntimeError::Return(v)) => v,
-            Err(e) => return Err(ir_err(e)),
-        };
-        let updated: Vec<klio_runtime::Value> = captured_names
-            .iter()
-            .map(|n| env.borrow().lookup(n).unwrap_or(klio_runtime::Value::Unit))
-            .collect();
-        Ok((result, updated))
     }
 
     fn store_global(

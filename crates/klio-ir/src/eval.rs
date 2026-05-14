@@ -167,29 +167,17 @@ pub trait Host {
         self.register_class(class)
     }
 
-    fn eval_ast(
+    /// Synthesise an anonymous-object instance from an `object {
+    /// … }` AST node. Hosts build a fresh ClassDef from the AST's
+    /// members, hook up the captured env from `captures`, and
+    /// return the resulting `Value::Instance`.
+    fn build_object(
         &mut self,
         _ast: &klio_ast::Expr,
         _captured_names: &[String],
         _captures: Vec<Value>,
     ) -> Result<Value, EvalError> {
-        Err(EvalError::Unsupported("Host::eval_ast"))
-    }
-
-    /// Variant of `eval_ast` that also returns the post-eval value
-    /// of every captured name so the caller can write back any
-    /// mutations the AST performed on outer locals (closure-mutable
-    /// workaround). Default forwards to `eval_ast` and reports the
-    /// original capture snapshot as unchanged.
-    fn eval_ast_with_writeback(
-        &mut self,
-        ast: &klio_ast::Expr,
-        captured_names: &[String],
-        captures: Vec<Value>,
-    ) -> Result<(Value, Vec<Value>), EvalError> {
-        let snapshot = captures.clone();
-        let v = self.eval_ast(ast, captured_names, captures)?;
-        Ok((v, snapshot))
+        Err(EvalError::Unsupported("Host::build_object"))
     }
 
     /// Materialise a closure value capturing the supplied snapshot
@@ -712,15 +700,9 @@ fn exec_inst(
             let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
             host.register_class_captured(class, captured_names, cap_values)?;
         }
-        Inst::EvalAst { dst, ast, captured_names, captures } => {
+        Inst::BuildObject { dst, ast, captured_names, captures } => {
             let captured_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
-            let (v, updated) = host.eval_ast_with_writeback(ast, captured_names, captured_values)?;
-            // Write back any mutations the AST performed on captured
-            // outer locals — closure-mutable shim for HOFs whose
-            // lambdas assign to enclosing-scope vars.
-            for (reg, value) in captures.iter().zip(updated.into_iter()) {
-                frame.write(*reg, value);
-            }
+            let v = host.build_object(ast, captured_names, captured_values)?;
             frame.write(*dst, v);
         }
         Inst::StoreGlobal { name, value } => {

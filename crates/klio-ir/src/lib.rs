@@ -207,7 +207,12 @@ pub enum Inst {
         captured_names: Vec<String>,
         captures: Vec<Reg>,
     },
-    EvalAst {
+    /// Build an anonymous-object instance from an `object { … }` /
+    /// `object : Parent(args) { … }` AST node. The host
+    /// synthesises a fresh `ClassDef` from the AST, populates its
+    /// captured env from the snapshotted `captures`, runs its
+    /// init pipeline, and returns the `Value::Instance`.
+    BuildObject {
         dst: Reg,
         ast: Box<klio_ast::Expr>,
         captured_names: Vec<String>,
