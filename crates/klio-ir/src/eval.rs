@@ -200,6 +200,18 @@ pub trait Host {
         Err(EvalError::Unsupported("Host::call_super"))
     }
 
+    /// Resolve `this@Qual` by walking the receiver's outer
+    /// instance chain looking for one whose class matches
+    /// `qualifier`. Returns the receiver itself when the
+    /// qualifier matches the leaf class.
+    fn qualified_this(
+        &mut self,
+        _receiver: &Value,
+        _qualifier: &str,
+    ) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::qualified_this"))
+    }
+
     /// Read a captured variable's current value out of a
     /// `Value::Lambda`'s env. Used after closure-mutating calls
     /// to sync writes back into the caller's regs.
@@ -806,6 +818,15 @@ fn exec_inst(
                 let v = host.read_lambda_capture(&lam, &name_str)?;
                 frame.write(*dst, v);
             }
+        }
+        Inst::QualifiedThis { dst, receiver, qualifier } => {
+            let recv = frame.read(*receiver);
+            let qual_str = match &frame.module.consts[qualifier.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type("QualifiedThis: qualifier not a string const".into())),
+            };
+            let v = host.qualified_this(&recv, &qual_str)?;
+            frame.write(*dst, v);
         }
         Inst::PropertyRef { dst, name } => {
             let name_str = match &frame.module.consts[name.0 as usize] {

@@ -1991,11 +1991,24 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             });
             dst
         }
-        Expr::This { .. } => {
+        Expr::This { qualifier, .. } => {
             // `this` bare resolves to the implicit first param
             // bound by `lower_method` / extension lowering.
+            // `this@Q` walks the outer-instance chain via the
+            // host's `qualified_this`.
             if let Some(this_reg) = b.resolve("this") {
-                this_reg
+                if let Some(q) = qualifier {
+                    let nm = b.module.intern_const(Const::String(q.name.clone()));
+                    let dst = b.alloc_reg();
+                    b.push(Inst::QualifiedThis {
+                        dst,
+                        receiver: this_reg,
+                        qualifier: nm,
+                    });
+                    dst
+                } else {
+                    this_reg
+                }
             } else {
                 b.push(Inst::Trace { span: expr_span(expr) });
                 b.emit_const(Const::Unit)

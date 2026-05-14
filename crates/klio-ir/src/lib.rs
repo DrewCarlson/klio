@@ -175,6 +175,14 @@ pub enum Inst {
         names: Vec<ConstId>,
         dsts: Vec<Reg>,
     },
+    /// `this@Qualifier` — walk the receiver's outer chain
+    /// looking for an instance whose class matches `qualifier`,
+    /// and write that instance into `dst`.
+    QualifiedThis {
+        dst: Reg,
+        receiver: Reg,
+        qualifier: ConstId,
+    },
     /// `::name` — produce a `KProperty`-shaped reference value
     /// carrying the property name. Reflection target.
     PropertyRef { dst: Reg, name: ConstId },

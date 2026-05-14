@@ -12121,6 +12121,55 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         )))
     }
 
+    fn qualified_this(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        qualifier: &str,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            // Walk the leaf class + supertypes to see if `this`
+            // itself matches the qualifier.
+            let matches = {
+                let i = inst.borrow();
+                let mut cur = Some(std::rc::Rc::clone(&i.class));
+                let mut found = false;
+                while let Some(c) = cur {
+                    if c.name == qualifier || c.fqn == qualifier {
+                        found = true;
+                        break;
+                    }
+                    cur = c.parent.borrow().clone();
+                }
+                found
+            };
+            if matches {
+                return Ok(receiver.clone());
+            }
+            // Walk the outer chain (set up by inner-class
+            // construction) until we hit an instance whose
+            // class name / FQN matches the qualifier.
+            let mut cur_outer = inst.borrow().outer.clone();
+            while let Some(outer_v) = cur_outer {
+                if let klio_runtime::Value::Instance(oi) = &outer_v {
+                    let cls = oi.borrow().class.clone();
+                    let mut walk = Some(cls);
+                    while let Some(c) = walk {
+                        if c.name == qualifier || c.fqn == qualifier {
+                            return Ok(outer_v.clone());
+                        }
+                        walk = c.parent.borrow().clone();
+                    }
+                    cur_outer = oi.borrow().outer.clone();
+                } else {
+                    break;
+                }
+            }
+        }
+        Err(klio_ir::eval::EvalError::Type(format!(
+            "`this@{qualifier}` is not bound in this scope"
+        )))
+    }
+
     fn read_lambda_capture(
         &mut self,
         lambda: &klio_runtime::Value,
