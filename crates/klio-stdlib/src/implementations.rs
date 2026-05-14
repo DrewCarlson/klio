@@ -641,6 +641,58 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.find", coll_iter_find),
     ("kotlin.collections.Set.find", coll_iter_find),
     ("kotlin.collections.MutableSet.find", coll_iter_find),
+    ("kotlin.collections.List.fold", coll_iter_fold),
+    ("kotlin.collections.MutableList.fold", coll_iter_fold),
+    ("kotlin.collections.Set.fold", coll_iter_fold),
+    ("kotlin.collections.MutableSet.fold", coll_iter_fold),
+    ("kotlin.collections.Map.fold", coll_iter_fold),
+    ("kotlin.collections.MutableMap.fold", coll_iter_fold),
+    ("kotlin.collections.List.reduce", coll_iter_reduce),
+    ("kotlin.collections.MutableList.reduce", coll_iter_reduce),
+    ("kotlin.collections.Set.reduce", coll_iter_reduce),
+    ("kotlin.collections.MutableSet.reduce", coll_iter_reduce),
+    ("kotlin.collections.List.sumOf", coll_iter_sum_of),
+    ("kotlin.collections.MutableList.sumOf", coll_iter_sum_of),
+    ("kotlin.collections.Set.sumOf", coll_iter_sum_of),
+    ("kotlin.collections.MutableSet.sumOf", coll_iter_sum_of),
+    ("kotlin.collections.Map.sumOf", coll_iter_sum_of),
+    ("kotlin.collections.MutableMap.sumOf", coll_iter_sum_of),
+    ("kotlin.collections.List.takeWhile", coll_iter_take_while),
+    ("kotlin.collections.MutableList.takeWhile", coll_iter_take_while),
+    ("kotlin.collections.Set.takeWhile", coll_iter_take_while),
+    ("kotlin.collections.MutableSet.takeWhile", coll_iter_take_while),
+    ("kotlin.collections.List.dropWhile", coll_iter_drop_while),
+    ("kotlin.collections.MutableList.dropWhile", coll_iter_drop_while),
+    ("kotlin.collections.Set.dropWhile", coll_iter_drop_while),
+    ("kotlin.collections.MutableSet.dropWhile", coll_iter_drop_while),
+    ("kotlin.collections.List.partition", coll_iter_partition),
+    ("kotlin.collections.MutableList.partition", coll_iter_partition),
+    ("kotlin.collections.Set.partition", coll_iter_partition),
+    ("kotlin.collections.MutableSet.partition", coll_iter_partition),
+    ("kotlin.collections.List.distinctBy", coll_iter_distinct_by),
+    ("kotlin.collections.MutableList.distinctBy", coll_iter_distinct_by),
+    ("kotlin.collections.Set.distinctBy", coll_iter_distinct_by),
+    ("kotlin.collections.MutableSet.distinctBy", coll_iter_distinct_by),
+    ("kotlin.collections.List.flatMap", coll_iter_flat_map),
+    ("kotlin.collections.MutableList.flatMap", coll_iter_flat_map),
+    ("kotlin.collections.Set.flatMap", coll_iter_flat_map),
+    ("kotlin.collections.MutableSet.flatMap", coll_iter_flat_map),
+    ("kotlin.collections.List.groupBy", coll_iter_group_by),
+    ("kotlin.collections.MutableList.groupBy", coll_iter_group_by),
+    ("kotlin.collections.Set.groupBy", coll_iter_group_by),
+    ("kotlin.collections.MutableSet.groupBy", coll_iter_group_by),
+    ("kotlin.collections.List.associate", coll_iter_associate),
+    ("kotlin.collections.MutableList.associate", coll_iter_associate),
+    ("kotlin.collections.Set.associate", coll_iter_associate),
+    ("kotlin.collections.MutableSet.associate", coll_iter_associate),
+    ("kotlin.collections.List.associateBy", coll_iter_associate_by),
+    ("kotlin.collections.MutableList.associateBy", coll_iter_associate_by),
+    ("kotlin.collections.Set.associateBy", coll_iter_associate_by),
+    ("kotlin.collections.MutableSet.associateBy", coll_iter_associate_by),
+    ("kotlin.collections.List.associateWith", coll_iter_associate_with),
+    ("kotlin.collections.MutableList.associateWith", coll_iter_associate_with),
+    ("kotlin.collections.Set.associateWith", coll_iter_associate_with),
+    ("kotlin.collections.MutableSet.associateWith", coll_iter_associate_with),
 
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
@@ -990,6 +1042,269 @@ fn coll_iter_none(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
     }
     Ok(Value::Bool(true))
+}
+
+fn coll_iter_fold(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 3 {
+        return Err(RuntimeError::Arity("fold expects (receiver, initial, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "fold")?;
+    let mut acc = ctx.args[1].clone();
+    let block = ctx.args[2].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for v in items {
+        let lam_args = [acc.clone(), v];
+        acc = host.invoke_callable(&block, &lam_args, *out)?;
+    }
+    Ok(acc)
+}
+
+fn coll_iter_reduce(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("reduce expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "reduce")?;
+    let mut iter = items.into_iter();
+    let Some(mut acc) = iter.next() else {
+        return Err(RuntimeError::Thrown(Value::Exception {
+            fqn: Rc::new("kotlin.UnsupportedOperationException".into()),
+            message: Some(Rc::new("Empty collection can't be reduced.".into())),
+            cause: None,
+        }));
+    };
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for v in iter {
+        let lam_args = [acc.clone(), v];
+        acc = host.invoke_callable(&block, &lam_args, *out)?;
+    }
+    Ok(acc)
+}
+
+fn coll_iter_sum_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("sumOf expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "sumOf")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut acc_int: Option<i64> = Some(0);
+    let mut acc_dbl: Option<f64> = None;
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if r.is_integral() {
+            let n = r.as_i64().unwrap();
+            if let Some(a) = acc_int.as_mut() {
+                *a = a.wrapping_add(n);
+            } else if let Some(a) = acc_dbl.as_mut() {
+                *a += n as f64;
+            }
+        } else if r.is_floating() {
+            let d = r.as_f64().unwrap();
+            if let Some(a) = acc_int.take() {
+                acc_dbl = Some(a as f64 + d);
+            } else if let Some(a) = acc_dbl.as_mut() {
+                *a += d;
+            }
+        } else {
+            return Err(RuntimeError::Type(format!(
+                "sumOf selector must return Int or Double, got {r:?}"
+            )));
+        }
+    }
+    Ok(match acc_dbl {
+        Some(d) => Value::Double(d),
+        None => Value::new_int(acc_int.unwrap_or(0)),
+    })
+}
+
+fn coll_iter_take_while(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("takeWhile expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "takeWhile")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if matches!(r, Value::Bool(true)) {
+            result.push(v);
+        } else {
+            break;
+        }
+    }
+    Ok(make_list(result, false))
+}
+
+fn coll_iter_drop_while(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("dropWhile expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "dropWhile")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    let mut dropping = true;
+    for v in items {
+        if dropping {
+            let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+            if matches!(r, Value::Bool(true)) {
+                continue;
+            }
+            dropping = false;
+        }
+        result.push(v);
+    }
+    Ok(make_list(result, false))
+}
+
+fn coll_iter_partition(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("partition expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "partition")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut yes = Vec::new();
+    let mut no = Vec::new();
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if matches!(r, Value::Bool(true)) {
+            yes.push(v);
+        } else {
+            no.push(v);
+        }
+    }
+    Ok(Value::Pair(Box::new(make_list(yes, false)), Box::new(make_list(no, false))))
+}
+
+fn coll_iter_distinct_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("distinctBy expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "distinctBy")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut keys: Vec<Value> = Vec::new();
+    let mut result: Vec<Value> = Vec::new();
+    for v in items {
+        let key = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if !keys.iter().any(|k| Value::structural_eq(k, &key)) {
+            keys.push(key);
+            result.push(v);
+        }
+    }
+    Ok(make_list(result, false))
+}
+
+fn coll_iter_flat_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("flatMap expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "flatMap")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        match r {
+            Value::List { items, .. } => result.extend(items.borrow().clone()),
+            Value::Set { items, .. } => result.extend(items.borrow().clone()),
+            other => {
+                return Err(RuntimeError::Type(format!(
+                    "flatMap selector must return a List/Set, got {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(make_list(result, false))
+}
+
+fn coll_iter_group_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("groupBy expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "groupBy")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+    for v in items {
+        let key = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if let Some(slot) = groups.iter_mut().find(|(k, _)| Value::structural_eq(k, &key)) {
+            slot.1.push(v);
+        } else {
+            groups.push((key, vec![v]));
+        }
+    }
+    let entries: Vec<(Value, Value)> = groups
+        .into_iter()
+        .map(|(k, vs)| (k, make_list(vs, false)))
+        .collect();
+    Ok(make_map(entries, false))
+}
+
+fn coll_iter_associate(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("associate expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "associate")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        let Value::Pair(k, val) = r else {
+            return Err(RuntimeError::Type(
+                "associate selector must return Pair".into(),
+            ));
+        };
+        let key = *k;
+        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &key)) {
+            slot.1 = *val;
+        } else {
+            entries.push((key, *val));
+        }
+    }
+    Ok(make_map(entries, false))
+}
+
+fn coll_iter_associate_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("associateBy expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "associateBy")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for v in items {
+        let key = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &key)) {
+            slot.1 = v;
+        } else {
+            entries.push((key, v));
+        }
+    }
+    Ok(make_map(entries, false))
+}
+
+fn coll_iter_associate_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("associateWith expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "associateWith")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for v in items {
+        let val = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &v)) {
+            slot.1 = val;
+        } else {
+            entries.push((v, val));
+        }
+    }
+    Ok(make_map(entries, false))
 }
 
 fn coll_iter_find(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
