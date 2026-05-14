@@ -6196,6 +6196,18 @@ impl Interpreter {
                 return Ok(Some(func(&mut ctx)?));
             }
         }
+        if matches!(name, "getOrElse" | "getOrPut") && args.len() == 2 {
+            let k = if matches!(receiver, Value::Map { mutable: true, .. }) { "MutableMap" } else { "Map" };
+            let fqn = format!("kotlin.collections.{k}.{name}");
+            if let Some(func) = klio_stdlib::implementation(&fqn) {
+                let key = self.eval_expr(&args[0], env, out)?;
+                let lam = self.eval_expr(&args[1], env, out)?;
+                let arg_vals = [receiver.clone(), key, lam];
+                let mut __interp_host = InterpHostRef { interp: self };
+                let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                return Ok(Some(func(&mut ctx)?));
+            }
+        }
         match name {
             "filterKeys" | "filterValues" | "mapKeys" | "mapValues" => {
                 let lam_expr = args.last().ok_or_else(|| {

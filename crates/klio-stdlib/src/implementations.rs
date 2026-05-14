@@ -737,6 +737,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableMap.mapKeys", map_map_keys),
     ("kotlin.collections.Map.mapValues", map_map_values),
     ("kotlin.collections.MutableMap.mapValues", map_map_values),
+    ("kotlin.collections.Map.getOrElse", map_get_or_else),
+    ("kotlin.collections.MutableMap.getOrElse", map_get_or_else),
+    ("kotlin.collections.MutableMap.getOrPut", map_get_or_put),
 
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
@@ -1577,6 +1580,40 @@ fn map_map_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         result.push((k, new_v));
     }
     Ok(make_map(result, false))
+}
+
+fn map_get_or_else(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 3 {
+        return Err(RuntimeError::Arity("getOrElse expects (receiver, key, block)".into()));
+    }
+    let entries = map_entries_clone(&ctx.args[0], "getOrElse")?;
+    let key = ctx.args[1].clone();
+    if let Some((_, v)) = entries.iter().find(|(k, _)| Value::structural_eq(k, &key)) {
+        return Ok(v.clone());
+    }
+    let block = ctx.args[2].clone();
+    let CallCtx { out, host, .. } = ctx;
+    host.invoke_callable(&block, &[], *out)
+}
+
+fn map_get_or_put(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 3 {
+        return Err(RuntimeError::Arity("getOrPut expects (receiver, key, block)".into()));
+    }
+    let recv = ctx.args[0].clone();
+    let Value::Map { entries, .. } = &recv else {
+        return Err(RuntimeError::Type("getOrPut requires a MutableMap receiver".into()));
+    };
+    let entries_rc = Rc::clone(entries);
+    let key = ctx.args[1].clone();
+    if let Some((_, v)) = entries_rc.borrow().iter().find(|(k, _)| Value::structural_eq(k, &key)) {
+        return Ok(v.clone());
+    }
+    let block = ctx.args[2].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let new_v = host.invoke_callable(&block, &[], *out)?;
+    entries_rc.borrow_mut().push((key, new_v.clone()));
+    Ok(new_v)
 }
 
 fn coll_iter_find(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
