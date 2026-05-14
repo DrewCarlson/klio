@@ -370,34 +370,6 @@ impl Interpreter {
     /// Look up an intrinsic by name through the captured global env.
     /// Used by the IR Host to resolve bare top-level identifiers
     /// (`println`, user `fun foo`) to a callable Value.
-    pub fn scheduler_mut(&mut self) -> &mut dyn klio_runtime::Scheduler {
-        &mut *self.scheduler
-    }
-
-    pub fn set_scheduler(&mut self, scheduler: Box<dyn klio_runtime::Scheduler>) {
-        self.scheduler = scheduler;
-    }
-
-    /// Run a closure with a `CallCtx` constructed against this
-    /// interpreter — the host side-channel + the scheduler + the
-    /// supplied output sink. Used by every stdlib-intrinsic call
-    /// site so they share the same wiring without each one
-    /// hand-rolling the field borrows.
-    pub fn with_call_ctx<R>(
-        &mut self,
-        args: &[klio_runtime::Value],
-        out: &mut dyn Output,
-        f: impl FnOnce(&mut klio_runtime::CallCtx<'_>) -> R,
-    ) -> R {
-        let mut host_ref = InterpHostRef { interp: self };
-        let mut ctx = klio_runtime::CallCtx {
-            args,
-            out,
-            host: &mut host_ref,
-        };
-        f(&mut ctx)
-    }
-
     fn lookup_global_callable(&self, name: &str) -> Option<klio_runtime::Value> {
         // Primitive companion constants — `Int.MAX_VALUE`,
         // `Double.NaN`, etc. — surface as bare dotted FQNs through
@@ -471,7 +443,7 @@ impl Interpreter {
             .map_or(false, |v| v.len() > 1)
     }
 
-    pub fn dispatch_top_level_overload(
+    fn dispatch_top_level_overload(
         &mut self,
         name: &str,
         args: &[Value],
@@ -524,24 +496,11 @@ impl Interpreter {
             .any(|(f, _)| f.params.iter().any(|p| p.default.is_some()))
     }
 
-    /// True when any registered top-level overload declares a
-    /// `reified` type parameter. Reified types live in the tree
-    /// walker's call-site type_args path, so IR call sites route
-    /// the call through invoke_named_intrinsic when this fires.
-    pub fn has_top_level_reified(&self, name: &str) -> bool {
-        let Some(overloads) = self.top_level_overloads.get(name) else {
-            return false;
-        };
-        overloads
-            .iter()
-            .any(|(f, _)| f.type_params.iter().any(|p| p.is_reified))
-    }
-
     /// Re-enter the IR evaluator against a stashed closure with a
     /// full IrHost so member calls / new-instance / etc. work.
     /// Looked up by invoke_callable_value when it encounters a
     /// `Value::IrClosure`.
-    pub fn invoke_ir_closure_with_host(
+    fn invoke_ir_closure_with_host(
         &mut self,
         id: u64,
         captures: &[Value],
@@ -581,7 +540,7 @@ impl Interpreter {
     /// Look up an intrinsic by FQN. Checks pack-installed bindings
     /// first, falls back to the static `klio_stdlib` table.
     #[must_use]
-    pub fn lookup_intrinsic(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
+    fn lookup_intrinsic(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
         if let Some(f) = self.installed_bindings.get(fqn) {
             return Some(*f);
         }
@@ -3432,7 +3391,7 @@ impl Interpreter {
         self.call_lambda_with_this(params, body, captured_env, args, None, false, out)
     }
 
-    pub fn call_lambda_with_this(
+    fn call_lambda_with_this(
         &mut self,
         params: &[String],
         body: &klio_ast::Block,
@@ -3538,7 +3497,7 @@ impl Interpreter {
     /// Invoke any callable `Value` (Lambda, Function, Intrinsic, bound
     /// method) with positional/named arguments. Used by member-call
     /// dispatch when a property holds a callable.
-    pub fn invoke_callable_value(
+    fn invoke_callable_value(
         &mut self,
         callee: &Value,
         args: &[Value],
@@ -3589,7 +3548,7 @@ impl Interpreter {
         }
     }
 
-    pub fn invoke_lambda(
+    fn invoke_lambda(
         &mut self,
         lambda: &Value,
         args: &[Value],
@@ -3608,19 +3567,6 @@ impl Interpreter {
     /// `forEach`, `map`, `filter`). Catches `LabeledReturn` matching that
     /// label so the non-local return terminates only the current lambda
     /// invocation. Spec §4.2 implicit lambda labels.
-    pub fn invoke_lambda_labeled(
-        &mut self,
-        lambda: &Value,
-        label: &str,
-        args: &[Value],
-        out: &mut dyn Output,
-    ) -> Result<Value, RuntimeError> {
-        self.implicit_lambda_label_stack.push(label.to_string());
-        let r = self.invoke_lambda(lambda, args, out);
-        self.implicit_lambda_label_stack.pop();
-        r
-    }
-
     /// Handles `receiver.{let,also,apply,run,takeIf,takeUnless}(lambda)`.
     /// Returns `Ok(Some(value))` when the name was a scoping fn (caller skips
     /// the normal intrinsic dispatch), `Ok(None)` otherwise.
@@ -4604,7 +4550,7 @@ impl Interpreter {
     /// Drive the lazy pull. Sort ops break the stream into stages: when one
     /// is present we materialize the pre-sort portion, sort the buffer,
     /// then recurse with the remaining ops over an `Items` source.
-    pub fn materialize_sequence_pub(
+    fn materialize_sequence_pub(
         &mut self,
         data: &klio_runtime::SequenceData,
         out: &mut dyn Output,
@@ -5314,15 +5260,6 @@ impl Interpreter {
     /// If the body suspends, we keep the frame alive — its
     /// captured continuation must eventually be resumed by user
     /// code (or the call will hang).
-    /// Post a `launch { … }` block onto the scheduler queue. Drained
-    /// by the enclosing `runBlocking` after its body completes. The
-    /// lambda's body is later driven through the suspend
-    /// state-machine machinery so suspending calls inside it pause
-    /// the launched task correctly.
-    pub fn spawn_launch(&mut self, lambda: klio_runtime::Value) {
-        self.launch_queue.push(lambda);
-    }
-
     /// Drain every queued `launch { … }` block in FIFO order,
     /// running each through `run_blocking`. Called by `run_blocking`
     /// at the end of its main body so the launches don't interfere
@@ -5330,7 +5267,7 @@ impl Interpreter {
     /// each launch runs to completion before the next starts,
     /// matching the in-order observable behavior the existing
     /// synchronous `launch` shim already provides.
-    pub fn drain_launch_queue(&mut self, out: &mut dyn Output) -> Result<(), RuntimeError> {
+    fn drain_launch_queue(&mut self, out: &mut dyn Output) -> Result<(), RuntimeError> {
         let mut iter = 0;
         loop {
             iter += 1;
@@ -6642,7 +6579,7 @@ impl Interpreter {
     /// done in later passes by the caller; that ordering is what lets a
     /// subclass declared above its parent in source order still work, and
     /// lets enum-entry construction see resolved methods.
-    pub fn register_class_decl(
+    fn register_class_decl(
         &mut self,
         class: &klio_ast::Class,
         out: &mut dyn Output,
@@ -6650,7 +6587,7 @@ impl Interpreter {
         self.register_class_decl_with_env(class, &[], Vec::new(), out)
     }
 
-    pub fn register_class_decl_with_env(
+    fn register_class_decl_with_env(
         &mut self,
         class: &klio_ast::Class,
         captured_names: &[String],
