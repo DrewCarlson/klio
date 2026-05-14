@@ -12110,6 +12110,16 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     prim: None,
                 });
             }
+            (klio_runtime::Value::Pair(a, _), "component1") => return Ok((**a).clone()),
+            (klio_runtime::Value::Pair(_, b), "component2") => return Ok((**b).clone()),
+            (klio_runtime::Value::Pair(a, _), "first") => return Ok((**a).clone()),
+            (klio_runtime::Value::Pair(_, b), "second") => return Ok((**b).clone()),
+            (klio_runtime::Value::Triple(a, _, _), "component1") => return Ok((**a).clone()),
+            (klio_runtime::Value::Triple(_, b, _), "component2") => return Ok((**b).clone()),
+            (klio_runtime::Value::Triple(_, _, c), "component3") => return Ok((**c).clone()),
+            (klio_runtime::Value::Triple(a, _, _), "first") => return Ok((**a).clone()),
+            (klio_runtime::Value::Triple(_, b, _), "second") => return Ok((**b).clone()),
+            (klio_runtime::Value::Triple(_, _, c), "third") => return Ok((**c).clone()),
             (klio_runtime::Value::MapEntry { key, .. }, "component1") => {
                 return Ok((**key).clone());
             }

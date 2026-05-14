@@ -1621,7 +1621,34 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             });
             None
         }
-        Stmt::Decl(_) | Stmt::DestructuringDecl { .. } => None,
+        Stmt::DestructuringDecl { names, init, .. } => {
+            // `val (a, b, ...) = expr` desugars to repeated
+            // `expr.componentN()` calls. `_` placeholders skip the
+            // call entirely. Tree walker handles this via
+            // eval_stmt; the IR's CallMember + Host dispatch covers
+            // the same surface, so we lower it inline.
+            let recv = lower_expr(b, init);
+            for (i, name) in names.iter().enumerate() {
+                if name.name == "_" {
+                    continue;
+                }
+                let comp_name = format!("component{}", i + 1);
+                let nm = b.module.intern_const(Const::String(comp_name));
+                let args_start = b.alloc_reg();
+                let dst = b.alloc_reg();
+                b.push(Inst::CallMember {
+                    dst,
+                    receiver: recv,
+                    name: nm,
+                    args: args_start,
+                    n_args: 0,
+                    arg_names: Vec::new(),
+                });
+                b.bind(name.name.clone(), dst);
+            }
+            None
+        }
+        Stmt::Decl(_) => None,
     }
 }
 
