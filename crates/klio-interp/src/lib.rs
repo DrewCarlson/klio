@@ -521,12 +521,14 @@ impl Interpreter {
             .iter()
             .map(|c| c.name.clone())
             .collect();
+        let method_index = IrHost::build_method_index(&slot.module);
         let mut host = IrHost {
             interp: self,
             out,
             class_names,
             closures: Vec::new(),
             module: std::rc::Rc::clone(&slot.module),
+            method_index,
         };
         klio_ir::eval::eval_with_captures(
             &slot.module,
@@ -926,12 +928,14 @@ impl Interpreter {
             .map(|c| c.name.clone())
             .collect();
         let module_rc = std::rc::Rc::new(module);
+        let method_index = IrHost::build_method_index(&module_rc);
         let mut host = IrHost {
             interp: self,
             out,
             class_names,
             closures: Vec::new(),
             module: std::rc::Rc::clone(&module_rc),
+            method_index,
         };
         klio_ir::eval::eval_with(&module_rc, &func, Vec::new(), &mut host)
             .map_err(|e| {
@@ -11369,6 +11373,10 @@ struct IrHost<'a> {
     /// consult class method FuncIds (and similar IR-side
     /// metadata) without re-walking the module each call.
     module: std::rc::Rc<klio_ir::Module>,
+    /// `(class_name, method_name) -> FuncId` index built once per
+    /// run. Lets `lookup_ir_method` avoid the linear class+func
+    /// walk on every member call.
+    method_index: std::collections::HashMap<(String, String), klio_ir::FuncId>,
 }
 
 #[derive(Clone)]
@@ -11412,14 +11420,28 @@ impl<'a> IrHost<'a> {
         class_fqn: &str,
         method_name: &str,
     ) -> Option<klio_ir::FuncId> {
-        let class = self.module.classes.iter().find(|c| c.fqn == class_fqn || c.name == class_fqn)?;
-        for fid in &class.methods {
-            let func = &self.module.funcs[fid.0 as usize];
-            if func.name == method_name {
-                return Some(*fid);
+        self.method_index
+            .get(&(class_fqn.to_string(), method_name.to_string()))
+            .copied()
+    }
+
+    /// Build the `(class, method) → FuncId` index from the active
+    /// IR module. Run once at host construction so member-call
+    /// dispatch is constant-time.
+    fn build_method_index(
+        module: &klio_ir::Module,
+    ) -> std::collections::HashMap<(String, String), klio_ir::FuncId> {
+        let mut idx = std::collections::HashMap::new();
+        for c in &module.classes {
+            for fid in &c.methods {
+                let func = &module.funcs[fid.0 as usize];
+                idx.insert((c.name.clone(), func.name.clone()), *fid);
+                if c.fqn != c.name {
+                    idx.insert((c.fqn.clone(), func.name.clone()), *fid);
+                }
             }
         }
-        None
+        idx
     }
 
     /// Synthesize and dispatch a member call through the tree
@@ -11885,6 +11907,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 class_names: self.class_names.clone(),
                 closures: self.closures.clone(),
                 module: std::rc::Rc::clone(&self.module),
+                method_index: self.method_index.clone(),
             };
             return klio_ir::eval::eval_with_captures(
                 &slot.module,
@@ -12052,6 +12075,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             class_names: self.class_names.clone(),
             closures: self.closures.clone(),
             module: std::rc::Rc::clone(&self.module),
+            method_index: self.method_index.clone(),
         };
         klio_ir::eval::eval_with(module, &f, args, &mut child)
     }
