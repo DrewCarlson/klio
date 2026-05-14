@@ -38,6 +38,10 @@ pub const HASH_LEN: usize = 32;
 pub enum Compression {
     None = 0,
     Zstd = 1,
+    /// zstd compressed against the dictionary bytes carried in
+    /// this pack's `zstd_dict` section. Section is rejected if
+    /// the pack does not carry a matching dictionary.
+    ZstdDict = 2,
 }
 
 /// Directory entry for one section. Names are case-sensitive byte strings;
@@ -79,6 +83,9 @@ pub mod section_names {
     pub const BINDINGS: &str = "bindings";
     pub const TESTS: &str = "tests";
     pub const DEBUG: &str = "debug";
+    /// Raw zstd dictionary bytes. When present, sections marked
+    /// `Compression::ZstdDict` decode against these bytes.
+    pub const ZSTD_DICT: &str = "zstd_dict";
 }
 
 /// Byte offset of the `dir_len` u32 inside the file header. Useful for

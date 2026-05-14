@@ -122,6 +122,20 @@ enum PackCmd {
         #[arg(long = "out")]
         out: Option<PathBuf>,
     },
+    /// Train a zstd dictionary from the AST + sources sections of
+    /// the supplied packs and write it to a file. Use the resulting
+    /// file with `klio pack build --zstd-dict <path>` to compress
+    /// those sections against shared inter-pack vocabulary.
+    TrainDict {
+        /// Input pack files to sample.
+        inputs: Vec<PathBuf>,
+        /// Output dictionary file.
+        #[arg(long = "out", default_value = "target/packs/klio.zstd-dict")]
+        out: PathBuf,
+        /// Maximum dictionary size in bytes.
+        #[arg(long = "max-size", default_value_t = 64 * 1024)]
+        max_size: usize,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -240,6 +254,16 @@ fn run_pack(cmd: PackCmd) -> ExitCode {
                 }
             }
         }
+        PackCmd::TrainDict { inputs, out, max_size } => match train_zstd_dict(&inputs, &out, max_size) {
+            Ok(()) => {
+                eprintln!("trained dict {}", out.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
         PackCmd::New { dir, id } => match scaffold_library(&dir, id.as_deref()) {
             Ok(()) => {
                 eprintln!("scaffolded {}", dir.display());
@@ -272,6 +296,11 @@ fn migrate_pack(input: &std::path::Path, output: &std::path::Path) -> Result<(),
         let comp = match entry.compression {
             Compression::None => Compression::None,
             Compression::Zstd => Compression::Zstd,
+            // Dictionary-compressed sections are decoded by the
+            // reader using the inline zstd_dict section, and
+            // re-emitted as plain Zstd by the migrate path —
+            // re-training a dictionary is the user's call.
+            Compression::ZstdDict => Compression::Zstd,
         };
         writer.add_section(entry.name.clone(), payload.into_owned(), comp);
     }
@@ -280,6 +309,44 @@ fn migrate_pack(input: &std::path::Path, output: &std::path::Path) -> Result<(),
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(output, bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Train a zstd dictionary from the AST + sources sections of the
+/// supplied packs. Uses `zstd::dict::from_continuous` over the
+/// concatenated section bytes; dictionary size is bounded so the
+/// emitted file fits comfortably as a pack section.
+fn train_zstd_dict(
+    inputs: &[std::path::PathBuf],
+    out: &std::path::Path,
+    max_size: usize,
+) -> Result<(), String> {
+    if inputs.is_empty() {
+        return Err("at least one input pack required".into());
+    }
+    let mut samples: Vec<Vec<u8>> = Vec::new();
+    for path in inputs {
+        let pack = klio_pack::PackReader::from_path(path).map_err(|e| e.to_string())?;
+        for name in [
+            klio_pack::section_names::SOURCES,
+            klio_pack::section_names::AST,
+            klio_pack::section_names::SYMBOLS,
+        ] {
+            if let Some(bytes) = pack.read_section(name).map_err(|e| e.to_string())? {
+                samples.push(bytes.into_owned());
+            }
+        }
+    }
+    if samples.is_empty() {
+        return Err("no AST/sources/symbols sections found in inputs".into());
+    }
+    let dict = zstd::dict::from_samples(&samples, max_size)
+        .map_err(|e| format!("zstd dict training failed: {e}"))?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(out, &dict).map_err(|e| e.to_string())?;
+    eprintln!("dict size: {} bytes", dict.len());
     Ok(())
 }
 

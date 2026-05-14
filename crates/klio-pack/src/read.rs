@@ -172,6 +172,59 @@ impl PackReader {
                 }
                 Ok(Some(Cow::Owned(out)))
             }
+            Compression::ZstdDict => {
+                let dict_bytes = self.zstd_dict()?;
+                let dict = dict_bytes.as_ref().ok_or_else(|| {
+                    PackError::Compression(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "section `{}` uses ZstdDict but no zstd_dict section is present",
+                            entry.name
+                        ),
+                    ))
+                })?;
+                let mut decoder =
+                    zstd::stream::Decoder::with_dictionary(stored, dict)
+                        .map_err(PackError::Compression)?;
+                let mut out =
+                    Vec::with_capacity(usize::try_from(entry.uncompressed_len).unwrap_or(0));
+                use std::io::Read;
+                decoder.read_to_end(&mut out).map_err(PackError::Compression)?;
+                if out.len() as u64 != entry.uncompressed_len {
+                    return Err(PackError::LengthMismatch {
+                        section: entry.name.clone(),
+                        expected: entry.uncompressed_len,
+                        actual: out.len() as u64,
+                    });
+                }
+                Ok(Some(Cow::Owned(out)))
+            }
+        }
+    }
+
+    /// Read and cache the pack's zstd dictionary if present.
+    fn zstd_dict(&self) -> Result<Option<Vec<u8>>, PackError> {
+        match self.read_section_raw(crate::format::section_names::ZSTD_DICT)? {
+            Some(bytes) => Ok(Some(bytes.into_owned())),
+            None => Ok(None),
+        }
+    }
+
+    fn read_section_raw(&self, name: &str) -> Result<Option<Cow<'_, [u8]>>, PackError> {
+        let Some(entry) = self.dir.entries.iter().find(|e| e.name == name) else {
+            return Ok(None);
+        };
+        let buf = self.bytes.as_slice();
+        let start = self.payload_start + entry.offset as usize;
+        let end = start + entry.stored_len as usize;
+        let stored = &buf[start..end];
+        match entry.compression {
+            Compression::None => Ok(Some(Cow::Borrowed(stored))),
+            // The dictionary itself is required to be uncompressed.
+            _ => Err(PackError::Compression(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "zstd_dict section must be uncompressed",
+            ))),
         }
     }
 

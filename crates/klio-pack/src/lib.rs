@@ -175,6 +175,41 @@ mod tests {
     }
 
     #[test]
+    fn zstd_dict_round_trip() {
+        // Same payload pattern twice — a dictionary trained on
+        // either should make the second-section encoding small.
+        let payload: Vec<u8> = std::iter::repeat(b'A')
+            .take(8 * 1024)
+            .chain(std::iter::repeat(b'B').take(8 * 1024))
+            .collect();
+        // Hand-rolled "dictionary" — just the payload itself.
+        // zstd accepts arbitrary bytes; a real builder would
+        // call `zstd::dict::from_samples`.
+        let dict = payload[..512].to_vec();
+
+        let mut w = PackWriter::new();
+        w.set_zstd_dict(dict.clone());
+        w.add_zstd_dict("a", payload.clone());
+        w.add_zstd_dict("b", payload.clone());
+        let bytes = w.finish().expect("encode dict pack");
+
+        let reader = PackReader::from_bytes(bytes).expect("decode dict pack");
+        assert_eq!(
+            &*reader.read_section("a").unwrap().unwrap(),
+            &payload[..]
+        );
+        assert_eq!(
+            &*reader.read_section("b").unwrap().unwrap(),
+            &payload[..]
+        );
+        // The dictionary itself is reachable.
+        assert_eq!(
+            &*reader.read_section(section_names::ZSTD_DICT).unwrap().unwrap(),
+            &dict[..]
+        );
+    }
+
+    #[test]
     fn duplicate_section_is_rejected() {
         let mut w = PackWriter::new();
         w.add_raw(section_names::MANIFEST, b"one".to_vec());

@@ -17,6 +17,11 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 pub struct PackWriter {
     sections: Vec<PendingSection>,
     flags: u32,
+    /// Optional zstd dictionary bytes. When supplied, sections
+    /// added via `add_zstd_dict` compress against it and the
+    /// dictionary is emitted as a `zstd_dict` section so readers
+    /// can decompress without out-of-band state.
+    zstd_dict: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -64,9 +69,37 @@ impl PackWriter {
         self.add_section(name, payload, Compression::Zstd)
     }
 
+    /// Compress this section against the writer's zstd dictionary.
+    /// Calling this without first calling [`Self::set_zstd_dict`]
+    /// produces an error at [`Self::finish`].
+    pub fn add_zstd_dict(&mut self, name: impl Into<String>, payload: Vec<u8>) -> &mut Self {
+        self.add_section(name, payload, Compression::ZstdDict)
+    }
+
+    /// Attach a zstd dictionary to this pack. Subsequent
+    /// [`Self::add_zstd_dict`] calls compress against the
+    /// dictionary; the dictionary itself is emitted as a
+    /// `zstd_dict` section.
+    pub fn set_zstd_dict(&mut self, bytes: Vec<u8>) -> &mut Self {
+        self.zstd_dict = Some(bytes);
+        self
+    }
+
     /// Encode the pack to a byte vector. Output is deterministic for a
     /// given set of input sections.
     pub fn finish(mut self) -> Result<Vec<u8>, PackError> {
+        // Emit the dictionary as a `zstd_dict` section so readers
+        // can resolve it on load. If the user explicitly added a
+        // zstd_dict section we honour theirs.
+        if let Some(dict) = &self.zstd_dict {
+            if !self.sections.iter().any(|s| s.name == section_names::ZSTD_DICT) {
+                self.sections.push(PendingSection {
+                    name: section_names::ZSTD_DICT.to_string(),
+                    payload: dict.clone(),
+                    compression: Compression::None,
+                });
+            }
+        }
         // Sort by section name so the encoded directory and payload
         // ordering are stable across builds.
         self.sections.sort_by(|a, b| a.name.cmp(&b.name));
@@ -81,12 +114,27 @@ impl PackWriter {
         // payload buffer with each section optionally compressed.
         let mut payloads: Vec<u8> = Vec::new();
         let mut entries: Vec<SectionEntry> = Vec::with_capacity(self.sections.len());
+        let dict_for_encode = self.zstd_dict.clone();
         for s in self.sections {
             let uncompressed_len = s.payload.len() as u64;
             let stored = match s.compression {
                 Compression::None => s.payload,
                 Compression::Zstd => zstd::stream::encode_all(s.payload.as_slice(), DEFAULT_ZSTD_LEVEL)
                     .map_err(PackError::Compression)?,
+                Compression::ZstdDict => {
+                    let dict = dict_for_encode.as_ref().ok_or_else(|| {
+                        PackError::Compression(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "ZstdDict section requires set_zstd_dict before finish",
+                        ))
+                    })?;
+                    let mut encoder =
+                        zstd::stream::Encoder::with_dictionary(Vec::new(), DEFAULT_ZSTD_LEVEL, dict)
+                            .map_err(PackError::Compression)?;
+                    use std::io::Write;
+                    encoder.write_all(&s.payload).map_err(PackError::Compression)?;
+                    encoder.finish().map_err(PackError::Compression)?
+                }
             };
             let offset = payloads.len() as u64;
             let stored_len = stored.len() as u64;
