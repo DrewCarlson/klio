@@ -884,6 +884,7 @@ dependencies = [
  "klio-typeck",
  "rustyline",
  "serde",
+ "serde_json",
  "toml",
  "walkdir",
 ]

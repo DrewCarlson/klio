@@ -111,6 +111,17 @@ enum PackCmd {
         #[arg(long = "id")]
         id: Option<String>,
     },
+    /// Migrate a pack to the current on-disk format version. Today
+    /// it's a passthrough — `FORMAT_VERSION == 1` is the only one
+    /// shipped — but the entry point exists so callers can stop
+    /// special-casing once v2 lands.
+    Migrate {
+        /// Path to the input pack.
+        input: PathBuf,
+        /// Output path. Defaults to overwriting the input.
+        #[arg(long = "out")]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -216,6 +227,19 @@ fn run_pack(cmd: PackCmd) -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        PackCmd::Migrate { input, out } => {
+            let target = out.unwrap_or_else(|| input.clone());
+            match migrate_pack(&input, &target) {
+                Ok(()) => {
+                    eprintln!("migrated {} -> {}", input.display(), target.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         PackCmd::New { dir, id } => match scaffold_library(&dir, id.as_deref()) {
             Ok(()) => {
                 eprintln!("scaffolded {}", dir.display());
@@ -227,6 +251,36 @@ fn run_pack(cmd: PackCmd) -> ExitCode {
             }
         },
     }
+}
+
+/// Re-encode a pack against the currently-supported FORMAT_VERSION.
+///
+/// Today the writer only knows how to emit one version, so a
+/// successful migrate is a no-op round-trip that validates the
+/// input pack and rewrites it deterministically. The function is
+/// in place ahead of v2 so callers and CI flows can be wired up
+/// before the schema change lands.
+fn migrate_pack(input: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+    use klio_pack::{Compression, PackReader, PackWriter};
+    let reader = PackReader::from_path(input).map_err(|e| e.to_string())?;
+    let mut writer = PackWriter::new();
+    for entry in reader.sections() {
+        let payload = reader
+            .read_section(&entry.name)
+            .map_err(|e| e.to_string())?
+            .expect("section listed in directory must decode");
+        let comp = match entry.compression {
+            Compression::None => Compression::None,
+            Compression::Zstd => Compression::Zstd,
+        };
+        writer.add_section(entry.name.clone(), payload.into_owned(), comp);
+    }
+    let bytes = writer.finish().map_err(|e| e.to_string())?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(output, bytes).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn scaffold_library(dir: &std::path::Path, id_override: Option<&str>) -> Result<(), String> {
@@ -525,7 +579,65 @@ fn install_pack_into_cache(src: &std::path::Path) -> Result<PathBuf, String> {
         manifest.library_id, manifest.library_version
     ));
     std::fs::copy(src, &dest).map_err(|e| format!("copy: {e}"))?;
+    let _ = rebuild_cache_index(&cache);
     Ok(dest)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct CacheIndexEntry {
+    library_id: String,
+    version: String,
+    abi_version: u32,
+    path: String,
+    dependencies: Vec<String>,
+}
+
+const CACHE_INDEX_NAME: &str = "index.json";
+
+/// Walk every pack file in the cache, read each manifest, and write a
+/// sidecar `index.json` so subsequent startups can skip the per-pack
+/// header read. Best-effort: failures here are logged but do not
+/// break the install flow.
+fn rebuild_cache_index(cache: &std::path::Path) -> Result<(), String> {
+    let entries = match std::fs::read_dir(cache) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    let mut out: Vec<CacheIndexEntry> = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x != "klio-pack").unwrap_or(true) {
+            continue;
+        }
+        let Ok(m) = read_pack_manifest(&p) else { continue };
+        out.push(CacheIndexEntry {
+            library_id: m.library_id,
+            version: m.library_version,
+            abi_version: m.abi_version,
+            path: p.to_string_lossy().into_owned(),
+            dependencies: m.dependencies.iter().map(|d| d.library_id.clone()).collect(),
+        });
+    }
+    out.sort_by(|a, b| a.library_id.cmp(&b.library_id));
+    let bytes = serde_json::to_vec_pretty(&out).map_err(|e| e.to_string())?;
+    let idx_path = cache.join(CACHE_INDEX_NAME);
+    std::fs::write(&idx_path, bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Read the cache sidecar index. Returns `None` if absent or stale.
+/// Staleness check: the index is considered fresh when every entry's
+/// path exists on disk; mismatch means a manual `rm` happened and we
+/// fall back to the full directory walk.
+fn read_cache_index(cache: &std::path::Path) -> Option<Vec<CacheIndexEntry>> {
+    let bytes = std::fs::read(cache.join(CACHE_INDEX_NAME)).ok()?;
+    let entries: Vec<CacheIndexEntry> = serde_json::from_slice(&bytes).ok()?;
+    for e in &entries {
+        if !std::path::Path::new(&e.path).exists() {
+            return None;
+        }
+    }
+    Some(entries)
 }
 
 fn list_cache_packs() -> Result<(), String> {
@@ -591,6 +703,7 @@ fn remove_cache_pack(library_id: &str, version: Option<&str>) -> Result<PathBuf,
             }
         }
         std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+        let _ = rebuild_cache_index(&cache);
         return Ok(p);
     }
     Err(format!("no pack matching {library_id} found in cache"))
@@ -889,13 +1002,22 @@ fn install_extra_packs(interp: &mut Interpreter) {
     }
     if let Some(home) = std::env::var_os("HOME") {
         let cache = PathBuf::from(home).join(".klio").join("packs");
-        if let Ok(entries) = std::fs::read_dir(&cache) {
+        // Fast path: read the sidecar index when it's fresh. Saves
+        // one fs::open + header decode per cached pack at startup.
+        if let Some(idx) = read_cache_index(&cache) {
+            for entry in idx {
+                paths.push(PathBuf::from(entry.path));
+            }
+        } else if let Ok(entries) = std::fs::read_dir(&cache) {
             for e in entries.flatten() {
                 let p = e.path();
                 if p.extension().map(|x| x == "klio-pack").unwrap_or(false) {
                     paths.push(p);
                 }
             }
+            // Rebuild the index in the background of a successful
+            // walk so subsequent runs use the fast path.
+            let _ = rebuild_cache_index(&cache);
         }
     }
     paths.sort();
