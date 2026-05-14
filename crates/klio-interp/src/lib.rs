@@ -5741,6 +5741,21 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
         self.active_suspend_frames.push(Rc::clone(frame));
+        // Re-entry from the scheduler: a previously-suspended
+        // frame just had its paused_resume staged by the drain
+        // pump. Feed that value into the next state's
+        // resume_target so the resumption flows correctly.
+        if resumed_value.is_none() {
+            if let Some(record) = frame.borrow().paused_resume.borrow_mut().take() {
+                resumed_value = Some(match record {
+                    klio_runtime::PausedResume::Resumed(v) => v,
+                    klio_runtime::PausedResume::Failed(exc) => {
+                        self.active_suspend_frames.pop();
+                        return Err(RuntimeError::Thrown(exc));
+                    }
+                });
+            }
+        }
         let result = (|| {
             loop {
                 let (body, state_idx) = {
@@ -5847,12 +5862,14 @@ impl Interpreter {
         let slot = Rc::new(RefCell::new(ContinuationSlot::Pending));
         self.coroutine_continuations.push(Rc::clone(&slot));
         let cont = self.make_continuation_value(Rc::clone(&slot));
-        // Bind the active frame onto the cont's native_state so
-        // `cont.resume(v)` called *after* this suspendCoroutine
-        // returns can find the frame and stage its `paused_resume`
-        // for next entry.
+        // Bind the *outermost* active frame onto the cont's
+        // native_state so `cont.resume(v)` called *after* this
+        // suspendCoroutine returns can find the launched frame
+        // (not a transient inner frame for the nested suspend
+        // fn that hosted the suspendCoroutine call). The
+        // scheduler drives at the outer-frame level.
         if let (Value::Instance(inst), Some(frame)) =
-            (&cont, self.active_suspend_frames.last().cloned())
+            (&cont, self.active_suspend_frames.first().cloned())
         {
             let frame_clone = Rc::clone(&frame);
             inst.borrow_mut().ensure_native_state("klio.cont.frame", move || {
