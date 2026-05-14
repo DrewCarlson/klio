@@ -8716,7 +8716,7 @@ impl Interpreter {
         Ok(Some(v))
     }
 
-    fn try_extension_property_set(
+    pub fn try_extension_property_set(
         &mut self,
         receiver: &Value,
         name: &str,
@@ -11715,6 +11715,32 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         self.interp
             .eval_property_access(receiver.clone(), name, self.out)
             .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
+    }
+
+    fn set_field(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+        value: klio_runtime::Value,
+    ) -> Result<(), klio_ir::eval::EvalError> {
+        // Extension-property setter dispatch first; `var Holder.foo set(v){…}`
+        // mutates `receiver` through its setter body.
+        if let Ok(Some(())) = self
+            .interp
+            .try_extension_property_set(receiver, name, value.clone(), self.out)
+        {
+            return Ok(());
+        }
+        match receiver {
+            klio_runtime::Value::Instance(inst) => {
+                inst.borrow_mut().define(name, value);
+                Ok(())
+            }
+            klio_runtime::Value::Null => Ok(()),
+            _ => Err(klio_ir::eval::EvalError::Type(format!(
+                "SetField on non-instance: {receiver:?}"
+            ))),
+        }
     }
 
     fn instance_of(&mut self, value: &klio_runtime::Value, ty: &klio_ir::TypeRef) -> bool {

@@ -88,6 +88,28 @@ pub trait Host {
         }
     }
 
+    /// Write a property on the receiver. Default writes directly to
+    /// the instance backing store; concrete hosts route through the
+    /// tree walker's assignment path so extension-property setters
+    /// fire.
+    fn set_field(
+        &mut self,
+        receiver: &Value,
+        name: &str,
+        value: Value,
+    ) -> Result<(), EvalError> {
+        match receiver {
+            Value::Instance(inst) => {
+                inst.borrow_mut().define(name, value);
+                Ok(())
+            }
+            Value::Null => Ok(()),
+            _ => Err(EvalError::Type(format!(
+                "SetField on non-instance: {receiver:?}"
+            ))),
+        }
+    }
+
     /// Test whether `value` is an instance of `ty`. The default
     /// implementation handles the primitive nominal types via
     /// `Value::type_fqn`; complex types defer to the host.
@@ -481,12 +503,7 @@ fn exec_inst(
                 Const::String(s) => s.clone(),
                 _ => return Err(EvalError::Type("SetField: name not a string const".into())),
             };
-            match r {
-                Value::Instance(inst) => {
-                    inst.borrow_mut().define(&name, v);
-                }
-                _ => return Err(EvalError::Type(format!("SetField on non-instance: {r:?}"))),
-            }
+            host.set_field(&r, &name, v)?;
         }
         Inst::Call { dst, func, args, n_args, arg_names } => {
             let arg_values = read_arg_run(frame, *args, *n_args);
@@ -713,8 +730,22 @@ fn render_value(v: &Value) -> String {
         Value::ULong(u) => u.to_string(),
         Value::UShort(u) => u.to_string(),
         Value::UByte(u) => u.to_string(),
-        Value::Double(d) => format!("{d}"),
-        Value::Float(f) => format!("{f}"),
+        Value::Double(d) => {
+            if d.is_finite() && d.fract() == 0.0 && !d.is_sign_negative() && d.abs() < 1e16 {
+                format!("{d:.1}")
+            } else if d.is_finite() && d.fract() == 0.0 && d.is_sign_negative() && d.abs() < 1e16 {
+                format!("{d:.1}")
+            } else {
+                format!("{d}")
+            }
+        }
+        Value::Float(f) => {
+            if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e7 {
+                format!("{f:.1}")
+            } else {
+                format!("{f}")
+            }
+        }
         Value::Bool(b) => b.to_string(),
         Value::String(s) => s.as_str().to_string(),
         Value::Char(c) => c.to_string(),

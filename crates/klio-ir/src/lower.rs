@@ -471,8 +471,20 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.switch_to(dead);
             b.emit_const(Const::Unit)
         }
-        Expr::When { subject, branches, .. } => {
-            lower_when(b, subject.as_deref(), branches, expr_span(expr))
+        Expr::When { subject, subject_binding, branches, .. } => {
+            // `when (val v = subject) { ... }` binds `v` to the
+            // subject's value so pattern arms can refer to it. Push
+            // a scope so the binding pops after the when.
+            if let (Some(s), Some(bind)) = (subject.as_deref(), subject_binding) {
+                b.push_scope();
+                let sv = lower_expr(b, s);
+                b.bind(bind.name.name.clone(), sv);
+                let r = lower_when(b, subject.as_deref(), branches, expr_span(expr));
+                b.pop_scope();
+                r
+            } else {
+                lower_when(b, subject.as_deref(), branches, expr_span(expr))
+            }
         }
         Expr::Try { body, catches, finally, .. } => {
             // Exception-edge model: the body block carries a list
@@ -689,6 +701,24 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.switch_to(exit);
                 b.emit_const(Const::Unit)
             }
+            Expr::For { vars, iter, body, .. } => {
+                lower_for_labeled(b, vars, iter, body, Some(label.name.clone()))
+            }
+            Expr::DoWhile { body, cond, .. } => {
+                let body_blk = b.alloc_block();
+                let exit = b.alloc_block();
+                b.terminate(Terminator::Goto(body_blk));
+                b.switch_to(body_blk);
+                b.push_loop(Some(label.name.clone()), body_blk, exit);
+                if let Some(body) = body {
+                    let _ = lower_expr(b, body);
+                }
+                b.pop_loop();
+                let c = lower_expr(b, cond);
+                b.terminate(Terminator::Branch { cond: c, t: body_blk, f: exit });
+                b.switch_to(exit);
+                b.emit_const(Const::Unit)
+            }
             _ => lower_expr(b, inner),
         },
         Expr::AnonFun { params, body, .. } => {
@@ -780,6 +810,16 @@ fn lower_for(
     iter: &Expr,
     body: &Expr,
 ) -> Reg {
+    lower_for_labeled(b, vars, iter, body, None)
+}
+
+fn lower_for_labeled(
+    b: &mut FuncBuilder<'_>,
+    vars: &[klio_ast::Ident],
+    iter: &Expr,
+    body: &Expr,
+    label: Option<String>,
+) -> Reg {
     let recv = lower_expr(b, iter);
     let it_reg = b.alloc_reg();
     let zero = b.alloc_reg();
@@ -850,7 +890,7 @@ fn lower_for(
             b.bind(v.name.clone(), comp);
         }
     }
-    b.push_loop(None, header, exit);
+    b.push_loop(label, header, exit);
     let _ = lower_expr(b, body);
     b.pop_loop();
     b.pop_scope();
