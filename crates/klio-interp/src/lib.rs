@@ -11259,6 +11259,34 @@ impl<'a> klio_runtime::IntrinsicHost for InterpHostRef<'a> {
     }
 }
 
+/// Structural hash that matches `Value::structural_eq`:
+/// `a == b` implies the same hash. Used by IR-native data-class
+/// `hashCode()` so the equals/hashCode contract holds.
+fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
+    use klio_runtime::Value::*;
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match v {
+        Unit => 0i32.hash(&mut h),
+        Null => 1i32.hash(&mut h),
+        Bool(b) => { 2i32.hash(&mut h); b.hash(&mut h); }
+        Char(c) => { 3i32.hash(&mut h); c.hash(&mut h); }
+        Int(i) => { 4i32.hash(&mut h); (*i as i64).hash(&mut h); }
+        Long(l) => { 4i32.hash(&mut h); l.hash(&mut h); }
+        Short(s) => { 4i32.hash(&mut h); (*s as i64).hash(&mut h); }
+        Byte(b) => { 4i32.hash(&mut h); (*b as i64).hash(&mut h); }
+        UInt(u) => { 4i32.hash(&mut h); (*u as i64).hash(&mut h); }
+        ULong(u) => { 4i32.hash(&mut h); u.hash(&mut h); }
+        UShort(u) => { 4i32.hash(&mut h); (*u as i64).hash(&mut h); }
+        UByte(u) => { 4i32.hash(&mut h); (*u as i64).hash(&mut h); }
+        Float(f) => { 5i32.hash(&mut h); f.to_bits().hash(&mut h); }
+        Double(d) => { 5i32.hash(&mut h); d.to_bits().hash(&mut h); }
+        String(s) => { 6i32.hash(&mut h); s.hash(&mut h); }
+        _ => 7i32.hash(&mut h),
+    }
+    h.finish() as i32
+}
+
 fn ir_err(e: klio_runtime::RuntimeError) -> klio_ir::eval::EvalError {
     match e {
         klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
@@ -11927,6 +11955,25 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                             }
                         }
                     }
+                }
+            }
+            // Data-class auto-generated `hashCode()`: combine
+            // primary-ctor field hashes with the JVM-style
+            // `31 * h + field_hash` accumulation. Field hashes
+            // come from a structural value-hash that matches our
+            // `structural_eq` semantics, so `a == b` implies
+            // `a.hashCode() == b.hashCode()`.
+            if args.is_empty() && name == "hashCode" {
+                let i = inst.borrow();
+                if i.class.is_data
+                    && !i.class.methods.iter().any(|m| m.name == "hashCode")
+                {
+                    let mut h: i32 = 0;
+                    for p in &i.class.primary_params {
+                        let v = i.get(&p.name).unwrap_or(klio_runtime::Value::Null);
+                        h = h.wrapping_mul(31).wrapping_add(value_structural_hash(&v));
+                    }
+                    return Ok(klio_runtime::Value::new_int(h as i64));
                 }
             }
             // Data-class auto-generated `equals(other)`: structural
