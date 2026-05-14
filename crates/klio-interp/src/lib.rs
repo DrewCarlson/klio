@@ -12078,7 +12078,10 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // each shape needing its own member-method registration.
         match (receiver, name) {
             (klio_runtime::Value::Range { start, end, step, kind }, "contains") if args.len() == 1 => {
-                let v = args[0].as_i64().unwrap_or(i64::MIN);
+                let v = match &args[0] {
+                    klio_runtime::Value::Char(c) => *c as i64,
+                    other => other.as_i64().unwrap_or(i64::MIN),
+                };
                 let inside = if *step > 0 {
                     let _ = kind;
                     v >= *start && v <= *end

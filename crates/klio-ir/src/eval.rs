@@ -938,6 +938,18 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
             step: 1,
             kind: klio_runtime::RangeKind::Int,
         }),
+        (BinOp::RangeTo, Value::Char(a), Value::Char(b)) => Ok(Value::Range {
+            start: *a as i64,
+            end: *b as i64,
+            step: 1,
+            kind: klio_runtime::RangeKind::Char,
+        }),
+        (BinOp::RangeUntil, Value::Char(a), Value::Char(b)) => Ok(Value::Range {
+            start: *a as i64,
+            end: (*b as i64) - 1,
+            step: 1,
+            kind: klio_runtime::RangeKind::Char,
+        }),
         (BinOp::RangeTo, Long(a), Long(b)) => Ok(Value::Range {
             start: *a, end: *b, step: 1, kind: klio_runtime::RangeKind::Long,
         }),
