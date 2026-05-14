@@ -12311,9 +12311,18 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 if let Ok(n) = name["component".len()..].parse::<usize>() {
                     if n >= 1 {
                         let i = inst.borrow();
-                        if let Some(p) = i.class.primary_params.get(n - 1) {
-                            if let Some(v) = i.get(&p.name) {
-                                return Ok(v);
+                        // Only fire the auto-componentN fast-
+                        // path for data classes that haven't
+                        // overridden it with a user `operator
+                        // fun componentN`. Otherwise the user
+                        // body (side-effects + custom logic)
+                        // must run.
+                        let has_user_override = i.class.find_method(name).is_some();
+                        if i.class.is_data && !has_user_override {
+                            if let Some(p) = i.class.primary_params.get(n - 1) {
+                                if let Some(v) = i.get(&p.name) {
+                                    return Ok(v);
+                                }
                             }
                         }
                     }
