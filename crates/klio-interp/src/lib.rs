@@ -3632,8 +3632,12 @@ impl Interpreter {
             Value::BoundUserMethod { receiver, method } => {
                 self.call_method(receiver, method, args, arg_names, out)
             }
-            Value::Class(class) => self
-                .construct_by_name_with_names(&class.name, args, arg_names, out),
+            Value::Class(class) => {
+                // Construct against the resolved ClassDef directly
+                // — nested classes aren't necessarily in the global
+                // class_table, so construct_by_name would fail.
+                self.construct_instance(class, args, arg_names, out)
+            }
             Value::BoundInnerClass { class, outer } => self.construct_instance_with_outer(
                 class,
                 args,
