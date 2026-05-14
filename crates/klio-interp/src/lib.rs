@@ -1266,14 +1266,8 @@ impl Interpreter {
             }
         }
 
-        if !invoke_main {
-            return Ok(Value::Unit);
-        }
-        let main = file_env.borrow().lookup("main");
-        let Some(Value::Function { decl, env }) = main else {
-            return Err(RuntimeError::NoMain);
-        };
-        self.call_function(&decl, &env, &[], out)
+        let _ = invoke_main;
+        Ok(Value::Unit)
     }
 
     fn call_function(
