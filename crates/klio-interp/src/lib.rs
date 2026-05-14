@@ -986,6 +986,34 @@ impl Interpreter {
     /// this interpreter for dispatch the IR evaluator cannot
     /// resolve standalone — top-level fn calls, member calls,
     /// instance construction.
+    /// Multi-file IR entry point — mirrors `run_ir` but accepts a
+    /// slice of `KotlinFile`. Registers every file's decls through
+    /// the bootstrap pass before locating `fun main` and driving
+    /// it through the IR evaluator.
+    pub fn run_module_ir(
+        &mut self,
+        files: &[KotlinFile],
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, String> {
+        if files.is_empty() {
+            return Err("no input files".into());
+        }
+        let main_idx = files.iter().position(|f| {
+            f.decls.iter().any(|d| {
+                matches!(d, klio_ast::Decl::Function(f) if f.name.name == "main")
+            })
+        });
+        for (i, file) in files.iter().enumerate() {
+            if Some(i) == main_idx {
+                continue;
+            }
+            self.run_with_output_impl(file, out, /*invoke_main=*/ false, /*persist=*/ true)
+                .map_err(|e| format!("bootstrap: {e}"))?;
+        }
+        let main_idx = main_idx.ok_or_else(|| "no `fun main` across the supplied files".to_string())?;
+        self.run_ir(&files[main_idx], out)
+    }
+
     pub fn run_ir(
         &mut self,
         file: &KotlinFile,
