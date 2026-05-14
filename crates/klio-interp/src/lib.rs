@@ -11331,7 +11331,8 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             | "compareBy" | "compareByDescending" | "naturalOrder" | "reverseOrder"
             | "thenBy" | "thenByDescending"
             // Sequence builders + common range helpers
-            | "sequenceOf" | "sequence" | "emptyList" | "emptyMap" | "emptySet"
+            | "sequenceOf" | "sequence" | "generateSequence" | "emptySequence"
+            | "emptyList" | "emptyMap" | "emptySet"
             | "lazyOf" | "lazy" | "buildList" | "buildSet" | "buildMap" | "buildString"
             | "println" | "print" | "readLine"
             | "minOf" | "maxOf" | "abs"
@@ -11727,6 +11728,18 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     pos: std::rc::Rc::new(std::cell::RefCell::new(0)),
                     prim: None,
                 });
+            }
+            (klio_runtime::Value::MapEntry { key, .. }, "component1") => {
+                return Ok((**key).clone());
+            }
+            (klio_runtime::Value::MapEntry { value, .. }, "component2") => {
+                return Ok((**value).clone());
+            }
+            (klio_runtime::Value::MapEntry { key, .. }, "key") => {
+                return Ok((**key).clone());
+            }
+            (klio_runtime::Value::MapEntry { value, .. }, "value") => {
+                return Ok((**value).clone());
             }
             (klio_runtime::Value::Map { entries, .. }, "iterator") => {
                 // `for (e in map)` walks the entries; each `e` is a
