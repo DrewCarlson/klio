@@ -349,6 +349,27 @@ pub fn lower_binary_expr_as_thunk(
     id
 }
 
+/// Lower an arbitrary expression as an N-arg IR function. Used to
+/// lift parent-ctor argument expressions whose scope is the child
+/// class's primary-ctor params.
+pub fn lower_expr_as_param_thunk(
+    module: &mut crate::Module,
+    params: &[&str],
+    expr: &Expr,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    bind_params(&mut b, params);
+    let v = lower_expr(&mut b, expr);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
 /// Lower a class init block as a 1-arg IR function whose only
 /// parameter binds `this`. Bare identifiers inside the body
 /// resolve through the supplied owner class + member set.

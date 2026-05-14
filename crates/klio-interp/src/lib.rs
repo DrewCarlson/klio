@@ -93,6 +93,10 @@ pub struct Interpreter {
     /// fast-path runs each one with `this` bound to the freshly
     /// allocated instance.
     class_init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    /// Per-class lowered parent-ctor-arg thunks. Each thunk takes
+    /// the child class's primary-ctor params in declaration order
+    /// and returns the value for one parent ctor arg.
+    class_parent_ctor_args: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     /// `@Retention` value declared on each annotation class (`SOURCE`,
     /// `BINARY`, or `RUNTIME`). Populated when an `annotation class`
     /// is registered. Drives whether the annotation surfaces through
@@ -333,6 +337,7 @@ impl Interpreter {
             instance_prop_getters: std::collections::HashMap::new(),
             instance_prop_setters: std::collections::HashMap::new(),
             class_init_blocks: std::collections::HashMap::new(),
+            class_parent_ctor_args: std::collections::HashMap::new(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
@@ -1114,6 +1119,35 @@ impl Interpreter {
                     if p.property.is_some() {
                         own_members.insert(p.name.name.clone());
                     }
+                }
+                // Parent-ctor args: lower each expression as an
+                // N-arg thunk whose params are the child's primary
+                // ctor params, so the new_instance fast-path can
+                // evaluate them by passing the child's primary args.
+                let primary_param_names: Vec<String> = c
+                    .primary_params
+                    .iter()
+                    .map(|p| p.name.name.clone())
+                    .collect();
+                let parent_args_expr: Option<&Vec<klio_ast::Expr>> = c
+                    .supertype_args
+                    .iter()
+                    .find_map(|a| a.as_ref());
+                if let Some(args) = parent_args_expr {
+                    let mut fids: Vec<klio_ir::FuncId> = Vec::with_capacity(args.len());
+                    let params_ref: Vec<&str> =
+                        primary_param_names.iter().map(|s| s.as_str()).collect();
+                    for (idx, e) in args.iter().enumerate() {
+                        let id = klio_ir::lower::lower_expr_as_param_thunk(
+                            &mut module,
+                            &params_ref,
+                            e,
+                            &format!("__parent_arg__{}#{}", c.name.name, idx),
+                        );
+                        fids.push(id);
+                    }
+                    self.class_parent_ctor_args
+                        .insert(c.name.name.clone(), fids);
                 }
                 // Init blocks: each `init { ... }` becomes its own
                 // 1-arg IR func taking `this`. The new_instance
@@ -14166,11 +14200,16 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                         .map_or(p.init_blocks.is_empty(), |fids| {
                             fids.len() == p.init_blocks.len()
                         });
-                    let p_ok = p.primary_params.is_empty()
-                        && parent_inits_lowered
+                    let parent_ctor_args_lowered = p.parent_ctor_args.is_empty()
+                        || self
+                            .interp
+                            .class_parent_ctor_args
+                            .get(&p.name)
+                            .map_or(false, |fids| fids.len() == p.parent_ctor_args.len());
+                    let p_ok = parent_inits_lowered
                         && p.body_properties.is_empty()
                         && p.secondary_ctors.is_empty()
-                        && p.parent_ctor_args.is_empty()
+                        && parent_ctor_args_lowered
                         && p.supertype_delegates.borrow().is_empty()
                         && p.delegate_forwarders.borrow().is_empty();
                     if !p_ok {
@@ -14188,6 +14227,12 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 .map_or(cls.init_blocks.is_empty(), |fids| {
                     fids.len() == cls.init_blocks.len()
                 });
+            let leaf_parent_ctor_args_lowered = cls.parent_ctor_args.is_empty()
+                || self
+                    .interp
+                    .class_parent_ctor_args
+                    .get(&name)
+                    .map_or(false, |fids| fids.len() == cls.parent_ctor_args.len());
             let simple = !cls.is_inner
                 && !cls.is_anonymous
                 && !cls.is_abstract
@@ -14196,7 +14241,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 && !cls.is_object
                 && init_blocks_lowered
                 && cls.secondary_ctors.is_empty()
-                && cls.parent_ctor_args.is_empty()
+                && leaf_parent_ctor_args_lowered
                 && cls.supertype_delegates.borrow().is_empty()
                 && cls.delegate_forwarders.borrow().is_empty()
                 && body_props_ok
@@ -14244,6 +14289,37 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     },
                 ));
                 let inst_val = klio_runtime::Value::Instance(inst);
+                let module = std::rc::Rc::clone(&self.module);
+                // Populate parent primary-ctor fields from lowered
+                // parent-arg thunks (when the leaf class declared
+                // `: Parent(arg, arg, …)` and Parent has primary
+                // params). Each thunk takes the child's primary
+                // args in declaration order.
+                if let Some(parent_arg_fids) =
+                    self.interp.class_parent_ctor_args.get(&name).cloned()
+                {
+                    if let Some(parent) = cls.parent.borrow().clone() {
+                        let mut parent_vals: Vec<klio_runtime::Value> =
+                            Vec::with_capacity(parent_arg_fids.len());
+                        for fid in &parent_arg_fids {
+                            let func = module.funcs[fid.0 as usize].clone();
+                            let v = klio_ir::eval::eval_with(
+                                &module,
+                                &func,
+                                args.to_vec(),
+                                self,
+                            )?;
+                            parent_vals.push(v);
+                        }
+                        if let klio_runtime::Value::Instance(inst_rc) = &inst_val {
+                            for (p, v) in parent.primary_params.iter().zip(parent_vals.iter()) {
+                                inst_rc
+                                    .borrow_mut()
+                                    .define(p.name.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
                 // Run parent-chain lowered init blocks first (root →
                 // child), then this class's. Each init is a 1-arg IR
                 // func taking `this`.
@@ -14261,7 +14337,6 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                         }
                     }
                 }
-                let module = std::rc::Rc::clone(&self.module);
                 for fid in parent_inits {
                     let func = module.funcs[fid.0 as usize].clone();
                     klio_ir::eval::eval_with(&module, &func, vec![inst_val.clone()], self)?;
