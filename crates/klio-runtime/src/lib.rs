@@ -73,6 +73,13 @@ pub enum Value {
         absorb_return: bool,
     },
     Intrinsic { fqn: &'static str, func: StdlibFn },
+    /// IR-side closure handle. Produced by the IR evaluator's
+    /// `Inst::Lambda` op via the Host's `build_closure` callback.
+    /// `id` is an opaque side-table key; the IR host resolves it
+    /// back to a `(module, body_func, captures)` triple at call
+    /// time. Distinct from `Value::Lambda` (which carries an AST
+    /// block + env tied to the tree walker).
+    IrClosure { id: u64, captures: Rc<Vec<Value>> },
     /// A method intrinsic bound to a specific receiver — produced by member
     /// access like `s.uppercase`. Calling it invokes `func` with the receiver
     /// prepended to the user arguments.
@@ -942,6 +949,7 @@ impl fmt::Debug for Value {
             }
             Self::Function { decl, .. } => write!(f, "Function({})", decl.name.name),
             Self::Lambda { params, .. } => write!(f, "Lambda(params={})", params.len()),
+            Self::IrClosure { id, captures } => write!(f, "IrClosure(id={id}, captures={})", captures.len()),
             Self::Intrinsic { fqn, .. } => write!(f, "Intrinsic({fqn})"),
             Self::BoundMethod { fqn, .. } => write!(f, "BoundMethod({fqn})"),
             Self::BoundUserMethod { receiver, method } => write!(
@@ -1037,6 +1045,7 @@ impl fmt::Display for Value {
             }
             Self::Function { decl, .. } => write!(f, "fun {}(...)", decl.name.name),
             Self::Lambda { .. } => write!(f, "{{lambda}}"),
+            Self::IrClosure { id, .. } => write!(f, "{{ir-closure#{id}}}"),
             Self::Intrinsic { fqn, .. } | Self::BoundMethod { fqn, .. } => {
                 write!(f, "fun {fqn}(...)")
             }
@@ -1433,6 +1442,7 @@ impl Value {
             },
             Self::Function { .. }
             | Self::Lambda { .. }
+            | Self::IrClosure { .. }
             | Self::Intrinsic { .. }
             | Self::BoundMethod { .. }
             | Self::BoundUserMethod { .. } => "kotlin.Function",
@@ -1572,6 +1582,7 @@ impl Value {
             Value::Comparator { .. } => matches!(name, "Comparator" | "Any"),
             Value::Function { .. }
             | Value::Lambda { .. }
+            | Value::IrClosure { .. }
             | Value::Intrinsic { .. }
             | Value::BoundMethod { .. }
             | Value::BoundUserMethod { .. } => {

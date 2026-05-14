@@ -213,8 +213,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 if let Some(r) = b.resolve(&segments[0].name) {
                     return r;
                 }
-                // Not a local — emit LoadGlobal so the host can
-                // resolve it against the interpreter's globals env.
+                // Lambda-body capture: name lives in an enclosing
+                // frame but not as a top-level global.
+                if b.knows_outer(&segments[0].name) {
+                    let idx = b.record_capture(&segments[0].name);
+                    let dst = b.alloc_reg();
+                    b.push(Inst::LoadCapture { dst, idx });
+                    // Bind the capture name to the freshly-loaded
+                    // reg so subsequent Path reads hit the local
+                    // path instead of re-emitting LoadCapture.
+                    b.bind(segments[0].name.clone(), dst);
+                    return dst;
+                }
+                // Not a local and not a known capture — emit
+                // LoadGlobal so the host resolves against the
+                // interpreter's globals env.
                 let dst = b.alloc_reg();
                 let name = b.module.intern_const(Const::String(segments[0].name.clone()));
                 b.push(Inst::LoadGlobal { dst, name });
@@ -413,13 +426,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             r
         }
         Expr::Lambda { params, body, .. } => {
-            // Lower the lambda body as its own Func added to the
-            // enclosing module. The Lambda inst at the call site
-            // carries the produced FuncId plus the captured-reg
-            // list; the evaluator snapshots the values at the
-            // capture site.
-            let captures: Vec<Reg> = b.captured_regs();
-            let body_func = lower_lambda_body(b.module, params, body);
+            // Snapshot the names visible to the enclosing builder
+            // so the lambda lowering can flag free references as
+            // captures.
+            let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let (body_func, captured_names) =
+                lower_lambda_body_capturing(b.module, params, body, outer_names);
+            // Resolve each captured name back to the *outer* reg.
+            // Names that the outer builder doesn't have locally
+            // bound (top-level globals, intrinsics) are dropped
+            // from the capture list — the lambda body will load
+            // them via LoadGlobal at call time.
+            let captures: Vec<Reg> = captured_names
+                .iter()
+                .filter_map(|n| b.resolve(n))
+                .collect();
             let dst = b.alloc_reg();
             b.push(Inst::Lambda { dst, body_func, captures });
             dst
@@ -538,17 +559,35 @@ fn lower_lambda_body(
     params: &[klio_ast::Ident],
     body: &klio_ast::Block,
 ) -> crate::FuncId {
+    let (id, _) =
+        lower_lambda_body_capturing(module, params, body, std::collections::HashSet::new());
+    id
+}
+
+/// Lower a lambda body, threading the enclosing builder's
+/// visible-name set so Path references that hit it lower to
+/// `LoadCapture`. Returns the body's `FuncId` plus the ordered
+/// list of captured names — the caller resolves each to an outer
+/// reg and ships it through `Inst::Lambda::captures`.
+fn lower_lambda_body_capturing(
+    module: &mut crate::Module,
+    params: &[klio_ast::Ident],
+    body: &klio_ast::Block,
+    outer: std::collections::HashSet<String>,
+) -> (crate::FuncId, Vec<String>) {
     let mut b = FuncBuilder::new(module);
+    b.set_outer_names(outer);
     let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
     bind_params(&mut b, &names);
     let result = lower_block(&mut b, body);
     b.terminate(Terminator::Return(Some(result)));
+    let captured = b.captures_taken().to_vec();
     let func = b.finish("<lambda>", "<lambda>", crate::TypeRef::unit());
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
     placed.id = id;
     module.funcs.push(placed);
-    id
+    (id, captured)
 }
 
 fn lower_for(

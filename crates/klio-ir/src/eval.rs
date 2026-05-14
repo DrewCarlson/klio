@@ -61,6 +61,20 @@ pub trait Host {
         None
     }
 
+    /// Materialise a closure value capturing the supplied snapshot
+    /// of register values. `body_func` is a FuncId in the active
+    /// module; concrete hosts build a `Value::Lambda` (or
+    /// equivalent) wrapping the body + env so it can be invoked
+    /// through `call_value`.
+    fn build_closure(
+        &mut self,
+        _module: &Module,
+        _body_func: FuncId,
+        _captures: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::build_closure"))
+    }
+
     /// Resolve a function call by FuncId. The default routes
     /// through `eval()` recursively, so a single-module IR program
     /// stays self-contained.
@@ -99,6 +113,7 @@ struct Frame<'a> {
     func: &'a Func,
     regs: Vec<Value>,
     params: Vec<Value>,
+    captures: Vec<Value>,
 }
 
 impl<'a> Frame<'a> {
@@ -108,6 +123,22 @@ impl<'a> Frame<'a> {
             func,
             regs: vec![Value::Unit; func.n_locals as usize],
             params,
+            captures: Vec::new(),
+        }
+    }
+
+    fn new_with_captures(
+        module: &'a Module,
+        func: &'a Func,
+        params: Vec<Value>,
+        captures: Vec<Value>,
+    ) -> Self {
+        Self {
+            module,
+            func,
+            regs: vec![Value::Unit; func.n_locals as usize],
+            params,
+            captures,
         }
     }
 
@@ -145,7 +176,20 @@ pub fn eval_with(
     args: Vec<Value>,
     host: &mut dyn Host,
 ) -> Result<Value, EvalError> {
-    let mut frame = Frame::new(module, func, args);
+    eval_with_captures(module, func, args, Vec::new(), host)
+}
+
+/// Like `eval_with` but seeds the frame with a captured-values
+/// vector. Used by closure invocation so `Inst::LoadCapture` reads
+/// from the closure's snapshotted env rather than the call args.
+pub fn eval_with_captures(
+    module: &Module,
+    func: &Func,
+    args: Vec<Value>,
+    captures: Vec<Value>,
+    host: &mut dyn Host,
+) -> Result<Value, EvalError> {
+    let mut frame = Frame::new_with_captures(module, func, args, captures);
     let mut cur = func.entry;
     loop {
         // Clone the per-block instruction slice + terminator so the
@@ -302,10 +346,10 @@ fn exec_inst(
                 )));
             }
         }
-        Inst::Lambda { .. } => {
-            return Err(EvalError::Unsupported(
-                "Inst::Lambda — closure construction requires host integration",
-            ));
+        Inst::Lambda { dst, body_func, captures } => {
+            let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
+            let v = host.build_closure(frame.module, *body_func, cap_values)?;
+            frame.write(*dst, v);
         }
         Inst::LoadGlobal { dst, name } => {
             let name_str = match &frame.module.consts[name.0 as usize] {
@@ -317,11 +361,16 @@ fn exec_inst(
                 .ok_or_else(|| EvalError::Type(format!("unresolved global `{name_str}`")))?;
             frame.write(*dst, v);
         }
-        Inst::LoadCapture { dst, idx: _ } => {
-            // Captures need host integration to materialise; for now
-            // surface a clear error.
-            let _ = dst;
-            return Err(EvalError::Unsupported("Inst::LoadCapture"));
+        Inst::LoadCapture { dst, idx } => {
+            // Captures live in the frame's separate captures vec —
+            // distinct from positional params so the closure body
+            // can index by its own capture order.
+            let v = frame
+                .captures
+                .get(*idx as usize)
+                .cloned()
+                .unwrap_or(Value::Unit);
+            frame.write(*dst, v);
         }
         Inst::Index { dst, receiver, index } => {
             let r = frame.read(*receiver);

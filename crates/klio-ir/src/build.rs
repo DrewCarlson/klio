@@ -20,6 +20,15 @@ pub struct FuncBuilder<'a> {
     /// bindings; lowering pushes a fresh frame per block expression
     /// so val/var declarations are popped correctly.
     scopes: Vec<std::collections::HashMap<String, Reg>>,
+    /// Names visible to the function but living in an enclosing
+    /// frame. Lowering a lambda body seeds these from the outer
+    /// FuncBuilder's scope chain; references to them lower as
+    /// `LoadCapture` insts and record the capture-name so the
+    /// lambda-construction site knows which outer registers to
+    /// snapshot.
+    outer_names: std::collections::HashSet<String>,
+    capture_order: Vec<String>,
+    capture_regs: std::collections::HashMap<String, Reg>,
     /// Loop context stack. Each frame names the loop's continue
     /// target (header / latch) and break target (exit). The frame's
     /// optional `label` matches an explicit `break@label` /
@@ -48,7 +57,55 @@ impl<'a> FuncBuilder<'a> {
             next_reg: 0,
             scopes: vec![std::collections::HashMap::new()],
             loops: Vec::new(),
+            outer_names: std::collections::HashSet::new(),
+            capture_order: Vec::new(),
+            capture_regs: std::collections::HashMap::new(),
         }
+    }
+
+    /// Seed the captured-name set for a nested function builder
+    /// (lambda body). When the lambda body's lowering hits a
+    /// `Path { name }` that does not resolve locally but appears
+    /// in `outer_names`, lowering emits a `LoadCapture` and
+    /// records the name in `capture_order` so the enclosing
+    /// `Inst::Lambda` knows which outer regs to snapshot.
+    pub fn set_outer_names(&mut self, names: std::collections::HashSet<String>) {
+        self.outer_names = names;
+    }
+
+    /// Record a capture reference encountered during lowering.
+    /// Returns the per-lambda capture index. Idempotent for the
+    /// same name.
+    pub fn record_capture(&mut self, name: &str) -> u16 {
+        if let Some(&r) = self.capture_regs.get(name) {
+            // Already captured at this reg — return its index.
+            return self
+                .capture_order
+                .iter()
+                .position(|n| n == name)
+                .map(|i| i as u16)
+                .unwrap_or(0);
+        }
+        let idx = self.capture_order.len() as u16;
+        self.capture_order.push(name.to_string());
+        // Allocate a reg the lambda body will write LoadCapture into.
+        let r = self.alloc_reg();
+        self.capture_regs.insert(name.to_string(), r);
+        idx
+    }
+
+    /// True when a name names an outer-frame capture this builder
+    /// is allowed to reference.
+    #[must_use]
+    pub fn knows_outer(&self, name: &str) -> bool {
+        self.outer_names.contains(name)
+    }
+
+    /// Capture-name list in declaration order. Used by the
+    /// lambda-construction site to materialise the corresponding
+    /// outer registers.
+    pub fn captures_taken(&self) -> &[String] {
+        &self.capture_order
     }
 
     pub fn push_loop(&mut self, label: Option<String>, cont_t: BlockId, brk_t: BlockId) {
@@ -108,6 +165,18 @@ impl<'a> FuncBuilder<'a> {
             }
         }
         out.sort_by_key(|r| r.0);
+        out
+    }
+
+    /// Names currently visible across the live scope chain.
+    #[must_use]
+    pub fn visible_names(&self) -> std::collections::HashSet<String> {
+        let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for frame in &self.scopes {
+            for k in frame.keys() {
+                out.insert(k.clone());
+            }
+        }
         out
     }
 

@@ -714,7 +714,12 @@ impl Interpreter {
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        let mut host = IrHost { interp: self, out, class_names };
+        let mut host = IrHost {
+            interp: self,
+            out,
+            class_names,
+            closures: Vec::new(),
+        };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host)
             .map_err(|e| format!("ir eval: {e}"))
     }
@@ -10759,6 +10764,17 @@ struct IrHost<'a> {
     /// against the interpreter's class_table without re-walking
     /// the IR module.
     class_names: Vec<String>,
+    /// Closure side-table — Value::IrClosure carries the slot id;
+    /// the host materialises (module_ptr, body_func) at call time.
+    closures: Vec<IrClosureSlot>,
+}
+
+#[derive(Clone)]
+struct IrClosureSlot {
+    body_func: klio_ir::FuncId,
+    // The module pointer lives inside run_ir; we stash a raw clone
+    // since IR Module is Clone. Captures travel with the value.
+    module: std::rc::Rc<klio_ir::Module>,
 }
 
 impl<'a> klio_ir::eval::Host for IrHost<'a> {
@@ -10771,10 +10787,77 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         callee: &klio_runtime::Value,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // IrClosure callees dispatch back into the IR evaluator
+        // with captures appended to the positional args.
+        if let klio_runtime::Value::IrClosure { id, captures } = callee {
+            let slot = self
+                .closures
+                .get(*id as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
+                })?;
+            let body = slot.module.funcs[slot.body_func.0 as usize].clone();
+            let mut child = IrHost {
+                interp: self.interp,
+                out: self.out,
+                class_names: self.class_names.clone(),
+                closures: self.closures.clone(),
+            };
+            return klio_ir::eval::eval_with_captures(
+                &slot.module,
+                &body,
+                args.to_vec(),
+                captures.iter().cloned().collect(),
+                &mut child,
+            );
+        }
         let names: Vec<Option<String>> = vec![None; args.len()];
         self.interp
             .invoke_callable_value(callee, args, &names, self.out)
             .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
+    }
+
+    fn build_closure(
+        &mut self,
+        module: &klio_ir::Module,
+        body_func: klio_ir::FuncId,
+        captures: Vec<klio_runtime::Value>,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let id = self.closures.len() as u64;
+        self.closures.push(IrClosureSlot {
+            body_func,
+            module: std::rc::Rc::new(module.clone()),
+        });
+        Ok(klio_runtime::Value::IrClosure {
+            id,
+            captures: std::rc::Rc::new(captures),
+        })
+    }
+
+    fn call_func(
+        &mut self,
+        module: &klio_ir::Module,
+        func: klio_ir::FuncId,
+        args: Vec<klio_runtime::Value>,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Override the trait default (which calls `eval` with a
+        // NullHost) so nested function calls keep flowing through
+        // *this* IrHost — otherwise CallValue/CallMember inside
+        // the called fn would error with the default Host's
+        // "unsupported" message.
+        let f = module
+            .funcs
+            .get(func.0 as usize)
+            .ok_or_else(|| klio_ir::eval::EvalError::Type(format!("unknown FuncId {}", func.0)))?
+            .clone();
+        let mut child = IrHost {
+            interp: self.interp,
+            out: self.out,
+            class_names: self.class_names.clone(),
+            closures: self.closures.clone(),
+        };
+        klio_ir::eval::eval_with(module, &f, args, &mut child)
     }
 
     fn call_member(
