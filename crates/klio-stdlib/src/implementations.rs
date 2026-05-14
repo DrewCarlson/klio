@@ -601,6 +601,24 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableSet.forEach", coll_iter_for_each),
     ("kotlin.collections.Map.forEach", coll_iter_for_each),
     ("kotlin.collections.MutableMap.forEach", coll_iter_for_each),
+    ("kotlin.collections.List.map", coll_iter_map),
+    ("kotlin.collections.MutableList.map", coll_iter_map),
+    ("kotlin.collections.Set.map", coll_iter_map),
+    ("kotlin.collections.MutableSet.map", coll_iter_map),
+    ("kotlin.collections.Map.map", coll_iter_map),
+    ("kotlin.collections.MutableMap.map", coll_iter_map),
+    ("kotlin.collections.List.filter", coll_iter_filter),
+    ("kotlin.collections.MutableList.filter", coll_iter_filter),
+    ("kotlin.collections.Set.filter", coll_iter_filter),
+    ("kotlin.collections.MutableSet.filter", coll_iter_filter),
+    ("kotlin.collections.Map.filter", coll_iter_filter),
+    ("kotlin.collections.MutableMap.filter", coll_iter_filter),
+    ("kotlin.collections.List.filterNot", coll_iter_filter_not),
+    ("kotlin.collections.MutableList.filterNot", coll_iter_filter_not),
+    ("kotlin.collections.Set.filterNot", coll_iter_filter_not),
+    ("kotlin.collections.MutableSet.filterNot", coll_iter_filter_not),
+    ("kotlin.collections.Map.filterNot", coll_iter_filter_not),
+    ("kotlin.collections.MutableMap.filterNot", coll_iter_filter_not),
 
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
@@ -874,6 +892,54 @@ fn coll_iter_for_each(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
     }
     Ok(Value::Unit)
+}
+
+fn coll_iter_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("map expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "map")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::with_capacity(items.len());
+    for v in items {
+        result.push(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?);
+    }
+    Ok(make_list(result, false))
+}
+
+fn coll_iter_filter(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("filter expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "filter")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if matches!(r, Value::Bool(true)) {
+            result.push(v);
+        }
+    }
+    Ok(make_list(result, false))
+}
+
+fn coll_iter_filter_not(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("filterNot expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "filterNot")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if matches!(r, Value::Bool(false)) {
+            result.push(v);
+        }
+    }
+    Ok(make_list(result, false))
 }
 
 fn scope_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
