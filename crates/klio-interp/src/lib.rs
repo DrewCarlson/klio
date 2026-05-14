@@ -11898,32 +11898,17 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // rather than registered intrinsics. Return a sentinel so
         // call_value can route them through eval_via_ast below.
         match name {
-            "repeat" | "let" | "apply" | "also" | "with" | "run"
-            | "takeIf" | "takeUnless" | "require" | "check"
-            | "requireNotNull" | "checkNotNull" | "error" | "TODO"
-            | "listOf" | "mutableListOf" | "arrayOf" | "setOf"
-            | "mapOf" | "mutableMapOf" | "mutableSetOf"
-            // Built-in array constructors (one-arg + init-lambda forms).
-            | "IntArray" | "LongArray" | "ShortArray" | "ByteArray"
-            | "DoubleArray" | "FloatArray" | "BooleanArray" | "CharArray"
+            "require" | "check" | "requireNotNull" | "checkNotNull" | "error" | "TODO"
+            // UInt variants not yet host-bound
             | "UIntArray" | "ULongArray" | "UShortArray" | "UByteArray"
-            | "Array"
-            // Pair / Triple / `to` infix
-            | "Pair" | "Triple" | "to"
-            // kotlin.comparisons + ranges helpers
-            | "compareBy" | "compareByDescending" | "naturalOrder" | "reverseOrder"
+            // Comparator-shaped helpers requiring lambda steps
             | "thenBy" | "thenByDescending"
-            | "compareValues" | "compareValuesBy" | "Comparator"
-            | "runCatching" | "Result"
-            // Sequence builders + common range helpers
-            | "sequenceOf" | "sequence" | "generateSequence" | "emptySequence"
-            | "emptyList" | "emptyMap" | "emptySet"
-            | "intArrayOf" | "longArrayOf" | "shortArrayOf" | "byteArrayOf"
-            | "doubleArrayOf" | "floatArrayOf" | "booleanArrayOf" | "charArrayOf"
-            | "uintArrayOf" | "ulongArrayOf" | "ushortArrayOf" | "ubyteArrayOf"
+            | "compareValuesBy" | "Comparator"
+            | "naturalOrder" | "reverseOrder"
+            | "Result"
+            // Sequence builder lambda form
+            | "sequence"
             | "lazyOf" | "lazy" | "buildList" | "buildSet" | "buildMap" | "buildString"
-            | "println" | "print" | "readLine"
-            | "minOf" | "maxOf" | "abs"
             | "synchronized"
             | "tailrec"
             | "objects" => {
