@@ -11164,6 +11164,13 @@ pub fn invoke_ir_closure(
 
 /// Bridge the IR evaluator back to this interpreter for dispatch
 /// that requires the real class table / dispatch machinery.
+fn ir_err(e: klio_runtime::RuntimeError) -> klio_ir::eval::EvalError {
+    match e {
+        klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
+        other => klio_ir::eval::EvalError::Type(other.to_string()),
+    }
+}
+
 struct IrHost<'a> {
     interp: &'a mut Interpreter,
     out: &'a mut dyn Output,
@@ -11384,7 +11391,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             return self
                 .interp
                 .invoke_named_member_call_with_names(receiver, name, args, arg_names, self.out)
-                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                .map_err(ir_err);
         }
         self.call_member(receiver, name, args)
     }
@@ -11402,7 +11409,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             return self
                 .interp
                 .construct_by_name("NullPointerException", args, self.out)
-                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                .map_err(ir_err);
         }
         let name = self
             .class_names
@@ -11433,7 +11440,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     return self
                         .interp
                         .invoke_named_intrinsic_with_names(&name, args, arg_names, self.out)
-                        .map_err(|e2| klio_ir::eval::EvalError::Type(e2.to_string()));
+                        .map_err(ir_err);
                 }
                 Err(klio_ir::eval::EvalError::Type(msg))
             }
@@ -11460,7 +11467,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 return self
                     .interp
                     .invoke_named_intrinsic(simple, args, self.out)
-                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                    .map_err(ir_err);
             }
             match *fqn {
                 "__klio_intrinsic_runBlocking" => {
@@ -11481,7 +11488,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     return self
                         .interp
                         .run_blocking(&args[0], self.out)
-                        .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                        .map_err(ir_err);
                 }
                 "__klio_intrinsic_suspendCoroutine" => {
                     if args.len() != 1 {
@@ -11492,7 +11499,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     return self
                         .interp
                         .eval_suspend_coroutine(&args[0], self.out)
-                        .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                        .map_err(ir_err);
                 }
                 _ => {}
             }
@@ -11508,7 +11515,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 return self
                     .interp
                     .invoke_named_intrinsic(&name, args, self.out)
-                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                    .map_err(ir_err);
             }
         }
         // Value::Class callee → constructor call. Dispatch through
@@ -11519,7 +11526,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             return self
                 .interp
                 .construct_by_name(&class.name, args, self.out)
-                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                .map_err(ir_err);
         }
         // IrClosure callees dispatch back into the IR evaluator
         // with captures appended to the positional args.
@@ -11558,7 +11565,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         let names: Vec<Option<String>> = vec![None; args.len()];
         self.interp
             .invoke_callable_value(callee, args, &names, self.out)
-            .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
+            .map_err(ir_err)
     }
 
     fn build_ast_lambda(
@@ -11649,7 +11656,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             return self
                 .interp
                 .invoke_named_intrinsic_with_names(&name, &args, arg_names, self.out)
-                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                .map_err(ir_err);
         }
         let f = f.clone();
         let mut child = IrHost {
@@ -11700,7 +11707,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 let items = self
                     .interp
                     .materialize_sequence_pub(data, self.out)
-                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))?;
+                    .map_err(ir_err)?;
                 return Ok(klio_runtime::Value::Iterator {
                     items: std::rc::Rc::new(std::cell::RefCell::new(items)),
                     pos: std::rc::Rc::new(std::cell::RefCell::new(0)),
@@ -11821,7 +11828,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 all.extend_from_slice(args);
                 let mut ctx = CallCtx { args: &all, out: self.out };
                 return func(&mut ctx)
-                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                    .map_err(ir_err);
             }
             let class = Rc::clone(&inst.borrow().class);
             // Use arg-type-aware overload pick when the first
@@ -11836,7 +11843,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 return self
                     .interp
                     .call_method(inst, &method, args, &names, self.out)
-                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                    .map_err(ir_err);
             }
         }
         // Companion / static-style call: `Foo.barMethod(args)` ―
@@ -11850,7 +11857,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     return self
                         .interp
                         .call_method(&comp_inst, &method, args, &names, self.out)
-                        .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                        .map_err(ir_err);
                 }
             }
             // Top-level intrinsic registered as `<ClassFqn>.<name>`.
@@ -11858,7 +11865,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             if let Some(func) = self.interp.lookup_intrinsic(&fqn) {
                 let mut ctx = CallCtx { args, out: self.out };
                 return func(&mut ctx)
-                    .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                    .map_err(ir_err);
             }
         }
         if args.is_empty() {
@@ -11875,7 +11882,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             return self
                 .interp
                 .invoke_named_member_call(receiver, name, args, self.out)
-                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                .map_err(ir_err);
         }
         // Extension-style intrinsic on a value type.
         let type_fqn = receiver.type_fqn();
@@ -11886,7 +11893,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             all.extend_from_slice(args);
             let mut ctx = CallCtx { args: &all, out: self.out };
             return func(&mut ctx)
-                .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                .map_err(ir_err);
         }
         // Last resort: synthesise the call through the tree
         // walker's full member-dispatch path, which picks up
@@ -11910,7 +11917,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // extension props all fire correctly.
         self.interp
             .eval_property_access(receiver.clone(), name, self.out)
-            .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
+            .map_err(ir_err)
     }
 
     fn store_global(
@@ -11920,7 +11927,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
     ) -> Result<(), klio_ir::eval::EvalError> {
         self.interp
             .assign_top_level_pub(name, value, self.out)
-            .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
+            .map_err(ir_err)
     }
 
     fn set_field(
@@ -11963,7 +11970,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     return self
                         .interp
                         .write_instance_property_pub(inst, &p, value, self.out)
-                        .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                        .map_err(ir_err);
                 }
                 inst.borrow_mut().define(name, value);
                 Ok(())
@@ -12008,7 +12015,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             .clone();
         self.interp
             .construct_by_name(&name, args, self.out)
-            .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
+            .map_err(ir_err)
     }
 }
 
