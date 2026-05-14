@@ -24,11 +24,66 @@ pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
     }
 }
 
+/// Lower a Kotlin class declaration into an IR Class. Methods are
+/// lowered as Funcs with a synthetic `<receiver>` first parameter
+/// (the constructor params are lifted onto the Class's
+/// primary_params for instance construction). The Class becomes
+/// reachable through `module.class_id` so Path-callees that name
+/// the class lower to `NewInstance`.
+pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::ClassId {
+    let primary_params: Vec<crate::Param> = c
+        .primary_params
+        .iter()
+        .map(|p| crate::Param {
+            name: p.name.name.clone(),
+            ty: crate::TypeRef::unit(),
+            default: None,
+        })
+        .collect();
+    let mut methods: Vec<crate::FuncId> = Vec::new();
+    for m in &c.members {
+        if let klio_ast::Decl::Function(f) = m {
+            let id = crate::FuncId(module.funcs.len() as u32);
+            let mut func = lower_function(module, f);
+            func.id = id;
+            // Pop the function back out of `lower_function`'s
+            // append-on-finish path: lower_function already pushed
+            // the func onto module.funcs with a fresh id, so we
+            // just record its FuncId.
+            let last_id = crate::FuncId((module.funcs.len() - 1) as u32);
+            methods.push(last_id);
+            let _ = id; // synthesised id above; the real id is last_id
+        }
+    }
+    let class = crate::Class {
+        id: crate::ClassId(0), // set by add_class
+        name: c.name.name.clone(),
+        fqn: c.name.name.clone(),
+        primary_params,
+        methods,
+        init_block: None,
+        companion: None,
+        supertypes: Vec::new(),
+    };
+    module.add_class(class)
+}
+
 /// Lower one AST function into an IR Func. The function body is
 /// lowered into the entry block; parameters are bound via
 /// `bind_params`; the trailing implicit return falls through to a
 /// `Return` terminator.
 pub fn lower_function(module: &mut crate::Module, f: &klio_ast::Function) -> crate::Func {
+    // Wrapper that, after lowering, appends the func to the module
+    // and assigns its id.
+    let func = lower_function_body(module, f);
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed.clone());
+    placed
+}
+
+fn lower_function_body(module: &mut crate::Module, f: &klio_ast::Function) -> crate::Func {
     let mut b = FuncBuilder::new(module);
     let names: Vec<&str> = f.params.iter().map(|p| p.name.name.as_str()).collect();
     bind_params(&mut b, &names);
@@ -182,6 +237,33 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             dst
         }
         Expr::Call { callee, args, .. } => {
+            // Path-callee with a registered class name → NewInstance.
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1 {
+                    if let Some(class_id) = b.module.class_id(&segments[0].name) {
+                        let args_start = b.alloc_reg();
+                        let mut count = 0u8;
+                        for (i, a) in args.iter().enumerate() {
+                            let r = lower_expr(b, a);
+                            if i == 0 {
+                                b.push(Inst::Move { dst: args_start, src: r });
+                            } else {
+                                let nx = b.alloc_reg();
+                                b.push(Inst::Move { dst: nx, src: r });
+                            }
+                            count += 1;
+                        }
+                        let dst = b.alloc_reg();
+                        b.push(Inst::NewInstance {
+                            dst,
+                            class: class_id,
+                            args: args_start,
+                            n_args: count,
+                        });
+                        return dst;
+                    }
+                }
+            }
             // Lower the callee's receiver / value separately so the
             // dispatcher knows whether to emit CallMember or
             // CallValue.

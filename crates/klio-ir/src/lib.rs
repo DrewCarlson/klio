@@ -207,8 +207,32 @@ pub struct Module {
     pub consts: Vec<Const>,
     /// Top-level (file-scope) function ids, in declaration order.
     pub top_level: Vec<FuncId>,
+    /// Top-level class declarations by simple name → ClassId. The
+    /// lowering pass populates this so `Foo(args)` Calls become
+    /// `NewInstance` instructions when `Foo` resolves to a class.
+    pub class_index: Vec<(String, ClassId)>,
     /// Package path for FQN qualification.
     pub package: Option<String>,
+}
+
+impl Module {
+    /// Look up a class by simple name.
+    #[must_use]
+    pub fn class_id(&self, name: &str) -> Option<ClassId> {
+        self.class_index
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+    }
+
+    /// Register a class declaration and return its id.
+    pub fn add_class(&mut self, mut class: Class) -> ClassId {
+        let id = ClassId(self.classes.len() as u32);
+        class.id = id;
+        self.class_index.push((class.name.clone(), id));
+        self.classes.push(class);
+        id
+    }
 }
 
 /// Constant pool entry. Anything not representable as a `u32`
