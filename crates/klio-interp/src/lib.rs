@@ -526,6 +526,7 @@ impl Interpreter {
             out,
             class_names,
             closures: Vec::new(),
+            module: std::rc::Rc::clone(&slot.module),
         };
         klio_ir::eval::eval_with_captures(
             &slot.module,
@@ -928,13 +929,15 @@ impl Interpreter {
             .iter()
             .map(|c| c.name.clone())
             .collect();
+        let module_rc = std::rc::Rc::new(module);
         let mut host = IrHost {
             interp: self,
             out,
             class_names,
             closures: Vec::new(),
+            module: std::rc::Rc::clone(&module_rc),
         };
-        klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host)
+        klio_ir::eval::eval_with(&module_rc, &func, Vec::new(), &mut host)
             .map_err(|e| {
                 // Strip the "IR type error: " prefix the evaluator
                 // adds so the message format matches the tree
@@ -11323,6 +11326,10 @@ struct IrHost<'a> {
     /// Closure side-table — Value::IrClosure carries the slot id;
     /// the host materialises (module_ptr, body_func) at call time.
     closures: Vec<IrClosureSlot>,
+    /// The active IR module. Held so member-call dispatch can
+    /// consult class method FuncIds (and similar IR-side
+    /// metadata) without re-walking the module each call.
+    module: std::rc::Rc<klio_ir::Module>,
 }
 
 #[derive(Clone)]
@@ -11748,6 +11755,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 out: self.out,
                 class_names: self.class_names.clone(),
                 closures: self.closures.clone(),
+                module: std::rc::Rc::clone(&self.module),
             };
             return klio_ir::eval::eval_with_captures(
                 &slot.module,
@@ -11914,6 +11922,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             out: self.out,
             class_names: self.class_names.clone(),
             closures: self.closures.clone(),
+            module: std::rc::Rc::clone(&self.module),
         };
         klio_ir::eval::eval_with(module, &f, args, &mut child)
     }
