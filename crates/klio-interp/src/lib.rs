@@ -12748,6 +12748,25 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         if matches!(value, klio_runtime::Value::Null) {
             return ty.nullable;
         }
+        // User exception classes — open class MyErr : RuntimeException()
+        // — should answer `is Exception` / `is Throwable` true even
+        // though those types aren't named in the runtime's
+        // supertype-name list for Instance. Walk the class chain
+        // looking for any Throwable-rooted supertype name.
+        if matches!(ty.name.as_str(), "Throwable" | "Exception" | "RuntimeException" | "Error") {
+            if let klio_runtime::Value::Instance(inst) = value {
+                let class = std::rc::Rc::clone(&inst.borrow().class);
+                let mut current = Some(class);
+                while let Some(c) = current {
+                    for st in &c.supertype_names {
+                        if matches!(st.as_str(), "Throwable" | "Exception" | "RuntimeException" | "Error") {
+                            return true;
+                        }
+                    }
+                    current = c.parent.borrow().clone();
+                }
+            }
+        }
         // Route through the runtime's nominal-type machinery so
         // throw/catch and is/as semantics see subtype hierarchies
         // (RuntimeException is-a Exception is-a Throwable) and
