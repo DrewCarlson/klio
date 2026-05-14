@@ -693,6 +693,30 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.associateWith", coll_iter_associate_with),
     ("kotlin.collections.Set.associateWith", coll_iter_associate_with),
     ("kotlin.collections.MutableSet.associateWith", coll_iter_associate_with),
+    ("kotlin.collections.List.sortedBy", coll_iter_sorted_by),
+    ("kotlin.collections.MutableList.sortedBy", coll_iter_sorted_by),
+    ("kotlin.collections.Set.sortedBy", coll_iter_sorted_by),
+    ("kotlin.collections.MutableSet.sortedBy", coll_iter_sorted_by),
+    ("kotlin.collections.List.sortedByDescending", coll_iter_sorted_by_desc),
+    ("kotlin.collections.MutableList.sortedByDescending", coll_iter_sorted_by_desc),
+    ("kotlin.collections.Set.sortedByDescending", coll_iter_sorted_by_desc),
+    ("kotlin.collections.MutableSet.sortedByDescending", coll_iter_sorted_by_desc),
+    ("kotlin.collections.List.maxOf", coll_iter_max_of),
+    ("kotlin.collections.MutableList.maxOf", coll_iter_max_of),
+    ("kotlin.collections.Set.maxOf", coll_iter_max_of),
+    ("kotlin.collections.MutableSet.maxOf", coll_iter_max_of),
+    ("kotlin.collections.List.minOf", coll_iter_min_of),
+    ("kotlin.collections.MutableList.minOf", coll_iter_min_of),
+    ("kotlin.collections.Set.minOf", coll_iter_min_of),
+    ("kotlin.collections.MutableSet.minOf", coll_iter_min_of),
+    ("kotlin.collections.List.onEach", coll_iter_on_each),
+    ("kotlin.collections.MutableList.onEach", coll_iter_on_each),
+    ("kotlin.collections.Set.onEach", coll_iter_on_each),
+    ("kotlin.collections.MutableSet.onEach", coll_iter_on_each),
+    ("kotlin.collections.List.mapNotNull", coll_iter_map_not_null),
+    ("kotlin.collections.MutableList.mapNotNull", coll_iter_map_not_null),
+    ("kotlin.collections.Set.mapNotNull", coll_iter_map_not_null),
+    ("kotlin.collections.MutableSet.mapNotNull", coll_iter_map_not_null),
 
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
@@ -1305,6 +1329,114 @@ fn coll_iter_associate_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
     }
     Ok(make_map(entries, false))
+}
+
+fn coll_iter_sorted_by_impl(ctx: &mut CallCtx, descending: bool, what: &str) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity(format!("{what} expects (receiver, block)")));
+    }
+    let items = iterable_items(&ctx.args[0], what)?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+    for v in items {
+        let key = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        keyed.push((key, v));
+    }
+    let mut err: Option<RuntimeError> = None;
+    keyed.sort_by(|a, b| {
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match compare_values(&a.0, &b.0) {
+            Ok(o) => if descending { o.reverse() } else { o },
+            Err(e) => {
+                err = Some(e);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(make_list(keyed.into_iter().map(|(_, v)| v).collect(), false))
+}
+
+fn coll_iter_sorted_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    coll_iter_sorted_by_impl(ctx, false, "sortedBy")
+}
+
+fn coll_iter_sorted_by_desc(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    coll_iter_sorted_by_impl(ctx, true, "sortedByDescending")
+}
+
+fn coll_iter_extreme(ctx: &mut CallCtx, want_max: bool, what: &str) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity(format!("{what} expects (receiver, block)")));
+    }
+    let items = iterable_items(&ctx.args[0], what)?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut best: Option<Value> = None;
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        best = Some(match best {
+            None => r,
+            Some(a) => {
+                let ord = compare_values(&a, &r)?;
+                match (want_max, ord) {
+                    (true, std::cmp::Ordering::Less) => r,
+                    (true, _) => a,
+                    (false, std::cmp::Ordering::Greater) => r,
+                    (false, _) => a,
+                }
+            }
+        });
+    }
+    best.ok_or_else(|| RuntimeError::Thrown(Value::Exception {
+        fqn: Rc::new("kotlin.NoSuchElementException".into()),
+        message: Some(Rc::new("Collection is empty.".into())),
+        cause: None,
+    }))
+}
+
+fn coll_iter_max_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    coll_iter_extreme(ctx, true, "maxOf")
+}
+
+fn coll_iter_min_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    coll_iter_extreme(ctx, false, "minOf")
+}
+
+fn coll_iter_on_each(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("onEach expects (receiver, block)".into()));
+    }
+    let recv = ctx.args[0].clone();
+    let items = iterable_items(&recv, "onEach")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for v in items {
+        host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+    }
+    Ok(recv)
+}
+
+fn coll_iter_map_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("mapNotNull expects (receiver, block)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "mapNotNull")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = Vec::new();
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        if !matches!(r, Value::Null) {
+            result.push(r);
+        }
+    }
+    Ok(make_list(result, false))
 }
 
 fn coll_iter_find(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

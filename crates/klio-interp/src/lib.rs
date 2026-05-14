@@ -6289,6 +6289,7 @@ impl Interpreter {
                 "forEach" | "map" | "filter" | "filterNot" | "any" | "all" | "none" | "find"
                 | "reduce" | "sumOf" | "takeWhile" | "dropWhile" | "partition" | "distinctBy"
                 | "flatMap" | "groupBy" | "associate" | "associateBy" | "associateWith"
+                | "sortedBy" | "sortedByDescending" | "maxOf" | "minOf" | "onEach" | "mapNotNull"
             ) && args.len() == 1;
             let fold_shape = name == "fold" && args.len() == 2;
             if single_lambda || fold_shape {
