@@ -51,6 +51,10 @@ pub struct FuncBuilder<'a> {
     /// operand the same way the tree walker does, so
     /// `(0.0 as Any) == (-0.0 as Any)` uses bitwise compare.
     any_typed_locals: std::collections::HashSet<String>,
+    /// When the function is a class method, the simple name of
+    /// the owning class. Used by `super.method()` lowering to
+    /// emit `Inst::CallSuper` with the right starting class.
+    owner_class: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +86,7 @@ impl<'a> FuncBuilder<'a> {
             mutables: std::collections::HashSet::new(),
             mutable_homes: std::collections::HashMap::new(),
             any_typed_locals: std::collections::HashSet::new(),
+            owner_class: None,
         }
     }
 
@@ -209,6 +214,13 @@ impl<'a> FuncBuilder<'a> {
     /// fall back to module-level lookup (top-level functions,
     /// imports, etc.).
     #[must_use]
+    pub fn set_owner_class(&mut self, name: String) {
+        self.owner_class = Some(name);
+    }
+    pub fn owner_class(&self) -> Option<&str> {
+        self.owner_class.as_deref()
+    }
+
     pub fn resolve(&self, name: &str) -> Option<Reg> {
         for frame in self.scopes.iter().rev() {
             if let Some(r) = frame.get(name) {

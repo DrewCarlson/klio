@@ -185,6 +185,20 @@ pub trait Host {
     /// module; concrete hosts build a `Value::Lambda` (or
     /// equivalent) wrapping the body + env so it can be invoked
     /// through `call_value`.
+    /// Dispatch `super.name(args)` on `receiver` against the
+    /// parent of `owner_class`. Hosts walk the parent chain and
+    /// invoke the matching method body.
+    fn call_super(
+        &mut self,
+        _receiver: &Value,
+        _owner_class: &str,
+        _name: &str,
+        _args: &[Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::call_super"))
+    }
+
     /// Read a captured variable's current value out of a
     /// `Value::Lambda`'s env. Used after closure-mutating calls
     /// to sync writes back into the caller's regs.
@@ -632,6 +646,21 @@ fn exec_inst(
                 }
             }
             let result = host.call_value_named(&callee_v, &arg_values, &effective_names)?;
+            frame.write(*dst, result);
+        }
+        Inst::CallSuper { dst, receiver, owner_class, name, args, n_args, arg_names } => {
+            let recv = frame.read(*receiver);
+            let owner_str = match &frame.module.consts[owner_class.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type("CallSuper: owner not a string const".into())),
+            };
+            let name_str = match &frame.module.consts[name.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type("CallSuper: name not a string const".into())),
+            };
+            let arg_values = read_arg_run(frame, *args, *n_args);
+            let names = resolve_arg_names(frame.module, arg_names);
+            let result = host.call_super(&recv, &owner_str, &name_str, &arg_values, &names)?;
             frame.write(*dst, result);
         }
         Inst::CallMember { dst, receiver, name, args, n_args, arg_names } => {

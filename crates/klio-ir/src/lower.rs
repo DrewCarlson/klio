@@ -326,7 +326,7 @@ pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::Cl
             // `GetField`) and member calls (`this.method()` →
             // `CallMember`) resolve through the bound receiver
             // reg rather than failing as free globals.
-            let _ = lower_method(module, f);
+            let _ = lower_method(module, f, &c.name.name);
             let last_id = crate::FuncId((module.funcs.len() - 1) as u32);
             methods.push(last_id);
         }
@@ -435,13 +435,57 @@ fn lower_function_body_with_implicit(
 /// `func_index` — method names live in the class's method table,
 /// not the top-level fn namespace, so a top-level Path-callee
 /// lookup must not surface a class method.
-pub fn lower_method(module: &mut crate::Module, f: &klio_ast::Function) -> crate::Func {
-    let func = lower_function_body_with_implicit(module, f, &["this"]);
+pub fn lower_method(
+    module: &mut crate::Module,
+    f: &klio_ast::Function,
+    owner_class: &str,
+) -> crate::Func {
+    let func = lower_function_body_with_implicit_owner(module, f, &["this"], Some(owner_class));
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
     placed.id = id;
     module.funcs.push(placed.clone());
     placed
+}
+
+fn lower_function_body_with_implicit_owner(
+    module: &mut crate::Module,
+    f: &klio_ast::Function,
+    implicit_params: &[&str],
+    owner_class: Option<&str>,
+) -> crate::Func {
+    let mut b = FuncBuilder::new(module);
+    let mut names: Vec<&str> = Vec::with_capacity(implicit_params.len() + f.params.len());
+    names.extend_from_slice(implicit_params);
+    names.extend(f.params.iter().map(|p| p.name.name.as_str()));
+    bind_params(&mut b, &names);
+    if let Some(owner) = owner_class {
+        let _ = b.set_owner_class(owner.to_string());
+    }
+    let result = match &f.body {
+        Some(klio_ast::FunctionBody::Block(blk)) => Some(lower_block(&mut b, blk)),
+        Some(klio_ast::FunctionBody::Expr(e)) => Some(lower_expr(&mut b, e)),
+        None => None,
+    };
+    b.terminate(Terminator::Return(result));
+    let fqn = f.name.name.clone();
+    let mut func = b.finish(f.name.name.clone(), fqn, crate::TypeRef::unit());
+    let mut params: Vec<crate::Param> = implicit_params
+        .iter()
+        .map(|n| crate::Param {
+            name: (*n).to_string(),
+            ty: crate::TypeRef::unit(),
+            default: None,
+        })
+        .collect();
+    params.extend(f.params.iter().map(|p| crate::Param {
+        name: p.name.name.clone(),
+        ty: crate::TypeRef::unit(),
+        default: None,
+    }));
+    func.params = params;
+    func.is_suspend = f.is_suspend;
+    func
 }
 
 /// Lower one expression into the current block. Returns the
@@ -1221,6 +1265,30 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // CallValue.
             match callee.as_ref() {
                 Expr::Member { receiver, name, .. } => {
+                    // `super.method(...)` — emit `CallSuper` so the
+                    // host walks the parent class chain rather
+                    // than re-entering the leaf class's override.
+                    if matches!(receiver.as_ref(), Expr::Super { .. }) {
+                        if let Some(this_reg) = b.resolve("this") {
+                            if let Some(owner) = b.owner_class().map(|s| s.to_string()) {
+                                let (args_start, count) = lower_arg_run(b, args);
+                                let arg_names = intern_arg_names(b.module, ast_arg_names);
+                                let dst = b.alloc_reg();
+                                let nm = b.module.intern_const(Const::String(name.name.clone()));
+                                let oc = b.module.intern_const(Const::String(owner));
+                                b.push(Inst::CallSuper {
+                                    dst,
+                                    receiver: this_reg,
+                                    owner_class: oc,
+                                    name: nm,
+                                    args: args_start,
+                                    n_args: count,
+                                    arg_names,
+                                });
+                                return dst;
+                            }
+                        }
+                    }
                     let recv = lower_expr(b, receiver);
                     let (args_start, count) = lower_arg_run(b, args);
                     let arg_names = intern_arg_names(b.module, ast_arg_names);
@@ -1711,6 +1779,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 absorb_return: true,
             });
             dst
+        }
+        Expr::Super { .. } => {
+            // `super` bare or `super.member` reads the same
+            // instance value as `this`; the method-dispatch site
+            // would normally walk to the parent class's body.
+            // The IR has no native super-dispatch yet, so we
+            // return `this` and let the host's call_member fall
+            // back to the tree walker's `super.foo()` machinery
+            // via `dispatch_member_via_ast` when a method-on-
+            // super resolves to a different parent override.
+            if let Some(this_reg) = b.resolve("this") {
+                this_reg
+            } else {
+                b.push(Inst::Trace { span: expr_span(expr) });
+                b.emit_const(Const::Unit)
+            }
         }
         _ => {
             // Remaining expression forms not yet lowered. Emit a

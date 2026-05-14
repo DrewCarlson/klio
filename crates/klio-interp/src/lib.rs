@@ -11989,6 +11989,57 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         })
     }
 
+    fn call_super(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        owner_class: &str,
+        name: &str,
+        args: &[klio_runtime::Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Resolve the owner class in the runtime class_table,
+        // step to its parent, find the method there, and invoke
+        // it directly so the leaf class's override is bypassed.
+        let inst = match receiver {
+            klio_runtime::Value::Instance(i) => i.clone(),
+            _ => {
+                return Err(klio_ir::eval::EvalError::Type(format!(
+                    "super.{name}: receiver is not an instance"
+                )))
+            }
+        };
+        let owner = self
+            .interp
+            .class_table
+            .get(owner_class)
+            .cloned()
+            .ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "super.{name}: unknown owner class `{owner_class}`"
+                ))
+            })?;
+        let parent = owner
+            .parent
+            .borrow()
+            .clone()
+            .ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "super.{name}: `{owner_class}` has no parent"
+                ))
+            })?;
+        let (method, _owner_cls) = parent
+            .find_method(name)
+            .ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "super.{name}: parent `{}` has no method `{name}`",
+                    parent.name
+                ))
+            })?;
+        self.interp
+            .call_method_with_owner(&inst, &parent, &method, args, &vec![None; args.len()], self.out)
+            .map_err(ir_err)
+    }
+
     fn read_lambda_capture(
         &mut self,
         lambda: &klio_runtime::Value,
@@ -12225,9 +12276,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // After exhausting the parent chain, walk implemented
             // interfaces so default methods inherited from an
             // interface route through IR too.
+            // Walk classes and interfaces breadth-first. Robot
+            // -> Being / [FormalGreeter] -> FormalGreeter
+            // -> [Greeter] -> Greeter, etc. — so default
+            // methods declared on a transitively-implemented
+            // interface still resolve.
             let mut fid: Option<klio_ir::FuncId> = None;
-            let mut cur_class = Some(std::rc::Rc::clone(&inst.borrow().class));
-            while let Some(c) = cur_class {
+            let mut queue: std::collections::VecDeque<std::rc::Rc<klio_runtime::ClassDef>> =
+                std::collections::VecDeque::new();
+            let mut seen: std::collections::HashSet<*const klio_runtime::ClassDef> =
+                std::collections::HashSet::new();
+            queue.push_back(std::rc::Rc::clone(&inst.borrow().class));
+            while let Some(c) = queue.pop_front() {
+                let ptr = std::rc::Rc::as_ptr(&c);
+                if !seen.insert(ptr) {
+                    continue;
+                }
                 if let Some(f) = self
                     .lookup_ir_method(&c.fqn, name)
                     .or_else(|| self.lookup_ir_method(&c.name, name))
@@ -12236,18 +12300,11 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     break;
                 }
                 for iface in c.interfaces.borrow().iter() {
-                    if let Some(f) = self
-                        .lookup_ir_method(&iface.fqn, name)
-                        .or_else(|| self.lookup_ir_method(&iface.name, name))
-                    {
-                        fid = Some(f);
-                        break;
-                    }
+                    queue.push_back(std::rc::Rc::clone(iface));
                 }
-                if fid.is_some() {
-                    break;
+                if let Some(p) = c.parent.borrow().clone() {
+                    queue.push_back(p);
                 }
-                cur_class = c.parent.borrow().clone();
             }
             if let Some(fid) = fid {
                 let module = std::rc::Rc::clone(&self.module);

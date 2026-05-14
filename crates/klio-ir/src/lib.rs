@@ -124,6 +124,21 @@ pub enum Inst {
         #[serde(default)]
         arg_names: Vec<Option<ConstId>>,
     },
+    /// `super.method(args)` — dispatch the named method on the
+    /// receiver's value, but resolved against the parent of
+    /// `owner_class` rather than the leaf class. Used inside
+    /// method bodies; `owner_class` is the class whose body is
+    /// being lowered.
+    CallSuper {
+        dst: Reg,
+        receiver: Reg,
+        owner_class: ConstId,
+        name: ConstId,
+        args: Reg,
+        n_args: u8,
+        #[serde(default)]
+        arg_names: Vec<Option<ConstId>>,
+    },
     /// Member call on a receiver. The evaluator resolves the
     /// method through the receiver's class table at runtime.
     CallMember {
