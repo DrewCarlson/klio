@@ -903,9 +903,20 @@ impl Interpreter {
         // module. Classes go first so Path→NewInstance routing
         // sees them.
         let mut module = klio_ir::Module::default();
+        // Pre-build a name → AST map of every class in the
+        // file so lower_class can walk supertype chains by
+        // name and collect inherited member names for the
+        // method-body lowering's `this.<name>` heuristic.
+        let mut file_classes: std::collections::HashMap<String, &klio_ast::Class> =
+            std::collections::HashMap::new();
         for d in &file.decls {
             if let Decl::Class(c) = d {
-                let _ = klio_ir::lower::lower_class(&mut module, c);
+                file_classes.insert(c.name.name.clone(), c);
+            }
+        }
+        for d in &file.decls {
+            if let Decl::Class(c) = d {
+                let _ = klio_ir::lower::lower_class_with_file(&mut module, c, &file_classes);
             }
         }
         let mut main_id: Option<klio_ir::FuncId> = None;

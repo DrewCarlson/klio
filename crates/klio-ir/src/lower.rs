@@ -309,6 +309,15 @@ pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
 /// reachable through `module.class_id` so Path-callees that name
 /// the class lower to `NewInstance`.
 pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::ClassId {
+    let empty = std::collections::HashMap::new();
+    lower_class_with_file(module, c, &empty)
+}
+
+pub fn lower_class_with_file(
+    module: &mut crate::Module,
+    c: &klio_ast::Class,
+    file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
+) -> crate::ClassId {
     let primary_params: Vec<crate::Param> = c
         .primary_params
         .iter()
@@ -335,22 +344,42 @@ pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::Cl
     // from `topLevelFn()` (LoadGlobal).
     let mut own_member_names: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    for m in &c.members {
-        match m {
-            klio_ast::Decl::Function(f) => {
-                own_member_names.insert(f.name.name.clone());
+    // Walk this class + every supertype reachable through the
+    // file's class registry so inherited member names also
+    // route as `this.<name>` in method-body lowering.
+    fn collect_members(
+        c: &klio_ast::Class,
+        file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
+        out: &mut std::collections::HashSet<String>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        if !seen.insert(c.name.name.clone()) {
+            return;
+        }
+        for m in &c.members {
+            match m {
+                klio_ast::Decl::Function(f) => {
+                    out.insert(f.name.name.clone());
+                }
+                klio_ast::Decl::Property(p) => {
+                    out.insert(p.name.name.clone());
+                }
+                _ => {}
             }
-            klio_ast::Decl::Property(p) => {
-                own_member_names.insert(p.name.name.clone());
+        }
+        for p in &c.primary_params {
+            if p.property.is_some() {
+                out.insert(p.name.name.clone());
             }
-            _ => {}
+        }
+        for sup in &c.supertypes {
+            if let Some(parent) = file_classes.get(&sup.name.name) {
+                collect_members(parent, file_classes, out, seen);
+            }
         }
     }
-    for p in &c.primary_params {
-        if p.property.is_some() {
-            own_member_names.insert(p.name.name.clone());
-        }
-    }
+    let mut seen_for_collect: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_members(c, file_classes, &mut own_member_names, &mut seen_for_collect);
     // Companion-object members are visible under their bare
     // names inside this class's method bodies.
     for m in &c.members {
@@ -1848,6 +1877,16 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 absorb_return: true,
             });
             dst
+        }
+        Expr::This { .. } => {
+            // `this` bare resolves to the implicit first param
+            // bound by `lower_method` / extension lowering.
+            if let Some(this_reg) = b.resolve("this") {
+                this_reg
+            } else {
+                b.push(Inst::Trace { span: expr_span(expr) });
+                b.emit_const(Const::Unit)
+            }
         }
         Expr::Super { .. } => {
             // `super` bare or `super.member` reads the same
