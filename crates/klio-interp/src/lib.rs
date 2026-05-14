@@ -378,6 +378,26 @@ impl Interpreter {
         self.scheduler = scheduler;
     }
 
+    /// Run a closure with a `CallCtx` constructed against this
+    /// interpreter — the host side-channel + the scheduler + the
+    /// supplied output sink. Used by every stdlib-intrinsic call
+    /// site so they share the same wiring without each one
+    /// hand-rolling the field borrows.
+    pub fn with_call_ctx<R>(
+        &mut self,
+        args: &[klio_runtime::Value],
+        out: &mut dyn Output,
+        f: impl FnOnce(&mut klio_runtime::CallCtx<'_>) -> R,
+    ) -> R {
+        let mut host_ref = InterpHostRef { interp: self };
+        let mut ctx = klio_runtime::CallCtx {
+            args,
+            out,
+            host: &mut host_ref,
+        };
+        f(&mut ctx)
+    }
+
     pub fn lookup_global_callable(&self, name: &str) -> Option<klio_runtime::Value> {
         // Primitive companion constants — `Int.MAX_VALUE`,
         // `Double.NaN`, etc. — surface as bare dotted FQNs through
@@ -1201,13 +1221,13 @@ impl Interpreter {
                         simple: String,
                         fqn: &str,
                         out: &mut dyn Output,
-                        scheduler: &mut dyn klio_runtime::Scheduler| {
+                        host: &mut dyn klio_runtime::IntrinsicHost| {
             if let Some(func) = klio_stdlib::implementation(fqn) {
                 let fqn_static: &'static str = leak_fqn(fqn);
                 let is_property = klio_stdlib::lookup(fqn)
                     .map_or(false, |s| matches!(s.kind, klio_stdlib::SymbolKind::Property));
                 let bound = if is_property {
-                    let mut ctx = CallCtx { args: &[], out, scheduler };
+                    let mut ctx = CallCtx { args: &[], out, host };
                     match func(&mut ctx) {
                         Ok(v) => v,
                         Err(_) => Value::Intrinsic { fqn: fqn_static, func },
@@ -1235,7 +1255,7 @@ impl Interpreter {
                     .collect();
                 for sym_fqn in symbols {
                     let simple = sym_fqn[prefix.len()..].to_string();
-                    bind_fqn(&file_env, simple, &sym_fqn, out, &mut *self.scheduler);
+                    { let mut h = InterpHostRef { interp: self }; bind_fqn(&file_env, simple, &sym_fqn, out, &mut h); };
                 }
                 continue;
             }
@@ -1245,7 +1265,10 @@ impl Interpreter {
                 .as_ref()
                 .map(|a| a.name.clone())
                 .unwrap_or_else(|| last_seg.name.clone());
-            bind_fqn(&file_env, simple.clone(), &fqn, out, &mut *self.scheduler);
+            {
+                let mut h = InterpHostRef { interp: self };
+                bind_fqn(&file_env, simple.clone(), &fqn, out, &mut h);
+            }
             if let Some(alias_ident) = &imp.alias {
                 self.import_renames
                     .insert(last_seg.name.clone(), alias_ident.name.clone());
@@ -2607,7 +2630,7 @@ impl Interpreter {
                         let fqn = format!("{}.{}", this_val.type_fqn(), name);
                         if let Some(func) = self.lookup_intrinsic(&fqn) {
                             let args = [this_val];
-                            let mut ctx = CallCtx { args: &args, out, scheduler: &mut *self.scheduler };
+                            let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &args, out, host: &mut __interp_host };
                             return func(&mut ctx);
                         }
                     }
@@ -3066,7 +3089,7 @@ impl Interpreter {
                 if !*safe {
                     if let Some(fqn) = try_qualified_name(expr) {
                         if let Some(func) = self.lookup_intrinsic(&fqn) {
-                            let mut ctx = CallCtx { args: &[], out, scheduler: &mut *self.scheduler };
+                            let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &[], out, host: &mut __interp_host };
                             return func(&mut ctx);
                         }
                     }
@@ -3129,7 +3152,7 @@ impl Interpreter {
                 let Some(func) = self.lookup_intrinsic(&fqn) else {
                     return Err(RuntimeError::Unimplemented(fqn));
                 };
-                let mut ctx = CallCtx { args: &arg_vals, out, scheduler: &mut *self.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
                 func(&mut ctx)
             }
             Expr::Throw { value, .. } => {
@@ -3638,7 +3661,7 @@ impl Interpreter {
             let fqn = format!("{}.{}", this_val.type_fqn(), name);
             if let Some(func) = self.lookup_intrinsic(&fqn) {
                 let args = [this_val];
-                let mut ctx = CallCtx { args: &args, out, scheduler: &mut *self.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &args, out, host: &mut __interp_host };
                 return func(&mut ctx);
             }
         }
@@ -3666,7 +3689,7 @@ impl Interpreter {
                 self.call_function_named(decl, env, args, arg_names, out)
             }
             Value::Intrinsic { func, .. } => {
-                let mut ctx = CallCtx { args, out, scheduler: &mut *self.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args, out, host: &mut __interp_host };
                 func(&mut ctx)
             }
             Value::BoundMethod { fqn, func, receiver } => {
@@ -3674,7 +3697,7 @@ impl Interpreter {
                 all.push((**receiver).clone());
                 all.extend_from_slice(args);
                 let user_args = reorder_intrinsic_args(fqn, all, arg_names)?;
-                let mut ctx = CallCtx { args: &user_args, out, scheduler: &mut *self.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &user_args, out, host: &mut __interp_host };
                 func(&mut ctx)
             }
             Value::BoundUserMethod { receiver, method } => {
@@ -4700,7 +4723,7 @@ impl Interpreter {
             for a in args {
                 arg_vals.push(self.eval_expr(a, env, out)?);
             }
-            let mut ctx = CallCtx { args: &arg_vals, out, scheduler: &mut *self.scheduler };
+            let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
             return Ok(Some(func(&mut ctx)?));
         }
         Ok(None)
@@ -8142,14 +8165,14 @@ impl Interpreter {
                 self.call_lambda_with_this(params, body, env, args, None, *absorb_return, out)
             }
             Value::Intrinsic { func, .. } => {
-                let mut ctx = CallCtx { args, out, scheduler: &mut *self.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args, out, host: &mut __interp_host };
                 func(&mut ctx)
             }
             Value::BoundMethod { func, receiver, .. } => {
                 let mut all = Vec::with_capacity(args.len() + 1);
                 all.push((**receiver).clone());
                 all.extend_from_slice(args);
-                let mut ctx = CallCtx { args: &all, out, scheduler: &mut *self.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &all, out, host: &mut __interp_host };
                 func(&mut ctx)
             }
             Value::BoundUserMethod { receiver, method } => {
@@ -9085,7 +9108,7 @@ impl Interpreter {
         let fqn = format!("{}.{}", receiver.type_fqn(), name);
         if let Some(func) = self.lookup_intrinsic(&fqn) {
             let args = [receiver];
-            let mut ctx = CallCtx { args: &args, out, scheduler: &mut *self.scheduler };
+            let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &args, out, host: &mut __interp_host };
             return func(&mut ctx);
         }
         if let Some(v) = self.try_extension_property_get(&receiver, name, out)? {
@@ -9447,7 +9470,7 @@ impl Interpreter {
                         for a in args {
                             arg_vals.push(self.eval_expr(a, env, out)?);
                         }
-                        let mut ctx = CallCtx { args: &arg_vals, out, scheduler: &mut *self.scheduler };
+                        let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
                         return func(&mut ctx);
                     }
                 }
@@ -9463,7 +9486,7 @@ impl Interpreter {
                     arg_vals.push(self.eval_expr(a, env, out)?);
                 }
                 arg_vals = reorder_intrinsic_args(&fqn, arg_vals, arg_names)?;
-                let mut ctx = CallCtx { args: &arg_vals, out, scheduler: &mut *self.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
                 return func(&mut ctx);
             }
         }
@@ -9848,7 +9871,7 @@ impl Interpreter {
                     let mut arg_vals = Vec::with_capacity(user_args.len() + 1);
                     arg_vals.push(recv.clone());
                     arg_vals.extend(user_args);
-                    let mut ctx = CallCtx { args: &arg_vals, out, scheduler: &mut *self.scheduler };
+                    let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
                     return func(&mut ctx);
                 }
             }
@@ -10145,7 +10168,7 @@ impl Interpreter {
                 let mut arg_vals = Vec::with_capacity(user_args.len() + 1);
                 arg_vals.push(recv);
                 arg_vals.extend(user_args);
-                let mut ctx = CallCtx { args: &arg_vals, out, scheduler: &mut *self.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
                 return func(&mut ctx);
             }
             // User-declared extension functions on a matching receiver
@@ -10234,7 +10257,7 @@ impl Interpreter {
                 // for intrinsics already bound at startup (implicit
                 // aliases, prior callsite caches, etc.).
                 let effective = self.binding_override(fqn).unwrap_or(func);
-                let mut ctx = CallCtx { args: &arg_vals, out, scheduler: &mut *self.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
                 effective(&mut ctx)
             }
             Value::BoundMethod { fqn, func, receiver } => {
@@ -10243,7 +10266,7 @@ impl Interpreter {
                 all.push(*receiver);
                 all.extend(user_args);
                 let effective = self.binding_override(fqn).unwrap_or(func);
-                let mut ctx = CallCtx { args: &all, out, scheduler: &mut *self.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &all, out, host: &mut __interp_host };
                 effective(&mut ctx)
             }
             Value::BoundUserMethod { receiver, method } => {
@@ -10468,7 +10491,7 @@ impl Interpreter {
         arg_vals.extend(idxs);
         let fqn = format!("{}.get", arg_vals[0].type_fqn());
         if let Some(func) = self.lookup_intrinsic(&fqn) {
-            let mut ctx = CallCtx { args: &arg_vals, out, scheduler: &mut *self.scheduler };
+            let mut __interp_host = InterpHostRef { interp: self }; let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
             return func(&mut ctx);
         }
         // User-class `operator fun get(...)` dispatch.
@@ -11568,6 +11591,29 @@ struct FrameNative {
     frame: Rc<RefCell<klio_runtime::SuspendFrame>>,
 }
 
+/// `IntrinsicHost` impl backed by an `&mut Interpreter`. Lets a
+/// stdlib intrinsic reach the scheduler + invoke a user lambda
+/// without each call site stitching the field borrows together.
+struct InterpHostRef<'a> {
+    interp: &'a mut Interpreter,
+}
+
+impl<'a> klio_runtime::IntrinsicHost for InterpHostRef<'a> {
+    fn scheduler(&mut self) -> &mut dyn klio_runtime::Scheduler {
+        &mut *self.interp.scheduler
+    }
+
+    fn invoke_callable(
+        &mut self,
+        callable: &klio_runtime::Value,
+        args: &[klio_runtime::Value],
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, RuntimeError> {
+        let names: Vec<Option<String>> = vec![None; args.len()];
+        self.interp.invoke_callable_value(callable, args, &names, out)
+    }
+}
+
 fn ir_err(e: klio_runtime::RuntimeError) -> klio_ir::eval::EvalError {
     match e {
         klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
@@ -11654,7 +11700,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     let looks_const = !last.is_empty()
                         && last.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit());
                     if looks_const {
-                        let mut ctx = CallCtx { args: &[], out: self.out, scheduler: &mut *self.interp.scheduler };
+                        let mut __interp_host = InterpHostRef { interp: self.interp }; let mut ctx = CallCtx { args: &[], out: self.out, host: &mut __interp_host };
                         if let Ok(v) = f(&mut ctx) {
                             return Some(v);
                         }
@@ -11678,7 +11724,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 let looks_const = !last.is_empty()
                     && last.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit());
                 if looks_const {
-                    let mut ctx = CallCtx { args: &[], out: self.out, scheduler: &mut *self.interp.scheduler };
+                    let mut __interp_host = InterpHostRef { interp: self.interp }; let mut ctx = CallCtx { args: &[], out: self.out, host: &mut __interp_host };
                     if let Ok(v) = f(&mut ctx) {
                         return Some(v);
                     }
@@ -11821,8 +11867,12 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                         // `kotlin.math.abs` whose last segment isn't
                         // re-exported as a bare top-level name.
                         if fqn.contains('.') {
-                            let mut ctx =
-                                klio_runtime::CallCtx { args, out: self.out, scheduler: &mut *self.interp.scheduler };
+                            let mut __interp_host = InterpHostRef { interp: self.interp };
+                            let mut ctx = klio_runtime::CallCtx {
+                                args,
+                                out: self.out,
+                                host: &mut __interp_host,
+                            };
                             return func(&mut ctx).map_err(|e2| {
                                 klio_ir::eval::EvalError::Type(e2.to_string())
                             });
@@ -12428,7 +12478,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 let mut all = Vec::with_capacity(args.len() + 1);
                 all.push(receiver.clone());
                 all.extend_from_slice(args);
-                let mut ctx = CallCtx { args: &all, out: self.out, scheduler: &mut *self.interp.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self.interp }; let mut ctx = CallCtx { args: &all, out: self.out, host: &mut __interp_host };
                 return func(&mut ctx)
                     .map_err(ir_err);
             }
@@ -12465,7 +12515,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // Top-level intrinsic registered as `<ClassFqn>.<name>`.
             let fqn = format!("{}.{}", class.fqn, name);
             if let Some(func) = self.interp.lookup_intrinsic(&fqn) {
-                let mut ctx = CallCtx { args, out: self.out, scheduler: &mut *self.interp.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self.interp }; let mut ctx = CallCtx { args, out: self.out, host: &mut __interp_host };
                 return func(&mut ctx)
                     .map_err(ir_err);
             }
@@ -12543,7 +12593,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     let mut all = Vec::with_capacity(args.len() + 1);
                     all.push(receiver.clone());
                     all.extend_from_slice(args);
-                    let mut ctx = CallCtx { args: &all, out: self.out, scheduler: &mut *self.interp.scheduler };
+                    let mut __interp_host = InterpHostRef { interp: self.interp }; let mut ctx = CallCtx { args: &all, out: self.out, host: &mut __interp_host };
                     return func(&mut ctx).map_err(ir_err);
                 }
             }
@@ -12625,7 +12675,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         };
         for probe in &static_probes {
             if let Some(func) = self.interp.lookup_intrinsic(probe) {
-                let mut ctx = CallCtx { args, out: self.out, scheduler: &mut *self.interp.scheduler };
+                let mut __interp_host = InterpHostRef { interp: self.interp }; let mut ctx = CallCtx { args, out: self.out, host: &mut __interp_host };
                 return func(&mut ctx).map_err(ir_err);
             }
         }

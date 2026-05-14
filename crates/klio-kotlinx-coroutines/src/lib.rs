@@ -121,7 +121,7 @@ fn spawn_launch_block(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             "__kxco_spawn: expected the launch block as the first arg".into(),
         ));
     };
-    ctx.scheduler.spawn(lam);
+    ctx.host.scheduler().spawn(lam);
     Ok(Value::Unit)
 }
 
@@ -135,7 +135,7 @@ fn schedule_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             "__kxco_scheduleResume: expected the continuation arg".into(),
         ));
     };
-    ctx.scheduler.schedule_resume(cont);
+    ctx.host.scheduler().schedule_resume(cont);
     Ok(Value::Unit)
 }
 

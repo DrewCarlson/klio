@@ -22,12 +22,35 @@ pub type StdlibFn = fn(&mut CallCtx) -> Result<Value, RuntimeError>;
 pub struct CallCtx<'a> {
     pub args: &'a [Value],
     pub out: &'a mut dyn Output,
-    /// Scheduler the call has access to. Coroutine builders post
-    /// launched bodies / parked continuations here; the
-    /// interpreter drains it between rounds. Always present —
-    /// the default `InProcessScheduler` runs everything in-order
-    /// for callers that aren't using a coroutines pack.
-    pub scheduler: &'a mut dyn Scheduler,
+    /// Single trait object the intrinsic uses to reach the rest of
+    /// the runtime — the scheduler (for `launch { }` / parked
+    /// continuations) and the lambda invoker (for `.map { }`,
+    /// `.let { }`, `runCatching { }` etc.). Bundled this way so a
+    /// call site can borrow `out` and the host from a single
+    /// `&mut Interpreter` without conflicting field borrows.
+    pub host: &'a mut dyn IntrinsicHost,
+}
+
+/// Side-channel the runtime exposes to stdlib intrinsics. Lets a
+/// binding call back into the interpreter for the bits an
+/// intrinsic can't carry out on its own — invoking a
+/// caller-supplied lambda, posting to the cooperative scheduler.
+pub trait IntrinsicHost {
+    /// Cooperative scheduler. Coroutine builders post launched
+    /// bodies / parked continuations here.
+    fn scheduler(&mut self) -> &mut dyn Scheduler;
+
+    /// Invoke a callable `Value` (`Value::Lambda`, `Value::IrClosure`,
+    /// `Value::Function`, `Value::Intrinsic`, `Value::BoundMethod`,
+    /// `Value::PropertyRef`, …) with the supplied args. Used by
+    /// stdlib HOFs and scope functions to drive the user's
+    /// lambda body.
+    fn invoke_callable(
+        &mut self,
+        callable: &Value,
+        args: &[Value],
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError>;
 }
 
 /// Cooperative scheduler the runtime exposes to anything called
