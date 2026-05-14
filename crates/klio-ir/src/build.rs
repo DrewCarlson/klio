@@ -34,6 +34,18 @@ pub struct FuncBuilder<'a> {
     /// optional `label` matches an explicit `break@label` /
     /// `continue@label`; bare jumps target the innermost frame.
     loops: Vec<LoopFrame>,
+    /// Names declared as `var` (mutable) in any live scope. `val`
+    /// bindings are absent. Used by compound-assignment lowering to
+    /// pick between rebind (Path target on a `var`) and plusAssign
+    /// dispatch (Path target on a `val`, e.g. `val xs = mutableListOf…`).
+    mutables: std::collections::HashSet<String>,
+    /// `var` locals each get a permanent "home" register. Reads of
+    /// the local always resolve to this reg; writes emit a Move
+    /// into it. This gives the IR's flat block model the slot
+    /// semantics that mutable Kotlin locals need — without it, a
+    /// rebind inside a loop body just leaves the body's reads
+    /// pointing at the pre-loop register and loops never terminate.
+    mutable_homes: std::collections::HashMap<String, Reg>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,7 +74,27 @@ impl<'a> FuncBuilder<'a> {
             outer_names: std::collections::HashSet::new(),
             capture_order: Vec::new(),
             capture_regs: std::collections::HashMap::new(),
+            mutables: std::collections::HashSet::new(),
+            mutable_homes: std::collections::HashMap::new(),
         }
+    }
+
+    pub fn mark_mutable(&mut self, name: &str) {
+        self.mutables.insert(name.to_string());
+    }
+
+    #[must_use]
+    pub fn is_mutable(&self, name: &str) -> bool {
+        self.mutables.contains(name)
+    }
+
+    pub fn set_mutable_home(&mut self, name: &str, reg: Reg) {
+        self.mutable_homes.insert(name.to_string(), reg);
+    }
+
+    #[must_use]
+    pub fn mutable_home(&self, name: &str) -> Option<Reg> {
+        self.mutable_homes.get(name).copied()
     }
 
     /// Seed the captured-name set for a nested function builder
@@ -136,6 +168,25 @@ impl<'a> FuncBuilder<'a> {
             .last_mut()
             .expect("at least one scope is always live")
             .insert(name.into(), reg);
+    }
+
+    /// Rebind a name. If the name is already bound in some live
+    /// frame, update that frame's mapping in place; otherwise bind
+    /// it in the current scope. Used by `var` rebind / compound
+    /// assignment so writes inside a nested block don't shadow the
+    /// outer binding (which would make a `while (n > 0)` after
+    /// `n -= 1` loop forever against the outer reg).
+    pub fn rebind(&mut self, name: &str, reg: Reg) {
+        for frame in self.scopes.iter_mut().rev() {
+            if frame.contains_key(name) {
+                frame.insert(name.to_string(), reg);
+                return;
+            }
+        }
+        self.scopes
+            .last_mut()
+            .expect("at least one scope is always live")
+            .insert(name.to_string(), reg);
     }
 
     /// Resolve a simple name through the scope chain. Returns

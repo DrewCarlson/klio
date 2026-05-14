@@ -662,7 +662,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.push(Inst::UnOp { dst: new, op, operand: s });
                 if let Expr::Path { segments, .. } = inner.as_ref() {
                     if segments.len() == 1 {
-                        b.bind(segments[0].name.clone(), new);
+                        if let Some(home) = b.mutable_home(&segments[0].name) {
+                            b.push(Inst::Move { dst: home, src: new });
+                        } else {
+                            b.rebind(&segments[0].name, new);
+                        }
                     }
                 }
                 s
@@ -994,7 +998,19 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                 Some(e) => lower_expr(b, e),
                 None => b.emit_const(Const::Unit),
             };
-            b.bind(p.name.name.clone(), init);
+            if p.mutable {
+                // Allocate a permanent home reg and Move the init
+                // value into it. Reads bind to the home reg so
+                // later writes (compound assign, postfix inc/dec)
+                // can Move new values into the same slot.
+                let home = b.alloc_reg();
+                b.push(Inst::Move { dst: home, src: init });
+                b.set_mutable_home(&p.name.name, home);
+                b.mark_mutable(&p.name.name);
+                b.bind(p.name.name.clone(), home);
+            } else {
+                b.bind(p.name.name.clone(), init);
+            }
             None
         }
         Stmt::Decl(klio_ast::Decl::Function(f)) => {
@@ -1054,7 +1070,23 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             // to the rebind path below. Today this fires only
             // when the target is a Path-bound local — Member /
             // Index targets need their own routing.
-            if !matches!(op, klio_ast::AssignOp::Assign) {
+            // Only attempt `plusAssign`-style member dispatch when the
+            // target is NOT a mutable local Path. For a `var` local the
+            // primitive rebind path below is what Kotlin actually does
+            // (Int has no plusAssign). For a `val` Path the value's type
+            // declares plusAssign (operator on a class, or built-in
+            // collection mutation), so CallMember is correct.
+            // The plusAssign / minusAssign-style member dispatch only
+            // fires for a Path target naming a `val` local (e.g.
+            // `val h = Histogram(); h += w` or `val xs = mutableListOf<Int>(); xs += 1`).
+            // For a `var` Path, Member, or Index target, fall through
+            // to the read-modify-write path below — `xs[i] += v` must
+            // become `xs.set(i, xs.get(i) + v)`, not `xs.get(i).plusAssign(v)`.
+            let path_is_val = matches!(
+                target,
+                Expr::Path { segments, .. } if segments.len() == 1 && !b.is_mutable(&segments[0].name)
+            );
+            if !matches!(op, klio_ast::AssignOp::Assign) && path_is_val {
                 let method_name = match op {
                     klio_ast::AssignOp::Add => "plusAssign",
                     klio_ast::AssignOp::Sub => "minusAssign",
@@ -1099,7 +1131,11 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             };
             match target {
                 Expr::Path { segments, .. } if segments.len() == 1 => {
-                    b.bind(segments[0].name.clone(), combined);
+                    if let Some(home) = b.mutable_home(&segments[0].name) {
+                        b.push(Inst::Move { dst: home, src: combined });
+                    } else {
+                        b.rebind(&segments[0].name, combined);
+                    }
                 }
                 Expr::Member { receiver, name, .. } => {
                     let recv = lower_expr(b, receiver);
