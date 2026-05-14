@@ -164,6 +164,12 @@ pub struct Interpreter {
     /// calls through an alias name) and runtime type checks
     /// (`x is Alias`, `x as Alias`) to the alias target.
     type_aliases: std::collections::HashMap<String, String>,
+    /// IR module built by the decl-registration pass. `run_ir_typed`
+    /// reads it directly instead of re-lowering at run time.
+    current_module: Option<std::rc::Rc<klio_ir::Module>>,
+    /// FuncId of the active file's `main`, recorded alongside
+    /// `current_module`.
+    current_main_id: Option<klio_ir::FuncId>,
     /// Stack of implicit lambda labels — pushed by the higher-order
     /// dispatcher right before invoking a lambda argument. Lambda call
     /// frames consult the top entry to swallow `LabeledReturn` matching
@@ -283,6 +289,8 @@ impl Interpreter {
             loop_label_stack: Vec::new(),
             label_already_pushed_for_loop: false,
             type_aliases: std::collections::HashMap::new(),
+            current_module: None,
+            current_main_id: None,
             implicit_lambda_label_stack: Vec::new(),
             tailrec_stack: Vec::new(),
             expr_types: std::collections::HashMap::new(),
@@ -717,6 +725,7 @@ impl Interpreter {
                 format!("kotlin.ranges.{name}")
             }
             "Pair" | "Triple" => format!("kotlin.{name}"),
+            n if builtin_exception_parent(n).is_some() => format!("kotlin.{n}"),
             _ => return None,
         };
         Some(Value::Class(Rc::new(ClassDef {
@@ -916,10 +925,16 @@ impl Interpreter {
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, RuntimeError> {
         self.register_file_decls(file, out)?;
+        self.build_ir_module_for_file(file)?;
+        let module_rc = self
+            .current_module
+            .clone()
+            .expect("current_module set by build_ir_module_for_file");
+        let main_id = self.current_main_id.ok_or(RuntimeError::NoMain)?;
+        return self.run_main(module_rc, main_id, out);
+    }
 
-        // Now lower the file's classes / top-level fns into an IR
-        // module. Classes go first so Path→NewInstance routing
-        // sees them.
+    fn build_ir_module_for_file(&mut self, file: &KotlinFile) -> Result<(), RuntimeError> {
         let mut module = klio_ir::Module::default();
         // Pre-build a name → AST map of every class in the
         // file so lower_class can walk supertype chains by
@@ -977,17 +992,23 @@ impl Interpreter {
                 }
             }
         }
-        let main_id = main_id.ok_or(RuntimeError::NoMain)?;
-        let func = module.funcs[main_id.0 as usize].clone();
-        // Pre-stash class names indexed by IR ClassId so the Host
-        // can resolve NewInstance(class_id, args) without re-walking
-        // the module.
-        let class_names: Vec<String> = module
+        self.current_module = Some(std::rc::Rc::new(module));
+        self.current_main_id = main_id;
+        Ok(())
+    }
+
+    fn run_main(
+        &mut self,
+        module_rc: std::rc::Rc<klio_ir::Module>,
+        main_id: klio_ir::FuncId,
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, RuntimeError> {
+        let func = module_rc.funcs[main_id.0 as usize].clone();
+        let class_names: Vec<String> = module_rc
             .classes
             .iter()
             .map(|c| c.name.clone())
             .collect();
-        let module_rc = std::rc::Rc::new(module);
         let method_index = IrHost::build_method_index(&module_rc);
         let mut host = IrHost {
             interp: self,
@@ -11606,6 +11627,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 return Some(v);
             }
         }
+        if builtin_exception_parent(name).is_some()
+            && !self.interp.class_table.contains_key(name)
+        {
+            if let Some(v) = self.interp.synth_primitive_class(name) {
+                return Some(v);
+            }
+        }
         // Top-level property with a delegate / custom getter — route
         // the read through the tree walker so the getter (e.g.
         // `lazy {…}`, `Delegates.notNull()`, `Delegates.observable(...)`)
@@ -12047,6 +12075,27 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // pack-imported classes (Buffer, Instant, HttpClient) that
         // the IR module's class_index doesn't see.
         if let klio_runtime::Value::Class(class) = callee {
+            // Builtin exception classes — `NoWhenBranchMatchedException()`,
+            // `NullPointerException("...")` etc. — construct a
+            // `Value::Exception` so throw/catch matches the right type.
+            if builtin_exception_parent(&class.name).is_some()
+                && !self.interp.class_table.contains_key(&class.name)
+            {
+                let message = match args.first() {
+                    Some(klio_runtime::Value::String(s)) => Some(std::rc::Rc::clone(s)),
+                    Some(klio_runtime::Value::Null) | None => None,
+                    Some(other) => Some(std::rc::Rc::new(format!("{other:?}"))),
+                };
+                let cause = match args.get(1) {
+                    Some(v) if !matches!(v, klio_runtime::Value::Null) => Some(Box::new(v.clone())),
+                    _ => None,
+                };
+                return Ok(klio_runtime::Value::Exception {
+                    fqn: std::rc::Rc::new(class.fqn.clone()),
+                    message,
+                    cause,
+                });
+            }
             let empty = vec![None; args.len()];
             return self
                 .construct_by_name(&class.name, args, &empty)

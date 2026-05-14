@@ -2369,7 +2369,20 @@ fn lower_when(
     if let Some(subj) = subject_r {
         if let Some(arms) = collect_switch_arms(b, branches) {
             let (cases, default_blk, body_block_for_branch) = arms;
-            let default = default_blk.unwrap_or(join);
+            // When the source has no `else`, route the default edge
+            // to a fresh block that throws NoWhenBranchMatchedException
+            // rather than falling through to the join.
+            let default = match default_blk {
+                Some(blk) => blk,
+                None => {
+                    let throw_blk = b.alloc_block();
+                    let saved = b.cur;
+                    b.switch_to(throw_blk);
+                    emit_no_when_throw(b);
+                    b.switch_to(saved);
+                    throw_blk
+                }
+            };
             b.terminate(Terminator::Switch { reg: subj, arms: cases, default });
             // Emit each branch body, including the optional else
             // branch landing on default_blk.
@@ -2494,11 +2507,29 @@ fn lower_when(
         b.terminate(Terminator::Goto(join));
         b.switch_to(next_blk);
     }
-    // Fall-through with no matching branch: leave `result` at its
-    // default. A real impl would throw NoWhenBranchMatchedException.
-    b.terminate(Terminator::Goto(join));
+    // No matching branch and no `else` arm: throw
+    // `NoWhenBranchMatchedException`.
+    emit_no_when_throw(b);
     b.switch_to(join);
     result
+}
+
+fn emit_no_when_throw(b: &mut FuncBuilder<'_>) {
+    let class_name = b
+        .module
+        .intern_const(Const::String("NoWhenBranchMatchedException".into()));
+    let ctor = b.alloc_reg();
+    b.push(Inst::LoadGlobal { dst: ctor, name: class_name });
+    let args_start = b.alloc_reg();
+    let exc = b.alloc_reg();
+    b.push(Inst::CallValue {
+        dst: exc,
+        callee: ctor,
+        args: args_start,
+        n_args: 0,
+        arg_names: Vec::new(),
+    });
+    b.terminate(Terminator::Throw(exc));
 }
 
 fn or_chain(b: &mut FuncBuilder<'_>, mk: impl FnOnce(&mut FuncBuilder<'_>) -> Vec<Reg>) -> Reg {
