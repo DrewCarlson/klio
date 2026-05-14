@@ -948,6 +948,36 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::Div, Int(a), Double(b)) => Ok(Double((*a as f64) / b)),
         (BinOp::Add, Double(a), Long(b)) => Ok(Double(a + (*b as f64))),
         (BinOp::Add, Long(a), Double(b)) => Ok(Double((*a as f64) + b)),
+        // Unsigned integer arithmetic.
+        (BinOp::Add, Value::UInt(a), Value::UInt(b)) => Ok(Value::UInt(a.wrapping_add(*b))),
+        (BinOp::Sub, Value::UInt(a), Value::UInt(b)) => Ok(Value::UInt(a.wrapping_sub(*b))),
+        (BinOp::Mul, Value::UInt(a), Value::UInt(b)) => Ok(Value::UInt(a.wrapping_mul(*b))),
+        (BinOp::Div, Value::UInt(a), Value::UInt(b)) => {
+            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            Ok(Value::UInt(a / b))
+        }
+        (BinOp::Mod, Value::UInt(a), Value::UInt(b)) => {
+            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            Ok(Value::UInt(a % b))
+        }
+        (BinOp::Add, Value::ULong(a), Value::ULong(b)) => Ok(Value::ULong(a.wrapping_add(*b))),
+        (BinOp::Sub, Value::ULong(a), Value::ULong(b)) => Ok(Value::ULong(a.wrapping_sub(*b))),
+        (BinOp::Mul, Value::ULong(a), Value::ULong(b)) => Ok(Value::ULong(a.wrapping_mul(*b))),
+        (BinOp::Div, Value::ULong(a), Value::ULong(b)) => {
+            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            Ok(Value::ULong(a / b))
+        }
+        (BinOp::Mod, Value::ULong(a), Value::ULong(b)) => {
+            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            Ok(Value::ULong(a % b))
+        }
+        // Mixed unsigned widening.
+        (BinOp::Add, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_add(*b as u64))),
+        (BinOp::Add, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong((*a as u64).wrapping_add(*b))),
+        (BinOp::Mul, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_mul(*b as u64))),
+        (BinOp::Mul, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong((*a as u64).wrapping_mul(*b))),
+        (BinOp::Sub, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_sub(*b as u64))),
+        (BinOp::Sub, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong((*a as u64).wrapping_sub(*b))),
         // Float arithmetic + mixed Float/Double promotion.
         (BinOp::Add, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
         (BinOp::Sub, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
