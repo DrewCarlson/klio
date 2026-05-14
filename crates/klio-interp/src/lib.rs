@@ -11730,14 +11730,6 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // rather than registered intrinsics. Return a sentinel so
         // call_value can route them through eval_via_ast below.
         match name {
-            "thenBy" | "thenByDescending" | "Result" => {
-                let leaked: &'static str =
-                    Box::leak(format!("__klio_intrinsic_name:{name}").into_boxed_str());
-                Some(klio_runtime::Value::Intrinsic {
-                    fqn: leaked,
-                    func: ir_intrinsic_stub,
-                })
-            }
             _ => None,
         }
     }
@@ -11869,17 +11861,6 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // exactly one lambda arg; the suspend intrinsics also take
         // a lambda arg that runs against a continuation.
         if let klio_runtime::Value::Intrinsic { fqn, .. } = callee {
-            // Name-dispatched scope / builder intrinsics route
-            // back through the tree walker by synthesising a Call
-            // expression and re-running it. Heavy but it lets the
-            // IR path cover stdlib surface area that lives in
-            // eval_call rather than the registered intrinsic table.
-            if let Some(simple) = fqn.strip_prefix("__klio_intrinsic_name:") {
-                return self
-                    .interp
-                    .invoke_named_intrinsic(simple, args, self.out)
-                    .map_err(ir_err);
-            }
             match *fqn {
                 "__klio_intrinsic_runBlocking" => {
                     if args.len() != 1 {
