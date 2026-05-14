@@ -11821,6 +11821,24 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     || msg.contains("InstantiationError")
                     || msg.contains("abstract")
                 {
+                    // SAM conversion: when the interface has
+                    // exactly one abstract method and the call
+                    // supplies a single lambda arg, synthesize
+                    // an instance whose SAM dispatches through
+                    // the lambda body.
+                    if args.len() == 1
+                        && matches!(&args[0], klio_runtime::Value::Lambda { .. })
+                    {
+                        if let Some(cls) = self.interp.class_table.get(&name).cloned() {
+                            if cls.is_interface || cls.is_fun_interface {
+                                let v = self
+                                    .interp
+                                    .sam_construct(&cls, args[0].clone(), self.out)
+                                    .map_err(ir_err)?;
+                                return Ok(v);
+                            }
+                        }
+                    }
                     if let Some(v) = self
                         .interp
                         .dispatch_top_level_overload(&name, args, arg_names, self.out)
@@ -12296,6 +12314,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // After exhausting the parent chain, walk implemented
             // interfaces so default methods inherited from an
             // interface route through IR too.
+            // SAM-converted instance: when the receiver's class
+            // has a `sam_lambda`-bound method for `name`, invoke
+            // the bundled lambda directly. The synthetic class
+            // has no IR FuncId for this method, so the walk
+            // would otherwise land on the abstract interface
+            // declaration and return Unit.
+            {
+                let sam_lambda: Option<klio_runtime::Value> = inst
+                    .borrow()
+                    .class
+                    .find_method(name)
+                    .and_then(|(m, _)| m.sam_lambda.clone());
+                if let Some(lam) = sam_lambda {
+                    return self.call_value(&lam, args);
+                }
+            }
             // Walk classes and interfaces breadth-first. Robot
             // -> Being / [FormalGreeter] -> FormalGreeter
             // -> [Greeter] -> Greeter, etc. — so default
