@@ -303,16 +303,6 @@ struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    fn new(module: &'a Module, func: &'a Func, params: Vec<Value>) -> Self {
-        Self {
-            module,
-            func,
-            regs: vec![Value::Unit; func.n_locals as usize],
-            params,
-            captures: Vec::new(),
-        }
-    }
-
     fn new_with_captures(
         module: &'a Module,
         func: &'a Func,

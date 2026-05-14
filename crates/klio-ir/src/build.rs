@@ -126,7 +126,7 @@ impl<'a> FuncBuilder<'a> {
     /// Returns the per-lambda capture index. Idempotent for the
     /// same name.
     pub fn record_capture(&mut self, name: &str) -> u16 {
-        if let Some(&r) = self.capture_regs.get(name) {
+        if self.capture_regs.contains_key(name) {
             // Already captured at this reg — return its index.
             return self
                 .capture_order
