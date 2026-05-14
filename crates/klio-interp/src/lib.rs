@@ -253,6 +253,11 @@ pub(crate) struct ClassIrTables {
         std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     pub body_prop_inits:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Per-instance-property delegate expressions lowered as N-arg
+    /// IR thunks parameterised on the class's primary-ctor params.
+    /// Consumed by run_body_initializers + the IR ctor fast-path.
+    pub body_prop_delegates:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     pub supertype_delegates:
         std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
     pub secondary_ctors:
@@ -1350,6 +1355,18 @@ impl Interpreter {
                                     &format!("__init__{}.{}", c.name.name, p.name.name),
                                 );
                                 self.module_registry.class_ir.body_prop_inits.insert(
+                                    (c.name.name.clone(), p.name.name.clone()),
+                                    id,
+                                );
+                            }
+                            if let Some(delegate) = &p.delegate {
+                                let id = klio_ir::lower::lower_expr_as_param_thunk(
+                                    &mut module,
+                                    &params_ref,
+                                    delegate,
+                                    &format!("__delegate__{}.{}", c.name.name, p.name.name),
+                                );
+                                self.module_registry.class_ir.body_prop_delegates.insert(
                                     (c.name.name.clone(), p.name.name.clone()),
                                     id,
                                 );
@@ -8049,7 +8066,63 @@ impl Interpreter {
                 continue;
             }
             if let Some(delegate_expr) = &p.delegate {
-                let dval = self.eval_expr(delegate_expr, ctor_env, out)?;
+                let dval = {
+                    let key = (class.name.clone(), p.name.clone());
+                    if let Some(fid) = self
+                        .module_registry
+                        .class_ir
+                        .body_prop_delegates
+                        .get(&key)
+                        .copied()
+                    {
+                        let module_rc = self.current_module.clone();
+                        if let Some(module_rc) = module_rc {
+                            let func = module_rc.funcs[fid.0 as usize].clone();
+                            let primary_args: Vec<Value> = class
+                                .primary_params
+                                .iter()
+                                .map(|p| {
+                                    ctor_env
+                                        .borrow()
+                                        .lookup(&p.name)
+                                        .unwrap_or(Value::Null)
+                                })
+                                .collect();
+                            let class_names: Vec<String> = module_rc
+                                .classes
+                                .iter()
+                                .map(|c| c.name.clone())
+                                .collect();
+                            let method_index = IrHost::build_method_index(&module_rc);
+                            let mut host = IrHost {
+                                interp: self,
+                                out,
+                                class_names,
+                                closures: Vec::new(),
+                                module: std::rc::Rc::clone(&module_rc),
+                                method_index,
+                            };
+                            match klio_ir::eval::eval_with(
+                                &module_rc,
+                                &func,
+                                primary_args,
+                                &mut host,
+                            ) {
+                                Ok(v) => v,
+                                Err(klio_ir::eval::EvalError::Unsupported(_)) => {
+                                    self.eval_expr(delegate_expr, ctor_env, out)?
+                                }
+                                Err(e) => {
+                                    return Err(RuntimeError::Type(format!("{e}")));
+                                }
+                            }
+                        } else {
+                            self.eval_expr(delegate_expr, ctor_env, out)?
+                        }
+                    } else {
+                        self.eval_expr(delegate_expr, ctor_env, out)?
+                    }
+                };
                 // Spec ch.9: if the delegate value's class declares
                 // `operator fun provideDelegate(thisRef, property)`, call
                 // it once at property-init time and store the result.
