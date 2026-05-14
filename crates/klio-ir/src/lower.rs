@@ -13,6 +13,17 @@ use klio_ast::{BinOp as AstBinOp, Block as AstBlock, Expr, Stmt, UnOp as AstUnOp
 use crate::build::FuncBuilder;
 use crate::{BinOp, Const, Inst, Reg, Terminator, UnOp};
 
+/// Bind function parameters into the current scope. Each param is
+/// loaded into a fresh register via `Inst::LoadParam` so subsequent
+/// `Path { name }` reads route through the same register.
+pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
+    for (i, name) in names.iter().enumerate() {
+        let dst = b.alloc_reg();
+        b.push(Inst::LoadParam { dst, idx: i as u16 });
+        b.bind(*name, dst);
+    }
+}
+
 /// Lower one expression into the current block. Returns the
 /// register holding the result. Statements that do not produce a
 /// value (assignments, declarations) return a synthetic `Unit`
@@ -80,6 +91,66 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             dst
         }
         Expr::Block(block) => lower_block(b, block),
+        Expr::Path { segments, .. } => {
+            if segments.len() == 1 {
+                if let Some(r) = b.resolve(&segments[0].name) {
+                    return r;
+                }
+            }
+            // Unresolved path — emit a Trace so the gap is visible
+            // and return Unit so the lowering pass stays total.
+            b.push(Inst::Trace { span: expr_span(expr) });
+            b.emit_const(Const::Unit)
+        }
+        Expr::StringTemplate { parts, .. } => {
+            let mut cur = b.emit_const(Const::String(String::new()));
+            for part in parts {
+                let piece = match part {
+                    klio_ast::StringPart::Text(s) => b.emit_const(Const::String(s.clone())),
+                    klio_ast::StringPart::ShortInterp(ident) => {
+                        b.resolve(&ident.name)
+                            .unwrap_or_else(|| b.emit_const(Const::String(String::new())))
+                    }
+                    klio_ast::StringPart::Interp(e) => lower_expr(b, e),
+                };
+                let dst = b.alloc_reg();
+                b.push(Inst::BinOp { dst, op: BinOp::StringConcat, lhs: cur, rhs: piece });
+                cur = dst;
+            }
+            cur
+        }
+        Expr::While { cond, body, .. } => {
+            let header = b.alloc_block();
+            let body_blk = b.alloc_block();
+            let exit = b.alloc_block();
+            b.terminate(Terminator::Goto(header));
+
+            b.switch_to(header);
+            let c = lower_expr(b, cond);
+            b.terminate(Terminator::Branch { cond: c, t: body_blk, f: exit });
+
+            b.switch_to(body_blk);
+            let _ = lower_expr(b, body);
+            b.terminate(Terminator::Goto(header));
+
+            b.switch_to(exit);
+            b.emit_const(Const::Unit)
+        }
+        Expr::DoWhile { body, cond, .. } => {
+            let body_blk = b.alloc_block();
+            let exit = b.alloc_block();
+            b.terminate(Terminator::Goto(body_blk));
+
+            b.switch_to(body_blk);
+            if let Some(body) = body {
+                let _ = lower_expr(b, body);
+            }
+            let c = lower_expr(b, cond);
+            b.terminate(Terminator::Branch { cond: c, t: body_blk, f: exit });
+
+            b.switch_to(exit);
+            b.emit_const(Const::Unit)
+        }
         Expr::Return { value, .. } => {
             let r = match value {
                 Some(e) => Some(lower_expr(b, e)),
@@ -235,6 +306,37 @@ mod tests {
         // 2 consts + 1 binop
         assert_eq!(func.blocks[0].insts.len(), 3);
         assert!(matches!(func.blocks[0].insts[2], Inst::BinOp { op: BinOp::Add, .. }));
+    }
+
+    #[test]
+    fn lowers_path_through_scope() {
+        let mut m = Module::default();
+        let mut b = FuncBuilder::new(&mut m);
+        let p = b.alloc_reg();
+        b.bind("x", p);
+        let path = Expr::Path {
+            segments: vec![klio_ast::Ident { name: "x".into(), span: dummy_span() }],
+            span: dummy_span(),
+        };
+        let r = lower_expr(&mut b, &path);
+        assert_eq!(r, p, "path should resolve to bound param register");
+    }
+
+    #[test]
+    fn lowers_while_loop_shape() {
+        let mut m = Module::default();
+        let mut b = FuncBuilder::new(&mut m);
+        let cond = Expr::BoolLit { value: true, span: dummy_span() };
+        let body = Expr::Block(klio_ast::Block { stmts: Vec::new(), span: dummy_span() });
+        let w = Expr::While {
+            cond: Box::new(cond),
+            body: Box::new(body),
+            span: dummy_span(),
+        };
+        let _ = lower_expr(&mut b, &w);
+        let func = b.finish("f", "test.f", TypeRef::unit());
+        // header, body, exit, plus entry — 4 blocks at least.
+        assert!(func.blocks.len() >= 4);
     }
 
     #[test]

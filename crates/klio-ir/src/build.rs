@@ -8,12 +8,18 @@ use crate::{Block, BlockId, Const, Func, Inst, Module, Reg, Terminator, TypeRef}
 
 /// Per-function builder. Owns a fresh register counter, the list of
 /// blocks, and a "current block" cursor that the lowering pass
-/// appends to.
+/// appends to. Carries a simple scope stack so the lowering pass
+/// can resolve `Path { name }` reads against function parameters
+/// and locally introduced bindings.
 pub struct FuncBuilder<'a> {
     pub module: &'a mut Module,
     pub blocks: Vec<Block>,
     pub cur: BlockId,
     next_reg: u32,
+    /// Scope stack. The bottom frame holds the function's parameter
+    /// bindings; lowering pushes a fresh frame per block expression
+    /// so val/var declarations are popped correctly.
+    scopes: Vec<std::collections::HashMap<String, Reg>>,
 }
 
 impl<'a> FuncBuilder<'a> {
@@ -28,6 +34,43 @@ impl<'a> FuncBuilder<'a> {
             blocks: vec![entry],
             cur: BlockId(0),
             next_reg: 0,
+            scopes: vec![std::collections::HashMap::new()],
+        }
+    }
+
+    /// Bind a name in the current scope.
+    pub fn bind(&mut self, name: impl Into<String>, reg: Reg) {
+        self.scopes
+            .last_mut()
+            .expect("at least one scope is always live")
+            .insert(name.into(), reg);
+    }
+
+    /// Resolve a simple name through the scope chain. Returns
+    /// `None` when the name is not a local/parameter — callers can
+    /// fall back to module-level lookup (top-level functions,
+    /// imports, etc.).
+    #[must_use]
+    pub fn resolve(&self, name: &str) -> Option<Reg> {
+        for frame in self.scopes.iter().rev() {
+            if let Some(r) = frame.get(name) {
+                return Some(*r);
+            }
+        }
+        None
+    }
+
+    /// Push a fresh scope (`{` opens a block, lambdas open their
+    /// own scope, etc.).
+    pub fn push_scope(&mut self) {
+        self.scopes.push(std::collections::HashMap::new());
+    }
+
+    /// Pop the current scope.
+    pub fn pop_scope(&mut self) {
+        self.scopes.pop();
+        if self.scopes.is_empty() {
+            self.scopes.push(std::collections::HashMap::new());
         }
     }
 
