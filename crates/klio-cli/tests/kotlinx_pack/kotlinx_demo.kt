@@ -34,7 +34,7 @@ fun ioSection() {
     buf.writeInt(42)
     buf.writeLong(1_000_000_000_000L)
     buf.writeString("kt")
-    println("size_before=${buf.size()}")
+    println("size_before=${buf.size}")
     val i = buf.readInt()
     val l = buf.readLong()
     val s = buf.readString()

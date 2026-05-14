@@ -71,7 +71,7 @@ fn arg_string(ctx: &CallCtx, idx: usize) -> Result<String, RuntimeError> {
 
 klio_stdlib::host_bindings! {
     pub fn host_bindings() {
-        "kotlinx.io.Buffer.size"               => buffer_size,
+        "kotlinx.io.__kxio_bufferSize"         => buffer_size_helper,
         "kotlinx.io.Buffer.isEmpty"            => buffer_is_empty,
         "kotlinx.io.Buffer.isNotEmpty"         => buffer_is_not_empty,
         "kotlinx.io.Buffer.clear"              => buffer_clear,
@@ -94,6 +94,13 @@ klio_stdlib::host_bindings! {
 
 fn buffer_size(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     with_buffer(ctx, |state| Ok(Value::Long(state.bytes.len() as i64)))
+}
+
+// Top-level `kotlinx.io.__kxio_bufferSize(buffer)` — the shim's
+// `Buffer.size` property getter calls this. Receiver-as-first-arg
+// path means `args[0]` is the Buffer instance.
+fn buffer_size_helper(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    buffer_size(ctx)
 }
 
 fn buffer_is_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

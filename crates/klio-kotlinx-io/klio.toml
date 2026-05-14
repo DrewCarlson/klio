@@ -9,7 +9,7 @@ source_roots = ["shim"]
 id = "stdlib"
 
 [bindings]
-"kotlinx.io.Buffer.size"       = "kotlinx.io.Buffer.size"
+"kotlinx.io.__kxio_bufferSize" = "kotlinx.io.__kxio_bufferSize"
 "kotlinx.io.Buffer.isEmpty"    = "kotlinx.io.Buffer.isEmpty"
 "kotlinx.io.Buffer.isNotEmpty" = "kotlinx.io.Buffer.isNotEmpty"
 "kotlinx.io.Buffer.clear"      = "kotlinx.io.Buffer.clear"
