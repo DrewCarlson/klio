@@ -11308,6 +11308,7 @@ impl<'a> klio_runtime::IntrinsicHost for InterpHostRef<'a> {
 fn ir_err(e: klio_runtime::RuntimeError) -> klio_ir::eval::EvalError {
     match e {
         klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
+        klio_runtime::RuntimeError::Return(v) => klio_ir::eval::EvalError::NonLocalReturn(v),
         other => klio_ir::eval::EvalError::Type(other.to_string()),
     }
 }

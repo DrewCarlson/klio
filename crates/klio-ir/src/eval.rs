@@ -275,6 +275,12 @@ pub enum EvalError {
     Type(String),
     #[error("uncaught throw inside IR evaluator")]
     Throw(Value),
+    /// `return` from a nested lambda whose target is an
+    /// enclosing IR function frame. `eval_with` catches this at
+    /// the matching fn boundary and converts it to a normal
+    /// return value.
+    #[error("non-local return inside IR evaluator")]
+    NonLocalReturn(Value),
 }
 
 /// Per-call evaluation frame.
@@ -382,6 +388,7 @@ pub fn eval_with_captures(
             match exec_inst(&mut frame, inst, host) {
                 Ok(()) => {}
                 Err(EvalError::Throw(v)) => { thrown = Some(v); break; }
+                Err(EvalError::NonLocalReturn(v)) => return Ok(v),
                 Err(e) => return Err(e),
             }
         }
