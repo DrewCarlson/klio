@@ -359,8 +359,20 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let piece = match part {
                     klio_ast::StringPart::Text(s) => b.emit_const(Const::String(s.clone())),
                     klio_ast::StringPart::ShortInterp(ident) => {
-                        b.resolve(&ident.name)
-                            .unwrap_or_else(|| b.emit_const(Const::String(String::new())))
+                        if let Some(r) = b.resolve(&ident.name) {
+                            r
+                        } else if b.knows_outer(&ident.name) {
+                            let idx = b.record_capture(&ident.name);
+                            let dst = b.alloc_reg();
+                            b.push(Inst::LoadCapture { dst, idx });
+                            b.bind(ident.name.clone(), dst);
+                            dst
+                        } else {
+                            let dst = b.alloc_reg();
+                            let n = b.module.intern_const(Const::String(ident.name.clone()));
+                            b.push(Inst::LoadGlobal { dst, name: n });
+                            dst
+                        }
                     }
                     klio_ast::StringPart::Interp(e) => lower_expr(b, e),
                 };
@@ -1318,14 +1330,18 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             // declares plusAssign (operator on a class, or built-in
             // collection mutation), so CallMember is correct.
             // The plusAssign / minusAssign-style member dispatch only
-            // fires for a Path target naming a `val` local (e.g.
+            // fires for a Path target naming a `val` LOCAL (e.g.
             // `val h = Histogram(); h += w` or `val xs = mutableListOf<Int>(); xs += 1`).
-            // For a `var` Path, Member, or Index target, fall through
-            // to the read-modify-write path below — `xs[i] += v` must
-            // become `xs.set(i, xs.get(i) + v)`, not `xs.get(i).plusAssign(v)`.
+            // A Path target whose name doesn't resolve locally is a
+            // top-level binding; route it through the BinOp +
+            // StoreGlobal path below so top-level `var` compound
+            // assigns + delegated-property setters fire.
             let path_is_val = matches!(
                 target,
-                Expr::Path { segments, .. } if segments.len() == 1 && !b.is_mutable(&segments[0].name)
+                Expr::Path { segments, .. }
+                    if segments.len() == 1
+                        && !b.is_mutable(&segments[0].name)
+                        && b.resolve(&segments[0].name).is_some()
             );
             if !matches!(op, klio_ast::AssignOp::Assign) && path_is_val {
                 let method_name = match op {
@@ -1374,8 +1390,13 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                 Expr::Path { segments, .. } if segments.len() == 1 => {
                     if let Some(home) = b.mutable_home(&segments[0].name) {
                         b.push(Inst::Move { dst: home, src: combined });
-                    } else {
+                    } else if b.resolve(&segments[0].name).is_some() {
                         b.rebind(&segments[0].name, combined);
+                    } else {
+                        // Top-level binding: route through StoreGlobal so
+                        // the tree-walker setter / delegate fires.
+                        let n = b.module.intern_const(Const::String(segments[0].name.clone()));
+                        b.push(Inst::StoreGlobal { name: n, value: combined });
                     }
                 }
                 Expr::Member { receiver, name, .. } => {

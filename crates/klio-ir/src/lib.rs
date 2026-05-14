@@ -158,6 +158,11 @@ pub enum Inst {
     /// other module-scoped reference. The Host's `lookup_global`
     /// receives the interned name and returns the live value.
     LoadGlobal { dst: Reg, name: ConstId },
+    /// Write a global / top-level binding. Mirrors `LoadGlobal` for
+    /// the write side: routed through `Host::store_global` so a
+    /// delegated top-level property's setter (or a plain top-level
+    /// `var`) gets updated.
+    StoreGlobal { name: ConstId, value: Reg },
     /// Materialise a lambda value capturing the current scope's
     /// registers. The captures are listed as a `Vec<Reg>`; the
     /// evaluator snapshots the live values into a closure env.

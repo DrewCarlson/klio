@@ -351,6 +351,45 @@ impl Interpreter {
         self.globals.borrow().lookup(name)
     }
 
+    /// True when `name` names a registered top-level property
+    /// (delegated or with custom accessors). The IR's LoadGlobal
+    /// can then route through `read_top_level_property_pub` so
+    /// `val cached by lazy {…}` reads fire the delegate.
+    #[must_use]
+    pub fn has_top_level_property(&self, name: &str) -> bool {
+        self.top_level_props.contains_key(name)
+    }
+
+    pub fn assign_top_level_pub(
+        &mut self,
+        name: &str,
+        value: klio_runtime::Value,
+        out: &mut dyn Output,
+    ) -> Result<(), RuntimeError> {
+        // Top-level delegated / setter-bearing property — route the
+        // write through the tree walker's setter machinery so the
+        // delegate's `setValue` fires.
+        if let Some(pdef) = self.top_level_props.get(name).cloned() {
+            if pdef.delegate.is_some() || pdef.setter.is_some() {
+                let env = Rc::clone(&self.globals);
+                return self.write_top_level_property(&pdef, value, &env, out);
+            }
+        }
+        // Plain top-level `var` lives in `globals`; rebind it there.
+        self.globals.borrow_mut().define(name, value);
+        Ok(())
+    }
+
+    pub fn read_top_level_property_pub(
+        &mut self,
+        name: &str,
+        out: &mut dyn Output,
+    ) -> Option<Result<klio_runtime::Value, RuntimeError>> {
+        let pdef = self.top_level_props.get(name).cloned()?;
+        let env = Rc::clone(&self.globals);
+        Some(self.read_top_level_property(&pdef, &env, out))
+    }
+
     /// True when the named symbol has more than one top-level
     /// overload registered. IR call sites route these through the
     /// tree walker's eval_call so overload resolution picks the
@@ -7477,6 +7516,16 @@ impl Interpreter {
         Ok(v)
     }
 
+    pub fn write_instance_property_pub(
+        &mut self,
+        inst: &Rc<RefCell<klio_runtime::InstanceData>>,
+        pdef: &klio_runtime::PropertyDef,
+        new_value: klio_runtime::Value,
+        out: &mut dyn Output,
+    ) -> Result<(), RuntimeError> {
+        self.write_instance_property(inst, pdef, new_value, out)
+    }
+
     fn write_instance_property(
         &mut self,
         inst: &Rc<RefCell<InstanceData>>,
@@ -11136,9 +11185,40 @@ struct IrClosureSlot {
 }
 
 impl<'a> klio_ir::eval::Host for IrHost<'a> {
+    fn lookup_global_throwing(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<klio_runtime::Value>, klio_ir::eval::EvalError> {
+        if let Some(v) = self.interp.lookup_global_callable(name) {
+            return Ok(Some(v));
+        }
+        if self.interp.has_top_level_property(name) {
+            match self.interp.read_top_level_property_pub(name, self.out) {
+                Some(Ok(v)) => return Ok(Some(v)),
+                Some(Err(klio_runtime::RuntimeError::Thrown(exc))) => {
+                    return Err(klio_ir::eval::EvalError::Throw(exc));
+                }
+                Some(Err(e)) => {
+                    return Err(klio_ir::eval::EvalError::Type(e.to_string()));
+                }
+                None => {}
+            }
+        }
+        Ok(self.lookup_global(name))
+    }
+
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         if let Some(v) = self.interp.lookup_global_callable(name) {
             return Some(v);
+        }
+        // Top-level property with a delegate / custom getter — route
+        // the read through the tree walker so the getter (e.g.
+        // `lazy {…}`, `Delegates.notNull()`, `Delegates.observable(...)`)
+        // fires.
+        if self.interp.has_top_level_property(name) {
+            if let Some(Ok(v)) = self.interp.read_top_level_property_pub(name, self.out) {
+                return Some(v);
+            }
         }
         // Fully-qualified name probe — `kotlin.math.PI`, `kotlin.io.println`.
         // Returns the intrinsic by FQN directly when it's already a
@@ -11833,6 +11913,16 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
     }
 
+    fn store_global(
+        &mut self,
+        name: &str,
+        value: klio_runtime::Value,
+    ) -> Result<(), klio_ir::eval::EvalError> {
+        self.interp
+            .assign_top_level_pub(name, value, self.out)
+            .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()))
+    }
+
     fn set_field(
         &mut self,
         receiver: &klio_runtime::Value,
@@ -11849,6 +11939,32 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         }
         match receiver {
             klio_runtime::Value::Instance(inst) => {
+                // Honour a class property's custom setter / delegate
+                // (e.g. `var counter: Int set(v){ if (v >= 0) field = v }`).
+                // Walk the class + parents for a body_property with a
+                // setter or delegate; if present, route through the
+                // tree walker's write_instance_property.
+                let pdef: Option<klio_runtime::PropertyDef> = {
+                    let borrow = inst.borrow();
+                    let mut current = Some(std::rc::Rc::clone(&borrow.class));
+                    let mut found = None;
+                    while let Some(c) = current {
+                        if let Some(p) = c.body_properties.iter().find(|p| p.name == name) {
+                            if p.setter.is_some() || p.delegate.is_some() {
+                                found = Some(p.clone());
+                                break;
+                            }
+                        }
+                        current = c.parent.borrow().clone();
+                    }
+                    found
+                };
+                if let Some(p) = pdef {
+                    return self
+                        .interp
+                        .write_instance_property_pub(inst, &p, value, self.out)
+                        .map_err(|e| klio_ir::eval::EvalError::Type(e.to_string()));
+                }
                 inst.borrow_mut().define(name, value);
                 Ok(())
             }

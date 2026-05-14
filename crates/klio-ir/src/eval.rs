@@ -128,6 +128,22 @@ pub trait Host {
         None
     }
 
+    /// Throwing-aware variant of `lookup_global`. Hosts override
+    /// this when a delegated top-level property's getter may raise
+    /// a Throwable (e.g. `Delegates.notNull()` accessed before its
+    /// first set). The default forwards to `lookup_global`.
+    fn lookup_global_throwing(&mut self, name: &str) -> Result<Option<Value>, EvalError> {
+        Ok(self.lookup_global(name))
+    }
+
+    /// Write a top-level binding. Used by compound assignment on
+    /// a `Path` target that names a top-level `var` (or a delegated
+    /// property whose setter must fire). Default fails so the
+    /// missing wiring is visible.
+    fn store_global(&mut self, _name: &str, _value: Value) -> Result<(), EvalError> {
+        Err(EvalError::Unsupported("Host::store_global"))
+    }
+
     /// Materialise a closure value capturing the supplied snapshot
     /// of register values. `body_func` is a FuncId in the active
     /// module; concrete hosts build a `Value::Lambda` (or
@@ -563,13 +579,21 @@ fn exec_inst(
             let v = host.build_ast_lambda(params, body_ast, captured_names, cap_values)?;
             frame.write(*dst, v);
         }
+        Inst::StoreGlobal { name, value } => {
+            let name_str = match &frame.module.consts[name.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type("StoreGlobal: name not a string const".into())),
+            };
+            let v = frame.read(*value);
+            host.store_global(&name_str, v)?;
+        }
         Inst::LoadGlobal { dst, name } => {
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
                 _ => return Err(EvalError::Type("LoadGlobal: name not a string const".into())),
             };
             let v = host
-                .lookup_global(&name_str)
+                .lookup_global_throwing(&name_str)?
                 .ok_or_else(|| EvalError::Type(format!("unresolved global `{name_str}`")))?;
             frame.write(*dst, v);
         }
