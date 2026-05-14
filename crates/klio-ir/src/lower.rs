@@ -1485,6 +1485,35 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // CallValue.
             match callee.as_ref() {
                 Expr::Member { receiver, name, .. } => {
+                    // Receiver-typed lambda invocation: `list.block()`
+                    // where `block: T.() -> R` is a local. Lower
+                    // as CallValueWithThis so the host binds the
+                    // receiver as `this` inside the lambda body.
+                    if let Some(local_reg) = b.resolve(&name.name) {
+                        let recv = lower_expr(b, receiver);
+                        let n = args.len();
+                        let args_start = if n > 0 { b.alloc_reg() } else { Reg(0) };
+                        if n > 0 {
+                            let mut arg_slots: Vec<Reg> = vec![args_start];
+                            for _ in 1..n {
+                                arg_slots.push(b.alloc_reg());
+                            }
+                            for (slot, a) in arg_slots.iter().zip(args.iter()) {
+                                let r = lower_expr(b, a);
+                                b.push(Inst::Move { dst: *slot, src: r });
+                            }
+                        }
+                        let dst = b.alloc_reg();
+                        b.push(Inst::CallValueWithThis {
+                            dst,
+                            callee: local_reg,
+                            receiver: recv,
+                            args: args_start,
+                            n_args: n as u8,
+                            arg_names: Vec::new(),
+                        });
+                        return dst;
+                    }
                     // `super.method(...)` — emit `CallSuper` so the
                     // host walks the parent class chain rather
                     // than re-entering the leaf class's override.

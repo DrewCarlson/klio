@@ -12077,6 +12077,35 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         })
     }
 
+    fn call_value_with_this(
+        &mut self,
+        callee: &klio_runtime::Value,
+        this_value: &klio_runtime::Value,
+        args: &[klio_runtime::Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Delegate to the tree-walker's `call_lambda_with_this`
+        // when the callable is a `Value::Lambda` — it threads
+        // the receiver through as `this` for the body.
+        if let klio_runtime::Value::Lambda { params, body, env, absorb_return } = callee {
+            return self
+                .interp
+                .call_lambda_with_this(
+                    params,
+                    body,
+                    env,
+                    args,
+                    Some(this_value.clone()),
+                    *absorb_return,
+                    self.out,
+                )
+                .map_err(ir_err);
+        }
+        Err(klio_ir::eval::EvalError::Type(format!(
+            "call_value_with_this: callee is not a lambda"
+        )))
+    }
+
     fn call_super(
         &mut self,
         receiver: &klio_runtime::Value,

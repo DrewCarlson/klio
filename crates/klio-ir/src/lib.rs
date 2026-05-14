@@ -104,6 +104,19 @@ pub enum Inst {
         #[serde(default)]
         arg_names: Vec<Option<ConstId>>,
     },
+    /// `receiver.lambda(args)` — invoke a callable with a
+    /// receiver bound as `this` inside the body. Used for
+    /// receiver-typed lambda invocations on a local that's not
+    /// a method on the receiver's class.
+    CallValueWithThis {
+        dst: Reg,
+        callee: Reg,
+        receiver: Reg,
+        args: Reg,
+        n_args: u8,
+        #[serde(default)]
+        arg_names: Vec<Option<ConstId>>,
+    },
     /// Call a callable value held in a register.
     CallValue {
         dst: Reg,

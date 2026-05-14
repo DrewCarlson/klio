@@ -185,6 +185,20 @@ pub trait Host {
     /// module; concrete hosts build a `Value::Lambda` (or
     /// equivalent) wrapping the body + env so it can be invoked
     /// through `call_value`.
+    /// Invoke a callable with `this_value` bound as the
+    /// implicit receiver inside the body. Used by receiver-
+    /// typed lambda invocations like `list.block()` where
+    /// `block: T.() -> R` is a local in scope.
+    fn call_value_with_this(
+        &mut self,
+        _callee: &Value,
+        _this_value: &Value,
+        _args: &[Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<Value, EvalError> {
+        Err(EvalError::Unsupported("Host::call_value_with_this"))
+    }
+
     /// Dispatch `super.name(args)` on `receiver` against the
     /// parent of `owner_class`. Hosts walk the parent chain and
     /// invoke the matching method body.
@@ -659,6 +673,14 @@ fn exec_inst(
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
             let result = host.call_value_named(&callee_v, &arg_values, &names)?;
+            frame.write(*dst, result);
+        }
+        Inst::CallValueWithThis { dst, callee, receiver, args, n_args, arg_names } => {
+            let callee_v = frame.read(*callee);
+            let recv = frame.read(*receiver);
+            let arg_values = read_arg_run(frame, *args, *n_args);
+            let names = resolve_arg_names(frame.module, arg_names);
+            let result = host.call_value_with_this(&callee_v, &recv, &arg_values, &names)?;
             frame.write(*dst, result);
         }
         Inst::CallSpread { dst, callee, parts, arg_names } => {
