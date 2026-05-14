@@ -199,11 +199,24 @@ fn lower_function_body(module: &mut crate::Module, f: &klio_ast::Function) -> cr
 /// register so downstream code stays uniform.
 pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
     match expr {
-        Expr::IntLit { value, .. } => {
-            if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 {
-                b.emit_const(Const::Int(*value as i32))
-            } else {
-                b.emit_const(Const::Long(*value))
+        Expr::IntLit { value, kind, .. } => {
+            // Honour the literal's declared kind (`1L`, `1U`, `1uL`)
+            // rather than letting the value range pick. The suffix
+            // is what tells `is Long` apart from `is Int` for small
+            // values.
+            match kind {
+                klio_ast::IntLitKind::Long => b.emit_const(Const::Long(*value)),
+                klio_ast::IntLitKind::UInt => {
+                    b.emit_const(Const::Int(*value as i32))
+                }
+                klio_ast::IntLitKind::ULong => b.emit_const(Const::Long(*value)),
+                klio_ast::IntLitKind::Int => {
+                    if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 {
+                        b.emit_const(Const::Int(*value as i32))
+                    } else {
+                        b.emit_const(Const::Long(*value))
+                    }
+                }
             }
         }
         Expr::FloatLit { value, .. } => b.emit_const(Const::Double(*value)),
