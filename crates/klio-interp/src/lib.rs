@@ -82,7 +82,7 @@ pub struct Interpreter {
     /// is registered. Drives whether the annotation surfaces through
     /// `KClass.annotations`. Defaults to `RUNTIME` (spec §17.2) when
     /// the annotation class doesn't declare an explicit retention.
-    annotation_class_retentions: std::collections::HashMap<String, String>,
+    // annotation_class_retentions moved onto module_registry.
     /// Class table populated at registration so reflection can look
     /// up a `ClassDef` by simple name without walking the lexical
     /// scope chain. `synthesize_annotation_value` consults this when
@@ -124,7 +124,7 @@ pub struct Interpreter {
     /// Names registered as suspending functions, populated at
     /// top-level decl registration so the suspend-body lowering
     /// recognises calls to user-declared `suspend fun foo()`.
-    suspend_function_names: suspend_lower::SuspendNameSet,
+    // suspend_function_names moved onto module_registry.
     /// Monotonic counter for synthesizing unique names for anonymous-object
     /// `ClassDef`s. Only surfaces in diagnostic-style debug output.
     anon_class_counter: usize,
@@ -137,13 +137,13 @@ pub struct Interpreter {
     /// and stdlib intrinsics have been exhausted, picks the first
     /// signature whose name matches, and dispatches with `this` bound to
     /// the receiver.
-    extensions: std::collections::HashMap<String, Vec<ExtensionFn>>,
+    // extensions moved onto module_registry.
     /// Extension properties keyed by simple receiver-type name. Looked up
     /// after class-member resolution at a property read or write site;
     /// the chosen getter/setter is invoked with `this` bound to the
     /// receiver value. No backing field; reads/writes must go through
     /// declared accessors.
-    extension_properties: std::collections::HashMap<String, Vec<ExtensionProp>>,
+    // extension_properties moved onto module_registry.
     /// Stack of reified type-parameter bindings for in-flight `inline fun`
     /// calls. Each frame maps a type-param name (`T`) to the simple type
     /// name resolved at the call site (`"String"`, `"Int"`, …). `is`-checks
@@ -165,7 +165,7 @@ pub struct Interpreter {
     /// evaluation. Used to redirect identifier resolution (constructor
     /// calls through an alias name) and runtime type checks
     /// (`x is Alias`, `x as Alias`) to the alias target.
-    type_aliases: std::collections::HashMap<String, String>,
+    // type_aliases moved onto module_registry.
     /// IR module built by the decl-registration pass. `run_ir_typed`
     /// reads it directly instead of re-lowering at run time.
     current_module: Option<std::rc::Rc<klio_ir::Module>>,
@@ -196,7 +196,7 @@ pub struct Interpreter {
     /// current file. Maps the *original* simple name (the last path segment)
     /// to the chosen alias so we can surface a helpful "renamed to <alias>"
     /// message when a user references the shadowed name.
-    import_renames: std::collections::HashMap<String, String>,
+    // import_renames moved onto module_registry.
     /// Dotted package name from the file's `package` header (if any), used to
     /// stamp fully-qualified names onto user-declared classes and enums so the
     /// default `Any.toString` and `Enum.valueOf` failure messages match JVM
@@ -243,6 +243,12 @@ pub(crate) struct ModuleRegistryOwned {
     pub installed_bindings: std::collections::HashMap<String, klio_runtime::StdlibFn>,
     pub class_table: std::collections::HashMap<String, Rc<ClassDef>>,
     pub current_package: Option<String>,
+    pub extensions: std::collections::HashMap<String, Vec<ExtensionFn>>,
+    pub extension_properties: std::collections::HashMap<String, Vec<ExtensionProp>>,
+    pub type_aliases: std::collections::HashMap<String, String>,
+    pub annotation_class_retentions: std::collections::HashMap<String, String>,
+    pub import_renames: std::collections::HashMap<String, String>,
+    pub suspend_function_names: suspend_lower::SuspendNameSet,
 }
 
 /// Per-class IR side-tables produced during decl registration.
@@ -387,28 +393,25 @@ impl Interpreter {
         }
         Self {
             globals: Rc::new(RefCell::new(env)),
-            module_registry: ModuleRegistryOwned::default(),
-            annotation_class_retentions: std::collections::HashMap::new(),
+            module_registry: ModuleRegistryOwned {
+                suspend_function_names: suspend_lower::SuspendNameSet::with_intrinsics(),
+                ..ModuleRegistryOwned::default()
+            },
             coroutine_continuations: Vec::new(),
             active_suspend_frames: Vec::new(),
             launch_queue: Vec::new(),
             paused_frames: Vec::new(),
             scheduler: Box::new(klio_runtime::InProcessScheduler::new()),
-            suspend_function_names: suspend_lower::SuspendNameSet::with_intrinsics(),
             anon_class_counter: 0,
             instance_id_counter: 0,
-            extensions: std::collections::HashMap::new(),
-            extension_properties: std::collections::HashMap::new(),
             reified_stack: Vec::new(),
             loop_label_stack: Vec::new(),
             label_already_pushed_for_loop: false,
-            type_aliases: std::collections::HashMap::new(),
             current_module: None,
             current_main_id: None,
             implicit_lambda_label_stack: Vec::new(),
             tailrec_stack: Vec::new(),
             expr_types: std::collections::HashMap::new(),
-            import_renames: std::collections::HashMap::new(),
             pack_implicit_packages: Vec::new(),
             pack_known_packages: std::collections::HashSet::new(),
         }
@@ -750,7 +753,7 @@ impl Interpreter {
     fn resolve_type_alias(&self, name: &str) -> String {
         let mut cur = name.to_string();
         for _ in 0..32 {
-            match self.type_aliases.get(&cur) {
+            match self.module_registry.type_aliases.get(&cur) {
                 Some(next) if next != &cur => cur = next.clone(),
                 _ => return cur,
             }
@@ -769,7 +772,7 @@ impl Interpreter {
         if klio_types::builtin_by_name(name).is_some() {
             return false;
         }
-        if self.type_aliases.contains_key(name) {
+        if self.module_registry.type_aliases.contains_key(name) {
             return false;
         }
         if self.globals.borrow().lookup(name).is_some() {
@@ -909,7 +912,7 @@ impl Interpreter {
             let Some(simple) = ann.path.last().map(|s| s.name.clone()) else { continue };
             // Look up the annotation class's own @Retention.
             let retention = self
-                .annotation_class_retentions
+                .module_registry.annotation_class_retentions
                 .get(&simple)
                 .cloned()
                 .unwrap_or_else(|| "RUNTIME".to_string());
@@ -1577,7 +1580,7 @@ impl Interpreter {
         //  * `import path.X` (no alias) binds the simple name `X`.
         //  * `import path.*` binds every stdlib symbol whose FQN starts with
         //    `path.` and whose remainder has no further `.`.
-        self.import_renames.clear();
+        self.module_registry.import_renames.clear();
         let bind_fqn = |env: &Rc<RefCell<Env>>,
                         simple: String,
                         fqn: &str,
@@ -1631,7 +1634,7 @@ impl Interpreter {
                 bind_fqn(&file_env, simple.clone(), &fqn, out, &mut h);
             }
             if let Some(alias_ident) = &imp.alias {
-                self.import_renames
+                self.module_registry.import_renames
                     .insert(last_seg.name.clone(), alias_ident.name.clone());
             }
         }
@@ -1642,7 +1645,7 @@ impl Interpreter {
         // underlying head type at evaluation time.
         for d in &file.decls {
             if let Decl::TypeAlias(a) = d {
-                self.type_aliases
+                self.module_registry.type_aliases
                     .insert(a.name.name.clone(), a.target.name.name.clone());
             }
         }
@@ -1654,10 +1657,10 @@ impl Interpreter {
             if let Decl::Function(f) = d {
                 let decl = Rc::new(f.clone());
                 if f.is_suspend {
-                    self.suspend_function_names.insert(f.name.name.clone());
+                    self.module_registry.suspend_function_names.insert(f.name.name.clone());
                 }
                 if let Some(recv) = &f.receiver_type {
-                    self.extensions
+                    self.module_registry.extensions
                         .entry(recv.name.name.clone())
                         .or_default()
                         .push(ExtensionFn {
@@ -1750,7 +1753,7 @@ impl Interpreter {
         for d in &file.decls {
             if let Decl::Property(p) = d {
                 if let Some(recv) = &p.receiver_type {
-                    self.extension_properties
+                    self.module_registry.extension_properties
                         .entry(recv.name.name.clone())
                         .or_default()
                         .push(ExtensionProp {
@@ -1891,7 +1894,7 @@ impl Interpreter {
             }
         }
         let Some(body) = decl.body.as_ref() else { return false };
-        let names = &self.suspend_function_names;
+        let names = &self.module_registry.suspend_function_names;
         match body {
             FunctionBody::Block(b) => !b.stmts.iter().any(|s| stmt_has_suspend(s, names)),
             FunctionBody::Expr(e) => !expr_has_suspend(e, names),
@@ -2302,7 +2305,7 @@ impl Interpreter {
         let keys = Self::receiver_type_names(receiver);
         let mut chosen: Option<ExtensionFn> = None;
         'outer: for key in &keys {
-            if let Some(list) = self.extensions.get(key) {
+            if let Some(list) = self.module_registry.extensions.get(key) {
                 for ext in list {
                     if ext.decl.name.name == name && args.len() <= ext.decl.params.len() {
                         chosen = Some(ext.clone());
@@ -2315,7 +2318,7 @@ impl Interpreter {
         // key matched, dispatch through any extension whose declared
         // receiver type carries a `?`. Matches `fun T?.foo()` shape.
         if chosen.is_none() && matches!(receiver, Value::Null) {
-            for list in self.extensions.values() {
+            for list in self.module_registry.extensions.values() {
                 for ext in list {
                     let nullable_recv = ext
                         .decl
@@ -2340,7 +2343,7 @@ impl Interpreter {
         // the type-parameter name `T`. Match any receiver when no concrete
         // key has answered first.
         if chosen.is_none() {
-            for (key, list) in &self.extensions {
+            for (key, list) in &self.module_registry.extensions {
                 for ext in list {
                     let is_generic_receiver = ext.decl.type_params.iter().any(|tp| tp.name.name == *key);
                     if is_generic_receiver
@@ -2378,7 +2381,7 @@ impl Interpreter {
         let keys = Self::receiver_type_names(receiver);
         let mut chosen: Option<ExtensionFn> = None;
         'outer: for key in &keys {
-            if let Some(list) = self.extensions.get(key) {
+            if let Some(list) = self.module_registry.extensions.get(key) {
                 for ext in list {
                     if ext.decl.name.name == name && arg_vals.len() <= ext.decl.params.len() {
                         chosen = Some(ext.clone());
@@ -2388,7 +2391,7 @@ impl Interpreter {
             }
         }
         if chosen.is_none() {
-            for (key, list) in &self.extensions {
+            for (key, list) in &self.module_registry.extensions {
                 for ext in list {
                     let is_generic_receiver = ext.decl.type_params.iter().any(|tp| tp.name.name == *key);
                     if is_generic_receiver
@@ -2941,7 +2944,7 @@ impl Interpreter {
                     // shadows the implicit-prelude `X` in this file. If `X`
                     // appears unqualified and would only resolve through the
                     // prelude (nothing local provides it), report the rename.
-                    if let Some(alias) = self.import_renames.get(name) {
+                    if let Some(alias) = self.module_registry.import_renames.get(name) {
                         if env.borrow().lookup_excluding(name, &self.globals).is_none() {
                             return Err(RuntimeError::Unbound(format!(
                                 "{name} (renamed to `{alias}` by an import in this file)"
@@ -6013,7 +6016,7 @@ impl Interpreter {
             annotations: Vec::new(),
             span: body.span,
         });
-        let Some(suspend_body) = suspend_lower::lower(&synth, &self.suspend_function_names) else {
+        let Some(suspend_body) = suspend_lower::lower(&synth, &self.module_registry.suspend_function_names) else {
             return Err(RuntimeError::Type(
                 "launch: failed to lower lambda body to a suspend state machine".into(),
             ));
@@ -6099,7 +6102,7 @@ impl Interpreter {
         args: &[Value],
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
-        let Some(body) = suspend_lower::lower(decl, &self.suspend_function_names) else {
+        let Some(body) = suspend_lower::lower(decl, &self.module_registry.suspend_function_names) else {
             return Err(RuntimeError::Type(format!(
                 "suspend fun `{}` has no block body",
                 decl.name.name
@@ -7258,7 +7261,7 @@ impl Interpreter {
         // be filtered when reflection asks for them later.
         if c.is_annotation {
             let retention = extract_retention(&c.annotations).unwrap_or_else(|| "RUNTIME".to_string());
-            self.annotation_class_retentions
+            self.module_registry.annotation_class_retentions
                 .insert(c.name.name.clone(), retention);
         }
         let mut methods = Vec::new();
@@ -9156,7 +9159,7 @@ impl Interpreter {
         // val / function / class with the same name is unaffected.
         if segments.len() == 1 {
             let name = &segments[0].name;
-            if let Some(alias) = self.import_renames.get(name) {
+            if let Some(alias) = self.module_registry.import_renames.get(name) {
                 if let Some(v) = env.borrow().lookup_excluding(name, &self.globals) {
                     return Ok(v);
                 }
@@ -9513,7 +9516,7 @@ impl Interpreter {
     ) -> Option<ExtensionProp> {
         let keys = Self::receiver_type_names(receiver);
         for key in &keys {
-            if let Some(list) = self.extension_properties.get(key) {
+            if let Some(list) = self.module_registry.extension_properties.get(key) {
                 for ep in list {
                     if ep.decl.name.name == name {
                         return Some(ep.clone());
@@ -12313,7 +12316,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
     ) -> Result<Option<klio_runtime::Value>, klio_ir::eval::EvalError> {
         // Honour `import path.X as Y` — bare `X` is unresolved
         // when an alias hides it.
-        if let Some(alias) = self.interp.import_renames.get(name).cloned() {
+        if let Some(alias) = self.interp.module_registry.import_renames.get(name).cloned() {
             return Err(klio_ir::eval::EvalError::Unbound(format!(
                 "{name} (renamed to `{alias}` by an import in this file)"
             )));
@@ -14046,7 +14049,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             let type_keys = Interpreter::receiver_type_names(receiver);
             for key in &type_keys {
                 let ext_fn_opt: Option<std::rc::Rc<klio_ast::Function>> = {
-                    let list = self.interp.extensions.get(key);
+                    let list = self.interp.module_registry.extensions.get(key);
                     list.and_then(|exts| {
                         exts.iter()
                             .find(|e| {
