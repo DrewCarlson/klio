@@ -469,6 +469,13 @@ fn exec_inst(
         }
         Inst::Not { dst, src } => {
             let v = frame.read(*src);
+            // User-defined `operator fun not(): T` overrides the
+            // builtin Bool inversion; route through call_member.
+            if matches!(v, Value::Instance(_)) {
+                let result = host.call_member(&v, "not", &[])?;
+                frame.write(*dst, result);
+                return Ok(());
+            }
             let b = match v {
                 Value::Bool(b) => !b,
                 _ => return Err(EvalError::Type("Not on non-bool".into())),
