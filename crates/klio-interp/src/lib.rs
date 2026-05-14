@@ -107,6 +107,16 @@ pub struct Interpreter {
     /// ctor params and returns the delegate value.
     class_supertype_delegates:
         std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
+    /// Per-class secondary ctor entries keyed by (class name, arity).
+    /// Each value is `(delegation_arg_funcs, body_func)` where the
+    /// delegation funcs are N-arg thunks parameterised on the
+    /// secondary's params and return one primary-ctor arg, and the
+    /// body func is a 1+N-arg func (`this` + secondary params)
+    /// running the ctor body.
+    class_secondary_ctors: std::collections::HashMap<
+        (String, usize),
+        SecondaryCtorIr,
+    >,
     /// `@Retention` value declared on each annotation class (`SOURCE`,
     /// `BINARY`, or `RUNTIME`). Populated when an `annotation class`
     /// is registered. Drives whether the annotation surfaces through
@@ -259,6 +269,17 @@ pub struct Interpreter {
 /// than its own fields so the existing Interpreter storage stays the
 /// single source of truth; future passes can swap the backing fields
 /// onto this struct directly without churning every call site.
+/// One secondary constructor's lowered IR. `delegation_args` is
+/// `Some(thunks)` for `: this(args)` / `: super(args)` headers and
+/// `None` for implicit delegation. `body` is the ctor body run with
+/// `this` plus the secondary's declared params.
+#[derive(Clone)]
+struct SecondaryCtorIr {
+    delegation_args: Option<Vec<klio_ir::FuncId>>,
+    body: klio_ir::FuncId,
+    targets_super: bool,
+}
+
 pub struct ModuleRegistry<'a> {
     interp: &'a Interpreter,
 }
@@ -350,6 +371,7 @@ impl Interpreter {
             class_parent_ctor_args: std::collections::HashMap::new(),
             class_body_prop_inits: std::collections::HashMap::new(),
             class_supertype_delegates: std::collections::HashMap::new(),
+            class_secondary_ctors: std::collections::HashMap::new(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
@@ -1131,6 +1153,98 @@ impl Interpreter {
                     if p.property.is_some() {
                         own_members.insert(p.name.name.clone());
                     }
+                }
+                // Secondary constructors. Each `constructor(...)` is
+                // lowered as a 1+N-arg IR body func (this + secondary
+                // params) plus, when the source provided
+                // `: this(args)` or `: super(args)`, a vec of
+                // delegation-arg thunks parameterised on the
+                // secondary's own params. new_instance_named picks
+                // the matching arity to dispatch.
+                for sc in &c.secondary_ctors {
+                    let param_names: Vec<String> = sc
+                        .params
+                        .iter()
+                        .map(|p| p.name.name.clone())
+                        .collect();
+                    let params_ref: Vec<&str> =
+                        param_names.iter().map(|s| s.as_str()).collect();
+                    let (delegation_args, targets_super) = match &sc.delegation {
+                        klio_ast::CtorDelegation::This(args) => {
+                            let mut fids = Vec::with_capacity(args.len());
+                            for (idx, e) in args.iter().enumerate() {
+                                fids.push(klio_ir::lower::lower_expr_as_param_thunk(
+                                    &mut module,
+                                    &params_ref,
+                                    e,
+                                    &format!(
+                                        "__ctor_delegate__{}.{}#{}",
+                                        c.name.name,
+                                        sc.params.len(),
+                                        idx,
+                                    ),
+                                ));
+                            }
+                            (Some(fids), false)
+                        }
+                        klio_ast::CtorDelegation::Super(args) => {
+                            let mut fids = Vec::with_capacity(args.len());
+                            for (idx, e) in args.iter().enumerate() {
+                                fids.push(klio_ir::lower::lower_expr_as_param_thunk(
+                                    &mut module,
+                                    &params_ref,
+                                    e,
+                                    &format!(
+                                        "__ctor_super_delegate__{}.{}#{}",
+                                        c.name.name,
+                                        sc.params.len(),
+                                        idx,
+                                    ),
+                                ));
+                            }
+                            (Some(fids), true)
+                        }
+                        klio_ast::CtorDelegation::None => (None, false),
+                    };
+                    // Lower the body as a 1+N-arg func bound on
+                    // `this` plus the secondary's params. Bare
+                    // identifiers in the body resolve via the class's
+                    // member set (so `name` inside reads `this.name`).
+                    let mut with_this: Vec<&str> = Vec::with_capacity(params_ref.len() + 1);
+                    with_this.push("this");
+                    with_this.extend_from_slice(&params_ref);
+                    let body = if let Some(body) = &sc.body {
+                        klio_ir::lower::lower_init_block_with_params(
+                            &mut module,
+                            &c.name.name,
+                            &own_members,
+                            &with_this,
+                            body,
+                            &format!(
+                                "__secondary__{}#{}",
+                                c.name.name,
+                                sc.params.len(),
+                            ),
+                        )
+                    } else {
+                        klio_ir::lower::lower_empty_thunk(
+                            &mut module,
+                            &with_this,
+                            &format!(
+                                "__secondary__{}#{}",
+                                c.name.name,
+                                sc.params.len(),
+                            ),
+                        )
+                    };
+                    self.class_secondary_ctors.insert(
+                        (c.name.name.clone(), sc.params.len()),
+                        SecondaryCtorIr {
+                            delegation_args,
+                            body,
+                            targets_super,
+                        },
+                    );
                 }
                 // Supertype `by` delegates. Lower each delegate
                 // expression as an N-arg IR thunk parameterised on
@@ -12332,6 +12446,63 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 ))
             })?
             .clone();
+        // Secondary ctor: when the call's arity doesn't match the
+        // class's primary-ctor params but a lowered secondary ctor
+        // matches, route through it. Resolves delegation arg thunks
+        // → primary args, recurses to construct via primary, then
+        // runs the secondary body with (this, args).
+        if let Some(cls) = self.interp.class_table.get(&name).cloned() {
+            if !cls.is_interface
+                && !cls.is_abstract
+                && args.len() != cls.primary_params.len()
+            {
+                let key = (name.clone(), args.len());
+                if let Some(entry) = self.interp.class_secondary_ctors.get(&key).cloned() {
+                    let module = std::rc::Rc::clone(&self.module);
+                    let primary_args: Vec<klio_runtime::Value> = match &entry.delegation_args {
+                        Some(fids) => {
+                            let mut vals = Vec::with_capacity(fids.len());
+                            for fid in fids {
+                                let func = module.funcs[fid.0 as usize].clone();
+                                let v = klio_ir::eval::eval_with(
+                                    &module,
+                                    &func,
+                                    args.to_vec(),
+                                    self,
+                                )?;
+                                vals.push(v);
+                            }
+                            vals
+                        }
+                        None => Vec::new(),
+                    };
+                    let inst_val = if entry.targets_super {
+                        let parent = cls.parent.borrow().clone().ok_or_else(|| {
+                            klio_ir::eval::EvalError::Type(format!(
+                                "secondary ctor on `{name}` targets super but class has no parent"
+                            ))
+                        })?;
+                        let empty = vec![None; primary_args.len()];
+                        let mut v = self
+                            .construct_by_name(&parent.name, &primary_args, &empty)
+                            .map_err(ir_err)?;
+                        if let klio_runtime::Value::Instance(inst_rc) = &mut v {
+                            inst_rc.borrow_mut().class = std::rc::Rc::clone(&cls);
+                        }
+                        v
+                    } else {
+                        self.new_instance(class, &primary_args)?
+                    };
+                    let body_func = module.funcs[entry.body.0 as usize].clone();
+                    let mut call_args: Vec<klio_runtime::Value> =
+                        Vec::with_capacity(args.len() + 1);
+                    call_args.push(inst_val.clone());
+                    call_args.extend_from_slice(args);
+                    klio_ir::eval::eval_with(&module, &body_func, call_args, self)?;
+                    return Ok(inst_val);
+                }
+            }
+        }
         match self.construct_by_name(&name, args, arg_names) {
             Ok(v) => Ok(v),
             Err(e) => {
@@ -14383,7 +14554,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                         self,
                     )?;
                     if let klio_runtime::Value::Instance(inst_rc) = &inst_val {
-                        inst_rc.borrow_mut().define(p.name.clone(), v);
+                        inst_rc.borrow_mut().define(&p.name, v);
                     }
                 }
                 // Walk the parent chain leaf → root. At each level
@@ -14420,7 +14591,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                             for (p, v) in parent.primary_params.iter().zip(parent_vals.iter()) {
                                 inst_rc
                                     .borrow_mut()
-                                    .define(p.name.clone(), v.clone());
+                                    .define(&p.name, v.clone());
                             }
                         }
                         cur_name = parent.name.clone();
@@ -14445,7 +14616,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                             self,
                         )?;
                         if let klio_runtime::Value::Instance(inst_rc) = &inst_val {
-                            inst_rc.borrow_mut().define(field_key, v);
+                            inst_rc.borrow_mut().define(&field_key, v);
                         }
                     }
                 }
