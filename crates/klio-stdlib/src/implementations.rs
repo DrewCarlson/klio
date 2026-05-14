@@ -744,6 +744,15 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.comparisons.compareBy", cmp_compare_by),
     ("kotlin.comparisons.compareByDescending", cmp_compare_by_descending),
     ("kotlin.comparisons.compareValues", cmp_compare_values),
+    ("kotlin.Array", array_ctor_generic),
+    ("kotlin.IntArray", array_ctor_int),
+    ("kotlin.LongArray", array_ctor_long),
+    ("kotlin.DoubleArray", array_ctor_double),
+    ("kotlin.FloatArray", array_ctor_float),
+    ("kotlin.ShortArray", array_ctor_short),
+    ("kotlin.ByteArray", array_ctor_byte),
+    ("kotlin.BooleanArray", array_ctor_boolean),
+    ("kotlin.CharArray", array_ctor_char),
 
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
@@ -1627,6 +1636,66 @@ fn map_get_or_put(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let new_v = host.invoke_callable(&block, &[], *out)?;
     entries_rc.borrow_mut().push((key, new_v.clone()));
     Ok(new_v)
+}
+
+fn array_size_arg(v: &Value, what: &str) -> Result<i64, RuntimeError> {
+    let n = v.as_i64().ok_or_else(|| RuntimeError::Type(format!("{what} expects an Int size")))?;
+    if n < 0 {
+        return Err(RuntimeError::Type(format!("{what}: negative array size {n}")));
+    }
+    Ok(n)
+}
+
+fn array_ctor_impl(
+    ctx: &mut CallCtx,
+    name: &str,
+    prim: Option<klio_runtime::PrimitiveArrayKind>,
+    default: Value,
+) -> Result<Value, RuntimeError> {
+    if ctx.args.is_empty() || ctx.args.len() > 2 {
+        return Err(RuntimeError::Arity(format!("{name} expects (size) or (size, init)")));
+    }
+    let n = array_size_arg(&ctx.args[0], name)?;
+    if ctx.args.len() == 1 {
+        let items: Vec<Value> = (0..n).map(|_| default.clone()).collect();
+        return Ok(Value::Array { items: Rc::new(RefCell::new(items)), prim });
+    }
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut items = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let v = host.invoke_callable(&block, &[Value::Int(i as i32)], *out)?;
+        items.push(v);
+    }
+    Ok(Value::Array { items: Rc::new(RefCell::new(items)), prim })
+}
+
+fn array_ctor_generic(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_ctor_impl(ctx, "Array", None, Value::Null)
+}
+fn array_ctor_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_ctor_impl(ctx, "IntArray", Some(klio_runtime::PrimitiveArrayKind::Int), Value::Int(0))
+}
+fn array_ctor_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_ctor_impl(ctx, "LongArray", Some(klio_runtime::PrimitiveArrayKind::Long), Value::Long(0))
+}
+fn array_ctor_double(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_ctor_impl(ctx, "DoubleArray", Some(klio_runtime::PrimitiveArrayKind::Double), Value::Double(0.0))
+}
+fn array_ctor_float(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_ctor_impl(ctx, "FloatArray", Some(klio_runtime::PrimitiveArrayKind::Float), Value::Float(0.0))
+}
+fn array_ctor_short(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_ctor_impl(ctx, "ShortArray", Some(klio_runtime::PrimitiveArrayKind::Short), Value::Short(0))
+}
+fn array_ctor_byte(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_ctor_impl(ctx, "ByteArray", Some(klio_runtime::PrimitiveArrayKind::Byte), Value::Byte(0))
+}
+fn array_ctor_boolean(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_ctor_impl(ctx, "BooleanArray", Some(klio_runtime::PrimitiveArrayKind::Boolean), Value::Bool(false))
+}
+fn array_ctor_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_ctor_impl(ctx, "CharArray", Some(klio_runtime::PrimitiveArrayKind::Char), Value::Char('\u{0}'))
 }
 
 fn cmp_compare_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

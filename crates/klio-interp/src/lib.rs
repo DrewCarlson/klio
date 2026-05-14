@@ -4286,6 +4286,22 @@ impl Interpreter {
         env: &Rc<RefCell<Env>>,
         out: &mut dyn Output,
     ) -> Result<Option<Value>, RuntimeError> {
+        if matches!(
+            name,
+            "Array" | "IntArray" | "LongArray" | "DoubleArray" | "FloatArray"
+            | "ShortArray" | "ByteArray" | "BooleanArray" | "CharArray"
+        ) && (args.len() == 1 || args.len() == 2) {
+            let fqn = format!("kotlin.{name}");
+            if let Some(func) = klio_stdlib::implementation(&fqn) {
+                let mut arg_vals = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_vals.push(self.eval_expr(a, env, out)?);
+                }
+                let mut __interp_host = InterpHostRef { interp: self };
+                let mut ctx = CallCtx { args: &arg_vals, out, host: &mut __interp_host };
+                return Ok(Some(func(&mut ctx)?));
+            }
+        }
         use klio_runtime::PrimitiveArrayKind;
         let prim_kind = match name {
             "IntArray" => Some(PrimitiveArrayKind::Int),
