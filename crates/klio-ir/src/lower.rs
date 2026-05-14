@@ -330,10 +330,31 @@ pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::Cl
         companion: None,
         supertypes: Vec::new(),
     });
+    // Collect this class's own member names so method-body
+    // lowering can tell `someMember()` (this.someMember) apart
+    // from `topLevelFn()` (LoadGlobal).
+    let mut own_member_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for m in &c.members {
+        match m {
+            klio_ast::Decl::Function(f) => {
+                own_member_names.insert(f.name.name.clone());
+            }
+            klio_ast::Decl::Property(p) => {
+                own_member_names.insert(p.name.name.clone());
+            }
+            _ => {}
+        }
+    }
+    for p in &c.primary_params {
+        if p.property.is_some() {
+            own_member_names.insert(p.name.name.clone());
+        }
+    }
     let mut methods: Vec<crate::FuncId> = Vec::new();
     for m in &c.members {
         if let klio_ast::Decl::Function(f) = m {
-            let _ = lower_method(module, f, &c.name.name);
+            let _ = lower_method(module, f, &c.name.name, &own_member_names);
             let last_id = crate::FuncId((module.funcs.len() - 1) as u32);
             methods.push(last_id);
         }
@@ -437,8 +458,15 @@ pub fn lower_method(
     module: &mut crate::Module,
     f: &klio_ast::Function,
     owner_class: &str,
+    own_members: &std::collections::HashSet<String>,
 ) -> crate::Func {
-    let func = lower_function_body_with_implicit_owner(module, f, &["this"], Some(owner_class));
+    let func = lower_function_body_with_implicit_owner(
+        module,
+        f,
+        &["this"],
+        Some(owner_class),
+        Some(own_members),
+    );
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
     placed.id = id;
@@ -451,6 +479,7 @@ fn lower_function_body_with_implicit_owner(
     f: &klio_ast::Function,
     implicit_params: &[&str],
     owner_class: Option<&str>,
+    own_members: Option<&std::collections::HashSet<String>>,
 ) -> crate::Func {
     let mut b = FuncBuilder::new(module);
     let mut names: Vec<&str> = Vec::with_capacity(implicit_params.len() + f.params.len());
@@ -459,6 +488,9 @@ fn lower_function_body_with_implicit_owner(
     bind_params(&mut b, &names);
     if let Some(owner) = owner_class {
         let _ = b.set_owner_class(owner.to_string());
+    }
+    if let Some(set) = own_members {
+        let _ = b.set_own_members(set.clone());
     }
     let result = match &f.body {
         Some(klio_ast::FunctionBody::Block(blk)) => Some(lower_block(&mut b, blk)),
@@ -757,18 +789,19 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // identifier that didn't resolve as a local /
                 // capture / known outer is most likely a field
                 // read on the instance — try `this.<name>` via
-                // GetField before falling through to LoadGlobal.
-                // (Method calls on `this` are handled separately
-                // at the Call match arm so they emit CallMember.)
-                if let Some(this_reg) = b.resolve("this") {
-                    let dst = b.alloc_reg();
-                    let nm = b.module.intern_const(Const::String(segments[0].name.clone()));
-                    b.push(Inst::GetField {
-                        dst,
-                        receiver: this_reg,
-                        field: nm,
-                    });
-                    return dst;
+                // GetField when the owning class declares this
+                // name. Otherwise fall through to LoadGlobal.
+                if b.has_own_member(&segments[0].name) {
+                    if let Some(this_reg) = b.resolve("this") {
+                        let dst = b.alloc_reg();
+                        let nm = b.module.intern_const(Const::String(segments[0].name.clone()));
+                        b.push(Inst::GetField {
+                            dst,
+                            receiver: this_reg,
+                            field: nm,
+                        });
+                        return dst;
+                    }
                 }
                 // Not a local and not a known capture — emit
                 // LoadGlobal so the host resolves against the
@@ -836,9 +869,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             b.push(Inst::LoadCapture { dst, idx });
                             b.bind(ident.name.clone(), dst);
                             dst
-                        } else if let Some(this_reg) = b.resolve("this") {
+                        } else if b.has_own_member(&ident.name)
+                            && b.resolve("this").is_some()
+                        {
                             // Inside a method body, unqualified
                             // `$name` resolves through `this.name`.
+                            let this_reg = b.resolve("this").unwrap();
                             let dst = b.alloc_reg();
                             let nm = b.module.intern_const(Const::String(ident.name.clone()));
                             b.push(Inst::GetField { dst, receiver: this_reg, field: nm });
@@ -1208,6 +1244,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 if segments.len() == 1
                     && b.resolve(&segments[0].name).is_none()
                     && !b.knows_outer(&segments[0].name)
+                    // Only emit this.name(...) when the owning
+                    // class declares this name (method or
+                    // property); otherwise it's a global call
+                    // and the normal CallValue path should fire.
+                    && b.has_own_member(&segments[0].name)
                 {
                     if let Some(this_reg) = b.resolve("this") {
                         let (args_start, count) = lower_arg_run(b, args);

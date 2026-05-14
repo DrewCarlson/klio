@@ -55,6 +55,11 @@ pub struct FuncBuilder<'a> {
     /// the owning class. Used by `super.method()` lowering to
     /// emit `Inst::CallSuper` with the right starting class.
     owner_class: Option<String>,
+    /// Names declared on the owning class (methods, body
+    /// properties, primary-ctor properties). Used by method-
+    /// body lowering to know whether an unqualified `foo(...)`
+    /// is `this.foo(...)` (a class member) or a global lookup.
+    own_members: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +92,7 @@ impl<'a> FuncBuilder<'a> {
             mutable_homes: std::collections::HashMap::new(),
             any_typed_locals: std::collections::HashSet::new(),
             owner_class: None,
+            own_members: std::collections::HashSet::new(),
         }
     }
 
@@ -219,6 +225,12 @@ impl<'a> FuncBuilder<'a> {
     }
     pub fn owner_class(&self) -> Option<&str> {
         self.owner_class.as_deref()
+    }
+    pub fn set_own_members(&mut self, set: std::collections::HashSet<String>) {
+        self.own_members = set;
+    }
+    pub fn has_own_member(&self, name: &str) -> bool {
+        self.own_members.contains(name)
     }
 
     pub fn resolve(&self, name: &str) -> Option<Reg> {
