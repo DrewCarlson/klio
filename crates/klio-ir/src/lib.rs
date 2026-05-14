@@ -33,6 +33,9 @@
 //!   handle resolved at lowering time, identical to the closure
 //!   shape `klio_runtime::Value::Lambda` already uses.
 
+pub mod build;
+pub mod lower;
+
 use klio_span::Span;
 use serde::{Deserialize, Serialize};
 
