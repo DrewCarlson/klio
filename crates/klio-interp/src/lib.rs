@@ -11875,6 +11875,8 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             format!("kotlin.{name}"),
             format!("kotlin.io.{name}"),
             format!("kotlin.collections.{name}"),
+            format!("kotlin.comparisons.{name}"),
+            format!("kotlin.sequences.{name}"),
             format!("kotlin.ranges.{name}"),
             format!("kotlin.text.{name}"),
             format!("kotlin.math.{name}"),
