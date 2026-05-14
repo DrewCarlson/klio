@@ -84,6 +84,11 @@ pub struct Interpreter {
     /// Same idea as `top_level_prop_getters` but for setters. The
     /// FuncId names a 1-arg accessor that receives the new value.
     top_level_prop_setters: std::collections::HashMap<String, klio_ir::FuncId>,
+    /// Instance-property accessor FuncIds keyed by (class name,
+    /// property name). The getter is a 1-arg fn taking `this`; the
+    /// setter is a 2-arg fn taking `this`, `value`.
+    instance_prop_getters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    instance_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// `@Retention` value declared on each annotation class (`SOURCE`,
     /// `BINARY`, or `RUNTIME`). Populated when an `annotation class`
     /// is registered. Drives whether the annotation surfaces through
@@ -284,6 +289,8 @@ impl Interpreter {
             top_level_props: std::collections::HashMap::new(),
             top_level_prop_getters: std::collections::HashMap::new(),
             top_level_prop_setters: std::collections::HashMap::new(),
+            instance_prop_getters: std::collections::HashMap::new(),
+            instance_prop_setters: std::collections::HashMap::new(),
             annotation_class_retentions: std::collections::HashMap::new(),
             class_table: std::collections::HashMap::new(),
             coroutine_continuations: Vec::new(),
@@ -1035,6 +1042,72 @@ impl Interpreter {
                 module.funcs[id.0 as usize] = placed;
                 if f.name.name == "main" {
                     main_id = Some(id);
+                }
+            }
+        }
+        // Lower each user-class property's expression-form
+        // accessor to an IR FuncId keyed by (class name, prop name).
+        // IrHost::get_field / set_field then dispatch directly.
+        for d in &file.decls {
+            if let Decl::Class(c) = d {
+                let mut own_members: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for m in &c.members {
+                    match m {
+                        Decl::Function(f) => {
+                            own_members.insert(f.name.name.clone());
+                        }
+                        Decl::Property(p) => {
+                            own_members.insert(p.name.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                for p in &c.primary_params {
+                    if p.property.is_some() {
+                        own_members.insert(p.name.name.clone());
+                    }
+                }
+                for m in &c.members {
+                    if let Decl::Property(p) = m {
+                        if let Some(getter) = &p.getter {
+                            if let Some(body) = getter_body_expr(getter) {
+                                let id = klio_ir::lower::lower_accessor_expr(
+                                    &mut module,
+                                    &c.name.name,
+                                    &own_members,
+                                    &["this"],
+                                    &body,
+                                    &format!("__get__{}.{}", c.name.name, p.name.name),
+                                );
+                                self.instance_prop_getters.insert(
+                                    (c.name.name.clone(), p.name.name.clone()),
+                                    id,
+                                );
+                            }
+                        }
+                        if let Some(setter) = &p.setter {
+                            let param = setter
+                                .params
+                                .first()
+                                .map(|i| i.name.clone())
+                                .unwrap_or_else(|| "value".into());
+                            if let Some(body) = getter_body_expr(setter) {
+                                let id = klio_ir::lower::lower_accessor_expr(
+                                    &mut module,
+                                    &c.name.name,
+                                    &own_members,
+                                    &["this", &param],
+                                    &body,
+                                    &format!("__set__{}.{}", c.name.name, p.name.name),
+                                );
+                                self.instance_prop_setters.insert(
+                                    (c.name.name.clone(), p.name.name.clone()),
+                                    id,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -11524,8 +11597,42 @@ fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
 
 fn getter_body_expr(acc: &klio_ast::Accessor) -> Option<klio_ast::Expr> {
     match &acc.body {
-        klio_ast::FunctionBody::Expr(e) => Some(e.clone()),
-        klio_ast::FunctionBody::Block(_) => None,
+        klio_ast::FunctionBody::Expr(e) if !expr_uses_field(e) => Some(e.clone()),
+        _ => None,
+    }
+}
+
+/// True when `expr` references the implicit `field` identifier
+/// (the property's backing field). Accessors that read or write
+/// `field` need the tree walker's accessor scope to bind it; the
+/// IR fast-path skips them.
+fn expr_uses_field(expr: &klio_ast::Expr) -> bool {
+    use klio_ast::Expr;
+    match expr {
+        Expr::Path { segments, .. } => {
+            segments.len() == 1 && segments[0].name == "field"
+        }
+        Expr::Call { callee, args, .. } => {
+            expr_uses_field(callee) || args.iter().any(expr_uses_field)
+        }
+        Expr::Member { receiver, .. } => expr_uses_field(receiver),
+        Expr::Binary { lhs, rhs, .. } => expr_uses_field(lhs) || expr_uses_field(rhs),
+        Expr::Unary { expr, .. } => expr_uses_field(expr),
+        Expr::Postfix { expr, .. } => expr_uses_field(expr),
+        Expr::IsCheck { expr, .. } | Expr::As { expr, .. } => expr_uses_field(expr),
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            expr_uses_field(cond)
+                || expr_uses_field(then_branch)
+                || else_branch.as_ref().map_or(false, |e| expr_uses_field(e))
+        }
+        Expr::Index { receiver, args, .. } => {
+            expr_uses_field(receiver) || args.iter().any(expr_uses_field)
+        }
+        Expr::Throw { value, .. } => expr_uses_field(value),
+        Expr::Return { value, .. } => value.as_ref().map_or(false, |e| expr_uses_field(e)),
+        Expr::Spread { expr, .. } => expr_uses_field(expr),
+        Expr::Lambda { .. } | Expr::Block { .. } | Expr::When { .. } | Expr::Try { .. } => true,
+        _ => false,
     }
 }
 
@@ -13421,6 +13528,22 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // IR-native accessor: instance property with an
+        // expression-form custom getter lowered to its own FuncId.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let class_name = inst.borrow().class.name.clone();
+            let key = (class_name, name.to_string());
+            if let Some(fid) = self.interp.instance_prop_getters.get(&key).copied() {
+                let module = std::rc::Rc::clone(&self.module);
+                let func = module.funcs[fid.0 as usize].clone();
+                return klio_ir::eval::eval_with(
+                    &module,
+                    &func,
+                    vec![receiver.clone()],
+                    self,
+                );
+            }
+        }
         // IR-native fast-path: when the receiver is a user-class
         // instance and the named property is a plain stored field
         // (no custom getter, no delegate, no extension property),
@@ -13710,6 +13833,23 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         name: &str,
         value: klio_runtime::Value,
     ) -> Result<(), klio_ir::eval::EvalError> {
+        // IR-native accessor: expression-form setter lowered as a
+        // 2-arg FuncId taking `this` and the new value.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let class_name = inst.borrow().class.name.clone();
+            let key = (class_name, name.to_string());
+            if let Some(fid) = self.interp.instance_prop_setters.get(&key).copied() {
+                let module = std::rc::Rc::clone(&self.module);
+                let func = module.funcs[fid.0 as usize].clone();
+                klio_ir::eval::eval_with(
+                    &module,
+                    &func,
+                    vec![receiver.clone(), value],
+                    self,
+                )?;
+                return Ok(());
+            }
+        }
         // Class-side property write through the companion object
         // (`Counter.count = 5` where `companion object { var count }`).
         if let klio_runtime::Value::Class(class) = receiver {

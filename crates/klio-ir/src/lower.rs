@@ -327,9 +327,53 @@ pub fn lower_expr_as_thunk(
     id
 }
 
-/// Lower an expression as a 1-arg synthetic function whose single
-/// parameter is bound under `param_name`. Used to model property
-/// setter bodies whose source form is `set(v) = field.assign(v)`.
+/// Lower an expression as a 2-arg synthetic function bound under
+/// the supplied parameter names. Used for instance accessors whose
+/// first arg is `this` and second is the new value.
+pub fn lower_binary_expr_as_thunk(
+    module: &mut crate::Module,
+    param_a: &str,
+    param_b: &str,
+    expr: &Expr,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    bind_params(&mut b, &[param_a, param_b]);
+    let v = lower_expr(&mut b, expr);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+/// Lower an instance accessor body. `owner_class` plus `own_members`
+/// teach the lowering that bare names like `first` inside the body
+/// resolve as `this.first` (rather than free globals).
+pub fn lower_accessor_expr(
+    module: &mut crate::Module,
+    owner_class: &str,
+    own_members: &std::collections::HashSet<String>,
+    params: &[&str],
+    expr: &Expr,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    b.set_owner_class(owner_class.to_string());
+    b.set_own_members(own_members.clone());
+    bind_params(&mut b, params);
+    let v = lower_expr(&mut b, expr);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
 pub fn lower_unary_expr_as_thunk(
     module: &mut crate::Module,
     param_name: &str,
