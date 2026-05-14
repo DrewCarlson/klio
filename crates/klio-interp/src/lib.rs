@@ -642,92 +642,6 @@ impl Interpreter {
         self.eval_expr(&call, &env, out)
     }
 
-    /// Same as `invoke_named_intrinsic` but threads named args
-    /// through so default-value fill + reorder fires.
-    pub fn invoke_named_intrinsic_with_names(
-        &mut self,
-        name: &str,
-        args: &[Value],
-        arg_names: &[Option<String>],
-        out: &mut dyn Output,
-    ) -> Result<Value, RuntimeError> {
-        use klio_ast::{Expr, Ident};
-        use klio_span::{FileId, Span};
-        let dummy_span = Span::new(FileId(0), 0, 0);
-        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.globals))));
-        let mut arg_exprs: Vec<Expr> = Vec::with_capacity(args.len());
-        for (i, v) in args.iter().enumerate() {
-            let slot = format!("__ir_arg_{i}");
-            env.borrow_mut().define(slot.clone(), v.clone());
-            arg_exprs.push(Expr::Path {
-                segments: vec![Ident { name: slot, span: dummy_span }],
-                span: dummy_span,
-            });
-        }
-        let names: Vec<Option<String>> = if arg_names.len() == args.len() {
-            arg_names.to_vec()
-        } else {
-            vec![None; args.len()]
-        };
-        let call = Expr::Call {
-            callee: Box::new(Expr::Path {
-                segments: vec![Ident { name: name.to_string(), span: dummy_span }],
-                span: dummy_span,
-            }),
-            args: arg_exprs,
-            arg_names: names,
-            type_args: Vec::new(),
-            is_infix: false,
-            span: dummy_span,
-        };
-        self.eval_expr(&call, &env, out)
-    }
-
-    /// Invoke a name-dispatched intrinsic (`repeat`, `let`, `apply`,
-    /// `listOf`, …) that the tree walker recognises by simple name
-    /// inside `eval_call`. Used by the IR host to route these forms
-    /// back through the existing machinery without forcing the IR
-    /// evaluator to reimplement them. Args are pre-evaluated values
-    /// — the wrapper synthesises a fresh AST Call from a literal
-    /// callable name and bound argument placeholders so existing
-    /// dispatch fires.
-    pub fn invoke_named_intrinsic(
-        &mut self,
-        name: &str,
-        args: &[klio_runtime::Value],
-        out: &mut dyn Output,
-    ) -> Result<klio_runtime::Value, RuntimeError> {
-        use klio_ast::{Expr, Ident};
-        use klio_span::{FileId, Span};
-        let dummy_span = Span::new(FileId(0), 0, 0);
-        // Stash the pre-evaluated args as locals so the synthesised
-        // call's arg-Expr nodes resolve to them. We use a dedicated
-        // env layer so the names don't leak.
-        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.globals))));
-        let mut arg_exprs: Vec<Expr> = Vec::with_capacity(args.len());
-        for (i, v) in args.iter().enumerate() {
-            let slot_name = format!("__ir_arg_{i}");
-            env.borrow_mut().define(slot_name.clone(), v.clone());
-            arg_exprs.push(Expr::Path {
-                segments: vec![Ident { name: slot_name, span: dummy_span }],
-                span: dummy_span,
-            });
-        }
-        let arg_count = arg_exprs.len();
-        let call = Expr::Call {
-            callee: Box::new(Expr::Path {
-                segments: vec![Ident { name: name.to_string(), span: dummy_span }],
-                span: dummy_span,
-            }),
-            args: arg_exprs,
-            arg_names: vec![None; arg_count],
-            type_args: Vec::new(),
-            is_infix: false,
-            span: dummy_span,
-        };
-        self.eval_expr(&call, &env, out)
-    }
-
     /// Look up an intrinsic by FQN. Checks pack-installed bindings
     /// first, falls back to the static `klio_stdlib` table.
     #[must_use]
@@ -11846,10 +11760,14 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     || msg.contains("InstantiationError")
                     || msg.contains("abstract")
                 {
-                    return self
+                    if let Some(v) = self
                         .interp
-                        .invoke_named_intrinsic_with_names(&name, args, arg_names, self.out)
-                        .map_err(ir_err);
+                        .dispatch_top_level_overload(&name, args, arg_names, self.out)
+                        .map_err(ir_err)?
+                    {
+                        return Ok(v);
+                    }
+                    return Err(klio_ir::eval::EvalError::Type(msg));
                 }
                 Err(klio_ir::eval::EvalError::Type(msg))
             }
