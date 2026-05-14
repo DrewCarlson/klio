@@ -97,10 +97,11 @@ fn lambda_writes_outer_var(b: &FuncBuilder<'_>, arg: &Expr) -> bool {
                     && is_path_outer(expr, visible)
             }
             Expr::Return { .. } => {
-                // Bare `return` from inside the lambda body —
-                // upstream treats this as a non-local return.
-                // Force EvalAst fallback for the call.
-                true
+                // Non-local return from inside the lambda body
+                // propagates as `EvalError::NonLocalReturn` through
+                // the host's `call_value_named`; the enclosing IR
+                // fn frame catches it. No EvalAst fallback needed.
+                false
             }
             Expr::Block(b) => b.stmts.iter().any(|s| walk(s, visible)),
             Expr::If { cond, then_branch, else_branch, .. } => {
