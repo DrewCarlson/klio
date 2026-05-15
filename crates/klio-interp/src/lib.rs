@@ -2049,13 +2049,14 @@ impl Interpreter {
                 Call { callee, args, .. } => {
                     if let Path { segments, .. } = callee.as_ref() {
                         // suspendCoroutine itself runs through the IR
-                        // path: when the body resumes synchronously
-                        // (`cont.resume(v)` before returning), the
-                        // intrinsic produces the resumed value
-                        // without needing the state-machine driver.
-                        // Real suspending operations (delay, yield,
-                        // and the rest of the kotlinx pack) still
-                        // route through the state machine.
+                        // path; bodies whose only suspending op is a
+                        // synchronously-resumed continuation produce
+                        // the resumed value without needing the
+                        // state-machine driver. Real async suspending
+                        // operations (delay, yield, kotlinx pack
+                        // entry points) still route through the state
+                        // machine — they're listed in the
+                        // SuspendNameSet.
                         if segments.len() == 1
                             && matches!(
                                 segments[0].name.as_str(),
@@ -2064,10 +2065,16 @@ impl Interpreter {
                                     | "suspendCoroutineUninterceptedOrReturn"
                             )
                         {
-                            // fall through — let suspendCoroutine
-                            // dispatch through IR.
-                        }
-                        if segments.len() == 1 && names.names.contains(&segments[0].name) {
+                            // fall through — IR handles it.
+                        } else if segments.len() == 1
+                            && names.names.contains(&segments[0].name)
+                            && !matches!(
+                                segments[0].name.as_str(),
+                                "suspendCoroutine"
+                                    | "suspendCancellableCoroutine"
+                                    | "suspendCoroutineUninterceptedOrReturn"
+                            )
+                        {
                             return true;
                         }
                     }
