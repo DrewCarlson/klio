@@ -2905,7 +2905,11 @@ impl Interpreter {
                     };
                     return self.eval_stmt(&new_stmt, &scope, out);
                 }
-                let new_value = self.eval_expr(value, env, out)?;
+                let new_value = match self.eval_property_init_via_ir(value, out) {
+                    Some(Ok(v)) => v,
+                    Some(Err(err)) => return Err(err),
+                    None => self.eval_expr(value, env, out)?,
+                };
                 // §7.1.2 operator-assignment dispatch. Compound ops first
                 // attempt `*Assign` (plusAssign / minusAssign / …) on the
                 // LHS receiver. When that resolves to a member or to a
