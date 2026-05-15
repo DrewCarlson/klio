@@ -12934,16 +12934,23 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 Err(e) => return Err(e),
             }
         }
-        if self.interp.has_top_level_property(name) {
-            match self.interp.read_top_level_property_pub(name, self.out) {
-                Some(Ok(v)) => return Ok(Some(v)),
-                Some(Err(klio_runtime::RuntimeError::Thrown(exc))) => {
-                    return Err(klio_ir::eval::EvalError::Throw(exc));
-                }
-                Some(Err(e)) => {
-                    return Err(klio_ir::eval::EvalError::Type(e.to_string()));
-                }
-                None => {}
+        // Native lateinit sentinel handling: when globals' raw value
+        // is the lateinit-sentinel exception, the catch is to throw
+        // UninitializedPropertyAccessException with the property
+        // name. Lifting this check here lets IR-host stop bouncing
+        // through read_top_level_property_pub for the sentinel-only
+        // case.
+        if let Some(v) = self.interp.globals.borrow().lookup(name) {
+            if let Some(pname) = lateinit_sentinel_name(&v) {
+                return Err(klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
+                    fqn: std::rc::Rc::new(
+                        "kotlin.UninitializedPropertyAccessException".to_string(),
+                    ),
+                    message: Some(std::rc::Rc::new(format!(
+                        "lateinit property {pname} has not been initialized"
+                    ))),
+                    cause: None,
+                }));
             }
         }
         Ok(self.lookup_global(name))
