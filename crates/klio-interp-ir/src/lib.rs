@@ -4240,15 +4240,49 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // lowers as a top-level fn whose first param is the
         // receiver. Look it up by simple name and dispatch with
         // receiver prepended.
-        if let Some(fid) = self.module.func_id(name) {
-            if let Some(func) = self.module.funcs.get(fid.0 as usize).cloned() {
-                if func.params.len() == args.len() + 1 {
-                    let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
-                    all.push(receiver.clone());
-                    all.extend_from_slice(args);
-                    let module = Rc::clone(&self.module);
-                    return klio_ir::eval::eval_with(&module, &func, all, self);
+        {
+            // Gather every top-level fn named `name` with the right
+            // arity for an extension call (receiver + args). Pick the
+            // candidate whose first (receiver) parameter type best
+            // matches the actual receiver, so `bytes.encodeBase64()`
+            // and `byteString.encodeBase64()` resolve to their own
+            // overloads rather than the first-declared one.
+            let want = args.len() + 1;
+            let candidates: Vec<klio_ir::Func> = self
+                .module
+                .func_index
+                .iter()
+                .filter(|(n, _)| n == name)
+                .filter_map(|(_, fid)| self.module.funcs.get(fid.0 as usize).cloned())
+                .filter(|f| f.params.len() == want)
+                .collect();
+            let chosen = if candidates.len() <= 1 {
+                candidates.into_iter().next()
+            } else {
+                let mut best: Option<(klio_ir::Func, i32)> = None;
+                for f in candidates {
+                    let score = self
+                        .overload_score_arg(&f.params[0].ty, receiver)
+                        .unwrap_or(-1);
+                    if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+                        best = Some((f, score));
+                    }
                 }
+                best.map(|(f, _)| f)
+            };
+            if let Some(func) = chosen {
+                let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
+                all.push(receiver.clone());
+                all.extend_from_slice(args);
+                // A pack-installed binding shadows the extension's
+                // (possibly bodyless `expect`) Kotlin source —
+                // e.g. `expect fun ByteArray.encodeBase64()` with
+                // a native `actual`.
+                if let Some(intrinsic) = self.installed_bindings.resolve(&func.fqn) {
+                    return self.dispatch_intrinsic(intrinsic, &all);
+                }
+                let module = Rc::clone(&self.module);
+                return klio_ir::eval::eval_with(&module, &func, all, self);
             }
         }
         // Class-delegation forwarding: when the receiver instance
