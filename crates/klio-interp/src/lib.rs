@@ -3600,7 +3600,11 @@ impl Interpreter {
                 if matches!(op, UnOp::PreInc | UnOp::PreDec) {
                     return self.eval_prefix_incdec(*op, expr, env, out);
                 }
-                let v = self.eval_expr(expr, env, out)?;
+                let v = match self.eval_property_init_via_ir(expr, out) {
+                    Some(Ok(v)) => v,
+                    Some(Err(err)) => return Err(err),
+                    None => self.eval_expr(expr, env, out)?,
+                };
                 // Spec ch.9: unary operators on user types lower to
                 // `unaryPlus` / `unaryMinus` / `not`.
                 if matches!(op, UnOp::Pos | UnOp::Neg | UnOp::Not)
