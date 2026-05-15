@@ -2300,7 +2300,11 @@ impl Interpreter {
                 let v = if let Some(Some(v)) = slotted.get(i) {
                     v.clone()
                 } else if let Some(d) = &p.default {
-                    self.eval_expr(d, &frame, out)?
+                    match self.eval_property_init_via_ir(d, out) {
+                        Some(Ok(v)) => v,
+                        Some(Err(err)) => return Err(err),
+                        None => self.eval_expr(d, &frame, out)?,
+                    }
                 } else {
                     return Err(RuntimeError::Arity(format!(
                         "missing argument for `{}` (parameter `{}`)",
