@@ -2820,7 +2820,11 @@ impl Interpreter {
             Stmt::Expr(e) => self.eval_expr(e, env, out),
             Stmt::Decl(Decl::Property(p)) => {
                 let value = match &p.init {
-                    Some(e) => self.eval_expr(e, env, out)?,
+                    Some(e) => match self.eval_property_init_via_ir(e, out) {
+                        Some(Ok(v)) => v,
+                        Some(Err(err)) => return Err(err),
+                        None => self.eval_expr(e, env, out)?,
+                    },
                     None => Value::Null,
                 };
                 env.borrow_mut().define(p.name.name.clone(), value);
