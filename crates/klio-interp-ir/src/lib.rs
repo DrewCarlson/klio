@@ -197,7 +197,28 @@ impl<'a> VmHost<'a> {
 
 impl<'a> klio_ir::eval::Host for VmHost<'a> {
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
-        self.globals.borrow().lookup(name)
+        if let Some(v) = self.globals.borrow().lookup(name) {
+            return Some(v);
+        }
+        // Probe stdlib by FQN for known package surfaces. Covers
+        // bare references to `IntArray`, `compareBy`, `buildList`,
+        // `naturalOrder`, `PI`, etc. that aren't in IMPLICIT_ALIASES.
+        let direct_probes: [String; 7] = [
+            name.to_string(),
+            format!("kotlin.{name}"),
+            format!("kotlin.collections.{name}"),
+            format!("kotlin.text.{name}"),
+            format!("kotlin.ranges.{name}"),
+            format!("kotlin.math.{name}"),
+            format!("kotlin.comparisons.{name}"),
+        ];
+        for fqn in &direct_probes {
+            if let Some(func) = klio_stdlib::implementation(fqn) {
+                let leaked: &'static str = Box::leak(fqn.clone().into_boxed_str());
+                return Some(klio_runtime::Value::Intrinsic { fqn: leaked, func });
+            }
+        }
+        None
     }
 
     fn store_global(
