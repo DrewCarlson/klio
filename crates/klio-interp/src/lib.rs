@@ -328,10 +328,6 @@ impl<'a> ModuleRegistry<'a> {
             })
     }
     #[must_use]
-    pub fn has_top_level_property(&self, name: &str) -> bool {
-        self.interp.module_registry.top_level_props.contains_key(name)
-    }
-    #[must_use]
     pub fn lookup_global_callable(&self, name: &str) -> Option<klio_runtime::Value> {
         if let Some((ty, prop)) = name.split_once('.') {
             if let Some(v) = primitive_companion_const(ty, prop) {
