@@ -13816,11 +13816,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         }
         let body_rc = Rc::new(body.clone());
         // Register the lambda body's FuncId for IR-first dispatch only
-        // when there are no captures: the IR-first path in
-        // `call_lambda_with_this` passes no captures, so a body using
-        // `LoadCapture` would read uninitialised values.
+        // when there are no captures and the lambda has explicit
+        // params: the IR-first path passes no captures and binds args
+        // to the lowered Func's params, but implicit-`it` lambdas have
+        // empty params and `it` references inside the body lower as
+        // LoadGlobal("it"), which would fail without a runtime binding.
         if let Some(fid) = body_func {
-            if captured_names.is_empty() {
+            if captured_names.is_empty() && !params.is_empty() {
                 let sp = body_rc.span;
                 let key = (sp.file.0, sp.start, sp.end);
                 self.interp

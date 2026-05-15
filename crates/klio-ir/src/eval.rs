@@ -867,7 +867,7 @@ fn exec_inst(
             };
             let v = host
                 .lookup_global_throwing(&name_str)?
-                .ok_or_else(|| EvalError::Type(format!("unresolved global `{name_str}`")))?;
+                .ok_or_else(|| EvalError::Unbound(format!("unresolved global `{name_str}`")))?;
             frame.write(*dst, v);
         }
         Inst::LoadCapture { dst, idx } => {
