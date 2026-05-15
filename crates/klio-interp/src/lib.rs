@@ -1579,7 +1579,11 @@ impl Interpreter {
                     continue;
                 }
                 if let Some(getter) = &p.getter {
-                    if let Some(body) = getter_body_expr(getter) {
+                    if let klio_ast::FunctionBody::Expr(raw) = &getter.body {
+                        // Rewrite `field` references to the property's
+                        // backing global so the IR thunk can run without
+                        // a tree-walker accessor scope.
+                        let body = substitute_field_with(&p.name.name, raw);
                         let id = klio_ir::lower::lower_expr_as_thunk(
                             &mut module,
                             &body,
@@ -12480,6 +12484,62 @@ fn getter_body_expr(acc: &klio_ast::Accessor) -> Option<klio_ast::Expr> {
         klio_ast::FunctionBody::Expr(e) if !expr_uses_field(e) => Some(e.clone()),
         _ => None,
     }
+}
+
+/// Replace every bare `field` identifier inside `expr` with a
+/// reference to `prop_name`. Used when lowering a top-level
+/// accessor body to IR — the backing field lives in globals
+/// under the property's declared name.
+fn substitute_field_with(prop_name: &str, expr: &klio_ast::Expr) -> klio_ast::Expr {
+    use klio_ast::{Expr, Ident};
+    let mut out = expr.clone();
+    fn walk(prop: &str, e: &mut Expr) {
+        use Expr::*;
+        match e {
+            Path { segments, .. } => {
+                if segments.len() == 1 && segments[0].name == "field" {
+                    segments[0].name = prop.to_string();
+                }
+            }
+            Call { callee, args, .. } => {
+                walk(prop, callee);
+                for a in args {
+                    walk(prop, a);
+                }
+            }
+            Member { receiver, .. } => walk(prop, receiver),
+            Binary { lhs, rhs, .. } => {
+                walk(prop, lhs);
+                walk(prop, rhs);
+            }
+            Unary { expr, .. } | Postfix { expr, .. } => walk(prop, expr),
+            If { cond, then_branch, else_branch, .. } => {
+                walk(prop, cond);
+                walk(prop, then_branch);
+                if let Some(e) = else_branch.as_deref_mut() {
+                    walk(prop, e);
+                }
+            }
+            Index { receiver, args, .. } => {
+                walk(prop, receiver);
+                for a in args {
+                    walk(prop, a);
+                }
+            }
+            IsCheck { expr, .. } | As { expr, .. } => walk(prop, expr),
+            Throw { value, .. } => walk(prop, value),
+            Return { value, .. } => {
+                if let Some(v) = value.as_deref_mut() {
+                    walk(prop, v);
+                }
+            }
+            Spread { expr, .. } => walk(prop, expr),
+            _ => {}
+        }
+    }
+    let _ = Ident { name: String::new(), span: klio_span::Span::new(klio_span::FileId(0), 0, 0) };
+    walk(prop_name, &mut out);
+    out
 }
 
 /// True when `expr` references the implicit `field` identifier
