@@ -8206,7 +8206,12 @@ impl Interpreter {
             klio_ast::CtorDelegation::This(dargs) => {
                 let mut vals = Vec::with_capacity(dargs.len());
                 for e in &dargs {
-                    vals.push(self.eval_expr(e, &ctor_env, out)?);
+                    let v = match self.eval_property_init_via_ir(e, out) {
+                        Some(Ok(v)) => v,
+                        Some(Err(err)) => return Err(err),
+                        None => self.eval_expr(e, &ctor_env, out)?,
+                    };
+                    vals.push(v);
                 }
                 let names: Vec<Option<String>> = vec![None; vals.len()];
                 self.dispatch_ctor(class, inst, &vals, &names, out)?;
@@ -8221,7 +8226,12 @@ impl Interpreter {
                 if let Some(parent) = class.parent.borrow().clone() {
                     let mut vals = Vec::with_capacity(dargs.len());
                     for e in &dargs {
-                        vals.push(self.eval_expr(e, &ctor_env, out)?);
+                        let v = match self.eval_property_init_via_ir(e, out) {
+                            Some(Ok(v)) => v,
+                            Some(Err(err)) => return Err(err),
+                            None => self.eval_expr(e, &ctor_env, out)?,
+                        };
+                        vals.push(v);
                     }
                     let names: Vec<Option<String>> = vec![None; vals.len()];
                     self.run_ctor_chain(&parent, inst, &vals, &names, out)?;
