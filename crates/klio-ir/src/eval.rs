@@ -815,7 +815,7 @@ fn exec_inst(
             let v = host.build_closure(frame.module, *body_func, cap_values)?;
             frame.write(*dst, v);
         }
-        Inst::AstLambda { dst, params, body_ast, captures, captured_names, absorb_return } => {
+        Inst::AstLambda { dst, params, body_ast, captures, captured_names, absorb_return, .. } => {
             let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
             let v = host.build_ast_lambda_with_flag(params, body_ast, captured_names, cap_values, *absorb_return)?;
             frame.write(*dst, v);

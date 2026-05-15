@@ -299,6 +299,14 @@ pub enum Inst {
         /// lambdas — the enclosing function is the return target.
         #[serde(default)]
         absorb_return: bool,
+        /// FuncId of the IR-lowered body. The lambda lowering also
+        /// emits an IR Func for the body in parallel with the AST
+        /// snapshot; call sites that recognise IR-lowered lambdas
+        /// can dispatch through this FuncId without going through
+        /// the tree walker. `None` for legacy emissions that
+        /// haven't been migrated.
+        #[serde(default)]
+        body_func: Option<FuncId>,
     },
 }
 

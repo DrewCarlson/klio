@@ -2021,7 +2021,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // stdlib intrinsics) fall through to the tree walker's
             // global lookup at call time.
             let outer_names: std::collections::HashSet<String> = b.visible_names();
-            let (_body_func, captured_names) =
+            let (body_func, captured_names) =
                 lower_lambda_body_capturing(b.module, params, body, outer_names);
             let captures: Vec<Reg> = captured_names
                 .iter()
@@ -2037,6 +2037,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 captures,
                 captured_names,
                 absorb_return: false,
+                body_func: Some(body_func),
             });
             dst
         }
@@ -2339,6 +2340,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 captures,
                 captured_names,
                 absorb_return: true,
+                body_func: None,
             });
             dst
         }
@@ -2873,6 +2875,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     captures,
                     captured_names,
                     absorb_return: true,
+                    body_func: None,
                 });
                 b.bind(f.name.name.clone(), dst);
             }
