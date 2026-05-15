@@ -95,6 +95,12 @@ pub struct Vm {
     /// reified-typed calls to bind `T` → `Value::Class(arg)` as a
     /// global for the duration of the call.
     func_type_params: std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
+    /// Top-level property names declared with `by <delegate>`. Reads
+    /// and writes route through the stored delegate's
+    /// `getValue` / `setValue` operator methods.
+    top_level_delegated_props: std::collections::HashSet<String>,
+    /// Body-property `(class, prop)` pairs declared with `by`.
+    delegated_body_props: std::collections::HashSet<(String, String)>,
     /// Default outer instance to attach to locally-registered
     /// classes. `register_class_captured` snapshots `this` when
     /// the local class is declared inside a method body so the
@@ -170,6 +176,8 @@ impl Vm {
             func_defaults: std::collections::HashMap::new(),
             enclosing_class: std::collections::HashMap::new(),
             func_type_params: std::collections::HashMap::new(),
+            top_level_delegated_props: std::collections::HashSet::new(),
+            delegated_body_props: std::collections::HashSet::new(),
             class_default_outer: Rc::new(RefCell::new(std::collections::HashMap::new())),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
@@ -199,6 +207,8 @@ impl Vm {
         vm.func_defaults = built.func_defaults;
         vm.enclosing_class = built.enclosing_class;
         vm.func_type_params = built.func_type_params;
+        vm.top_level_delegated_props = built.top_level_delegated_props;
+        vm.delegated_body_props = built.delegated_body_props;
         // Pre-populated enum-entry override methods land in the
         // same anon_methods side-table the Vm consults for
         // anon-object + local-class methods.
@@ -249,11 +259,48 @@ impl Vm {
                     func_defaults: &self.func_defaults,
                     enclosing_class: &self.enclosing_class,
                     func_type_params: &self.func_type_params,
+                    top_level_delegated_props: &self.top_level_delegated_props,
+                    delegated_body_props: &self.delegated_body_props,
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
-                klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
-                    .map_err(VmError::from)?
+                let mut v = klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
+                    .map_err(VmError::from)?;
+                if self.top_level_delegated_props.contains(name) {
+                    if let klio_runtime::Value::Instance(ref inst) = v {
+                        let dcls_name = inst.borrow().class.name.clone();
+                        let has_provide = module
+                            .classes
+                            .iter()
+                            .find(|c| c.name == dcls_name)
+                            .map(|c| {
+                                c.methods.iter().any(|fid| {
+                                    module
+                                        .funcs
+                                        .get(fid.0 as usize)
+                                        .map(|f| f.name == "provideDelegate")
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false);
+                        if has_provide {
+                            let prop_ref = klio_runtime::Value::PropertyRef {
+                                name: Rc::new(name.clone()),
+                            };
+                            if let Ok(replacement) =
+                                <VmHost as klio_ir::eval::Host>::call_member(
+                                    &mut host,
+                                    &v,
+                                    "provideDelegate",
+                                    &[klio_runtime::Value::Null, prop_ref],
+                                )
+                            {
+                                v = replacement;
+                            }
+                        }
+                    }
+                }
+                v
             };
             self.globals.borrow_mut().define(name, v);
         }
@@ -307,6 +354,8 @@ impl Vm {
                     func_defaults: &self.func_defaults,
                     enclosing_class: &self.enclosing_class,
                     func_type_params: &self.func_type_params,
+                    top_level_delegated_props: &self.top_level_delegated_props,
+                    delegated_body_props: &self.delegated_body_props,
                     class_default_outer: Rc::clone(&self.class_default_outer),
                         closures: &mut self.closures,
                     };
@@ -352,6 +401,8 @@ impl Vm {
                     func_defaults: &self.func_defaults,
                     enclosing_class: &self.enclosing_class,
                     func_type_params: &self.func_type_params,
+                    top_level_delegated_props: &self.top_level_delegated_props,
+                    delegated_body_props: &self.delegated_body_props,
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
@@ -400,6 +451,8 @@ impl Vm {
             func_defaults: &self.func_defaults,
             enclosing_class: &self.enclosing_class,
             func_type_params: &self.func_type_params,
+                    top_level_delegated_props: &self.top_level_delegated_props,
+                    delegated_body_props: &self.delegated_body_props,
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut self.closures,
         };
@@ -473,6 +526,8 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<String, String>,
     func_type_params:
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
+    top_level_delegated_props: &'a std::collections::HashSet<String>,
+    delegated_body_props: &'a std::collections::HashSet<(String, String)>,
     class_default_outer:
         Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     closures: &'a mut Vec<ClosureInfo>,
@@ -740,6 +795,8 @@ impl<'a> VmHost<'a> {
             func_defaults: self.func_defaults,
             enclosing_class: self.enclosing_class,
             func_type_params: self.func_type_params,
+            top_level_delegated_props: self.top_level_delegated_props,
+            delegated_body_props: self.delegated_body_props,
             class_default_outer: Rc::clone(&self.class_default_outer),
             instance_id_counter: &mut *self.instance_id_counter,
         };
@@ -761,6 +818,23 @@ impl<'a> VmHost<'a> {
 impl<'a> klio_ir::eval::Host for VmHost<'a> {
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         let cached = self.globals.borrow().lookup(name);
+        if self.top_level_delegated_props.contains(name) {
+            if let Some(v) = cached.clone() {
+                if matches!(v, klio_runtime::Value::Instance(_)) {
+                    let prop_ref = klio_runtime::Value::PropertyRef {
+                        name: Rc::new(name.to_string()),
+                    };
+                    if let Ok(result) = <Self as klio_ir::eval::Host>::call_member(
+                        self,
+                        &v,
+                        "getValue",
+                        &[klio_runtime::Value::Null, prop_ref],
+                    ) {
+                        return Some(result);
+                    }
+                }
+            }
+        }
         if let Some(v) = cached {
             // Delegate auto-resolve for top-level `var/val X by <delegate>`.
             if let klio_runtime::Value::Delegate(d) = &v {
@@ -939,6 +1013,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         value: klio_runtime::Value,
     ) -> Result<(), klio_ir::eval::EvalError> {
+        if self.top_level_delegated_props.contains(name) {
+            let existing = self.globals.borrow().lookup(name);
+            if let Some(d) = existing {
+                if matches!(d, klio_runtime::Value::Instance(_)) {
+                    let prop_ref = klio_runtime::Value::PropertyRef {
+                        name: Rc::new(name.to_string()),
+                    };
+                    <Self as klio_ir::eval::Host>::call_member(
+                        self,
+                        &d,
+                        "setValue",
+                        &[klio_runtime::Value::Null, prop_ref, value],
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
         // Delegate-aware write: if the slot currently holds a
         // `Value::Delegate(NotNull/Observable)`, route the write
         // through the delegate's setValue semantics. Observable
@@ -1377,6 +1468,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
+            if self
+                .delegated_body_props
+                .contains(&(class_name.clone(), name.to_string()))
+            {
+                let raw = inst.borrow().get(name);
+                if let Some(d) = raw {
+                    let prop_ref = klio_runtime::Value::PropertyRef {
+                        name: Rc::new(name.to_string()),
+                    };
+                    return <Self as klio_ir::eval::Host>::call_member(
+                        self,
+                        &d,
+                        "getValue",
+                        &[receiver.clone(), prop_ref],
+                    );
+                }
+            }
             if let Some(fid) = self
                 .instance_prop_getters
                 .get(&(class_name.clone(), name.to_string()))
@@ -1676,6 +1784,24 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             if !bypass_setter {
                 let class_name = inst.borrow().class.name.clone();
+                if self
+                    .delegated_body_props
+                    .contains(&(class_name.clone(), real_name.to_string()))
+                {
+                    let raw = inst.borrow().get(real_name);
+                    if let Some(d) = raw {
+                        let prop_ref = klio_runtime::Value::PropertyRef {
+                            name: Rc::new(real_name.to_string()),
+                        };
+                        <Self as klio_ir::eval::Host>::call_member(
+                            self,
+                            &d,
+                            "setValue",
+                            &[receiver.clone(), prop_ref, value],
+                        )?;
+                        return Ok(());
+                    }
+                }
                 if let Some(fid) = self
                     .instance_prop_setters
                     .get(&(class_name, real_name.to_string()))
@@ -2357,6 +2483,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if ty.name == "KClass" {
             return matches!(value, klio_runtime::Value::Class(_));
         }
+        if ty.name == "EnumEntries" {
+            return matches!(
+                value,
+                klio_runtime::Value::List { enum_class: Some(_), .. }
+            );
+        }
+        // Lambda / function values match `Function<R>`, `Function0`,
+        // `Function1`, `Function2`, … (the arity-indexed `FunctionN`
+        // hierarchy from kotlin.jvm.functions).
+        if matches!(
+            value,
+            klio_runtime::Value::IrClosure { .. }
+                | klio_runtime::Value::Lambda { .. }
+                | klio_runtime::Value::Function { .. }
+        ) {
+            if ty.name == "Function" {
+                return true;
+            }
+            if let Some(rest) = ty.name.strip_prefix("Function") {
+                if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
+                    return true;
+                }
+            }
+        }
         // Dotted nested-class names (`S.A`, `Outer.Inner`) — match
         // by the last segment, which corresponds to the lifted
         // top-level class name in our module table.
@@ -2374,9 +2524,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // runtime — Kotlin matches them unchecked. Single-letter
         // (or short uppercase) type names are conventionally
         // generic parameters and have no class entry; treat them
-        // as accept-any-non-null.
+        // as accept-any-non-null — unless the call site bound a
+        // reified type-param to a concrete `Value::Class`, in
+        // which case redirect the check to that class's name.
         if matches!(ty.name.as_str(), "T" | "U" | "V" | "K" | "R" | "E" | "X" | "Y" | "Z" | "A" | "B" | "C" | "D")
         {
+            let bound = self.globals.borrow().lookup(&ty.name);
+            if let Some(klio_runtime::Value::Class(c)) = bound {
+                let alt = klio_ir::TypeRef {
+                    name: c.name.clone(),
+                    nullable: ty.nullable,
+                    args: ty.args.clone(),
+                };
+                return self.instance_of(value, &alt);
+            }
             let is_user_class = self.classes.borrow().contains_key(&ty.name)
                 || self.module.class_id(&ty.name).is_some();
             if !is_user_class {
@@ -3480,7 +3641,41 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // precedence (we check find_method first).
         if let klio_runtime::Value::Instance(inst) = receiver {
             let is_data = inst.borrow().class.is_data;
-            let has_user_override = inst.borrow().class.methods.iter().any(|m| m.name == name);
+            let has_user_override = {
+                let start_name = inst.borrow().class.name.clone();
+                let mut queue: std::collections::VecDeque<String> =
+                    std::collections::VecDeque::new();
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                queue.push_back(start_name);
+                let mut found = false;
+                while let Some(cur) = queue.pop_front() {
+                    if !seen.insert(cur.clone()) {
+                        continue;
+                    }
+                    if let Some(ir_class) =
+                        self.module.classes.iter().find(|c| c.name == cur)
+                    {
+                        for fid in &ir_class.methods {
+                            if let Some(f) = self.module.funcs.get(fid.0 as usize) {
+                                if f.name == name {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                    if let Some(def) = self.classes.borrow().get(&cur).cloned() {
+                        for sup in &def.supertype_names {
+                            queue.push_back(sup.clone());
+                        }
+                    }
+                }
+                found
+            };
             let is_object = inst.borrow().class.is_object;
             if is_data && is_object && !has_user_override && name == "toString" {
                 // `data object` renders as the bare class name even
@@ -3725,7 +3920,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
                 return Ok(klio_runtime::Value::String(Rc::new(format!(
                     "{}@{:x}",
-                    i.class.name, i.identity
+                    i.class.fqn, i.identity
                 ))));
             }
             if args.is_empty() && name == "hashCode" {
@@ -4295,7 +4490,43 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(1 + args.len());
                 all.push(inst_value.clone());
                 all.extend_from_slice(args);
-                let v = klio_ir::eval::eval_with(&module, &func, all, self)?;
+                let mut v = klio_ir::eval::eval_with(&module, &func, all, self)?;
+                if self
+                    .delegated_body_props
+                    .contains(&(cls.name.clone(), p.name.clone()))
+                {
+                    if let klio_runtime::Value::Instance(ref dinst) = v {
+                        let dcls_name = dinst.borrow().class.name.clone();
+                        let has_provide = self
+                            .module
+                            .classes
+                            .iter()
+                            .find(|c| c.name == dcls_name)
+                            .map(|c| {
+                                c.methods.iter().any(|fid| {
+                                    self.module
+                                        .funcs
+                                        .get(fid.0 as usize)
+                                        .map(|f| f.name == "provideDelegate")
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false);
+                        if has_provide {
+                            let prop_ref = klio_runtime::Value::PropertyRef {
+                                name: Rc::new(p.name.clone()),
+                            };
+                            if let Ok(rep) = <Self as klio_ir::eval::Host>::call_member(
+                                self,
+                                &v,
+                                "provideDelegate",
+                                &[inst_value.clone(), prop_ref],
+                            ) {
+                                v = rep;
+                            }
+                        }
+                    }
+                }
                 inst.borrow_mut().define(&p.name, v);
             } else if let Some(init_expr) = p.init.as_ref() {
                 // Runtime-registered class (no lowered thunk):
@@ -4498,6 +4729,8 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<String, String>,
     func_type_params:
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
+    top_level_delegated_props: &'a std::collections::HashSet<String>,
+    delegated_body_props: &'a std::collections::HashSet<(String, String)>,
     class_default_outer:
         Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     instance_id_counter: &'a mut u64,
@@ -4566,6 +4799,8 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     func_defaults: self.func_defaults,
                     enclosing_class: self.enclosing_class,
                     func_type_params: self.func_type_params,
+            top_level_delegated_props: self.top_level_delegated_props,
+            delegated_body_props: self.delegated_body_props,
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut *self.closures,
                 };
@@ -4617,6 +4852,8 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 func_defaults: self.func_defaults,
                 enclosing_class: self.enclosing_class,
                 func_type_params: self.func_type_params,
+            top_level_delegated_props: self.top_level_delegated_props,
+            delegated_body_props: self.delegated_body_props,
                 class_default_outer: Rc::clone(&self.class_default_outer),
                 instance_id_counter: &mut *self.instance_id_counter,
             };
@@ -4742,6 +4979,8 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             func_defaults: self.func_defaults,
             enclosing_class: self.enclosing_class,
             func_type_params: self.func_type_params,
+            top_level_delegated_props: self.top_level_delegated_props,
+            delegated_body_props: self.delegated_body_props,
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut *self.closures,
         };

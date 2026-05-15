@@ -457,6 +457,10 @@ pub struct BuiltModule {
     /// `Value::Class` globals for the duration of the call.
     pub func_type_params:
         std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
+    /// Top-level property names declared as `var/val X by <delegate>`.
+    pub top_level_delegated_props: std::collections::HashSet<String>,
+    /// Body-property `(class, prop)` pairs declared as `by <delegate>`.
+    pub delegated_body_props: std::collections::HashSet<(String, String)>,
 }
 
 /// Pre-lowered metadata for one secondary constructor. Each entry's
@@ -503,6 +507,17 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
 
 pub fn build_module(file: &KotlinFile) -> BuiltModule {
     let mut module = klio_ir::Module::default();
+    let package_prefix: String = file
+        .package
+        .as_ref()
+        .map(|p| {
+            p.path
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .unwrap_or_default();
 
     // Synthesise a `Class` for every `object` declaration so the
     // shared class-lowering pipeline picks them up (members, init,
@@ -757,6 +772,8 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         std::collections::HashMap::new();
     let mut instance_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId> =
         std::collections::HashMap::new();
+    let mut delegated_body_props: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for d in decls {
         if let Decl::Class(c) = d {
             // Collect own-member names so accessor bodies' bare
@@ -804,7 +821,8 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                         );
                         body_prop_inits.insert((c.name.name.clone(), p.name.name.clone()), fid);
                     } else if let Some(delegate) = &p.delegate {
-                        // Instance property `val x: T by <expr>`:
+                        delegated_body_props
+                            .insert((c.name.name.clone(), p.name.name.clone()));
                         // evaluate the delegate at construction
                         // time and store under the property name;
                         // get_field on the instance unwraps Lazy /
@@ -929,7 +947,11 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
             let is_object = object_names.iter().any(|n| n == &c.name.name);
             let def = std::rc::Rc::new(ClassDef {
                 name: c.name.name.clone(),
-                fqn: c.name.name.clone(),
+                fqn: if package_prefix.is_empty() {
+                    c.name.name.clone()
+                } else {
+                    format!("{}.{}", package_prefix, c.name.name)
+                },
                 annotation_names: Vec::new(),
                 primary_params,
                 methods: Vec::new(),
@@ -1308,6 +1330,8 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // `var name = expr` declared at file scope. Each lowers to a
     // 0-arg thunk. Vm::run drives them at startup.
     let mut top_level_props: Vec<(String, klio_ir::FuncId)> = Vec::new();
+    let mut top_level_delegated_props: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for d in decls {
         if let Decl::Property(p) = d {
             if p.receiver_type.is_some() {
@@ -1321,6 +1345,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                 );
                 top_level_props.push((p.name.name.clone(), fid));
             } else if let Some(delegate) = &p.delegate {
+                top_level_delegated_props.insert(p.name.name.clone());
                 // `val X by delegate-expr` — evaluate the delegate
                 // value at startup and store under the property
                 // name. Vm `lookup_global` unwraps `Value::Delegate(Lazy)`
@@ -1455,5 +1480,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         enum_entry_methods,
         enum_entry_synth_class,
         func_type_params,
+        top_level_delegated_props,
+        delegated_body_props,
     }
 }
