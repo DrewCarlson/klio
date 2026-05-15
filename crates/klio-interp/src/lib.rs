@@ -220,6 +220,12 @@ pub struct Interpreter {
     /// `is_known_package` surface contributed by every loaded pack —
     /// the set of packages reachable through the pack's symbol index.
     pack_known_packages: std::collections::HashSet<String>,
+    /// Re-entry counter for dispatch_member_via_ast. Incremented before
+    /// the IR-first thunk attempt and decremented after; when non-zero
+    /// the helper skips the IR attempt and runs the tree walker
+    /// directly, preventing infinite recursion when the IR host's
+    /// call_member fallback routes back into this helper.
+    pub(crate) dispatch_member_via_ast_depth: usize,
 }
 
 /// Read-only view over the interpreter's registry surface — the set
@@ -417,6 +423,7 @@ impl Interpreter {
             expr_types: std::collections::HashMap::new(),
             pack_implicit_packages: Vec::new(),
             pack_known_packages: std::collections::HashSet::new(),
+            dispatch_member_via_ast_depth: 0,
         }
     }
 
@@ -12960,6 +12967,12 @@ impl<'a> IrHost<'a> {
         // run it via klio_ir::eval — the IR-native path picks up
         // named args + vararg + default values through ordinary
         // dispatch. Fall back to the tree walker on IR Unsupported.
+        // Skip the IR attempt when already inside one: IR's call_member
+        // fallback re-enters this helper, which would otherwise loop.
+        if self.interp.dispatch_member_via_ast_depth > 0 {
+            return self.interp.eval_expr(&call, &env, self.out);
+        }
+        self.interp.dispatch_member_via_ast_depth += 1;
         let mut local_module = klio_ir::Module::default();
         let mut param_names: Vec<String> = Vec::with_capacity(args.len() + 1);
         param_names.push("__ir_self".to_string());
@@ -12989,7 +13002,9 @@ impl<'a> IrHost<'a> {
             module: std::rc::Rc::clone(&module_rc),
             method_index,
         };
-        match klio_ir::eval::eval_with(&module_rc, &func, thunk_args, &mut child) {
+        let ir_result = klio_ir::eval::eval_with(&module_rc, &func, thunk_args, &mut child);
+        self.interp.dispatch_member_via_ast_depth -= 1;
+        match ir_result {
             Ok(v) => return Ok(v),
             Err(klio_ir::eval::EvalError::Unsupported(_)) => {}
             Err(klio_ir::eval::EvalError::Throw(v)) => {
