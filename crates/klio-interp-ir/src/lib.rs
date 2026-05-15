@@ -2409,8 +2409,38 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         module: &klio_ir::Module,
         func: klio_ir::FuncId,
         args: Vec<klio_runtime::Value>,
-        _arg_names: &[Option<String>],
+        arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Reorder named args against the target function's
+        // declared parameter list. Positional args fill the next
+        // free slot; named args slot by name.
+        if arg_names.iter().any(|n| n.is_some()) {
+            if let Some(f) = module.funcs.get(func.0 as usize) {
+                let params = &f.params;
+                let mut slots: Vec<Option<klio_runtime::Value>> = vec![None; params.len()];
+                let mut positional_idx = 0usize;
+                for (i, a) in args.iter().enumerate() {
+                    if let Some(Some(arg_name)) = arg_names.get(i) {
+                        if let Some(pos) =
+                            params.iter().position(|p| &p.name == arg_name)
+                        {
+                            slots[pos] = Some(a.clone());
+                        }
+                    } else {
+                        if positional_idx < params.len() {
+                            slots[positional_idx] = Some(a.clone());
+                        }
+                        positional_idx += 1;
+                    }
+                }
+                let mut reordered: Vec<klio_runtime::Value> =
+                    slots.into_iter().map(|s| s.unwrap_or(klio_runtime::Value::Null)).collect();
+                while matches!(reordered.last(), Some(klio_runtime::Value::Null)) {
+                    reordered.pop();
+                }
+                return self.call_func(module, func, reordered);
+            }
+        }
         self.call_func(module, func, args)
     }
 
