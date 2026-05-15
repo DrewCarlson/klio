@@ -910,6 +910,56 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => {}
             }
         }
+        // Built-in collection in-place mutation operators.
+        match (receiver, name) {
+            (klio_runtime::Value::List { items, mutable: true, .. }, "plusAssign")
+                if args.len() == 1 =>
+            {
+                items.borrow_mut().push(args[0].clone());
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::List { items, mutable: true, .. }, "minusAssign")
+                if args.len() == 1 =>
+            {
+                let mut v = items.borrow_mut();
+                if let Some(pos) = v
+                    .iter()
+                    .position(|x| klio_runtime::Value::structural_eq(x, &args[0]))
+                {
+                    v.remove(pos);
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::Set { items, mutable: true, .. }, "plusAssign")
+                if args.len() == 1 =>
+            {
+                let mut v = items.borrow_mut();
+                if !v
+                    .iter()
+                    .any(|x| klio_runtime::Value::structural_eq(x, &args[0]))
+                {
+                    v.push(args[0].clone());
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::Map { entries, mutable: true, .. }, "plusAssign")
+                if args.len() == 1 =>
+            {
+                if let klio_runtime::Value::Pair(k, val) = &args[0] {
+                    let mut e = entries.borrow_mut();
+                    if let Some(slot) = e
+                        .iter_mut()
+                        .find(|(ek, _)| klio_runtime::Value::structural_eq(ek, k))
+                    {
+                        slot.1 = (**val).clone();
+                    } else {
+                        e.push(((**k).clone(), (**val).clone()));
+                    }
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
+            _ => {}
+        }
         // Pair / Triple / MapEntry component / first / second / etc.
         match (receiver, name) {
             (klio_runtime::Value::Pair(a, _), "component1" | "first") => return Ok((**a).clone()),
