@@ -911,6 +911,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Generic Any.toString / equals / hashCode fallback —
+        // structural where appropriate, reference-based for opaque
+        // values. Runs after the user-method walk so override
+        // bodies still win.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            if args.is_empty() && name == "toString" {
+                let i = inst.borrow();
+                return Ok(klio_runtime::Value::String(Rc::new(format!(
+                    "{}@{:x}",
+                    i.class.name, i.identity
+                ))));
+            }
+            if args.is_empty() && name == "hashCode" {
+                let i = inst.borrow();
+                return Ok(klio_runtime::Value::new_int(i.identity as i64));
+            }
+            if args.len() == 1 && name == "equals" {
+                if let klio_runtime::Value::Instance(o) = &args[0] {
+                    let same = Rc::ptr_eq(inst, o);
+                    return Ok(klio_runtime::Value::Bool(same));
+                }
+                return Ok(klio_runtime::Value::Bool(false));
+            }
+        }
         // Stdlib member dispatch: probe the receiver's type FQN
         // for a `<typeFqn>.<name>` intrinsic, then for the common
         // package-extension fallbacks. The intrinsic receives the
