@@ -2226,7 +2226,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 "hasNext" if args.is_empty() => {
                     return Ok(klio_runtime::Value::Bool(*pos.borrow() < items.borrow().len()));
                 }
-                "next" if args.is_empty() => {
+                "next" | "nextInt" | "nextLong" | "nextChar" | "nextByte"
+                | "nextShort" | "nextDouble" | "nextFloat" | "nextBoolean"
+                    if args.is_empty() =>
+                {
                     let p = *pos.borrow();
                     let v = items.borrow().get(p).cloned().ok_or_else(|| {
                         klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
