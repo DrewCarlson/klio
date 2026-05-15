@@ -159,6 +159,12 @@ pub struct BuiltModule {
     /// `new_instance` invokes them after primary-ctor field
     /// binding + body-property init.
     pub init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    /// Top-level extension properties (`val T.name: U get() = …`).
+    /// Keyed by `(receiver simple type name, property name)`. The
+    /// Vm probes this table from `get_field` when a regular field
+    /// lookup fails.
+    pub extension_props:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// FuncId of the file's `main`, or `None` when the file has no
     /// `main` entry point.
     pub main: Option<klio_ir::FuncId>,
@@ -480,6 +486,47 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         }
     }
 
+    // Top-level extension properties: `val T.name: U get() = …` /
+    // `var T.name: U get() = … set(value) { … }`. Each lowers to a
+    // 1-arg thunk taking the receiver as `this`.
+    let mut extension_props: std::collections::HashMap<(String, String), klio_ir::FuncId> =
+        std::collections::HashMap::new();
+    for d in &file.decls {
+        if let Decl::Property(p) = d {
+            if let Some(recv) = &p.receiver_type {
+                if let Some(getter) = &p.getter {
+                    let empty_members = std::collections::HashSet::new();
+                    let fid = match &getter.body {
+                        klio_ast::FunctionBody::Expr(body) => Some(
+                            klio_ir::lower::lower_accessor_expr(
+                                &mut module,
+                                &recv.name.name,
+                                &empty_members,
+                                &["this"],
+                                body,
+                                &format!("__ext_get_{}_{}", recv.name.name, p.name.name),
+                            ),
+                        ),
+                        klio_ast::FunctionBody::Block(blk) => Some(
+                            klio_ir::lower::lower_accessor_block(
+                                &mut module,
+                                &recv.name.name,
+                                &empty_members,
+                                &["this"],
+                                blk,
+                                &format!("__ext_get_{}_{}", recv.name.name, p.name.name),
+                            ),
+                        ),
+                    };
+                    if let Some(fid) = fid {
+                        extension_props
+                            .insert((recv.name.name.clone(), p.name.name.clone()), fid);
+                    }
+                }
+            }
+        }
+    }
+
     BuiltModule {
         module: Rc::new(module),
         classes,
@@ -487,6 +534,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         instance_prop_getters,
         parent_ctor_args,
         init_blocks,
+        extension_props,
         main: main_id,
     }
 }

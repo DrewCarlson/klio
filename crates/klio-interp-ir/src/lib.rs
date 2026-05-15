@@ -52,6 +52,11 @@ pub struct Vm {
     /// param). `new_instance` runs them in declaration order after
     /// the parent-ctor chain + body-property init.
     init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    /// Top-level extension property getters keyed by
+    /// `(receiver-type-simple-name, prop-name)`. `Vm::get_field`
+    /// invokes the FuncId with the receiver as `this`.
+    extension_props:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// Closure side-table. Each `Value::IrClosure { id, captures }`
     /// resolves to a `(body_func, n_params)` here. `n_params` lets
     /// the dispatch fill missing positional args with `Null` (for
@@ -99,6 +104,7 @@ impl Vm {
             instance_prop_getters: std::collections::HashMap::new(),
             parent_ctor_args: std::collections::HashMap::new(),
             init_blocks: std::collections::HashMap::new(),
+            extension_props: std::collections::HashMap::new(),
             closures: Vec::new(),
         }
     }
@@ -114,6 +120,7 @@ impl Vm {
         vm.instance_prop_getters = built.instance_prop_getters;
         vm.parent_ctor_args = built.parent_ctor_args;
         vm.init_blocks = built.init_blocks;
+        vm.extension_props = built.extension_props;
         (vm, main)
     }
 
@@ -141,6 +148,7 @@ impl Vm {
             instance_prop_getters: &self.instance_prop_getters,
             parent_ctor_args: &self.parent_ctor_args,
             init_blocks: &self.init_blocks,
+            extension_props: &self.extension_props,
             closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
@@ -180,6 +188,8 @@ struct VmHost<'a> {
     parent_ctor_args:
         &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     init_blocks: &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    extension_props:
+        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     closures: &'a mut Vec<ClosureInfo>,
 }
 
@@ -205,6 +215,7 @@ impl<'a> VmHost<'a> {
             instance_prop_getters: self.instance_prop_getters,
             parent_ctor_args: self.parent_ctor_args,
             init_blocks: self.init_blocks,
+            extension_props: self.extension_props,
             instance_id_counter: &mut *self.instance_id_counter,
         };
         let mut ctx = klio_runtime::CallCtx {
@@ -399,6 +410,32 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // bound as `this`. Wins over the plain field read so a
         // `val full: String get() = "$first $last"` shape evaluates
         // the getter rather than returning a missing-field Null.
+        // Top-level extension property: `val T.name get() = ...`
+        // — keyed by (receiver simple type, prop name). Falls
+        // through to the standard lookup chain when the user
+        // didn't declare an extension property for this combo.
+        {
+            let type_fqn = receiver.type_fqn();
+            let recv_simple: String = type_fqn
+                .rsplit('.')
+                .next()
+                .unwrap_or(type_fqn)
+                .to_string();
+            if let Some(fid) = self
+                .extension_props
+                .get(&(recv_simple, name.to_string()))
+                .copied()
+            {
+                let func = self.module.funcs.get(fid.0 as usize).cloned().ok_or_else(|| {
+                    klio_ir::eval::EvalError::Type(format!(
+                        "extension prop FuncId {} out of range",
+                        fid.0
+                    ))
+                })?;
+                let module = Rc::clone(&self.module);
+                return klio_ir::eval::eval_with(&module, &func, vec![receiver.clone()], self);
+            }
+        }
         // `size` on arrays + collections.
         if name == "size" {
             match receiver {
@@ -1534,6 +1571,8 @@ struct VmIntrinsicHost<'a> {
     parent_ctor_args:
         &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     init_blocks: &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    extension_props:
+        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_id_counter: &'a mut u64,
 }
 
@@ -1590,6 +1629,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     instance_prop_getters: self.instance_prop_getters,
                     parent_ctor_args: self.parent_ctor_args,
             init_blocks: self.init_blocks,
+            extension_props: self.extension_props,
                     closures: &mut *self.closures,
                 };
                 klio_ir::eval::eval_with_captures(
@@ -1627,6 +1667,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 instance_prop_getters: self.instance_prop_getters,
                 parent_ctor_args: self.parent_ctor_args,
             init_blocks: self.init_blocks,
+            extension_props: self.extension_props,
                 instance_id_counter: &mut *self.instance_id_counter,
             };
             let mut ctx = klio_runtime::CallCtx {
