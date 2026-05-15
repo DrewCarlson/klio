@@ -128,6 +128,177 @@ fn rewrite_block_field(block: &klio_ast::Block, prop: &str) -> klio_ast::Block {
     out
 }
 
+/// Recursively walk a class's members and lift companion objects,
+/// plain nested classes, and inner classes to top-level entries in
+/// `out_decls`. Companion singletons are registered with the Vm's
+/// `companion_singletons` table and tagged with the outer's
+/// visible-member set in `nested_outer_members`. Returns nothing —
+/// mutates the passed-in collections.
+fn collect_enclosing_member_names(
+    c: &klio_ast::Class,
+) -> std::collections::HashSet<String> {
+    let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in &c.primary_params {
+        s.insert(p.name.name.clone());
+    }
+    for m in &c.members {
+        match m {
+            Decl::Property(p) => {
+                s.insert(p.name.name.clone());
+            }
+            Decl::Function(f) => {
+                s.insert(f.name.name.clone());
+            }
+            Decl::Class(nested) if nested.is_companion => {
+                // Companion's members are visible bare-name to
+                // siblings (and to nested classes that walk the
+                // enclosing chain).
+                for m2 in &nested.members {
+                    match m2 {
+                        Decl::Property(p) => {
+                            s.insert(p.name.name.clone());
+                        }
+                        Decl::Function(f) => {
+                            s.insert(f.name.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if c.is_enum {
+        s.insert("entries".to_string());
+        s.insert("values".to_string());
+        s.insert("valueOf".to_string());
+        for e in &c.enum_entries {
+            s.insert(e.name.name.clone());
+        }
+    }
+    s
+}
+
+fn lift_class_recursive(
+    c: &klio_ast::Class,
+    enclosing_chain: &[klio_ast::Class],
+    out_decls: &mut Vec<Decl>,
+    object_names: &mut Vec<String>,
+    companion_singletons: &mut std::collections::HashMap<String, String>,
+    nested_outer_members: &mut std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    >,
+    enclosing_class: &mut std::collections::HashMap<String, String>,
+) {
+    for m in &c.members {
+        if let Decl::Object(co) = m {
+            let comp_name = format!("{}$Companion${}", c.name.name, co.name.name);
+            let mut renamed = co.clone();
+            renamed.name = klio_ast::Ident {
+                name: comp_name.clone(),
+                span: co.name.span,
+            };
+            object_names.push(comp_name.clone());
+            out_decls.push(Decl::Class(synthesize_class_from_object(&renamed)));
+            companion_singletons.insert(c.name.name.clone(), comp_name);
+        } else if let Decl::Class(nested) = m {
+            if nested.is_companion {
+                let comp_name =
+                    format!("{}$Companion${}", c.name.name, nested.name.name);
+                let mut renamed = nested.clone();
+                renamed.name = klio_ast::Ident {
+                    name: comp_name.clone(),
+                    span: nested.name.span,
+                };
+                renamed.is_companion = false;
+                let mut extras: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for p in &c.primary_params {
+                    extras.insert(p.name.name.clone());
+                }
+                for m2 in &c.members {
+                    match m2 {
+                        Decl::Property(p) => {
+                            extras.insert(p.name.name.clone());
+                        }
+                        Decl::Function(f) => {
+                            extras.insert(f.name.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                if c.is_enum {
+                    extras.insert("entries".to_string());
+                    extras.insert("values".to_string());
+                    extras.insert("valueOf".to_string());
+                    for e in &c.enum_entries {
+                        extras.insert(e.name.name.clone());
+                    }
+                }
+                // Layer in members visible up the enclosing chain
+                // so nested companions can reach the outer's
+                // companion statics by bare name.
+                for outer_c in enclosing_chain.iter().rev() {
+                    extras.extend(collect_enclosing_member_names(outer_c));
+                }
+                nested_outer_members.insert(comp_name.clone(), extras);
+                object_names.push(comp_name.clone());
+                enclosing_class.insert(comp_name.clone(), c.name.name.clone());
+                let mut next_chain: Vec<klio_ast::Class> = enclosing_chain.to_vec();
+                next_chain.push(c.clone());
+                lift_class_recursive(
+                    &renamed,
+                    &next_chain,
+                    out_decls,
+                    object_names,
+                    companion_singletons,
+                    nested_outer_members,
+                    enclosing_class,
+                );
+                out_decls.push(Decl::Class(renamed));
+                companion_singletons.insert(c.name.name.clone(), comp_name);
+            } else {
+                let mut extras: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for p in &c.primary_params {
+                    extras.insert(p.name.name.clone());
+                }
+                for m2 in &c.members {
+                    match m2 {
+                        Decl::Property(p) => {
+                            extras.insert(p.name.name.clone());
+                        }
+                        Decl::Function(f) => {
+                            extras.insert(f.name.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                for outer_c in enclosing_chain.iter().rev() {
+                    extras.extend(collect_enclosing_member_names(outer_c));
+                }
+                nested_outer_members
+                    .insert(nested.name.name.clone(), extras);
+                enclosing_class
+                    .insert(nested.name.name.clone(), c.name.name.clone());
+                let mut next_chain: Vec<klio_ast::Class> = enclosing_chain.to_vec();
+                next_chain.push(c.clone());
+                lift_class_recursive(
+                    nested,
+                    &next_chain,
+                    out_decls,
+                    object_names,
+                    companion_singletons,
+                    nested_outer_members,
+                    enclosing_class,
+                );
+                out_decls.push(Decl::Class(nested.clone()));
+            }
+        }
+    }
+}
+
 /// Synthesise a `Class` AST node that mirrors an `ObjectDecl`. The
 /// resulting class participates in the regular class-lowering pipeline
 /// (members, supertype delegation, init blocks); a separate
@@ -252,6 +423,12 @@ pub struct BuiltModule {
     /// default-init thunk when the caller omits the arg.
     pub func_defaults:
         std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
+    /// Inner class → outer class name. Populated during the
+    /// recursive lift so the Vm can resolve `this@Outer.X` and
+    /// outer-chain field lookups for nested classes lifted to
+    /// top-level decls.
+    pub enclosing_class:
+        std::collections::HashMap<String, String>,
 }
 
 /// Pre-lowered metadata for one secondary constructor. Each entry's
@@ -295,6 +472,8 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         String,
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
+    let mut enclosing_class: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut all_decls: Vec<Decl> = Vec::with_capacity(file.decls.len());
     for d in &file.decls {
         match d {
@@ -303,11 +482,28 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                 all_decls.push(Decl::Class(synthesize_class_from_object(o)));
             }
             Decl::Class(c) => {
-                // Lift companion objects out of the class body and
-                // synthesise them as standalone classes + singletons.
-                // A reverse map (outer → companion singleton name)
-                // lets the Vm route `Foo.member` reads/writes through
-                // the companion instance.
+                lift_class_recursive(
+                    c,
+                    &[],
+                    &mut all_decls,
+                    &mut object_names,
+                    &mut companion_singletons,
+                    &mut nested_outer_members,
+                    &mut enclosing_class,
+                );
+                all_decls.push(d.clone());
+            }
+            other => all_decls.push(other.clone()),
+        }
+    }
+    // The inline lift loop below has been replaced by
+    // `lift_class_recursive`. Disable the original arm so it
+    // doesn't execute twice and produce duplicate decls.
+    if false {
+        for d in &file.decls {
+            match d {
+                Decl::Object(_) => {}
+                Decl::Class(c) => {
                 for m in &c.members {
                     if let Decl::Object(co) = m {
                         let comp_name = format!("{}$Companion${}", c.name.name, co.name.name);
@@ -393,8 +589,9 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                     }
                 }
                 all_decls.push(d.clone());
+                }
+                _ => {}
             }
-            other => all_decls.push(other.clone()),
         }
     }
     let decls: &[Decl] = &all_decls;
@@ -1083,5 +1280,6 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         secondary_ctors,
         class_delegates,
         func_defaults,
+        enclosing_class,
     }
 }

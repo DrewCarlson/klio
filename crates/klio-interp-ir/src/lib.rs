@@ -85,6 +85,9 @@ pub struct Vm {
     /// Per-function default-arg thunk table.
     func_defaults:
         std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
+    /// Inner class → outer class name. Used to walk enclosing
+    /// chains for nested-companion field reads.
+    enclosing_class: std::collections::HashMap<String, String>,
     /// Runtime-lowered method bodies for anonymous-object / local
     /// classes, indexed by `(class name, method name) -> (Module, FuncId)`.
     /// The IR module is immutable after build, so methods declared
@@ -150,6 +153,7 @@ impl Vm {
             secondary_ctors: std::collections::HashMap::new(),
             class_delegates: std::collections::HashMap::new(),
             func_defaults: std::collections::HashMap::new(),
+            enclosing_class: std::collections::HashMap::new(),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
         }
@@ -175,6 +179,7 @@ impl Vm {
         vm.secondary_ctors = built.secondary_ctors;
         vm.class_delegates = built.class_delegates;
         vm.func_defaults = built.func_defaults;
+        vm.enclosing_class = built.enclosing_class;
         (vm, main)
     }
 
@@ -214,6 +219,7 @@ impl Vm {
                     secondary_ctors: &self.secondary_ctors,
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
+                    enclosing_class: &self.enclosing_class,
                     closures: &mut self.closures,
                 };
                 klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -268,6 +274,7 @@ impl Vm {
                     secondary_ctors: &self.secondary_ctors,
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
+                    enclosing_class: &self.enclosing_class,
                         closures: &mut self.closures,
                     };
                     klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -309,6 +316,7 @@ impl Vm {
                     secondary_ctors: &self.secondary_ctors,
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
+                    enclosing_class: &self.enclosing_class,
                     closures: &mut self.closures,
                 };
                 <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
@@ -353,6 +361,7 @@ impl Vm {
             secondary_ctors: &self.secondary_ctors,
             class_delegates: &self.class_delegates,
             func_defaults: &self.func_defaults,
+            enclosing_class: &self.enclosing_class,
             closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
@@ -419,6 +428,8 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
     func_defaults:
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
+    enclosing_class:
+        &'a std::collections::HashMap<String, String>,
     closures: &'a mut Vec<ClosureInfo>,
 }
 
@@ -681,6 +692,7 @@ impl<'a> VmHost<'a> {
             secondary_ctors: self.secondary_ctors,
             class_delegates: self.class_delegates,
             func_defaults: self.func_defaults,
+            enclosing_class: self.enclosing_class,
             instance_id_counter: &mut *self.instance_id_counter,
         };
         let mut ctx = klio_runtime::CallCtx {
@@ -1330,11 +1342,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         }
                         cur_outer = outer_inst.borrow().outer.clone();
                     }
-                    klio_runtime::Value::Class(_) => {
+                    klio_runtime::Value::Class(cls) => {
                         if let Ok(v) = self.get_field(&o, name) {
                             return Ok(v);
                         }
-                        cur_outer = None;
+                        // Step to the enclosing class — nested
+                        // companions chain `Inner` → `Outer` so
+                        // bare-name lookups for outer companion
+                        // statics resolve.
+                        cur_outer = self
+                            .enclosing_class
+                            .get(&cls.name)
+                            .cloned()
+                            .and_then(|n| self.classes.borrow().get(&n).cloned())
+                            .map(klio_runtime::Value::Class);
                     }
                     _ => cur_outer = None,
                 }
@@ -3706,6 +3727,8 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
     func_defaults:
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
+    enclosing_class:
+        &'a std::collections::HashMap<String, String>,
     instance_id_counter: &'a mut u64,
 }
 
@@ -3769,6 +3792,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     secondary_ctors: self.secondary_ctors,
                     class_delegates: self.class_delegates,
                     func_defaults: self.func_defaults,
+                    enclosing_class: self.enclosing_class,
                     closures: &mut *self.closures,
                 };
                 klio_ir::eval::eval_with_captures(
@@ -3813,6 +3837,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 secondary_ctors: self.secondary_ctors,
                 class_delegates: self.class_delegates,
                 func_defaults: self.func_defaults,
+                enclosing_class: self.enclosing_class,
                 instance_id_counter: &mut *self.instance_id_counter,
             };
             let mut ctx = klio_runtime::CallCtx {
