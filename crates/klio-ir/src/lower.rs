@@ -1676,6 +1676,111 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
                     if let Some(func_id) = b.module.func_id(&segments[0].name) {
+                        // Extension fn called by its bare name from inside
+                        // a receiver-typed scope: prepend the active
+                        // `this` reg so `this.launch(block)` flows through
+                        // the same Call inst the qualified form would
+                        // emit. Detected by the resolved func declaring
+                        // `this` as its first param.
+                        let needs_this = b
+                            .module
+                            .funcs
+                            .get(func_id.0 as usize)
+                            .map(|f| f.params.first().map(|p| p.name == "this").unwrap_or(false))
+                            .unwrap_or(false);
+                        if needs_this {
+                            // Resolve a `this` reg even from a lambda
+                            // body that hasn't bound it locally — fall
+                            // back to a capture so the eval frame
+                            // loads the receiver value populated by
+                            // `invoke_callable_with_this`.
+                            let this_reg_opt: Option<Reg> = b
+                                .resolve("this")
+                                .or_else(|| {
+                                    if b.knows_outer("this") || b.is_lambda_body() {
+                                        let idx = b.record_capture("this");
+                                        let dst = b.alloc_reg();
+                                        b.push(Inst::LoadCapture { dst, idx });
+                                        b.bind("this".to_string(), dst);
+                                        Some(dst)
+                                    } else {
+                                        None
+                                    }
+                                });
+                            if let Some(this_reg) = this_reg_opt {
+                                let mut all: Vec<Expr> =
+                                    Vec::with_capacity(args.len() + 1);
+                                // Synthesise a Path("this") arg expr; the
+                                // existing arg-run path resolves it back
+                                // to the bound reg.
+                                let synth = Expr::Path {
+                                    segments: vec![klio_ast::Ident {
+                                        name: "this".to_string(),
+                                        span: expr_span(callee.as_ref()),
+                                    }],
+                                    span: expr_span(callee.as_ref()),
+                                };
+                                all.push(synth);
+                                all.extend(args.iter().cloned());
+                                let (args_start, count) = lower_arg_run(b, &all);
+                                // Trailing-lambda routing for extension
+                                // fns with default-valued middle params
+                                // (`fun T.launch(context = …, block)` —
+                                // `obj.launch { … }` skips the default
+                                // context, assigns the lambda to `block`).
+                                // Build per-arg names by aligning user-
+                                // supplied args with the func's tail
+                                // params and emitting an explicit
+                                // arg-name for the last user-supplied
+                                // arg so call_func_named slots it
+                                // correctly.
+                                let mut arg_names = intern_arg_names(b.module, ast_arg_names);
+                                let target_params: Vec<String> = b
+                                    .module
+                                    .funcs
+                                    .get(func_id.0 as usize)
+                                    .map(|f| {
+                                        f.params.iter().map(|p| p.name.clone()).collect()
+                                    })
+                                    .unwrap_or_default();
+                                let user_arg_count = all.len() - 1;
+                                if !target_params.is_empty()
+                                    && user_arg_count >= 1
+                                    && (1 + user_arg_count) < target_params.len()
+                                    && ast_arg_names.iter().all(|n| n.is_none())
+                                {
+                                    // Synthesise arg_names: positional for
+                                    // injected `this` + each user arg,
+                                    // then re-tag the last user arg with
+                                    // the last param's name so it routes
+                                    // to that slot.
+                                    let mut names: Vec<Option<crate::ConstId>> =
+                                        vec![None; all.len()];
+                                    let last_param = target_params.last().cloned();
+                                    if let Some(p_name) = last_param {
+                                        let cid = b.module.intern_const(Const::String(p_name));
+                                        let last_idx = names.len() - 1;
+                                        names[last_idx] = Some(cid);
+                                    }
+                                    arg_names = names;
+                                }
+                                let type_args = intern_type_args(b.module, ast_type_args);
+                                let dst = b.alloc_reg();
+                                let _ = this_reg;
+                                b.push(Inst::Call {
+                                    dst,
+                                    func: func_id,
+                                    args: args_start,
+                                    n_args: count,
+                                    arg_names,
+                                    type_args,
+                                });
+                                return dst;
+                            }
+                            // No `this` in scope — fall through to the
+                            // unmodified Call below; runtime will error
+                            // with a clearer "missing receiver" diag.
+                        }
                         let callee_is_tailrec = b
                             .module
                             .funcs
@@ -2145,7 +2250,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 lower_lambda_body_capturing(b.module, params, body, outer_names);
             let captures: Vec<Reg> = captured_names
                 .iter()
-                .filter_map(|n| b.resolve(n))
+                .map(|n| resolve_capture(b, n))
                 .collect();
             let mut param_names: Vec<String> =
                 params.iter().map(|p| p.name.clone()).collect();
@@ -2430,7 +2535,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let captured_names: Vec<String> = outer_names.iter().cloned().collect();
             let captures: Vec<Reg> = captured_names
                 .iter()
-                .filter_map(|n| b.resolve(n))
+                .map(|n| resolve_capture(b, n))
                 .collect();
             let dst = b.alloc_reg();
             b.push(Inst::BuildObject {
@@ -2465,7 +2570,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             );
             let captures: Vec<Reg> = captured_names
                 .iter()
-                .filter_map(|n| b.resolve(n))
+                .map(|n| resolve_capture(b, n))
                 .collect();
             let dst = b.alloc_reg();
             b.push(Inst::AstLambda {
@@ -2535,6 +2640,32 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.emit_const(Const::Unit)
         }
     }
+}
+
+/// Materialise a register holding the value captured by a child
+/// lambda. If `name` resolves locally we use its reg directly. Else
+/// when the enclosing scope knows it as an outer capture, record it
+/// on the current builder + emit a `LoadCapture` so the value flows
+/// through the chain (the outer scope's lambda already captured it
+/// or will need to, via the same mechanism, when its own enclosing
+/// lambda lowers).
+fn resolve_capture(b: &mut FuncBuilder<'_>, name: &str) -> Reg {
+    if let Some(r) = b.resolve(name) {
+        return r;
+    }
+    if b.knows_outer(name) {
+        let idx = b.record_capture(name);
+        let dst = b.alloc_reg();
+        b.push(Inst::LoadCapture { dst, idx });
+        b.bind(name.to_string(), dst);
+        return dst;
+    }
+    // Nothing matched; allocate a Unit-filled placeholder so the
+    // capture run stays well-formed.
+    let dst = b.alloc_reg();
+    let unit = b.module.intern_const(Const::Unit);
+    b.push(Inst::Const { dst, value: unit });
+    dst
 }
 
 /// Lower a lambda body, threading the enclosing builder's
@@ -3028,7 +3159,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                 );
                 let captures: Vec<Reg> = captured_names
                     .iter()
-                    .filter_map(|n| b.resolve(n))
+                    .map(|n| resolve_capture(b, n))
                     .collect();
                 let param_names: Vec<String> =
                     f.params.iter().map(|p| p.name.name.clone()).collect();
@@ -3303,7 +3434,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             let captured_names: Vec<String> = visible.iter().cloned().collect();
             let captures: Vec<Reg> = captured_names
                 .iter()
-                .filter_map(|n| b.resolve(n))
+                .map(|n| resolve_capture(b, n))
                 .collect();
             b.push(Inst::RegisterClass {
                 class: Box::new(c.clone()),

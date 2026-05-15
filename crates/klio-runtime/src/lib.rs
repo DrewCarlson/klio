@@ -78,6 +78,16 @@ pub trait IntrinsicHost {
     ) -> Option<Result<Value, RuntimeError>> {
         None
     }
+
+    /// Resolve a top-level identifier (class / object / function)
+    /// against the running interpreter's global environment.
+    /// Bindings can use this to grab a singleton (`GlobalScope`) or
+    /// look up a class for `NewInstance`-style dispatch. Default
+    /// impl returns `None`, signalling the host doesn't expose a
+    /// global table.
+    fn lookup_global(&mut self, _name: &str) -> Option<Value> {
+        None
+    }
 }
 
 /// Cooperative scheduler the runtime exposes to anything called

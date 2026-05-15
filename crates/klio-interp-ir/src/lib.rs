@@ -5250,6 +5250,10 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         &mut *self.scheduler
     }
 
+    fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
+        self.globals.borrow().lookup(name)
+    }
+
     fn invoke_method(
         &mut self,
         receiver: &klio_runtime::Value,

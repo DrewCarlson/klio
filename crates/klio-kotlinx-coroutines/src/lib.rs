@@ -55,9 +55,17 @@ fn run_blocking(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             "runBlocking: expected the block lambda as the trailing arg".into(),
         ));
     };
+    // Resolve a CoroutineScope receiver so `this.launch { … }` inside
+    // the block dispatches the shim extension. GlobalScope is the
+    // singleton the shim publishes; fall back to Null if the pack
+    // hasn't been registered yet (e.g. unit tests with NoopHost).
+    let scope = ctx
+        .host
+        .lookup_global("GlobalScope")
+        .unwrap_or(Value::Null);
     let result = ctx
         .host
-        .invoke_callable_with_this(&block, &[], &Value::Null, ctx.out)?;
+        .invoke_callable_with_this(&block, &[], &scope, ctx.out)?;
     // Drain any tasks `launch` enqueued during the block.
     loop {
         let launches = ctx.host.scheduler().drain_launches();
@@ -67,11 +75,11 @@ fn run_blocking(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
         for task in launches {
             ctx.host
-                .invoke_callable_with_this(&task, &[], &Value::Null, ctx.out)?;
+                .invoke_callable_with_this(&task, &[], &scope, ctx.out)?;
         }
         for cont in resumes {
             ctx.host
-                .invoke_callable_with_this(&cont, &[], &Value::Null, ctx.out)?;
+                .invoke_callable_with_this(&cont, &[], &scope, ctx.out)?;
         }
     }
     Ok(result)

@@ -322,6 +322,14 @@ impl<'a> FuncBuilder<'a> {
                 out.insert(k.clone());
             }
         }
+        // Include names captured from the enclosing scope so a
+        // nested lambda's body knows it can reach them by walking
+        // the capture chain. Without this, `{ { scope } }`'s inner
+        // lambda doesn't recognise `scope` as an outer name and
+        // lowers it as a global lookup.
+        for n in &self.outer_names {
+            out.insert(n.clone());
+        }
         out
     }
 
