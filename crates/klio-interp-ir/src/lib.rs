@@ -446,7 +446,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
     }
 }
 
-/// Stdlib `CallCtx` host adapter for native Vm dispatch.
+/// Stdlib `CallCtx` host adapter for native Vm dispatch. HOF
+/// bindings (`map`, `forEach`, scope fns, ...) reach back through
+/// this adapter to invoke the lambda they were passed. Implementing
+/// `invoke_callable` for `Value::IrClosure` requires borrowing the
+/// Vm's closure table + module recursively from inside a stdlib
+/// binding — that lands once the IntrinsicHost grows the right
+/// borrow shape. Today the Vm returns `Unimplemented` so the failing
+/// surfaces are visible.
 struct VmIntrinsicHost<'a> {
     scheduler: &'a mut dyn klio_runtime::Scheduler,
 }
@@ -454,13 +461,14 @@ struct VmIntrinsicHost<'a> {
 impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
     fn invoke_callable(
         &mut self,
-        _callable: &klio_runtime::Value,
+        callable: &klio_runtime::Value,
         _args: &[klio_runtime::Value],
         _out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
-        Err(klio_runtime::RuntimeError::Unimplemented(
-            "Vm::invoke_callable".into(),
-        ))
+        Err(klio_runtime::RuntimeError::Unimplemented(format!(
+            "Vm::invoke_callable on `{}`",
+            callable.type_fqn()
+        )))
     }
 
     fn invoke_callable_with_this(
