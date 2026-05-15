@@ -394,6 +394,44 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
             classes.insert(c.name.name.clone(), def);
         }
     }
+    // Populate enum entries on each `enum class` synthesised
+    // ClassDef. Each entry becomes a `Value::Instance` of the same
+    // class with `name` + `ordinal` fields populated. The entry's
+    // ctor args + body members aren't run — that lands when the IR
+    // class shape supports per-entry overrides.
+    let mut next_id = 1u64;
+    for d in &file.decls {
+        if let Decl::Class(c) = d {
+            if !c.is_enum {
+                continue;
+            }
+            if let Some(class_def) = classes.get(&c.name.name).cloned() {
+                let mut entries: Vec<(String, klio_runtime::Value)> = Vec::new();
+                for (ordinal, entry) in c.enum_entries.iter().enumerate() {
+                    let id = next_id;
+                    next_id += 1;
+                    let mut fields: Vec<(String, klio_runtime::Value)> = Vec::new();
+                    fields.push((
+                        "name".to_string(),
+                        klio_runtime::Value::String(std::rc::Rc::new(entry.name.name.clone())),
+                    ));
+                    fields.push((
+                        "ordinal".to_string(),
+                        klio_runtime::Value::new_int(ordinal as i64),
+                    ));
+                    let inst = std::rc::Rc::new(RefCell::new(klio_runtime::InstanceData {
+                        class: std::rc::Rc::clone(&class_def),
+                        fields,
+                        outer: None,
+                        identity: id,
+                        native_state: None,
+                    }));
+                    entries.push((entry.name.name.clone(), klio_runtime::Value::Instance(inst)));
+                }
+                *class_def.enum_entries.borrow_mut() = entries;
+            }
+        }
+    }
     // Resolve runtime parent + interface references so dispatch
     // walks (call_member supertype chain, instance_of class
     // hierarchy, qualified_this outer walks) follow the source-

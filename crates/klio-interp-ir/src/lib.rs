@@ -410,6 +410,35 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // bound as `this`. Wins over the plain field read so a
         // `val full: String get() = "$first $last"` shape evaluates
         // the getter rather than returning a missing-field Null.
+        // Enum: `Color.RED` / `Color.entries`. Resolves named
+        // entries on a Value::Class for an enum and the
+        // generated `entries` list / `values()` companion-style
+        // accessor.
+        if let klio_runtime::Value::Class(cls) = receiver {
+            if cls.is_enum {
+                if name == "entries" {
+                    let items: Vec<klio_runtime::Value> = cls
+                        .enum_entries
+                        .borrow()
+                        .iter()
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    return Ok(klio_runtime::Value::List {
+                        items: Rc::new(RefCell::new(items)),
+                        mutable: false,
+                        enum_class: Some(Rc::new(cls.name.clone())),
+                    });
+                }
+                if let Some((_, v)) = cls
+                    .enum_entries
+                    .borrow()
+                    .iter()
+                    .find(|(n, _)| n == name)
+                {
+                    return Ok(v.clone());
+                }
+            }
+        }
         // Top-level extension property: `val T.name get() = ...`
         // — keyed by (receiver simple type, prop name). Falls
         // through to the standard lookup chain when the user
