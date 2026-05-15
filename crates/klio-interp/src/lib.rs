@@ -1686,7 +1686,8 @@ impl Interpreter {
                         .first()
                         .map(|i| i.name.clone())
                         .unwrap_or_else(|| "value".into());
-                    if let Some(body) = getter_body_expr(setter) {
+                    if let klio_ast::FunctionBody::Expr(raw) = &setter.body {
+                        let body = substitute_field_with(&p.name.name, raw);
                         let id = klio_ir::lower::lower_unary_expr_as_thunk(
                             &mut module,
                             &param,
