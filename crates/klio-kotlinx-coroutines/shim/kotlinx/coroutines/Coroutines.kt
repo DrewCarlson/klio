@@ -36,6 +36,15 @@ internal fun __kxco_schedulerDrainCount(): Int = 0
 internal fun __kxco_spawn(block: () -> Unit): Unit = Unit
 internal fun __kxco_scheduleResume(cont: Any): Unit = Unit
 
+// `runBlocking` bridges the non-suspending world into a coroutine:
+// it builds a fresh scope, runs the suspend block to completion on
+// the caller's stack, and drains any `launch`/resume work queued
+// during the block. The platform implementation is supplied by the
+// `klio-kotlinx-coroutines` host crate (the `actual` half); this
+// `expect` declaration carries the public signature so callers
+// type-check and the API surface lives entirely in this pack.
+expect fun <T> runBlocking(block: suspend CoroutineScope.() -> T): T
+
 class CancellationException(message: String) : Throwable(message)
 
 interface Job {

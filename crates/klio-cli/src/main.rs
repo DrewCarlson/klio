@@ -5,9 +5,7 @@ use clap::{Parser as ClapParser, Subcommand, ValueEnum};
 use klio_diagnostics::{render, DiagnosticSink, Severity};
 use klio_lexer::Lexer;
 use klio_parser::Parser;
-use klio_resolver::resolve;
 use klio_span::SourceMap;
-use klio_typeck::typecheck;
 
 #[derive(ClapParser)]
 #[command(name = "klio", version, about = "Experimental Kotlin interpreter")]
@@ -862,6 +860,7 @@ fn write_pack(out: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// kotlinx import is present.
 fn load_installed_packs(
     user_asts: &[klio_ast::KotlinFile],
+    source_map: &mut SourceMap,
 ) -> (Vec<klio_ast::KotlinFile>, klio_stdlib::HostBindings) {
     use klio_pack::schema::{decode, AstBundle, BindingManifest, PackManifest};
     use klio_pack::{section_names, PackReader};
@@ -934,10 +933,73 @@ fn load_installed_packs(
         if !wanted {
             continue;
         }
-        if let Ok(Some(payload)) = pack.read_section(section_names::AST) {
-            if let Ok(ast_bundle) = decode::<AstBundle>(&payload) {
-                for f in ast_bundle.files {
-                    out_asts.push(f.kotlin_file);
+        // Teach the resolver every package this pack ships +
+        // declares implicit, so user `import kotlinx.*` lines
+        // resolve instead of tripping the "only kotlin.* is known"
+        // gate. Pack manifests carry implicit packages; each AST
+        // file's `package` header covers the rest.
+        klio_stdlib::register_known_package(manifest.library_id.clone());
+        for p in &manifest.implicit_packages {
+            klio_stdlib::register_known_package(p.clone());
+        }
+        // Re-parse the pack's Kotlin sources through the shared
+        // SourceMap rather than decoding the frozen `ast` section.
+        // Re-parsing (a) assigns every pack file a fresh, unique
+        // FileId so its spans never collide with user files and the
+        // diagnostic renderer can show pack source, and (b) is
+        // immune to AST-schema drift — a pack built against an older
+        // klio still loads because we parse with the current
+        // grammar. Falls back to the frozen `ast` bundle only when
+        // the `sources` section is absent.
+        let mut loaded_from_sources = false;
+        if let Ok(Some(payload)) = pack.read_section(section_names::SOURCES) {
+            if let Ok(bundle) = decode::<klio_pack::schema::SourceBundle>(&payload) {
+                for sf in &bundle.files {
+                    let text = String::from_utf8_lossy(&sf.bytes).into_owned();
+                    let fid = source_map.add(&sf.rel_path, text);
+                    let src = source_map.get(fid).source.clone();
+                    let lexed = klio_lexer::Lexer::new(fid, &src).tokenize();
+                    if lexed.diagnostics.has_errors() {
+                        continue;
+                    }
+                    let (ast, diags) =
+                        klio_parser::Parser::new(fid, &src, &lexed.tokens).parse_file();
+                    if diags.has_errors() {
+                        continue;
+                    }
+                    if let Some(pkg) = &ast.package {
+                        let path = pkg
+                            .path
+                            .iter()
+                            .map(|i| i.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        if !path.is_empty() {
+                            klio_stdlib::register_known_package(path);
+                        }
+                    }
+                    out_asts.push(ast);
+                    loaded_from_sources = true;
+                }
+            }
+        }
+        if !loaded_from_sources {
+            if let Ok(Some(payload)) = pack.read_section(section_names::AST) {
+                if let Ok(ast_bundle) = decode::<AstBundle>(&payload) {
+                    for f in ast_bundle.files {
+                        if let Some(pkg) = &f.kotlin_file.package {
+                            let path = pkg
+                                .path
+                                .iter()
+                                .map(|i| i.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".");
+                            if !path.is_empty() {
+                                klio_stdlib::register_known_package(path);
+                            }
+                        }
+                        out_asts.push(f.kotlin_file);
+                    }
                 }
             }
         }
@@ -1231,8 +1293,11 @@ fn run_check(files: &[PathBuf], format: DiagFormat) -> ExitCode {
     }
     let mut map = SourceMap::new();
     let mut all = DiagnosticSink::new();
+    let mut user_asts: Vec<klio_ast::KotlinFile> = Vec::with_capacity(files.len());
+    let mut user_file_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for path in files {
         let Some(id) = load(&mut map, path) else { return ExitCode::from(2) };
+        user_file_ids.insert(id.0);
         let src = map.get(id).source.clone();
         let lexed = Lexer::new(id, &src).tokenize();
         for d in lexed.diagnostics.diagnostics() {
@@ -1242,12 +1307,27 @@ fn run_check(files: &[PathBuf], format: DiagFormat) -> ExitCode {
         for d in parse_diags.diagnostics() {
             all.emit(d.clone());
         }
-        let r = resolve(&ast);
-        for d in r.diagnostics.diagnostics() {
+        user_asts.push(ast);
+    }
+    // Load any installed packs the user imports so the type checker
+    // sees their real signatures (e.g. `expect fun runBlocking(block:
+    // suspend …)`). Pack declarations participate in resolution +
+    // type inference, but only diagnostics anchored in a user file
+    // are surfaced — pack shims are trusted.
+    let (pack_asts, _pack_bindings) = load_installed_packs(&user_asts, &mut map);
+    let mut combined: Vec<klio_ast::KotlinFile> =
+        Vec::with_capacity(pack_asts.len() + user_asts.len());
+    combined.extend(pack_asts);
+    combined.extend(user_asts);
+    let r = klio_resolver::resolve_module(&combined);
+    for d in r.diagnostics.diagnostics() {
+        if user_file_ids.contains(&d.primary.span.file.0) {
             all.emit(d.clone());
         }
-        let tc = typecheck(&ast, &r);
-        for d in tc.diagnostics.diagnostics() {
+    }
+    let tc = klio_typeck::typecheck_module(&combined, &r);
+    for d in tc.diagnostics.diagnostics() {
+        if user_file_ids.contains(&d.primary.span.file.0) {
             all.emit(d.clone());
         }
     }
@@ -1322,7 +1402,7 @@ fn run_module_files(paths: &[PathBuf]) -> ExitCode {
         }
         asts.push(ast);
     }
-    let (pack_asts, pack_bindings) = load_installed_packs(&asts);
+    let (pack_asts, pack_bindings) = load_installed_packs(&asts, &mut map);
     // Pack ASTs first so the user's main wins when build_module_files
     // picks a `main` declaration.
     let mut all_asts: Vec<klio_ast::KotlinFile> =
@@ -1366,7 +1446,7 @@ fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let user_asts = vec![ast];
-    let (pack_asts, pack_bindings) = load_installed_packs(&user_asts);
+    let (pack_asts, pack_bindings) = load_installed_packs(&user_asts, &mut map);
     if pack_asts.is_empty() {
         // No packs needed — fall back to the single-file build path.
         let ast = user_asts.into_iter().next().expect("user ast");

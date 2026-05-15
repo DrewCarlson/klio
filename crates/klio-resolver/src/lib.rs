@@ -186,6 +186,11 @@ struct Resolver {
     diagnostics: DiagnosticSink,
     /// Dotted package name from the file's `package` header, if any.
     file_package: Option<String>,
+    /// Top-level function signature keys already declared, per
+    /// `(scope, name, arity, param-type-names)`. Lets overloads with
+    /// distinct signatures coexist while still flagging an exact
+    /// duplicate (`fun foo()` declared twice) as a redeclaration.
+    fn_sig_keys: std::collections::HashSet<(u32, String)>,
 }
 
 impl Resolver {
@@ -196,6 +201,7 @@ impl Resolver {
             uses: HashMap::new(),
             diagnostics: DiagnosticSink::new(),
             file_package: None,
+            fn_sig_keys: std::collections::HashSet::new(),
         };
         let builtins = r.push_scope(None, ScopeKind::Builtins);
         for name in BUILTINS {
@@ -259,14 +265,31 @@ impl Resolver {
         }
 
         if path_owned[0] != "kotlin" {
-            self.diagnostics.emit(
-                Diagnostic::error(
-                    format!("no package `{path_str}` is known to this build"),
-                    imp.span,
-                )
-                .with_code("R0003")
-                .with_note("only the `kotlin.*` standard library is available"),
-            );
+            // Non-`kotlin.*` import. Permitted when a loaded pack has
+            // registered the package (e.g. `kotlinx.coroutines`,
+            // `kotlinx.io`). The candidate package is the path itself
+            // for a wildcard import, else the path minus the trailing
+            // entity segment.
+            let candidate_pkg = if imp.wildcard {
+                path_str.clone()
+            } else if path_owned.len() >= 2 {
+                path_owned[..path_owned.len() - 1].join(".")
+            } else {
+                path_str.clone()
+            };
+            if !klio_stdlib::is_known_package(&candidate_pkg) {
+                self.diagnostics.emit(
+                    Diagnostic::error(
+                        format!("no package `{path_str}` is known to this build"),
+                        imp.span,
+                    )
+                    .with_code("R0003")
+                    .with_note(
+                        "only the `kotlin.*` standard library and installed \
+                         packs are available",
+                    ),
+                );
+            }
             return;
         }
 
@@ -319,6 +342,61 @@ impl Resolver {
             Decl::Object(o) => (o.name.name.clone(), SymbolKind::Class, o.name.span),
             Decl::TypeAlias(a) => (a.name.name.clone(), SymbolKind::TypeAlias, a.name.span),
         };
+        // Kotlin permits multiple top-level functions to share a
+        // name (overloads) and a factory function to share a name
+        // with a class/interface (`fun CoroutineScope(...)` +
+        // `interface CoroutineScope`). Only an *exact* duplicate
+        // signature (`fun foo()` declared twice) is a redeclaration;
+        // distinct overloads and factory-fn/class name sharing are
+        // legal and disambiguated later by overload resolution.
+        if let Decl::Function(f) = decl {
+            let mut key = format!("{name}#{}", f.params.len());
+            for p in &f.params {
+                key.push('|');
+                key.push_str(&p.ty.name.name);
+            }
+            let sig = (scope.0, key);
+            if self.fn_sig_keys.contains(&sig) {
+                let prev_span = self.scopes[scope.0 as usize]
+                    .bindings
+                    .get(&name)
+                    .and_then(|id| self.symbols[id.0 as usize].decl_span);
+                let mut d = Diagnostic::error(
+                    format!(
+                        "Conflicting declarations: duplicate top-level declaration `{name}`"
+                    ),
+                    span,
+                )
+                .with_code("R0004")
+                .with_factory(&klio_diagnostics::generated::factories::REDECLARATION);
+                if let Some(ps) = prev_span {
+                    d = d.with_label(ps, "previous declaration here");
+                }
+                self.diagnostics.emit(d);
+            }
+            self.fn_sig_keys.insert(sig);
+            let id = self.add_symbol(name.clone(), kind, Some(span));
+            self.scopes[scope.0 as usize].bindings.insert(name, id);
+            return;
+        }
+        // A non-function sharing a name with an existing function
+        // (or vice-versa) is the legal factory pattern — bind
+        // without a conflict diagnostic.
+        let func_involved = self.scopes[scope.0 as usize]
+            .bindings
+            .get(&name)
+            .map(|id| {
+                matches!(
+                    self.symbols[id.0 as usize].kind,
+                    SymbolKind::TopLevelFunction
+                )
+            })
+            .unwrap_or(false);
+        if func_involved {
+            let id = self.add_symbol(name.clone(), kind, Some(span));
+            self.scopes[scope.0 as usize].bindings.insert(name, id);
+            return;
+        }
         self.declare(scope, name, kind, span, /*allow_shadow=*/ false);
     }
 
