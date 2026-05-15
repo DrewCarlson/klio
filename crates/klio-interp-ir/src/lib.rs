@@ -149,8 +149,20 @@ impl<'a> VmHost<'a> {
         func: klio_runtime::StdlibFn,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Build an IntrinsicHost that can recursively invoke
+        // lambdas (Value::IrClosure) via the Vm's closure table +
+        // module. This lets HOF stdlib bindings (`map`, `forEach`,
+        // scope fns) call back into IR-lowered lambda bodies
+        // natively, without bouncing through klio-interp.
+        let module_for_intrinsic = Rc::clone(&self.module);
         let mut intrinsic_host = VmIntrinsicHost {
             scheduler: &mut *self.scheduler,
+            module: module_for_intrinsic,
+            closures: &mut *self.closures,
+            globals: Rc::clone(&self.globals),
+            classes: self.classes,
+            body_prop_inits: self.body_prop_inits,
+            instance_id_counter: &mut *self.instance_id_counter,
         };
         let mut ctx = klio_runtime::CallCtx {
             args,
@@ -358,6 +370,27 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Stdlib member dispatch: probe the receiver's type FQN
+        // for a `<typeFqn>.<name>` intrinsic, then for the common
+        // package-extension fallbacks. The intrinsic receives the
+        // receiver as its first arg followed by the user-supplied
+        // args.
+        let type_fqn = receiver.type_fqn();
+        let probes = [
+            format!("{type_fqn}.{name}"),
+            format!("kotlin.collections.{name}"),
+            format!("kotlin.text.{name}"),
+            format!("kotlin.ranges.{name}"),
+            format!("kotlin.{name}"),
+        ];
+        for probe in &probes {
+            if let Some(func) = klio_stdlib::implementation(probe) {
+                let mut all_args: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
+                all_args.push(receiver.clone());
+                all_args.extend_from_slice(args);
+                return self.dispatch_intrinsic(func, &all_args);
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()
@@ -487,23 +520,86 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
 
 /// Stdlib `CallCtx` host adapter for native Vm dispatch. HOF
 /// bindings (`map`, `forEach`, scope fns, ...) reach back through
-/// this adapter to invoke the lambda they were passed. Implementing
-/// `invoke_callable` for `Value::IrClosure` requires borrowing the
-/// Vm's closure table + module recursively from inside a stdlib
-/// binding — that lands once the IntrinsicHost grows the right
-/// borrow shape. Today the Vm returns `Unimplemented` so the failing
-/// surfaces are visible.
+/// this adapter to invoke the lambda they were passed. The Vm
+/// dispatches `Value::IrClosure` via the IR evaluator, reusing the
+/// same closure / class / globals tables the outer Vm uses.
 struct VmIntrinsicHost<'a> {
     scheduler: &'a mut dyn klio_runtime::Scheduler,
+    module: Rc<klio_ir::Module>,
+    closures: &'a mut Vec<ClosureInfo>,
+    globals: Rc<RefCell<klio_runtime::Env>>,
+    classes: &'a std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
+    body_prop_inits:
+        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    instance_id_counter: &'a mut u64,
 }
 
 impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
     fn invoke_callable(
         &mut self,
         callable: &klio_runtime::Value,
-        _args: &[klio_runtime::Value],
-        _out: &mut dyn Output,
+        args: &[klio_runtime::Value],
+        out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        if let klio_runtime::Value::IrClosure { id, captures } = callable {
+            let info = self
+                .closures
+                .get(*id as usize)
+                .cloned()
+                .ok_or_else(|| klio_runtime::RuntimeError::Type(format!(
+                    "unknown IrClosure id {id}"
+                )))?;
+            let func = self
+                .module
+                .funcs
+                .get(info.body_func.0 as usize)
+                .cloned()
+                .ok_or_else(|| klio_runtime::RuntimeError::Type(format!(
+                    "closure body FuncId {} out of range",
+                    info.body_func.0
+                )))?;
+            let mut call_args: Vec<klio_runtime::Value> = Vec::with_capacity(info.n_params);
+            for i in 0..info.n_params {
+                call_args.push(args.get(i).cloned().unwrap_or(klio_runtime::Value::Null));
+            }
+            let capture_values: Vec<klio_runtime::Value> = (**captures).clone();
+            let module = Rc::clone(&self.module);
+            let mut host = VmHost {
+                globals: Rc::clone(&self.globals),
+                module: Rc::clone(&self.module),
+                scheduler: &mut *self.scheduler,
+                out,
+                instance_id_counter: &mut *self.instance_id_counter,
+                classes: self.classes,
+                body_prop_inits: self.body_prop_inits,
+                closures: &mut *self.closures,
+            };
+            return klio_ir::eval::eval_with_captures(
+                &module,
+                &func,
+                call_args,
+                capture_values,
+                &mut host,
+            )
+            .map_err(|e| klio_runtime::RuntimeError::Type(format!("{e}")));
+        }
+        if let klio_runtime::Value::Intrinsic { func, .. } = callable {
+            let mut child = VmIntrinsicHost {
+                scheduler: &mut *self.scheduler,
+                module: Rc::clone(&self.module),
+                closures: &mut *self.closures,
+                globals: Rc::clone(&self.globals),
+                classes: self.classes,
+                body_prop_inits: self.body_prop_inits,
+                instance_id_counter: &mut *self.instance_id_counter,
+            };
+            let mut ctx = klio_runtime::CallCtx {
+                args,
+                out,
+                host: &mut child,
+            };
+            return func(&mut ctx);
+        }
         Err(klio_runtime::RuntimeError::Unimplemented(format!(
             "Vm::invoke_callable on `{}`",
             callable.type_fqn()
