@@ -3983,6 +3983,239 @@ pub fn primitive_companion_const(ty: &str, name: &str) -> Option<Value> {
     }
 }
 
+/// Drive a lazy `Value::Sequence` to completion. Each pipeline op
+/// invokes its user lambda through the [`IntrinsicHost`] callback
+/// surface (not the interpreter's internal call path), so the HOF
+/// dispatch lives entirely in the standard library. Sorting ops
+/// buffer-then-emit; `SortedWith` dispatches the comparator's
+/// `compare` through `invoke_method`.
+pub fn materialise_sequence(
+    seq_val: &Value,
+    host: &mut dyn klio_runtime::IntrinsicHost,
+    out: &mut dyn klio_runtime::Output,
+) -> Result<Vec<Value>, RuntimeError> {
+    use klio_runtime::{SeqOp, SequenceSource};
+    let Value::Sequence(seq) = seq_val else {
+        return Err(RuntimeError::Type("materialise_sequence: not a Sequence".into()));
+    };
+    let call = |host: &mut dyn klio_runtime::IntrinsicHost,
+                f: &Value,
+                args: &[Value],
+                out: &mut dyn klio_runtime::Output|
+     -> Result<Value, RuntimeError> { host.invoke_callable(f, args, out) };
+    let mut items: Vec<Value> = match &seq.source {
+        SequenceSource::Items(v) => (**v).clone(),
+        SequenceSource::Generate { seed, next } => {
+            let mut acc: Vec<Value> = Vec::new();
+            let limit = 1024usize;
+            let mut cur = seed.as_ref().map(|b| (**b).clone());
+            while acc.len() < limit {
+                let candidate = match &cur {
+                    Some(v) => v.clone(),
+                    None => {
+                        let r = call(host, next, &[], out)?;
+                        if matches!(r, Value::Null) {
+                            break;
+                        }
+                        r
+                    }
+                };
+                acc.push(candidate.clone());
+                let r = call(host, next, std::slice::from_ref(&candidate), out)?;
+                if matches!(r, Value::Null) {
+                    break;
+                }
+                cur = Some(r);
+            }
+            acc
+        }
+    };
+    for op in seq.ops.iter() {
+        match op {
+            SeqOp::Map(f) => {
+                let mut nx: Vec<Value> = Vec::with_capacity(items.len());
+                for v in &items {
+                    nx.push(call(host, f, std::slice::from_ref(v), out)?);
+                }
+                items = nx;
+            }
+            SeqOp::Filter(f) => {
+                let mut nx: Vec<Value> = Vec::new();
+                for v in &items {
+                    if matches!(call(host, f, std::slice::from_ref(v), out)?, Value::Bool(true)) {
+                        nx.push(v.clone());
+                    }
+                }
+                items = nx;
+            }
+            SeqOp::FilterNot(f) => {
+                let mut nx: Vec<Value> = Vec::new();
+                for v in &items {
+                    if !matches!(call(host, f, std::slice::from_ref(v), out)?, Value::Bool(true)) {
+                        nx.push(v.clone());
+                    }
+                }
+                items = nx;
+            }
+            SeqOp::Take(n) => {
+                let n = *n as usize;
+                if n < items.len() {
+                    items.truncate(n);
+                }
+            }
+            SeqOp::Drop(n) => {
+                let n = (*n as usize).min(items.len());
+                items.drain(..n);
+            }
+            SeqOp::TakeWhile(f) => {
+                let mut cutoff = items.len();
+                for (i, v) in items.iter().enumerate() {
+                    if !matches!(call(host, f, std::slice::from_ref(v), out)?, Value::Bool(true)) {
+                        cutoff = i;
+                        break;
+                    }
+                }
+                items.truncate(cutoff);
+            }
+            SeqOp::DropWhile(f) => {
+                let mut start = 0usize;
+                while start < items.len() {
+                    let v = items[start].clone();
+                    if !matches!(call(host, f, std::slice::from_ref(&v), out)?, Value::Bool(true)) {
+                        break;
+                    }
+                    start += 1;
+                }
+                items.drain(..start);
+            }
+            SeqOp::FlatMap(f) => {
+                let mut nx: Vec<Value> = Vec::new();
+                for v in &items {
+                    let mapped = call(host, f, std::slice::from_ref(v), out)?;
+                    match mapped {
+                        Value::List { items: xs, .. } | Value::Set { items: xs, .. } => {
+                            nx.extend(xs.borrow().iter().cloned());
+                        }
+                        Value::Sequence(_) => {
+                            nx.extend(materialise_sequence(&mapped, host, out)?);
+                        }
+                        other => nx.push(other),
+                    }
+                }
+                items = nx;
+            }
+            SeqOp::Distinct => {
+                let mut seen: Vec<Value> = Vec::new();
+                let mut nx: Vec<Value> = Vec::new();
+                for v in &items {
+                    if !seen.iter().any(|s| Value::structural_eq(s, v)) {
+                        seen.push(v.clone());
+                        nx.push(v.clone());
+                    }
+                }
+                items = nx;
+            }
+            SeqOp::DistinctBy(f) => {
+                let mut seen: Vec<Value> = Vec::new();
+                let mut nx: Vec<Value> = Vec::new();
+                for v in &items {
+                    let key = call(host, f, std::slice::from_ref(v), out)?;
+                    if !seen.iter().any(|s| Value::structural_eq(s, &key)) {
+                        seen.push(key);
+                        nx.push(v.clone());
+                    }
+                }
+                items = nx;
+            }
+            SeqOp::Sorted(descending) => {
+                let descending = *descending;
+                let mut err: Option<RuntimeError> = None;
+                items.sort_by(|a, b| {
+                    if err.is_some() {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    match compare_values(a, b) {
+                        Ok(o) => {
+                            if descending {
+                                o.reverse()
+                            } else {
+                                o
+                            }
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            std::cmp::Ordering::Equal
+                        }
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(e);
+                }
+            }
+            SeqOp::SortedBy(f, descending) => {
+                let descending = *descending;
+                let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+                for v in items.drain(..) {
+                    let k = call(host, f, std::slice::from_ref(&v), out)?;
+                    keyed.push((k, v));
+                }
+                let mut err: Option<RuntimeError> = None;
+                keyed.sort_by(|a, b| {
+                    if err.is_some() {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    match compare_values(&a.0, &b.0) {
+                        Ok(o) => {
+                            if descending {
+                                o.reverse()
+                            } else {
+                                o
+                            }
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            std::cmp::Ordering::Equal
+                        }
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                items = keyed.into_iter().map(|(_, v)| v).collect();
+            }
+            SeqOp::SortedWith(comparator) => {
+                let comp = comparator.clone();
+                // Insertion sort so the comparator callback can
+                // dispatch back through the host.
+                for i in 1..items.len() {
+                    let mut j = i;
+                    while j > 0 {
+                        let a = items[j - 1].clone();
+                        let b = items[j].clone();
+                        let ord_val = match host.invoke_method(&comp, "compare", &[a, b], out) {
+                            Some(Ok(v)) => v,
+                            Some(Err(e)) => return Err(e),
+                            None => {
+                                return Err(RuntimeError::Type(
+                                    "SortedWith: comparator has no `compare` method".into(),
+                                ))
+                            }
+                        };
+                        let n = ord_val.as_i64().unwrap_or(0);
+                        if n > 0 {
+                            items.swap(j - 1, j);
+                            j -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(items)
+}
+
 pub fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, RuntimeError> {
     use std::cmp::Ordering::*;
     if a.is_numeric() && b.is_numeric() {

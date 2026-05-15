@@ -96,6 +96,7 @@ pub use pack_builder::build_stdlib_pack;
 // Re-export internal helpers that the interpreter's higher-order ops use
 // for comparisons. Keeps the API surface small.
 pub use implementations::compare_values;
+pub use implementations::materialise_sequence;
 pub use implementations::primitive_companion_const;
 pub use text::compare_utf16;
 

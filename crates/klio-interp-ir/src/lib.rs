@@ -521,233 +521,47 @@ impl<'a> VmHost<'a> {
     /// Drive a lazy `Value::Sequence` to completion. Each upstream
     /// item flows through the pipeline ops by invoking the user
     /// lambdas via `self.call_value`. Sorting ops buffer-and-emit.
+    /// Drive a lazy `Value::Sequence` to completion. The HOF
+    /// dispatch lives in `klio-stdlib`; the Vm only supplies an
+    /// `IntrinsicHost` so the op lambdas resolve back into IR
+    /// closures. Building the host here mirrors `dispatch_intrinsic`.
     fn materialise_sequence(
         &mut self,
         seq_val: &klio_runtime::Value,
     ) -> Result<Vec<klio_runtime::Value>, klio_ir::eval::EvalError> {
-        use klio_ir::eval::Host as _;
-        let klio_runtime::Value::Sequence(seq) = seq_val else {
-            return Err(klio_ir::eval::EvalError::Type(
-                "materialise_sequence: not a Sequence".into(),
-            ));
+        let module_for_intrinsic = Rc::clone(&self.module);
+        let mut intrinsic_host = VmIntrinsicHost {
+            scheduler: &mut *self.scheduler,
+            module: module_for_intrinsic,
+            closures: &mut *self.closures,
+            globals: Rc::clone(&self.globals),
+            classes: Rc::clone(&self.classes),
+            body_prop_inits: self.body_prop_inits,
+            instance_prop_getters: self.instance_prop_getters,
+            instance_prop_setters: self.instance_prop_setters,
+            parent_ctor_args: self.parent_ctor_args,
+            init_blocks: self.init_blocks,
+            extension_props: self.extension_props,
+            extension_prop_setters: self.extension_prop_setters,
+            anon_methods: Rc::clone(&self.anon_methods),
+            companion_singletons: &self.module.registry.companion_singletons,
+            secondary_ctors: self.secondary_ctors,
+            class_delegates: self.class_delegates,
+            func_defaults: self.func_defaults,
+            enclosing_class: &self.module.registry.enclosing_class,
+            func_type_params: &self.module.registry.func_type_params,
+            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+            delegated_body_props: &self.module.registry.delegated_body_props,
+            installed_bindings: Rc::clone(&self.installed_bindings),
+            class_default_outer: Rc::clone(&self.class_default_outer),
+            instance_id_counter: &mut *self.instance_id_counter,
         };
-        let mut items: Vec<klio_runtime::Value> = match &seq.source {
-            klio_runtime::SequenceSource::Items(v) => (**v).clone(),
-            klio_runtime::SequenceSource::Generate { seed, next } => {
-                let mut out: Vec<klio_runtime::Value> = Vec::new();
-                let limit = 1024usize;
-                let mut cur = seed.as_ref().map(|b| (**b).clone());
-                while out.len() < limit {
-                    let candidate = match &cur {
-                        Some(v) => v.clone(),
-                        None => {
-                            let r = self.call_value(next, &[])?;
-                            if matches!(r, klio_runtime::Value::Null) {
-                                break;
-                            }
-                            r
-                        }
-                    };
-                    out.push(candidate.clone());
-                    let r = self.call_value(next, std::slice::from_ref(&candidate))?;
-                    if matches!(r, klio_runtime::Value::Null) {
-                        break;
-                    }
-                    cur = Some(r);
-                }
-                out
-            }
-        };
-        for op in seq.ops.iter() {
-            match op {
-                klio_runtime::SeqOp::Map(f) => {
-                    let mut next: Vec<klio_runtime::Value> = Vec::with_capacity(items.len());
-                    for v in &items {
-                        next.push(self.call_value(f, std::slice::from_ref(v))?);
-                    }
-                    items = next;
-                }
-                klio_runtime::SeqOp::Filter(f) => {
-                    let mut next: Vec<klio_runtime::Value> = Vec::new();
-                    for v in &items {
-                        if matches!(
-                            self.call_value(f, std::slice::from_ref(v))?,
-                            klio_runtime::Value::Bool(true)
-                        ) {
-                            next.push(v.clone());
-                        }
-                    }
-                    items = next;
-                }
-                klio_runtime::SeqOp::FilterNot(f) => {
-                    let mut next: Vec<klio_runtime::Value> = Vec::new();
-                    for v in &items {
-                        if !matches!(
-                            self.call_value(f, std::slice::from_ref(v))?,
-                            klio_runtime::Value::Bool(true)
-                        ) {
-                            next.push(v.clone());
-                        }
-                    }
-                    items = next;
-                }
-                klio_runtime::SeqOp::Take(n) => {
-                    let n = *n as usize;
-                    if n < items.len() {
-                        items.truncate(n);
-                    }
-                }
-                klio_runtime::SeqOp::Drop(n) => {
-                    let n = (*n as usize).min(items.len());
-                    items.drain(..n);
-                }
-                klio_runtime::SeqOp::TakeWhile(f) => {
-                    let mut cutoff = items.len();
-                    for (i, v) in items.iter().enumerate() {
-                        if !matches!(
-                            self.call_value(f, std::slice::from_ref(v))?,
-                            klio_runtime::Value::Bool(true)
-                        ) {
-                            cutoff = i;
-                            break;
-                        }
-                    }
-                    items.truncate(cutoff);
-                }
-                klio_runtime::SeqOp::DropWhile(f) => {
-                    let mut start = 0usize;
-                    while start < items.len() {
-                        let v = items[start].clone();
-                        if !matches!(
-                            self.call_value(f, std::slice::from_ref(&v))?,
-                            klio_runtime::Value::Bool(true)
-                        ) {
-                            break;
-                        }
-                        start += 1;
-                    }
-                    items.drain(..start);
-                }
-                klio_runtime::SeqOp::FlatMap(f) => {
-                    let mut next: Vec<klio_runtime::Value> = Vec::new();
-                    for v in &items {
-                        let mapped = self.call_value(f, std::slice::from_ref(v))?;
-                        match mapped {
-                            klio_runtime::Value::List { items: xs, .. }
-                            | klio_runtime::Value::Set { items: xs, .. } => {
-                                next.extend(xs.borrow().iter().cloned());
-                            }
-                            klio_runtime::Value::Sequence(_) => {
-                                let inner = self.materialise_sequence(&mapped)?;
-                                next.extend(inner);
-                            }
-                            _ => next.push(mapped),
-                        }
-                    }
-                    items = next;
-                }
-                klio_runtime::SeqOp::Distinct => {
-                    let mut seen: Vec<klio_runtime::Value> = Vec::new();
-                    let mut next: Vec<klio_runtime::Value> = Vec::new();
-                    for v in &items {
-                        if !seen.iter().any(|s| klio_runtime::Value::structural_eq(s, v)) {
-                            seen.push(v.clone());
-                            next.push(v.clone());
-                        }
-                    }
-                    items = next;
-                }
-                klio_runtime::SeqOp::DistinctBy(f) => {
-                    let mut seen: Vec<klio_runtime::Value> = Vec::new();
-                    let mut next: Vec<klio_runtime::Value> = Vec::new();
-                    for v in &items {
-                        let key = self.call_value(f, std::slice::from_ref(v))?;
-                        if !seen.iter().any(|s| klio_runtime::Value::structural_eq(s, &key)) {
-                            seen.push(key);
-                            next.push(v.clone());
-                        }
-                    }
-                    items = next;
-                }
-                klio_runtime::SeqOp::Sorted(descending) => {
-                    let descending = *descending;
-                    let mut err: Option<klio_ir::eval::EvalError> = None;
-                    items.sort_by(|a, b| {
-                        if err.is_some() {
-                            return std::cmp::Ordering::Equal;
-                        }
-                        match klio_stdlib::compare_values(a, b) {
-                            Ok(o) => if descending { o.reverse() } else { o },
-                            Err(e) => {
-                                err = Some(klio_ir::eval::EvalError::Type(format!("{e}")));
-                                std::cmp::Ordering::Equal
-                            }
-                        }
-                    });
-                    if let Some(e) = err {
-                        return Err(e);
-                    }
-                }
-                klio_runtime::SeqOp::SortedBy(f, descending) => {
-                    let descending = *descending;
-                    let mut keyed: Vec<(klio_runtime::Value, klio_runtime::Value)> =
-                        Vec::with_capacity(items.len());
-                    for v in items.drain(..) {
-                        let k = self.call_value(f, std::slice::from_ref(&v))?;
-                        keyed.push((k, v));
-                    }
-                    let mut err: Option<klio_ir::eval::EvalError> = None;
-                    keyed.sort_by(|a, b| {
-                        if err.is_some() {
-                            return std::cmp::Ordering::Equal;
-                        }
-                        match klio_stdlib::compare_values(&a.0, &b.0) {
-                            Ok(o) => if descending { o.reverse() } else { o },
-                            Err(e) => {
-                                err = Some(klio_ir::eval::EvalError::Type(format!("{e}")));
-                                std::cmp::Ordering::Equal
-                            }
-                        }
-                    });
-                    if let Some(e) = err {
-                        return Err(e);
-                    }
-                    items = keyed.into_iter().map(|(_, v)| v).collect();
-                }
-                klio_runtime::SeqOp::SortedWith(comparator) => {
-                    let comp = comparator.clone();
-                    let mut err: Option<klio_ir::eval::EvalError> = None;
-                    // Insertion sort so the comparator callback can
-                    // dispatch back through the Vm via call_member.
-                    for i in 1..items.len() {
-                        let mut j = i;
-                        while j > 0 && err.is_none() {
-                            let a = items[j - 1].clone();
-                            let b = items[j].clone();
-                            let ord_val = match
-                                <Self as klio_ir::eval::Host>::call_member(self, &comp, "compare", &[a, b])
-                            {
-                                Ok(v) => v,
-                                Err(e) => { err = Some(e); break; }
-                            };
-                            let n = ord_val.as_i64().unwrap_or(0);
-                            if n > 0 {
-                                items.swap(j - 1, j);
-                                j -= 1;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(e) = err {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        Ok(items)
+        klio_stdlib::materialise_sequence(seq_val, &mut intrinsic_host, self.out)
+            .map_err(|e| match e {
+                klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
+                other => klio_ir::eval::EvalError::Type(format!("{other}")),
+            })
     }
-
     /// Score an arg/param compatibility for overload resolution.
     /// Higher is better. Exact type match wins over `Any`, which
     /// wins over a type-parameter (`T`) fallback. Returning `None`
