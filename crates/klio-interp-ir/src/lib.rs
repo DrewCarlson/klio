@@ -1515,6 +1515,38 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // KFunction reflection: `::main.name`, `::main.parameters`.
+        // Top-level fn refs lower as `Value::IrClosure` pointing at
+        // the lowered Func; surface its metadata as field reads so
+        // user code can introspect a callable.
+        if let klio_runtime::Value::IrClosure { id, .. } = receiver {
+            if let Some(info) = self.closures.get(*id as usize).cloned() {
+                if let Some(f) = self.module.funcs.get(info.body_func.0 as usize) {
+                    match name {
+                        "name" => {
+                            return Ok(klio_runtime::Value::String(Rc::new(
+                                f.name.clone(),
+                            )));
+                        }
+                        "parameters" => {
+                            let items: Vec<klio_runtime::Value> = f
+                                .params
+                                .iter()
+                                .map(|p| {
+                                    klio_runtime::Value::String(Rc::new(p.name.clone()))
+                                })
+                                .collect();
+                            return Ok(klio_runtime::Value::List {
+                                items: Rc::new(RefCell::new(items)),
+                                mutable: false,
+                                enum_class: None,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         // Companion-object forwarding: `Foo.PI` reads `PI` from the
         // companion singleton when the receiver is the user class.
         // Enum entries (`Color.RED`) take precedence above; reaching
@@ -1588,6 +1620,96 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
                 "qualifiedName" => {
                     return Ok(klio_runtime::Value::String(Rc::new(cls.fqn.clone())));
+                }
+                "isData" => return Ok(klio_runtime::Value::Bool(cls.is_data)),
+                "isOpen" => return Ok(klio_runtime::Value::Bool(cls.is_open)),
+                "isAbstract" => return Ok(klio_runtime::Value::Bool(cls.is_abstract)),
+                "isSealed" => return Ok(klio_runtime::Value::Bool(cls.is_sealed)),
+                "isFinal" => {
+                    return Ok(klio_runtime::Value::Bool(!cls.is_open && !cls.is_abstract));
+                }
+                "isCompanion" => {
+                    return Ok(klio_runtime::Value::Bool(
+                        self.companion_singletons.values().any(|v| v == &cls.name),
+                    ));
+                }
+                "isInner" => return Ok(klio_runtime::Value::Bool(cls.is_inner)),
+                "isInterface" => return Ok(klio_runtime::Value::Bool(cls.is_interface)),
+                "isFun" => return Ok(klio_runtime::Value::Bool(cls.is_fun_interface)),
+                "objectInstance" => {
+                    if cls.is_object {
+                        if let Some(v) = self.globals.borrow().lookup(&cls.name) {
+                            return Ok(v);
+                        }
+                    }
+                    return Ok(klio_runtime::Value::Null);
+                }
+                "members" | "declaredMembers" | "functions" | "declaredFunctions"
+                | "memberFunctions" | "memberProperties" | "declaredMemberProperties" => {
+                    let mut items: Vec<klio_runtime::Value> = Vec::new();
+                    for fid in self
+                        .module
+                        .classes
+                        .iter()
+                        .find(|c| c.name == cls.name)
+                        .map(|c| c.methods.clone())
+                        .unwrap_or_default()
+                    {
+                        if let Some(f) = self.module.funcs.get(fid.0 as usize) {
+                            items.push(klio_runtime::Value::PropertyRef {
+                                name: Rc::new(f.name.clone()),
+                            });
+                        }
+                    }
+                    for p in &cls.primary_params {
+                        if p.property.is_some() {
+                            items.push(klio_runtime::Value::PropertyRef {
+                                name: Rc::new(p.name.clone()),
+                            });
+                        }
+                    }
+                    for p in &cls.body_properties {
+                        items.push(klio_runtime::Value::PropertyRef {
+                            name: Rc::new(p.name.clone()),
+                        });
+                    }
+                    return Ok(klio_runtime::Value::List {
+                        items: Rc::new(RefCell::new(items)),
+                        mutable: false,
+                        enum_class: None,
+                    });
+                }
+                "supertypes" => {
+                    let items: Vec<klio_runtime::Value> = cls
+                        .supertype_names
+                        .iter()
+                        .map(|n| {
+                            if let Some(c) = self.classes.borrow().get(n).cloned() {
+                                klio_runtime::Value::Class(c)
+                            } else {
+                                klio_runtime::Value::String(Rc::new(n.clone()))
+                            }
+                        })
+                        .collect();
+                    return Ok(klio_runtime::Value::List {
+                        items: Rc::new(RefCell::new(items)),
+                        mutable: false,
+                        enum_class: None,
+                    });
+                }
+                "sealedSubclasses" => {
+                    let items: Vec<klio_runtime::Value> = self
+                        .classes
+                        .borrow()
+                        .values()
+                        .filter(|c| c.supertype_names.iter().any(|n| n == &cls.name))
+                        .map(|c| klio_runtime::Value::Class(Rc::clone(c)))
+                        .collect();
+                    return Ok(klio_runtime::Value::List {
+                        items: Rc::new(RefCell::new(items)),
+                        mutable: false,
+                        enum_class: None,
+                    });
                 }
                 _ => {}
             },
@@ -2073,7 +2195,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         // `X::class` is a class reference, not a member ref —
         // return the class itself so `.simpleName` etc. resolve.
+        // For instance receivers (`obj::class`) reach into the
+        // runtime ClassDef so `.isData` / `.qualifiedName` etc.
+        // inspect the runtime class.
         if name == "class" {
+            if let klio_runtime::Value::Instance(inst) = receiver {
+                return Ok(klio_runtime::Value::Class(Rc::clone(&inst.borrow().class)));
+            }
             return Ok(receiver.clone());
         }
         // `recv::method` produces a callable wrapper that, when
@@ -3540,6 +3668,55 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     ))));
                 }
                 _ => {}
+            }
+        }
+        // KFunction reflection surface on a closure / function value.
+        // `f.call(a, b)` / `f.invoke(a, b)` dispatch the callable;
+        // `f.name` / `f.parameters` report the lowered Func metadata.
+        if matches!(
+            receiver,
+            klio_runtime::Value::IrClosure { .. }
+                | klio_runtime::Value::Lambda { .. }
+                | klio_runtime::Value::Function { .. }
+        ) {
+            match name {
+                "invoke" | "call" => {
+                    return <Self as klio_ir::eval::Host>::call_value(self, receiver, args);
+                }
+                _ => {}
+            }
+            if args.is_empty() {
+                if let klio_runtime::Value::IrClosure { id, .. } = receiver {
+                    if let Some(info) = self.closures.get(*id as usize).cloned() {
+                        if let Some(f) = self.module.funcs.get(info.body_func.0 as usize)
+                        {
+                            match name {
+                                "name" => {
+                                    return Ok(klio_runtime::Value::String(Rc::new(
+                                        f.name.clone(),
+                                    )));
+                                }
+                                "parameters" => {
+                                    let items: Vec<klio_runtime::Value> = f
+                                        .params
+                                        .iter()
+                                        .map(|p| {
+                                            klio_runtime::Value::String(Rc::new(
+                                                p.name.clone(),
+                                            ))
+                                        })
+                                        .collect();
+                                    return Ok(klio_runtime::Value::List {
+                                        items: Rc::new(RefCell::new(items)),
+                                        mutable: false,
+                                        enum_class: None,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
             }
         }
         // PropertyRef invocation: `nameRef.get(p)` / `nameRef.call(p)`
