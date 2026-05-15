@@ -4378,6 +4378,75 @@ impl Interpreter {
         absorb_return: bool,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
+        // IR-native dispatch: when this lambda's body has a lowered
+        // FuncId registered, call through klio_ir::eval rather than
+        // walking the AST block.
+        let sp = body.span;
+        let key = (sp.file.0, sp.start, sp.end);
+        if let Some(fid) = self
+            .module_registry
+            .class_ir
+            .lambda_ir_funcs
+            .get(&key)
+            .copied()
+        {
+            if this_binding.is_none() {
+                if let Some(module_rc) = self.current_module.clone() {
+                    let func = module_rc.funcs[fid.0 as usize].clone();
+                    // The IR func's params are the lambda params; the
+                    // captures live in the captured_env. Read the
+                    // capture values by name from the env, in the
+                    // order the lower pass recorded.
+                    let captures: Vec<Value> = func
+                        .params
+                        .iter()
+                        .skip(params.len())
+                        .filter_map(|p| captured_env.borrow().lookup(&p.name))
+                        .collect();
+                    let mut all_args: Vec<Value> = Vec::with_capacity(params.len() + captures.len());
+                    let bind_it = params.is_empty() && args.len() == 1 && !absorb_return;
+                    if bind_it {
+                        all_args.push(args[0].clone());
+                    } else {
+                        for (i, _) in params.iter().enumerate() {
+                            all_args.push(args.get(i).cloned().unwrap_or(Value::Null));
+                        }
+                    }
+                    all_args.extend(captures);
+                    let class_names: Vec<String> =
+                        module_rc.classes.iter().map(|c| c.name.clone()).collect();
+                    let method_index = IrHost::build_method_index(&module_rc);
+                    let mut host = IrHost {
+                        interp: self,
+                        out,
+                        class_names,
+                        closures: Vec::new(),
+                        module: std::rc::Rc::clone(&module_rc),
+                        method_index,
+                    };
+                    match klio_ir::eval::eval_with(&module_rc, &func, all_args, &mut host) {
+                        Ok(v) => return Ok(v),
+                        Err(klio_ir::eval::EvalError::Unsupported(_)) => {}
+                        Err(klio_ir::eval::EvalError::Throw(v)) => return Err(RuntimeError::Thrown(v)),
+                        Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => {
+                            if absorb_return {
+                                return Ok(v);
+                            }
+                            return Err(RuntimeError::Return(v));
+                        }
+                        Err(klio_ir::eval::EvalError::LabeledReturn(l, v)) => {
+                            return Err(RuntimeError::LabeledReturn(l, v));
+                        }
+                        Err(klio_ir::eval::EvalError::Arity(s)) => return Err(RuntimeError::Arity(s)),
+                        Err(klio_ir::eval::EvalError::Unbound(s)) => return Err(RuntimeError::Unbound(s)),
+                        Err(klio_ir::eval::EvalError::Unimplemented(s)) => {
+                            return Err(RuntimeError::Unimplemented(s));
+                        }
+                        Err(e) => return Err(RuntimeError::Type(format!("{e}"))),
+                    }
+                }
+            }
+        }
         // Implicit `it` parameter: a lambda literal without an arrow
         // header that takes exactly one argument binds the argument as
         // `it`. Anonymous functions never go through this path (their
