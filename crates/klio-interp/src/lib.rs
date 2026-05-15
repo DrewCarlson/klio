@@ -12900,7 +12900,66 @@ fn substitute_field_with_this(prop_name: &str, expr: &klio_ast::Expr) -> klio_as
                 }
             }
             Spread { expr, .. } => walk(prop, dummy, expr),
+            Block(b) => {
+                for s in &mut b.stmts {
+                    match s {
+                        klio_ast::Stmt::Expr(e) => walk(prop, dummy, e),
+                        klio_ast::Stmt::Assign { target, value, .. } => {
+                            walk(prop, dummy, target);
+                            walk(prop, dummy, value);
+                        }
+                        klio_ast::Stmt::DestructuringDecl { init, .. } => walk(prop, dummy, init),
+                        klio_ast::Stmt::Decl(_) => {}
+                    }
+                }
+            }
+            While { cond, body, .. } => {
+                walk(prop, dummy, cond);
+                walk(prop, dummy, body);
+            }
+            DoWhile { body, cond, .. } => {
+                if let Some(b) = body.as_deref_mut() {
+                    walk(prop, dummy, b);
+                }
+                walk(prop, dummy, cond);
+            }
+            For { iter, body, .. } => {
+                walk(prop, dummy, iter);
+                walk(prop, dummy, body);
+            }
+            When { subject, branches, .. } => {
+                if let Some(s) = subject.as_deref_mut() {
+                    walk(prop, dummy, s);
+                }
+                for br in branches {
+                    walk(prop, dummy, &mut br.body);
+                }
+            }
+            Try { body, catches, finally, .. } => {
+                walk_block(prop, dummy, body);
+                for c in catches {
+                    walk_block(prop, dummy, &mut c.body);
+                }
+                if let Some(f) = finally {
+                    walk_block(prop, dummy, f);
+                }
+            }
+            Lambda { body, .. } => walk_block(prop, dummy, body),
+            Labeled { expr, .. } => walk(prop, dummy, expr),
             _ => {}
+        }
+    }
+    fn walk_block(prop: &str, dummy: klio_span::Span, block: &mut klio_ast::Block) {
+        for s in &mut block.stmts {
+            match s {
+                klio_ast::Stmt::Expr(e) => walk(prop, dummy, e),
+                klio_ast::Stmt::Assign { target, value, .. } => {
+                    walk(prop, dummy, target);
+                    walk(prop, dummy, value);
+                }
+                klio_ast::Stmt::DestructuringDecl { init, .. } => walk(prop, dummy, init),
+                klio_ast::Stmt::Decl(_) => {}
+            }
         }
     }
     walk(prop_name, dummy, &mut out);
@@ -15015,29 +15074,35 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             let identity = inst.borrow().identity;
             let key = (class_name, name.to_string());
             let in_progress_key = (identity, name.to_string());
-            if !self.interp.accessor_in_progress.contains(&in_progress_key) {
-                if let Some(fid) = self
-                    .interp
-                    .module_registry
-                    .class_ir
-                    .instance_prop_getters
-                    .get(&key)
-                    .copied()
-                {
-                    let module = std::rc::Rc::clone(&self.module);
-                    let func = module.funcs[fid.0 as usize].clone();
-                    self.interp
-                        .accessor_in_progress
-                        .insert(in_progress_key.clone());
-                    let result = klio_ir::eval::eval_with(
-                        &module,
-                        &func,
-                        vec![receiver.clone()],
-                        self,
-                    );
-                    self.interp.accessor_in_progress.remove(&in_progress_key);
-                    return result;
+            if self.interp.accessor_in_progress.contains(&in_progress_key) {
+                // Inside the getter / setter body, `field` lowers to
+                // `this.<prop>`. Bypass the custom getter and read
+                // the raw backing field directly.
+                if let Some(v) = inst.borrow().get(name) {
+                    return Ok(v);
                 }
+            }
+            if let Some(fid) = self
+                .interp
+                .module_registry
+                .class_ir
+                .instance_prop_getters
+                .get(&key)
+                .copied()
+            {
+                let module = std::rc::Rc::clone(&self.module);
+                let func = module.funcs[fid.0 as usize].clone();
+                self.interp
+                    .accessor_in_progress
+                    .insert(in_progress_key.clone());
+                let result = klio_ir::eval::eval_with(
+                    &module,
+                    &func,
+                    vec![receiver.clone()],
+                    self,
+                );
+                self.interp.accessor_in_progress.remove(&in_progress_key);
+                return result;
             }
         }
         // IR-native fast-path: when the receiver is a user-class
@@ -15339,30 +15404,35 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             let identity = inst.borrow().identity;
             let key = (class_name, name.to_string());
             let in_progress_key = (identity, name.to_string());
-            if !self.interp.accessor_in_progress.contains(&in_progress_key) {
-                if let Some(fid) = self
-                    .interp
-                    .module_registry
-                    .class_ir
-                    .instance_prop_setters
-                    .get(&key)
-                    .copied()
-                {
-                    let module = std::rc::Rc::clone(&self.module);
-                    let func = module.funcs[fid.0 as usize].clone();
-                    self.interp
-                        .accessor_in_progress
-                        .insert(in_progress_key.clone());
-                    let result = klio_ir::eval::eval_with(
-                        &module,
-                        &func,
-                        vec![receiver.clone(), value],
-                        self,
-                    );
-                    self.interp.accessor_in_progress.remove(&in_progress_key);
-                    result?;
-                    return Ok(());
-                }
+            if self.interp.accessor_in_progress.contains(&in_progress_key) {
+                // Inside the setter body, `field = v` lowers to
+                // `this.<prop> = v`. Bypass any custom setter and
+                // write the raw backing field directly.
+                inst.borrow_mut().define(name, value);
+                return Ok(());
+            }
+            if let Some(fid) = self
+                .interp
+                .module_registry
+                .class_ir
+                .instance_prop_setters
+                .get(&key)
+                .copied()
+            {
+                let module = std::rc::Rc::clone(&self.module);
+                let func = module.funcs[fid.0 as usize].clone();
+                self.interp
+                    .accessor_in_progress
+                    .insert(in_progress_key.clone());
+                let result = klio_ir::eval::eval_with(
+                    &module,
+                    &func,
+                    vec![receiver.clone(), value],
+                    self,
+                );
+                self.interp.accessor_in_progress.remove(&in_progress_key);
+                result?;
+                return Ok(());
             }
         }
         // Class-side property write through the companion object
