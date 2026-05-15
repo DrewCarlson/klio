@@ -1991,6 +1991,40 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Natural-order sort on a list of user `Value::Instance` —
+        // dispatch each pair through `compareTo` so user-overridden
+        // ordering wins. Stdlib's `compare_values` rejects Instance
+        // pairs; this branch wins before the stdlib probe.
+        if (name == "sorted" || name == "sortedDescending") && args.is_empty() {
+            if let klio_runtime::Value::List { items, .. } = receiver {
+                let snap: Vec<klio_runtime::Value> = items.borrow().clone();
+                if snap.iter().any(|v| matches!(v, klio_runtime::Value::Instance(_))) {
+                    let mut sorted = snap;
+                    let descending = name == "sortedDescending";
+                    for i in 1..sorted.len() {
+                        let mut j = i;
+                        while j > 0 {
+                            let a = sorted[j - 1].clone();
+                            let b = sorted[j].clone();
+                            let cmp_val = self.call_member(&a, "compareTo", &[b])?;
+                            let n = cmp_val.as_i64().unwrap_or(0);
+                            let greater = if descending { n < 0 } else { n > 0 };
+                            if greater {
+                                sorted.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    return Ok(klio_runtime::Value::List {
+                        items: Rc::new(RefCell::new(sorted)),
+                        mutable: false,
+                        enum_class: None,
+                    });
+                }
+            }
+        }
         // Comparator chaining + reversal + compare.
         if let klio_runtime::Value::Comparator { steps, descending } = receiver {
             if name == "compare" && args.len() == 2 {
