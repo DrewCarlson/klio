@@ -3132,6 +3132,20 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                 Expr::Path { segments, .. } if segments.len() == 1 => {
                     if let Some(home) = b.mutable_home(&segments[0].name) {
                         b.push(Inst::Move { dst: home, src: combined });
+                    } else if b.knows_outer(&segments[0].name) {
+                        // Lambda body writing back to an outer-frame
+                        // capture: emit StoreGlobal (which lands in
+                        // the closure's scoped env) so the enclosing
+                        // call site's `WritebackCaptures` syncs the
+                        // value to the caller. Also rebind locally
+                        // so subsequent reads inside the same body
+                        // see the new value.
+                        let _ = b.record_capture(&segments[0].name);
+                        let n = b
+                            .module
+                            .intern_const(Const::String(segments[0].name.clone()));
+                        b.push(Inst::StoreGlobal { name: n, value: combined });
+                        b.rebind(&segments[0].name, combined);
                     } else if b.resolve(&segments[0].name).is_some() {
                         b.rebind(&segments[0].name, combined);
                     } else if b.has_own_member(&segments[0].name)
