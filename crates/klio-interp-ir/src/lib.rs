@@ -2722,17 +2722,50 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     target_args.push(v);
                 }
                 // For `: this(...)` recurse via new_instance with
-                // the resolved args. `: super(...)` is not yet
-                // supported.
-                if entry.is_super {
-                    return Err(klio_ir::eval::EvalError::Unimplemented(format!(
-                        "Vm::new_instance: secondary ctor super-delegation for `{}`",
-                        class_def.name
-                    )));
-                }
-                let inst_v = <Self as klio_ir::eval::Host>::new_instance(
-                    self, class, &target_args,
-                )?;
+                // the resolved args. For `: super(...)`, allocate
+                // the leaf class shell directly and populate the
+                // parent's primary-param fields from the resolved
+                // args; the leaf's body props + init blocks run
+                // through the normal path below by falling through
+                // to the primary-ctor path with empty args.
+                let inst_v = if entry.is_super {
+                    let parent_def = class_def
+                        .parent
+                        .borrow()
+                        .clone()
+                        .or_else(|| {
+                            class_def
+                                .supertype_names
+                                .first()
+                                .and_then(|n| self.classes.borrow().get(n).cloned())
+                        });
+                    if let Some(pdef) = parent_def {
+                        let leaf = <Self as klio_ir::eval::Host>::new_instance(
+                            self,
+                            class,
+                            &[],
+                        )?;
+                        if let klio_runtime::Value::Instance(leaf_inst) = &leaf {
+                            for (p, value) in pdef.primary_params.iter().zip(target_args.iter()) {
+                                if p.property.is_some() {
+                                    let mut i = leaf_inst.borrow_mut();
+                                    i.fields.retain(|(n, _)| n != &p.name);
+                                    i.fields.push((p.name.clone(), value.clone()));
+                                }
+                            }
+                        }
+                        leaf
+                    } else {
+                        return Err(klio_ir::eval::EvalError::Unimplemented(format!(
+                            "Vm::new_instance: secondary ctor super-delegation for `{}` (no parent class def)",
+                            class_def.name
+                        )));
+                    }
+                } else {
+                    <Self as klio_ir::eval::Host>::new_instance(
+                        self, class, &target_args,
+                    )?
+                };
                 // Body block — evaluate with `[this, ctor_params...]`.
                 if let Some(body_fid) = entry.body {
                     if let Some(body_func) = module.funcs.get(body_fid.0 as usize).cloned() {
