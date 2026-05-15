@@ -2689,6 +2689,33 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // KClass equality + hash + toString — structural by the
+        // class's `name`. `Person::class == Person::class` is true,
+        // distinct classes compare unequal.
+        if let klio_runtime::Value::Class(a) = receiver {
+            match (name, args.len()) {
+                ("equals", 1) => {
+                    let eq = if let klio_runtime::Value::Class(b) = &args[0] {
+                        a.name == b.name
+                    } else {
+                        false
+                    };
+                    return Ok(klio_runtime::Value::Bool(eq));
+                }
+                ("hashCode", 0) => {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    a.name.hash(&mut h);
+                    return Ok(klio_runtime::Value::new_int(h.finish() as i64));
+                }
+                ("toString", 0) => {
+                    return Ok(klio_runtime::Value::String(Rc::new(format!(
+                        "class {}", a.name
+                    ))));
+                }
+                _ => {}
+            }
+        }
         // PropertyRef invocation: `nameRef.get(p)` / `nameRef.call(p)`
         // reads the named property from the receiver. `hashCode`
         // and `equals` route to structural equality on the name.
