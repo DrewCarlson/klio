@@ -956,6 +956,17 @@ fn load_installed_packs(
                 }
             }
         }
+        // Also bring in any merged binding whose FQN sits under the
+        // loaded pack's library_id but isn't explicitly listed in
+        // the pack manifest. Newer Rust-side bindings (e.g. host
+        // entries added after the pack was last built) take effect
+        // without forcing a pack rebuild.
+        let lib_prefix = format!("{lib_id}.");
+        for (fqn, f) in merged.entries() {
+            if fqn.starts_with(&lib_prefix) {
+                out_bindings.register(fqn, f);
+            }
+        }
     }
     (out_asts, out_bindings)
 }

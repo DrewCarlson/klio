@@ -507,6 +507,8 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
     // wouldn't resolve at dispatch.
     let mut fqn_overrides: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut func_fqn_overrides: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for f in files {
         let prefix: String = f
             .package
@@ -521,10 +523,16 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
             .unwrap_or_default();
         for d in &f.decls {
             collect_class_fqns(d, &prefix, &mut fqn_overrides);
+            if let Decl::Function(fn_d) = d {
+                if !prefix.is_empty() {
+                    func_fqn_overrides
+                        .insert(fn_d.name.name.clone(), format!("{}.{}", prefix, fn_d.name.name));
+                }
+            }
         }
         combined.decls.extend(f.decls.iter().cloned());
     }
-    build_module_with_overrides(&combined, &fqn_overrides)
+    build_module_with_overrides(&combined, &fqn_overrides, &func_fqn_overrides)
 }
 
 fn collect_class_fqns(
@@ -548,12 +556,17 @@ fn collect_class_fqns(
 }
 
 pub fn build_module(file: &KotlinFile) -> BuiltModule {
-    build_module_with_overrides(file, &std::collections::HashMap::new())
+    build_module_with_overrides(
+        file,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    )
 }
 
 fn build_module_with_overrides(
     file: &KotlinFile,
     fqn_overrides: &std::collections::HashMap<String, String>,
+    func_fqn_overrides: &std::collections::HashMap<String, String>,
 ) -> BuiltModule {
     let mut module = klio_ir::Module::default();
     let package_prefix: String = file
@@ -739,10 +752,20 @@ fn build_module_with_overrides(
     for d in decls {
         if let Decl::Function(f) = d {
             let id = klio_ir::FuncId(module.funcs.len() as u32);
+            let fqn = func_fqn_overrides
+                .get(&f.name.name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if package_prefix.is_empty() {
+                        f.name.name.clone()
+                    } else {
+                        format!("{}.{}", package_prefix, f.name.name)
+                    }
+                });
             module.funcs.push(klio_ir::Func {
                 id,
                 name: f.name.name.clone(),
-                fqn: f.name.name.clone(),
+                fqn,
                 params: Vec::new(),
                 return_ty: klio_ir::TypeRef::unit(),
                 n_locals: 0,
@@ -776,6 +799,11 @@ fn build_module_with_overrides(
             stub_cursor += 1;
             let mut placed = func;
             placed.id = id;
+            // Preserve the FQN that the stub pass installed (it
+            // carries the file's package prefix); `lower_function_*`
+            // hard-codes a bare-name fqn that would otherwise lose
+            // the package on combined builds.
+            placed.fqn = module.funcs[id.0 as usize].fqn.clone();
             module.funcs[id.0 as usize] = placed;
             if f.name.name == "main" {
                 main_id = Some(id);

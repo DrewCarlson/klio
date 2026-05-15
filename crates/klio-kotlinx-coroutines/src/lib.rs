@@ -41,7 +41,47 @@ klio_stdlib::host_bindings! {
         "kotlinx.coroutines.__kxco_schedulerDrainCount" => scheduler_drain_count,
         "kotlinx.coroutines.__kxco_spawn"               => spawn_launch_block,
         "kotlinx.coroutines.__kxco_scheduleResume"      => schedule_resume,
+        "kotlinx.coroutines.runBlocking"                => run_blocking,
+        "kotlinx.coroutines.delay"                      => delay_top_level,
     }
+}
+
+/// `runBlocking { ... }` — single-threaded driver: invoke the block
+/// lambda, then drain any tasks the block enqueued via `launch`
+/// until the scheduler queue is empty.
+fn run_blocking(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let Some(block) = ctx.args.last().cloned() else {
+        return Err(RuntimeError::Type(
+            "runBlocking: expected the block lambda as the trailing arg".into(),
+        ));
+    };
+    let result = ctx
+        .host
+        .invoke_callable_with_this(&block, &[], &Value::Null, ctx.out)?;
+    // Drain any tasks `launch` enqueued during the block.
+    loop {
+        let launches = ctx.host.scheduler().drain_launches();
+        let resumes = ctx.host.scheduler().drain_resumes();
+        if launches.is_empty() && resumes.is_empty() {
+            break;
+        }
+        for task in launches {
+            ctx.host
+                .invoke_callable_with_this(&task, &[], &Value::Null, ctx.out)?;
+        }
+        for cont in resumes {
+            ctx.host
+                .invoke_callable_with_this(&cont, &[], &Value::Null, ctx.out)?;
+        }
+    }
+    Ok(result)
+}
+
+/// Top-level `delay(ms)` mirror — same as the internal helper but
+/// satisfies the suspend shim function directly so the IR doesn't
+/// have to run the placeholder body.
+fn delay_top_level(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    delay_millis(ctx)
 }
 
 fn delay_millis(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

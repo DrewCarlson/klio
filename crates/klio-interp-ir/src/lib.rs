@@ -792,8 +792,14 @@ impl<'a> VmHost<'a> {
         arg: &klio_runtime::Value,
     ) -> Option<i32> {
         let nm = param_ty.name.as_str();
-        let fqn = arg.type_fqn();
-        let v_ty = fqn.rsplit('.').next().unwrap_or(fqn);
+        let owned;
+        let v_ty: &str = if let klio_runtime::Value::Instance(i) = arg {
+            owned = i.borrow().class.name.clone();
+            owned.as_str()
+        } else {
+            let fqn = arg.type_fqn();
+            fqn.rsplit('.').next().unwrap_or(fqn)
+        };
         if nm == v_ty {
             return Some(100);
         }
@@ -820,6 +826,44 @@ impl<'a> VmHost<'a> {
             return Some(1);
         }
         None
+    }
+
+    fn pick_method_overload(
+        &self,
+        candidates: &[klio_ir::Func],
+        args: &[klio_runtime::Value],
+    ) -> Option<klio_ir::Func> {
+        if candidates.is_empty() {
+            return None;
+        }
+        if candidates.len() == 1 {
+            return Some(candidates[0].clone());
+        }
+        let mut best: Option<(usize, i32)> = None;
+        for (i, f) in candidates.iter().enumerate() {
+            // Method params include the implicit `this` slot first;
+            // skip it when scoring against the caller's args.
+            let params_skip = if f.params.first().map(|p| p.name == "this").unwrap_or(false) { 1 } else { 0 };
+            let effective: &[klio_ir::Param] = &f.params[params_skip..];
+            if effective.len() != args.len() {
+                continue;
+            }
+            let mut total: i32 = 0;
+            let mut ok = true;
+            for (p, a) in effective.iter().zip(args.iter()) {
+                match self.overload_score_arg(&p.ty, a) {
+                    Some(s) => total += s,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && best.map(|(_, s)| total > s).unwrap_or(true) {
+                best = Some((i, total));
+            }
+        }
+        best.map(|(i, _)| candidates[i].clone())
     }
 
     fn pick_overload(
@@ -1026,6 +1070,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             format!("kotlin.math.{name}"),
             format!("kotlin.comparisons.{name}"),
         ];
+        // Loaded packs register their FQNs in `installed_bindings`.
+        // For a bare-name reference, scan the overlay for a key that
+        // ends with `.{name}` — this lets user code call
+        // `runBlocking { … }` after `import kotlinx.coroutines.runBlocking`
+        // without having to teach `direct_probes` about every kotlinx
+        // package.
+        {
+            let suffix = format!(".{name}");
+            let entry: Option<(&'static str, klio_runtime::StdlibFn)> = self
+                .installed_bindings
+                .entries()
+                .find(|(k, _)| k.ends_with(&suffix))
+                .map(|(k, f)| (k, f));
+            if let Some((fqn, func)) = entry {
+                return Some(klio_runtime::Value::Intrinsic { fqn, func });
+            }
+        }
         for fqn in &direct_probes {
             if let Some(func) = self.lookup_intrinsic(fqn) {
                 // Property-style intrinsic: a 0-arg constant whose
@@ -1326,6 +1387,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         info.body_func.0
                     ))
                 })?;
+            // Pack binding overlay short-circuit for the wrapped
+            // top-level fn: e.g. a closure-of `kotlinx.datetime.__kxdt_*`
+            // dispatches the Rust binding instead of running the
+            // shim placeholder body.
+            if let Some(intrinsic) = self.installed_bindings.resolve(&func.fqn) {
+                return self.dispatch_intrinsic(intrinsic, args);
+            }
             // Fill missing positional args with Null so an
             // implicit-`it` lambda invoked with zero args still
             // initialises the param slot. Pack trailing vararg
@@ -2851,6 +2919,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             .ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown FuncId {}", func.0))
             })?;
+        // Pack-installed binding fast path: a top-level function whose
+        // package-qualified FQN matches a registered binding shadows
+        // the shim body shipped in source.
+        if let Some(intrinsic) = self.installed_bindings.resolve(&f.fqn) {
+            let v = self.dispatch_intrinsic(intrinsic, &args)?;
+            return Ok(v);
+        }
         // Pad missing positional args with each param's default
         // value (from the registered default-init thunks).
         let mut args = args;
@@ -4074,17 +4149,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     .find(|c| c.name == cur_name)
                     .cloned();
                 if let Some(ir_class) = ir_class {
-                    for fid in &ir_class.methods {
-                        if let Some(f) = self.module.funcs.get(fid.0 as usize).cloned() {
-                            if f.name == name {
-                                let mut all_args: Vec<klio_runtime::Value> =
-                                    Vec::with_capacity(args.len() + 1);
-                                all_args.push(receiver.clone());
-                                all_args.extend_from_slice(args);
-                                let module = Rc::clone(&self.module);
-                                return klio_ir::eval::eval_with(&module, &f, all_args, self);
-                            }
-                        }
+                    // Gather every method named `name` so we can pick
+                    // an overload by scoring runtime arg types.
+                    let candidates: Vec<klio_ir::Func> = ir_class
+                        .methods
+                        .iter()
+                        .filter_map(|fid| self.module.funcs.get(fid.0 as usize).cloned())
+                        .filter(|f| f.name == name)
+                        .collect();
+                    if let Some(f) = self.pick_method_overload(&candidates, args) {
+                        let mut all_args: Vec<klio_runtime::Value> =
+                            Vec::with_capacity(args.len() + 1);
+                        all_args.push(receiver.clone());
+                        all_args.extend_from_slice(args);
+                        let module = Rc::clone(&self.module);
+                        return klio_ir::eval::eval_with(&module, &f, all_args, self);
                     }
                 }
                 // Push runtime supertype names; the Vm's
