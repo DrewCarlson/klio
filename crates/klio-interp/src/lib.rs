@@ -6369,6 +6369,61 @@ impl Interpreter {
                 "runBlocking expects a lambda".into(),
             ));
         };
+        // Fast path: when the runBlocking lambda body never reaches a
+        // suspension point — no suspendCoroutine and no nested
+        // suspend-fn call — invoke the lambda directly. Skips the
+        // state-machine driver setup for the common synchronous
+        // `runBlocking { regular code }` shape.
+        let body_synchronous = {
+            use klio_ast::{Stmt, Expr};
+            let names = self.module_registry.suspend_function_names.clone();
+            fn stmt_sync(s: &Stmt, names: &suspend_lower::SuspendNameSet) -> bool {
+                match s {
+                    Stmt::Expr(e) => expr_sync(e, names),
+                    Stmt::Assign { target, value, .. } => {
+                        expr_sync(target, names) && expr_sync(value, names)
+                    }
+                    Stmt::Decl(klio_ast::Decl::Property(p)) => {
+                        p.init.as_ref().map_or(true, |e| expr_sync(e, names))
+                    }
+                    _ => true,
+                }
+            }
+            fn expr_sync(e: &Expr, names: &suspend_lower::SuspendNameSet) -> bool {
+                use Expr::*;
+                match e {
+                    Call { callee, args, .. } => {
+                        if let Path { segments, .. } = callee.as_ref() {
+                            if segments.len() == 1 && names.names.contains(&segments[0].name) {
+                                return false;
+                            }
+                        }
+                        expr_sync(callee, names) && args.iter().all(|a| expr_sync(a, names))
+                    }
+                    Member { receiver, .. } => expr_sync(receiver, names),
+                    Binary { lhs, rhs, .. } => expr_sync(lhs, names) && expr_sync(rhs, names),
+                    Unary { expr, .. } | Postfix { expr, .. } => expr_sync(expr, names),
+                    If { cond, then_branch, else_branch, .. } => {
+                        expr_sync(cond, names)
+                            && expr_sync(then_branch, names)
+                            && else_branch.as_ref().map_or(true, |e| expr_sync(e, names))
+                    }
+                    Index { receiver, args, .. } => {
+                        expr_sync(receiver, names) && args.iter().all(|a| expr_sync(a, names))
+                    }
+                    IsCheck { expr, .. } | As { expr, .. } => expr_sync(expr, names),
+                    Throw { value, .. } => expr_sync(value, names),
+                    Return { value, .. } => {
+                        value.as_ref().map_or(true, |e| expr_sync(e, names))
+                    }
+                    _ => true,
+                }
+            }
+            body.stmts.iter().all(|s| stmt_sync(s, &names))
+        };
+        if body_synchronous {
+            return self.call_lambda(params, body, captured, &[], out);
+        }
         // Synthesise an AST Function out of the lambda so the
         // suspend-body lowering can partition it. The synthetic
         // function takes no parameters and uses the lambda's
