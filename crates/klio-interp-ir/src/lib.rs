@@ -76,6 +76,9 @@ pub struct Vm {
     companion_singletons: std::collections::HashMap<String, String>,
     /// Enum-entry ctor-arg thunks to evaluate at startup.
     enum_entry_arg_inits: Vec<(String, String, Vec<klio_ir::FuncId>)>,
+    /// Per-class secondary-ctor dispatch entries.
+    secondary_ctors:
+        std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
     /// Runtime-lowered method bodies for anonymous-object / local
     /// classes, indexed by `(class name, method name) -> (Module, FuncId)`.
     /// The IR module is immutable after build, so methods declared
@@ -138,6 +141,7 @@ impl Vm {
             object_names: Vec::new(),
             companion_singletons: std::collections::HashMap::new(),
             enum_entry_arg_inits: Vec::new(),
+            secondary_ctors: std::collections::HashMap::new(),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
         }
@@ -160,6 +164,7 @@ impl Vm {
         vm.object_names = built.object_names;
         vm.companion_singletons = built.companion_singletons;
         vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
+        vm.secondary_ctors = built.secondary_ctors;
         (vm, main)
     }
 
@@ -196,6 +201,7 @@ impl Vm {
                     extension_props: &self.extension_props,
                     anon_methods: Rc::clone(&self.anon_methods),
                     companion_singletons: &self.companion_singletons,
+                    secondary_ctors: &self.secondary_ctors,
                     closures: &mut self.closures,
                 };
                 klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -247,6 +253,7 @@ impl Vm {
                         extension_props: &self.extension_props,
                         anon_methods: Rc::clone(&self.anon_methods),
                         companion_singletons: &self.companion_singletons,
+                    secondary_ctors: &self.secondary_ctors,
                         closures: &mut self.closures,
                     };
                     klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -285,6 +292,7 @@ impl Vm {
                     extension_props: &self.extension_props,
                     anon_methods: Rc::clone(&self.anon_methods),
                     companion_singletons: &self.companion_singletons,
+                    secondary_ctors: &self.secondary_ctors,
                     closures: &mut self.closures,
                 };
                 <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
@@ -312,6 +320,7 @@ impl Vm {
             extension_props: &self.extension_props,
             anon_methods: Rc::clone(&self.anon_methods),
             companion_singletons: &self.companion_singletons,
+            secondary_ctors: &self.secondary_ctors,
             closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
@@ -360,6 +369,8 @@ struct VmHost<'a> {
         (Rc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>>,
     companion_singletons: &'a std::collections::HashMap<String, String>,
+    secondary_ctors:
+        &'a std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
     closures: &'a mut Vec<ClosureInfo>,
 }
 
@@ -598,6 +609,7 @@ impl<'a> VmHost<'a> {
             extension_props: self.extension_props,
             anon_methods: Rc::clone(&self.anon_methods),
             companion_singletons: self.companion_singletons,
+            secondary_ctors: self.secondary_ctors,
             instance_id_counter: &mut *self.instance_id_counter,
         };
         let mut ctx = klio_runtime::CallCtx {
@@ -2615,20 +2627,78 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 cause: None,
             }));
         }
+        // Secondary-ctor dispatch: when the supplied arg count
+        // doesn't match the primary signature, look for a
+        // secondary ctor with the matching arity. Evaluate its
+        // delegation arg thunks, recurse for `: this(...)`, then
+        // run the optional body block.
+        let n_primary = class_def.primary_params.len();
+        if args.len() != n_primary {
+            let entries = self
+                .secondary_ctors
+                .get(&class_def.name)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(entry) = entries.iter().find(|e| e.param_count == args.len()) {
+                let module = Rc::clone(&self.module);
+                let mut target_args: Vec<klio_runtime::Value> =
+                    Vec::with_capacity(entry.delegation_arg_thunks.len());
+                for fid in &entry.delegation_arg_thunks {
+                    let func = module
+                        .funcs
+                        .get(fid.0 as usize)
+                        .cloned()
+                        .ok_or_else(|| {
+                            klio_ir::eval::EvalError::Type(format!(
+                                "secondary ctor arg FuncId {} out of range",
+                                fid.0
+                            ))
+                        })?;
+                    let v = klio_ir::eval::eval_with(
+                        &module,
+                        &func,
+                        args.to_vec(),
+                        self,
+                    )?;
+                    target_args.push(v);
+                }
+                // For `: this(...)` recurse via new_instance with
+                // the resolved args. `: super(...)` is not yet
+                // supported.
+                if entry.is_super {
+                    return Err(klio_ir::eval::EvalError::Unimplemented(format!(
+                        "Vm::new_instance: secondary ctor super-delegation for `{}`",
+                        class_def.name
+                    )));
+                }
+                let inst_v = <Self as klio_ir::eval::Host>::new_instance(
+                    self, class, &target_args,
+                )?;
+                // Body block — evaluate with `[this, ctor_params...]`.
+                if let Some(body_fid) = entry.body {
+                    if let Some(body_func) = module.funcs.get(body_fid.0 as usize).cloned() {
+                        let mut all: Vec<klio_runtime::Value> =
+                            Vec::with_capacity(1 + args.len());
+                        all.push(inst_v.clone());
+                        all.extend_from_slice(args);
+                        klio_ir::eval::eval_with(&module, &body_func, all, self)?;
+                    }
+                }
+                return Ok(inst_v);
+            }
+        }
         // Trivial primary-ctor shape: each primary param with
         // `property = Some(...)` becomes an instance field, then
         // body properties with init thunks run to populate their
         // fields. Init blocks, parent ctor chain, secondary ctors,
         // and supertype delegates are not yet handled.
         if !class_def.parent_ctor_args.is_empty()
-            || !class_def.secondary_ctors.is_empty()
             || !class_def.supertype_delegates.borrow().is_empty()
         {
-            return Err(klio_ir::eval::EvalError::Unimplemented(format!(
-                "Vm::new_instance: non-trivial ctor for `{}` (secondary ctors / supertype delegates not yet native)",
-                class_def.name
-            )));
+            // parent ctor args + supertype delegates handled
+            // further below — accept them as non-error here.
         }
+        let _is_block = ();
         let n_primary = class_def.primary_params.len();
         let mut effective_args: Vec<klio_runtime::Value> = args.to_vec();
         if effective_args.len() < n_primary {
@@ -2995,6 +3065,8 @@ struct VmIntrinsicHost<'a> {
         (Rc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>>,
     companion_singletons: &'a std::collections::HashMap<String, String>,
+    secondary_ctors:
+        &'a std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
     instance_id_counter: &'a mut u64,
 }
 
@@ -3055,6 +3127,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             extension_props: self.extension_props,
             anon_methods: Rc::clone(&self.anon_methods),
                     companion_singletons: self.companion_singletons,
+                    secondary_ctors: self.secondary_ctors,
                     closures: &mut *self.closures,
                 };
                 klio_ir::eval::eval_with_captures(
@@ -3096,6 +3169,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             extension_props: self.extension_props,
             anon_methods: Rc::clone(&self.anon_methods),
                 companion_singletons: self.companion_singletons,
+                secondary_ctors: self.secondary_ctors,
                 instance_id_counter: &mut *self.instance_id_counter,
             };
             let mut ctx = klio_runtime::CallCtx {

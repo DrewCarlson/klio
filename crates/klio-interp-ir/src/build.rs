@@ -232,6 +232,25 @@ pub struct BuiltModule {
     /// each thunk at startup and assigns the result into the entry
     /// instance's primary-ctor-param-named field.
     pub enum_entry_arg_inits: Vec<(String, String, Vec<klio_ir::FuncId>)>,
+    /// Secondary-ctor dispatch table:
+    /// `class_name -> Vec<SecondaryCtorEntry>`. The Vm walks each
+    /// class's list when `new_instance` is called with an arity
+    /// that doesn't match the primary constructor's signature.
+    pub secondary_ctors:
+        std::collections::HashMap<String, Vec<SecondaryCtorEntry>>,
+}
+
+/// Pre-lowered metadata for one secondary constructor. Each entry's
+/// `arg_thunks` evaluate the delegation arguments (`: this(...)` or
+/// `: super(...)`) against the secondary's positional params, then
+/// the Vm dispatches the resulting args to the primary ctor.
+#[derive(Clone)]
+pub struct SecondaryCtorEntry {
+    pub param_count: usize,
+    pub is_super: bool,
+    pub delegation_arg_thunks: Vec<klio_ir::FuncId>,
+    /// Optional body block lowered as a 1-arg fn taking `this`.
+    pub body: Option<klio_ir::FuncId>,
 }
 
 /// Lower a single file's declarations into an IR module. Classes are
@@ -742,6 +761,81 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         }
     }
 
+    // Per-class secondary-ctor lowering. Each entry captures the
+    // delegation arg thunks (parameterised on the secondary's
+    // params) plus an optional body block thunk taking `[this,
+    // ctor params...]`.
+    let mut secondary_ctors: std::collections::HashMap<String, Vec<SecondaryCtorEntry>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        if let Decl::Class(c) = d {
+            if c.secondary_ctors.is_empty() {
+                continue;
+            }
+            let mut own_members: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for p in &c.primary_params {
+                if p.property.is_some() {
+                    own_members.insert(p.name.name.clone());
+                }
+            }
+            for m in &c.members {
+                if let Decl::Property(p) = m {
+                    own_members.insert(p.name.name.clone());
+                }
+                if let Decl::Function(f) = m {
+                    own_members.insert(f.name.name.clone());
+                }
+            }
+            let mut entries: Vec<SecondaryCtorEntry> = Vec::new();
+            for (sc_idx, sc) in c.secondary_ctors.iter().enumerate() {
+                let param_names: Vec<String> =
+                    sc.params.iter().map(|p| p.name.name.clone()).collect();
+                let param_refs: Vec<&str> =
+                    param_names.iter().map(|s| s.as_str()).collect();
+                let (delegation_args, is_super) = match &sc.delegation {
+                    klio_ast::CtorDelegation::This(args) => (args.clone(), false),
+                    klio_ast::CtorDelegation::Super(args) => (args.clone(), true),
+                    klio_ast::CtorDelegation::None => (Vec::new(), false),
+                };
+                let mut arg_fids: Vec<klio_ir::FuncId> =
+                    Vec::with_capacity(delegation_args.len());
+                for (arg_idx, e) in delegation_args.iter().enumerate() {
+                    let fid = klio_ir::lower::lower_expr_as_param_thunk(
+                        &mut module,
+                        &param_refs,
+                        e,
+                        &format!(
+                            "__sec_ctor_{}_{sc_idx}_arg{arg_idx}",
+                            c.name.name
+                        ),
+                    );
+                    arg_fids.push(fid);
+                }
+                let body_fid = sc.body.as_ref().map(|blk| {
+                    let mut locals: Vec<&str> = Vec::with_capacity(1 + param_refs.len());
+                    locals.push("this");
+                    locals.extend_from_slice(&param_refs);
+                    klio_ir::lower::lower_accessor_block(
+                        &mut module,
+                        &c.name.name,
+                        &own_members,
+                        &locals,
+                        blk,
+                        &format!("__sec_ctor_body_{}_{sc_idx}", c.name.name),
+                    )
+                });
+                entries.push(SecondaryCtorEntry {
+                    param_count: sc.params.len(),
+                    is_super,
+                    delegation_arg_thunks: arg_fids,
+                    body: body_fid,
+                });
+            }
+            secondary_ctors.insert(c.name.name.clone(), entries);
+        }
+    }
+
     // Top-level property initialisers — `val name = expr` /
     // `var name = expr` declared at file scope. Each lowers to a
     // 0-arg thunk. Vm::run drives them at startup.
@@ -828,5 +922,6 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         object_names,
         companion_singletons,
         enum_entry_arg_inits,
+        secondary_ctors,
     }
 }
