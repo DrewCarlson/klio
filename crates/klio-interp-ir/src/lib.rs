@@ -1676,6 +1676,28 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Static call on a class-or-intrinsic receiver: probe stdlib
+        // by `<receiver-fqn>.<name>` so `Regex.escape("x")` and
+        // `Color.values()` route through the matching binding. The
+        // intrinsic value carries its package-qualified fqn; classes
+        // surface as the simple name (matching klio-stdlib's bare
+        // class-method registrations).
+        if let klio_runtime::Value::Intrinsic { fqn, .. } = receiver {
+            let probe = format!("{fqn}.{name}");
+            if let Some(func) = klio_stdlib::implementation(&probe) {
+                return self.dispatch_intrinsic(func, args);
+            }
+        }
+        if let klio_runtime::Value::Class(cls) = receiver {
+            let probe_simple = format!("{}.{}", cls.name, name);
+            if let Some(func) = klio_stdlib::implementation(&probe_simple) {
+                return self.dispatch_intrinsic(func, args);
+            }
+            let probe_fqn = format!("{}.{}", cls.fqn, name);
+            if let Some(func) = klio_stdlib::implementation(&probe_fqn) {
+                return self.dispatch_intrinsic(func, args);
+            }
+        }
         // Built-in iterator protocol for collections + ranges. The
         // IR's for-loop lowers as `receiver.iterator()` plus a
         // `hasNext` / `next` loop, so these have to dispatch
