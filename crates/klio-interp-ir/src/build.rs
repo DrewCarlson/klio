@@ -332,11 +332,29 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                     own_members.insert(f.name.name.clone());
                 }
             }
+            // Body-property initialisers may reference primary ctor
+            // params + `this` (for accessing already-bound properties
+            // declared earlier in the class). Lower as accessor exprs
+            // with `[this, ctor_param_names...]` as positional params;
+            // the Vm dispatches with `[inst, ctor_args...]`.
+            let ctor_param_names: Vec<String> = c
+                .primary_params
+                .iter()
+                .map(|p| p.name.name.clone())
+                .collect();
+            let mut prop_init_params: Vec<&str> = Vec::with_capacity(1 + ctor_param_names.len());
+            prop_init_params.push("this");
+            for n in &ctor_param_names {
+                prop_init_params.push(n.as_str());
+            }
             for m in &c.members {
                 if let Decl::Property(p) = m {
                     if let Some(init) = &p.init {
-                        let fid = klio_ir::lower::lower_expr_as_thunk(
+                        let fid = klio_ir::lower::lower_accessor_expr(
                             &mut module,
+                            &c.name.name,
+                            &own_members,
+                            &prop_init_params,
                             init,
                             &format!("__init_prop_{}_{}", c.name.name, p.name.name),
                         );

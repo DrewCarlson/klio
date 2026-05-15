@@ -1687,12 +1687,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
-        // (Leaf-class primary params for non-property args are already
-        // ignored by the loop above — only property params get fields.)
         let _ = (&class_def.primary_params, args);
-        // Body properties: run each init thunk and bind the result.
-        // Properties without an init expression but with a delegate
-        // or getter are not yet handled — we surface a clear failure.
+        // Materialise the instance with primary-param fields now so
+        // body-property initialisers can reference `this` (and read
+        // already-bound fields). Body props get appended into the
+        // same instance after the init thunks run.
+        let inst = std::rc::Rc::new(std::cell::RefCell::new(klio_runtime::InstanceData {
+            class: class_def.clone(),
+            fields,
+            outer: None,
+            identity,
+            native_state: None,
+        }));
+        let inst_value = klio_runtime::Value::Instance(std::rc::Rc::clone(&inst));
+        // Body properties: run each init thunk with `[this, leaf-ctor-args...]`
+        // and bind the result. Properties without an init expression
+        // but with a delegate or getter are not yet handled — we
+        // surface a clear failure.
         for p in &class_def.body_properties {
             if let Some(fid) = self
                 .body_prop_inits
@@ -1711,24 +1722,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         ))
                     })?;
                 let module = Rc::clone(&self.module);
-                let v = klio_ir::eval::eval_with(&module, &func, Vec::new(), self)?;
-                fields.push((p.name.clone(), v));
+                let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(1 + args.len());
+                all.push(inst_value.clone());
+                all.extend_from_slice(args);
+                let v = klio_ir::eval::eval_with(&module, &func, all, self)?;
+                inst.borrow_mut().fields.push((p.name.clone(), v));
             } else if p.getter.is_none() && p.delegate.is_none() {
-                // Plain `var n: Int` with no init defaults to a
-                // type-appropriate zero — matches Kotlin's
-                // primitive defaults for explicitly-typed body
-                // fields.
-                fields.push((p.name.clone(), klio_runtime::Value::Null));
+                inst.borrow_mut()
+                    .fields
+                    .push((p.name.clone(), klio_runtime::Value::Null));
             }
         }
-        let inst = std::rc::Rc::new(std::cell::RefCell::new(klio_runtime::InstanceData {
-            class: class_def,
-            fields,
-            outer: None,
-            identity,
-            native_state: None,
-        }));
-        let inst_value = klio_runtime::Value::Instance(std::rc::Rc::clone(&inst));
         // Run init blocks bottom-up across the parent chain so a
         // parent's init runs before its child's. Each init block
         // takes `this` as its sole param.
