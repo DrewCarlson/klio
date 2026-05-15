@@ -459,6 +459,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => {}
             }
         }
+        // Pair / Triple / MapEntry component / first / second / etc.
+        match (receiver, name) {
+            (klio_runtime::Value::Pair(a, _), "component1" | "first") => return Ok((**a).clone()),
+            (klio_runtime::Value::Pair(_, b), "component2" | "second") => return Ok((**b).clone()),
+            (klio_runtime::Value::Triple(a, _, _), "component1" | "first") => return Ok((**a).clone()),
+            (klio_runtime::Value::Triple(_, b, _), "component2" | "second") => return Ok((**b).clone()),
+            (klio_runtime::Value::Triple(_, _, c), "component3" | "third") => return Ok((**c).clone()),
+            (klio_runtime::Value::MapEntry { key, .. }, "component1" | "key") => return Ok((**key).clone()),
+            (klio_runtime::Value::MapEntry { value, .. }, "component2" | "value") => return Ok((**value).clone()),
+            _ => {}
+        }
         if let klio_runtime::Value::Iterator { items, pos, .. } = receiver {
             match name {
                 "hasNext" if args.is_empty() => {
