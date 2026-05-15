@@ -1882,7 +1882,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // `super<Klazz>.method()` passes Klazz so the
                     // host dispatches against that specific
                     // supertype.
-                    if let Expr::Super { qualifier, .. } = receiver.as_ref() {
+                    if let Expr::Super { qualifier, label, .. } = receiver.as_ref() {
                         if let Some(this_reg) = b.resolve("this") {
                             if let Some(owner) = b.owner_class().map(|s| s.to_string()) {
                                 let (args_start, count) = lower_arg_run(b, args);
@@ -1890,9 +1890,20 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                 let dst = b.alloc_reg();
                                 let nm = b.module.intern_const(Const::String(name.name.clone()));
                                 let oc = b.module.intern_const(Const::String(owner));
+                                // `super<Q>` uses `qualifier` (type
+                                // ref); `super@Q` uses `label` (an
+                                // identifier).
                                 let qual_const = qualifier
                                     .as_ref()
-                                    .map(|t| b.module.intern_const(Const::String(t.name.name.clone())));
+                                    .map(|t| {
+                                        b.module.intern_const(Const::String(t.name.name.clone()))
+                                    })
+                                    .or_else(|| {
+                                        label.as_ref().map(|id| {
+                                            b.module
+                                                .intern_const(Const::String(id.name.clone()))
+                                        })
+                                    });
                                 b.push(Inst::CallSuper {
                                     dst,
                                     receiver: this_reg,
