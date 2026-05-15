@@ -261,7 +261,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         ];
         for fqn in &direct_probes {
             if let Some(func) = klio_stdlib::implementation(fqn) {
+                // Property-style intrinsic: a 0-arg constant whose
+                // final segment is all uppercase + underscores
+                // (PI, MAX_VALUE, NaN-ish names like NaN itself
+                // would be lowercase-friendly — Kotlin convention
+                // uses all-caps for constants). Auto-invoke so the
+                // value flows through.
+                let tail = fqn.rsplit('.').next().unwrap_or(fqn.as_str());
+                let looks_const = !tail.is_empty()
+                    && tail
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit());
                 let leaked: &'static str = Box::leak(fqn.clone().into_boxed_str());
+                if looks_const {
+                    if let Ok(v) = self.dispatch_intrinsic(func, &[]) {
+                        return Some(v);
+                    }
+                }
                 return Some(klio_runtime::Value::Intrinsic { fqn: leaked, func });
             }
         }
