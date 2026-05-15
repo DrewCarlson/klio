@@ -11811,6 +11811,79 @@ fn expr_refers_to_this(expr: &klio_ast::Expr) -> bool {
 /// enclosing function. The IR lowers it as a plain Terminator::Return,
 /// which would terminate the lambda's Func instead — so IR-first
 /// dispatch must skip lambdas whose body has one.
+/// True when `block` contains a write (plain assignment or compound
+/// assignment) to any of `names` — capture names from a surrounding
+/// lambda. The IR lambda dispatch passes captures by value; writes
+/// inside the body would update the local snapshot only, not the
+/// enclosing variable. Tree walker shares the env, so writes
+/// propagate naturally. Until IR grows shared-cell captures, skip
+/// IR dispatch for these lambdas.
+fn block_writes_any(block: &klio_ast::Block, names: &[String]) -> bool {
+    fn assigns_to(target: &klio_ast::Expr, names: &[String]) -> bool {
+        if let klio_ast::Expr::Path { segments, .. } = target {
+            if segments.len() == 1 && names.iter().any(|n| n == &segments[0].name) {
+                return true;
+            }
+        }
+        false
+    }
+    fn expr_writes_any(e: &klio_ast::Expr, names: &[String]) -> bool {
+        use klio_ast::Expr::*;
+        match e {
+            Lambda { .. } | AnonFun { .. } => false,
+            Call { callee, args, .. } => {
+                expr_writes_any(callee, names) || args.iter().any(|a| expr_writes_any(a, names))
+            }
+            Member { receiver, .. } => expr_writes_any(receiver, names),
+            Binary { lhs, rhs, .. } => {
+                expr_writes_any(lhs, names) || expr_writes_any(rhs, names)
+            }
+            Unary { expr, .. } | Postfix { expr, .. } => expr_writes_any(expr, names),
+            If { cond, then_branch, else_branch, .. } => {
+                expr_writes_any(cond, names)
+                    || expr_writes_any(then_branch, names)
+                    || else_branch.as_deref().map_or(false, |e| expr_writes_any(e, names))
+            }
+            When { subject, branches, .. } => {
+                subject.as_deref().map_or(false, |s| expr_writes_any(s, names))
+                    || branches.iter().any(|b| expr_writes_any(&b.body, names))
+            }
+            While { cond, body, .. } => {
+                expr_writes_any(cond, names) || expr_writes_any(body, names)
+            }
+            DoWhile { body, cond, .. } => {
+                body.as_deref().map_or(false, |b| expr_writes_any(b, names))
+                    || expr_writes_any(cond, names)
+            }
+            For { iter, body, .. } => expr_writes_any(iter, names) || expr_writes_any(body, names),
+            Block(b) => block_writes_any(b, names),
+            Try { body, catches, finally, .. } => {
+                block_writes_any(body, names)
+                    || catches.iter().any(|c| block_writes_any(&c.body, names))
+                    || finally.as_ref().map_or(false, |f| block_writes_any(f, names))
+            }
+            Labeled { expr, .. } => expr_writes_any(expr, names),
+            Index { receiver, args, .. } => {
+                expr_writes_any(receiver, names) || args.iter().any(|a| expr_writes_any(a, names))
+            }
+            Spread { expr, .. } => expr_writes_any(expr, names),
+            Throw { value, .. } => expr_writes_any(value, names),
+            As { expr, .. } => expr_writes_any(expr, names),
+            IsCheck { expr, .. } => expr_writes_any(expr, names),
+            Return { value, .. } => value.as_deref().map_or(false, |v| expr_writes_any(v, names)),
+            _ => false,
+        }
+    }
+    block.stmts.iter().any(|s| match s {
+        klio_ast::Stmt::Expr(e) => expr_writes_any(e, names),
+        klio_ast::Stmt::Assign { target, value, .. } => {
+            assigns_to(target, names) || expr_writes_any(value, names)
+        }
+        klio_ast::Stmt::DestructuringDecl { init, .. } => expr_writes_any(init, names),
+        klio_ast::Stmt::Decl(_) => false,
+    })
+}
+
 fn block_contains_bare_return(block: &klio_ast::Block) -> bool {
     fn expr_has_bare_return(e: &klio_ast::Expr) -> bool {
         use klio_ast::Expr::*;
@@ -13962,9 +14035,12 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // empty params and `it` references inside the body lower as
         // LoadGlobal("it"), which would fail without a runtime binding.
         if let Some(fid) = body_func {
+            let body_writes_capture = !captured_names.is_empty()
+                && block_writes_any(&body_rc, captured_names);
             if !params.is_empty()
                 && !absorb_return
                 && !block_contains_bare_return(&body_rc)
+                && !body_writes_capture
             {
                 let sp = body_rc.span;
                 let key = (sp.file.0, sp.start, sp.end);
