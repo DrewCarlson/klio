@@ -927,6 +927,7 @@ name = "klio-interp-ir"
 version = "0.1.0"
 dependencies = [
  "klio-diagnostics",
+ "klio-interp",
  "klio-ir",
  "klio-runtime",
  "klio-span",

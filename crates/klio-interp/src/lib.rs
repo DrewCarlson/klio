@@ -1784,6 +1784,22 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Public escape hatch for `klio-interp-ir`: run a single IR
+    /// Func with the interpreter wired up as the IR Host. Lets the
+    /// new Vm reuse the existing host shim for surfaces it doesn't
+    /// natively service yet (class construction, member dispatch,
+    /// closures with `this`-bindings, suspend driver). Each
+    /// workstream migrates one surface and removes its dependency
+    /// on this hook.
+    pub fn run_ir_main(
+        &mut self,
+        module_rc: std::rc::Rc<klio_ir::Module>,
+        main_id: klio_ir::FuncId,
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, RuntimeError> {
+        self.run_main(module_rc, main_id, out)
+    }
+
     fn run_main(
         &mut self,
         module_rc: std::rc::Rc<klio_ir::Module>,

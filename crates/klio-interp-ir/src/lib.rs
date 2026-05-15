@@ -155,6 +155,42 @@ impl<'a> klio_ir::eval::Host for MinimalHost<'a> {
         // enough. Real named-arg routing lands later.
         self.call_value(callee, args)
     }
+
+    fn get_field(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Plain-field read on a user-class instance — no custom
+        // getter, no delegate, no extension property. The accessor
+        // and delegate surfaces land with the property-accessor
+        // workstream; until then they raise Unimplemented.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            if let Some(v) = inst.borrow().get(name) {
+                return Ok(v);
+            }
+        }
+        Err(klio_ir::eval::EvalError::Unimplemented(format!(
+            "klio-interp-ir Vm: get_field `{name}` on `{}`",
+            receiver.type_fqn()
+        )))
+    }
+
+    fn set_field(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+        value: klio_runtime::Value,
+    ) -> Result<(), klio_ir::eval::EvalError> {
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            inst.borrow_mut().define(name, value);
+            return Ok(());
+        }
+        Err(klio_ir::eval::EvalError::Unimplemented(format!(
+            "klio-interp-ir Vm: set_field `{name}` on `{}`",
+            receiver.type_fqn()
+        )))
+    }
 }
 
 /// Stdlib `CallCtx` host adapter. Today it only implements the

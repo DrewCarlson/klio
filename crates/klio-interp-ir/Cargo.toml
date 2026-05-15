@@ -15,4 +15,11 @@ klio-runtime     = { workspace = true }
 klio-span        = { workspace = true }
 klio-stdlib      = { workspace = true }
 klio-diagnostics = { workspace = true }
+# Temporary cross-crate dependency: klio-interp owns the AST-backed
+# host shims (class construction, member dispatch, etc.) that this
+# crate doesn't natively service yet. Each workstream migrates one
+# slice from `klio-interp`'s `IrHost` to `klio-interp-ir`'s `Vm`.
+# When the last surface lands, this dependency goes away and
+# `klio-interp` is deleted from the workspace.
+klio-interp      = { workspace = true }
 thiserror        = "2"
