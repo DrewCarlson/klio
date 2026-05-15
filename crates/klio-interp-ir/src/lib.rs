@@ -2664,14 +2664,25 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             native_state: None,
         }));
         let inst_value = klio_runtime::Value::Instance(std::rc::Rc::clone(&inst));
-        // Body properties: run each init thunk with `[this, leaf-ctor-args...]`
-        // and bind the result. Properties without an init expression
-        // but with a delegate or getter are not yet handled — we
-        // surface a clear failure.
-        for p in &class_def.body_properties {
+        // Body properties: walk each class in the parent chain so a
+        // subclass instance also picks up the parent's `var/val`
+        // body properties. Each init thunk runs with
+        // `[this, leaf-ctor-args...]`.
+        let mut chain_classes: Vec<Rc<klio_runtime::ClassDef>> = Vec::new();
+        {
+            let mut cur = Some(Rc::clone(&class_def));
+            while let Some(c) = cur {
+                chain_classes.push(Rc::clone(&c));
+                cur = c.parent.borrow().clone();
+            }
+        }
+        // Bottom-up so parent fields exist before child fields can
+        // override the same name.
+        for cls in chain_classes.iter().rev() {
+        for p in &cls.body_properties {
             if let Some(fid) = self
                 .body_prop_inits
-                .get(&(class_def.name.clone(), p.name.clone()))
+                .get(&(cls.name.clone(), p.name.clone()))
                 .copied()
             {
                 let func = self
@@ -2696,6 +2707,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     .fields
                     .push((p.name.clone(), klio_runtime::Value::Null));
             }
+        }
         }
         // Run init blocks bottom-up across the parent chain so a
         // parent's init runs before its child's. Each init block
