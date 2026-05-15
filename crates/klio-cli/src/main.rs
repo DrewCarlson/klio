@@ -1261,10 +1261,9 @@ fn run_module_files(paths: &[PathBuf]) -> ExitCode {
 }
 
 /// Run a single source file through `klio-interp-ir`'s Vm. The
-/// front end (parse → typecheck → IR module build) reuses the
-/// existing pipeline in `klio-interp::Interpreter::register_file_decls`;
-/// execution then jumps to the new IR Vm with no AST evaluator
-/// involvement. Failures fall back through the standard error path.
+/// pipeline is parse → typecheck → klio_interp_ir::build::build_module
+/// → `Vm::run`. No code path goes through `klio-interp` — the new
+/// Vm owns module construction end-to-end.
 fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
     let mut map = SourceMap::new();
     let Some(id) = load(&mut map, path) else { return ExitCode::FAILURE };
@@ -1285,22 +1284,13 @@ fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
         let _ = tc.diagnostics.render(&map, std::io::stderr());
         return ExitCode::FAILURE;
     }
-    let mut interp = Interpreter::new().with_expr_types(tc.types.clone());
-    install_embedded_stdlib(&mut interp);
-    let mut stdout = klio_runtime::StdoutOutput;
-    if let Err(e) = interp.register_file_decls(&ast, &mut stdout) {
-        eprintln!("registration error: {e}");
-        return ExitCode::FAILURE;
-    }
-    let Some(module) = interp.ir_module() else {
-        eprintln!("error: no IR module produced");
-        return ExitCode::FAILURE;
-    };
-    let Some(main_id) = interp.main_func_id() else {
+    let built = klio_interp_ir::build::build_module(&ast);
+    let Some(main_id) = built.main else {
         eprintln!("error: no main function found");
         return ExitCode::FAILURE;
     };
-    let mut vm = klio_interp_ir::Vm::new(module);
+    let mut vm = klio_interp_ir::Vm::new(built.module);
+    let mut stdout = klio_runtime::StdoutOutput;
     match vm.run(main_id, &mut stdout) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {

@@ -1,35 +1,39 @@
 //! IR-native interpreter.
 //!
-//! This crate is the destination of the IR cutover: it executes a
-//! frozen `klio_ir::Module` end-to-end with no AST evaluator, no
-//! callback into the tree-walker `klio-interp`, and no `IrHost` shim
-//! that synthesises AST.
+//! This crate executes a frozen `klio_ir::Module` end-to-end with no
+//! AST evaluator, no callback into `klio-interp`, and no `IrHost`
+//! shim that synthesises AST. The IR cutover plan replaces the tree
+//! walker by growing this crate's `Vm` until every Kotlin shape we
+//! support has a Vm-native execution path.
 //!
-//! The crate starts as a thin scaffold and grows per the IR cutover
-//! plan. Today's surface is the `Vm` struct + `Vm::run` entry point.
-//! New IR Insts and runtime shapes (closures, shared cells, suspend
-//! state machines, reflection refs, SAM wrappers) land into this
-//! crate as they're added to `klio-ir` and `klio-runtime`.
+//! The crate intentionally does not depend on `klio-interp`. Module
+//! construction goes through `klio_ir::lower` directly; the driver
+//! (`klio-cli`) parses + type-checks via the shared front-end crates
+//! and hands the resulting AST to this crate's `build_module`. Until
+//! W12 the legacy `klio` binary keeps the tree walker available as a
+//! reference; the new Vm runs alongside under `--ir-vm`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 pub use klio_runtime::Output;
 
+pub mod build;
+
 /// One Vm instance executes a single program against the IR module
-/// produced by the front end. Long-running state (globals,
-/// scheduler, stacks) lives here.
+/// produced by the front end.
 pub struct Vm {
     module: Rc<klio_ir::Module>,
     globals: Rc<RefCell<klio_runtime::Env>>,
     scheduler: Box<dyn klio_runtime::Scheduler>,
+    instance_id_counter: u64,
 }
 
 impl Vm {
     /// Build a Vm around an already-lowered IR module. Stdlib
     /// aliases (`print`, `println`, `listOf`, ...) are installed
-    /// into globals up front so a hello-world program can find them
-    /// without going through klio-interp.
+    /// into globals up front so identifiers covered by Kotlin's
+    /// default imports resolve without an explicit `import`.
     pub fn new(module: Rc<klio_ir::Module>) -> Self {
         let mut env = klio_runtime::Env::new();
         for (name, fqn) in klio_stdlib::IMPLICIT_ALIASES {
@@ -42,6 +46,7 @@ impl Vm {
             module,
             globals,
             scheduler: Box::new(klio_runtime::InProcessScheduler::new()),
+            instance_id_counter: 0,
         }
     }
 
@@ -58,19 +63,18 @@ impl Vm {
             .get(main.0 as usize)
             .ok_or(VmError::InvalidMain)?
             .clone();
-        let mut host = MinimalHost {
+        let mut host = VmHost {
             globals: Rc::clone(&self.globals),
             module: Rc::clone(&module),
             scheduler: &mut *self.scheduler,
             out,
+            instance_id_counter: &mut self.instance_id_counter,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
     }
 }
 
-/// Vm-level errors. The IR's `EvalError` rolls up into a single
-/// `Eval` variant; surface-level driver errors get their own
-/// variants as they appear.
+/// Vm-level errors.
 #[derive(Debug, thiserror::Error)]
 pub enum VmError {
     #[error("main function not found in module")]
@@ -85,26 +89,27 @@ impl From<klio_ir::eval::EvalError> for VmError {
     }
 }
 
-/// Provisional host impl. The cutover plan replaces this with a
-/// switch-on-Inst Vm that drops the `Host` trait entirely; until
-/// every Inst has a Vm-native implementation we route the
-/// stdlib-resolvable shapes through a small host that does *not*
-/// call back into the tree walker.
-struct MinimalHost<'a> {
+/// IR Host implementation. Every method native to the new Vm lives
+/// here. Methods that have no native implementation yet raise
+/// `EvalError::Unimplemented` (carrying the surface name) so the
+/// failure surfaces are easy to identify and migrate one by one.
+struct VmHost<'a> {
     globals: Rc<RefCell<klio_runtime::Env>>,
     #[allow(dead_code)]
     module: Rc<klio_ir::Module>,
     scheduler: &'a mut dyn klio_runtime::Scheduler,
     out: &'a mut dyn Output,
+    #[allow(dead_code)]
+    instance_id_counter: &'a mut u64,
 }
 
-impl<'a> MinimalHost<'a> {
+impl<'a> VmHost<'a> {
     fn dispatch_intrinsic(
         &mut self,
         func: klio_runtime::StdlibFn,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        let mut intrinsic_host = MinimalIntrinsicHost {
+        let mut intrinsic_host = VmIntrinsicHost {
             scheduler: &mut *self.scheduler,
         };
         let mut ctx = klio_runtime::CallCtx {
@@ -116,7 +121,7 @@ impl<'a> MinimalHost<'a> {
     }
 }
 
-impl<'a> klio_ir::eval::Host for MinimalHost<'a> {
+impl<'a> klio_ir::eval::Host for VmHost<'a> {
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         self.globals.borrow().lookup(name)
     }
@@ -138,8 +143,8 @@ impl<'a> klio_ir::eval::Host for MinimalHost<'a> {
         if let klio_runtime::Value::Intrinsic { func, .. } = callee {
             return self.dispatch_intrinsic(*func, args);
         }
-        Err(klio_ir::eval::EvalError::Type(format!(
-            "klio-interp-ir Vm: call_value not yet implemented for `{}`",
+        Err(klio_ir::eval::EvalError::Unimplemented(format!(
+            "Vm::call_value on `{}`",
             callee.type_fqn()
         )))
     }
@@ -150,9 +155,6 @@ impl<'a> klio_ir::eval::Host for MinimalHost<'a> {
         args: &[klio_runtime::Value],
         _arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        // The Vm's stdlib intrinsics handle arg names internally; for
-        // the smoke-test surface (println etc.) positional dispatch is
-        // enough. Real named-arg routing lands later.
         self.call_value(callee, args)
     }
 
@@ -161,17 +163,13 @@ impl<'a> klio_ir::eval::Host for MinimalHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        // Plain-field read on a user-class instance — no custom
-        // getter, no delegate, no extension property. The accessor
-        // and delegate surfaces land with the property-accessor
-        // workstream; until then they raise Unimplemented.
         if let klio_runtime::Value::Instance(inst) = receiver {
             if let Some(v) = inst.borrow().get(name) {
                 return Ok(v);
             }
         }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
-            "klio-interp-ir Vm: get_field `{name}` on `{}`",
+            "Vm::get_field `{name}` on `{}`",
             receiver.type_fqn()
         )))
     }
@@ -187,20 +185,18 @@ impl<'a> klio_ir::eval::Host for MinimalHost<'a> {
             return Ok(());
         }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
-            "klio-interp-ir Vm: set_field `{name}` on `{}`",
+            "Vm::set_field `{name}` on `{}`",
             receiver.type_fqn()
         )))
     }
 }
 
-/// Stdlib `CallCtx` host adapter. Today it only implements the
-/// methods the `println` / `print` path needs; further Vm-native
-/// handlers land as features migrate.
-struct MinimalIntrinsicHost<'a> {
+/// Stdlib `CallCtx` host adapter for native Vm dispatch.
+struct VmIntrinsicHost<'a> {
     scheduler: &'a mut dyn klio_runtime::Scheduler,
 }
 
-impl<'a> klio_runtime::IntrinsicHost for MinimalIntrinsicHost<'a> {
+impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
     fn invoke_callable(
         &mut self,
         _callable: &klio_runtime::Value,
@@ -208,7 +204,7 @@ impl<'a> klio_runtime::IntrinsicHost for MinimalIntrinsicHost<'a> {
         _out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
         Err(klio_runtime::RuntimeError::Unimplemented(
-            "Vm invoke_callable".into(),
+            "Vm::invoke_callable".into(),
         ))
     }
 
@@ -220,7 +216,7 @@ impl<'a> klio_runtime::IntrinsicHost for MinimalIntrinsicHost<'a> {
         _out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
         Err(klio_runtime::RuntimeError::Unimplemented(
-            "Vm invoke_callable_with_this".into(),
+            "Vm::invoke_callable_with_this".into(),
         ))
     }
 
@@ -232,10 +228,9 @@ impl<'a> klio_runtime::IntrinsicHost for MinimalIntrinsicHost<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use klio_ir::{Const, Inst, Module, Reg, Terminator, TypeRef};
     use klio_ir::build::FuncBuilder;
+    use klio_ir::{Const, Inst, Module, Terminator, TypeRef};
 
-    /// Capture-to-string Output so the Vm's stdout can be asserted.
     #[derive(Default)]
     struct StringOut(String);
 
@@ -251,7 +246,6 @@ mod tests {
 
     #[test]
     fn vm_runs_simple_main_returns_const() {
-        // fun main(): Int = 42
         let mut module = Module::default();
         let mut b = FuncBuilder::new(&mut module);
         let r = b.emit_const(Const::Int(42));
@@ -264,7 +258,7 @@ mod tests {
         module.func_index.push(("main".into(), main_id));
         module.top_level.push(main_id);
 
-        let mut vm = Vm::new(std::rc::Rc::new(module));
+        let mut vm = Vm::new(Rc::new(module));
         let mut out = StringOut::default();
         let v = vm.run(main_id, &mut out).unwrap();
         match v {
@@ -275,16 +269,12 @@ mod tests {
 
     #[test]
     fn vm_runs_println_via_intrinsic() {
-        // fun main() { println("hello") }
         let mut module = Module::default();
         let mut b = FuncBuilder::new(&mut module);
-        // LoadGlobal "println" → reg `callee`
         let callee = b.alloc_reg();
         let nm = b.module.intern_const(Const::String("println".into()));
         b.push(Inst::LoadGlobal { dst: callee, name: nm });
-        // Const "hello" → reg `arg`
         let arg = b.emit_const(Const::String("hello".into()));
-        // CallValue(callee, [arg])
         let args_start = b.alloc_reg();
         b.push(Inst::Move { dst: args_start, src: arg });
         let dst = b.alloc_reg();
@@ -304,13 +294,9 @@ mod tests {
         module.func_index.push(("main".into(), main_id));
         module.top_level.push(main_id);
 
-        let mut vm = Vm::new(std::rc::Rc::new(module));
+        let mut vm = Vm::new(Rc::new(module));
         let mut out = StringOut::default();
         vm.run(main_id, &mut out).unwrap();
         assert_eq!(out.0, "hello\n");
     }
-
-    // Keep `Reg` referenced so the import doesn't dangle as builders
-    // grow over the workstream sequence.
-    fn _force_reg_import(_: Reg) {}
 }
