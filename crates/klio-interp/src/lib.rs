@@ -1446,18 +1446,37 @@ impl Interpreter {
                                 .first()
                                 .map(|i| i.name.clone())
                                 .unwrap_or_else(|| "value".into());
-                            if let klio_ast::FunctionBody::Expr(raw) = &setter.body {
-                                let body = substitute_field_with_this(&p.name.name, raw);
-                                let id = klio_ir::lower::lower_accessor_expr(
-                                    &mut module,
-                                    &c.name.name,
-                                    &own_members,
-                                    &["this", &param],
-                                    &body,
-                                    &format!("__set__{}.{}", c.name.name, p.name.name),
-                                );
+                            let prop_name = p.name.name.clone();
+                            let lowered_id = match &setter.body {
+                                klio_ast::FunctionBody::Expr(raw) => Some({
+                                    let body = substitute_field_with_this(&prop_name, raw);
+                                    klio_ir::lower::lower_accessor_expr(
+                                        &mut module,
+                                        &c.name.name,
+                                        &own_members,
+                                        &["this", &param],
+                                        &body,
+                                        &format!("__set__{}.{}", c.name.name, prop_name),
+                                    )
+                                }),
+                                klio_ast::FunctionBody::Block(blk) => Some({
+                                    let p2 = prop_name.clone();
+                                    let rewritten = rewrite_block(blk, &move |e| {
+                                        substitute_field_with_this(&p2, e)
+                                    });
+                                    klio_ir::lower::lower_accessor_block(
+                                        &mut module,
+                                        &c.name.name,
+                                        &own_members,
+                                        &["this", &param],
+                                        &rewritten,
+                                        &format!("__set__{}.{}", c.name.name, prop_name),
+                                    )
+                                }),
+                            };
+                            if let Some(id) = lowered_id {
                                 self.module_registry.class_ir.instance_prop_setters.insert(
-                                    (c.name.name.clone(), p.name.name.clone()),
+                                    (c.name.name.clone(), prop_name),
                                     id,
                                 );
                             }
