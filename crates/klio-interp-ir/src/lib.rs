@@ -2416,6 +2416,16 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Null-receiver `equals` — `a == null` with `a: T?` lowers
+        // through `equals`, which Kotlin returns `true` only when
+        // both sides are null. `null.equals(x)` ≡ `x == null`.
+        if matches!(receiver, klio_runtime::Value::Null) && name == "equals" && args.len() == 1
+        {
+            return Ok(klio_runtime::Value::Bool(matches!(
+                args[0],
+                klio_runtime::Value::Null
+            )));
+        }
         // SAM conversion: a callable (lambda / closure / function
         // ref) passed where a `fun interface` is expected accepts
         // any method call by forwarding to the underlying invoke.
