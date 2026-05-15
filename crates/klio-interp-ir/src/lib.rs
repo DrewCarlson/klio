@@ -2310,6 +2310,48 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => {}
             }
         }
+        // `r.contains(x)` on a Range — covers Int/Long/Char ranges
+        // used in `when` arms and `x in 'a'..'z'` checks.
+        if name == "contains" && args.len() == 1 {
+            if let klio_runtime::Value::Range { start, end, step, kind } = receiver {
+                let inside = match (&args[0], kind) {
+                    (klio_runtime::Value::Char(c), klio_runtime::RangeKind::Char) => {
+                        let cv = *c as i64;
+                        cv >= *start && cv <= *end && (cv - *start) % step == 0
+                    }
+                    _ => {
+                        if let Some(v) = args[0].as_i64() {
+                            v >= *start && v <= *end && (v - *start) % step == 0
+                        } else {
+                            false
+                        }
+                    }
+                };
+                return Ok(klio_runtime::Value::Bool(inside));
+            }
+        }
+        // `m.contains(key)` / `m.containsKey(key)` / `m.containsValue(v)` for Map.
+        if let klio_runtime::Value::Map { entries, .. } = receiver {
+            match (name, args.len()) {
+                ("contains" | "containsKey", 1) => {
+                    let needle = &args[0];
+                    let has = entries
+                        .borrow()
+                        .iter()
+                        .any(|(k, _)| klio_runtime::Value::structural_eq(k, needle));
+                    return Ok(klio_runtime::Value::Bool(has));
+                }
+                ("containsValue", 1) => {
+                    let needle = &args[0];
+                    let has = entries
+                        .borrow()
+                        .iter()
+                        .any(|(_, v)| klio_runtime::Value::structural_eq(v, needle));
+                    return Ok(klio_runtime::Value::Bool(has));
+                }
+                _ => {}
+            }
+        }
         // Generic Array → List conversion + a couple of frequently
         // used array-shape methods.
         if let klio_runtime::Value::Array { items, .. } = receiver {
