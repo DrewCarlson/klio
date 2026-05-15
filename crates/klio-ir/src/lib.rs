@@ -428,6 +428,13 @@ pub struct Param {
     pub name: String,
     pub ty: TypeRef,
     pub default: Option<BlockId>,
+    /// True when the primary-ctor param doubles as a class property
+    /// (`val name` / `var name` prefix on the param). The Vm uses
+    /// this flag to decide which primary args become instance
+    /// fields. Defaults to `false` so unrelated callers don't need
+    /// to migrate.
+    #[serde(default)]
+    pub is_property: bool,
 }
 
 /// Class declaration.

@@ -27,6 +27,11 @@ pub struct Vm {
     globals: Rc<RefCell<klio_runtime::Env>>,
     scheduler: Box<dyn klio_runtime::Scheduler>,
     instance_id_counter: u64,
+    /// Per-class runtime metadata produced by `build::build_module`.
+    /// The Vm uses these for instance allocation. As IR Class
+    /// expands to carry the full runtime shape this table shrinks
+    /// and eventually goes away.
+    classes: std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
 }
 
 impl Vm {
@@ -47,7 +52,18 @@ impl Vm {
             globals,
             scheduler: Box::new(klio_runtime::InProcessScheduler::new()),
             instance_id_counter: 0,
+            classes: std::collections::HashMap::new(),
         }
+    }
+
+    /// Build a Vm from a fully-prepared `build::BuiltModule`. The
+    /// recommended entry point for the driver — it carries both the
+    /// IR module and the synthesised runtime ClassDef table.
+    pub fn from_built(built: build::BuiltModule) -> (Self, Option<klio_ir::FuncId>) {
+        let main = built.main;
+        let mut vm = Self::new(built.module);
+        vm.classes = built.classes;
+        (vm, main)
     }
 
     /// Run the program's `main` function. Stdout is routed through
@@ -69,6 +85,7 @@ impl Vm {
             scheduler: &mut *self.scheduler,
             out,
             instance_id_counter: &mut self.instance_id_counter,
+            classes: &self.classes,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
     }
@@ -95,12 +112,11 @@ impl From<klio_ir::eval::EvalError> for VmError {
 /// failure surfaces are easy to identify and migrate one by one.
 struct VmHost<'a> {
     globals: Rc<RefCell<klio_runtime::Env>>,
-    #[allow(dead_code)]
     module: Rc<klio_ir::Module>,
     scheduler: &'a mut dyn klio_runtime::Scheduler,
     out: &'a mut dyn Output,
-    #[allow(dead_code)]
     instance_id_counter: &'a mut u64,
+    classes: &'a std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
 }
 
 impl<'a> VmHost<'a> {
@@ -188,6 +204,138 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             "Vm::set_field `{name}` on `{}`",
             receiver.type_fqn()
         )))
+    }
+
+    fn call_member(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+        args: &[klio_runtime::Value],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            // Look up an IR-lowered method by walking the IR Class
+            // for the receiver's runtime class. Each method FuncId
+            // names itself, so the simple-name match is enough for
+            // the trivial single-class case. Inherited methods land
+            // when supertype lookup migrates.
+            let class_name = inst.borrow().class.name.clone();
+            let ir_class = self
+                .module
+                .classes
+                .iter()
+                .find(|c| c.name == class_name)
+                .cloned();
+            if let Some(ir_class) = ir_class {
+                for fid in &ir_class.methods {
+                    let func = self.module.funcs.get(fid.0 as usize).cloned();
+                    if let Some(f) = func {
+                        if f.name == name {
+                            let mut all_args: Vec<klio_runtime::Value> =
+                                Vec::with_capacity(args.len() + 1);
+                            all_args.push(receiver.clone());
+                            all_args.extend_from_slice(args);
+                            let module = Rc::clone(&self.module);
+                            return klio_ir::eval::eval_with(&module, &f, all_args, self);
+                        }
+                    }
+                }
+            }
+        }
+        Err(klio_ir::eval::EvalError::Unimplemented(format!(
+            "Vm::call_member `{name}` on `{}`",
+            receiver.type_fqn()
+        )))
+    }
+
+    fn call_member_named(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+        args: &[klio_runtime::Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        self.call_member(receiver, name, args)
+    }
+
+    fn new_instance(
+        &mut self,
+        class: klio_ir::ClassId,
+        args: &[klio_runtime::Value],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let ir_class = self.module.classes.get(class.0 as usize).ok_or_else(|| {
+            klio_ir::eval::EvalError::Type(format!(
+                "Vm::new_instance: ClassId {} not found in module",
+                class.0
+            ))
+        })?;
+        let class_def = self.classes.get(&ir_class.name).cloned().ok_or_else(|| {
+            klio_ir::eval::EvalError::Unimplemented(format!(
+                "Vm::new_instance: no runtime ClassDef registered for `{}`",
+                ir_class.name
+            ))
+        })?;
+        if class_def.is_abstract {
+            return Err(klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
+                fqn: std::rc::Rc::new("kotlin.InstantiationError".to_string()),
+                message: Some(std::rc::Rc::new(format!(
+                    "Cannot create an instance of an abstract class: {}",
+                    class_def.name
+                ))),
+                cause: None,
+            }));
+        }
+        if class_def.is_interface {
+            return Err(klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
+                fqn: std::rc::Rc::new("kotlin.InstantiationError".to_string()),
+                message: Some(std::rc::Rc::new(format!(
+                    "Cannot create an instance of an interface: {}",
+                    class_def.name
+                ))),
+                cause: None,
+            }));
+        }
+        // Trivial primary-ctor shape: each primary param with
+        // `property = Some(...)` becomes an instance field. Init
+        // blocks, body properties, parent ctor chain, secondary
+        // ctors, and supertype delegates are not yet handled —
+        // those return Unimplemented so the failing surfaces are
+        // visible.
+        if !class_def.init_blocks.is_empty()
+            || !class_def.body_properties.is_empty()
+            || !class_def.parent_ctor_args.is_empty()
+            || !class_def.secondary_ctors.is_empty()
+            || !class_def.supertype_delegates.borrow().is_empty()
+        {
+            return Err(klio_ir::eval::EvalError::Unimplemented(format!(
+                "Vm::new_instance: non-trivial ctor for `{}` (init blocks / parent ctor / body inits not yet native)",
+                class_def.name
+            )));
+        }
+        let n_primary = class_def.primary_params.len();
+        if args.len() != n_primary {
+            return Err(klio_ir::eval::EvalError::Arity(format!(
+                "{}() expects {n_primary} args, got {}",
+                class_def.name,
+                args.len()
+            )));
+        }
+        *self.instance_id_counter += 1;
+        let identity = *self.instance_id_counter;
+        let mut fields: Vec<(String, klio_runtime::Value)> =
+            Vec::with_capacity(class_def.primary_params.len());
+        for (param, value) in class_def.primary_params.iter().zip(args.iter()) {
+            if param.property.is_some() {
+                fields.push((param.name.clone(), value.clone()));
+            }
+        }
+        let inst = std::rc::Rc::new(std::cell::RefCell::new(klio_runtime::InstanceData {
+            class: class_def,
+            fields,
+            outer: None,
+            identity,
+            native_state: None,
+        }));
+        Ok(klio_runtime::Value::Instance(inst))
     }
 }
 

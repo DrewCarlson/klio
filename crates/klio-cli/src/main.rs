@@ -1285,11 +1285,11 @@ fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let built = klio_interp_ir::build::build_module(&ast);
-    let Some(main_id) = built.main else {
+    let (mut vm, main) = klio_interp_ir::Vm::from_built(built);
+    let Some(main_id) = main else {
         eprintln!("error: no main function found");
         return ExitCode::FAILURE;
     };
-    let mut vm = klio_interp_ir::Vm::new(built.module);
     let mut stdout = klio_runtime::StdoutOutput;
     match vm.run(main_id, &mut stdout) {
         Ok(_) => ExitCode::SUCCESS,
