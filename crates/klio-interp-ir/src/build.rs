@@ -16,8 +16,112 @@ use std::rc::Rc;
 
 use std::cell::RefCell;
 
-use klio_ast::{Decl, KotlinFile};
+use klio_ast::{Decl, Expr, Ident, KotlinFile};
 use klio_runtime::{ClassDef, ClassParamDef, PropertyDef};
+
+/// Replace every bare `field` identifier in `expr` with
+/// `this.<prop_name>`. Used by accessor-body lowering so the IR
+/// thunk reads / writes the backing field on the receiver.
+fn substitute_field_with_this(prop_name: &str, expr: &Expr) -> Expr {
+    use klio_span::{FileId, Span};
+    let dummy = Span::new(FileId(0), 0, 0);
+    let mut out = expr.clone();
+    walk_field(&mut out, prop_name, dummy);
+    out
+}
+
+fn walk_field(e: &mut Expr, prop: &str, dummy: klio_span::Span) {
+    let mut replace = None;
+    if let Expr::Path { segments, .. } = e {
+        if segments.len() == 1 && segments[0].name == "field" {
+            replace = Some(Expr::Member {
+                receiver: Box::new(Expr::Path {
+                    segments: vec![Ident { name: "this".into(), span: dummy }],
+                    span: dummy,
+                }),
+                name: Ident { name: prop.to_string(), span: dummy },
+                safe: false,
+                span: dummy,
+            });
+        }
+    }
+    if let Some(r) = replace {
+        *e = r;
+        return;
+    }
+    match e {
+        Expr::Call { callee, args, .. } => {
+            walk_field(callee, prop, dummy);
+            for a in args {
+                walk_field(a, prop, dummy);
+            }
+        }
+        Expr::Member { receiver, .. } => walk_field(receiver, prop, dummy),
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_field(lhs, prop, dummy);
+            walk_field(rhs, prop, dummy);
+        }
+        Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => walk_field(expr, prop, dummy),
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            walk_field(cond, prop, dummy);
+            walk_field(then_branch, prop, dummy);
+            if let Some(e) = else_branch.as_deref_mut() {
+                walk_field(e, prop, dummy);
+            }
+        }
+        Expr::Index { receiver, args, .. } => {
+            walk_field(receiver, prop, dummy);
+            for a in args {
+                walk_field(a, prop, dummy);
+            }
+        }
+        Expr::Block(b) => {
+            for s in &mut b.stmts {
+                match s {
+                    klio_ast::Stmt::Expr(e) => walk_field(e, prop, dummy),
+                    klio_ast::Stmt::Assign { target, value, .. } => {
+                        walk_field(target, prop, dummy);
+                        walk_field(value, prop, dummy);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Expr::StringTemplate { parts, .. } => {
+            for p in parts {
+                if let klio_ast::StringPart::Interp(e) = p {
+                    walk_field(e, prop, dummy);
+                }
+            }
+        }
+        Expr::Return { value, .. } => {
+            if let Some(v) = value.as_deref_mut() {
+                walk_field(v, prop, dummy);
+            }
+        }
+        Expr::Throw { value, .. } => walk_field(value, prop, dummy),
+        Expr::IsCheck { expr, .. } | Expr::As { expr, .. } => walk_field(expr, prop, dummy),
+        Expr::Spread { expr, .. } => walk_field(expr, prop, dummy),
+        _ => {}
+    }
+}
+
+fn rewrite_block_field(block: &klio_ast::Block, prop: &str) -> klio_ast::Block {
+    use klio_span::{FileId, Span};
+    let dummy = Span::new(FileId(0), 0, 0);
+    let mut out = block.clone();
+    for s in &mut out.stmts {
+        match s {
+            klio_ast::Stmt::Expr(e) => walk_field(e, prop, dummy),
+            klio_ast::Stmt::Assign { target, value, .. } => {
+                walk_field(target, prop, dummy);
+                walk_field(value, prop, dummy);
+            }
+            _ => {}
+        }
+    }
+    out
+}
 
 /// Result of building an IR module from a single Kotlin file.
 pub struct BuiltModule {
@@ -160,26 +264,29 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                     }
                     if let Some(getter) = &p.getter {
                         let fid = match &getter.body {
-                            klio_ast::FunctionBody::Expr(body) => Some(
-                                klio_ir::lower::lower_accessor_expr(
+                            klio_ast::FunctionBody::Expr(body) => {
+                                let rewritten =
+                                    substitute_field_with_this(&p.name.name, body);
+                                Some(klio_ir::lower::lower_accessor_expr(
                                     &mut module,
                                     &c.name.name,
                                     &own_members,
                                     &["this"],
-                                    body,
+                                    &rewritten,
                                     &format!("__get_{}_{}", c.name.name, p.name.name),
-                                ),
-                            ),
-                            klio_ast::FunctionBody::Block(blk) => Some(
-                                klio_ir::lower::lower_accessor_block(
+                                ))
+                            }
+                            klio_ast::FunctionBody::Block(blk) => {
+                                let rewritten = rewrite_block_field(blk, &p.name.name);
+                                Some(klio_ir::lower::lower_accessor_block(
                                     &mut module,
                                     &c.name.name,
                                     &own_members,
                                     &["this"],
-                                    blk,
+                                    &rewritten,
                                     &format!("__get_{}_{}", c.name.name, p.name.name),
-                                ),
-                            ),
+                                ))
+                            }
                         };
                         if let Some(fid) = fid {
                             instance_prop_getters
