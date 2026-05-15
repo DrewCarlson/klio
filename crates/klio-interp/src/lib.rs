@@ -226,6 +226,13 @@ pub struct Interpreter {
     /// directly, preventing infinite recursion when the IR host's
     /// call_member fallback routes back into this helper.
     pub(crate) dispatch_member_via_ast_depth: usize,
+    /// Set of (instance identity, property name) tuples currently
+    /// executing inside their custom getter. Reads against this key
+    /// short-circuit through the raw backing field so a body like
+    /// `get() = field` (which lowers to `this.<prop>`) doesn't
+    /// re-enter the same getter. Setters use the same key to avoid
+    /// re-entering their setter when assigning through `field`.
+    pub(crate) accessor_in_progress: std::collections::HashSet<(u64, String)>,
 }
 
 /// Read-only view over the interpreter's registry surface — the set
@@ -424,6 +431,7 @@ impl Interpreter {
             pack_implicit_packages: Vec::new(),
             pack_known_packages: std::collections::HashSet::new(),
             dispatch_member_via_ast_depth: 0,
+            accessor_in_progress: std::collections::HashSet::new(),
         }
     }
 
@@ -14970,16 +14978,32 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // expression-form custom getter lowered to its own FuncId.
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
+            let identity = inst.borrow().identity;
             let key = (class_name, name.to_string());
-            if let Some(fid) = self.interp.module_registry.class_ir.instance_prop_getters.get(&key).copied() {
-                let module = std::rc::Rc::clone(&self.module);
-                let func = module.funcs[fid.0 as usize].clone();
-                return klio_ir::eval::eval_with(
-                    &module,
-                    &func,
-                    vec![receiver.clone()],
-                    self,
-                );
+            let in_progress_key = (identity, name.to_string());
+            if !self.interp.accessor_in_progress.contains(&in_progress_key) {
+                if let Some(fid) = self
+                    .interp
+                    .module_registry
+                    .class_ir
+                    .instance_prop_getters
+                    .get(&key)
+                    .copied()
+                {
+                    let module = std::rc::Rc::clone(&self.module);
+                    let func = module.funcs[fid.0 as usize].clone();
+                    self.interp
+                        .accessor_in_progress
+                        .insert(in_progress_key.clone());
+                    let result = klio_ir::eval::eval_with(
+                        &module,
+                        &func,
+                        vec![receiver.clone()],
+                        self,
+                    );
+                    self.interp.accessor_in_progress.remove(&in_progress_key);
+                    return result;
+                }
             }
         }
         // IR-native fast-path: when the receiver is a user-class
@@ -15278,17 +15302,33 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // 2-arg FuncId taking `this` and the new value.
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
+            let identity = inst.borrow().identity;
             let key = (class_name, name.to_string());
-            if let Some(fid) = self.interp.module_registry.class_ir.instance_prop_setters.get(&key).copied() {
-                let module = std::rc::Rc::clone(&self.module);
-                let func = module.funcs[fid.0 as usize].clone();
-                klio_ir::eval::eval_with(
-                    &module,
-                    &func,
-                    vec![receiver.clone(), value],
-                    self,
-                )?;
-                return Ok(());
+            let in_progress_key = (identity, name.to_string());
+            if !self.interp.accessor_in_progress.contains(&in_progress_key) {
+                if let Some(fid) = self
+                    .interp
+                    .module_registry
+                    .class_ir
+                    .instance_prop_setters
+                    .get(&key)
+                    .copied()
+                {
+                    let module = std::rc::Rc::clone(&self.module);
+                    let func = module.funcs[fid.0 as usize].clone();
+                    self.interp
+                        .accessor_in_progress
+                        .insert(in_progress_key.clone());
+                    let result = klio_ir::eval::eval_with(
+                        &module,
+                        &func,
+                        vec![receiver.clone(), value],
+                        self,
+                    );
+                    self.interp.accessor_in_progress.remove(&in_progress_key);
+                    result?;
+                    return Ok(());
+                }
             }
         }
         // Class-side property write through the companion object
