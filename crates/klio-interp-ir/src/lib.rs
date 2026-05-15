@@ -251,6 +251,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return Ok(v);
             }
         }
+        // Stdlib property read on a built-in type — `"abc".length`,
+        // `arr.size`, etc. The stdlib registers these as 1-arg
+        // intrinsics that take the receiver as their sole arg.
+        let type_fqn = receiver.type_fqn();
+        let probes = [
+            format!("{type_fqn}.{name}"),
+            format!("kotlin.collections.{name}"),
+            format!("kotlin.text.{name}"),
+            format!("kotlin.{name}"),
+        ];
+        for probe in &probes {
+            if let Some(func) = klio_stdlib::implementation(probe) {
+                let args = [receiver.clone()];
+                return self.dispatch_intrinsic(func, &args);
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::get_field `{name}` on `{}`",
             receiver.type_fqn()
