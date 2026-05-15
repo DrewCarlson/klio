@@ -14182,6 +14182,33 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Built-in delegate values (`lazy`, `Delegates.observable`,
+        // `Delegates.notNull`) carry their state in a runtime
+        // DelegateKind. `getValue` / `setValue` route through
+        // call_builtin_delegate_get / _set rather than a method walk.
+        if let klio_runtime::Value::Delegate(d) = receiver {
+            if name == "getValue" {
+                let prop = args.get(1).cloned().unwrap_or(klio_runtime::Value::Null);
+                let env = std::rc::Rc::new(std::cell::RefCell::new(
+                    klio_runtime::Env::with_parent(std::rc::Rc::clone(&self.interp.globals)),
+                ));
+                return self
+                    .interp
+                    .call_builtin_delegate_get(d, &prop, &env, self.out)
+                    .map_err(ir_err);
+            }
+            if name == "setValue" {
+                let prop = args.get(1).cloned().unwrap_or(klio_runtime::Value::Null);
+                let new_v = args.get(2).cloned().unwrap_or(klio_runtime::Value::Null);
+                let env = std::rc::Rc::new(std::cell::RefCell::new(
+                    klio_runtime::Env::with_parent(std::rc::Rc::clone(&self.interp.globals)),
+                ));
+                self.interp
+                    .call_builtin_delegate_set(d, &prop, new_v, &env, self.out)
+                    .map_err(ir_err)?;
+                return Ok(klio_runtime::Value::Unit);
+            }
+        }
         // IR-native instance method dispatch: when the receiver is
         // a user-class instance whose class has an IR-lowered
         // method matching `name`, call its FuncId directly through
