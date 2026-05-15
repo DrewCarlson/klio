@@ -1091,7 +1091,12 @@ impl Interpreter {
             Err(klio_ir::eval::EvalError::Throw(v)) => Some(Err(RuntimeError::Thrown(v))),
             Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => Some(Ok(v)),
             Err(klio_ir::eval::EvalError::Arity(s)) => Some(Err(RuntimeError::Arity(s))),
-            Err(klio_ir::eval::EvalError::Unbound(s)) => Some(Err(RuntimeError::Unbound(s))),
+            // An Unbound name from the thunk-lowering may actually be a
+            // local in the caller's env (e.g. `it` inside a lambda body,
+            // a tree-walker-local var). Surface as a fallback rather
+            // than a hard error so the tree walker re-resolves through
+            // the live env chain.
+            Err(klio_ir::eval::EvalError::Unbound(_)) => None,
             Err(klio_ir::eval::EvalError::Unimplemented(s)) => {
                 Some(Err(RuntimeError::Unimplemented(s)))
             }
