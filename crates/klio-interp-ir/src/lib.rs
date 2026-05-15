@@ -2638,6 +2638,60 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         chain.push((ir_class.name.clone(), args.to_vec()));
         let mut cur_class = ir_class.name.clone();
         let mut cur_args: Vec<klio_runtime::Value> = args.to_vec();
+        // Throwable-style parent ctor handling: when this class
+        // extends a built-in `RuntimeException`/`Throwable`/etc.
+        // (no user ClassDef registered), evaluate the parent-ctor
+        // arg thunks once and bind `message`/`cause` on the
+        // instance so user-visible `e.message` works.
+        let mut throwable_message: Option<klio_runtime::Value> = None;
+        let mut throwable_cause: Option<klio_runtime::Value> = None;
+        {
+            let cur_def = self.classes.borrow().get(&cur_class).cloned();
+            let parent_name = cur_def
+                .as_ref()
+                .and_then(|d| d.supertype_names.first().cloned());
+            if let Some(pname) = parent_name {
+                let is_throwable_name = matches!(
+                    pname.as_str(),
+                    "Throwable"
+                        | "Exception"
+                        | "RuntimeException"
+                        | "Error"
+                        | "IllegalArgumentException"
+                        | "IllegalStateException"
+                        | "IndexOutOfBoundsException"
+                        | "NullPointerException"
+                        | "ClassCastException"
+                        | "ArithmeticException"
+                        | "NumberFormatException"
+                        | "NoSuchElementException"
+                        | "ConcurrentModificationException"
+                        | "UnsupportedOperationException"
+                );
+                let parent_def = self.classes.borrow().get(&pname).cloned();
+                if is_throwable_name && parent_def.is_none() {
+                    if let Some(thunks) = self.parent_ctor_args.get(&cur_class).cloned() {
+                        for (idx, fid) in thunks.iter().enumerate() {
+                            if let Some(func) =
+                                self.module.funcs.get(fid.0 as usize).cloned()
+                            {
+                                let v = klio_ir::eval::eval_with(
+                                    &Rc::clone(&self.module),
+                                    &func,
+                                    cur_args.clone(),
+                                    self,
+                                )?;
+                                match idx {
+                                    0 => throwable_message = Some(v),
+                                    1 => throwable_cause = Some(v),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         while let Some(thunks) = self.parent_ctor_args.get(&cur_class).cloned() {
             let cur_def = self.classes.borrow().get(&cur_class).cloned();
             let parent_name = cur_def
@@ -2691,6 +2745,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             native_state: None,
         }));
         let inst_value = klio_runtime::Value::Instance(std::rc::Rc::clone(&inst));
+        if let Some(m) = throwable_message.clone() {
+            inst.borrow_mut().fields.push(("message".to_string(), m));
+        }
+        if let Some(c) = throwable_cause.clone() {
+            inst.borrow_mut().fields.push(("cause".to_string(), c));
+        }
         // Body properties: walk each class in the parent chain so a
         // subclass instance also picks up the parent's `var/val`
         // body properties. Each init thunk runs with
