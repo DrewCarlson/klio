@@ -88,6 +88,13 @@ pub struct Vm {
     /// Inner class → outer class name. Used to walk enclosing
     /// chains for nested-companion field reads.
     enclosing_class: std::collections::HashMap<String, String>,
+    /// Default outer instance to attach to locally-registered
+    /// classes. `register_class_captured` snapshots `this` when
+    /// the local class is declared inside a method body so the
+    /// resulting Local() instances can resolve `this@Outer` and
+    /// outer-field reads through `inst.outer`.
+    class_default_outer:
+        Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     /// Runtime-lowered method bodies for anonymous-object / local
     /// classes, indexed by `(class name, method name) -> (Module, FuncId)`.
     /// The IR module is immutable after build, so methods declared
@@ -154,6 +161,7 @@ impl Vm {
             class_delegates: std::collections::HashMap::new(),
             func_defaults: std::collections::HashMap::new(),
             enclosing_class: std::collections::HashMap::new(),
+            class_default_outer: Rc::new(RefCell::new(std::collections::HashMap::new())),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
         }
@@ -220,6 +228,7 @@ impl Vm {
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
                     enclosing_class: &self.enclosing_class,
+                    class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
                 klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -275,6 +284,7 @@ impl Vm {
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
                     enclosing_class: &self.enclosing_class,
+                    class_default_outer: Rc::clone(&self.class_default_outer),
                         closures: &mut self.closures,
                     };
                     klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -317,6 +327,7 @@ impl Vm {
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
                     enclosing_class: &self.enclosing_class,
+                    class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
                 <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
@@ -362,6 +373,7 @@ impl Vm {
             class_delegates: &self.class_delegates,
             func_defaults: &self.func_defaults,
             enclosing_class: &self.enclosing_class,
+            class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
@@ -430,6 +442,8 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     enclosing_class:
         &'a std::collections::HashMap<String, String>,
+    class_default_outer:
+        Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     closures: &'a mut Vec<ClosureInfo>,
 }
 
@@ -693,6 +707,7 @@ impl<'a> VmHost<'a> {
             class_delegates: self.class_delegates,
             func_defaults: self.func_defaults,
             enclosing_class: self.enclosing_class,
+            class_default_outer: Rc::clone(&self.class_default_outer),
             instance_id_counter: &mut *self.instance_id_counter,
         };
         let mut ctx = klio_runtime::CallCtx {
@@ -1660,6 +1675,18 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         captures: Vec<klio_runtime::Value>,
     ) -> Result<(), klio_ir::eval::EvalError> {
         self.register_class(class)?;
+        // Snapshot `this` from the captured outer env (when
+        // present) so instances of this local class get an `outer`
+        // pointing back at the enclosing scope's receiver.
+        if let Some(this_idx) =
+            captured_names.iter().position(|n| n == "this")
+        {
+            if let Some(this_val) = captures.get(this_idx).cloned() {
+                self.class_default_outer
+                    .borrow_mut()
+                    .insert(class.name.name.clone(), this_val);
+            }
+        }
         // Patch the just-registered method entries with the captured
         // outer-env so dispatch can layer them under globals.
         let capture_pairs: Vec<(String, klio_runtime::Value)> = captured_names
@@ -3526,6 +3553,16 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             native_state: None,
         }));
         let inst_value = klio_runtime::Value::Instance(std::rc::Rc::clone(&inst));
+        // Attach a stored default-outer if the class was
+        // registered inside a method body via Inst::RegisterClass —
+        // lets `this@Outer.X` and outer-field reads resolve.
+        if inst.borrow().outer.is_none() {
+            if let Some(default_outer) =
+                self.class_default_outer.borrow().get(&class_def.name).cloned()
+            {
+                inst.borrow_mut().outer = Some(default_outer);
+            }
+        }
         // Evaluate class-delegation expressions (`: I by g`) and
         // store the resulting delegate values on the instance
         // under `__delegate__<superName>` so call_member can
@@ -3773,6 +3810,8 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     enclosing_class:
         &'a std::collections::HashMap<String, String>,
+    class_default_outer:
+        Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     instance_id_counter: &'a mut u64,
 }
 
@@ -3837,6 +3876,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     class_delegates: self.class_delegates,
                     func_defaults: self.func_defaults,
                     enclosing_class: self.enclosing_class,
+                    class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut *self.closures,
                 };
                 klio_ir::eval::eval_with_captures(
@@ -3882,6 +3922,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 class_delegates: self.class_delegates,
                 func_defaults: self.func_defaults,
                 enclosing_class: self.enclosing_class,
+                class_default_outer: Rc::clone(&self.class_default_outer),
                 instance_id_counter: &mut *self.instance_id_counter,
             };
             let mut ctx = klio_runtime::CallCtx {
