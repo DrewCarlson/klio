@@ -14,10 +14,31 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use klio_interp::{CaptureOutput, Interpreter};
+use klio_interp_ir::build::build_module;
+use klio_interp_ir::Vm;
 use klio_lexer::Lexer;
 use klio_parser::Parser as KtParser;
 use klio_span::SourceMap;
+
+/// Stdout sink that captures every `println` line for parity diffing.
+#[derive(Default)]
+struct CaptureOutput {
+    lines: Vec<String>,
+    cur: String,
+}
+impl klio_runtime::Output for CaptureOutput {
+    fn write(&mut self, s: &str) {
+        self.cur.push_str(s);
+        while let Some(idx) = self.cur.find('\n') {
+            let line: String = self.cur.drain(..=idx).collect();
+            self.lines.push(line.trim_end_matches('\n').to_string());
+        }
+    }
+    fn writeln(&mut self, s: &str) {
+        self.write(s);
+        self.write("\n");
+    }
+}
 
 #[derive(Debug)]
 pub struct ParityReport {
@@ -835,11 +856,17 @@ pub fn run_with_ktc(file: &Path) -> Result<String, String> {
     }
     let mut out = CaptureOutput::default();
     let r = klio_resolver::resolve(&ast);
-    let tc = klio_typeck::typecheck(&ast, &r);
-    Interpreter::new()
-        .with_expr_types(tc.types.clone())
-        .run_with_output(&ast, &mut out)
-        .map_err(|e| format!("runtime error: {e}"))?;
+    let _ = klio_typeck::typecheck(&ast, &r);
+    let built = build_module(&ast);
+    let Some(main_id) = built.main else {
+        return Err("no main function in module".into());
+    };
+    let (mut vm, _main) = Vm::from_built(built);
+    vm.run(main_id, &mut out).map_err(|e| format!("runtime error: {e}"))?;
+    if !out.cur.is_empty() {
+        let trailing = std::mem::take(&mut out.cur);
+        out.lines.push(trailing);
+    }
     let mut joined = out.lines.join("\n");
     if !joined.is_empty() {
         joined.push('\n');

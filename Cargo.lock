@@ -1023,7 +1023,7 @@ dependencies = [
 name = "klio-parity"
 version = "0.1.0"
 dependencies = [
- "klio-interp",
+ "klio-interp-ir",
  "klio-lexer",
  "klio-parser",
  "klio-resolver",
