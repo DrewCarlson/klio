@@ -1397,6 +1397,32 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return klio_ir::eval::eval_with(&module, &func, vec![receiver.clone()], self);
             }
             if let Some(v) = inst.borrow().get(name) {
+                // `lateinit var x: T` reads before the first write
+                // throw `UninitializedPropertyAccessException` per
+                // Kotlin semantics. The body-property's lateinit
+                // flag pre-seeded the slot with Null.
+                if matches!(v, klio_runtime::Value::Null) {
+                    let is_lateinit = inst
+                        .borrow()
+                        .class
+                        .body_properties
+                        .iter()
+                        .any(|p| p.name == name && p.is_lateinit);
+                    if is_lateinit {
+                        return Err(klio_ir::eval::EvalError::Throw(
+                            klio_runtime::Value::Exception {
+                                fqn: Rc::new(
+                                    "kotlin.UninitializedPropertyAccessException"
+                                        .to_string(),
+                                ),
+                                message: Some(Rc::new(format!(
+                                    "lateinit property {name} has not been initialized"
+                                ))),
+                                cause: None,
+                            },
+                        ));
+                    }
+                }
                 // Auto-unwrap instance-level delegates so
                 // `val x by lazy { … }` reads return the resolved
                 // value rather than the Delegate wrapper.
@@ -2342,7 +2368,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     | ("NoSuchElementException", "RuntimeException")
                     | ("NumberFormatException", "RuntimeException")
                     | ("UnsupportedOperationException", "RuntimeException")
+                    | ("UninitializedPropertyAccessException", "RuntimeException")
+                    | ("ConcurrentModificationException", "RuntimeException")
+                    | ("NoWhenBranchMatchedException", "RuntimeException")
+                    | ("AssertionError", "Error")
                     | ("RuntimeException", "Exception")
+                    | ("Error", "Throwable")
+                    | ("Exception", "Throwable")
             ) {
                 return true;
             }
