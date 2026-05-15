@@ -2183,6 +2183,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Nested-class construction on a class receiver:
+        // `Container.Nested(args)` or `Sealed.Variant(args)` — look
+        // up the named class in the module table and construct.
+        if let klio_runtime::Value::Class(_) = receiver {
+            if let Some(class_id) = self.module.class_id(name) {
+                return <Self as klio_ir::eval::Host>::new_instance(self, class_id, args);
+            }
+        }
         // Companion forwarding for method calls: `Foo.parse("…")`
         // routes through the companion singleton's method.
         if let klio_runtime::Value::Class(cls) = receiver {
