@@ -223,6 +223,10 @@ pub struct BuiltModule {
     /// order. The Vm allocates one instance per name at startup and
     /// publishes it as a global so bare-name `Foo` reads resolve.
     pub object_names: Vec<String>,
+    /// Outer-class name → synthesised companion singleton global
+    /// name. `Foo.PI` routes through `companion_singletons["Foo"]`'s
+    /// instance's `PI` field.
+    pub companion_singletons: std::collections::HashMap<String, String>,
 }
 
 /// Lower a single file's declarations into an IR module. Classes are
@@ -242,12 +246,51 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // supertypes, accessors). A separate `object_names` list tells
     // the Vm to allocate one instance per object at startup.
     let mut object_names: Vec<String> = Vec::new();
+    let mut companion_singletons: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut all_decls: Vec<Decl> = Vec::with_capacity(file.decls.len());
     for d in &file.decls {
         match d {
             Decl::Object(o) => {
                 object_names.push(o.name.name.clone());
                 all_decls.push(Decl::Class(synthesize_class_from_object(o)));
+            }
+            Decl::Class(c) => {
+                // Lift companion objects out of the class body and
+                // synthesise them as standalone classes + singletons.
+                // A reverse map (outer → companion singleton name)
+                // lets the Vm route `Foo.member` reads/writes through
+                // the companion instance.
+                for m in &c.members {
+                    if let Decl::Object(co) = m {
+                        let comp_name = format!("{}$Companion${}", c.name.name, co.name.name);
+                        let mut renamed = co.clone();
+                        renamed.name = klio_ast::Ident {
+                            name: comp_name.clone(),
+                            span: co.name.span,
+                        };
+                        object_names.push(comp_name.clone());
+                        all_decls.push(Decl::Class(synthesize_class_from_object(&renamed)));
+                        companion_singletons.insert(c.name.name.clone(), comp_name);
+                    } else if let Decl::Class(nested) = m {
+                        if nested.is_companion {
+                            let comp_name =
+                                format!("{}$Companion${}", c.name.name, nested.name.name);
+                            let mut renamed = nested.clone();
+                            renamed.name = klio_ast::Ident {
+                                name: comp_name.clone(),
+                                span: nested.name.span,
+                            };
+                            renamed.is_companion = false;
+                            // Companion instances behave like
+                            // singletons — register one global.
+                            object_names.push(comp_name.clone());
+                            all_decls.push(Decl::Class(renamed));
+                            companion_singletons.insert(c.name.name.clone(), comp_name);
+                        }
+                    }
+                }
+                all_decls.push(d.clone());
             }
             other => all_decls.push(other.clone()),
         }
@@ -738,5 +781,6 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         extension_props,
         main: main_id,
         object_names,
+        companion_singletons,
     }
 }

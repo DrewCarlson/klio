@@ -70,6 +70,10 @@ pub struct Vm {
     /// `classes`) and inserts it into globals so bare-name `Foo`
     /// references resolve.
     object_names: Vec<String>,
+    /// Outer-class → companion singleton global name. Vm get_field /
+    /// set_field on a `Value::Class` falls back to the companion
+    /// instance's field when the name isn't on the class itself.
+    companion_singletons: std::collections::HashMap<String, String>,
     /// Runtime-lowered method bodies for anonymous-object / local
     /// classes, indexed by `(class name, method name) -> (Module, FuncId)`.
     /// The IR module is immutable after build, so methods declared
@@ -130,6 +134,7 @@ impl Vm {
             extension_props: std::collections::HashMap::new(),
             top_level_props: Vec::new(),
             object_names: Vec::new(),
+            companion_singletons: std::collections::HashMap::new(),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
         }
@@ -150,6 +155,7 @@ impl Vm {
         vm.extension_props = built.extension_props;
         vm.top_level_props = built.top_level_props;
         vm.object_names = built.object_names;
+        vm.companion_singletons = built.companion_singletons;
         (vm, main)
     }
 
@@ -185,6 +191,7 @@ impl Vm {
                     init_blocks: &self.init_blocks,
                     extension_props: &self.extension_props,
                     anon_methods: Rc::clone(&self.anon_methods),
+                    companion_singletons: &self.companion_singletons,
                     closures: &mut self.closures,
                 };
                 klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -219,6 +226,7 @@ impl Vm {
                     init_blocks: &self.init_blocks,
                     extension_props: &self.extension_props,
                     anon_methods: Rc::clone(&self.anon_methods),
+                    companion_singletons: &self.companion_singletons,
                     closures: &mut self.closures,
                 };
                 <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
@@ -245,6 +253,7 @@ impl Vm {
             init_blocks: &self.init_blocks,
             extension_props: &self.extension_props,
             anon_methods: Rc::clone(&self.anon_methods),
+            companion_singletons: &self.companion_singletons,
             closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
@@ -292,6 +301,7 @@ struct VmHost<'a> {
         (String, String),
         (Rc<klio_ir::Module>, klio_ir::FuncId),
     >>>,
+    companion_singletons: &'a std::collections::HashMap<String, String>,
     closures: &'a mut Vec<ClosureInfo>,
 }
 
@@ -320,6 +330,7 @@ impl<'a> VmHost<'a> {
             init_blocks: self.init_blocks,
             extension_props: self.extension_props,
             anon_methods: Rc::clone(&self.anon_methods),
+            companion_singletons: self.companion_singletons,
             instance_id_counter: &mut *self.instance_id_counter,
         };
         let mut ctx = klio_runtime::CallCtx {
@@ -563,6 +574,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Companion-object forwarding: `Foo.PI` reads `PI` from the
+        // companion singleton when the receiver is the user class.
+        // Enum entries (`Color.RED`) take precedence above; reaching
+        // here means the name isn't an entry.
+        if let klio_runtime::Value::Class(cls) = receiver {
+            if let Some(comp_name) = self.companion_singletons.get(&cls.name).cloned() {
+                if let Some(singleton) = self.globals.borrow().lookup(&comp_name) {
+                    if let klio_runtime::Value::Instance(inst) = &singleton {
+                        if let Some(v) = inst.borrow().get(name) {
+                            return Ok(v);
+                        }
+                    }
+                }
+            }
+        }
         // Top-level extension property: `val T.name get() = ...`
         // — keyed by (receiver simple type, prop name). Falls
         // through to the standard lookup chain when the user
@@ -708,6 +734,18 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         value: klio_runtime::Value,
     ) -> Result<(), klio_ir::eval::EvalError> {
+        // Companion forwarding for writes: `Foo.count = 1` routes
+        // to the companion singleton instance's field.
+        if let klio_runtime::Value::Class(cls) = receiver {
+            if let Some(comp_name) = self.companion_singletons.get(&cls.name).cloned() {
+                let singleton = self.globals.borrow().lookup(&comp_name);
+                if let Some(singleton) = singleton {
+                    if let klio_runtime::Value::Instance(_) = &singleton {
+                        return self.set_field(&singleton, name, value);
+                    }
+                }
+            }
+        }
         let bypass_setter = name.starts_with("__klio_field__");
         let real_name = name.strip_prefix("__klio_field__").unwrap_or(name);
         if let klio_runtime::Value::Instance(inst) = receiver {
@@ -1344,6 +1382,62 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     });
                 }
                 _ => {}
+            }
+        }
+        // Companion forwarding for method calls: `Foo.parse("…")`
+        // routes through the companion singleton's method.
+        if let klio_runtime::Value::Class(cls) = receiver {
+            if let Some(comp_name) = self.companion_singletons.get(&cls.name).cloned() {
+                let singleton = self.globals.borrow().lookup(&comp_name);
+                if let Some(singleton) = singleton {
+                    if matches!(singleton, klio_runtime::Value::Instance(_)) {
+                        // Try the companion instance first; on
+                        // unimplemented fall through so error sites
+                        // still see the class receiver.
+                        if let Ok(v) = self.call_member(&singleton, name, args) {
+                            return Ok(v);
+                        }
+                    }
+                }
+            }
+            // Enum.values() — synthesise the entries list from the class.
+            if cls.is_enum && (name == "values") && args.is_empty() {
+                let items: Vec<klio_runtime::Value> = cls
+                    .enum_entries
+                    .borrow()
+                    .iter()
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                return Ok(klio_runtime::Value::List {
+                    items: Rc::new(RefCell::new(items)),
+                    mutable: false,
+                    enum_class: Some(Rc::new(cls.name.clone())),
+                });
+            }
+            // Enum.valueOf("X") — find entry by name.
+            if cls.is_enum && name == "valueOf" && args.len() == 1 {
+                if let klio_runtime::Value::String(s) = &args[0] {
+                    if let Some((_, v)) = cls
+                        .enum_entries
+                        .borrow()
+                        .iter()
+                        .find(|(n, _)| n == s.as_str())
+                    {
+                        return Ok(v.clone());
+                    }
+                    return Err(klio_ir::eval::EvalError::Throw(
+                        klio_runtime::Value::Exception {
+                            fqn: std::rc::Rc::new(
+                                "kotlin.IllegalArgumentException".to_string(),
+                            ),
+                            message: Some(std::rc::Rc::new(format!(
+                                "No enum constant {}.{}",
+                                cls.name, s
+                            ))),
+                            cause: None,
+                        },
+                    ));
+                }
             }
         }
         // Comparator chaining + reversal.
@@ -2056,6 +2150,7 @@ struct VmIntrinsicHost<'a> {
         (String, String),
         (Rc<klio_ir::Module>, klio_ir::FuncId),
     >>>,
+    companion_singletons: &'a std::collections::HashMap<String, String>,
     instance_id_counter: &'a mut u64,
 }
 
@@ -2115,6 +2210,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             init_blocks: self.init_blocks,
             extension_props: self.extension_props,
             anon_methods: Rc::clone(&self.anon_methods),
+                    companion_singletons: self.companion_singletons,
                     closures: &mut *self.closures,
                 };
                 klio_ir::eval::eval_with_captures(
@@ -2155,6 +2251,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             init_blocks: self.init_blocks,
             extension_props: self.extension_props,
             anon_methods: Rc::clone(&self.anon_methods),
+                companion_singletons: self.companion_singletons,
                 instance_id_counter: &mut *self.instance_id_counter,
             };
             let mut ctx = klio_runtime::CallCtx {
