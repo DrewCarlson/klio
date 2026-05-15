@@ -567,6 +567,21 @@ pub fn lower_class_with_file(
     c: &klio_ast::Class,
     file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
 ) -> crate::ClassId {
+    lower_class_with_extras(module, c, file_classes, &std::collections::HashSet::new())
+}
+
+/// Same as `lower_class_with_file` but mixes an additional set of
+/// member names into the class's `own_members`. Used when a nested
+/// class is lifted to top level: the outer's property + method
+/// names are added so bare references inside the inner's body
+/// lower as `this.X` (resolved against the captured outer at
+/// runtime) instead of `LoadGlobal(X)`.
+pub fn lower_class_with_extras(
+    module: &mut crate::Module,
+    c: &klio_ast::Class,
+    file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
+    extra_members: &std::collections::HashSet<String>,
+) -> crate::ClassId {
     let primary_params: Vec<crate::Param> = c
         .primary_params
         .iter()
@@ -593,8 +608,7 @@ pub fn lower_class_with_file(
     // Collect this class's own member names so method-body
     // lowering can tell `someMember()` (this.someMember) apart
     // from `topLevelFn()` (LoadGlobal).
-    let mut own_member_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut own_member_names: std::collections::HashSet<String> = extra_members.clone();
     // Walk this class + every supertype reachable through the
     // file's class registry so inherited member names also
     // route as `this.<name>` in method-body lowering.

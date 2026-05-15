@@ -286,6 +286,15 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     let mut object_names: Vec<String> = Vec::new();
     let mut companion_singletons: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // Map from lifted nested class name → set of names visible in
+    // the outer scope (primary-ctor properties + body members).
+    // Lowering merges these into `own_members` so bare references
+    // inside the nested class's method bodies lower as
+    // `this.<name>` and resolve via the captured outer at runtime.
+    let mut nested_outer_members: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     let mut all_decls: Vec<Decl> = Vec::with_capacity(file.decls.len());
     for d in &file.decls {
         match d {
@@ -330,6 +339,24 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                             // to top level so bare-name access
                             // inside the outer class resolves
                             // through the module's class table.
+                            let mut extras: std::collections::HashSet<String> =
+                                std::collections::HashSet::new();
+                            for p in &c.primary_params {
+                                extras.insert(p.name.name.clone());
+                            }
+                            for m in &c.members {
+                                match m {
+                                    Decl::Property(p) => {
+                                        extras.insert(p.name.name.clone());
+                                    }
+                                    Decl::Function(f) => {
+                                        extras.insert(f.name.name.clone());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            nested_outer_members
+                                .insert(nested.name.name.clone(), extras);
                             all_decls.push(Decl::Class(nested.clone()));
                         }
                     }
@@ -353,7 +380,14 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     }
     for d in decls {
         if let Decl::Class(c) = d {
-            let _ = klio_ir::lower::lower_class_with_file(&mut module, c, &file_classes);
+            let empty = std::collections::HashSet::new();
+            let extras = nested_outer_members.get(&c.name.name).unwrap_or(&empty);
+            let _ = klio_ir::lower::lower_class_with_extras(
+                &mut module,
+                c,
+                &file_classes,
+                extras,
+            );
         }
     }
 
