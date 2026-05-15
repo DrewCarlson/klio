@@ -582,13 +582,34 @@ impl<'a> VmHost<'a> {
                     }
                     items = keyed.into_iter().map(|(_, v)| v).collect();
                 }
-                klio_runtime::SeqOp::SortedWith(_) => {
-                    // Comparator-based sort would dispatch the
-                    // user-supplied Comparator's `compare`; not
-                    // wired through this materialiser.
-                    return Err(klio_ir::eval::EvalError::Unimplemented(
-                        "Sequence.sortedWith materialisation".into(),
-                    ));
+                klio_runtime::SeqOp::SortedWith(comparator) => {
+                    let comp = comparator.clone();
+                    let mut err: Option<klio_ir::eval::EvalError> = None;
+                    // Insertion sort so the comparator callback can
+                    // dispatch back through the Vm via call_member.
+                    for i in 1..items.len() {
+                        let mut j = i;
+                        while j > 0 && err.is_none() {
+                            let a = items[j - 1].clone();
+                            let b = items[j].clone();
+                            let ord_val = match
+                                <Self as klio_ir::eval::Host>::call_member(self, &comp, "compare", &[a, b])
+                            {
+                                Ok(v) => v,
+                                Err(e) => { err = Some(e); break; }
+                            };
+                            let n = ord_val.as_i64().unwrap_or(0);
+                            if n > 0 {
+                                items.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = err {
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -2097,6 +2118,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     | "partition"
                     | "indexOf"
                     | "indexOfFirst"
+                    | "toMap"
+                    | "toHashSet"
+                    | "toMutableSet"
+                    | "windowed"
+                    | "chunked"
+                    | "zipWithNext"
             );
             if terminal {
                 let items = self.materialise_sequence(receiver)?;

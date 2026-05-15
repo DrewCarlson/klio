@@ -281,6 +281,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.RuntimeException", excn_runtime),
     ("kotlin.Throwable", excn_throwable),
     ("kotlin.UnsupportedOperationException", excn_unsupported),
+    ("kotlin.NoWhenBranchMatchedException", excn_no_when),
+    ("kotlin.NumberFormatException", excn_number_format),
+    ("kotlin.ConcurrentModificationException", excn_concurrent_mod),
+    ("kotlin.AssertionError", excn_assertion_error),
 
     // ----- Throwable members -----
     ("kotlin.Throwable.message", throwable_message),
@@ -3422,6 +3426,18 @@ fn excn_no_such_element(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn excn_unsupported(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     build_exception(ctx, "kotlin.UnsupportedOperationException")
+}
+fn excn_no_when(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    build_exception(ctx, "kotlin.NoWhenBranchMatchedException")
+}
+fn excn_number_format(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    build_exception(ctx, "kotlin.NumberFormatException")
+}
+fn excn_concurrent_mod(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    build_exception(ctx, "kotlin.ConcurrentModificationException")
+}
+fn excn_assertion_error(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    build_exception(ctx, "kotlin.AssertionError")
 }
 
 fn throwable_message(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
