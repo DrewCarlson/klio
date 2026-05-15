@@ -43,6 +43,11 @@ pub struct Vm {
     /// the named property.
     instance_prop_getters:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Per-class parent-ctor arg thunks. `new_instance` invokes
+    /// each thunk with the class's own primary args to compute the
+    /// values passed to the parent's primary ctor.
+    parent_ctor_args:
+        std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     /// Closure side-table. Each `Value::IrClosure { id, captures }`
     /// resolves to a `(body_func, n_params)` here. `n_params` lets
     /// the dispatch fill missing positional args with `Null` (for
@@ -88,6 +93,7 @@ impl Vm {
             classes: Rc::new(RefCell::new(std::collections::HashMap::new())),
             body_prop_inits: std::collections::HashMap::new(),
             instance_prop_getters: std::collections::HashMap::new(),
+            parent_ctor_args: std::collections::HashMap::new(),
             closures: Vec::new(),
         }
     }
@@ -101,6 +107,7 @@ impl Vm {
         vm.classes = Rc::new(RefCell::new(built.classes));
         vm.body_prop_inits = built.body_prop_inits;
         vm.instance_prop_getters = built.instance_prop_getters;
+        vm.parent_ctor_args = built.parent_ctor_args;
         (vm, main)
     }
 
@@ -126,6 +133,7 @@ impl Vm {
             classes: Rc::clone(&self.classes),
             body_prop_inits: &self.body_prop_inits,
             instance_prop_getters: &self.instance_prop_getters,
+            parent_ctor_args: &self.parent_ctor_args,
             closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
@@ -162,6 +170,8 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_prop_getters:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    parent_ctor_args:
+        &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     closures: &'a mut Vec<ClosureInfo>,
 }
 
@@ -185,6 +195,7 @@ impl<'a> VmHost<'a> {
             classes: Rc::clone(&self.classes),
             body_prop_inits: self.body_prop_inits,
             instance_prop_getters: self.instance_prop_getters,
+            parent_ctor_args: self.parent_ctor_args,
             instance_id_counter: &mut *self.instance_id_counter,
         };
         let mut ctx = klio_runtime::CallCtx {
@@ -1157,11 +1168,59 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         let identity = *self.instance_id_counter;
         let mut fields: Vec<(String, klio_runtime::Value)> =
             Vec::with_capacity(class_def.primary_params.len() + class_def.body_properties.len());
-        for (param, value) in class_def.primary_params.iter().zip(args.iter()) {
-            if param.property.is_some() {
-                fields.push((param.name.clone(), value.clone()));
+        // Walk the parent ctor chain top-down: each parent gets
+        // args computed by its child's parent_ctor_args thunks
+        // (taking the child's own primary args). Properties from
+        // every level land on the same instance, so a class
+        // overriding `name` via the parent's primary param sees the
+        // field correctly.
+        let mut chain: Vec<(String, Vec<klio_runtime::Value>)> = Vec::new();
+        chain.push((ir_class.name.clone(), args.to_vec()));
+        let mut cur_class = ir_class.name.clone();
+        let mut cur_args: Vec<klio_runtime::Value> = args.to_vec();
+        while let Some(thunks) = self.parent_ctor_args.get(&cur_class).cloned() {
+            let cur_def = self.classes.borrow().get(&cur_class).cloned();
+            let parent_name = cur_def
+                .as_ref()
+                .and_then(|d| d.supertype_names.first().cloned());
+            let Some(parent_name) = parent_name else { break };
+            // Resolve to a non-interface parent for ctor chaining.
+            let parent_def = self.classes.borrow().get(&parent_name).cloned();
+            if parent_def.as_ref().map_or(true, |d| d.is_interface) {
+                break;
+            }
+            let mut parent_args: Vec<klio_runtime::Value> = Vec::with_capacity(thunks.len());
+            for fid in &thunks {
+                let func = self.module.funcs.get(fid.0 as usize).cloned().ok_or_else(|| {
+                    klio_ir::eval::EvalError::Type(format!(
+                        "parent ctor arg FuncId {} out of range",
+                        fid.0
+                    ))
+                })?;
+                let module = Rc::clone(&self.module);
+                let v = klio_ir::eval::eval_with(&module, &func, cur_args.clone(), self)?;
+                parent_args.push(v);
+            }
+            chain.push((parent_name.clone(), parent_args.clone()));
+            cur_class = parent_name;
+            cur_args = parent_args;
+        }
+        // Apply primary-param properties from each level bottom-up
+        // so child overrides win on collision.
+        for (cls_name, cls_args) in chain.iter().rev() {
+            let cls_def = self.classes.borrow().get(cls_name).cloned();
+            if let Some(cls_def) = cls_def {
+                for (param, value) in cls_def.primary_params.iter().zip(cls_args.iter()) {
+                    if param.property.is_some() {
+                        fields.retain(|(n, _)| n != &param.name);
+                        fields.push((param.name.clone(), value.clone()));
+                    }
+                }
             }
         }
+        // (Leaf-class primary params for non-property args are already
+        // ignored by the loop above — only property params get fields.)
+        let _ = (&class_def.primary_params, args);
         // Body properties: run each init thunk and bind the result.
         // Properties without an init expression but with a delegate
         // or getter are not yet handled — we surface a clear failure.
@@ -1308,6 +1367,8 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_prop_getters:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    parent_ctor_args:
+        &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     instance_id_counter: &'a mut u64,
 }
 
@@ -1362,6 +1423,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     classes: Rc::clone(&self.classes),
                     body_prop_inits: self.body_prop_inits,
                     instance_prop_getters: self.instance_prop_getters,
+                    parent_ctor_args: self.parent_ctor_args,
                     closures: &mut *self.closures,
                 };
                 klio_ir::eval::eval_with_captures(
@@ -1397,6 +1459,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 classes: Rc::clone(&self.classes),
                 body_prop_inits: self.body_prop_inits,
                 instance_prop_getters: self.instance_prop_getters,
+                parent_ctor_args: self.parent_ctor_args,
                 instance_id_counter: &mut *self.instance_id_counter,
             };
             let mut ctx = klio_runtime::CallCtx {

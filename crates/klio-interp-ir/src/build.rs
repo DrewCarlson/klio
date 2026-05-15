@@ -147,6 +147,13 @@ pub struct BuiltModule {
     /// `Vm::get_field` is invoked for a custom-getter property.
     pub instance_prop_getters:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Parent-ctor argument thunks per class. Each entry is the
+    /// list of FuncIds — one per parent ctor arg — that take the
+    /// class's own primary-ctor params and return the value passed
+    /// to the parent. `class Dog(name: String) : Animal(name)` ends
+    /// up with `{ "Dog" => [thunk(name -> name)] }`.
+    pub parent_ctor_args:
+        std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     /// FuncId of the file's `main`, or `None` when the file has no
     /// `main` entry point.
     pub main: Option<klio_ir::FuncId>,
@@ -395,11 +402,46 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         }
     }
 
+    // Lower parent-ctor argument expressions as N-arg thunks
+    // parameterised on the class's own primary-ctor params. The Vm
+    // invokes these during new_instance to compute the parent's
+    // primary-ctor args.
+    let mut parent_ctor_args: std::collections::HashMap<String, Vec<klio_ir::FuncId>> =
+        std::collections::HashMap::new();
+    for d in &file.decls {
+        if let Decl::Class(c) = d {
+            for parent_args_opt in &c.supertype_args {
+                if let Some(parent_args) = parent_args_opt {
+                    let param_names: Vec<String> = c
+                        .primary_params
+                        .iter()
+                        .map(|p| p.name.name.clone())
+                        .collect();
+                    let param_refs: Vec<&str> =
+                        param_names.iter().map(|s| s.as_str()).collect();
+                    let mut fids: Vec<klio_ir::FuncId> = Vec::with_capacity(parent_args.len());
+                    for (idx, e) in parent_args.iter().enumerate() {
+                        let fid = klio_ir::lower::lower_expr_as_param_thunk(
+                            &mut module,
+                            &param_refs,
+                            e,
+                            &format!("__parent_ctor_arg_{}_{idx}", c.name.name),
+                        );
+                        fids.push(fid);
+                    }
+                    parent_ctor_args.insert(c.name.name.clone(), fids);
+                    break;
+                }
+            }
+        }
+    }
+
     BuiltModule {
         module: Rc::new(module),
         classes,
         body_prop_inits,
         instance_prop_getters,
+        parent_ctor_args,
         main: main_id,
     }
 }
