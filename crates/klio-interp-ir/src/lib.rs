@@ -1019,6 +1019,11 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         _this: &klio_runtime::Value,
         _out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        // Receiver-typed lambda dispatch requires the body's
+        // lowering to bind `this` as the first param, which the
+        // current parser-injected `it` model does not produce.
+        // That lower change lands together with a per-lambda
+        // "is receiver-typed" marker on the AST / IR shape.
         Err(klio_runtime::RuntimeError::Unimplemented(
             "Vm::invoke_callable_with_this".into(),
         ))
