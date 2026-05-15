@@ -12996,15 +12996,12 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                 return Some(v);
             }
         }
-        // Top-level property with a delegate / custom getter — route
-        // the read through the tree walker so the getter (e.g.
-        // `lazy {…}`, `Delegates.notNull()`, `Delegates.observable(...)`)
-        // fires.
-        if self.interp.has_top_level_property(name) {
-            if let Some(Ok(v)) = self.interp.read_top_level_property_pub(name, self.out) {
-                return Some(v);
-            }
-        }
+        // Top-level property with a delegate / custom getter — the
+        // IR-lowered getter is consulted above; what's left here is
+        // the lateinit-sentinel case for `lateinit var x`. Reading an
+        // uninitialised lateinit returns the raw sentinel from
+        // globals via lookup_global_callable; surface it as-is so the
+        // caller can throw appropriately.
         // Fully-qualified name probe — `kotlin.math.PI`, `kotlin.io.println`.
         // Returns the intrinsic by FQN directly when it's already a
         // package-qualified lookup so the IR path doesn't need to
