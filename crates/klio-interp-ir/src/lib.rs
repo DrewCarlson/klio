@@ -285,6 +285,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let klio_runtime::Value::Intrinsic { func, .. } = callee {
             return self.dispatch_intrinsic(*func, args);
         }
+        // `instance()` — invoke an instance via its `operator fun
+        // invoke(...)` method.
+        if matches!(callee, klio_runtime::Value::Instance(_)) {
+            return self.call_member(callee, "invoke", args);
+        }
         // Constructor-like call on a user class value
         // (`val ctor = ::Foo; ctor(1, 2)`).
         if let klio_runtime::Value::Class(cls) = callee {
