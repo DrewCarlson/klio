@@ -1750,28 +1750,44 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 "super.{name}: owner_class `{owner_class}` has no parent"
             )));
         };
-        // Look up the method on the parent's IR class.
-        let parent_ir = self
-            .module
-            .classes
-            .iter()
-            .find(|c| c.name == parent_name)
-            .cloned();
-        if let Some(parent_ir) = parent_ir {
-            for fid in &parent_ir.methods {
-                if let Some(func) = self.module.funcs.get(fid.0 as usize).cloned() {
-                    if func.name == name {
-                        let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
-                        all.push(receiver.clone());
-                        all.extend_from_slice(args);
-                        let module = Rc::clone(&self.module);
-                        return klio_ir::eval::eval_with(&module, &func, all, self);
+        // Walk the supertype chain starting at `parent_name` and
+        // dispatch the *first* class on the chain that declares the
+        // method. Falling through to `call_member` would re-enter
+        // virtual dispatch on the original receiver and recurse
+        // forever for overriding methods.
+        let mut current: Option<String> = Some(parent_name);
+        while let Some(cname) = current.take() {
+            let cls_ir = self
+                .module
+                .classes
+                .iter()
+                .find(|c| c.name == cname)
+                .cloned();
+            if let Some(cls_ir) = cls_ir {
+                for fid in &cls_ir.methods {
+                    if let Some(func) = self.module.funcs.get(fid.0 as usize).cloned() {
+                        if func.name == name {
+                            let mut all: Vec<klio_runtime::Value> =
+                                Vec::with_capacity(args.len() + 1);
+                            all.push(receiver.clone());
+                            all.extend_from_slice(args);
+                            let module = Rc::clone(&self.module);
+                            return klio_ir::eval::eval_with(&module, &func, all, self);
+                        }
                     }
                 }
             }
+            // Step to the next non-interface supertype.
+            let next: Option<String> = self
+                .classes
+                .borrow()
+                .get(&cname)
+                .and_then(|d| d.supertype_names.first().cloned());
+            current = next;
         }
-        // Fall back to the regular member dispatch on the receiver.
-        self.call_member(receiver, name, args)
+        Err(klio_ir::eval::EvalError::Type(format!(
+            "super.{name}: no matching method up the supertype chain from `{owner_class}`"
+        )))
     }
 
     fn qualified_this(
