@@ -2470,13 +2470,29 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             )));
         }
         let n_primary = class_def.primary_params.len();
-        if args.len() != n_primary {
+        let mut effective_args: Vec<klio_runtime::Value> = args.to_vec();
+        if effective_args.len() < n_primary {
+            // Fill missing positional args with each param's default.
+            // Literal-only defaults resolve eagerly here; anything more
+            // complex needs a lowered thunk and lands when class lowering
+            // grows ctor-arg defaults as IR FuncIds.
+            for idx in effective_args.len()..n_primary {
+                let p = &class_def.primary_params[idx];
+                let v = match &p.default {
+                    Some(e) => simple_literal(e).unwrap_or(klio_runtime::Value::Null),
+                    None => klio_runtime::Value::Null,
+                };
+                effective_args.push(v);
+            }
+        }
+        if effective_args.len() != n_primary {
             return Err(klio_ir::eval::EvalError::Arity(format!(
                 "{}() expects {n_primary} args, got {}",
                 class_def.name,
-                args.len()
+                effective_args.len()
             )));
         }
+        let args = effective_args.as_slice();
         *self.instance_id_counter += 1;
         let identity = *self.instance_id_counter;
         let mut fields: Vec<(String, klio_runtime::Value)> =
