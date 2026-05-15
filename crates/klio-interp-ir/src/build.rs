@@ -159,15 +159,29 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                         body_prop_inits.insert((c.name.name.clone(), p.name.name.clone()), fid);
                     }
                     if let Some(getter) = &p.getter {
-                        if let klio_ast::FunctionBody::Expr(body) = &getter.body {
-                            let fid = klio_ir::lower::lower_accessor_expr(
-                                &mut module,
-                                &c.name.name,
-                                &own_members,
-                                &["this"],
-                                body,
-                                &format!("__get_{}_{}", c.name.name, p.name.name),
-                            );
+                        let fid = match &getter.body {
+                            klio_ast::FunctionBody::Expr(body) => Some(
+                                klio_ir::lower::lower_accessor_expr(
+                                    &mut module,
+                                    &c.name.name,
+                                    &own_members,
+                                    &["this"],
+                                    body,
+                                    &format!("__get_{}_{}", c.name.name, p.name.name),
+                                ),
+                            ),
+                            klio_ast::FunctionBody::Block(blk) => Some(
+                                klio_ir::lower::lower_accessor_block(
+                                    &mut module,
+                                    &c.name.name,
+                                    &own_members,
+                                    &["this"],
+                                    blk,
+                                    &format!("__get_{}_{}", c.name.name, p.name.name),
+                                ),
+                            ),
+                        };
+                        if let Some(fid) = fid {
                             instance_prop_getters
                                 .insert((c.name.name.clone(), p.name.name.clone()), fid);
                         }
