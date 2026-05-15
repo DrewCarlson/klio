@@ -575,6 +575,7 @@ pub fn lower_class_with_file(
             ty: crate::TypeRef::unit(),
             default: None,
             is_property: p.property.is_some(),
+            is_vararg: p.is_vararg,
         })
         .collect();
     // Register the class shell first so the class name resolves
@@ -886,6 +887,7 @@ fn lower_function_body_with_implicit_owner(
             ty: crate::TypeRef::unit(),
             default: None,
             is_property: false,
+            is_vararg: false,
         })
         .collect();
     params.extend(f.params.iter().map(|p| crate::Param {
@@ -893,6 +895,7 @@ fn lower_function_body_with_implicit_owner(
         ty: crate::TypeRef::unit(),
         default: None,
         is_property: false,
+        is_vararg: p.is_vararg,
     }));
     func.params = params;
     func.is_suspend = f.is_suspend;

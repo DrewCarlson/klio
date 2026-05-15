@@ -790,10 +790,35 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 })?;
             // Fill missing positional args with Null so an
             // implicit-`it` lambda invoked with zero args still
-            // initialises the param slot.
+            // initialises the param slot. Pack trailing vararg
+            // args into an Array when the target's last param is
+            // marked vararg.
             let mut call_args: Vec<klio_runtime::Value> = Vec::with_capacity(info.n_params);
             for i in 0..info.n_params {
                 call_args.push(args.get(i).cloned().unwrap_or(klio_runtime::Value::Null));
+            }
+            if let Some(last) = func.params.last() {
+                if last.is_vararg && args.len() > info.n_params {
+                    let mut packed: Vec<klio_runtime::Value> = Vec::new();
+                    let fixed = info.n_params.saturating_sub(1);
+                    packed.extend(args[fixed..].iter().cloned());
+                    call_args[info.n_params - 1] = klio_runtime::Value::Array {
+                        items: Rc::new(RefCell::new(packed)),
+                        prim: None,
+                    };
+                } else if last.is_vararg
+                    && !matches!(call_args.last(), Some(klio_runtime::Value::Array { .. }))
+                {
+                    let fixed = info.n_params.saturating_sub(1);
+                    let mut packed: Vec<klio_runtime::Value> = Vec::new();
+                    if args.len() > fixed {
+                        packed.extend(args[fixed..].iter().cloned());
+                    }
+                    call_args[info.n_params - 1] = klio_runtime::Value::Array {
+                        items: Rc::new(RefCell::new(packed)),
+                        prim: None,
+                    };
+                }
             }
             let capture_values: Vec<klio_runtime::Value> = (**captures).clone();
             return klio_ir::eval::eval_with_captures(
@@ -1666,6 +1691,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             .ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown FuncId {}", func.0))
             })?;
+        let args = pack_vararg_args(&f, args);
         klio_ir::eval::eval_with(module, &f, args, self)
     }
 
@@ -2819,6 +2845,38 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         Ok(inst_value)
     }
+}
+
+/// Pack trailing positional args into a single `Value::Array` when
+/// the target function's last param is marked `vararg`. Leaves
+/// non-vararg signatures untouched. A single passed-in array slips
+/// through as-is to support `f(*arr)` call sites.
+fn pack_vararg_args(
+    func: &klio_ir::Func,
+    args: Vec<klio_runtime::Value>,
+) -> Vec<klio_runtime::Value> {
+    if let Some(last) = func.params.last() {
+        if last.is_vararg {
+            let fixed = func.params.len().saturating_sub(1);
+            if args.len() == func.params.len() {
+                if matches!(args.last(), Some(klio_runtime::Value::Array { .. })) {
+                    return args;
+                }
+            }
+            let mut out: Vec<klio_runtime::Value> = Vec::with_capacity(func.params.len());
+            for v in args.iter().take(fixed) {
+                out.push(v.clone());
+            }
+            let rest: Vec<klio_runtime::Value> =
+                args.into_iter().skip(fixed).collect();
+            out.push(klio_runtime::Value::Array {
+                items: Rc::new(RefCell::new(rest)),
+                prim: None,
+            });
+            return out;
+        }
+    }
+    args
 }
 
 /// Structural value hash matching `Value::structural_eq`. Used by

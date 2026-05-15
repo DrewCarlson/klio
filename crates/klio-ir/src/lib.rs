@@ -435,6 +435,11 @@ pub struct Param {
     /// to migrate.
     #[serde(default)]
     pub is_property: bool,
+    /// `vararg` parameter — variadic, runtime-collected into an
+    /// array. The Vm packs trailing positional args into a typed
+    /// array before binding.
+    #[serde(default)]
+    pub is_vararg: bool,
 }
 
 /// Class declaration.
