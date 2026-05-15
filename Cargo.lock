@@ -835,7 +835,7 @@ dependencies = [
  "criterion",
  "dhat",
  "klio-ast",
- "klio-interp",
+ "klio-interp-ir",
  "klio-lexer",
  "klio-parity",
  "klio-parser",

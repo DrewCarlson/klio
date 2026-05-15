@@ -10,7 +10,26 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use klio_ast::KotlinFile;
-use klio_interp::{CaptureOutput, Interpreter};
+use klio_interp_ir::{build::build_module, Vm};
+
+#[derive(Default)]
+struct CaptureOutput {
+    lines: Vec<String>,
+    cur: String,
+}
+impl klio_runtime::Output for CaptureOutput {
+    fn write(&mut self, s: &str) {
+        self.cur.push_str(s);
+        while let Some(idx) = self.cur.find('\n') {
+            let line: String = self.cur.drain(..=idx).collect();
+            self.lines.push(line.trim_end_matches('\n').to_string());
+        }
+    }
+    fn writeln(&mut self, s: &str) {
+        self.write(s);
+        self.write("\n");
+    }
+}
 use klio_lexer::{LexResult, Lexer};
 use klio_parser::Parser as KtParser;
 use klio_resolver::{resolve, Resolution};
@@ -112,9 +131,12 @@ pub fn run_full(prog: &Program) -> Result<String, String> {
     let ast = parse(&lexed);
     let _res = resolve_only(&ast);
     let mut out = CaptureOutput::default();
-    Interpreter::new()
-        .run_with_output(&ast, &mut out)
-        .map_err(|e| format!("runtime: {e}"))?;
+    let built = build_module(&ast);
+    let Some(main_id) = built.main else {
+        return Err("no main function in module".into());
+    };
+    let (mut vm, _main) = Vm::from_built(built);
+    vm.run(main_id, &mut out).map_err(|e| format!("runtime: {e}"))?;
     Ok(out.lines.join("\n"))
 }
 

@@ -20,7 +20,7 @@ klio-parser   = { workspace = true }
 klio-ast      = { workspace = true }
 klio-resolver = { workspace = true }
 klio-typeck   = { workspace = true }
-klio-interp   = { workspace = true }
+klio-interp-ir = { workspace = true }
 klio-runtime  = { workspace = true }
 klio-parity   = { path = "../klio-parity" }
 serde         = { workspace = true }
