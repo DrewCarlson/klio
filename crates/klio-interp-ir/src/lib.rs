@@ -2937,10 +2937,40 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .map_err(|e| klio_ir::eval::EvalError::Type(format!("{e}")))?;
                 } else {
                     for (sel, step_desc) in steps.iter() {
-                        let ka = self.call_value(sel, std::slice::from_ref(&a))?;
-                        let kb = self.call_value(sel, std::slice::from_ref(&b))?;
-                        let o = klio_stdlib::compare_values(&ka, &kb)
-                            .map_err(|e| klio_ir::eval::EvalError::Type(format!("{e}")))?;
+                        // Two shapes are supported:
+                        //   key-selector lambda: `{ x -> key }` —
+                        //     invoke with one arg per side, compare
+                        //     the resulting keys.
+                        //   comparator lambda: `{ a, b -> n }` —
+                        //     invoke once with both values; the
+                        //     return value is the comparison int.
+                        let n_params = match sel {
+                            klio_runtime::Value::IrClosure { id, .. } => self
+                                .closures
+                                .get(*id as usize)
+                                .map(|c| c.n_params)
+                                .unwrap_or(1),
+                            _ => 1,
+                        };
+                        let o = if n_params >= 2 {
+                            let r = self
+                                .call_value(sel, &[a.clone(), b.clone()])?;
+                            let n = r.as_i64().unwrap_or(0);
+                            if n < 0 {
+                                std::cmp::Ordering::Less
+                            } else if n > 0 {
+                                std::cmp::Ordering::Greater
+                            } else {
+                                std::cmp::Ordering::Equal
+                            }
+                        } else {
+                            let ka =
+                                self.call_value(sel, std::slice::from_ref(&a))?;
+                            let kb =
+                                self.call_value(sel, std::slice::from_ref(&b))?;
+                            klio_stdlib::compare_values(&ka, &kb)
+                                .map_err(|e| klio_ir::eval::EvalError::Type(format!("{e}")))?
+                        };
                         let flipped = if *step_desc { o.reverse() } else { o };
                         if flipped != std::cmp::Ordering::Equal {
                             ord = flipped;
