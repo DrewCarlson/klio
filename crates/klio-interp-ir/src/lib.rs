@@ -1029,6 +1029,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     queue.push(Rc::clone(ifc));
                 }
             }
+            // Outer-instance chain fallback: an inner-class method
+            // body referencing `x` (a field of the enclosing class)
+            // lowers as `this.x`. The instance keeps a reference to
+            // its outer in `InstanceData.outer`; walk the chain.
+            let mut cur_outer = inst.borrow().outer.clone();
+            while let Some(klio_runtime::Value::Instance(outer_inst)) = cur_outer.clone() {
+                if let Some(v) = outer_inst.borrow().get(name) {
+                    return Ok(v);
+                }
+                cur_outer = outer_inst.borrow().outer.clone();
+            }
             // Nested-class fallback: a method body referencing
             // `State` (a lifted nested class declared inside the
             // outer) lowers as `this.State`. Resolve through the
