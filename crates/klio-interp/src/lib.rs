@@ -2157,11 +2157,21 @@ impl Interpreter {
         for a in args {
             match a {
                 Expr::Spread { expr, .. } => {
-                    vals.push(self.eval_expr(expr, env, out)?);
+                    let v = match self.eval_property_init_via_ir(expr, out) {
+                        Some(Ok(v)) => v,
+                        Some(Err(err)) => return Err(err),
+                        None => self.eval_expr(expr, env, out)?,
+                    };
+                    vals.push(v);
                     mask.push(true);
                 }
                 _ => {
-                    vals.push(self.eval_expr(a, env, out)?);
+                    let v = match self.eval_property_init_via_ir(a, out) {
+                        Some(Ok(v)) => v,
+                        Some(Err(err)) => return Err(err),
+                        None => self.eval_expr(a, env, out)?,
+                    };
+                    vals.push(v);
                     mask.push(false);
                 }
             }
