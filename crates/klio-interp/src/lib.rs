@@ -515,15 +515,6 @@ impl Interpreter {
         self.globals.borrow().lookup(name)
     }
 
-    /// True when `name` names a registered top-level property
-    /// (delegated or with custom accessors). The IR's LoadGlobal
-    /// can then route through `read_top_level_property_pub` so
-    /// `val cached by lazy {…}` reads fire the delegate.
-    #[must_use]
-    fn has_top_level_property(&self, name: &str) -> bool {
-        self.module_registry.top_level_props.contains_key(name)
-    }
-
     fn assign_top_level_pub(
         &mut self,
         name: &str,
