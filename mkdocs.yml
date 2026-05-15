@@ -58,7 +58,7 @@ nav:
     - CLI Tour: getting-started/cli.md
   - Architecture:
     - Pipeline Overview: architecture/pipeline.md
-    - Interpreter: architecture/interpreter.md
+    - The Vm: architecture/interpreter.md
     - Standard Library: architecture/stdlib.md
     - Diagnostics: architecture/diagnostics.md
   - Packs:

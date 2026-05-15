@@ -31,10 +31,10 @@ pub struct SymbolEntry {
 
 The registry serves two consumers:
 
-1. **Resolver** — `is_known_package` and `all_symbol_names` use the
-   index to validate imports.
-2. **Interpreter** — `klio_stdlib::implementation(fqn)` looks up
-   the runtime function pointer.
+1. **Resolver** — `is_known_package` and the symbol index validate
+   imports during `klio check`.
+2. **Vm** — `klio_stdlib::implementation(fqn)` looks up the runtime
+   function pointer at dispatch.
 
 Coverage is reported via `klio_stdlib::coverage()` (`implemented`
 over `total`).

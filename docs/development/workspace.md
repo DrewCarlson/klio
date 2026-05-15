@@ -9,18 +9,19 @@ kt-exp/
 │   ├── klio-lexer/             UTF-8 → tokens
 │   ├── klio-ast/               AST node types (KotlinFile, Expr, Decl, …)
 │   ├── klio-parser/            Tokens → AST (P00xx diagnostics)
-│   ├── klio-resolver/          Name binding, imports (R00xx)
-│   ├── klio-types/             Kotlin Type IR, variance, constraints
-│   ├── klio-typeck/            Type checking, smart casts (T00xx)
+│   ├── klio-resolver/          Name binding, imports (R00xx) — klio check
+│   ├── klio-types/             Kotlin Type model, variance, constraints
+│   ├── klio-typeck/            Type checking, smart casts (T00xx) — klio check
 │   ├── klio-cfa/               Control- & data-flow analyses
-│   ├── klio-runtime/           Value / InstanceData / CallCtx
-│   ├── klio-interp/            Tree-walking interpreter
-│   ├── klio-stdlib/            Hand-written Kotlin stdlib intrinsics
-│   ├── klio-stdlib-gen/        Mines upstream Kotlin into the symbol table
+│   ├── klio-ir/                AST → register IR (lowering)
+│   ├── klio-interp-ir/         IR module builder + the Vm
+│   ├── klio-runtime/           Value / InstanceData / Output
+│   ├── klio-stdlib/            Native Rust stdlib intrinsics + symbol index
+│   ├── klio-stdlib-gen/        Mines upstream Kotlin into the symbol index
 │   ├── klio-stdlib-pack/       Build-script crate that embeds stdlib.klio-pack
 │   ├── klio-pack/              On-disk pack format (writer, reader, schema)
-│   ├── klio-cli/               `klio` binary
-│   ├── klio-parity/            Parity sweep against kotlinc-native
+│   ├── klio-cli/               The `klio` binary
+│   ├── klio-parity/            Parity sweep against kotlinc
 │   ├── klio-bench/             Criterion benchmarks
 │   ├── klio-kotlinx-atomicfu/  Native bindings + shim for kotlinx.atomicfu
 │   ├── klio-kotlinx-io/        Native bindings + shim for kotlinx.io
@@ -28,35 +29,36 @@ kt-exp/
 │   ├── klio-kotlinx-coroutines/Native bindings + shim for kotlinx.coroutines
 │   └── klio-ktor-client/       Native bindings + shim for io.ktor.client
 ├── examples/                   .kt programs that pass parity against kotlinc
-├── docs/                       This user-facing site (mkdocs)
-├── plans/                      In-progress design + roadmap documents
-├── kotlin-language-spec/       Spec PDFs (read-only reference)
-├── third-party/                Vendored kotlinx sources (read-only)
-└── xtask/                      cargo-xtask command runners (lint, gen)
+├── docs/                       This site (mkdocs)
+├── kotlin-language-spec/       Spec PDFs (read-only reference, gitignored)
+├── kotlin/                     JetBrains/kotlin checkout (read-only, gitignored)
+└── third-party/                Vendored kotlinx submodules (read-only)
 ```
 
 ## Roles
 
-- **Front end** (lexer → parser → resolver → typeck → cfa) compiles
-  source to a typed-and-analysed AST. Each crate owns its diagnostic
-  prefix.
-- **Back end** (runtime + interp + stdlib + stdlib-pack + pack)
-  runs the AST. The pack crate defines the on-disk container; the
-  stdlib crate provides intrinsics; the interpreter dispatches.
-- **Packs** ride on top of the back end. Each kotlinx-style crate
-  has a Kotlin shim (`shim/`) plus a Rust native impl
-  (`src/lib.rs`), shipping as a `.klio-pack` archive at build time.
+- **Front end** (`klio-lexer` → `klio-parser`) produces the AST that
+  both entry paths share.
+- **Execution** (`klio-ir` → `klio-interp-ir` + `klio-runtime` +
+  `klio-stdlib`) lowers the AST to IR and runs it. This is the
+  `klio run` path.
+- **Diagnostics** (`klio-resolver` → `klio-typeck`, backed by
+  `klio-types` and `klio-cfa`) type-checks the AST for `klio check`.
+  It is not on the execution path.
+- **Packs** ride on top of execution. Each kotlinx-style crate has a
+  Kotlin shim (`shim/`) plus a Rust native impl (`src/lib.rs`) and
+  ships as a `.klio-pack` built from its `klio.toml`.
 - **Tests / corpus** live in `crates/klio-parity/tests/corpus/`,
   per-crate `tests/` directories, and `examples/`. The parity sweep
-  diffs klio against `kotlinc-native` byte-for-byte.
+  diffs klio against `kotlinc` byte-for-byte.
 
 ## Common cargo flows
 
-| Goal                       | Command                                                          |
-|----------------------------|------------------------------------------------------------------|
-| Build everything           | `cargo build --workspace`                                        |
-| Run tests                  | `cargo test --workspace`                                         |
-| Rebuild stdlib pack        | `cargo build -p klio-stdlib-pack`                                |
-| Build a kotlinx pack       | `cargo run -p klio-cli -- pack build crates/klio-kotlinx-<name>` |
-| Run an example             | `cargo run -p klio-cli -- run examples/<file>.kt`                |
-| Update mined stdlib symbols| `cargo run -p klio-stdlib-gen --bin klio-stdlib-gen`             |
+| Goal                        | Command                                                          |
+|-----------------------------|------------------------------------------------------------------|
+| Build everything            | `cargo build --workspace`                                        |
+| Run tests                   | `cargo test --workspace`                                          |
+| Rebuild the stdlib pack     | `cargo build -p klio-stdlib-pack`                                |
+| Build a kotlinx pack        | `cargo run -p klio-cli -- pack build crates/klio-kotlinx-<name>` |
+| Run an example              | `cargo run -p klio-cli -- run examples/<file>.kt`                |
+| Update mined stdlib symbols | `cargo run -p klio-stdlib-gen`                                   |

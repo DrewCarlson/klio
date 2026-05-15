@@ -30,14 +30,14 @@ without re-running the parser or typechecker.
 - **Compressible.** Sections can be uncompressed or
   zstd-compressed individually.
 
-## Three kinds of packs
+## Kinds of packs
 
-| Kind            | Example                | Loaded by                                        |
-|-----------------|------------------------|--------------------------------------------------|
-| Embedded stdlib | `stdlib.klio-pack`     | Built into the `klio` binary; always active.     |
-| Kotlinx libs    | `kotlinx.io.klio-pack` | Bundled in the workspace; `klio pack install`.   |
-| Opt-in modules  | `io.ktor.client.klio-pack` | Same flow; not loaded unless the user asks.  |
-| Third-party     | Anything you build     | `klio pack install <file>`.                       |
+| Kind            | Example                    | Loaded by                                      |
+|-----------------|----------------------------|------------------------------------------------|
+| Embedded stdlib | `stdlib.klio-pack`         | Built into the `klio` binary; always active.   |
+| Kotlinx libs    | `kotlinx.io.klio-pack`     | Built in the workspace; `klio pack install`.   |
+| Opt-in modules  | `io.ktor.client.klio-pack` | Same flow; not loaded unless the user asks.    |
+| Third-party     | Anything you build         | `klio pack install <file>`.                    |
 
 The same format, the same loader, the same dispatch path — only the
 content and the install flow differ.
@@ -73,9 +73,10 @@ When `klio` starts:
 4. For each pack:
     - `manifest.abi_version` is checked against
       `klio_pack::SUPPORTED_ABI_VERSION`.
-    - `implicit_packages` and packages mentioned in the symbol index
-      are registered with the resolver.
-    - Bindings whose `host_symbol` resolves in the host registry
-      are installed into `Interpreter::installed_bindings`.
-    - The pack's frozen AST is fed through `register_pack_sources`
-      so top-level declarations become globals.
+    - `implicit_packages` and packages in the symbol index are
+      registered as known (so imports resolve).
+    - Bindings whose `host_symbol` resolves in the host registry are
+      collected and handed to the Vm via `set_installed_bindings`.
+    - The pack's parsed AST is merged into the IR module alongside
+      the user's files, so its declarations are lowered and
+      available to the program.

@@ -1,6 +1,6 @@
 # Hello, world
 
-Save the program below to `hello.kt`:
+Save this to `hello.kt`:
 
 ```kotlin
 fun main() {
@@ -16,8 +16,6 @@ Run it:
 klio run hello.kt
 ```
 
-Expected output:
-
 ```
 Hello, klio!
 1, 4, 9
@@ -25,46 +23,39 @@ Hello, klio!
 
 ## Running a module
 
-When `klio run` is invoked with more than one file, every file's
-top-level declarations are visible to every other file — single
-module semantics. The runner expects exactly one `fun main()` across
-the module.
+When `klio run` gets more than one file, every file's top-level
+declarations are visible to every other file — single-module
+semantics. Exactly one `fun main()` must exist across the module.
 
 ```sh
 klio run app/Main.kt app/Util.kt
 ```
 
-## Typecheck without running
+## Type-checking without running
 
 ```sh
 klio check hello.kt
 ```
 
-`klio check` emits plain-text diagnostics by default; pass
-`--format json` or `--format sarif` to integrate with editors and CI.
-
-## REPL
-
-```sh
-klio repl
-```
-
-The REPL accepts complete expressions and top-level declarations. It
-shares the same pipeline as `run`, so error messages and stdlib
-coverage are identical.
+`klio check` resolves names and type-checks, emits diagnostics, and
+exits non-zero on any error. It does not run the program. Pass
+`--format json` or `--format sarif` to integrate with editors and
+CI; the default is `plain`.
 
 ## What just happened?
 
 `klio run` walked your source through:
 
 1. **Lexer** — UTF-8 source → token stream.
-2. **Parser** — token stream → AST (`klio_ast::KotlinFile`).
-3. **Resolver** — name binding, import expansion, package recognition.
-4. **Typechecker** — Kotlin type system, smart-casts, constraints.
-5. **CFG analyses** — definite assignment, reachability, smart-cast
-   narrowing.
-6. **Interpreter** — walks the typed AST and runs your program.
+2. **Parser** — tokens → AST (`klio_ast::KotlinFile`).
+3. **Pack loading** — the embedded stdlib (and any installed packs
+   your file imports) merge into the module.
+4. **Lowering** — `klio-ir` lowers the AST to register IR.
+5. **Vm** — `klio-interp-ir` builds the IR module and runs it.
 
-The standard library is loaded automatically from the embedded
-`stdlib.klio-pack`. Any user-installed packs in `~/.klio/packs/`
-load on top.
+`klio check` takes a different path after parsing: it runs the
+resolver and type checker to produce diagnostics. Type-checking is
+not part of `klio run`.
+
+> The `klio repl` command is currently a placeholder that echoes
+> input. Use `klio run` for execution.

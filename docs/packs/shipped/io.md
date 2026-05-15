@@ -55,6 +55,3 @@ cargo run -q -p klio-cli -- pack install target/packs/kotlinx.io.klio-pack
 - `Source` / `Sink` interfaces.
 - Async pipelining (klio is single-threaded).
 - Codec support beyond `String` (UTF-8) and big-endian primitives.
-
-Track the gap list at
-[`plans/PACK-ROADMAP.md`](https://github.com/DrewCarlson/kt-exp/blob/main/plans/PACK-ROADMAP.md).

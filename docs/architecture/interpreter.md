@@ -1,66 +1,97 @@
-# Interpreter
+# The Vm
 
-`klio-interp` is a tree-walking interpreter that drives a typed AST
-to completion. It does not produce bytecode and does not maintain a
-separate IR; every expression is evaluated directly off the AST node
-the parser produced.
+klio executes a register-based intermediate representation. The
+front end lowers each source file to IR; the Vm in `klio-interp-ir`
+runs that IR to completion. There is no AST evaluator on the
+execution path.
+
+## Lowering
+
+`klio-ir` turns a `klio_ast::KotlinFile` into a `Module`:
+
+- **`Func`** — a lowered function body: a list of basic blocks, each
+  a sequence of `Inst` ending in a `Terminator` (branch, return,
+  switch). Top-level functions, methods, constructors, accessors,
+  lambda bodies, and suspend state machines are all `Func`s.
+- **`Class`** — class metadata: field layout, method table,
+  supertypes, and the `FuncId`s of its constructors and init blocks.
+- **`Module`** — the program: functions, classes, globals, top-level
+  properties, extensions, type aliases, and the intrinsic/binding
+  registry.
+
+Every supported construct lowers to structured IR. Lambdas become
+closures with explicit captures; mutable captured variables go
+through shared cells; `suspend fun` bodies become state machines
+with explicit resume edges; reflection references resolve to
+`ClassId` / `FuncId`; data-class members (`equals`, `hashCode`,
+`toString`, `copy`, `componentN`) are generated as real `Func`s at
+class-lowering time.
+
+## The Vm
+
+`klio_interp_ir::Vm` holds the module, the mutable globals, the
+coroutine scheduler, and the call stacks. `Vm::from_built` consumes
+a `BuiltModule` (produced by `klio_interp_ir::build`) and returns the
+Vm plus the entry `FuncId`; `Vm::run(main, out)` executes it.
+
+Execution is a switch over `Inst`:
+
+- Register moves, constants, arithmetic, comparisons.
+- Field access by index against a class's static field layout.
+- Calls: direct (`FuncId`), virtual (method table walk over
+  supertypes), closure (`CallValue`), and intrinsic.
+- Object construction, including constructor chaining and init
+  blocks.
+- Coroutine suspend/resume against the scheduler.
 
 ## Values
 
-`klio_runtime::Value` is the union of every runtime representation:
+Runtime values are `klio_runtime::Value`: the Kotlin primitives
+(`Int`, `Long`, `Double`, `Float` stored as `f32` for byte-identical
+parity, `Bool`, `Char`, `String` as `Rc<String>`, the unsigned
+siblings), `Unit` / `Null`, integer `Range`, collections (`List`,
+`Set`, `Map`, `Array`), user `Instance` data, closures, bound method
+references, exceptions, and the `CoroutineSuspended` sentinel.
 
-| Variant                       | Notes                                                              |
-|-------------------------------|--------------------------------------------------------------------|
-| `Int`, `Long`, `Short`, `Byte`| Signed integers stored as the natural Rust width.                   |
-| `UInt`, `ULong`, `UShort`, `UByte` | Unsigned counterparts (parser+typeck scaffolding in place).    |
-| `Double`, `Float`             | IEEE 754 — `Float` is stored as `f32` for byte-identical parity.    |
-| `Bool`, `Char`, `String`      | Strings are `Rc<String>` for cheap sharing.                         |
-| `Range`                       | Inclusive integer progression with signed step.                     |
-| `Function`, `Lambda`          | Closure with captured env.                                          |
-| `Intrinsic`, `BoundMethod`    | Native `StdlibFn` references (stdlib + pack bindings).              |
-| `Class`, `Instance`           | User-defined class metadata and per-instance state.                 |
-| `Array`                       | Boxed or primitive-typed array with shared mutability.              |
-| `List`, `Map`, `Set`          | Collection literals & builders.                                     |
-| `CoroutineSuspended`          | Sentinel returned by suspending calls awaiting resume.              |
+`InstanceData` carries each instance's fields plus an opaque
+`native_state` slot that host bindings use for per-instance Rust
+state (for example `kotlinx.io.Buffer` stashes a `VecDeque<u8>`
+there).
 
-`InstanceData` carries each instance's fields, identity counter, and
-an optional `native_state` slot used by host bindings (e.g.
-`kotlinx.io.Buffer` stashes its `VecDeque<u8>` there).
+## Dispatch and intrinsics
 
-## Dispatch
+Stdlib and pack functionality is host-bound. The Vm does not special
+-case specific FQNs: `klio_stdlib::implementation(fqn)` is the single
+resolution path, and higher-order stdlib functions (`map`, `fold`,
+`forEach`, `apply`, `let`, …) receive a callback to invoke a closure
+argument back through the Vm.
 
-The interpreter resolves callable expressions through a layered
-lookup:
-
-1. Per-instance method tables (for user-defined classes).
-2. Installed-binding table populated by loaded packs.
-3. The static `klio_stdlib::implementation` table.
-4. The user's top-level scope.
-
-When a pack-source file registers a top-level Kotlin function whose
-qualified FQN matches an installed native binding, the loader binds
-the simple name to `Value::Intrinsic` instead of `Value::Function`.
-This is what makes shim libraries Just Work: the Kotlin body in the
-shim acts as a documentation stub; the native binding wins at
-dispatch.
+When a pack ships a Kotlin top-level function whose FQN matches an
+installed native binding, the loader binds the name to the intrinsic
+instead of the lowered Kotlin body. This is why shim libraries work:
+the Kotlin source documents the surface, and the native binding wins
+at dispatch. See [Native Bindings](../packs/native-bindings.md).
 
 ## Coroutines
 
-The interpreter natively understands `suspend` (spec §18):
+`suspend` is implemented natively (Kotlin Language Specification §18):
 
-- `runBlocking { ... }` is recognised at the call site and drives
-  the suspend-lowered body to completion.
-- `suspendCoroutine` / `suspendCoroutineUninterceptedOrReturn` push
-  a `ContinuationSlot` onto a stack and yield `COROUTINE_SUSPENDED`.
-- A resumed continuation steps the state machine produced by
-  `suspend_lower::lower` until completion.
+- A `suspend fun` lowers to a state machine — a `switch` on the
+  state register into per-suspension-point blocks, with explicit
+  resume edges that read the resumed value into a destination
+  register.
+- A continuation carries its function, state, captured locals, and
+  module reference; `resume` / `resumeWithException` step the state
+  machine forward.
+- `runBlocking` is a stdlib intrinsic that pumps the scheduler until
+  the lambda's continuation reports completion.
 
-The high-level `kotlinx.coroutines` API (Dispatchers, CoroutineScope,
-launch/async, Channel, Flow) lives in the `kotlinx.coroutines` pack
-on top of this primitive surface.
+The high-level `kotlinx.coroutines` API (scopes, dispatchers,
+`launch`/`async`, `Channel`) layers on top of these primitives via
+the `kotlinx.coroutines` pack.
 
 ## Output
 
-All printed values flow through the `klio_runtime::Output` trait so
-the REPL, smoke harness, and parity sweep can capture stdout
-without diverting `println!` directly.
+All program output flows through the `klio_runtime::Output` trait so
+the parity sweep and pack smoke harness can capture stdout without
+intercepting `println!` directly.

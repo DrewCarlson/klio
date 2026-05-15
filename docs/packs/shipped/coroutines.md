@@ -48,8 +48,8 @@ klio runs single-threaded, so:
 This is sufficient for code that uses coroutines for *structured
 suspension* (e.g. composing async APIs sequentially) but does not
 deliver real concurrency. The full kotlinx.coroutines runtime
-(scheduler, cancellation, structured concurrency, `select`) is
-tracked as M31 in `plans/PLAN.md`.
+(scheduler, cancellation, structured concurrency, `select`) is not
+yet implemented.
 
 ## Install
 
