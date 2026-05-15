@@ -16,7 +16,8 @@ criterion        = { workspace = true }
 klio-lexer       = { workspace = true }
 klio-parser      = { workspace = true }
 klio-span        = { workspace = true }
-klio-interp      = { workspace = true }
+klio-interp-ir   = { workspace = true }
+klio-runtime     = { workspace = true }
 
 [[bench]]
 name = "intrinsics"

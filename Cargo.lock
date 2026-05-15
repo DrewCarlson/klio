@@ -1082,7 +1082,7 @@ name = "klio-stdlib"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "klio-interp",
+ "klio-interp-ir",
  "klio-lexer",
  "klio-pack",
  "klio-parser",

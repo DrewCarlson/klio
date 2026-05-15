@@ -3,19 +3,31 @@
 //! family.
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use klio_interp::{CaptureOutput, Interpreter};
+use klio_interp_ir::{build::build_module, Vm};
 use klio_lexer::Lexer;
 use klio_parser::Parser;
 use klio_span::SourceMap;
 use std::path::Path;
+
+#[derive(Default)]
+struct CaptureOutput;
+impl klio_runtime::Output for CaptureOutput {
+    fn write(&mut self, _: &str) {}
+    fn writeln(&mut self, _: &str) {}
+}
 
 fn run(src: &str) {
     let mut map = SourceMap::new();
     let id = map.add(Path::new("<bench>"), src.to_string());
     let lexed = Lexer::new(id, src).tokenize();
     let (ast, _) = Parser::new(id, src, &lexed.tokens).parse_file();
+    let built = build_module(&ast);
+    let Some(main_id) = built.main else {
+        return;
+    };
+    let (mut vm, _main) = Vm::from_built(built);
     let mut out = CaptureOutput::default();
-    let _ = Interpreter::new().run_with_output(&ast, &mut out);
+    let _ = vm.run(main_id, &mut out);
 }
 
 fn bench(c: &mut Criterion, name: &str, body: &str) {
