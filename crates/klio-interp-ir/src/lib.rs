@@ -2038,6 +2038,15 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 outer = o_inst.borrow().outer.clone();
             }
         }
+        // No class match — `this@<fn-name>` (extension fn label) or
+        // `this@<lambda-label>` resolves to the immediate receiver
+        // if the qualifier isn't a known class. The IR emits this
+        // form for scope-fn lambdas + extension fns whose receiver
+        // is already in `this`.
+        let known_class = self.classes.borrow().contains_key(qualifier);
+        if !known_class && !matches!(receiver, klio_runtime::Value::Null) {
+            return Ok(receiver.clone());
+        }
         Err(klio_ir::eval::EvalError::Type(format!(
             "`this@{qualifier}` is not bound in this scope"
         )))
