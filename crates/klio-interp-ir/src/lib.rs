@@ -2202,6 +2202,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Enum entries compare by ordinal natively. `Color.RED <
+        // Color.BLUE` lowers as `RED.compareTo(BLUE)`.
+        if name == "compareTo" && args.len() == 1 {
+            if let (
+                klio_runtime::Value::Instance(a),
+                klio_runtime::Value::Instance(b),
+            ) = (receiver, &args[0])
+            {
+                let cls = a.borrow().class.clone();
+                if cls.is_enum {
+                    let ord_a = a
+                        .borrow()
+                        .get("ordinal")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let ord_b = b
+                        .borrow()
+                        .get("ordinal")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    return Ok(klio_runtime::Value::new_int(ord_a - ord_b));
+                }
+            }
+        }
         // Natural-order sort on a list of user `Value::Instance` —
         // dispatch each pair through `compareTo` so user-overridden
         // ordering wins. Stdlib's `compare_values` rejects Instance
