@@ -1795,8 +1795,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         receiver: &klio_runtime::Value,
         qualifier: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        // Simple case: receiver's own class name (or fqn ending in
-        // `.<qualifier>`) matches — return the receiver as-is.
+        // Walk parent chain on the receiver's class for direct
+        // matches, then traverse the `outer` chain for inner-class
+        // and local-class scenarios. `this@Outer` from an Inner
+        // method walks to the captured outer instance.
         if let klio_runtime::Value::Instance(inst) = receiver {
             let mut cur: Option<Rc<klio_runtime::ClassDef>> =
                 Some(Rc::clone(&inst.borrow().class));
@@ -1805,6 +1807,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(receiver.clone());
                 }
                 cur = c.parent.borrow().clone();
+            }
+            let mut outer = inst.borrow().outer.clone();
+            while let Some(klio_runtime::Value::Instance(o_inst)) = outer.clone() {
+                let cls = o_inst.borrow().class.clone();
+                if cls.name == qualifier || cls.fqn == qualifier {
+                    return Ok(klio_runtime::Value::Instance(Rc::clone(&o_inst)));
+                }
+                let mut p = cls.parent.borrow().clone();
+                while let Some(c) = p {
+                    if c.name == qualifier || c.fqn == qualifier {
+                        return Ok(klio_runtime::Value::Instance(Rc::clone(&o_inst)));
+                    }
+                    p = c.parent.borrow().clone();
+                }
+                outer = o_inst.borrow().outer.clone();
             }
         }
         Err(klio_ir::eval::EvalError::Type(format!(
