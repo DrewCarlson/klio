@@ -1949,6 +1949,44 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => {}
             }
         }
+        // Generic Array → List conversion + a couple of frequently
+        // used array-shape methods.
+        if let klio_runtime::Value::Array { items, .. } = receiver {
+            match (name, args.len()) {
+                ("toList", 0) => {
+                    let v: Vec<klio_runtime::Value> = items.borrow().clone();
+                    return Ok(klio_runtime::Value::List {
+                        items: Rc::new(RefCell::new(v)),
+                        mutable: false,
+                        enum_class: None,
+                    });
+                }
+                ("toMutableList", 0) => {
+                    let v: Vec<klio_runtime::Value> = items.borrow().clone();
+                    return Ok(klio_runtime::Value::List {
+                        items: Rc::new(RefCell::new(v)),
+                        mutable: true,
+                        enum_class: None,
+                    });
+                }
+                ("asList", 0) => {
+                    let v: Vec<klio_runtime::Value> = items.borrow().clone();
+                    return Ok(klio_runtime::Value::List {
+                        items: Rc::new(RefCell::new(v)),
+                        mutable: false,
+                        enum_class: None,
+                    });
+                }
+                ("toSet", 0) => {
+                    let v: Vec<klio_runtime::Value> = items.borrow().clone();
+                    return Ok(klio_runtime::Value::Set {
+                        items: Rc::new(RefCell::new(v)),
+                        mutable: false,
+                    });
+                }
+                _ => {}
+            }
+        }
         // Indexed get/set on Array variants.
         if name == "get" && args.len() == 1 {
             if let klio_runtime::Value::Array { items, .. } = receiver {
