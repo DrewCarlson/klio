@@ -905,23 +905,6 @@ name = "klio-diagnostics-gen"
 version = "0.1.0"
 
 [[package]]
-name = "klio-interp"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "klio-ast",
- "klio-diagnostics",
- "klio-ir",
- "klio-lexer",
- "klio-pack",
- "klio-parser",
- "klio-runtime",
- "klio-span",
- "klio-stdlib",
- "klio-types",
-]
-
-[[package]]
 name = "klio-interp-ir"
 version = "0.1.0"
 dependencies = [
