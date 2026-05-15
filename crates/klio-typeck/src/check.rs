@@ -8311,6 +8311,28 @@ impl<'r> Checker<'r> {
                 }
                 Some(Type::String)
             }
+            // `public inline fun repeat(times: Int, action: (Int) ->
+            // Unit)`. Being inline, `action` inherits the caller's
+            // suspend context — `repeat(n) { delay() }` is legal
+            // inside a coroutine builder. Routing through
+            // `check_lambda_in_place` (which does not reset the
+            // suspend-context stack) preserves that inheritance,
+            // whereas the generic call path would force the lambda's
+            // context to the non-suspend param type.
+            "repeat" if args.len() == 2 => {
+                let _ = self.check_expr(&args[0], Some(&Type::Int));
+                if let Expr::Lambda { params, body, .. } = &args[1] {
+                    self.check_lambda_in_place(
+                        params,
+                        body,
+                        Some((Type::Int, None)),
+                        None,
+                    );
+                } else {
+                    let _ = self.check_expr(&args[1], None);
+                }
+                Some(Type::Unit)
+            }
             "check" | "require" if (1..=2).contains(&args.len()) => {
                 let cond = &args[0];
                 let _ = self.check_expr(cond, Some(&Type::Boolean));
