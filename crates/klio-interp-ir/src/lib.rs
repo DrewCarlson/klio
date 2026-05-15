@@ -1788,24 +1788,63 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         this: &klio_runtime::Value,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
-        // Receiver-typed lambda dispatch: when the lambda has a
-        // single param (the parser-injected implicit-`it` shape),
-        // pass the receiver as that param. \`it.foo()\` style scope
-        // fn bodies work this way; bodies that rely on bare-name
-        // resolution through `this` (\`apply { foo() }\`) still need
-        // the lower-time receiver-binding which lands when AST/IR
-        // grow a receiver-marker.
+        // Receiver-typed lambda dispatch: bind the receiver as the
+        // lambda's implicit `this` AND as the parser-injected `it`
+        // when the lambda has a single param. Bodies that use
+        // `it.foo()` see args[0] = receiver; bodies that use bare
+        // names like `add(1)` resolve through the captured `this`
+        // slot when the IR lower emitted CallMemberOrGlobal /
+        // LoadFromThisOrGlobal (it does for unresolved bare names
+        // in lambda bodies). The capture is overridden via the
+        // closure's captures cell before invoke.
         if let klio_runtime::Value::IrClosure { id, .. } = callable {
             let info = self.closures.get(*id as usize).cloned();
             if let Some(info) = info {
+                // Override the captured `this` slot, if present.
+                let prior_this: Option<klio_runtime::Value> = info
+                    .capture_names
+                    .iter()
+                    .position(|n| n == "this")
+                    .and_then(|idx| info.captures.borrow().get(idx).cloned());
+                if let Some(idx) = info
+                    .capture_names
+                    .iter()
+                    .position(|n| n == "this")
+                {
+                    let mut cap = info.captures.borrow_mut();
+                    if idx < cap.len() {
+                        cap[idx] = this.clone();
+                    } else {
+                        cap.resize(idx + 1, klio_runtime::Value::Null);
+                        cap[idx] = this.clone();
+                    }
+                }
                 let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(info.n_params);
                 if info.n_params >= 1 {
                     all.push(this.clone());
                     for a in args.iter() {
                         all.push(a.clone());
                     }
-                    return self.invoke_callable(callable, &all, out);
+                } else {
+                    all.extend_from_slice(args);
                 }
+                let result = self.invoke_callable(callable, &all, out);
+                // Restore prior this so a closure reused with
+                // different receivers preserves the original
+                // captured value between uses.
+                if let Some(idx) = info
+                    .capture_names
+                    .iter()
+                    .position(|n| n == "this")
+                {
+                    if let Some(prior) = prior_this {
+                        let mut cap = info.captures.borrow_mut();
+                        if idx < cap.len() {
+                            cap[idx] = prior;
+                        }
+                    }
+                }
+                return result;
             }
             return self.invoke_callable(callable, args, out);
         }
