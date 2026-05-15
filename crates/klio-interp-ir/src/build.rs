@@ -470,6 +470,26 @@ pub struct SecondaryCtorEntry {
 /// Top-level property initialisers + delegated properties are not
 /// yet wired through — that lands with the property accessor
 /// workstream.
+/// Drive `build_module` against multiple parsed files. All
+/// declarations from every file are concatenated into one
+/// synthesised `KotlinFile` and lowered as a single program. Used
+/// by `klio run a.kt b.kt …` to share class + function visibility
+/// across the sibling files without going through `klio-interp`'s
+/// module registry.
+pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
+    use klio_span::{FileId, Span};
+    let mut combined = KotlinFile {
+        package: None,
+        imports: Vec::new(),
+        decls: Vec::new(),
+        span: Span::new(FileId(0), 0, 0),
+    };
+    for f in files {
+        combined.decls.extend(f.decls.iter().cloned());
+    }
+    build_module(&combined)
+}
+
 pub fn build_module(file: &KotlinFile) -> BuiltModule {
     let mut module = klio_ir::Module::default();
 

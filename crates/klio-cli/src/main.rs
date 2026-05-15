@@ -1249,10 +1249,16 @@ fn run_module_files(paths: &[PathBuf]) -> ExitCode {
         let _ = tc.diagnostics.render(&map, std::io::stderr());
         return ExitCode::FAILURE;
     }
-    let mut interp = Interpreter::new().with_expr_types(tc.types.clone());
-    install_embedded_stdlib(&mut interp);
+    let _ = tc;
+    let built = klio_interp_ir::build::build_module_files(&asts);
+    let main_id = built.main;
+    let (mut vm, _main) = klio_interp_ir::Vm::from_built(built);
+    let Some(main_id) = main_id else {
+        eprintln!("runtime error: no main function in module");
+        return ExitCode::FAILURE;
+    };
     let mut stdout = klio_runtime::StdoutOutput;
-    match interp.run_module_ir(&asts, &mut stdout) {
+    match vm.run(main_id, &mut stdout) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("runtime error: {e}");
