@@ -479,6 +479,77 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => {}
             }
         }
+        // Data-class auto members (componentN, equals, hashCode,
+        // toString, copy) — synthesised structurally from the
+        // primary-ctor fields. Resolves before the IR method walk
+        // so user-declared override-method bodies still take
+        // precedence (we check find_method first).
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let is_data = inst.borrow().class.is_data;
+            let has_user_override = inst.borrow().class.methods.iter().any(|m| m.name == name);
+            if is_data && !has_user_override && args.is_empty() {
+                if let Some(rest) = name.strip_prefix("component") {
+                    if let Ok(n) = rest.parse::<usize>() {
+                        if n >= 1 {
+                            let i = inst.borrow();
+                            if let Some(p) = i.class.primary_params.get(n - 1) {
+                                if let Some(v) = i.get(&p.name) {
+                                    return Ok(v);
+                                }
+                            }
+                        }
+                    }
+                }
+                if name == "toString" {
+                    let i = inst.borrow();
+                    let mut s = String::new();
+                    s.push_str(&i.class.name);
+                    s.push('(');
+                    for (idx, p) in i.class.primary_params.iter().enumerate() {
+                        if idx > 0 {
+                            s.push_str(", ");
+                        }
+                        s.push_str(&p.name);
+                        s.push('=');
+                        let v = i.get(&p.name).unwrap_or(klio_runtime::Value::Null);
+                        s.push_str(&format!("{v}"));
+                    }
+                    s.push(')');
+                    return Ok(klio_runtime::Value::String(Rc::new(s)));
+                }
+                if name == "hashCode" {
+                    let i = inst.borrow();
+                    let mut h: i32 = 0;
+                    for p in &i.class.primary_params {
+                        let v = i.get(&p.name).unwrap_or(klio_runtime::Value::Null);
+                        h = h.wrapping_mul(31).wrapping_add(value_structural_hash(&v));
+                    }
+                    return Ok(klio_runtime::Value::new_int(h as i64));
+                }
+            }
+            if is_data && !has_user_override && args.len() == 1 && name == "equals" {
+                let i = inst.borrow();
+                let class_fqn = i.class.fqn.clone();
+                let same = matches!(&args[0],
+                    klio_runtime::Value::Instance(o) if o.borrow().class.fqn == class_fqn);
+                if !same {
+                    return Ok(klio_runtime::Value::Bool(false));
+                }
+                let klio_runtime::Value::Instance(o) = &args[0] else { unreachable!() };
+                let names: Vec<String> = i.class.primary_params.iter().map(|p| p.name.clone()).collect();
+                drop(i);
+                let lhs = inst.borrow();
+                let rhs = o.borrow();
+                for n in &names {
+                    let a = lhs.get(n).unwrap_or(klio_runtime::Value::Null);
+                    let b = rhs.get(n).unwrap_or(klio_runtime::Value::Null);
+                    if !klio_runtime::Value::structural_eq(&a, &b) {
+                        return Ok(klio_runtime::Value::Bool(false));
+                    }
+                }
+                return Ok(klio_runtime::Value::Bool(true));
+            }
+        }
         if let klio_runtime::Value::Instance(inst) = receiver {
             // Walk the IR class + its supertypes breadth-first
             // looking for a method matching `name`. The receiver's
@@ -670,6 +741,33 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }));
         Ok(klio_runtime::Value::Instance(inst))
     }
+}
+
+/// Structural value hash matching `Value::structural_eq`. Used by
+/// data-class auto `hashCode`. Mirrors klio-interp's helper.
+fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
+    use klio_runtime::Value::*;
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match v {
+        Unit => 0i32.hash(&mut h),
+        Null => 1i32.hash(&mut h),
+        Bool(b) => { 2i32.hash(&mut h); b.hash(&mut h); }
+        Char(c) => { 3i32.hash(&mut h); c.hash(&mut h); }
+        Int(i) => { 4i32.hash(&mut h); (*i as i64).hash(&mut h); }
+        Long(l) => { 4i32.hash(&mut h); l.hash(&mut h); }
+        Short(s) => { 4i32.hash(&mut h); (*s as i64).hash(&mut h); }
+        Byte(b) => { 4i32.hash(&mut h); (*b as i64).hash(&mut h); }
+        UInt(u) => { 4i32.hash(&mut h); (*u as i64).hash(&mut h); }
+        ULong(u) => { 4i32.hash(&mut h); u.hash(&mut h); }
+        UShort(u) => { 4i32.hash(&mut h); (*u as i64).hash(&mut h); }
+        UByte(u) => { 4i32.hash(&mut h); (*u as i64).hash(&mut h); }
+        Float(f) => { 5i32.hash(&mut h); f.to_bits().hash(&mut h); }
+        Double(d) => { 5i32.hash(&mut h); d.to_bits().hash(&mut h); }
+        String(s) => { 6i32.hash(&mut h); s.hash(&mut h); }
+        _ => 7i32.hash(&mut h),
+    }
+    h.finish() as i32
 }
 
 fn materialise_range_items(
