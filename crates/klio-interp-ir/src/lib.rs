@@ -400,6 +400,85 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Built-in iterator protocol for collections + ranges. The
+        // IR's for-loop lowers as `receiver.iterator()` plus a
+        // `hasNext` / `next` loop, so these have to dispatch
+        // natively rather than through the stdlib FQN table.
+        if name == "iterator" && args.is_empty() {
+            match receiver {
+                klio_runtime::Value::List { items, .. } => {
+                    let items_clone: Vec<klio_runtime::Value> = items.borrow().clone();
+                    return Ok(klio_runtime::Value::Iterator {
+                        items: Rc::new(RefCell::new(items_clone)),
+                        pos: Rc::new(RefCell::new(0)),
+                        prim: None,
+                    });
+                }
+                klio_runtime::Value::Set { items, .. } => {
+                    let items_clone: Vec<klio_runtime::Value> = items.borrow().clone();
+                    return Ok(klio_runtime::Value::Iterator {
+                        items: Rc::new(RefCell::new(items_clone)),
+                        pos: Rc::new(RefCell::new(0)),
+                        prim: None,
+                    });
+                }
+                klio_runtime::Value::Map { entries, .. } => {
+                    let entries_clone: Vec<klio_runtime::Value> = entries
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| klio_runtime::Value::MapEntry {
+                            key: Box::new(k.clone()),
+                            value: Box::new(v.clone()),
+                        })
+                        .collect();
+                    return Ok(klio_runtime::Value::Iterator {
+                        items: Rc::new(RefCell::new(entries_clone)),
+                        pos: Rc::new(RefCell::new(0)),
+                        prim: None,
+                    });
+                }
+                klio_runtime::Value::Range { start, end, step, kind } => {
+                    let items = materialise_range_items(*start, *end, *step, *kind);
+                    return Ok(klio_runtime::Value::Iterator {
+                        items: Rc::new(RefCell::new(items)),
+                        pos: Rc::new(RefCell::new(0)),
+                        prim: None,
+                    });
+                }
+                klio_runtime::Value::String(s) => {
+                    let items: Vec<klio_runtime::Value> = s
+                        .chars()
+                        .map(klio_runtime::Value::Char)
+                        .collect();
+                    return Ok(klio_runtime::Value::Iterator {
+                        items: Rc::new(RefCell::new(items)),
+                        pos: Rc::new(RefCell::new(0)),
+                        prim: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        if let klio_runtime::Value::Iterator { items, pos, .. } = receiver {
+            match name {
+                "hasNext" if args.is_empty() => {
+                    return Ok(klio_runtime::Value::Bool(*pos.borrow() < items.borrow().len()));
+                }
+                "next" if args.is_empty() => {
+                    let p = *pos.borrow();
+                    let v = items.borrow().get(p).cloned().ok_or_else(|| {
+                        klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
+                            fqn: Rc::new("kotlin.NoSuchElementException".to_string()),
+                            message: Some(Rc::new("iterator exhausted".into())),
+                            cause: None,
+                        })
+                    })?;
+                    *pos.borrow_mut() = p + 1;
+                    return Ok(v);
+                }
+                _ => {}
+            }
+        }
         if let klio_runtime::Value::Instance(inst) = receiver {
             // Walk the IR class + its supertypes breadth-first
             // looking for a method matching `name`. The receiver's
@@ -591,6 +670,43 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }));
         Ok(klio_runtime::Value::Instance(inst))
     }
+}
+
+fn materialise_range_items(
+    start: i64,
+    end: i64,
+    step: i64,
+    kind: klio_runtime::RangeKind,
+) -> Vec<klio_runtime::Value> {
+    use klio_runtime::{RangeKind, Value};
+    let mut out: Vec<Value> = Vec::new();
+    let mut cur = start;
+    if step > 0 {
+        while cur <= end {
+            match kind {
+                RangeKind::Int => out.push(Value::new_int(cur)),
+                RangeKind::Long => out.push(Value::Long(cur)),
+                RangeKind::Char => out.push(Value::Char(cur as u8 as char)),
+            }
+            cur = cur.saturating_add(step);
+            if cur > end && step > 0 {
+                break;
+            }
+        }
+    } else if step < 0 {
+        while cur >= end {
+            match kind {
+                RangeKind::Int => out.push(Value::new_int(cur)),
+                RangeKind::Long => out.push(Value::Long(cur)),
+                RangeKind::Char => out.push(Value::Char(cur as u8 as char)),
+            }
+            cur = cur.saturating_add(step);
+            if cur < end {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Stdlib `CallCtx` host adapter for native Vm dispatch. HOF
