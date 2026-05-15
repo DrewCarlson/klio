@@ -719,6 +719,29 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         self.classes
             .borrow_mut()
             .insert(class.name.name.clone(), def);
+        // Lower local-class methods into per-method side modules
+        // and stash in anon_methods so call_member can dispatch
+        // them. The synth class name is the user-declared name; if
+        // it collides with a top-level class, the local lookup
+        // wins (the runtime classes table is updated in-place).
+        for m in &class.members {
+            if let klio_ast::Decl::Function(f) = m {
+                if f.body.is_none() {
+                    continue;
+                }
+                let mut sub_module = klio_ir::Module::default();
+                let func = klio_ir::lower::lower_function(&mut sub_module, f);
+                let fid = klio_ir::FuncId(sub_module.funcs.len() as u32);
+                let mut placed = func;
+                placed.id = fid;
+                sub_module.funcs.push(placed);
+                let module_rc = Rc::new(sub_module);
+                self.anon_methods.borrow_mut().insert(
+                    (class.name.name.clone(), f.name.name.clone()),
+                    (module_rc, fid),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1344,31 +1367,29 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return Ok(klio_runtime::Value::Bool(true));
             }
         }
-        // Anon-class method dispatch: instances built via Host::build_object
-        // carry a class whose name starts with `$anon$`. Their methods
-        // are stored in the Vm's anon_methods side-table.
+        // Runtime-lowered method dispatch: anonymous-object instances
+        // (class name prefixed `$anon$`) and local classes registered
+        // via Inst::RegisterClass both stash methods in anon_methods.
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
-            if class_name.starts_with("$anon$") {
-                let key = (class_name, name.to_string());
-                let entry = self.anon_methods.borrow().get(&key).cloned();
-                if let Some((module_rc, fid)) = entry {
-                    let func = module_rc
-                        .funcs
-                        .get(fid.0 as usize)
-                        .cloned()
-                        .ok_or_else(|| {
-                            klio_ir::eval::EvalError::Type(format!(
-                                "anon method FuncId {} out of range",
-                                fid.0
-                            ))
-                        })?;
-                    let mut all: Vec<klio_runtime::Value> =
-                        Vec::with_capacity(args.len() + 1);
-                    all.push(receiver.clone());
-                    all.extend_from_slice(args);
-                    return klio_ir::eval::eval_with(&module_rc, &func, all, self);
-                }
+            let key = (class_name, name.to_string());
+            let entry = self.anon_methods.borrow().get(&key).cloned();
+            if let Some((module_rc, fid)) = entry {
+                let func = module_rc
+                    .funcs
+                    .get(fid.0 as usize)
+                    .cloned()
+                    .ok_or_else(|| {
+                        klio_ir::eval::EvalError::Type(format!(
+                            "anon method FuncId {} out of range",
+                            fid.0
+                        ))
+                    })?;
+                let mut all: Vec<klio_runtime::Value> =
+                    Vec::with_capacity(args.len() + 1);
+                all.push(receiver.clone());
+                all.extend_from_slice(args);
+                return klio_ir::eval::eval_with(&module_rc, &func, all, self);
             }
         }
         if let klio_runtime::Value::Instance(inst) = receiver {
