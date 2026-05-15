@@ -1066,6 +1066,17 @@ impl Interpreter {
         if expr_refers_to_this(init) {
             return None;
         }
+        // Bare-identifier reads can resolve through implicit `this`
+        // (an instance field shadowing a same-named global like
+        // `kotlin.math.max`). The IR thunk has no `this` binding, so
+        // a Path lowers as LoadGlobal and silently picks the wrong
+        // value. Let the tree walker — which has the live `this`
+        // chain — handle it.
+        if let klio_ast::Expr::Path { segments, .. } = init {
+            if segments.len() == 1 {
+                return None;
+            }
+        }
         let mut module = klio_ir::Module::default();
         let id = klio_ir::lower::lower_expr_as_thunk(&mut module, init, "__init__");
         let module_rc = std::rc::Rc::new(module);
