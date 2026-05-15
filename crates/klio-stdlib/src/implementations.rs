@@ -3823,9 +3823,16 @@ fn coll_list_last_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.joinToString")?;
-    // Slot map (after the receiver):
-    //   1 separator, 2 prefix, 3 postfix, 4 limit, 5 truncated.
-    // Named-arg reordering populates missing slots with `Value::Null`.
+    // Detect a trailing callable: a lambda/closure appearing as
+    // the last positional arg slots into `transform`, leaving the
+    // earlier args as separator/prefix/postfix/limit/truncated.
+    let mut effective: Vec<Value> = ctx.args[1..].to_vec();
+    let mut transform_slot: Option<Value> = None;
+    if let Some(last) = effective.last() {
+        if matches!(last, Value::IrClosure { .. } | Value::Lambda { .. }) {
+            transform_slot = effective.pop();
+        }
+    }
     fn opt_str<'a>(args: &'a [Value], idx: usize, default: &'a str) -> String {
         match args.get(idx) {
             None | Some(Value::Null) => default.to_string(),
@@ -3833,24 +3840,34 @@ fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Some(other) => format!("{other}"),
         }
     }
-    let sep = opt_str(ctx.args, 1, ", ");
-    let prefix = opt_str(ctx.args, 2, "");
-    let postfix = opt_str(ctx.args, 3, "");
-    let limit: i64 = match ctx.args.get(4) {
+    let sep = opt_str(&effective, 0, ", ");
+    let prefix = opt_str(&effective, 1, "");
+    let postfix = opt_str(&effective, 2, "");
+    let limit: i64 = match effective.get(3) {
         None | Some(Value::Null) => -1,
         Some(v) => v.as_i64().unwrap_or(-1),
     };
-    let truncated = opt_str(ctx.args, 5, "...");
-    let mut out = String::new();
-    out.push_str(&prefix);
-    let items = it.borrow();
+    let truncated = opt_str(&effective, 4, "...");
+    let items: Vec<Value> = it.borrow().clone();
     let n = items.len();
     let take = if limit < 0 { n } else { (limit as usize).min(n) };
+    let mut out = String::new();
+    out.push_str(&prefix);
+    let CallCtx { out: writer, host, .. } = ctx;
     for (i, v) in items.iter().enumerate().take(take) {
         if i > 0 {
             out.push_str(&sep);
         }
-        out.push_str(&format!("{v}"));
+        let piece = if let Some(t) = &transform_slot {
+            let r = host.invoke_callable(t, std::slice::from_ref(v), *writer)?;
+            match r {
+                Value::String(s) => (*s).clone(),
+                other => format!("{other}"),
+            }
+        } else {
+            format!("{v}")
+        };
+        out.push_str(&piece);
     }
     if limit >= 0 && n > take {
         if take > 0 {
