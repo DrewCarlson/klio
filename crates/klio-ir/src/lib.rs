@@ -488,6 +488,49 @@ pub struct Module {
     /// another tailrec function whose body hasn't been lowered yet.
     #[serde(default)]
     pub tailrec_fn_names: Vec<String>,
+    /// Module-scoped runtime metadata: per-class/per-function side
+    /// tables that the IR build phase produces and the Vm consults
+    /// at dispatch time. Living on the Module (instead of separate
+    /// Vm fields) lets pack-loading merge metadata cleanly and
+    /// keeps the Vm's state focused on per-run frames.
+    #[serde(default)]
+    pub registry: ModuleRegistry,
+}
+
+/// Module-scoped side tables consumed by the Vm at dispatch time.
+/// Populated by `klio-interp-ir`'s build pass; serialized into pack
+/// files so a pre-built pack can ship its registry alongside the
+/// frozen IR module.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModuleRegistry {
+    /// Names of `object` singletons. The Vm allocates one instance
+    /// per name at startup and publishes it as a global so
+    /// bare-name reads resolve.
+    #[serde(default)]
+    pub object_names: Vec<String>,
+    /// Outer-class → companion-singleton global name. Reads on
+    /// `Foo.X` fall through to the companion instance when `X` is
+    /// not a member of `Foo` itself.
+    #[serde(default)]
+    pub companion_singletons: std::collections::HashMap<String, String>,
+    /// Inner class → outer class name. Resolves `this@Outer` and
+    /// outer-chain field reads for nested classes lifted to top
+    /// level.
+    #[serde(default)]
+    pub enclosing_class: std::collections::HashMap<String, String>,
+    /// Per-function type-parameter names (in source order). Used
+    /// by reified-call dispatch to bind `T` → `Value::Class(arg)`
+    /// as a global for the call's lifetime.
+    #[serde(default)]
+    pub func_type_params: std::collections::HashMap<FuncId, Vec<String>>,
+    /// Top-level property names declared with `by <delegate>`.
+    /// Reads/writes route through the stored delegate's
+    /// `getValue` / `setValue` methods.
+    #[serde(default)]
+    pub top_level_delegated_props: std::collections::HashSet<String>,
+    /// Body-property `(class, prop)` pairs declared with `by`.
+    #[serde(default)]
+    pub delegated_body_props: std::collections::HashSet<(String, String)>,
 }
 
 impl Module {

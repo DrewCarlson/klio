@@ -1544,6 +1544,18 @@ fn build_module_with_overrides(
         }
     }
 
+    // Materialise the module-scoped runtime registry the Vm reads
+    // at dispatch time. Build populates the same data as the loose
+    // BuiltModule fields; the long-term plan is to drop those once
+    // every dispatch site reads through `module.registry` directly.
+    module.registry = klio_ir::ModuleRegistry {
+        object_names: object_names.clone(),
+        companion_singletons: companion_singletons.clone(),
+        enclosing_class: enclosing_class.clone(),
+        func_type_params: func_type_params.clone(),
+        top_level_delegated_props: top_level_delegated_props.clone(),
+        delegated_body_props: delegated_body_props.clone(),
+    };
     BuiltModule {
         module: Rc::new(module),
         classes,

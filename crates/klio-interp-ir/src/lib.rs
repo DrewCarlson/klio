@@ -68,15 +68,6 @@ pub struct Vm {
     /// Top-level property initialiser FuncIds. Run at Vm::run start
     /// so globals see the initial values.
     top_level_props: Vec<(String, klio_ir::FuncId)>,
-    /// Names of `object Foo { … }` singletons. Vm::run allocates one
-    /// instance per name at startup (using the synthesised ClassDef in
-    /// `classes`) and inserts it into globals so bare-name `Foo`
-    /// references resolve.
-    object_names: Vec<String>,
-    /// Outer-class → companion singleton global name. Vm get_field /
-    /// set_field on a `Value::Class` falls back to the companion
-    /// instance's field when the name isn't on the class itself.
-    companion_singletons: std::collections::HashMap<String, String>,
     /// Enum-entry ctor-arg thunks to evaluate at startup.
     enum_entry_arg_inits: Vec<(String, String, Vec<klio_ir::FuncId>)>,
     /// Per-class secondary-ctor dispatch entries.
@@ -88,19 +79,6 @@ pub struct Vm {
     /// Per-function default-arg thunk table.
     func_defaults:
         std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
-    /// Inner class → outer class name. Used to walk enclosing
-    /// chains for nested-companion field reads.
-    enclosing_class: std::collections::HashMap<String, String>,
-    /// Per-function type parameter names. The Vm consults this on
-    /// reified-typed calls to bind `T` → `Value::Class(arg)` as a
-    /// global for the duration of the call.
-    func_type_params: std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
-    /// Top-level property names declared with `by <delegate>`. Reads
-    /// and writes route through the stored delegate's
-    /// `getValue` / `setValue` operator methods.
-    top_level_delegated_props: std::collections::HashSet<String>,
-    /// Body-property `(class, prop)` pairs declared with `by`.
-    delegated_body_props: std::collections::HashSet<(String, String)>,
     /// Default outer instance to attach to locally-registered
     /// classes. `register_class_captured` snapshots `this` when
     /// the local class is declared inside a method body so the
@@ -173,16 +151,10 @@ impl Vm {
             extension_props: std::collections::HashMap::new(),
             extension_prop_setters: std::collections::HashMap::new(),
             top_level_props: Vec::new(),
-            object_names: Vec::new(),
-            companion_singletons: std::collections::HashMap::new(),
             enum_entry_arg_inits: Vec::new(),
             secondary_ctors: std::collections::HashMap::new(),
             class_delegates: std::collections::HashMap::new(),
             func_defaults: std::collections::HashMap::new(),
-            enclosing_class: std::collections::HashMap::new(),
-            func_type_params: std::collections::HashMap::new(),
-            top_level_delegated_props: std::collections::HashSet::new(),
-            delegated_body_props: std::collections::HashSet::new(),
             class_default_outer: Rc::new(RefCell::new(std::collections::HashMap::new())),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
@@ -212,16 +184,10 @@ impl Vm {
         vm.extension_props = built.extension_props;
         vm.extension_prop_setters = built.extension_prop_setters;
         vm.top_level_props = built.top_level_props;
-        vm.object_names = built.object_names;
-        vm.companion_singletons = built.companion_singletons;
         vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
         vm.secondary_ctors = built.secondary_ctors;
         vm.class_delegates = built.class_delegates;
         vm.func_defaults = built.func_defaults;
-        vm.enclosing_class = built.enclosing_class;
-        vm.func_type_params = built.func_type_params;
-        vm.top_level_delegated_props = built.top_level_delegated_props;
-        vm.delegated_body_props = built.delegated_body_props;
         // Pre-populated enum-entry override methods land in the
         // same anon_methods side-table the Vm consults for
         // anon-object + local-class methods.
@@ -266,21 +232,21 @@ impl Vm {
                     extension_props: &self.extension_props,
                     extension_prop_setters: &self.extension_prop_setters,
                     anon_methods: Rc::clone(&self.anon_methods),
-                    companion_singletons: &self.companion_singletons,
+                    companion_singletons: &self.module.registry.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
-                    enclosing_class: &self.enclosing_class,
-                    func_type_params: &self.func_type_params,
-                    top_level_delegated_props: &self.top_level_delegated_props,
-                    delegated_body_props: &self.delegated_body_props,
+                    enclosing_class: &self.module.registry.enclosing_class,
+                    func_type_params: &self.module.registry.func_type_params,
+                    top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+                    delegated_body_props: &self.module.registry.delegated_body_props,
                     installed_bindings: Rc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
                 let mut v = klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
                     .map_err(VmError::from)?;
-                if self.top_level_delegated_props.contains(name) {
+                if self.module.registry.top_level_delegated_props.contains(name) {
                     if let klio_runtime::Value::Instance(ref inst) = v {
                         let dcls_name = inst.borrow().class.name.clone();
                         let has_provide = module
@@ -362,14 +328,14 @@ impl Vm {
                         extension_props: &self.extension_props,
                     extension_prop_setters: &self.extension_prop_setters,
                         anon_methods: Rc::clone(&self.anon_methods),
-                        companion_singletons: &self.companion_singletons,
+                        companion_singletons: &self.module.registry.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
-                    enclosing_class: &self.enclosing_class,
-                    func_type_params: &self.func_type_params,
-                    top_level_delegated_props: &self.top_level_delegated_props,
-                    delegated_body_props: &self.delegated_body_props,
+                    enclosing_class: &self.module.registry.enclosing_class,
+                    func_type_params: &self.module.registry.func_type_params,
+                    top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+                    delegated_body_props: &self.module.registry.delegated_body_props,
                     installed_bindings: Rc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                         closures: &mut self.closures,
@@ -388,7 +354,7 @@ impl Vm {
         // alongside regular classes; the singleton runs that class's
         // primary ctor (parent chain + body props + init blocks)
         // with zero args.
-        let object_names: Vec<String> = self.object_names.clone();
+        let object_names: Vec<String> = self.module.registry.object_names.clone();
         for obj_name in &object_names {
             let class_id = match module.class_id(obj_name) {
                 Some(id) => id,
@@ -410,14 +376,14 @@ impl Vm {
                     extension_props: &self.extension_props,
                     extension_prop_setters: &self.extension_prop_setters,
                     anon_methods: Rc::clone(&self.anon_methods),
-                    companion_singletons: &self.companion_singletons,
+                    companion_singletons: &self.module.registry.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
-                    enclosing_class: &self.enclosing_class,
-                    func_type_params: &self.func_type_params,
-                    top_level_delegated_props: &self.top_level_delegated_props,
-                    delegated_body_props: &self.delegated_body_props,
+                    enclosing_class: &self.module.registry.enclosing_class,
+                    func_type_params: &self.module.registry.func_type_params,
+                    top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+                    delegated_body_props: &self.module.registry.delegated_body_props,
                     installed_bindings: Rc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
@@ -461,14 +427,14 @@ impl Vm {
             extension_props: &self.extension_props,
             extension_prop_setters: &self.extension_prop_setters,
             anon_methods: Rc::clone(&self.anon_methods),
-            companion_singletons: &self.companion_singletons,
+            companion_singletons: &self.module.registry.companion_singletons,
             secondary_ctors: &self.secondary_ctors,
             class_delegates: &self.class_delegates,
             func_defaults: &self.func_defaults,
-            enclosing_class: &self.enclosing_class,
-            func_type_params: &self.func_type_params,
-                    top_level_delegated_props: &self.top_level_delegated_props,
-                    delegated_body_props: &self.delegated_body_props,
+            enclosing_class: &self.module.registry.enclosing_class,
+            func_type_params: &self.module.registry.func_type_params,
+                    top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+                    delegated_body_props: &self.module.registry.delegated_body_props,
                     installed_bindings: Rc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut self.closures,
@@ -940,14 +906,14 @@ impl<'a> VmHost<'a> {
             extension_props: self.extension_props,
             extension_prop_setters: self.extension_prop_setters,
             anon_methods: Rc::clone(&self.anon_methods),
-            companion_singletons: self.companion_singletons,
+            companion_singletons: &self.module.registry.companion_singletons,
             secondary_ctors: self.secondary_ctors,
             class_delegates: self.class_delegates,
             func_defaults: self.func_defaults,
-            enclosing_class: self.enclosing_class,
-            func_type_params: self.func_type_params,
-            top_level_delegated_props: self.top_level_delegated_props,
-            delegated_body_props: self.delegated_body_props,
+            enclosing_class: &self.module.registry.enclosing_class,
+            func_type_params: &self.module.registry.func_type_params,
+            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+            delegated_body_props: &self.module.registry.delegated_body_props,
             installed_bindings: Rc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             instance_id_counter: &mut *self.instance_id_counter,
@@ -973,7 +939,7 @@ impl<'a> VmHost<'a> {
 impl<'a> klio_ir::eval::Host for VmHost<'a> {
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         let cached = self.globals.borrow().lookup(name);
-        if self.top_level_delegated_props.contains(name) {
+        if self.module.registry.top_level_delegated_props.contains(name) {
             if let Some(v) = cached.clone() {
                 if matches!(v, klio_runtime::Value::Instance(_)) {
                     let prop_ref = klio_runtime::Value::PropertyRef {
@@ -1185,7 +1151,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         value: klio_runtime::Value,
     ) -> Result<(), klio_ir::eval::EvalError> {
-        if self.top_level_delegated_props.contains(name) {
+        if self.module.registry.top_level_delegated_props.contains(name) {
             let existing = self.globals.borrow().lookup(name);
             if let Some(d) = existing {
                 if matches!(d, klio_runtime::Value::Instance(_)) {
@@ -1552,7 +1518,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Enum entries (`Color.RED`) take precedence above; reaching
         // here means the name isn't an entry.
         if let klio_runtime::Value::Class(cls) = receiver {
-            if let Some(comp_name) = self.companion_singletons.get(&cls.name).cloned() {
+            if let Some(comp_name) = self.module.registry.companion_singletons.get(&cls.name).cloned() {
                 // `Counter.Factory` — the user-declared companion
                 // name resolves to the companion singleton itself.
                 let suffix = format!("$Companion${}", name);
@@ -1630,7 +1596,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
                 "isCompanion" => {
                     return Ok(klio_runtime::Value::Bool(
-                        self.companion_singletons.values().any(|v| v == &cls.name),
+                        self.module.registry.companion_singletons.values().any(|v| v == &cls.name),
                     ));
                 }
                 "isInner" => return Ok(klio_runtime::Value::Bool(cls.is_inner)),
@@ -1888,7 +1854,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 if !visited.insert(c.name.clone()) {
                     continue;
                 }
-                if let Some(comp_name) = self.companion_singletons.get(&c.name).cloned() {
+                if let Some(comp_name) = self.module.registry.companion_singletons.get(&c.name).cloned() {
                     let singleton = self.globals.borrow().lookup(&comp_name);
                     if let Some(singleton) = singleton {
                         if let klio_runtime::Value::Instance(cinst) = &singleton {
@@ -2035,7 +2001,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Companion forwarding for writes: `Foo.count = 1` routes
         // to the companion singleton instance's field.
         if let klio_runtime::Value::Class(cls) = receiver {
-            if let Some(comp_name) = self.companion_singletons.get(&cls.name).cloned() {
+            if let Some(comp_name) = self.module.registry.companion_singletons.get(&cls.name).cloned() {
                 let singleton = self.globals.borrow().lookup(&comp_name);
                 if let Some(singleton) = singleton {
                     if let klio_runtime::Value::Instance(_) = &singleton {
@@ -2155,7 +2121,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             continue;
                         }
                         if let Some(comp_name) =
-                            self.companion_singletons.get(&c.name).cloned()
+                            self.module.registry.companion_singletons.get(&c.name).cloned()
                         {
                             let singleton = self.globals.borrow().lookup(&comp_name);
                             if let Some(singleton) = singleton {
@@ -3527,7 +3493,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Companion forwarding for method calls: `Foo.parse("…")`
         // routes through the companion singleton's method.
         if let klio_runtime::Value::Class(cls) = receiver {
-            if let Some(comp_name) = self.companion_singletons.get(&cls.name).cloned() {
+            if let Some(comp_name) = self.module.registry.companion_singletons.get(&cls.name).cloned() {
                 let singleton = self.globals.borrow().lookup(&comp_name);
                 if let Some(singleton) = singleton {
                     if matches!(singleton, klio_runtime::Value::Instance(_)) {
@@ -5268,14 +5234,14 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             extension_props: self.extension_props,
             extension_prop_setters: self.extension_prop_setters,
             anon_methods: Rc::clone(&self.anon_methods),
-                    companion_singletons: self.companion_singletons,
+                    companion_singletons: &self.module.registry.companion_singletons,
                     secondary_ctors: self.secondary_ctors,
                     class_delegates: self.class_delegates,
                     func_defaults: self.func_defaults,
-                    enclosing_class: self.enclosing_class,
-                    func_type_params: self.func_type_params,
-            top_level_delegated_props: self.top_level_delegated_props,
-            delegated_body_props: self.delegated_body_props,
+                    enclosing_class: &self.module.registry.enclosing_class,
+                    func_type_params: &self.module.registry.func_type_params,
+            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+            delegated_body_props: &self.module.registry.delegated_body_props,
             installed_bindings: Rc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut *self.closures,
@@ -5325,14 +5291,14 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             extension_props: self.extension_props,
             extension_prop_setters: self.extension_prop_setters,
             anon_methods: Rc::clone(&self.anon_methods),
-                companion_singletons: self.companion_singletons,
+                companion_singletons: &self.module.registry.companion_singletons,
                 secondary_ctors: self.secondary_ctors,
                 class_delegates: self.class_delegates,
                 func_defaults: self.func_defaults,
-                enclosing_class: self.enclosing_class,
-                func_type_params: self.func_type_params,
-            top_level_delegated_props: self.top_level_delegated_props,
-            delegated_body_props: self.delegated_body_props,
+                enclosing_class: &self.module.registry.enclosing_class,
+                func_type_params: &self.module.registry.func_type_params,
+            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+            delegated_body_props: &self.module.registry.delegated_body_props,
             installed_bindings: Rc::clone(&self.installed_bindings),
                 class_default_outer: Rc::clone(&self.class_default_outer),
                 instance_id_counter: &mut *self.instance_id_counter,
@@ -5457,14 +5423,14 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             extension_props: self.extension_props,
             extension_prop_setters: self.extension_prop_setters,
             anon_methods: Rc::clone(&self.anon_methods),
-            companion_singletons: self.companion_singletons,
+            companion_singletons: &self.module.registry.companion_singletons,
             secondary_ctors: self.secondary_ctors,
             class_delegates: self.class_delegates,
             func_defaults: self.func_defaults,
-            enclosing_class: self.enclosing_class,
-            func_type_params: self.func_type_params,
-            top_level_delegated_props: self.top_level_delegated_props,
-            delegated_body_props: self.delegated_body_props,
+            enclosing_class: &self.module.registry.enclosing_class,
+            func_type_params: &self.module.registry.func_type_params,
+            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+            delegated_body_props: &self.module.registry.delegated_body_props,
             installed_bindings: Rc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut *self.closures,
