@@ -972,12 +972,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if let Some(v) = inst.borrow().get(name) {
                 return Ok(v);
             }
-            // Walk the class's parent chain looking for a companion
-            // singleton that owns the field. Instance methods
-            // referencing companion members lower as `this.X`, which
-            // lands here after the instance's own fields miss.
-            let mut cur: Option<Rc<klio_runtime::ClassDef>> = Some(inst.borrow().class.clone());
-            while let Some(c) = cur {
+            // Walk the class's parent + interface chain looking for
+            // a companion singleton that owns the field. Instance
+            // methods referencing companion members lower as
+            // `this.X`, which lands here after the instance's own
+            // fields miss.
+            let mut queue: Vec<Rc<klio_runtime::ClassDef>> =
+                vec![inst.borrow().class.clone()];
+            let mut visited: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            while let Some(c) = queue.pop() {
+                if !visited.insert(c.name.clone()) {
+                    continue;
+                }
                 if let Some(comp_name) = self.companion_singletons.get(&c.name).cloned() {
                     let singleton = self.globals.borrow().lookup(&comp_name);
                     if let Some(singleton) = singleton {
@@ -988,7 +995,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         }
                     }
                 }
-                cur = c.parent.borrow().clone();
+                if let Some(p) = c.parent.borrow().clone() {
+                    queue.push(p);
+                }
+                for ifc in c.interfaces.borrow().iter() {
+                    queue.push(Rc::clone(ifc));
+                }
             }
             // Nested-class fallback: a method body referencing
             // `State` (a lifted nested class declared inside the
