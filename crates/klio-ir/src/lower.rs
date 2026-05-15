@@ -2325,7 +2325,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let param_idents: Vec<klio_ast::Ident> =
                 params.iter().map(|p| p.name.clone()).collect();
             let outer_names: std::collections::HashSet<String> = b.visible_names();
-            let (_body_func, captured_names) = lower_lambda_body_capturing(
+            let (body_func, captured_names) = lower_lambda_body_capturing(
                 b.module, &param_idents, &body_block, outer_names,
             );
             let captures: Vec<Reg> = captured_names
@@ -2340,7 +2340,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 captures,
                 captured_names,
                 absorb_return: true,
-                body_func: None,
+                body_func: Some(body_func),
             });
             dst
         }
@@ -2855,7 +2855,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                 let outer_names: std::collections::HashSet<String> = b.visible_names();
                 let param_idents: Vec<klio_ast::Ident> =
                     f.params.iter().map(|p| p.name.clone()).collect();
-                let (_body_func, captured_names) = lower_lambda_body_capturing(
+                let (body_func, captured_names) = lower_lambda_body_capturing(
                     b.module,
                     &param_idents,
                     &body,
@@ -2875,7 +2875,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     captures,
                     captured_names,
                     absorb_return: true,
-                    body_func: None,
+                    body_func: Some(body_func),
                 });
                 b.bind(f.name.name.clone(), dst);
             }
