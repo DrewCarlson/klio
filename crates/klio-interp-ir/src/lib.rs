@@ -43,6 +43,11 @@ pub struct Vm {
     /// the named property.
     instance_prop_getters:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Custom setter FuncIds. `Vm::set_field` invokes one when the
+    /// receiver's runtime ClassDef declares a custom setter for
+    /// the named property.
+    instance_prop_setters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// Per-class parent-ctor arg thunks. `new_instance` invokes
     /// each thunk with the class's own primary args to compute the
     /// values passed to the parent's primary ctor.
@@ -119,6 +124,7 @@ impl Vm {
             classes: Rc::new(RefCell::new(std::collections::HashMap::new())),
             body_prop_inits: std::collections::HashMap::new(),
             instance_prop_getters: std::collections::HashMap::new(),
+            instance_prop_setters: std::collections::HashMap::new(),
             parent_ctor_args: std::collections::HashMap::new(),
             init_blocks: std::collections::HashMap::new(),
             extension_props: std::collections::HashMap::new(),
@@ -138,6 +144,7 @@ impl Vm {
         vm.classes = Rc::new(RefCell::new(built.classes));
         vm.body_prop_inits = built.body_prop_inits;
         vm.instance_prop_getters = built.instance_prop_getters;
+        vm.instance_prop_setters = built.instance_prop_setters;
         vm.parent_ctor_args = built.parent_ctor_args;
         vm.init_blocks = built.init_blocks;
         vm.extension_props = built.extension_props;
@@ -173,6 +180,7 @@ impl Vm {
                     classes: Rc::clone(&self.classes),
                     body_prop_inits: &self.body_prop_inits,
                     instance_prop_getters: &self.instance_prop_getters,
+                    instance_prop_setters: &self.instance_prop_setters,
                     parent_ctor_args: &self.parent_ctor_args,
                     init_blocks: &self.init_blocks,
                     extension_props: &self.extension_props,
@@ -206,6 +214,7 @@ impl Vm {
                     classes: Rc::clone(&self.classes),
                     body_prop_inits: &self.body_prop_inits,
                     instance_prop_getters: &self.instance_prop_getters,
+                    instance_prop_setters: &self.instance_prop_setters,
                     parent_ctor_args: &self.parent_ctor_args,
                     init_blocks: &self.init_blocks,
                     extension_props: &self.extension_props,
@@ -231,6 +240,7 @@ impl Vm {
             classes: Rc::clone(&self.classes),
             body_prop_inits: &self.body_prop_inits,
             instance_prop_getters: &self.instance_prop_getters,
+            instance_prop_setters: &self.instance_prop_setters,
             parent_ctor_args: &self.parent_ctor_args,
             init_blocks: &self.init_blocks,
             extension_props: &self.extension_props,
@@ -271,6 +281,8 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_prop_getters:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    instance_prop_setters:
+        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     parent_ctor_args:
         &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     init_blocks: &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
@@ -303,6 +315,7 @@ impl<'a> VmHost<'a> {
             classes: Rc::clone(&self.classes),
             body_prop_inits: self.body_prop_inits,
             instance_prop_getters: self.instance_prop_getters,
+            instance_prop_setters: self.instance_prop_setters,
             parent_ctor_args: self.parent_ctor_args,
             init_blocks: self.init_blocks,
             extension_props: self.extension_props,
@@ -506,6 +519,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Backing-field bypass: getter / setter bodies that reference
+        // `field` lower into a member read on this synthetic name.
+        // Route straight to the raw instance slot to break recursion.
+        if let Some(raw) = name.strip_prefix("__klio_field__") {
+            if let klio_runtime::Value::Instance(inst) = receiver {
+                if let Some(v) = inst.borrow().get(raw) {
+                    return Ok(v);
+                }
+                return Ok(klio_runtime::Value::Null);
+            }
+        }
         // Custom getter — invoke its IR FuncId with the receiver
         // bound as `this`. Wins over the plain field read so a
         // `val full: String get() = "$first $last"` shape evaluates
@@ -684,8 +708,38 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         value: klio_runtime::Value,
     ) -> Result<(), klio_ir::eval::EvalError> {
+        let bypass_setter = name.starts_with("__klio_field__");
+        let real_name = name.strip_prefix("__klio_field__").unwrap_or(name);
         if let klio_runtime::Value::Instance(inst) = receiver {
-            inst.borrow_mut().define(name, value);
+            if !bypass_setter {
+                let class_name = inst.borrow().class.name.clone();
+                if let Some(fid) = self
+                    .instance_prop_setters
+                    .get(&(class_name, real_name.to_string()))
+                    .copied()
+                {
+                    let func = self
+                        .module
+                        .funcs
+                        .get(fid.0 as usize)
+                        .cloned()
+                        .ok_or_else(|| {
+                            klio_ir::eval::EvalError::Type(format!(
+                                "setter FuncId {} out of range",
+                                fid.0
+                            ))
+                        })?;
+                    let module = Rc::clone(&self.module);
+                    klio_ir::eval::eval_with(
+                        &module,
+                        &func,
+                        vec![receiver.clone(), value],
+                        self,
+                    )?;
+                    return Ok(());
+                }
+            }
+            inst.borrow_mut().define(real_name, value);
             return Ok(());
         }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
@@ -1991,6 +2045,8 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_prop_getters:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    instance_prop_setters:
+        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     parent_ctor_args:
         &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     init_blocks: &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
@@ -2054,6 +2110,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     classes: Rc::clone(&self.classes),
                     body_prop_inits: self.body_prop_inits,
                     instance_prop_getters: self.instance_prop_getters,
+                    instance_prop_setters: self.instance_prop_setters,
                     parent_ctor_args: self.parent_ctor_args,
             init_blocks: self.init_blocks,
             extension_props: self.extension_props,
@@ -2093,6 +2150,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 classes: Rc::clone(&self.classes),
                 body_prop_inits: self.body_prop_inits,
                 instance_prop_getters: self.instance_prop_getters,
+                instance_prop_setters: self.instance_prop_setters,
                 parent_ctor_args: self.parent_ctor_args,
             init_blocks: self.init_blocks,
             extension_props: self.extension_props,

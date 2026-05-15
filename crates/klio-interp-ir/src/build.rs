@@ -34,12 +34,17 @@ fn walk_field(e: &mut Expr, prop: &str, dummy: klio_span::Span) {
     let mut replace = None;
     if let Expr::Path { segments, .. } = e {
         if segments.len() == 1 && segments[0].name == "field" {
+            // Rewrite the raw `field` reference to a synthetic member
+            // access on `this` that names the backing slot. Vm
+            // get_field / set_field detect the `__klio_field__`
+            // prefix and skip the custom-getter/setter dispatch.
+            let backing = format!("__klio_field__{prop}");
             replace = Some(Expr::Member {
                 receiver: Box::new(Expr::Path {
                     segments: vec![Ident { name: "this".into(), span: dummy }],
                     span: dummy,
                 }),
-                name: Ident { name: prop.to_string(), span: dummy },
+                name: Ident { name: backing, span: dummy },
                 safe: false,
                 span: dummy,
             });
@@ -184,6 +189,11 @@ pub struct BuiltModule {
     /// `Vm::get_field` is invoked for a custom-getter property.
     pub instance_prop_getters:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Custom-setter FuncIds, keyed the same as getters. The Vm
+    /// invokes the setter (`set(value) { … }`) when set_field
+    /// targets a property whose class declares one.
+    pub instance_prop_setters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// Parent-ctor argument thunks per class. Each entry is the
     /// list of FuncIds — one per parent ctor arg — that take the
     /// class's own primary-ctor params and return the value passed
@@ -313,6 +323,8 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         std::collections::HashMap::new();
     let mut instance_prop_getters: std::collections::HashMap<(String, String), klio_ir::FuncId> =
         std::collections::HashMap::new();
+    let mut instance_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId> =
+        std::collections::HashMap::new();
     for d in decls {
         if let Decl::Class(c) = d {
             // Collect own-member names so accessor bodies' bare
@@ -388,6 +400,41 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                         };
                         if let Some(fid) = fid {
                             instance_prop_getters
+                                .insert((c.name.name.clone(), p.name.name.clone()), fid);
+                        }
+                    }
+                    if let Some(setter) = &p.setter {
+                        let setter_param_name = setter
+                            .params
+                            .first()
+                            .map(|n| n.name.clone())
+                            .unwrap_or_else(|| "value".to_string());
+                        let fid = match &setter.body {
+                            klio_ast::FunctionBody::Expr(body) => {
+                                let rewritten = substitute_field_with_this(&p.name.name, body);
+                                Some(klio_ir::lower::lower_accessor_expr(
+                                    &mut module,
+                                    &c.name.name,
+                                    &own_members,
+                                    &["this", setter_param_name.as_str()],
+                                    &rewritten,
+                                    &format!("__set_{}_{}", c.name.name, p.name.name),
+                                ))
+                            }
+                            klio_ast::FunctionBody::Block(blk) => {
+                                let rewritten = rewrite_block_field(blk, &p.name.name);
+                                Some(klio_ir::lower::lower_accessor_block(
+                                    &mut module,
+                                    &c.name.name,
+                                    &own_members,
+                                    &["this", setter_param_name.as_str()],
+                                    &rewritten,
+                                    &format!("__set_{}_{}", c.name.name, p.name.name),
+                                ))
+                            }
+                        };
+                        if let Some(fid) = fid {
+                            instance_prop_setters
                                 .insert((c.name.name.clone(), p.name.name.clone()), fid);
                         }
                     }
@@ -684,6 +731,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         classes,
         body_prop_inits,
         instance_prop_getters,
+        instance_prop_setters,
         parent_ctor_args,
         init_blocks,
         top_level_props,
