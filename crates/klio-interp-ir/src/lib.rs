@@ -781,6 +781,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
                 cur = c.parent.borrow().clone();
             }
+            // Nested-class fallback: a method body referencing
+            // `State` (a lifted nested class declared inside the
+            // outer) lowers as `this.State`. Resolve through the
+            // global class table when the instance has no field.
+            if let Some(def) = self.classes.borrow().get(name).cloned() {
+                return Ok(klio_runtime::Value::Class(def));
+            }
+            // Top-level global / module-scoped fallback. Mirrors the
+            // `LoadFromThisOrGlobal` Inst path for plain `GetField`s
+            // emitted on `this`.
+            if let Some(v) = self.globals.borrow().lookup(name) {
+                return Ok(v);
+            }
         }
         // Stdlib property read on a built-in type — `"abc".length`,
         // `arr.size`, etc. The stdlib registers these as 1-arg

@@ -292,6 +292,12 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                             object_names.push(comp_name.clone());
                             all_decls.push(Decl::Class(renamed));
                             companion_singletons.insert(c.name.name.clone(), comp_name);
+                        } else if !nested.is_inner {
+                            // Plain nested class — lift to top
+                            // level so bare-name access inside the
+                            // outer class resolves through the
+                            // module's class table.
+                            all_decls.push(Decl::Class(nested.clone()));
                         }
                     }
                 }
