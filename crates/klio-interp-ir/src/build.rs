@@ -452,6 +452,22 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                             &format!("__init_prop_{}_{}", c.name.name, p.name.name),
                         );
                         body_prop_inits.insert((c.name.name.clone(), p.name.name.clone()), fid);
+                    } else if let Some(delegate) = &p.delegate {
+                        // Instance property `val x: T by <expr>`:
+                        // evaluate the delegate at construction
+                        // time and store under the property name;
+                        // get_field on the instance unwraps Lazy /
+                        // NotNull / Observable via the same Value::Delegate
+                        // logic used for top-level delegates.
+                        let fid = klio_ir::lower::lower_accessor_expr(
+                            &mut module,
+                            &c.name.name,
+                            &own_members,
+                            &prop_init_params,
+                            delegate,
+                            &format!("__delegate_prop_{}_{}", c.name.name, p.name.name),
+                        );
+                        body_prop_inits.insert((c.name.name.clone(), p.name.name.clone()), fid);
                     }
                     if let Some(getter) = &p.getter {
                         let fid = match &getter.body {

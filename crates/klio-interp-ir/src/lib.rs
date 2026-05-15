@@ -1179,6 +1179,47 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return klio_ir::eval::eval_with(&module, &func, vec![receiver.clone()], self);
             }
             if let Some(v) = inst.borrow().get(name) {
+                // Auto-unwrap instance-level delegates so
+                // `val x by lazy { … }` reads return the resolved
+                // value rather than the Delegate wrapper.
+                if let klio_runtime::Value::Delegate(d) = &v {
+                    let state = d.borrow().clone();
+                    match state {
+                        klio_runtime::DelegateKind::Lazy { producer, cached } => {
+                            if let Some(c) = cached {
+                                return Ok(c);
+                            }
+                            let result = <Self as klio_ir::eval::Host>::call_value(
+                                self, &producer, &[],
+                            )?;
+                            if let klio_runtime::DelegateKind::Lazy { cached, .. } =
+                                &mut *d.borrow_mut()
+                            {
+                                *cached = Some(result.clone());
+                            }
+                            return Ok(result);
+                        }
+                        klio_runtime::DelegateKind::Observable { value, .. } => {
+                            return Ok(value);
+                        }
+                        klio_runtime::DelegateKind::NotNull { value, .. } => {
+                            return match value {
+                                Some(x) => Ok(x),
+                                None => Err(klio_ir::eval::EvalError::Throw(
+                                    klio_runtime::Value::Exception {
+                                        fqn: Rc::new(
+                                            "kotlin.IllegalStateException".into(),
+                                        ),
+                                        message: Some(Rc::new(format!(
+                                            "Property {name} should be initialized before get."
+                                        ))),
+                                        cause: None,
+                                    },
+                                )),
+                            };
+                        }
+                    }
+                }
                 return Ok(v);
             }
             // Walk the class's parent + interface chain looking for
