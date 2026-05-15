@@ -868,21 +868,63 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         // User-class instance: walk the runtime ClassDef chain.
         if let klio_runtime::Value::Instance(inst) = value {
+            let builtin_exception_names = [
+                "Throwable",
+                "Exception",
+                "RuntimeException",
+                "Error",
+                "IllegalArgumentException",
+                "IllegalStateException",
+                "IndexOutOfBoundsException",
+                "NoSuchElementException",
+                "NullPointerException",
+                "ArithmeticException",
+                "ClassCastException",
+                "NumberFormatException",
+                "UnsupportedOperationException",
+                "Any",
+            ];
             let mut cur: Option<Rc<klio_runtime::ClassDef>> =
                 Some(Rc::clone(&inst.borrow().class));
             while let Some(c) = cur {
                 if c.name == ty.name || c.fqn == ty.name {
                     return true;
                 }
-                if c
-                    .interfaces
+                if c.interfaces
                     .borrow()
                     .iter()
                     .any(|i| i.name == ty.name || i.fqn == ty.name)
                 {
                     return true;
                 }
+                // Walk supertype names — covers chains where the
+                // direct parent is a built-in exception class
+                // that isn't itself in the user class table.
+                for sup in &c.supertype_names {
+                    if sup == &ty.name {
+                        return true;
+                    }
+                    // A supertype that's a known builtin
+                    // exception promotes to Throwable / Exception
+                    // / Any matches as well.
+                    if builtin_exception_names.contains(&sup.as_str())
+                        && builtin_exception_names.contains(&ty.name.as_str())
+                    {
+                        return true;
+                    }
+                }
+                if c.is_anonymous {
+                    // Anonymous-object instances match their declared
+                    // supertype interface name(s).
+                    if c.supertype_names.iter().any(|n| n == &ty.name) {
+                        return true;
+                    }
+                }
                 cur = c.parent.borrow().clone();
+            }
+            // `Any` matches every instance.
+            if ty.name == "Any" {
+                return true;
             }
             return false;
         }
