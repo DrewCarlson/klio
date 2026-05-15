@@ -46,6 +46,13 @@ pub struct FuncBuilder<'a> {
     /// rebind inside a loop body just leaves the body's reads
     /// pointing at the pre-loop register and loops never terminate.
     mutable_homes: std::collections::HashMap<String, Reg>,
+    /// Names that are boxed into a shared `Value::Cell` because a
+    /// nested lambda captures them (Kotlin `Ref` boxing). Their home
+    /// reg holds the `Cell`; reads emit `CellGet`, writes `CellSet`,
+    /// and the declaration emits `MakeCell`. Captured into a lambda
+    /// the cell `Rc` is shared, so writes from a coroutine/closure
+    /// are visible at the declaration site.
+    boxed_vars: std::collections::HashSet<String>,
     /// Locals declared with an `: Any` (or other erased) type
     /// annotation — used by the `==` lowering to detect a boxed
     /// operand the same way the tree walker does, so
@@ -102,6 +109,7 @@ impl<'a> FuncBuilder<'a> {
             capture_regs: std::collections::HashMap::new(),
             mutables: std::collections::HashSet::new(),
             mutable_homes: std::collections::HashMap::new(),
+            boxed_vars: std::collections::HashSet::new(),
             any_typed_locals: std::collections::HashSet::new(),
             owner_class: None,
             own_members: std::collections::HashSet::new(),
@@ -136,6 +144,24 @@ impl<'a> FuncBuilder<'a> {
     #[must_use]
     pub fn mutable_home(&self, name: &str) -> Option<Reg> {
         self.mutable_homes.get(name).copied()
+    }
+
+    pub fn set_boxed_vars(&mut self, names: std::collections::HashSet<String>) {
+        self.boxed_vars = names;
+    }
+
+    pub fn mark_boxed(&mut self, name: &str) {
+        self.boxed_vars.insert(name.to_string());
+    }
+
+    #[must_use]
+    pub fn is_boxed(&self, name: &str) -> bool {
+        self.boxed_vars.contains(name)
+    }
+
+    #[must_use]
+    pub fn boxed_vars_snapshot(&self) -> std::collections::HashSet<String> {
+        self.boxed_vars.clone()
     }
 
     /// Seed the captured-name set for a nested function builder

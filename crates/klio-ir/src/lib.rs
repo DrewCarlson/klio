@@ -90,6 +90,15 @@ pub enum Inst {
     LoadCapture { dst: Reg, idx: u16 },
     /// Move one register's value into another.
     Move { dst: Reg, src: Reg },
+    /// Box `src` into a fresh capture cell (`Value::Cell`) and put
+    /// it in `dst`. Emitted for a `var` declaration when the var is
+    /// captured by a nested lambda (Kotlin `Ref` boxing).
+    MakeCell { dst: Reg, src: Reg },
+    /// Read the value held by the capture cell in `cell` into `dst`.
+    CellGet { dst: Reg, cell: Reg },
+    /// Store `value` through the capture cell in `cell`, keeping the
+    /// shared `Rc` so every holder observes the write.
+    CellSet { cell: Reg, value: Reg },
     /// Read a local property of a class instance.
     GetField { dst: Reg, receiver: Reg, field: ConstId },
     /// Write a local property of a class instance.

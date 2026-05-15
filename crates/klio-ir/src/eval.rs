@@ -762,6 +762,32 @@ fn exec_inst(
             let v = frame.read(*src);
             frame.write(*dst, v);
         }
+        Inst::MakeCell { dst, src } => {
+            let v = frame.read(*src);
+            frame.write(*dst, Value::new_cell(v));
+        }
+        Inst::CellGet { dst, cell } => {
+            let v = match frame.read(*cell) {
+                Value::Cell(c) => c.borrow().clone(),
+                // Tolerate a non-cell (e.g. captured before boxing
+                // analysis saw it) by passing the value through.
+                other => other,
+            };
+            frame.write(*dst, v);
+        }
+        Inst::CellSet { cell, value } => {
+            let v = frame.read(*value);
+            match frame.read(*cell) {
+                Value::Cell(c) => {
+                    *c.borrow_mut() = v;
+                }
+                _ => {
+                    // Not yet a cell — fall back to a plain reg write
+                    // so semantics degrade gracefully.
+                    frame.write(*cell, v);
+                }
+            }
+        }
         Inst::Not { dst, src } => {
             let v = frame.read(*src);
             // User-defined `operator fun not(): T` overrides the

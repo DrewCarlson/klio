@@ -368,6 +368,22 @@ pub enum Value {
     /// `kotlin.text.StringBuilder` — mutable string buffer. Shared
     /// storage so `sb1 === sb2` semantics hold across cloned values.
     StringBuilder(Rc<RefCell<String>>),
+    /// Boxed local `var` captured by a closure (Kotlin's
+    /// `Ref.ObjectRef`). The declaring scope and every capturing
+    /// lambda hold the same `Rc<RefCell<…>>`, so an assignment from
+    /// a coroutine / nested closure is immediately visible at the
+    /// declaration site. Created by `Inst::MakeCell`; only ever
+    /// touched through `Inst::CellGet` / `Inst::CellSet` — it never
+    /// escapes to user-visible value operations.
+    Cell(Rc<RefCell<Value>>),
+}
+
+impl Value {
+    /// Wrap a value in a fresh capture cell.
+    #[must_use]
+    pub fn new_cell(v: Value) -> Value {
+        Value::Cell(Rc::new(RefCell::new(v)))
+    }
 }
 
 /// Compiled regex + the original pattern source. Cheap to clone via `Rc`.
@@ -1136,6 +1152,7 @@ pub enum SeqOp {
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cell(c) => write!(f, "Cell({:?})", c.borrow()),
             Self::Unit => write!(f, "Unit"),
             Self::CoroutineSuspended(_) => write!(f, "CoroutineSuspended"),
             Self::Int(v) => write!(f, "Int({v})"),
@@ -1222,6 +1239,7 @@ impl fmt::Debug for Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cell(c) => write!(f, "{}", c.borrow()),
             Self::Unit => write!(f, "kotlin.Unit"),
             Self::CoroutineSuspended(_) => write!(f, "COROUTINE_SUSPENDED"),
             Self::Int(v) => write!(f, "{v}"),
@@ -1609,6 +1627,9 @@ impl Value {
     #[must_use]
     pub fn type_fqn(&self) -> &'static str {
         match self {
+            // A capture cell is always dereferenced before use; it
+            // never reaches a user-visible type query.
+            Self::Cell(_) => "kotlin.Any",
             Self::Unit => "kotlin.Unit",
             Self::CoroutineSuspended(_) => "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED",
             Self::Int(_) => "kotlin.Int",
@@ -1716,6 +1737,7 @@ impl Value {
     #[must_use]
     pub fn is_runtime_type(&self, name: &str) -> bool {
         match self {
+            Value::Cell(c) => c.borrow().is_runtime_type(name),
             Value::CoroutineSuspended(_) => false,
             Value::Int(_) => matches!(name, "Int" | "Number" | "Any" | "Comparable"),
             Value::Long(_) => matches!(name, "Long" | "Number" | "Any" | "Comparable"),

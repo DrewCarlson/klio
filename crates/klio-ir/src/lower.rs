@@ -218,6 +218,336 @@ fn lambda_writes_outer_var(b: &FuncBuilder<'_>, arg: &Expr) -> bool {
     body.stmts.iter().any(|s| walk(s, &visible))
 }
 
+/// Recursively collect every single-segment `Path` identifier that
+/// appears anywhere in an expression (used to find which names a
+/// nested lambda references).
+fn collect_path_idents(e: &Expr, out: &mut std::collections::HashSet<String>) {
+    match e {
+        Expr::Path { segments, .. } if segments.len() == 1 => {
+            out.insert(segments[0].name.clone());
+        }
+        Expr::Member { receiver, .. } => collect_path_idents(receiver, out),
+        Expr::MemberRef { receiver, .. } => collect_path_idents(receiver, out),
+        Expr::Call { callee, args, .. } => {
+            collect_path_idents(callee, out);
+            for a in args {
+                collect_path_idents(a, out);
+            }
+        }
+        Expr::Index { receiver, args, .. } => {
+            collect_path_idents(receiver, out);
+            for a in args {
+                collect_path_idents(a, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_path_idents(lhs, out);
+            collect_path_idents(rhs, out);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::Postfix { expr, .. }
+        | Expr::Spread { expr, .. }
+        | Expr::Throw { value: expr, .. }
+        | Expr::Labeled { expr, .. }
+        | Expr::As { expr, .. }
+        | Expr::IsCheck { expr, .. } => collect_path_idents(expr, out),
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            collect_path_idents(cond, out);
+            collect_path_idents(then_branch, out);
+            if let Some(e) = else_branch {
+                collect_path_idents(e, out);
+            }
+        }
+        Expr::While { cond, body, .. } => {
+            collect_path_idents(cond, out);
+            collect_path_idents(body, out);
+        }
+        Expr::DoWhile { body, cond, .. } => {
+            if let Some(b) = body {
+                collect_path_idents(b, out);
+            }
+            collect_path_idents(cond, out);
+        }
+        Expr::For { iter, body, .. } => {
+            collect_path_idents(iter, out);
+            collect_path_idents(body, out);
+        }
+        Expr::Return { value: Some(v), .. } => collect_path_idents(v, out),
+        Expr::Block(b) => {
+            for s in &b.stmts {
+                collect_path_idents_stmt(s, out);
+            }
+        }
+        Expr::Lambda { body, .. } => {
+            for s in &body.stmts {
+                collect_path_idents_stmt(s, out);
+            }
+        }
+        Expr::AnonFun { body: Some(fb), .. } => match fb.as_ref() {
+            klio_ast::FunctionBody::Block(b) => {
+                for s in &b.stmts {
+                    collect_path_idents_stmt(s, out);
+                }
+            }
+            klio_ast::FunctionBody::Expr(e) => collect_path_idents(e, out),
+        },
+        Expr::When { subject, branches, .. } => {
+            if let Some(s) = subject {
+                collect_path_idents(s, out);
+            }
+            for br in branches {
+                collect_path_idents(&br.body, out);
+            }
+        }
+        Expr::Try { body, catches, finally, .. } => {
+            for s in &body.stmts {
+                collect_path_idents_stmt(s, out);
+            }
+            for c in catches {
+                for s in &c.body.stmts {
+                    collect_path_idents_stmt(s, out);
+                }
+            }
+            if let Some(fb) = finally {
+                for s in &fb.stmts {
+                    collect_path_idents_stmt(s, out);
+                }
+            }
+        }
+        Expr::StringTemplate { parts, .. } => {
+            for p in parts {
+                match p {
+                    klio_ast::StringPart::Interp(e) => collect_path_idents(e, out),
+                    klio_ast::StringPart::ShortInterp(id) => {
+                        out.insert(id.name.clone());
+                    }
+                    klio_ast::StringPart::Text(_) => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_path_idents_stmt(s: &Stmt, out: &mut std::collections::HashSet<String>) {
+    match s {
+        Stmt::Expr(e) => collect_path_idents(e, out),
+        Stmt::Assign { target, value, .. } => {
+            collect_path_idents(target, out);
+            collect_path_idents(value, out);
+        }
+        Stmt::DestructuringDecl { init, .. } => collect_path_idents(init, out),
+        Stmt::Decl(klio_ast::Decl::Property(p)) => {
+            if let Some(e) = &p.init {
+                collect_path_idents(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Names referenced anywhere inside a nested `Lambda` / `AnonFun`
+/// within these statements (recursing into nested lambdas too).
+fn names_referenced_in_lambdas(
+    stmts: &[Stmt],
+    out: &mut std::collections::HashSet<String>,
+) {
+    fn scan_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        match e {
+            Expr::Lambda { body, .. } => {
+                for s in &body.stmts {
+                    collect_path_idents_stmt(s, out);
+                }
+            }
+            Expr::AnonFun { body: Some(fb), .. } => match fb.as_ref() {
+                klio_ast::FunctionBody::Block(b) => {
+                    for s in &b.stmts {
+                        collect_path_idents_stmt(s, out);
+                    }
+                }
+                klio_ast::FunctionBody::Expr(e) => collect_path_idents(e, out),
+            },
+            Expr::Member { receiver, .. }
+            | Expr::Unary { expr: receiver, .. }
+            | Expr::Postfix { expr: receiver, .. }
+            | Expr::Spread { expr: receiver, .. }
+            | Expr::Throw { value: receiver, .. }
+            | Expr::Labeled { expr: receiver, .. }
+            | Expr::As { expr: receiver, .. }
+            | Expr::IsCheck { expr: receiver, .. }
+            | Expr::MemberRef { receiver, .. } => scan_expr(receiver, out),
+            Expr::Call { callee, args, .. } => {
+                scan_expr(callee, out);
+                for a in args {
+                    scan_expr(a, out);
+                }
+            }
+            Expr::Index { receiver, args, .. } => {
+                scan_expr(receiver, out);
+                for a in args {
+                    scan_expr(a, out);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                scan_expr(lhs, out);
+                scan_expr(rhs, out);
+            }
+            Expr::If { cond, then_branch, else_branch, .. } => {
+                scan_expr(cond, out);
+                scan_expr(then_branch, out);
+                if let Some(e) = else_branch {
+                    scan_expr(e, out);
+                }
+            }
+            Expr::While { cond, body, .. } => {
+                scan_expr(cond, out);
+                scan_expr(body, out);
+            }
+            Expr::DoWhile { body, cond, .. } => {
+                if let Some(b) = body {
+                    scan_expr(b, out);
+                }
+                scan_expr(cond, out);
+            }
+            Expr::For { iter, body, .. } => {
+                scan_expr(iter, out);
+                scan_expr(body, out);
+            }
+            Expr::Return { value: Some(v), .. } => scan_expr(v, out),
+            Expr::Block(b) => names_referenced_in_lambdas(&b.stmts, out),
+            Expr::When { subject, branches, .. } => {
+                if let Some(s) = subject {
+                    scan_expr(s, out);
+                }
+                for br in branches {
+                    scan_expr(&br.body, out);
+                }
+            }
+            Expr::Try { body, catches, finally, .. } => {
+                names_referenced_in_lambdas(&body.stmts, out);
+                for c in catches {
+                    names_referenced_in_lambdas(&c.body.stmts, out);
+                }
+                if let Some(fb) = finally {
+                    names_referenced_in_lambdas(&fb.stmts, out);
+                }
+            }
+            Expr::StringTemplate { parts, .. } => {
+                for p in parts {
+                    match p {
+                        klio_ast::StringPart::Interp(e) => scan_expr(e, out),
+                        klio_ast::StringPart::ShortInterp(id) => {
+                            out.insert(id.name.clone());
+                        }
+                        klio_ast::StringPart::Text(_) => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in stmts {
+        match s {
+            Stmt::Expr(e) => scan_expr(e, out),
+            Stmt::Assign { target, value, .. } => {
+                scan_expr(target, out);
+                scan_expr(value, out);
+            }
+            Stmt::DestructuringDecl { init, .. } => scan_expr(init, out),
+            Stmt::Decl(klio_ast::Decl::Property(p)) => {
+                if let Some(e) = &p.init {
+                    scan_expr(e, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `var` names declared directly in these statements (not inside a
+/// nested lambda — those open their own frame).
+fn collect_var_decls(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    fn scan_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        match e {
+            Expr::Block(b) => collect_var_decls(&b.stmts, out),
+            Expr::If { then_branch, else_branch, .. } => {
+                scan_expr(then_branch, out);
+                if let Some(e) = else_branch {
+                    scan_expr(e, out);
+                }
+            }
+            Expr::While { body, .. } => scan_expr(body, out),
+            Expr::DoWhile { body: Some(b), .. } => scan_expr(b, out),
+            Expr::For { body, .. } => scan_expr(body, out),
+            Expr::When { branches, .. } => {
+                for br in branches {
+                    scan_expr(&br.body, out);
+                }
+            }
+            Expr::Labeled { expr, .. } => scan_expr(expr, out),
+            Expr::Try { body, catches, finally, .. } => {
+                collect_var_decls(&body.stmts, out);
+                for c in catches {
+                    collect_var_decls(&c.body.stmts, out);
+                }
+                if let Some(fb) = finally {
+                    collect_var_decls(&fb.stmts, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in stmts {
+        match s {
+            Stmt::Decl(klio_ast::Decl::Property(p)) if p.mutable => {
+                out.insert(p.name.name.clone());
+            }
+            Stmt::DestructuringDecl { mutable: true, names, .. } => {
+                for n in names {
+                    out.insert(n.name.clone());
+                }
+            }
+            Stmt::Expr(e) => scan_expr(e, out),
+            _ => {}
+        }
+    }
+}
+
+/// A `var` declared in this frame and captured by a nested lambda is
+/// boxed into a shared `Value::Cell` (Kotlin `Ref` semantics) so a
+/// write from a coroutine / closure is visible at the declaration
+/// site.
+fn compute_boxed_vars(stmts: &[Stmt]) -> std::collections::HashSet<String> {
+    let mut decls = std::collections::HashSet::new();
+    collect_var_decls(stmts, &mut decls);
+    if decls.is_empty() {
+        return decls;
+    }
+    let mut refs = std::collections::HashSet::new();
+    names_referenced_in_lambdas(stmts, &mut refs);
+    decls.retain(|n| refs.contains(n));
+    decls
+}
+
+/// Resolve the register holding the shared `Value::Cell` for a boxed
+/// `var`. In the declaring scope the cell lives in the var's
+/// `mutable_home`; once a capturing lambda has loaded it the name is
+/// rebound to that reg; otherwise it is captured from the enclosing
+/// frame so every closure shares the same cell.
+fn boxed_cell_reg(b: &mut FuncBuilder, name: &str) -> Reg {
+    if let Some(r) = b.mutable_home(name) {
+        r
+    } else if let Some(r) = b.resolve(name) {
+        r
+    } else {
+        let idx = b.record_capture(name);
+        let c = b.alloc_reg();
+        b.push(Inst::LoadCapture { dst: c, idx });
+        b.bind(name.to_string(), c);
+        c
+    }
+}
+
 fn is_package_head(name: &str) -> bool {
     if name.chars().next().map_or(false, |c| c.is_lowercase()) {
         return true;
@@ -886,6 +1216,9 @@ fn lower_function_body_with_implicit_owner(
     if f.is_tailrec {
         let _ = b.set_tailrec_self(f.name.name.clone());
     }
+    if let Some(klio_ast::FunctionBody::Block(blk)) = &f.body {
+        b.set_boxed_vars(compute_boxed_vars(&blk.stmts));
+    }
     let result = match &f.body {
         Some(klio_ast::FunctionBody::Block(blk)) => Some(lower_block(&mut b, blk)),
         Some(klio_ast::FunctionBody::Expr(e)) => Some(lower_expr(&mut b, e)),
@@ -1090,7 +1423,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.push(Inst::UnOp { dst, op: u, operand });
                 match expr.as_ref() {
                     Expr::Path { segments, .. } if segments.len() == 1 => {
-                        if let Some(home) = b.mutable_home(&segments[0].name) {
+                        if b.is_boxed(&segments[0].name) {
+                            let cell = boxed_cell_reg(b, &segments[0].name);
+                            b.push(Inst::CellSet { cell, value: dst });
+                        } else if let Some(home) = b.mutable_home(&segments[0].name) {
                             b.push(Inst::Move { dst: home, src: dst });
                         } else if b.knows_outer(&segments[0].name) {
                             let _ = b.record_capture(&segments[0].name);
@@ -1179,19 +1515,31 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         Expr::Path { segments, .. } => {
             if segments.len() == 1 {
                 if let Some(r) = b.resolve(&segments[0].name) {
+                    if b.is_boxed(&segments[0].name) {
+                        // `r` holds the shared `Value::Cell`; read
+                        // its current contents.
+                        let dst = b.alloc_reg();
+                        b.push(Inst::CellGet { dst, cell: r });
+                        return dst;
+                    }
                     return r;
                 }
                 // Lambda-body capture: name lives in an enclosing
                 // frame but not as a top-level global.
                 if b.knows_outer(&segments[0].name) {
                     let idx = b.record_capture(&segments[0].name);
-                    let dst = b.alloc_reg();
-                    b.push(Inst::LoadCapture { dst, idx });
+                    let cell = b.alloc_reg();
+                    b.push(Inst::LoadCapture { dst: cell, idx });
                     // Bind the capture name to the freshly-loaded
                     // reg so subsequent Path reads hit the local
                     // path instead of re-emitting LoadCapture.
-                    b.bind(segments[0].name.clone(), dst);
-                    return dst;
+                    b.bind(segments[0].name.clone(), cell);
+                    if b.is_boxed(&segments[0].name) {
+                        let dst = b.alloc_reg();
+                        b.push(Inst::CellGet { dst, cell });
+                        return dst;
+                    }
+                    return cell;
                 }
                 // Inside a method / extension fn body `this` is
                 // bound as the implicit first param. An unqualified
@@ -2295,8 +2643,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // stdlib intrinsics) fall through to the tree walker's
             // global lookup at call time.
             let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let outer_boxed = b.boxed_vars_snapshot();
             let (body_func, captured_names) =
-                lower_lambda_body_capturing(b.module, params, body, outer_names);
+                lower_lambda_body_capturing(b.module, params, body, outer_names, &outer_boxed);
             let captures: Vec<Reg> = captured_names
                 .iter()
                 .map(|n| resolve_capture(b, n))
@@ -2447,7 +2796,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.push(Inst::UnOp { dst: new, op, operand: old });
                 match inner.as_ref() {
                     Expr::Path { segments, .. } if segments.len() == 1 => {
-                        if let Some(home) = b.mutable_home(&segments[0].name) {
+                        if b.is_boxed(&segments[0].name) {
+                            let cell = boxed_cell_reg(b, &segments[0].name);
+                            b.push(Inst::CellSet { cell, value: new });
+                        } else if let Some(home) = b.mutable_home(&segments[0].name) {
                             b.push(Inst::Move { dst: home, src: new });
                         } else if b.has_own_member(&segments[0].name)
                             && b.resolve("this").is_some()
@@ -2614,8 +2966,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let param_idents: Vec<klio_ast::Ident> =
                 params.iter().map(|p| p.name.clone()).collect();
             let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let outer_boxed = b.boxed_vars_snapshot();
             let (body_func, captured_names) = lower_lambda_body_capturing_kind(
-                b.module, &param_idents, &body_block, outer_names, false,
+                b.module, &param_idents, &body_block, outer_names, false, &outer_boxed,
             );
             let captures: Vec<Reg> = captured_names
                 .iter()
@@ -2727,8 +3080,9 @@ fn lower_lambda_body_capturing(
     params: &[klio_ast::Ident],
     body: &klio_ast::Block,
     outer: std::collections::HashSet<String>,
+    outer_boxed: &std::collections::HashSet<String>,
 ) -> (crate::FuncId, Vec<String>) {
-    lower_lambda_body_capturing_kind(module, params, body, outer, true)
+    lower_lambda_body_capturing_kind(module, params, body, outer, true, outer_boxed)
 }
 
 fn lower_lambda_body_capturing_kind(
@@ -2737,6 +3091,7 @@ fn lower_lambda_body_capturing_kind(
     body: &klio_ast::Block,
     outer: std::collections::HashSet<String>,
     is_lambda: bool,
+    outer_boxed: &std::collections::HashSet<String>,
 ) -> (crate::FuncId, Vec<String>) {
     let mut b = FuncBuilder::new(module);
     if is_lambda {
@@ -2744,6 +3099,22 @@ fn lower_lambda_body_capturing_kind(
     } else {
         b.set_outer_names_without_lambda(outer);
     }
+    // Boxed vars: this lambda's own captured vars, plus any
+    // enclosing-frame boxed var this body references (a captured
+    // cell — reads/writes go through the shared `Rc`).
+    let mut boxed = compute_boxed_vars(&body.stmts);
+    if !outer_boxed.is_empty() {
+        let mut refs = std::collections::HashSet::new();
+        for s in &body.stmts {
+            collect_path_idents_stmt(s, &mut refs);
+        }
+        for n in outer_boxed {
+            if refs.contains(n) {
+                boxed.insert(n.clone());
+            }
+        }
+    }
+    b.set_boxed_vars(boxed);
     // Implicit `it` lambdas have empty params — bind a synthetic
     // `it` slot so bare `it` references inside the body lower as
     // a LoadParam rather than a LoadGlobal.
@@ -3164,7 +3535,16 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     b.mark_any_typed(&p.name.name);
                 }
             }
-            if p.mutable || p.init.is_none() {
+            if b.is_boxed(&p.name.name) {
+                // Captured `var` — box into a shared cell so writes
+                // from a nested closure / coroutine are visible
+                // here (Kotlin `Ref` semantics).
+                let home = b.alloc_reg();
+                b.push(Inst::MakeCell { dst: home, src: init });
+                b.set_mutable_home(&p.name.name, home);
+                b.mark_mutable(&p.name.name);
+                b.bind(p.name.name.clone(), home);
+            } else if p.mutable || p.init.is_none() {
                 let home = b.alloc_reg();
                 b.push(Inst::Move { dst: home, src: init });
                 b.set_mutable_home(&p.name.name, home);
@@ -3198,6 +3578,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             };
             if let Some(body) = body_block {
                 let outer_names: std::collections::HashSet<String> = b.visible_names();
+                let outer_boxed = b.boxed_vars_snapshot();
                 let param_idents: Vec<klio_ast::Ident> =
                     f.params.iter().map(|p| p.name.clone()).collect();
                 let (body_func, captured_names) = lower_lambda_body_capturing(
@@ -3205,6 +3586,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     &param_idents,
                     &body,
                     outer_names,
+                    &outer_boxed,
                 );
                 let captures: Vec<Reg> = captured_names
                     .iter()
@@ -3381,7 +3763,10 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             };
             match target {
                 Expr::Path { segments, .. } if segments.len() == 1 => {
-                    if let Some(home) = b.mutable_home(&segments[0].name) {
+                    if b.is_boxed(&segments[0].name) {
+                        let cell = boxed_cell_reg(b, &segments[0].name);
+                        b.push(Inst::CellSet { cell, value: combined });
+                    } else if let Some(home) = b.mutable_home(&segments[0].name) {
                         b.push(Inst::Move { dst: home, src: combined });
                     } else if b.knows_outer(&segments[0].name) {
                         // Lambda body writing back to an outer-frame
