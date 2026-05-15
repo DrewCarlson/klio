@@ -327,6 +327,43 @@ pub fn lower_expr_as_thunk(
     id
 }
 
+/// Lower a block as a 0-arg synthetic function. The block's trailing
+/// expression becomes the implicit return value.
+pub fn lower_block_as_thunk(
+    module: &mut crate::Module,
+    block: &klio_ast::Block,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    let v = lower_block(&mut b, block);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+/// 1-arg block thunk for setter bodies.
+pub fn lower_block_as_unary_thunk(
+    module: &mut crate::Module,
+    param_name: &str,
+    block: &klio_ast::Block,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    bind_params(&mut b, &[param_name]);
+    let v = lower_block(&mut b, block);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
 /// Lower an expression as a 2-arg synthetic function bound under
 /// the supplied parameter names. Used for instance accessors whose
 /// first arg is `this` and second is the new value.

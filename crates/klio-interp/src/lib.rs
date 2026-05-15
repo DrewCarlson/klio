@@ -1619,17 +1619,30 @@ impl Interpreter {
                     continue;
                 }
                 if let Some(getter) = &p.getter {
-                    if let klio_ast::FunctionBody::Expr(raw) = &getter.body {
-                        // Rewrite `field` references to the property's
-                        // backing global so the IR thunk can run without
-                        // a tree-walker accessor scope.
-                        let body = substitute_field_with(&p.name.name, raw);
-                        let id = klio_ir::lower::lower_expr_as_thunk(
-                            &mut module,
-                            &body,
-                            &format!("__get__{}", p.name.name),
-                        );
-                        self.module_registry.class_ir.top_level_prop_getters.insert(p.name.name.clone(), id);
+                    let prop_name = p.name.name.clone();
+                    let id = match &getter.body {
+                        klio_ast::FunctionBody::Expr(raw) => {
+                            let body = substitute_field_with(&prop_name, raw);
+                            Some(klio_ir::lower::lower_expr_as_thunk(
+                                &mut module,
+                                &body,
+                                &format!("__get__{}", prop_name),
+                            ))
+                        }
+                        klio_ast::FunctionBody::Block(blk) => {
+                            let p2 = prop_name.clone();
+                            let rewritten = rewrite_block(blk, &move |e| {
+                                substitute_field_with(&p2, e)
+                            });
+                            Some(klio_ir::lower::lower_block_as_thunk(
+                                &mut module,
+                                &rewritten,
+                                &format!("__get__{}", prop_name),
+                            ))
+                        }
+                    };
+                    if let Some(id) = id {
+                        self.module_registry.class_ir.top_level_prop_getters.insert(prop_name, id);
                     }
                 }
                 // Delegated top-level setter: synthesize a 1-arg
@@ -1726,15 +1739,32 @@ impl Interpreter {
                         .first()
                         .map(|i| i.name.clone())
                         .unwrap_or_else(|| "value".into());
-                    if let klio_ast::FunctionBody::Expr(raw) = &setter.body {
-                        let body = substitute_field_with(&p.name.name, raw);
-                        let id = klio_ir::lower::lower_unary_expr_as_thunk(
-                            &mut module,
-                            &param,
-                            &body,
-                            &format!("__set__{}", p.name.name),
-                        );
-                        self.module_registry.class_ir.top_level_prop_setters.insert(p.name.name.clone(), id);
+                    let prop_name = p.name.name.clone();
+                    let id = match &setter.body {
+                        klio_ast::FunctionBody::Expr(raw) => {
+                            let body = substitute_field_with(&prop_name, raw);
+                            Some(klio_ir::lower::lower_unary_expr_as_thunk(
+                                &mut module,
+                                &param,
+                                &body,
+                                &format!("__set__{}", prop_name),
+                            ))
+                        }
+                        klio_ast::FunctionBody::Block(blk) => {
+                            let p2 = prop_name.clone();
+                            let rewritten = rewrite_block(blk, &move |e| {
+                                substitute_field_with(&p2, e)
+                            });
+                            Some(klio_ir::lower::lower_block_as_unary_thunk(
+                                &mut module,
+                                &param,
+                                &rewritten,
+                                &format!("__set__{}", prop_name),
+                            ))
+                        }
+                    };
+                    if let Some(id) = id {
+                        self.module_registry.class_ir.top_level_prop_setters.insert(prop_name, id);
                     }
                 }
             }
