@@ -1059,19 +1059,26 @@ impl Interpreter {
     ) -> Option<Result<klio_runtime::Value, RuntimeError>> {
         // Constrain to the conservatively-supported shapes for now —
         // any IR-untranslatable construct (suspend, super, reified
-        // type params) falls back to `eval_expr`.
+        // type params) falls back to `eval_expr`. When the file's
+        // module is already built, expose its class / func tables to
+        // the host so the thunk's body can reach declared names.
         let mut module = klio_ir::Module::default();
         let id = klio_ir::lower::lower_expr_as_thunk(&mut module, init, "__init__");
         let module_rc = std::rc::Rc::new(module);
         let func = module_rc.funcs[id.0 as usize].clone();
-        let class_names: Vec<String> = module_rc.classes.iter().map(|c| c.name.clone()).collect();
-        let method_index = IrHost::build_method_index(&module_rc);
+        let host_module = self
+            .current_module
+            .clone()
+            .unwrap_or_else(|| std::rc::Rc::clone(&module_rc));
+        let class_names: Vec<String> =
+            host_module.classes.iter().map(|c| c.name.clone()).collect();
+        let method_index = IrHost::build_method_index(&host_module);
         let mut host = IrHost {
             interp: self,
             out,
             class_names,
             closures: Vec::new(),
-            module: std::rc::Rc::clone(&module_rc),
+            module: host_module,
             method_index,
         };
         match klio_ir::eval::eval_with(&module_rc, &func, Vec::new(), &mut host) {
