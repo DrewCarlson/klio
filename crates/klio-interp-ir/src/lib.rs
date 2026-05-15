@@ -974,6 +974,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return self.dispatch_intrinsic(func, &all_args);
             }
         }
+        // Extension fn fallback: a user-defined `fun T.name(...)`
+        // lowers as a top-level fn whose first param is the
+        // receiver. Look it up by simple name and dispatch with
+        // receiver prepended.
+        if let Some(fid) = self.module.func_id(name) {
+            if let Some(func) = self.module.funcs.get(fid.0 as usize).cloned() {
+                if func.params.len() == args.len() + 1 {
+                    let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
+                    all.push(receiver.clone());
+                    all.extend_from_slice(args);
+                    let module = Rc::clone(&self.module);
+                    return klio_ir::eval::eval_with(&module, &func, all, self);
+                }
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()
