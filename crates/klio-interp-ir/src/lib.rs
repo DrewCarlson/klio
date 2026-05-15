@@ -57,6 +57,9 @@ pub struct Vm {
     /// invokes the FuncId with the receiver as `this`.
     extension_props:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Top-level property initialiser FuncIds. Run at Vm::run start
+    /// so globals see the initial values.
+    top_level_props: Vec<(String, klio_ir::FuncId)>,
     /// Closure side-table. Each `Value::IrClosure { id, captures }`
     /// resolves to a `(body_func, n_params)` here. `n_params` lets
     /// the dispatch fill missing positional args with `Null` (for
@@ -105,6 +108,7 @@ impl Vm {
             parent_ctor_args: std::collections::HashMap::new(),
             init_blocks: std::collections::HashMap::new(),
             extension_props: std::collections::HashMap::new(),
+            top_level_props: Vec::new(),
             closures: Vec::new(),
         }
     }
@@ -121,6 +125,7 @@ impl Vm {
         vm.parent_ctor_args = built.parent_ctor_args;
         vm.init_blocks = built.init_blocks;
         vm.extension_props = built.extension_props;
+        vm.top_level_props = built.top_level_props;
         (vm, main)
     }
 
@@ -132,6 +137,35 @@ impl Vm {
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, VmError> {
         let module = Rc::clone(&self.module);
+        // Run top-level property initialisers before main so global
+        // reads against the env see the initial values.
+        let inits: Vec<(String, klio_ir::FuncId)> = self.top_level_props.clone();
+        for (name, fid) in &inits {
+            let init_func = module
+                .funcs
+                .get(fid.0 as usize)
+                .cloned()
+                .ok_or(VmError::InvalidMain)?;
+            let v = {
+                let mut host = VmHost {
+                    globals: Rc::clone(&self.globals),
+                    module: Rc::clone(&module),
+                    scheduler: &mut *self.scheduler,
+                    out,
+                    instance_id_counter: &mut self.instance_id_counter,
+                    classes: Rc::clone(&self.classes),
+                    body_prop_inits: &self.body_prop_inits,
+                    instance_prop_getters: &self.instance_prop_getters,
+                    parent_ctor_args: &self.parent_ctor_args,
+                    init_blocks: &self.init_blocks,
+                    extension_props: &self.extension_props,
+                    closures: &mut self.closures,
+                };
+                klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
+                    .map_err(VmError::from)?
+            };
+            self.globals.borrow_mut().define(name, v);
+        }
         let func = module
             .funcs
             .get(main.0 as usize)

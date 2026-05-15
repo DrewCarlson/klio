@@ -159,6 +159,10 @@ pub struct BuiltModule {
     /// `new_instance` invokes them after primary-ctor field
     /// binding + body-property init.
     pub init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    /// Top-level property initialisers (`val n = 0`). Vm::run
+    /// invokes each in declaration order at startup so reads
+    /// against the global env see the initial value.
+    pub top_level_props: Vec<(String, klio_ir::FuncId)>,
     /// Top-level extension properties (`val T.name: U get() = …`).
     /// Keyed by `(receiver simple type name, property name)`. The
     /// Vm probes this table from `get_field` when a regular field
@@ -524,6 +528,26 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         }
     }
 
+    // Top-level property initialisers — `val name = expr` /
+    // `var name = expr` declared at file scope. Each lowers to a
+    // 0-arg thunk. Vm::run drives them at startup.
+    let mut top_level_props: Vec<(String, klio_ir::FuncId)> = Vec::new();
+    for d in &file.decls {
+        if let Decl::Property(p) = d {
+            if p.receiver_type.is_some() {
+                continue;
+            }
+            if let Some(init) = &p.init {
+                let fid = klio_ir::lower::lower_expr_as_thunk(
+                    &mut module,
+                    init,
+                    &format!("__top_prop_init_{}", p.name.name),
+                );
+                top_level_props.push((p.name.name.clone(), fid));
+            }
+        }
+    }
+
     // Top-level extension properties: `val T.name: U get() = …` /
     // `var T.name: U get() = … set(value) { … }`. Each lowers to a
     // 1-arg thunk taking the receiver as `this`.
@@ -572,6 +596,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         instance_prop_getters,
         parent_ctor_args,
         init_blocks,
+        top_level_props,
         extension_props,
         main: main_id,
     }
