@@ -287,6 +287,22 @@ pub trait Host {
         self.build_ast_lambda(params, body, captured_names, captures)
     }
 
+    /// Variant that also receives the lambda body's lowered FuncId
+    /// when available. The default ignores it; klio's interp host
+    /// registers the FuncId under the lambda's body pointer so
+    /// later call sites can dispatch through IR.
+    fn build_ast_lambda_with_flag_funcid(
+        &mut self,
+        params: &[String],
+        body: &klio_ast::Block,
+        captured_names: &[String],
+        captures: Vec<Value>,
+        absorb_return: bool,
+        _body_func: Option<FuncId>,
+    ) -> Result<Value, EvalError> {
+        self.build_ast_lambda_with_flag(params, body, captured_names, captures, absorb_return)
+    }
+
     /// Resolve a function call by FuncId. The default routes
     /// through `eval()` recursively, so a single-module IR program
     /// stays self-contained.
@@ -815,9 +831,16 @@ fn exec_inst(
             let v = host.build_closure(frame.module, *body_func, cap_values)?;
             frame.write(*dst, v);
         }
-        Inst::AstLambda { dst, params, body_ast, captures, captured_names, absorb_return, .. } => {
+        Inst::AstLambda { dst, params, body_ast, captures, captured_names, absorb_return, body_func } => {
             let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
-            let v = host.build_ast_lambda_with_flag(params, body_ast, captured_names, cap_values, *absorb_return)?;
+            let v = host.build_ast_lambda_with_flag_funcid(
+                params,
+                body_ast,
+                captured_names,
+                cap_values,
+                *absorb_return,
+                *body_func,
+            )?;
             frame.write(*dst, v);
         }
         Inst::RegisterClass { class, captured_names, captures } => {

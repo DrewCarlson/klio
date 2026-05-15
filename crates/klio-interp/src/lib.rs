@@ -13639,6 +13639,32 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         })
     }
 
+    fn build_ast_lambda_with_flag_funcid(
+        &mut self,
+        params: &[String],
+        body: &klio_ast::Block,
+        captured_names: &[String],
+        captures: Vec<klio_runtime::Value>,
+        absorb_return: bool,
+        body_func: Option<klio_ir::FuncId>,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.interp.globals))));
+        for (name, value) in captured_names.iter().zip(captures.iter()) {
+            env.borrow_mut().define(name.clone(), value.clone());
+        }
+        let body_rc = Rc::new(body.clone());
+        if let Some(fid) = body_func {
+            let key = Rc::as_ptr(&body_rc) as usize;
+            self.interp.module_registry.class_ir.lambda_ir_funcs.insert(key, fid);
+        }
+        Ok(klio_runtime::Value::Lambda {
+            params: Rc::new(params.to_vec()),
+            body: body_rc,
+            env,
+            absorb_return,
+        })
+    }
+
     fn call_value_with_this(
         &mut self,
         callee: &klio_runtime::Value,
