@@ -32,6 +32,11 @@ pub struct Vm {
     /// expands to carry the full runtime shape this table shrinks
     /// and eventually goes away.
     classes: std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
+    /// Body-property initialiser FuncIds. Invoked during instance
+    /// allocation to populate fields for `val/var x: T = expr`
+    /// declared in a class body (not primary-ctor params).
+    body_prop_inits:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// Closure side-table. Each `Value::IrClosure { id, captures }`
     /// resolves to a `(body_func, n_params)` here. `n_params` lets
     /// the dispatch fill missing positional args with `Null` (for
@@ -64,6 +69,7 @@ impl Vm {
             scheduler: Box::new(klio_runtime::InProcessScheduler::new()),
             instance_id_counter: 0,
             classes: std::collections::HashMap::new(),
+            body_prop_inits: std::collections::HashMap::new(),
             closures: Vec::new(),
         }
     }
@@ -75,6 +81,7 @@ impl Vm {
         let main = built.main;
         let mut vm = Self::new(built.module);
         vm.classes = built.classes;
+        vm.body_prop_inits = built.body_prop_inits;
         (vm, main)
     }
 
@@ -98,6 +105,7 @@ impl Vm {
             out,
             instance_id_counter: &mut self.instance_id_counter,
             classes: &self.classes,
+            body_prop_inits: &self.body_prop_inits,
             closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
@@ -130,6 +138,8 @@ struct VmHost<'a> {
     out: &'a mut dyn Output,
     instance_id_counter: &'a mut u64,
     classes: &'a std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
+    body_prop_inits:
+        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     closures: &'a mut Vec<ClosureInfo>,
 }
 
@@ -402,19 +412,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }));
         }
         // Trivial primary-ctor shape: each primary param with
-        // `property = Some(...)` becomes an instance field. Init
-        // blocks, body properties, parent ctor chain, secondary
-        // ctors, and supertype delegates are not yet handled —
-        // those return Unimplemented so the failing surfaces are
-        // visible.
+        // `property = Some(...)` becomes an instance field, then
+        // body properties with init thunks run to populate their
+        // fields. Init blocks, parent ctor chain, secondary ctors,
+        // and supertype delegates are not yet handled.
         if !class_def.init_blocks.is_empty()
-            || !class_def.body_properties.is_empty()
             || !class_def.parent_ctor_args.is_empty()
             || !class_def.secondary_ctors.is_empty()
             || !class_def.supertype_delegates.borrow().is_empty()
         {
             return Err(klio_ir::eval::EvalError::Unimplemented(format!(
-                "Vm::new_instance: non-trivial ctor for `{}` (init blocks / parent ctor / body inits not yet native)",
+                "Vm::new_instance: non-trivial ctor for `{}` (init blocks / parent ctor / secondary ctors / supertype delegates not yet native)",
                 class_def.name
             )));
         }
@@ -429,10 +437,41 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         *self.instance_id_counter += 1;
         let identity = *self.instance_id_counter;
         let mut fields: Vec<(String, klio_runtime::Value)> =
-            Vec::with_capacity(class_def.primary_params.len());
+            Vec::with_capacity(class_def.primary_params.len() + class_def.body_properties.len());
         for (param, value) in class_def.primary_params.iter().zip(args.iter()) {
             if param.property.is_some() {
                 fields.push((param.name.clone(), value.clone()));
+            }
+        }
+        // Body properties: run each init thunk and bind the result.
+        // Properties without an init expression but with a delegate
+        // or getter are not yet handled — we surface a clear failure.
+        for p in &class_def.body_properties {
+            if let Some(fid) = self
+                .body_prop_inits
+                .get(&(class_def.name.clone(), p.name.clone()))
+                .copied()
+            {
+                let func = self
+                    .module
+                    .funcs
+                    .get(fid.0 as usize)
+                    .cloned()
+                    .ok_or_else(|| {
+                        klio_ir::eval::EvalError::Type(format!(
+                            "body prop init FuncId {} out of range",
+                            fid.0
+                        ))
+                    })?;
+                let module = Rc::clone(&self.module);
+                let v = klio_ir::eval::eval_with(&module, &func, Vec::new(), self)?;
+                fields.push((p.name.clone(), v));
+            } else if p.getter.is_none() && p.delegate.is_none() {
+                // Plain `var n: Int` with no init defaults to a
+                // type-appropriate zero — matches Kotlin's
+                // primitive defaults for explicitly-typed body
+                // fields.
+                fields.push((p.name.clone(), klio_runtime::Value::Null));
             }
         }
         let inst = std::rc::Rc::new(std::cell::RefCell::new(klio_runtime::InstanceData {

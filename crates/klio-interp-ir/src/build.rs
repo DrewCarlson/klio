@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 
 use klio_ast::{Decl, KotlinFile};
-use klio_runtime::{ClassDef, ClassParamDef};
+use klio_runtime::{ClassDef, ClassParamDef, PropertyDef};
 
 /// Result of building an IR module from a single Kotlin file.
 pub struct BuiltModule {
@@ -29,6 +29,14 @@ pub struct BuiltModule {
     /// init blocks lowered as FuncIds) this table shrinks and
     /// eventually goes away.
     pub classes: std::collections::HashMap<String, Rc<ClassDef>>,
+    /// `(class name, property name) -> FuncId` for body properties
+    /// with a literal-style initialiser (`val x: Int = 5`). The Vm
+    /// invokes the FuncId during allocation to populate the field.
+    /// Properties whose init references `this`, captured outer
+    /// state, or another instance field land later as the IR grows
+    /// to express them.
+    pub body_prop_inits:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// FuncId of the file's `main`, or `None` when the file has no
     /// `main` entry point.
     pub main: Option<klio_ir::FuncId>,
@@ -105,6 +113,31 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         }
     }
 
+    // Lower body-property initialisers as 0-arg thunks so the Vm
+    // can run them at instance allocation time. Inits that
+    // reference `this` or captured outer state land as the IR
+    // class shape grows; for now they're lowered the same way and
+    // either succeed (literal-only inits) or surface a clear
+    // failure at run time.
+    let mut body_prop_inits: std::collections::HashMap<(String, String), klio_ir::FuncId> =
+        std::collections::HashMap::new();
+    for d in &file.decls {
+        if let Decl::Class(c) = d {
+            for m in &c.members {
+                if let Decl::Property(p) = m {
+                    if let Some(init) = &p.init {
+                        let fid = klio_ir::lower::lower_expr_as_thunk(
+                            &mut module,
+                            init,
+                            &format!("__init_prop_{}_{}", c.name.name, p.name.name),
+                        );
+                        body_prop_inits.insert((c.name.name.clone(), p.name.name.clone()), fid);
+                    }
+                }
+            }
+        }
+    }
+
     // Synthesise a minimal runtime ClassDef for every class in the
     // file. Future workstreams move these fields onto the IR Class
     // (methods, init blocks, supertypes, secondary ctors, ...); for
@@ -123,13 +156,30 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                     default: p.default.as_ref().map(|e| std::rc::Rc::new(e.clone())),
                 })
                 .collect();
+            let body_properties: Vec<PropertyDef> = c
+                .members
+                .iter()
+                .filter_map(|m| match m {
+                    Decl::Property(p) => Some(PropertyDef {
+                        name: p.name.name.clone(),
+                        mutable: p.mutable,
+                        init: p.init.as_ref().map(|e| std::rc::Rc::new(e.clone())),
+                        getter: p.getter.as_ref().map(|a| std::rc::Rc::new(a.clone())),
+                        setter: p.setter.as_ref().map(|a| std::rc::Rc::new(a.clone())),
+                        delegate: p.delegate.as_ref().map(|e| std::rc::Rc::new(e.clone())),
+                        is_abstract: p.is_abstract,
+                        is_lateinit: p.is_lateinit,
+                    }),
+                    _ => None,
+                })
+                .collect();
             let def = std::rc::Rc::new(ClassDef {
                 name: c.name.name.clone(),
                 fqn: c.name.name.clone(),
                 annotation_names: Vec::new(),
                 primary_params,
                 methods: Vec::new(),
-                body_properties: Vec::new(),
+                body_properties,
                 init_blocks: Vec::new(),
                 is_data: c.is_data,
                 is_object: false,
@@ -170,6 +220,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     BuiltModule {
         module: Rc::new(module),
         classes,
+        body_prop_inits,
         main: main_id,
     }
 }
