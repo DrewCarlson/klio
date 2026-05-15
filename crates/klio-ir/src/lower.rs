@@ -1440,6 +1440,55 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             });
             dst
         }
+        // `repeat(n) { … }` — inline-desugar to a counted loop so
+        // the body runs in the caller's eval frame. This must win
+        // over the closure-mutating-lambda arms below (the body
+        // commonly mutates an outer `var`) and over the generic
+        // stdlib-dispatch arm, because dispatching `repeat` to its
+        // Rust binding would run a suspending body in a
+        // non-resumable Rust frame.
+        Expr::Call { callee, args, is_infix, .. }
+            if !*is_infix
+                && args.len() == 2
+                && matches!(&args[1], Expr::Lambda { .. })
+                && matches!(callee.as_ref(), Expr::Path { segments, .. }
+                    if segments.len() == 1
+                        && segments[0].name == "repeat"
+                        && b.resolve("repeat").is_none()
+                        && b.module.func_id("repeat").is_none()) =>
+        {
+            let Expr::Lambda { params, body, .. } = &args[1] else { unreachable!() };
+            let n_reg = lower_expr(b, &args[0]);
+            let i_reg = b.alloc_reg();
+            let zero = b.emit_const(Const::Int(0));
+            b.push(Inst::Move { dst: i_reg, src: zero });
+            let header = b.alloc_block();
+            let body_blk = b.alloc_block();
+            let exit = b.alloc_block();
+            b.terminate(Terminator::Goto(header));
+            b.switch_to(header);
+            let cond = b.alloc_reg();
+            b.push(Inst::BinOp { dst: cond, op: BinOp::Less, lhs: i_reg, rhs: n_reg });
+            b.terminate(Terminator::Branch { cond, t: body_blk, f: exit });
+            b.switch_to(body_blk);
+            b.push_scope();
+            let pname = params
+                .first()
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "it".to_string());
+            b.bind(pname, i_reg);
+            b.push_loop(None, header, exit);
+            let _ = lower_block(b, body);
+            b.pop_loop();
+            b.pop_scope();
+            let one = b.emit_const(Const::Int(1));
+            let nexti = b.alloc_reg();
+            b.push(Inst::BinOp { dst: nexti, op: BinOp::Add, lhs: i_reg, rhs: one });
+            b.push(Inst::Move { dst: i_reg, src: nexti });
+            b.terminate(Terminator::Goto(header));
+            b.switch_to(exit);
+            b.emit_const(Const::Unit)
+        }
         Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. }
             if args.iter().any(|a| lambda_writes_outer_var(b, a))
                 && matches!(callee.as_ref(), Expr::Member { .. })

@@ -745,6 +745,20 @@ impl<'a> VmHost<'a> {
             klio_runtime::RuntimeError::Return(v) => {
                 klio_ir::eval::EvalError::NonLocalReturn(v)
             }
+            // A suspending primitive (`delay` / `yield`) asked to
+            // park. Seed a fresh SuspendState; each enclosing
+            // `eval` frame snapshots itself as it unwinds, and the
+            // coroutine driver parks the result under a token.
+            klio_runtime::RuntimeError::Suspend(wake) => {
+                klio_ir::eval::EvalError::Suspended(Box::new(
+                    klio_ir::eval::SuspendState {
+                        token: 0,
+                        frames: Vec::new(),
+                        wake_in_millis: wake,
+                        pending_resume_reg: None,
+                    },
+                ))
+            }
             other => klio_ir::eval::EvalError::Type(format!("{other}")),
         })
     }
@@ -4991,7 +5005,368 @@ struct VmIntrinsicHost<'a> {
     instance_id_counter: &'a mut u64,
 }
 
+/// Per-`runBlocking` cooperative scheduler state. A stack of these
+/// supports nested `runBlocking` / `coroutineScope`.
+#[derive(Default)]
+struct CoroSched {
+    next_token: u64,
+    virtual_now: i64,
+    /// token → (parked activation, virtual-time wakeup; i64::MAX =
+    /// indefinite — only an explicit ready entry resumes it).
+    parked: std::collections::HashMap<u64, (klio_ir::eval::SuspendState, i64)>,
+    /// FIFO of tokens whose wakeup is due (timer fired or yielded).
+    ready: std::collections::VecDeque<u64>,
+    /// Child `launch` blocks queued during the active scope.
+    launched: Vec<klio_runtime::Value>,
+}
+
+thread_local! {
+    static CORO_STACK: RefCell<Vec<CoroSched>> = const { RefCell::new(Vec::new()) };
+}
+
+impl<'a> VmIntrinsicHost<'a> {
+    /// Evaluate an `IrClosure` and return the *raw* EvalError so the
+    /// coroutine driver can observe `Suspended`. Mirrors the
+    /// closure-setup half of `invoke_callable` (capture env, param
+    /// fill, write-back) without flattening errors.
+    fn eval_closure_raw(
+        &mut self,
+        callable: &klio_runtime::Value,
+        args: &[klio_runtime::Value],
+        this: Option<&klio_runtime::Value>,
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let klio_runtime::Value::IrClosure { id, .. } = callable else {
+            return Err(klio_ir::eval::EvalError::Type(format!(
+                "coroutine block is not a closure: `{}`",
+                callable.type_fqn()
+            )));
+        };
+        let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
+            klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
+        })?;
+        let func = self
+            .module
+            .funcs
+            .get(info.body_func.0 as usize)
+            .cloned()
+            .ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "closure body FuncId {} out of range",
+                    info.body_func.0
+                ))
+            })?;
+        let mut call_args: Vec<klio_runtime::Value> =
+            Vec::with_capacity(info.n_params.max(args.len()));
+        if let Some(t) = this {
+            if info.n_params >= 1 {
+                call_args.push(t.clone());
+                for a in args {
+                    call_args.push(a.clone());
+                }
+            } else {
+                call_args.extend_from_slice(args);
+            }
+        } else {
+            for i in 0..info.n_params {
+                call_args.push(args.get(i).cloned().unwrap_or(klio_runtime::Value::Null));
+            }
+        }
+        while call_args.len() < info.n_params {
+            call_args.push(klio_runtime::Value::Null);
+        }
+        if let Some(t) = this {
+            if let Some(idx) = info.capture_names.iter().position(|n| n == "this") {
+                let mut cap = info.captures.borrow_mut();
+                if idx < cap.len() {
+                    cap[idx] = t.clone();
+                }
+            }
+        }
+        let capture_values: Vec<klio_runtime::Value> = info.captures.borrow().clone();
+        let scoped_env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(
+            Rc::clone(&self.globals),
+        )));
+        for (n, v) in info.capture_names.iter().zip(capture_values.iter()) {
+            scoped_env.borrow_mut().define(n.clone(), v.clone());
+        }
+        let module = Rc::clone(&self.module);
+        let result = {
+            let mut host = VmHost {
+                globals: Rc::clone(&scoped_env),
+                module: Rc::clone(&self.module),
+                scheduler: &mut *self.scheduler,
+                out,
+                instance_id_counter: &mut *self.instance_id_counter,
+                classes: Rc::clone(&self.classes),
+                body_prop_inits: self.body_prop_inits,
+                instance_prop_getters: self.instance_prop_getters,
+                instance_prop_setters: self.instance_prop_setters,
+                parent_ctor_args: self.parent_ctor_args,
+                init_blocks: self.init_blocks,
+                extension_props: self.extension_props,
+                extension_prop_setters: self.extension_prop_setters,
+                anon_methods: Rc::clone(&self.anon_methods),
+                companion_singletons: &self.module.registry.companion_singletons,
+                secondary_ctors: self.secondary_ctors,
+                class_delegates: self.class_delegates,
+                func_defaults: self.func_defaults,
+                enclosing_class: &self.module.registry.enclosing_class,
+                func_type_params: &self.module.registry.func_type_params,
+                top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+                delegated_body_props: &self.module.registry.delegated_body_props,
+                installed_bindings: Rc::clone(&self.installed_bindings),
+                class_default_outer: Rc::clone(&self.class_default_outer),
+                closures: &mut *self.closures,
+            };
+            klio_ir::eval::eval_with_captures(
+                &module,
+                &func,
+                call_args,
+                capture_values,
+                &mut host,
+            )
+        };
+        let new_captures: Vec<klio_runtime::Value> = info
+            .capture_names
+            .iter()
+            .map(|n| scoped_env.borrow().lookup(n).unwrap_or(klio_runtime::Value::Null))
+            .collect();
+        *info.captures.borrow_mut() = new_captures;
+        result
+    }
+
+    /// Resume a parked activation with `value`, raw EvalError out.
+    fn resume_raw(
+        &mut self,
+        state: klio_ir::eval::SuspendState,
+        value: klio_runtime::Value,
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let module = Rc::clone(&self.module);
+        let mut host = VmHost {
+            globals: Rc::clone(&self.globals),
+            module: Rc::clone(&module),
+            scheduler: &mut *self.scheduler,
+            out,
+            instance_id_counter: &mut *self.instance_id_counter,
+            classes: Rc::clone(&self.classes),
+            body_prop_inits: self.body_prop_inits,
+            instance_prop_getters: self.instance_prop_getters,
+            instance_prop_setters: self.instance_prop_setters,
+            parent_ctor_args: self.parent_ctor_args,
+            init_blocks: self.init_blocks,
+            extension_props: self.extension_props,
+            extension_prop_setters: self.extension_prop_setters,
+            anon_methods: Rc::clone(&self.anon_methods),
+            companion_singletons: &self.module.registry.companion_singletons,
+            secondary_ctors: self.secondary_ctors,
+            class_delegates: self.class_delegates,
+            func_defaults: self.func_defaults,
+            enclosing_class: &self.module.registry.enclosing_class,
+            func_type_params: &self.module.registry.func_type_params,
+            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+            delegated_body_props: &self.module.registry.delegated_body_props,
+            installed_bindings: Rc::clone(&self.installed_bindings),
+            class_default_outer: Rc::clone(&self.class_default_outer),
+            closures: &mut *self.closures,
+        };
+        klio_ir::eval::resume_continuation(&module, state, value, &mut host)
+    }
+
+    /// Park a freshly-suspended activation in the active scheduler,
+    /// assigning it a token and a virtual-time wakeup. Returns the
+    /// token so the driver can recognise the root's completion.
+    fn park(&self, mut state: klio_ir::eval::SuspendState) -> u64 {
+        CORO_STACK.with(|s| {
+            let mut stk = s.borrow_mut();
+            let sched = stk.last_mut().expect("park outside runBlocking");
+            sched.next_token += 1;
+            let token = sched.next_token;
+            state.token = token;
+            let wake_at = if state.wake_in_millis < 0 {
+                i64::MAX
+            } else {
+                sched.virtual_now + state.wake_in_millis
+            };
+            if state.wake_in_millis == 0 {
+                sched.ready.push_back(token);
+            }
+            sched.parked.insert(token, (state, wake_at));
+            token
+        })
+    }
+
+    /// The cooperative event loop behind `runBlocking`.
+    fn drive_run_blocking(
+        &mut self,
+        block: &klio_runtime::Value,
+        scope: &klio_runtime::Value,
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        CORO_STACK.with(|s| s.borrow_mut().push(CoroSched::default()));
+        let map_err = |e: klio_ir::eval::EvalError| -> klio_runtime::RuntimeError {
+            match e {
+                klio_ir::eval::EvalError::Throw(v) => klio_runtime::RuntimeError::Thrown(v),
+                klio_ir::eval::EvalError::NonLocalReturn(v) => {
+                    klio_runtime::RuntimeError::Return(v)
+                }
+                other => klio_runtime::RuntimeError::Type(format!("{other}")),
+            }
+        };
+        // Root coroutine.
+        let mut root_value: Option<klio_runtime::Value> = None;
+        let mut root_token: Option<u64> = None;
+        match self.eval_closure_raw(block, &[], Some(scope), out) {
+            Ok(v) => root_value = Some(v),
+            Err(klio_ir::eval::EvalError::Suspended(st)) => {
+                root_token = Some(self.park(*st));
+            }
+            Err(e) => {
+                CORO_STACK.with(|s| {
+                    s.borrow_mut().pop();
+                });
+                return Err(map_err(e));
+            }
+        }
+        loop {
+            // 1. Start any queued child launches.
+            let launched: Vec<klio_runtime::Value> = CORO_STACK.with(|s| {
+                let mut stk = s.borrow_mut();
+                let sched = stk.last_mut().unwrap();
+                std::mem::take(&mut sched.launched)
+            });
+            let mut progressed = !launched.is_empty();
+            for child in launched {
+                match self.eval_closure_raw(&child, &[], Some(scope), out) {
+                    Ok(_) => {}
+                    Err(klio_ir::eval::EvalError::Suspended(st)) => {
+                        self.park(*st);
+                    }
+                    Err(e) => {
+                        CORO_STACK.with(|s| {
+                            s.borrow_mut().pop();
+                        });
+                        return Err(map_err(e));
+                    }
+                }
+            }
+            // 2. Resume a ready coroutine, if any.
+            let next_ready = CORO_STACK.with(|s| {
+                let mut stk = s.borrow_mut();
+                stk.last_mut().unwrap().ready.pop_front()
+            });
+            if let Some(tok) = next_ready {
+                let entry = CORO_STACK.with(|s| {
+                    let mut stk = s.borrow_mut();
+                    stk.last_mut().unwrap().parked.remove(&tok)
+                });
+                if let Some((st, _)) = entry {
+                    progressed = true;
+                    match self.resume_raw(st, klio_runtime::Value::Unit, out) {
+                        Ok(v) => {
+                            if Some(tok) == root_token {
+                                root_value = Some(v);
+                                root_token = None;
+                            }
+                        }
+                        Err(klio_ir::eval::EvalError::Suspended(st2)) => {
+                            let new_tok = self.park(*st2);
+                            if Some(tok) == root_token {
+                                // Root re-suspended — track its new token.
+                                root_token = Some(new_tok);
+                            }
+                        }
+                        Err(e) => {
+                            CORO_STACK.with(|s| {
+                                s.borrow_mut().pop();
+                            });
+                            return Err(map_err(e));
+                        }
+                    }
+                }
+                continue;
+            }
+            // 3. No ready coroutine — advance virtual time to the
+            //    nearest timer and arm every coroutine due then.
+            let advanced = CORO_STACK.with(|s| {
+                let mut stk = s.borrow_mut();
+                let sched = stk.last_mut().unwrap();
+                let soonest = sched
+                    .parked
+                    .values()
+                    .map(|(_, w)| *w)
+                    .filter(|w| *w != i64::MAX)
+                    .min();
+                if let Some(t) = soonest {
+                    if t > sched.virtual_now {
+                        sched.virtual_now = t;
+                    }
+                    let now = sched.virtual_now;
+                    let mut due: Vec<u64> = sched
+                        .parked
+                        .iter()
+                        .filter(|(_, (_, w))| *w != i64::MAX && *w <= now)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    due.sort_unstable();
+                    for tok in &due {
+                        sched.ready.push_back(*tok);
+                    }
+                    !due.is_empty()
+                } else {
+                    false
+                }
+            });
+            if advanced {
+                continue;
+            }
+            // 4. Nothing ready, no timers: done (or deadlocked on an
+            //    indefinitely-parked coroutine with no resumer).
+            if !progressed {
+                break;
+            }
+        }
+        CORO_STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+        Ok(root_value.unwrap_or(klio_runtime::Value::Unit))
+    }
+}
+
 impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
+    fn run_blocking(
+        &mut self,
+        block: &klio_runtime::Value,
+        scope: &klio_runtime::Value,
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        self.drive_run_blocking(block, scope, out)
+    }
+
+    fn coroutine_launch(
+        &mut self,
+        block: &klio_runtime::Value,
+        _scope: &klio_runtime::Value,
+        _out: &mut dyn Output,
+    ) -> Result<(), klio_runtime::RuntimeError> {
+        let queued = CORO_STACK.with(|s| {
+            let mut stk = s.borrow_mut();
+            if let Some(sched) = stk.last_mut() {
+                sched.launched.push(block.clone());
+                true
+            } else {
+                false
+            }
+        });
+        if queued {
+            Ok(())
+        } else {
+            // No active runBlocking — run the child eagerly.
+            self.invoke_callable(block, &[], _out).map(|_| ())
+        }
+    }
+
     fn invoke_callable(
         &mut self,
         callable: &klio_runtime::Value,

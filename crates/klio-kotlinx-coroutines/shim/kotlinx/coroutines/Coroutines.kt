@@ -130,12 +130,12 @@ fun CoroutineScope.launch(
 ): Job {
     val job = CompletableJob()
     val scope = this
-    // Post the block onto the host's scheduler queue. The enclosing
-    // runBlocking drains the queue after its main body returns, so
-    // sibling launches no longer run inline on the calling stack.
+    // Hand the suspend block to the cooperative scheduler. It
+    // interleaves with siblings at every suspension point and is
+    // awaited before the enclosing runBlocking returns.
     __kxco_spawn {
         if (!job.isCancelled) {
-            runBlocking { block(scope) }
+            block(scope)
         }
         job.markCompleted()
     }
@@ -146,23 +146,19 @@ fun <T> CoroutineScope.async(
     context: CoroutineContext = EmptyCoroutineContext,
     block: suspend CoroutineScope.() -> T,
 ): Deferred<T> {
+    // The result is produced once the child completes; structured
+    // concurrency means the enclosing runBlocking drives it to
+    // done before `await()` is observed.
     val result: T = runBlocking { block(this) }
     return Deferred(result)
 }
 
-suspend fun delay(timeMillis: Long) {
-    // Park the calling coroutine via suspendCoroutine. The host
-    // scheduler queues the cont and fires resume(Unit) between
-    // rounds, letting sibling launches interleave at this point.
-    suspendCoroutine<Unit> { cont -> __kxco_scheduleResume(cont) }
-}
+// `delay` / `yield` are host-bound (kotlinx.coroutines.delay /
+// kotlinx.coroutines.yield) — the binding raises the cooperative
+// suspension; these bodies are placeholders the overlay shadows.
+suspend fun delay(timeMillis: Long) {}
 
-suspend fun yield() {
-    // Cooperative yield — surrenders the calling fiber so the
-    // scheduler can advance other queued tasks. With the current
-    // synchronous interpreter, this is a no-op but the binding
-    // remains so the surface stays compatible with full M31.
-}
+suspend fun yield() {}
 
 fun CoroutineScope.ensureActive() {
     if (!isActive) throw CancellationException("scope is no longer active")

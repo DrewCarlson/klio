@@ -88,6 +88,34 @@ pub trait IntrinsicHost {
     fn lookup_global(&mut self, _name: &str) -> Option<Value> {
         None
     }
+
+    /// Run `block` as the root of a cooperative coroutine and drive
+    /// the scheduler to completion: launched children interleave at
+    /// suspension points and `delay` advances *virtual* time so a
+    /// long-running block never blocks the OS thread. Returns the
+    /// block's terminal value. Default impl runs `block` straight
+    /// through with no scheduling (no suspension support).
+    fn run_blocking(
+        &mut self,
+        block: &Value,
+        scope: &Value,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        self.invoke_callable_with_this(block, &[], scope, out)
+    }
+
+    /// Spawn `block` as a child coroutine of the active
+    /// `runBlocking`/coroutineScope. It interleaves with siblings at
+    /// suspension points and is awaited before the root completes.
+    /// Default impl runs it eagerly to completion.
+    fn coroutine_launch(
+        &mut self,
+        block: &Value,
+        scope: &Value,
+        out: &mut dyn Output,
+    ) -> Result<(), RuntimeError> {
+        self.invoke_callable_with_this(block, &[], scope, out).map(|_| ())
+    }
 }
 
 /// Cooperative scheduler the runtime exposes to anything called
@@ -2027,6 +2055,14 @@ pub enum RuntimeError {
     /// — the interpreter unwraps it as `Value::Function`.
     #[error("internal: tail jump")]
     TailJump(Value, Vec<Value>, Vec<Option<String>>),
+    /// Coroutine suspension request. A suspending primitive
+    /// (`delay` / `yield` / `suspendCoroutine`) raises this; the
+    /// interpreter snapshots the live activation, parks it, and the
+    /// cooperative driver resumes it after `wake_in_millis` of
+    /// *virtual* time (`0` = yield to ready coroutines now; a
+    /// negative value = park indefinitely until an explicit resume).
+    #[error("internal: coroutine suspended (wake {0}ms)")]
+    Suspend(i64),
 }
 
 pub trait Output {

@@ -375,6 +375,50 @@ pub enum EvalError {
     /// Operation not yet implemented on this value.
     #[error("not yet implemented: {0}")]
     Unimplemented(String),
+    /// A suspension point fired (`delay` / `yield` /
+    /// `suspendCoroutine`). Each `eval_with_captures` frame on the
+    /// unwind path pushes its [`FrameSnapshot`] onto `state.frames`
+    /// (innermost last) and re-propagates; the coroutine driver
+    /// parks the resulting [`SuspendState`] and resumes it later via
+    /// [`resume_continuation`].
+    #[error("coroutine suspended (token {})", .0.token)]
+    Suspended(Box<SuspendState>),
+}
+
+/// One paused `eval_with_captures` activation. Enough to re-enter
+/// the block loop exactly where it left off.
+#[derive(Debug, Clone)]
+pub struct FrameSnapshot {
+    pub func: FuncId,
+    pub block: BlockId,
+    /// Index of the *next* instruction to run within `block.insts`.
+    pub inst_idx: usize,
+    pub regs: Vec<Value>,
+    pub params: Vec<Value>,
+    pub captures: Vec<Value>,
+    pub try_stack: Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)>,
+    pub is_lambda: bool,
+    /// Register the resumed value is written into before execution
+    /// continues (the destination of the suspending call site).
+    pub resume_reg: Option<Reg>,
+}
+
+/// A parked coroutine: a stack of frame snapshots (outermost first,
+/// innermost last) plus the scheduler token the driver uses to
+/// resume it.
+#[derive(Debug, Clone)]
+pub struct SuspendState {
+    pub token: u64,
+    pub frames: Vec<FrameSnapshot>,
+    /// Virtual-time wakeup the suspending primitive requested:
+    /// `>= 0` resumes after that many ms of virtual time, `< 0`
+    /// parks indefinitely until an explicit resume.
+    pub wake_in_millis: i64,
+    /// Transient: set by the suspending call instruction to its
+    /// destination register, consumed by the enclosing block loop
+    /// when it records the frame snapshot. Always `None` once a
+    /// frame has been pushed.
+    pub pending_resume_reg: Option<Reg>,
 }
 
 /// Per-call evaluation frame.
@@ -451,8 +495,67 @@ pub fn eval_with_captures(
 ) -> Result<Value, EvalError> {
     let mut try_stack: Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)> = Vec::new();
     let mut frame = Frame::new_with_captures(module, func, args, captures);
-    let _ = &mut try_stack;
-    let mut cur = func.entry;
+    let cur = func.entry;
+    run_frame(module, &mut frame, &mut try_stack, cur, 0, host)
+}
+
+/// Resume a parked coroutine. `resume_value` is written into the
+/// innermost frame's resume register, then that frame runs to
+/// completion (or re-suspends). When it returns, its value feeds
+/// the next-outer frame's resume register, and so on up the stack.
+pub fn resume_continuation(
+    module: &Module,
+    mut state: SuspendState,
+    resume_value: Value,
+    host: &mut dyn Host,
+) -> Result<Value, EvalError> {
+    let mut carry = resume_value;
+    // `frames` is innermost-first (the deepest activation snapshots
+    // itself first as `Suspended` unwinds). Resume the innermost,
+    // then feed its return value to the next-outer frame, and so on.
+    let mut frames: std::collections::VecDeque<FrameSnapshot> =
+        state.frames.into();
+    while let Some(snap) = frames.pop_front() {
+        let func = &module.funcs[snap.func.0 as usize];
+        let mut frame = Frame::new_with_captures(
+            module,
+            func,
+            snap.params.clone(),
+            snap.captures.clone(),
+        );
+        frame.regs = snap.regs.clone();
+        if let Some(r) = snap.resume_reg {
+            frame.write(r, carry.clone());
+        }
+        let mut try_stack = snap.try_stack.clone();
+        match run_frame(module, &mut frame, &mut try_stack, snap.block, snap.inst_idx, host) {
+            Ok(v) => {
+                carry = v;
+            }
+            Err(EvalError::Suspended(mut inner)) => {
+                // Re-suspended before this frame finished. The newly
+                // captured inner frames stay innermost-first; the
+                // still-pending outer frames sit after them.
+                inner.frames.extend(frames.into_iter());
+                return Err(EvalError::Suspended(inner));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(carry)
+}
+
+/// Run (or resume) a single activation's block loop. `start_idx` is
+/// the instruction index to begin at within `cur` (0 for a fresh
+/// call, the post-suspension index on resume).
+fn run_frame<'a>(
+    module: &'a Module,
+    frame: &mut Frame<'a>,
+    try_stack: &mut Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)>,
+    mut cur: BlockId,
+    mut resume_idx: usize,
+    host: &mut dyn Host,
+) -> Result<Value, EvalError> {
     loop {
         // Push any catch / finally metadata attached to this block.
         let (insts, term, catches, finally) = {
@@ -464,12 +567,16 @@ pub fn eval_with_captures(
                 block.finally,
             )
         };
-        if !catches.is_empty() || finally.is_some() {
+        if resume_idx == 0 && (!catches.is_empty() || finally.is_some()) {
             try_stack.push((cur, catches, finally));
         }
         let mut thrown: Option<Value> = None;
-        for inst in &insts {
-            match exec_inst(&mut frame, inst, host) {
+        let start_idx = std::mem::take(&mut resume_idx);
+        for (idx, inst) in insts.iter().enumerate() {
+            if idx < start_idx {
+                continue;
+            }
+            match exec_inst(frame, inst, host) {
                 Ok(()) => {}
                 Err(EvalError::Throw(v)) => { thrown = Some(v); break; }
                 Err(EvalError::NonLocalReturn(v)) => {
@@ -477,6 +584,27 @@ pub fn eval_with_captures(
                         return Err(EvalError::NonLocalReturn(v));
                     }
                     return Ok(v);
+                }
+                Err(EvalError::Suspended(mut state)) => {
+                    // Snapshot this activation so it can be resumed
+                    // just past the suspending instruction. The
+                    // resume value lands in the suspending call's
+                    // destination register (or one a binding set
+                    // explicitly via `pending_resume_reg`).
+                    let resume_reg =
+                        state.pending_resume_reg.take().or_else(|| inst_dst(inst));
+                    state.frames.push(FrameSnapshot {
+                        func: frame.func.id,
+                        block: cur,
+                        inst_idx: idx + 1,
+                        regs: frame.regs.clone(),
+                        params: frame.params.clone(),
+                        captures: frame.captures.clone(),
+                        try_stack: try_stack.clone(),
+                        is_lambda: frame.func.is_lambda,
+                        resume_reg,
+                    });
+                    return Err(EvalError::Suspended(state));
                 }
                 Err(e) => return Err(e),
             }
@@ -596,6 +724,22 @@ pub fn eval_with_captures(
                 cur = next;
             }
         }
+    }
+}
+
+/// Destination register of a value-producing instruction, used to
+/// route a coroutine resume value back to the suspending call site.
+fn inst_dst(inst: &Inst) -> Option<Reg> {
+    match inst {
+        Inst::Call { dst, .. }
+        | Inst::CallValue { dst, .. }
+        | Inst::CallValueWithThis { dst, .. }
+        | Inst::CallSpread { dst, .. }
+        | Inst::CallSuper { dst, .. }
+        | Inst::CallMember { dst, .. }
+        | Inst::CallMemberOrGlobal { dst, .. }
+        | Inst::NewInstance { dst, .. } => Some(*dst),
+        _ => None,
     }
 }
 
