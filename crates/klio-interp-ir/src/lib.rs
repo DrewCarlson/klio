@@ -685,7 +685,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let class_name = inst.borrow().class.name.clone();
             if let Some(fid) = self
                 .instance_prop_getters
-                .get(&(class_name, name.to_string()))
+                .get(&(class_name.clone(), name.to_string()))
                 .copied()
             {
                 let func = self
@@ -704,6 +704,24 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
             if let Some(v) = inst.borrow().get(name) {
                 return Ok(v);
+            }
+            // Walk the class's parent chain looking for a companion
+            // singleton that owns the field. Instance methods
+            // referencing companion members lower as `this.X`, which
+            // lands here after the instance's own fields miss.
+            let mut cur: Option<Rc<klio_runtime::ClassDef>> = Some(inst.borrow().class.clone());
+            while let Some(c) = cur {
+                if let Some(comp_name) = self.companion_singletons.get(&c.name).cloned() {
+                    let singleton = self.globals.borrow().lookup(&comp_name);
+                    if let Some(singleton) = singleton {
+                        if let klio_runtime::Value::Instance(cinst) = &singleton {
+                            if let Some(v) = cinst.borrow().get(name) {
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
+                cur = c.parent.borrow().clone();
             }
         }
         // Stdlib property read on a built-in type — `"abc".length`,
