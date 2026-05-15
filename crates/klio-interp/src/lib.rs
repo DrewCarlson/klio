@@ -4391,18 +4391,14 @@ impl Interpreter {
             .copied()
         {
             if this_binding.is_none() {
-                if let Some(module_rc) = self.current_module.clone() {
-                    let func = module_rc.funcs[fid.0 as usize].clone();
-                    // The IR func's params are the lambda params; the
-                    // captures live in the captured_env. Read the
-                    // capture values by name from the env, in the
-                    // order the lower pass recorded.
-                    let captures: Vec<Value> = func
-                        .params
-                        .iter()
-                        .skip(params.len())
-                        .filter_map(|p| captured_env.borrow().lookup(&p.name))
-                        .collect();
+            if let Some(module_rc) = self.current_module.clone() {
+                let func = module_rc.funcs[fid.0 as usize].clone();
+                let captures: Vec<Value> = func
+                    .params
+                    .iter()
+                    .skip(params.len())
+                    .filter_map(|p| captured_env.borrow().lookup(&p.name))
+                    .collect();
                     let mut all_args: Vec<Value> = Vec::with_capacity(params.len() + captures.len());
                     let bind_it = params.is_empty() && args.len() == 1 && !absorb_return;
                     if bind_it {
@@ -4444,7 +4440,7 @@ impl Interpreter {
                         }
                         Err(e) => return Err(RuntimeError::Type(format!("{e}"))),
                     }
-                }
+            }
             }
         }
         // Implicit `it` parameter: a lambda literal without an arrow
