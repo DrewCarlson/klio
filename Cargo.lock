@@ -922,6 +922,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "klio-interp-ir"
+version = "0.1.0"
+dependencies = [
+ "klio-diagnostics",
+ "klio-ir",
+ "klio-runtime",
+ "klio-span",
+ "thiserror",
+]
+
+[[package]]
 name = "klio-ir"
 version = "0.1.0"
 dependencies = [

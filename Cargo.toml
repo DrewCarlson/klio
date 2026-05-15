@@ -22,6 +22,7 @@ members = [
     "crates/klio-kotlinx-io",
     "crates/klio-ktor-client",
     "crates/klio-interp",
+    "crates/klio-interp-ir",
     "crates/klio-cli",
     "crates/klio-parity",
     "crates/klio-diagnostics-gen",
@@ -56,6 +57,7 @@ klio-kotlinx-datetime   = { path = "crates/klio-kotlinx-datetime" }
 klio-kotlinx-io         = { path = "crates/klio-kotlinx-io" }
 klio-ktor-client        = { path = "crates/klio-ktor-client" }
 klio-interp      = { path = "crates/klio-interp" }
+klio-interp-ir   = { path = "crates/klio-interp-ir" }
 
 thiserror      = "2"
 ariadne        = "0.6.0"
