@@ -3250,7 +3250,11 @@ impl Interpreter {
                             s.push_str(&r);
                         }
                         StringPart::Interp(e) => {
-                            let v = self.eval_expr(e, env, out)?;
+                            let v = match self.eval_property_init_via_ir(e, out) {
+                                Some(Ok(v)) => v,
+                                Some(Err(err)) => return Err(err),
+                                None => self.eval_expr(e, env, out)?,
+                            };
                             let r = self.format_value(&v, out)?;
                             s.push_str(&r);
                         }
