@@ -83,7 +83,7 @@ pub struct Vm {
     /// modules and dispatch from this table.
     anon_methods: Rc<RefCell<std::collections::HashMap<
         (String, String),
-        (Rc<klio_ir::Module>, klio_ir::FuncId),
+        (Rc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>>,
     /// Closure side-table. Each `Value::IrClosure { id, captures }`
     /// resolves to a `(body_func, n_params)` here. `n_params` lets
@@ -357,7 +357,7 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     anon_methods: Rc<RefCell<std::collections::HashMap<
         (String, String),
-        (Rc<klio_ir::Module>, klio_ir::FuncId),
+        (Rc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>>,
     companion_singletons: &'a std::collections::HashMap<String, String>,
     closures: &'a mut Vec<ClosureInfo>,
@@ -982,21 +982,41 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // them. The synth class name is the user-declared name; if
         // it collides with a top-level class, the local lookup
         // wins (the runtime classes table is updated in-place).
+        let mut own_members: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for p in &class.primary_params {
+            if p.property.is_some() {
+                own_members.insert(p.name.name.clone());
+            }
+        }
+        for m in &class.members {
+            match m {
+                klio_ast::Decl::Property(p) => {
+                    own_members.insert(p.name.name.clone());
+                }
+                klio_ast::Decl::Function(f) => {
+                    own_members.insert(f.name.name.clone());
+                }
+                _ => {}
+            }
+        }
         for m in &class.members {
             if let klio_ast::Decl::Function(f) = m {
                 if f.body.is_none() {
                     continue;
                 }
                 let mut sub_module = klio_ir::Module::default();
-                let func = klio_ir::lower::lower_function(&mut sub_module, f);
-                let fid = klio_ir::FuncId(sub_module.funcs.len() as u32);
-                let mut placed = func;
-                placed.id = fid;
-                sub_module.funcs.push(placed);
+                let func = klio_ir::lower::lower_method(
+                    &mut sub_module,
+                    f,
+                    &class.name.name,
+                    &own_members,
+                );
+                let fid = func.id;
                 let module_rc = Rc::new(sub_module);
                 self.anon_methods.borrow_mut().insert(
                     (class.name.name.clone(), f.name.name.clone()),
-                    (module_rc, fid),
+                    (module_rc, fid, Vec::new()),
                 );
             }
         }
@@ -1015,9 +1035,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
     fn build_object(
         &mut self,
         ast: &klio_ast::Expr,
-        _captured_names: &[String],
-        _captures: Vec<klio_runtime::Value>,
+        captured_names: &[String],
+        captures: Vec<klio_runtime::Value>,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let capture_pairs: Vec<(String, klio_runtime::Value)> = captured_names
+            .iter()
+            .cloned()
+            .zip(captures.into_iter())
+            .collect();
         // Minimal anonymous-object support: synthesise an
         // InstanceData backed by a fresh ClassDef from the AST's
         // ObjectExpr shape, with no parent ctor chain, no method
@@ -1031,22 +1056,38 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // Lower each method body into a per-method side
             // module + FuncId. dispatch at call_member time.
             let synth_class_name = format!("$anon${identity}");
+            // Collect the anon object's own member names so bare
+            // identifiers inside method bodies resolve through this.
+            let mut own_members: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for m in members {
+                match m {
+                    klio_ast::Decl::Property(p) => {
+                        own_members.insert(p.name.name.clone());
+                    }
+                    klio_ast::Decl::Function(f) => {
+                        own_members.insert(f.name.name.clone());
+                    }
+                    _ => {}
+                }
+            }
             for m in members {
                 if let klio_ast::Decl::Function(f) = m {
                     if f.body.is_none() {
                         continue;
                     }
                     let mut sub_module = klio_ir::Module::default();
-                    let func =
-                        klio_ir::lower::lower_function(&mut sub_module, f);
-                    let fid = klio_ir::FuncId(sub_module.funcs.len() as u32);
-                    let mut placed = func;
-                    placed.id = fid;
-                    sub_module.funcs.push(placed);
+                    let func = klio_ir::lower::lower_method(
+                        &mut sub_module,
+                        f,
+                        &synth_class_name,
+                        &own_members,
+                    );
+                    let fid = func.id;
                     let module_rc = Rc::new(sub_module);
                     self.anon_methods.borrow_mut().insert(
                         (synth_class_name.clone(), f.name.name.clone()),
-                        (module_rc, fid),
+                        (module_rc, fid, capture_pairs.clone()),
                     );
                 }
             }
@@ -1778,7 +1819,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let class_name = inst.borrow().class.name.clone();
             let key = (class_name, name.to_string());
             let entry = self.anon_methods.borrow().get(&key).cloned();
-            if let Some((module_rc, fid)) = entry {
+            if let Some((module_rc, fid, captures)) = entry {
                 let func = module_rc
                     .funcs
                     .get(fid.0 as usize)
@@ -1793,7 +1834,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     Vec::with_capacity(args.len() + 1);
                 all.push(receiver.clone());
                 all.extend_from_slice(args);
-                return klio_ir::eval::eval_with(&module_rc, &func, all, self);
+                // Layer captured outer-env names onto globals for the
+                // duration of the method call so the body's
+                // bare-name globals resolve to the captured values.
+                let prev = Rc::clone(&self.globals);
+                if !captures.is_empty() {
+                    let scoped = Rc::new(RefCell::new(
+                        klio_runtime::Env::with_parent(Rc::clone(&prev)),
+                    ));
+                    for (n, v) in &captures {
+                        scoped.borrow_mut().define(n.clone(), v.clone());
+                    }
+                    self.globals = scoped;
+                }
+                let result = klio_ir::eval::eval_with(&module_rc, &func, all, self);
+                self.globals = prev;
+                return result;
             }
         }
         if let klio_runtime::Value::Instance(inst) = receiver {
@@ -2267,7 +2323,7 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     anon_methods: Rc<RefCell<std::collections::HashMap<
         (String, String),
-        (Rc<klio_ir::Module>, klio_ir::FuncId),
+        (Rc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>>,
     companion_singletons: &'a std::collections::HashMap<String, String>,
     instance_id_counter: &'a mut u64,
