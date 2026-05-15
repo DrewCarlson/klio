@@ -356,6 +356,18 @@ pub enum VmError {
 
 impl From<klio_ir::eval::EvalError> for VmError {
     fn from(e: klio_ir::eval::EvalError) -> Self {
+        // Format Throw variants with the thrown exception's
+        // fqn + message so the user-facing diagnostic is
+        // actionable rather than the trait's generic phrase.
+        if let klio_ir::eval::EvalError::Throw(v) = &e {
+            if let klio_runtime::Value::Exception { fqn, message, .. } = v {
+                let msg = message
+                    .as_deref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("<no message>");
+                return VmError::Eval(format!("uncaught {fqn}: {msg}"));
+            }
+        }
         VmError::Eval(e.to_string())
     }
 }
