@@ -271,6 +271,11 @@ impl Type {
                 Self::Function { params: lp, return_type: lr, is_suspend: ls },
                 Self::Function { params: rp, return_type: rr, is_suspend: rs },
             ) => {
+                // Spec §18.1: suspending and non-suspending function
+                // types are distinct; neither is a subtype of the
+                // other. (Passing a *lambda literal* to a `suspend`
+                // parameter is a separate assignability conversion
+                // handled at the call site, not general subtyping.)
                 ls == rs
                     && lp.len() == rp.len()
                     && lp.iter().zip(rp.iter()).all(|(l, r)| r.is_subtype_of(l))

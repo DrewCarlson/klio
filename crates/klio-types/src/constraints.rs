@@ -449,6 +449,39 @@ impl ConstraintSystem {
                     Err(InferenceError::UnsatisfiableConcrete { lhs: lhs.clone(), rhs: rhs.clone() })
                 }
             }
+            // Function on both sides: decompose structurally so an
+            // inference variable in a parameter or the return type
+            // gets bound. Parameters are contravariant, the return
+            // type covariant. A non-suspend function satisfies a
+            // `suspend` expectation but not the reverse.
+            (
+                Type::Function { params: lp, return_type: lr, is_suspend: ls },
+                Type::Function { params: rp, return_type: rr, is_suspend: rs },
+            ) if lp.len() == rp.len() => {
+                if *ls && !*rs {
+                    Err(InferenceError::UnsatisfiableConcrete {
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                    })
+                } else {
+                    for (l, r) in lp.iter().zip(rp.iter()) {
+                        // contravariant: expected-param <: actual-param
+                        self.add_constraint_with(
+                            r.clone(),
+                            l.clone(),
+                            ConstraintKind::Subtype,
+                            provenance.clone(),
+                        );
+                    }
+                    self.add_constraint_with(
+                        (**lr).clone(),
+                        (**rr).clone(),
+                        ConstraintKind::Subtype,
+                        provenance.clone(),
+                    );
+                    Ok(())
+                }
+            }
             // Parameterised generic on both sides with the same head:
             // reduce per-argument with variance-aware containment
             // (spec §13.2.1, the `Q ⪯ F` table).

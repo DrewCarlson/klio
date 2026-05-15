@@ -7202,6 +7202,39 @@ impl<'r> Checker<'r> {
                     if let Some(ty) = self.check_toplevel_contract_call(name, args, call_span) {
                         return ty;
                     }
+                    // Tolerant bare extension-call fallback. Inside a
+                    // receiver-typed lambda the implicit receiver
+                    // makes an extension function callable without a
+                    // qualifier (`launch { … }` / `async { … }` are
+                    // `CoroutineScope` extensions). The resolver/typeck
+                    // have no receiver-type context at a bare call
+                    // site. Only treat it as an extension call when
+                    // the call is NOT infix (infix `a ext b` is
+                    // dispatched as a member on the lhs elsewhere) —
+                    // detected here by the trailing arg being a
+                    // lambda, which is the receiver-lambda builder
+                    // shape we care about.
+                    let looks_like_builder = args
+                        .last()
+                        .map(|a| matches!(a, Expr::Lambda { .. } | Expr::AnonFun { .. }))
+                        .unwrap_or(false);
+                    if looks_like_builder {
+                        let ext_sig: Option<FnSig> = self
+                            .extensions
+                            .values()
+                            .flat_map(|v| v.iter())
+                            .find(|e| e.name == *name)
+                            .map(|e| e.sig.clone());
+                        if let Some(sig) = ext_sig {
+                            return self.check_overloaded_call(
+                                std::slice::from_ref(&sig),
+                                args,
+                                arg_names,
+                                type_args,
+                                callee.span(),
+                            );
+                        }
+                    }
                 }
                 if let Some(sigs) = self.fns.get(name).cloned() {
                     if let Some(entries) = self.fn_visibility.get(name).cloned() {
@@ -7514,7 +7547,28 @@ impl<'r> Checker<'r> {
             if has_type_args || sig.type_param_count == 0 {
                 return sig.return_ty.clone();
             }
-            let arg_tys: Vec<Type> = args.iter().map(|a| self.check_expr(a, None)).collect();
+            // Pre-type each argument with its declared parameter type
+            // as the expected hint (type-params stay abstract and are
+            // treated permissively). Critically, a lambda argument
+            // whose parameter is `suspend …` is then checked in a
+            // suspend context, so calls like `runBlocking { delay() }`
+            // don't spuriously flag the suspend body. Checking with
+            // `None` here would lose that context and break inference
+            // against `suspend CoroutineScope.() -> T`.
+            let trailing_idx = Self::trailing_lambda_param_idx(&sig, args);
+            let arg_tys: Vec<Type> = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let pidx = if i + 1 == args.len() {
+                        trailing_idx.unwrap_or(i)
+                    } else {
+                        i
+                    };
+                    let hint = sig.params.get(pidx);
+                    self.check_expr(a, hint)
+                })
+                .collect();
             return self.infer_call_return_with_args(&sig, &arg_tys, args, call_span);
         }
         // Pre-type each argument once; selection consults these types,
@@ -7676,19 +7730,28 @@ impl<'r> Checker<'r> {
                 local_subst.insert(name.clone(), t);
                 vars.push(v);
             }
-            for (i, p) in sig.params.iter().enumerate() {
-                if let Some(at) = arg_tys.get(i) {
-                    if matches!(at, Type::Unresolved) {
-                        continue;
-                    }
-                    let p_with_vars = substitute_type_params(p, &local_subst);
-                    session.cs.add_constraint_with(
-                        at.clone(),
-                        p_with_vars,
-                        ConstraintKind::Subtype,
-                        Provenance::CallSite { span: call_span, arg_idx: i },
-                    );
+            // Map each argument to its parameter slot, honouring a
+            // trailing lambda that binds to the last functional
+            // parameter past defaulted middle params (so `async { … }`
+            // constrains the lambda against `block`, not `context`).
+            let trailing_idx = Self::trailing_lambda_param_idx(sig, args);
+            for (i, at) in arg_tys.iter().enumerate() {
+                if matches!(at, Type::Unresolved) {
+                    continue;
                 }
+                let pidx = if i + 1 == arg_tys.len() {
+                    trailing_idx.unwrap_or(i)
+                } else {
+                    i
+                };
+                let Some(p) = sig.params.get(pidx) else { continue };
+                let p_with_vars = substitute_type_params(p, &local_subst);
+                session.cs.add_constraint_with(
+                    at.clone(),
+                    p_with_vars,
+                    ConstraintKind::Subtype,
+                    Provenance::CallSite { span: call_span, arg_idx: i },
+                );
             }
         }
         // The return type carries our fresh inference vars. Outer
@@ -7742,11 +7805,17 @@ impl<'r> Checker<'r> {
         // Lambda re-typing pass — only meaningful at the root,
         // since the substitution carries the fully-solved types.
         if is_root {
+            let trailing_idx = Self::trailing_lambda_param_idx(sig, args);
             for (i, arg) in args.iter().enumerate() {
                 if !matches!(arg, Expr::Lambda { .. }) {
                     continue;
                 }
-                let Some(param_ty) = sig.params.get(i) else { continue };
+                let pidx = if i + 1 == args.len() {
+                    trailing_idx.unwrap_or(i)
+                } else {
+                    i
+                };
+                let Some(param_ty) = sig.params.get(pidx) else { continue };
                 let expected = substitute_type_params(param_ty, &final_subst);
                 if !expected_changed(param_ty, &expected) {
                     continue;
@@ -7775,8 +7844,32 @@ impl<'r> Checker<'r> {
         returned
     }
 
+    /// Index of the parameter a trailing-lambda argument binds to,
+    /// when the call omits defaulted middle parameters. Kotlin lets
+    /// `obj.async { … }` bind the lambda to the last functional
+    /// parameter (`block`), skipping the defaulted `context`. Returns
+    /// `Some(last_param_idx)` only for the final argument when it is
+    /// a lambda, the call passed fewer args than params, and the
+    /// last parameter is a functional type.
+    fn trailing_lambda_param_idx(sig: &FnSig, args: &[Expr]) -> Option<usize> {
+        if args.is_empty() || sig.params.len() <= args.len() {
+            return None;
+        }
+        let last = args.len() - 1;
+        if !matches!(args[last], Expr::Lambda { .. } | Expr::AnonFun { .. }) {
+            return None;
+        }
+        let lp = sig.params.len() - 1;
+        if matches!(sig.params.get(lp), Some(Type::Function { .. })) {
+            Some(lp)
+        } else {
+            None
+        }
+    }
+
     fn check_arity_and_args(&mut self, sig: &FnSig, args: &[Expr], call_span: Span) {
         let vararg_idx = sig.is_vararg.iter().position(|v| *v);
+        let trailing_lambda_idx = Self::trailing_lambda_param_idx(sig, args);
         // Spread arguments must land on a vararg parameter regardless of
         // arity. Emit T0047 up front so the diagnostic still fires when a
         // mis-spread also produces an arity mismatch.
@@ -7827,9 +7920,13 @@ impl<'r> Checker<'r> {
             let is_spread = matches!(a, Expr::Spread { .. });
             // Map positional index i to a parameter slot. Past the vararg
             // index, every additional positional arg lands on the vararg.
-            let target_param = match vararg_idx {
-                Some(va_i) if i >= va_i => va_i,
-                _ => i,
+            let target_param = if Some(i) == trailing_lambda_idx.map(|_| args.len() - 1) {
+                trailing_lambda_idx.unwrap()
+            } else {
+                match vararg_idx {
+                    Some(va_i) if i >= va_i => va_i,
+                    _ => i,
+                }
             };
             if is_spread {
                 let is_va = sig.is_vararg.get(target_param).copied().unwrap_or(false);

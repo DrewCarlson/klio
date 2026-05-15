@@ -322,14 +322,15 @@ impl Resolver {
     }
 
     fn declare_top_level(&mut self, scope: ScopeId, decl: &Decl) {
-        // Extension declarations live in a per-receiver namespace, not the
-        // top-level value scope; skip the bare-name binding so two
-        // extensions on different receivers can share a name.
-        if let Decl::Function(f) = decl {
-            if f.receiver_type.is_some() {
-                return;
-            }
-        }
+        // Extension *functions* are also bound by their bare name as
+        // a tolerant fallback: inside a receiver-typed lambda the
+        // implicit receiver makes `launch { … }` / `async { … }`
+        // (extensions on `CoroutineScope`) callable without an
+        // explicit qualifier, and the resolver has no receiver-type
+        // info at this pre-typeck stage. Functions never conflict on
+        // name alone (overloads), so the bare binding is safe and
+        // prevents spurious UNRESOLVED_REFERENCE on valid code. The
+        // qualified `recv.ext()` path resolves independently.
         if let Decl::Property(p) = decl {
             if p.receiver_type.is_some() {
                 return;
