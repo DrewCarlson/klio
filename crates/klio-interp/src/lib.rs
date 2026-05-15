@@ -13729,14 +13729,20 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             env.borrow_mut().define(name.clone(), value.clone());
         }
         let body_rc = Rc::new(body.clone());
+        // Register the lambda body's FuncId for IR-first dispatch only
+        // when there are no captures: the IR-first path in
+        // `call_lambda_with_this` passes no captures, so a body using
+        // `LoadCapture` would read uninitialised values.
         if let Some(fid) = body_func {
-            let sp = body_rc.span;
-            let key = (sp.file.0, sp.start, sp.end);
-            self.interp
-                .module_registry
-                .class_ir
-                .lambda_ir_funcs
-                .insert(key, fid);
+            if captured_names.is_empty() {
+                let sp = body_rc.span;
+                let key = (sp.file.0, sp.start, sp.end);
+                self.interp
+                    .module_registry
+                    .class_ir
+                    .lambda_ir_funcs
+                    .insert(key, fid);
+            }
         }
         Ok(klio_runtime::Value::Lambda {
             params: Rc::new(params.to_vec()),
@@ -13941,39 +13947,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             name: Ident { name: name.to_string(), span: dummy_span },
             span: dummy_span,
         };
-        // Try the IR-native route first.
-        {
-            let mut local_module = klio_ir::Module::default();
-            let fid = klio_ir::lower::lower_expr_as_param_thunk(
-                &mut local_module,
-                &["__ir_self"],
-                &expr,
-                "__member_ref__",
-            );
-            let module_rc = std::rc::Rc::new(local_module);
-            let func = module_rc.funcs[fid.0 as usize].clone();
-            let class_names: Vec<String> =
-                module_rc.classes.iter().map(|c| c.name.clone()).collect();
-            let method_index = IrHost::build_method_index(&module_rc);
-            let mut child = IrHost {
-                interp: self.interp,
-                out: self.out,
-                class_names,
-                closures: Vec::new(),
-                module: std::rc::Rc::clone(&module_rc),
-                method_index,
-            };
-            match klio_ir::eval::eval_with(
-                &module_rc,
-                &func,
-                vec![receiver.clone()],
-                &mut child,
-            ) {
-                Ok(v) => return Ok(v),
-                Err(klio_ir::eval::EvalError::Unsupported(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
+        // Lowering Expr::MemberRef through IR would re-enter
+        // member_ref (lower_expr emits Inst::MemberRef for MemberRef),
+        // so resolve via the tree walker directly.
         self.interp.eval_expr(&expr, &env, self.out).map_err(ir_err)
     }
 
@@ -15185,40 +15161,9 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         captured_names: &[String],
         captures: Vec<klio_runtime::Value>,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        // Lower the captured AST as an N-arg IR thunk parameterised
-        // on the captured names; invoke via klio_ir::eval with the
-        // captured values as positional args. Falls back to the
-        // tree walker when the IR refuses to lower a shape.
-        if !captured_names.is_empty()
-            && captured_names.len() == captures.len()
-        {
-            let mut local_module = klio_ir::Module::default();
-            let name_refs: Vec<&str> = captured_names.iter().map(|s| s.as_str()).collect();
-            let fid = klio_ir::lower::lower_expr_as_param_thunk(
-                &mut local_module,
-                &name_refs,
-                ast,
-                "__build_object__",
-            );
-            let module_rc = std::rc::Rc::new(local_module);
-            let func = module_rc.funcs[fid.0 as usize].clone();
-            let class_names: Vec<String> =
-                module_rc.classes.iter().map(|c| c.name.clone()).collect();
-            let method_index = IrHost::build_method_index(&module_rc);
-            let mut child = IrHost {
-                interp: self.interp,
-                out: self.out,
-                class_names,
-                closures: Vec::new(),
-                module: std::rc::Rc::clone(&module_rc),
-                method_index,
-            };
-            match klio_ir::eval::eval_with(&module_rc, &func, captures.clone(), &mut child) {
-                Ok(v) => return Ok(v),
-                Err(klio_ir::eval::EvalError::Unsupported(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
+        // Lowering the ObjectExpr through IR would re-enter
+        // BuildObject (lower_expr emits BuildObject for ObjectExpr),
+        // so synthesise the class via the tree walker directly.
         let env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(Rc::clone(&self.interp.globals))));
         for (n, v) in captured_names.iter().zip(captures.iter()) {
             env.borrow_mut().define(n.clone(), v.clone());
