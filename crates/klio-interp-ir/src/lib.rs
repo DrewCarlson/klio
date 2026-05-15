@@ -1867,7 +1867,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // markers and `object : SomeInterface { override fun ... }`
         // SAM-like wrappers used by tests. Full lowering lands when
         // the IR Class shape supports it.
-        if let klio_ast::Expr::ObjectExpr { members, supertypes, .. } = ast {
+        if let klio_ast::Expr::ObjectExpr { members, supertypes, supertype_args, .. } = ast {
             *self.instance_id_counter += 1;
             let identity = *self.instance_id_counter;
             // Lower each method body into a per-method side
@@ -1875,6 +1875,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let synth_class_name = format!("$anon${identity}");
             // Collect the anon object's own member names so bare
             // identifiers inside method bodies resolve through this.
+            // Pulls in supertype members too: an `object : Named(...)`
+            // body that references `name` resolves through this.name
+            // and the field bound below from the parent's primary
+            // ctor args.
             let mut own_members: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for m in members {
@@ -1886,6 +1890,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         own_members.insert(f.name.name.clone());
                     }
                     _ => {}
+                }
+            }
+            for sup in supertypes {
+                if let Some(pdef) = self.classes.borrow().get(&sup.name.name).cloned() {
+                    for p in &pdef.primary_params {
+                        own_members.insert(p.name.clone());
+                    }
+                    for p in &pdef.body_properties {
+                        own_members.insert(p.name.clone());
+                    }
+                    for me in pdef.methods.iter() {
+                        own_members.insert(me.name.clone());
+                    }
                 }
             }
             for m in members {
@@ -1974,6 +1991,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 } else {
                     fields.push((p.name.clone(), klio_runtime::Value::Null));
+                }
+            }
+            // Populate parent's primary-param fields from
+            // `object : Named("Anna") { … }` style supertype
+            // ctor args. Best-effort: evaluate literal args via
+            // `simple_literal` so subsequent `name` reads on this
+            // instance see the parent's field.
+            for (idx, sup) in supertypes.iter().enumerate() {
+                let arg_exprs = match supertype_args.get(idx) {
+                    Some(Some(v)) => v.clone(),
+                    _ => continue,
+                };
+                let parent_def = self.classes.borrow().get(&sup.name.name).cloned();
+                if let Some(pdef) = parent_def {
+                    for (param, arg_expr) in
+                        pdef.primary_params.iter().zip(arg_exprs.iter())
+                    {
+                        if param.property.is_none() {
+                            continue;
+                        }
+                        let v =
+                            simple_literal(arg_expr).unwrap_or(klio_runtime::Value::Null);
+                        fields.push((param.name.clone(), v));
+                    }
                 }
             }
             let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
