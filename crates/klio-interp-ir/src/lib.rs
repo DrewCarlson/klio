@@ -312,6 +312,24 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // bound as `this`. Wins over the plain field read so a
         // `val full: String get() = "$first $last"` shape evaluates
         // the getter rather than returning a missing-field Null.
+        // `size` on arrays + collections.
+        if name == "size" {
+            match receiver {
+                klio_runtime::Value::Array { items, .. } => {
+                    return Ok(klio_runtime::Value::new_int(items.borrow().len() as i64));
+                }
+                klio_runtime::Value::List { items, .. } => {
+                    return Ok(klio_runtime::Value::new_int(items.borrow().len() as i64));
+                }
+                klio_runtime::Value::Set { items, .. } => {
+                    return Ok(klio_runtime::Value::new_int(items.borrow().len() as i64));
+                }
+                klio_runtime::Value::Map { entries, .. } => {
+                    return Ok(klio_runtime::Value::new_int(entries.borrow().len() as i64));
+                }
+                _ => {}
+            }
+        }
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
             if let Some(fid) = self
