@@ -810,6 +810,9 @@ impl<'a> VmHost<'a> {
             // try/catch can match the handler against the exception
             // class. Stringifying here would break `try { … } catch`.
             klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
+            klio_runtime::RuntimeError::Return(v) => {
+                klio_ir::eval::EvalError::NonLocalReturn(v)
+            }
             other => klio_ir::eval::EvalError::Type(format!("{other}")),
         })
     }
@@ -1828,6 +1831,56 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(());
                 }
             }
+            if !bypass_setter {
+                let has_own = inst.borrow().get(real_name).is_some();
+                let is_own_member = inst
+                    .borrow()
+                    .class
+                    .primary_params
+                    .iter()
+                    .any(|p| p.name == real_name)
+                    || inst
+                        .borrow()
+                        .class
+                        .body_properties
+                        .iter()
+                        .any(|p| p.name == real_name);
+                if !has_own && !is_own_member {
+                    // Walk class chain (parents + interfaces) and
+                    // probe each level's companion for the field.
+                    let mut queue: Vec<Rc<klio_runtime::ClassDef>> =
+                        vec![inst.borrow().class.clone()];
+                    let mut visited: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    while let Some(c) = queue.pop() {
+                        if !visited.insert(c.name.clone()) {
+                            continue;
+                        }
+                        if let Some(comp_name) =
+                            self.companion_singletons.get(&c.name).cloned()
+                        {
+                            let singleton = self.globals.borrow().lookup(&comp_name);
+                            if let Some(singleton) = singleton {
+                                if let klio_runtime::Value::Instance(cinst) = &singleton {
+                                    if cinst.borrow().get(real_name).is_some() {
+                                        return self.set_field(&singleton, real_name, value);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(p) = c.parent.borrow().clone() {
+                            queue.push(p);
+                        }
+                        for ifc in c.interfaces.borrow().iter() {
+                            queue.push(Rc::clone(ifc));
+                        }
+                    }
+                    let outer = inst.borrow().outer.clone();
+                    if let Some(outer_val) = outer {
+                        return self.set_field(&outer_val, real_name, value);
+                    }
+                }
+            }
             inst.borrow_mut().define(real_name, value);
             return Ok(());
         }
@@ -2614,6 +2667,34 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 {
                     return true;
                 }
+                // Walk transitive interface supertypes:
+                // `class Robot : FormalGreeter` where
+                // `interface FormalGreeter : Greeter` matches both.
+                {
+                    let mut iq: std::collections::VecDeque<Rc<klio_runtime::ClassDef>> =
+                        c.interfaces.borrow().iter().cloned().collect();
+                    let mut iseen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    while let Some(iface) = iq.pop_front() {
+                        if !iseen.insert(iface.name.clone()) {
+                            continue;
+                        }
+                        if iface.name == ty.name || iface.fqn == ty.name {
+                            return true;
+                        }
+                        for sup in &iface.supertype_names {
+                            if sup == &ty.name {
+                                return true;
+                            }
+                            if let Some(d) = self.classes.borrow().get(sup).cloned() {
+                                iq.push_back(d);
+                            }
+                        }
+                        for sup in iface.interfaces.borrow().iter() {
+                            iq.push_back(Rc::clone(sup));
+                        }
+                    }
+                }
                 // Walk supertype names — covers chains where the
                 // direct parent is a built-in exception class
                 // that isn't itself in the user class table.
@@ -3151,7 +3232,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             ),
                             message: Some(std::rc::Rc::new(format!(
                                 "No enum constant {}.{}",
-                                cls.name, s
+                                cls.fqn, s
                             ))),
                             cause: None,
                         },
@@ -4828,6 +4909,9 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             *info.captures.borrow_mut() = new_captures;
             return result.map_err(|e| match e {
                 klio_ir::eval::EvalError::Throw(v) => klio_runtime::RuntimeError::Thrown(v),
+                klio_ir::eval::EvalError::NonLocalReturn(v) => {
+                    klio_runtime::RuntimeError::Return(v)
+                }
                 other => klio_runtime::RuntimeError::Type(format!("{other}")),
             });
         }

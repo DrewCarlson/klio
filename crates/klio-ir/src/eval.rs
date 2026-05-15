@@ -472,7 +472,12 @@ pub fn eval_with_captures(
             match exec_inst(&mut frame, inst, host) {
                 Ok(()) => {}
                 Err(EvalError::Throw(v)) => { thrown = Some(v); break; }
-                Err(EvalError::NonLocalReturn(v)) => return Ok(v),
+                Err(EvalError::NonLocalReturn(v)) => {
+                    if frame.func.is_lambda {
+                        return Err(EvalError::NonLocalReturn(v));
+                    }
+                    return Ok(v);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -511,6 +516,13 @@ pub fn eval_with_captures(
             }
             Terminator::Return(r) => {
                 return Ok(r.map(|r| frame.read(r)).unwrap_or(Value::Unit));
+            }
+            Terminator::NonLocalReturn(r) => {
+                let v = r.map(|r| frame.read(r)).unwrap_or(Value::Unit);
+                if frame.func.is_lambda {
+                    return Err(EvalError::NonLocalReturn(v));
+                }
+                return Ok(v);
             }
             Terminator::Throw(r) => {
                 let exc = frame.read(r);

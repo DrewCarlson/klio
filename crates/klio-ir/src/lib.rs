@@ -375,6 +375,10 @@ pub enum Terminator {
     /// calls between two `tailrec` functions so mutual recursion stays
     /// in a single host frame.
     TailCallFunc { func: FuncId, args: Reg, n_args: u8 },
+    /// Non-local return — propagates an EvalError::NonLocalReturn
+    /// up through enclosing lambda frames until a non-lambda fn
+    /// catches it and converts it into a normal return value.
+    NonLocalReturn(Option<Reg>),
 }
 
 /// Catch handler frame attached to a try-body block. When a Throw
@@ -421,6 +425,11 @@ pub struct Func {
     pub is_suspend: bool,
     #[serde(default)]
     pub is_tailrec: bool,
+    /// True for synthetic lambda bodies. `return` inside the body
+    /// propagates as a non-local return through this frame instead
+    /// of being caught locally.
+    #[serde(default)]
+    pub is_lambda: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

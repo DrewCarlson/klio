@@ -71,6 +71,7 @@ pub struct FuncBuilder<'a> {
     /// (e.g. a builder lambda) rather than a member of the
     /// receiver.
     param_names: std::collections::HashSet<String>,
+    is_lambda_body: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +107,7 @@ impl<'a> FuncBuilder<'a> {
             own_members: std::collections::HashSet::new(),
             tailrec_self: None,
             param_names: std::collections::HashSet::new(),
+            is_lambda_body: false,
         }
     }
 
@@ -144,6 +146,18 @@ impl<'a> FuncBuilder<'a> {
     /// `Inst::Lambda` knows which outer regs to snapshot.
     pub fn set_outer_names(&mut self, names: std::collections::HashSet<String>) {
         self.outer_names = names;
+        self.is_lambda_body = true;
+    }
+
+    pub fn set_outer_names_without_lambda(
+        &mut self,
+        names: std::collections::HashSet<String>,
+    ) {
+        self.outer_names = names;
+    }
+
+    pub fn is_lambda_body(&self) -> bool {
+        self.is_lambda_body
     }
 
     /// Record a capture reference encountered during lowering.
@@ -390,6 +404,7 @@ impl<'a> FuncBuilder<'a> {
             entry: BlockId(0),
         is_suspend: false,
         is_tailrec: self.tailrec_self.is_some(),
+        is_lambda: false,
         }
     }
 }

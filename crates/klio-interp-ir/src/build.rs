@@ -700,6 +700,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                 entry: klio_ir::BlockId(0),
                 is_suspend: false,
                 is_tailrec: f.is_tailrec,
+                is_lambda: false,
             });
             module.func_index.push((f.name.name.clone(), id));
             if f.is_tailrec {

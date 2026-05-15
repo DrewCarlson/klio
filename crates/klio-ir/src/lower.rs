@@ -2001,12 +2001,17 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.switch_to(exit);
             b.emit_const(Const::Unit)
         }
-        Expr::Return { value, .. } => {
+        Expr::Return { value, label, .. } => {
             let r = match value {
                 Some(e) => Some(lower_expr(b, e)),
                 None => None,
             };
-            b.terminate(Terminator::Return(r));
+            if b.is_lambda_body() && label.is_none() {
+                b.terminate(Terminator::NonLocalReturn(r));
+            } else {
+                b.terminate(Terminator::Return(r));
+            }
+            let _ = label;
             // The post-return path is unreachable; allocate a fresh
             // block so caller code that emits anything after sees a
             // distinct cursor.
@@ -2451,8 +2456,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let param_idents: Vec<klio_ast::Ident> =
                 params.iter().map(|p| p.name.clone()).collect();
             let outer_names: std::collections::HashSet<String> = b.visible_names();
-            let (body_func, captured_names) = lower_lambda_body_capturing(
-                b.module, &param_idents, &body_block, outer_names,
+            let (body_func, captured_names) = lower_lambda_body_capturing_kind(
+                b.module, &param_idents, &body_block, outer_names, false,
             );
             let captures: Vec<Reg> = captured_names
                 .iter()
@@ -2539,8 +2544,22 @@ fn lower_lambda_body_capturing(
     body: &klio_ast::Block,
     outer: std::collections::HashSet<String>,
 ) -> (crate::FuncId, Vec<String>) {
+    lower_lambda_body_capturing_kind(module, params, body, outer, true)
+}
+
+fn lower_lambda_body_capturing_kind(
+    module: &mut crate::Module,
+    params: &[klio_ast::Ident],
+    body: &klio_ast::Block,
+    outer: std::collections::HashSet<String>,
+    is_lambda: bool,
+) -> (crate::FuncId, Vec<String>) {
     let mut b = FuncBuilder::new(module);
-    b.set_outer_names(outer);
+    if is_lambda {
+        b.set_outer_names(outer);
+    } else {
+        b.set_outer_names_without_lambda(outer);
+    }
     // Implicit `it` lambdas have empty params — bind a synthetic
     // `it` slot so bare `it` references inside the body lower as
     // a LoadParam rather than a LoadGlobal.
@@ -2556,6 +2575,7 @@ fn lower_lambda_body_capturing(
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
     placed.id = id;
+    placed.is_lambda = is_lambda;
     module.funcs.push(placed);
     (id, captured)
 }
