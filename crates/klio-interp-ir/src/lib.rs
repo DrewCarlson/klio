@@ -1287,12 +1287,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // through to the standard lookup chain when the user
         // didn't declare an extension property for this combo.
         {
-            let type_fqn = receiver.type_fqn();
-            let recv_simple: String = type_fqn
-                .rsplit('.')
-                .next()
-                .unwrap_or(type_fqn)
-                .to_string();
+            let recv_simple: String = match receiver {
+                klio_runtime::Value::Instance(i) => i.borrow().class.name.clone(),
+                other => {
+                    let f = other.type_fqn();
+                    f.rsplit('.').next().unwrap_or(f).to_string()
+                }
+            };
             if let Some(fid) = self
                 .extension_props
                 .get(&(recv_simple, name.to_string()))
@@ -1613,12 +1614,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Extension-property setter — `var T.x: ... set(value) {…}`
         // — keyed by `(receiver simple type, prop name)`.
         if !bypass_setter {
-            let type_fqn = receiver.type_fqn();
-            let recv_simple: String = type_fqn
-                .rsplit('.')
-                .next()
-                .unwrap_or(type_fqn)
-                .to_string();
+            let recv_simple: String = match receiver {
+                klio_runtime::Value::Instance(i) => i.borrow().class.name.clone(),
+                other => {
+                    let f = other.type_fqn();
+                    f.rsplit('.').next().unwrap_or(f).to_string()
+                }
+            };
             if let Some(fid) = self
                 .extension_prop_setters
                 .get(&(recv_simple, real_name.to_string()))

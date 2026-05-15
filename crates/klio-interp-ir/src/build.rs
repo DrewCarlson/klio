@@ -1382,7 +1382,20 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                         .first()
                         .map(|n| n.name.clone())
                         .unwrap_or_else(|| "value".to_string());
-                    let empty_members = std::collections::HashSet::new();
+                    // Receiver-class members are visible bare-name
+                    // inside the extension setter (`set(v) { x = v }`
+                    // writes to `this.x`).
+                    let mut recv_members: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    if let Some(rdef) = classes.get(&recv.name.name) {
+                        for p in &rdef.primary_params {
+                            recv_members.insert(p.name.clone());
+                        }
+                        for p in &rdef.body_properties {
+                            recv_members.insert(p.name.clone());
+                        }
+                    }
+                    let empty_members = recv_members;
                     let fid = match &setter.body {
                         klio_ast::FunctionBody::Expr(body) => Some(
                             klio_ir::lower::lower_accessor_expr(
