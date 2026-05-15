@@ -637,30 +637,43 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         let cached = self.globals.borrow().lookup(name);
         if let Some(v) = cached {
-            // Lazy-delegate auto-resolve: a top-level `val X by lazy { … }`
-            // stores the `Value::Delegate(Lazy)` here; the first read
-            // invokes the producer, caches the result, and returns it.
+            // Delegate auto-resolve for top-level `var/val X by <delegate>`.
             if let klio_runtime::Value::Delegate(d) = &v {
-                let mut state = d.borrow_mut();
-                if let klio_runtime::DelegateKind::Lazy { producer, cached } = &mut *state {
-                    if let Some(c) = cached.clone() {
-                        return Some(c);
-                    }
-                    let prod = producer.clone();
-                    drop(state);
-                    if let Ok(result) =
-                        <Self as klio_ir::eval::Host>::call_value(self, &prod, &[])
-                    {
-                        if let klio_runtime::Value::Delegate(d2) = &v {
+                let state = d.borrow();
+                match &*state {
+                    klio_runtime::DelegateKind::Lazy { producer, cached } => {
+                        if let Some(c) = cached.clone() {
+                            return Some(c);
+                        }
+                        let prod = producer.clone();
+                        drop(state);
+                        if let Ok(result) =
+                            <Self as klio_ir::eval::Host>::call_value(self, &prod, &[])
+                        {
                             if let klio_runtime::DelegateKind::Lazy { cached, .. } =
-                                &mut *d2.borrow_mut()
+                                &mut *d.borrow_mut()
                             {
                                 *cached = Some(result.clone());
                             }
+                            return Some(result);
                         }
-                        return Some(result);
+                        return Some(v);
                     }
-                    return Some(v);
+                    klio_runtime::DelegateKind::NotNull { value, name: _ } => {
+                        match value.clone() {
+                            Some(x) => return Some(x),
+                            None => {
+                                // Reading a `Delegates.notNull` slot
+                                // before it's been written throws
+                                // IllegalStateException per Kotlin.
+                                let _ = name;
+                                return None;
+                            }
+                        }
+                    }
+                    klio_runtime::DelegateKind::Observable { value, .. } => {
+                        return Some(value.clone());
+                    }
                 }
             }
             return Some(v);
@@ -725,6 +738,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return Some(klio_runtime::Value::Intrinsic { fqn: leaked, func });
             }
         }
+        // `Delegates` singleton — a synthetic intrinsic value that
+        // exposes `notNull`, `observable`, and `vetoable` member
+        // calls. The Vm intercepts those in call_member when the
+        // receiver is this singleton.
+        if name == "Delegates" {
+            return Some(klio_runtime::Value::Intrinsic {
+                fqn: "kotlin.properties.Delegates",
+                func: |_ctx| {
+                    Err(klio_runtime::RuntimeError::Type(
+                        "Delegates: use Delegates.notNull / Delegates.observable / Delegates.vetoable"
+                            .into(),
+                    ))
+                },
+            });
+        }
         // Primitive-companion constants (`Int.MAX_VALUE`, `Double.NaN`,
         // `Long.SIZE_BITS`, …). The IR lowers these as a single
         // dotted-name global ref; we split on `.` and consult the
@@ -742,8 +770,63 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         value: klio_runtime::Value,
     ) -> Result<(), klio_ir::eval::EvalError> {
+        // Delegate-aware write: if the slot currently holds a
+        // `Value::Delegate(NotNull/Observable)`, route the write
+        // through the delegate's setValue semantics. Observable
+        // fires its on_change callback (oldValue, newValue).
+        let existing = self.globals.borrow().lookup(name);
+        if let Some(klio_runtime::Value::Delegate(d)) = existing {
+            let kind = d.borrow().clone();
+            match kind {
+                klio_runtime::DelegateKind::NotNull { .. } => {
+                    *d.borrow_mut() = klio_runtime::DelegateKind::NotNull {
+                        value: Some(value),
+                        name: name.to_string(),
+                    };
+                    return Ok(());
+                }
+                klio_runtime::DelegateKind::Observable { value: old, on_change } => {
+                    *d.borrow_mut() = klio_runtime::DelegateKind::Observable {
+                        value: value.clone(),
+                        on_change: on_change.clone(),
+                    };
+                    let prop_ref = klio_runtime::Value::PropertyRef {
+                        name: Rc::new(name.to_string()),
+                    };
+                    let _ = <Self as klio_ir::eval::Host>::call_value(
+                        self,
+                        &on_change,
+                        &[prop_ref, old, value],
+                    )?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         self.globals.borrow_mut().define(name, value);
         Ok(())
+    }
+
+    fn lookup_global_throwing(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<klio_runtime::Value>, klio_ir::eval::EvalError> {
+        let raw = self.globals.borrow().lookup(name);
+        if let Some(klio_runtime::Value::Delegate(d)) = &raw {
+            if let klio_runtime::DelegateKind::NotNull { value: None, .. } = &*d.borrow() {
+                return Err(klio_ir::eval::EvalError::Throw(
+                    klio_runtime::Value::Exception {
+                        fqn: Rc::new("kotlin.IllegalStateException".to_string()),
+                        message: Some(Rc::new(format!(
+                            "Property {} should be initialized before get.",
+                            name
+                        ))),
+                        cause: None,
+                    },
+                ));
+            }
+        }
+        Ok(self.lookup_global(name))
     }
 
     fn call_value(
@@ -1827,6 +1910,33 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // `Delegates.notNull` / `Delegates.observable` /
+        // `Delegates.vetoable` — synthesise the proper
+        // `Value::Delegate` directly. The singleton itself is
+        // surfaced via `lookup_global` as a sentinel Intrinsic.
+        if let klio_runtime::Value::Intrinsic { fqn, .. } = receiver {
+            if *fqn == "kotlin.properties.Delegates" {
+                match (name, args.len()) {
+                    ("notNull", 0) => {
+                        return Ok(klio_runtime::Value::Delegate(Rc::new(RefCell::new(
+                            klio_runtime::DelegateKind::NotNull {
+                                value: None,
+                                name: String::new(),
+                            },
+                        ))));
+                    }
+                    ("observable", 2) => {
+                        return Ok(klio_runtime::Value::Delegate(Rc::new(RefCell::new(
+                            klio_runtime::DelegateKind::Observable {
+                                value: args[0].clone(),
+                                on_change: args[1].clone(),
+                            },
+                        ))));
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Static call on a class-or-intrinsic receiver: probe stdlib
         // by `<receiver-fqn>.<name>` so `Regex.escape("x")` and
         // `Color.values()` route through the matching binding. The
@@ -2263,6 +2373,18 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     .any(|x| klio_runtime::Value::structural_eq(x, &args[0]))
                 {
                     v.push(args[0].clone());
+                }
+                return Ok(klio_runtime::Value::Unit);
+            }
+            (klio_runtime::Value::Set { items, mutable: true, .. }, "minusAssign")
+                if args.len() == 1 =>
+            {
+                let mut v = items.borrow_mut();
+                if let Some(pos) = v
+                    .iter()
+                    .position(|x| klio_runtime::Value::structural_eq(x, &args[0]))
+                {
+                    v.remove(pos);
                 }
                 return Ok(klio_runtime::Value::Unit);
             }
