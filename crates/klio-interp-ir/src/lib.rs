@@ -1393,6 +1393,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::new_int(h as i64));
                 }
             }
+            if is_data && !has_user_override && name == "copy" {
+                let class_def = inst.borrow().class.clone();
+                let n_params = class_def.primary_params.len();
+                if args.len() <= n_params {
+                    let mut new_args: Vec<klio_runtime::Value> = Vec::with_capacity(n_params);
+                    let i = inst.borrow();
+                    for (idx, p) in class_def.primary_params.iter().enumerate() {
+                        let v = if idx < args.len() {
+                            args[idx].clone()
+                        } else {
+                            i.get(&p.name).unwrap_or(klio_runtime::Value::Null)
+                        };
+                        new_args.push(v);
+                    }
+                    drop(i);
+                    if let Some(class_id) = self.module.class_id(&class_def.name) {
+                        return <VmHost as klio_ir::eval::Host>::new_instance(self, class_id, &new_args);
+                    }
+                }
+            }
             if is_data && !has_user_override && args.len() == 1 && name == "equals" {
                 let i = inst.borrow();
                 let class_fqn = i.class.fqn.clone();
@@ -1569,8 +1589,52 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
         args: &[klio_runtime::Value],
-        _arg_names: &[Option<String>],
+        arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // data-class `copy(name = …, age = …)` — reorder named args
+        // into the primary-ctor param positions, defaulting missing
+        // slots to the receiver's current field values.
+        if name == "copy" {
+            if let klio_runtime::Value::Instance(inst) = receiver {
+                let class_def = inst.borrow().class.clone();
+                if class_def.is_data {
+                    let n_params = class_def.primary_params.len();
+                    let mut slots: Vec<Option<klio_runtime::Value>> = vec![None; n_params];
+                    let mut positional_idx = 0usize;
+                    for (i, a) in args.iter().enumerate() {
+                        if let Some(Some(arg_name)) = arg_names.get(i) {
+                            if let Some(pos) = class_def
+                                .primary_params
+                                .iter()
+                                .position(|p| &p.name == arg_name)
+                            {
+                                slots[pos] = Some(a.clone());
+                            }
+                        } else {
+                            if positional_idx < n_params {
+                                slots[positional_idx] = Some(a.clone());
+                            }
+                            positional_idx += 1;
+                        }
+                    }
+                    let inst_ref = inst.borrow();
+                    let mut new_args: Vec<klio_runtime::Value> = Vec::with_capacity(n_params);
+                    for (idx, p) in class_def.primary_params.iter().enumerate() {
+                        let v = slots[idx]
+                            .take()
+                            .or_else(|| inst_ref.get(&p.name))
+                            .unwrap_or(klio_runtime::Value::Null);
+                        new_args.push(v);
+                    }
+                    drop(inst_ref);
+                    if let Some(class_id) = self.module.class_id(&class_def.name) {
+                        return <VmHost as klio_ir::eval::Host>::new_instance(
+                            self, class_id, &new_args,
+                        );
+                    }
+                }
+            }
+        }
         self.call_member(receiver, name, args)
     }
 
