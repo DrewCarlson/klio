@@ -1954,6 +1954,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if ty.name == "Any" {
             return !matches!(value, klio_runtime::Value::Null);
         }
+        // Dotted nested-class names (`S.A`, `Outer.Inner`) — match
+        // by the last segment, which corresponds to the lifted
+        // top-level class name in our module table.
+        if ty.name.contains('.') {
+            if let Some(last) = ty.name.rsplit('.').next() {
+                let alt = klio_ir::TypeRef {
+                    name: last.to_string(),
+                    nullable: ty.nullable,
+                    args: ty.args.clone(),
+                };
+                return self.instance_of(value, &alt);
+            }
+        }
         // Generic type-parameter casts (`x as T`) are erased at
         // runtime — Kotlin matches them unchecked. Single-letter
         // (or short uppercase) type names are conventionally
