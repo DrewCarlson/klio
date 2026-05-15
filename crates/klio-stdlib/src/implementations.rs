@@ -807,6 +807,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Result.getOrNull", result_get_or_null),
     ("kotlin.Result.exceptionOrNull", result_exception_or_null),
     ("kotlin.Result.getOrDefault", result_get_or_default),
+    ("kotlin.Result.getOrElse", result_get_or_else),
     ("kotlin.Result.toString", result_to_string),
 
     // ----- Regex -----
@@ -5909,6 +5910,22 @@ fn result_get_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn result_exception_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (ok, payload) = recv_result(ctx.args, "Result.exceptionOrNull")?;
     if ok { Ok(Value::Null) } else { Ok(payload.clone()) }
+}
+
+fn result_get_or_else(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity(
+            "Result.getOrElse expects (receiver, onFailure)".into(),
+        ));
+    }
+    let (ok, payload) = recv_result(&ctx.args[..1], "Result.getOrElse")?;
+    if ok {
+        return Ok(payload.clone());
+    }
+    let payload = payload.clone();
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    host.invoke_callable(&block, std::slice::from_ref(&payload), *out)
 }
 
 fn result_get_or_default(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
