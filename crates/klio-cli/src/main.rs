@@ -186,13 +186,14 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Lex { file } => run_lex(&file),
         Cmd::Parse { file } => run_parse(&file),
-        Cmd::Run { files, ir_vm } => match files.as_slice() {
+        Cmd::Run { files, ir_vm: _ } => match files.as_slice() {
             [] => {
                 eprintln!("usage: klio run <file.kt> [<file2.kt> ...]");
                 ExitCode::from(2)
             }
-            [single] if ir_vm => run_file_ir_vm(single),
-            [single] => run_file_ir(single),
+            // The IR-native Vm is the only `run` path now. The
+            // legacy `--ir-vm` flag is accepted but ignored.
+            [single] => run_file_ir_vm(single),
             many => run_module_files(many),
         },
         Cmd::Check { files, format } => run_check(&files, format),
