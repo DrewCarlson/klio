@@ -1693,6 +1693,36 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                 }
             }
+            // Unresolved bare-name call. Inside a lambda body that
+            // may be invoked with a this-binding, dispatch through
+            // CallMemberOrGlobal so a method on the captured this
+            // wins over a top-level lookup. For non-lambda frames
+            // (or lambdas not this-bound) the captured this is
+            // Null and the inst falls back to a regular global
+            // call.
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1
+                    && b.resolve(&segments[0].name).is_none()
+                    && !b.knows_outer(&segments[0].name)
+                    && b.module.class_id(&segments[0].name).is_none()
+                    && b.module.func_id(&segments[0].name).is_none()
+                {
+                    let this_idx = b.record_capture("this");
+                    let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
+                    let dst = b.alloc_reg();
+                    let nm = b.module.intern_const(Const::String(segments[0].name.clone()));
+                    b.push(Inst::CallMemberOrGlobal {
+                        dst,
+                        this_idx,
+                        name: nm,
+                        args: args_start,
+                        n_args: count,
+                        arg_names,
+                    });
+                    return dst;
+                }
+            }
             // Built-in stdlib companion shortcuts: `Result.success(x)`,
             // `Result.failure(e)`, etc. The callee parses as
             // Member { Path("Result"), "success" }; rewrite to a

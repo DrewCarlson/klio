@@ -784,6 +784,41 @@ fn exec_inst(
             let result = host.call_super(&recv, &owner_str, qual_str.as_deref(), &name_str, &arg_values, &names)?;
             frame.write(*dst, result);
         }
+        Inst::CallMemberOrGlobal { dst, this_idx, name, args, n_args, arg_names } => {
+            let name_str = match &frame.module.consts[name.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type(
+                    "CallMemberOrGlobal: name not a string const".into(),
+                )),
+            };
+            let arg_values = read_arg_run(frame, *args, *n_args);
+            let names = resolve_arg_names(frame.module, arg_names);
+            let this_val = frame
+                .captures
+                .get(*this_idx as usize)
+                .cloned()
+                .unwrap_or(Value::Null);
+            let mut resolved: Option<Value> = None;
+            if !matches!(this_val, Value::Null | Value::Unit) {
+                if let Ok(v) = host.call_member_named(
+                    &this_val, &name_str, &arg_values, &names,
+                ) {
+                    resolved = Some(v);
+                }
+            }
+            let result = match resolved {
+                Some(v) => v,
+                None => {
+                    let callee = host
+                        .lookup_global_throwing(&name_str)?
+                        .ok_or_else(|| EvalError::Unbound(
+                            format!("unresolved global `{name_str}`"),
+                        ))?;
+                    host.call_value_named(&callee, &arg_values, &names)?
+                }
+            };
+            frame.write(*dst, result);
+        }
         Inst::CallMember { dst, receiver, name, args, n_args, arg_names } => {
             let recv = frame.read(*receiver);
             let name_str = match &frame.module.consts[name.0 as usize] {

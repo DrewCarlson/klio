@@ -248,6 +248,19 @@ pub enum Inst {
     /// field/method named `name`, read it; otherwise fall back to
     /// LoadGlobal(name).
     LoadFromThisOrGlobal { dst: Reg, this_idx: u16, name: ConstId },
+    /// Call a bare-name function inside a lambda body that may be
+    /// invoked with a this-receiver. If the captured this is an
+    /// instance with a method named `name`, dispatch as a member
+    /// call on it; otherwise fall back to a top-level lookup +
+    /// invoke.
+    CallMemberOrGlobal {
+        dst: Reg,
+        this_idx: u16,
+        name: ConstId,
+        args: Reg,
+        n_args: u8,
+        arg_names: Vec<Option<ConstId>>,
+    },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host::store_global` so a
     /// delegated top-level property's setter (or a plain top-level
