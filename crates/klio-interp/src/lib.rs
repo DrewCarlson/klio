@@ -294,6 +294,13 @@ pub(crate) struct ClassIrTables {
     /// `start`, `end`) — stable per lambda literal in the source
     /// regardless of how many times its lambda value is built.
     pub lambda_ir_funcs: std::collections::HashMap<(u32, u32, u32), klio_ir::FuncId>,
+    /// Parallel index recording the capture-name order for each
+    /// lambda body's IR FuncId. The body uses Inst::LoadCapture by
+    /// index, so the dispatcher needs the same ordered name list to
+    /// pull capture values out of the env and pass them as the
+    /// `captures` argument to `eval_with_captures`.
+    pub lambda_capture_names:
+        std::collections::HashMap<(u32, u32, u32), Vec<String>>,
 }
 
 /// One secondary constructor's lowered IR. `delegation_args` is
@@ -4423,24 +4430,23 @@ impl Interpreter {
             .copied()
         {
             if this_binding.is_none() {
-            if let Some(module_rc) = self.current_module.clone() {
-                let func = module_rc.funcs[fid.0 as usize].clone();
-                let captures: Vec<Value> = func
-                    .params
-                    .iter()
-                    .skip(params.len())
-                    .filter_map(|p| captured_env.borrow().lookup(&p.name))
-                    .collect();
-                    let mut all_args: Vec<Value> = Vec::with_capacity(params.len() + captures.len());
-                    let bind_it = params.is_empty() && args.len() == 1 && !absorb_return;
-                    if bind_it {
-                        all_args.push(args[0].clone());
-                    } else {
-                        for (i, _) in params.iter().enumerate() {
-                            all_args.push(args.get(i).cloned().unwrap_or(Value::Null));
-                        }
+                if let Some(module_rc) = self.current_module.clone() {
+                    let func = module_rc.funcs[fid.0 as usize].clone();
+                    let capture_names: Vec<String> = self
+                        .module_registry
+                        .class_ir
+                        .lambda_capture_names
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_default();
+                    let captures: Vec<Value> = capture_names
+                        .iter()
+                        .map(|n| captured_env.borrow().lookup(n).unwrap_or(Value::Null))
+                        .collect();
+                    let mut call_args: Vec<Value> = Vec::with_capacity(params.len());
+                    for (i, _) in params.iter().enumerate() {
+                        call_args.push(args.get(i).cloned().unwrap_or(Value::Null));
                     }
-                    all_args.extend(captures);
                     let class_names: Vec<String> =
                         module_rc.classes.iter().map(|c| c.name.clone()).collect();
                     let method_index = IrHost::build_method_index(&module_rc);
@@ -4452,7 +4458,9 @@ impl Interpreter {
                         module: std::rc::Rc::clone(&module_rc),
                         method_index,
                     };
-                    match klio_ir::eval::eval_with(&module_rc, &func, all_args, &mut host) {
+                    match klio_ir::eval::eval_with_captures(
+                        &module_rc, &func, call_args, captures, &mut host,
+                    ) {
                         Ok(v) => return Ok(v),
                         Err(klio_ir::eval::EvalError::Unsupported(_)) => {}
                         Err(klio_ir::eval::EvalError::Throw(v)) => return Err(RuntimeError::Thrown(v)),
@@ -4472,7 +4480,7 @@ impl Interpreter {
                         }
                         Err(e) => return Err(RuntimeError::Type(format!("{e}"))),
                     }
-            }
+                }
             }
         }
         // Implicit `it` parameter: a lambda literal without an arrow
@@ -13954,8 +13962,7 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // empty params and `it` references inside the body lower as
         // LoadGlobal("it"), which would fail without a runtime binding.
         if let Some(fid) = body_func {
-            if captured_names.is_empty()
-                && !params.is_empty()
+            if !params.is_empty()
                 && !absorb_return
                 && !block_contains_bare_return(&body_rc)
             {
@@ -13966,6 +13973,11 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
                     .class_ir
                     .lambda_ir_funcs
                     .insert(key, fid);
+                self.interp
+                    .module_registry
+                    .class_ir
+                    .lambda_capture_names
+                    .insert(key, captured_names.to_vec());
             }
         }
         Ok(klio_runtime::Value::Lambda {
