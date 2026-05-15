@@ -2103,8 +2103,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 .iter()
                 .filter_map(|n| b.resolve(n))
                 .collect();
-            let param_names: Vec<String> =
+            let mut param_names: Vec<String> =
                 params.iter().map(|p| p.name.clone()).collect();
+            if param_names.is_empty() {
+                param_names.push("it".to_string());
+            }
             let dst = b.alloc_reg();
             b.push(Inst::AstLambda {
                 dst,
@@ -2491,7 +2494,13 @@ fn lower_lambda_body_capturing(
 ) -> (crate::FuncId, Vec<String>) {
     let mut b = FuncBuilder::new(module);
     b.set_outer_names(outer);
-    let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+    // Implicit `it` lambdas have empty params — bind a synthetic
+    // `it` slot so bare `it` references inside the body lower as
+    // a LoadParam rather than a LoadGlobal.
+    let mut names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+    if params.is_empty() {
+        names.push("it");
+    }
     bind_params(&mut b, &names);
     let result = lower_block(&mut b, body);
     b.terminate(Terminator::Return(Some(result)));
