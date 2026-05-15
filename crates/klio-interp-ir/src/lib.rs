@@ -375,6 +375,76 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         )))
     }
 
+    fn call_super(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        owner_class: &str,
+        qualifier: Option<&str>,
+        name: &str,
+        args: &[klio_runtime::Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Find the parent class of owner_class — `super.method()`
+        // walks one step up the inheritance chain. With `super<Q>`,
+        // dispatch on Q directly.
+        let parent_name: Option<String> = if let Some(q) = qualifier {
+            Some(q.to_string())
+        } else if let Some(owner_def) = self.classes.get(owner_class) {
+            owner_def.supertype_names.first().cloned()
+        } else {
+            None
+        };
+        let Some(parent_name) = parent_name else {
+            return Err(klio_ir::eval::EvalError::Type(format!(
+                "super.{name}: owner_class `{owner_class}` has no parent"
+            )));
+        };
+        // Look up the method on the parent's IR class.
+        let parent_ir = self
+            .module
+            .classes
+            .iter()
+            .find(|c| c.name == parent_name)
+            .cloned();
+        if let Some(parent_ir) = parent_ir {
+            for fid in &parent_ir.methods {
+                if let Some(func) = self.module.funcs.get(fid.0 as usize).cloned() {
+                    if func.name == name {
+                        let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
+                        all.push(receiver.clone());
+                        all.extend_from_slice(args);
+                        let module = Rc::clone(&self.module);
+                        return klio_ir::eval::eval_with(&module, &func, all, self);
+                    }
+                }
+            }
+        }
+        // Fall back to the regular member dispatch on the receiver.
+        self.call_member(receiver, name, args)
+    }
+
+    fn qualified_this(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        qualifier: &str,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Simple case: receiver's own class name (or fqn ending in
+        // `.<qualifier>`) matches — return the receiver as-is.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let mut cur: Option<Rc<klio_runtime::ClassDef>> =
+                Some(Rc::clone(&inst.borrow().class));
+            while let Some(c) = cur {
+                if c.name == qualifier || c.fqn == qualifier {
+                    return Ok(receiver.clone());
+                }
+                cur = c.parent.borrow().clone();
+            }
+        }
+        Err(klio_ir::eval::EvalError::Type(format!(
+            "`this@{qualifier}` is not bound in this scope"
+        )))
+    }
+
     fn instance_of(
         &mut self,
         value: &klio_runtime::Value,
