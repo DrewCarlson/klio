@@ -1864,6 +1864,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         value: &klio_runtime::Value,
         ty: &klio_ir::TypeRef,
     ) -> bool {
+        // `Any` is the universal supertype: every non-null value
+        // is an instance of `Any` (nullable matters separately).
+        if ty.name == "Any" {
+            return !matches!(value, klio_runtime::Value::Null);
+        }
         // Exception values match by walking the builtin Throwable
         // hierarchy. The default impl returns "kotlin.Throwable" for
         // every Exception which loses the specific class name —
