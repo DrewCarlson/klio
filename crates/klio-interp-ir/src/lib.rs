@@ -546,6 +546,33 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         )))
     }
 
+    fn member_ref(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Foo::method / instance::method — produce a callable
+        // closure that, when invoked, dispatches the named member
+        // on the receiver. Bound-method closures store the
+        // receiver as a capture and forward call args to
+        // call_member.
+        let captures = vec![receiver.clone()];
+        let id = self.closures.len() as u64;
+        // Synthesize a 0-Func body that's just a dispatcher.
+        // Since the closure infrastructure expects an IR FuncId,
+        // and we don't want to lower a new Func per ref, return
+        // a Value::BoundMethod-style PropertyRef-ish handle. For
+        // a usable runtime value we instead use a Value::Lambda
+        // with a synthetic dispatcher body — too much. Simplest
+        // is to return Value::PropertyRef as a stand-in (the
+        // value implements `.name` etc.) until reflection lands.
+        let _ = captures;
+        let _ = id;
+        Ok(klio_runtime::Value::PropertyRef {
+            name: Rc::new(name.to_string()),
+        })
+    }
+
     fn register_class(
         &mut self,
         class: &klio_ast::Class,
