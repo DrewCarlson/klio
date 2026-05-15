@@ -314,6 +314,20 @@ impl Vm {
                 <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
                     .map_err(VmError::from)?
             };
+            // Companion singletons get their `outer` field wired to
+            // the enclosing class so method bodies that read
+            // bare-name members (e.g. enum `entries`) resolve via
+            // the outer-chain walk in get_field.
+            if let klio_runtime::Value::Instance(i) = &inst {
+                if let Some((outer_name, _)) = obj_name.split_once("$Companion$") {
+                    if let Some(outer_def) =
+                        self.classes.borrow().get(outer_name).cloned()
+                    {
+                        i.borrow_mut().outer =
+                            Some(klio_runtime::Value::Class(outer_def));
+                    }
+                }
+            }
             self.globals.borrow_mut().define(obj_name, inst);
         }
         let func = module
@@ -1286,12 +1300,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // body referencing `x` (a field of the enclosing class)
             // lowers as `this.x`. The instance keeps a reference to
             // its outer in `InstanceData.outer`; walk the chain.
+            // Companion singletons store the outer-class itself
+            // (Value::Class) to resolve enum-static reads like
+            // `entries` from companion method bodies.
             let mut cur_outer = inst.borrow().outer.clone();
-            while let Some(klio_runtime::Value::Instance(outer_inst)) = cur_outer.clone() {
-                if let Some(v) = outer_inst.borrow().get(name) {
-                    return Ok(v);
+            while let Some(o) = cur_outer.clone() {
+                match &o {
+                    klio_runtime::Value::Instance(outer_inst) => {
+                        if let Some(v) = outer_inst.borrow().get(name) {
+                            return Ok(v);
+                        }
+                        cur_outer = outer_inst.borrow().outer.clone();
+                    }
+                    klio_runtime::Value::Class(_) => {
+                        if let Ok(v) = self.get_field(&o, name) {
+                            return Ok(v);
+                        }
+                        cur_outer = None;
+                    }
+                    _ => cur_outer = None,
                 }
-                cur_outer = outer_inst.borrow().outer.clone();
             }
             // Enum entry bare-name access: an enum method body
             // referencing `RED` lowers as `this.RED`. Resolve

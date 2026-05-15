@@ -329,6 +329,37 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                                 span: nested.name.span,
                             };
                             renamed.is_companion = false;
+                            // Outer members visible inside the
+                            // companion body: primary-ctor + body
+                            // names from the enclosing class, plus
+                            // enum-specific statics (`entries`,
+                            // `values`, `valueOf`) and entry names
+                            // when the enclosing class is an enum.
+                            let mut extras: std::collections::HashSet<String> =
+                                std::collections::HashSet::new();
+                            for p in &c.primary_params {
+                                extras.insert(p.name.name.clone());
+                            }
+                            for m in &c.members {
+                                match m {
+                                    Decl::Property(p) => {
+                                        extras.insert(p.name.name.clone());
+                                    }
+                                    Decl::Function(f) => {
+                                        extras.insert(f.name.name.clone());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if c.is_enum {
+                                extras.insert("entries".to_string());
+                                extras.insert("values".to_string());
+                                extras.insert("valueOf".to_string());
+                                for e in &c.enum_entries {
+                                    extras.insert(e.name.name.clone());
+                                }
+                            }
+                            nested_outer_members.insert(comp_name.clone(), extras);
                             // Companion instances behave like
                             // singletons — register one global.
                             object_names.push(comp_name.clone());
