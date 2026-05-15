@@ -27,7 +27,15 @@ enum Cmd {
     /// supplied, every file's top-level declarations are visible to
     /// every other file (single-module semantics), with `fun main`
     /// invoked from whichever file declares it.
-    Run { files: Vec<PathBuf> },
+    Run {
+        files: Vec<PathBuf>,
+        /// Execute through the IR-native Vm (klio-interp-ir) instead
+        /// of the tree-walking interpreter. The IR module is built
+        /// via the existing front end; the Vm runs the lowered IR
+        /// directly with no AST evaluator.
+        #[arg(long = "ir-vm")]
+        ir_vm: bool,
+    },
     /// Type-check `.kt` files and emit diagnostics. Exit 1 on any error.
     Check {
         files: Vec<PathBuf>,
@@ -178,11 +186,12 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Lex { file } => run_lex(&file),
         Cmd::Parse { file } => run_parse(&file),
-        Cmd::Run { files } => match files.as_slice() {
+        Cmd::Run { files, ir_vm } => match files.as_slice() {
             [] => {
                 eprintln!("usage: klio run <file.kt> [<file2.kt> ...]");
                 ExitCode::from(2)
             }
+            [single] if ir_vm => run_file_ir_vm(single),
             [single] => run_file_ir(single),
             many => run_module_files(many),
         },
@@ -1243,6 +1252,56 @@ fn run_module_files(paths: &[PathBuf]) -> ExitCode {
     install_embedded_stdlib(&mut interp);
     let mut stdout = klio_runtime::StdoutOutput;
     match interp.run_module_ir(&asts, &mut stdout) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("runtime error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run a single source file through `klio-interp-ir`'s Vm. The
+/// front end (parse → typecheck → IR module build) reuses the
+/// existing pipeline in `klio-interp::Interpreter::register_file_decls`;
+/// execution then jumps to the new IR Vm with no AST evaluator
+/// involvement. Failures fall back through the standard error path.
+fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
+    let mut map = SourceMap::new();
+    let Some(id) = load(&mut map, path) else { return ExitCode::FAILURE };
+    let src = map.get(id).source.clone();
+    let lexed = Lexer::new(id, &src).tokenize();
+    let _ = lexed.diagnostics.render(&map, std::io::stderr());
+    if lexed.diagnostics.has_errors() {
+        return ExitCode::FAILURE;
+    }
+    let (ast, diags) = Parser::new(id, &src, &lexed.tokens).parse_file();
+    let _ = diags.render(&map, std::io::stderr());
+    if diags.has_errors() {
+        return ExitCode::FAILURE;
+    }
+    let r = resolve(&ast);
+    let tc = typecheck(&ast, &r);
+    if tc.diagnostics.has_errors() {
+        let _ = tc.diagnostics.render(&map, std::io::stderr());
+        return ExitCode::FAILURE;
+    }
+    let mut interp = Interpreter::new().with_expr_types(tc.types.clone());
+    install_embedded_stdlib(&mut interp);
+    let mut stdout = klio_runtime::StdoutOutput;
+    if let Err(e) = interp.register_file_decls(&ast, &mut stdout) {
+        eprintln!("registration error: {e}");
+        return ExitCode::FAILURE;
+    }
+    let Some(module) = interp.ir_module() else {
+        eprintln!("error: no IR module produced");
+        return ExitCode::FAILURE;
+    };
+    let Some(main_id) = interp.main_func_id() else {
+        eprintln!("error: no main function found");
+        return ExitCode::FAILURE;
+    };
+    let mut vm = klio_interp_ir::Vm::new(module);
+    match vm.run(main_id, &mut stdout) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("runtime error: {e}");

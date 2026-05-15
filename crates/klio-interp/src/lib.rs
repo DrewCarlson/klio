@@ -405,6 +405,23 @@ impl Interpreter {
         }
     }
 
+    /// Access the file's lowered IR module after `register_file_decls`
+    /// has run. Returns `None` before any file has been registered.
+    /// Used by the IR-native Vm driver to take ownership of the
+    /// module without re-running the front end through the tree
+    /// walker.
+    #[must_use]
+    pub fn ir_module(&self) -> Option<std::rc::Rc<klio_ir::Module>> {
+        self.current_module.clone()
+    }
+
+    /// The `main` function's FuncId for the most-recently registered
+    /// file. `None` when no file with a `main` has been registered.
+    #[must_use]
+    pub fn main_func_id(&self) -> Option<klio_ir::FuncId> {
+        self.current_main_id
+    }
+
     /// Install bindings, implicit packages, and the package surface
     /// from a loaded `klio-pack`. The pack carries the FQN → host
     /// symbol mapping; `host` resolves each host symbol to a Rust
@@ -1823,7 +1840,7 @@ impl Interpreter {
     /// `file_env`. Does not invoke `main`. Used by the IR run
     /// path so all `Value::Function` / `Value::Class` references
     /// resolve before the IR evaluator drives `fun main`.
-    fn register_file_decls(
+    pub fn register_file_decls(
         &mut self,
         file: &KotlinFile,
         out: &mut dyn Output,

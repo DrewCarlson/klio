@@ -868,6 +868,7 @@ dependencies = [
  "klio-ast",
  "klio-diagnostics",
  "klio-interp",
+ "klio-interp-ir",
  "klio-kotlinx-atomicfu",
  "klio-kotlinx-coroutines",
  "klio-kotlinx-datetime",
