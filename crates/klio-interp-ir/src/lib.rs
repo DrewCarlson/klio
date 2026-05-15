@@ -2315,6 +2315,48 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if ty.name == "Any" {
             return true;
         }
+        // Reflection-style checks against synth bound refs.
+        // `Box::v` lowers as an Instance with `__bound_receiver__`
+        // (a Class for unbound prop refs, an Instance for bound
+        // method refs). Match KProperty / KFunction / KCallable
+        // accordingly so `is`-checks return what kotlinc produces.
+        if matches!(
+            ty.name.as_str(),
+            "KProperty" | "KCallable" | "KFunction" | "KFunction0"
+                | "KFunction1" | "KFunction2" | "KMutableProperty"
+        ) {
+            if let klio_runtime::Value::Instance(inst) = value {
+                let snap = inst.borrow();
+                if snap.get("__bound_receiver__").is_some() {
+                    let is_property = matches!(
+                        snap.get("__bound_receiver__"),
+                        Some(klio_runtime::Value::Class(_))
+                    );
+                    return match ty.name.as_str() {
+                        "KProperty" | "KMutableProperty" => is_property,
+                        "KFunction" | "KFunction0" | "KFunction1" | "KFunction2" => {
+                            !is_property
+                        }
+                        "KCallable" => true,
+                        _ => false,
+                    };
+                }
+            }
+            // `::greet` for a top-level fn surfaces as a
+            // Value::IrClosure (or Function). Treat those as
+            // KFunction / KCallable.
+            if matches!(
+                value,
+                klio_runtime::Value::IrClosure { .. }
+                    | klio_runtime::Value::Lambda { .. }
+                    | klio_runtime::Value::Function { .. }
+            ) {
+                return matches!(ty.name.as_str(), "KFunction" | "KCallable" | "KFunction0" | "KFunction1" | "KFunction2");
+            }
+        }
+        if ty.name == "KClass" {
+            return matches!(value, klio_runtime::Value::Class(_));
+        }
         // Dotted nested-class names (`S.A`, `Outer.Inner`) — match
         // by the last segment, which corresponds to the lifted
         // top-level class name in our module table.
