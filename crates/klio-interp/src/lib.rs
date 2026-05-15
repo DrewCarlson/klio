@@ -14037,9 +14037,13 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         if let Some(fid) = body_func {
             let body_writes_capture = !captured_names.is_empty()
                 && block_writes_any(&body_rc, captured_names);
+            // AnonFun bodies (absorb_return) catch their own return
+            // locally — IR's Terminator::Return matches that
+            // semantics. Lambda bodies with bare returns are
+            // non-local and need the tree walker.
+            let return_ok = absorb_return || !block_contains_bare_return(&body_rc);
             if !params.is_empty()
-                && !absorb_return
-                && !block_contains_bare_return(&body_rc)
+                && return_ok
                 && !body_writes_capture
             {
                 let sp = body_rc.span;
