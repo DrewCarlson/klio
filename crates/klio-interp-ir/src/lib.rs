@@ -1528,19 +1528,36 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
 
     fn invoke_callable_with_this(
         &mut self,
-        _callable: &klio_runtime::Value,
-        _args: &[klio_runtime::Value],
-        _this: &klio_runtime::Value,
-        _out: &mut dyn Output,
+        callable: &klio_runtime::Value,
+        args: &[klio_runtime::Value],
+        this: &klio_runtime::Value,
+        out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
-        // Receiver-typed lambda dispatch requires the body's
-        // lowering to bind `this` as the first param, which the
-        // current parser-injected `it` model does not produce.
-        // That lower change lands together with a per-lambda
-        // "is receiver-typed" marker on the AST / IR shape.
-        Err(klio_runtime::RuntimeError::Unimplemented(
-            "Vm::invoke_callable_with_this".into(),
-        ))
+        // Receiver-typed lambda dispatch: when the lambda has a
+        // single param (the parser-injected implicit-`it` shape),
+        // pass the receiver as that param. \`it.foo()\` style scope
+        // fn bodies work this way; bodies that rely on bare-name
+        // resolution through `this` (\`apply { foo() }\`) still need
+        // the lower-time receiver-binding which lands when AST/IR
+        // grow a receiver-marker.
+        if let klio_runtime::Value::IrClosure { id, .. } = callable {
+            let info = self.closures.get(*id as usize).cloned();
+            if let Some(info) = info {
+                let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(info.n_params);
+                if info.n_params >= 1 {
+                    all.push(this.clone());
+                    for a in args.iter() {
+                        all.push(a.clone());
+                    }
+                    return self.invoke_callable(callable, &all, out);
+                }
+            }
+            return self.invoke_callable(callable, args, out);
+        }
+        Err(klio_runtime::RuntimeError::Unimplemented(format!(
+            "Vm::invoke_callable_with_this on `{}`",
+            callable.type_fqn()
+        )))
     }
 
     fn scheduler(&mut self) -> &mut dyn klio_runtime::Scheduler {
