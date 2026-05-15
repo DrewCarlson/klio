@@ -2048,6 +2048,14 @@ impl Interpreter {
             match e {
                 Call { callee, args, .. } => {
                     if let Path { segments, .. } = callee.as_ref() {
+                        // suspendCoroutine itself runs through the IR
+                        // path: when the body resumes synchronously
+                        // (`cont.resume(v)` before returning), the
+                        // intrinsic produces the resumed value
+                        // without needing the state-machine driver.
+                        // Real suspending operations (delay, yield,
+                        // and the rest of the kotlinx pack) still
+                        // route through the state machine.
                         if segments.len() == 1
                             && matches!(
                                 segments[0].name.as_str(),
@@ -2056,7 +2064,8 @@ impl Interpreter {
                                     | "suspendCoroutineUninterceptedOrReturn"
                             )
                         {
-                            return true;
+                            // fall through — let suspendCoroutine
+                            // dispatch through IR.
                         }
                         if segments.len() == 1 && names.names.contains(&segments[0].name) {
                             return true;
