@@ -1904,6 +1904,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => {}
             }
         }
+        // Inner-class construction: `outer.Inner(args)` constructs an
+        // Inner instance with the outer stored on the instance's
+        // `outer` field. The lifted inner class lives at top level.
+        if let klio_runtime::Value::Instance(outer_inst) = receiver {
+            let def_opt = self.classes.borrow().get(name).cloned();
+            if let Some(def) = def_opt {
+                if def.is_inner {
+                    let class_id = self.module.class_id(name);
+                    if let Some(class_id) = class_id {
+                        let v = <Self as klio_ir::eval::Host>::new_instance(
+                            self, class_id, args,
+                        )?;
+                        if let klio_runtime::Value::Instance(i) = &v {
+                            i.borrow_mut().outer = Some(klio_runtime::Value::Instance(Rc::clone(outer_inst)));
+                        }
+                        return Ok(v);
+                    }
+                }
+            }
+        }
         // Companion forwarding for method calls: `Foo.parse("…")`
         // routes through the companion singleton's method.
         if let klio_runtime::Value::Class(cls) = receiver {
