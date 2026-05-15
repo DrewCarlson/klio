@@ -383,6 +383,15 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return Some(klio_runtime::Value::Intrinsic { fqn: leaked, func });
             }
         }
+        // Primitive-companion constants (`Int.MAX_VALUE`, `Double.NaN`,
+        // `Long.SIZE_BITS`, …). The IR lowers these as a single
+        // dotted-name global ref; we split on `.` and consult the
+        // stdlib's primitive-companion table.
+        if let Some((ty, member)) = name.split_once('.') {
+            if let Some(v) = klio_stdlib::primitive_companion_const(ty, member) {
+                return Some(v);
+            }
+        }
         None
     }
 
