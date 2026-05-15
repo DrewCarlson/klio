@@ -3517,6 +3517,57 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Stdlib intrinsic dispatch with named args: reorder
+        // according to the stdlib's declared param order so callers
+        // can pass `padEnd(padChar = '*', length = 4)`.
+        if arg_names.iter().any(|n| n.is_some()) {
+            let type_fqn = receiver.type_fqn();
+            let probes = [
+                format!("{type_fqn}.{name}"),
+                format!("kotlin.text.{name}"),
+                format!("kotlin.collections.{name}"),
+                format!("kotlin.{name}"),
+            ];
+            for probe in &probes {
+                if let Some(params) = klio_stdlib::param_names(probe) {
+                    let mut slots: Vec<Option<klio_runtime::Value>> =
+                        vec![None; params.len()];
+                    let mut positional_idx = 0usize;
+                    for (i, a) in args.iter().enumerate() {
+                        if let Some(Some(arg_name)) = arg_names.get(i) {
+                            if let Some(pos) =
+                                params.iter().position(|p| *p == arg_name.as_str())
+                            {
+                                slots[pos] = Some(a.clone());
+                            }
+                        } else {
+                            if positional_idx < params.len() {
+                                slots[positional_idx] = Some(a.clone());
+                            }
+                            positional_idx += 1;
+                        }
+                    }
+                    let mut reordered: Vec<klio_runtime::Value> = slots
+                        .into_iter()
+                        .map(|s| s.unwrap_or(klio_runtime::Value::Null))
+                        .collect();
+                    while matches!(
+                        reordered.last(),
+                        Some(klio_runtime::Value::Null)
+                    ) {
+                        reordered.pop();
+                    }
+                    if let Some(func) = klio_stdlib::implementation(probe) {
+                        let mut all_args: Vec<klio_runtime::Value> =
+                            Vec::with_capacity(reordered.len() + 1);
+                        all_args.push(receiver.clone());
+                        all_args.extend(reordered);
+                        return self.dispatch_intrinsic(func, &all_args);
+                    }
+                    break;
+                }
+            }
+        }
         self.call_member(receiver, name, args)
     }
 
