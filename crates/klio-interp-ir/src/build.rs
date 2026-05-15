@@ -227,6 +227,11 @@ pub struct BuiltModule {
     /// name. `Foo.PI` routes through `companion_singletons["Foo"]`'s
     /// instance's `PI` field.
     pub companion_singletons: std::collections::HashMap<String, String>,
+    /// Per enum-entry constructor-arg thunks. Each tuple is
+    /// `(enum class name, entry name, thunk FuncIds)`. The Vm runs
+    /// each thunk at startup and assigns the result into the entry
+    /// instance's primary-ctor-param-named field.
+    pub enum_entry_arg_inits: Vec<(String, String, Vec<klio_ir::FuncId>)>,
 }
 
 /// Lower a single file's declarations into an IR module. Classes are
@@ -570,6 +575,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // ctor args + body members aren't run — that lands when the IR
     // class shape supports per-entry overrides.
     let mut next_id = 1u64;
+    let mut enum_entry_arg_inits: Vec<(String, String, Vec<klio_ir::FuncId>)> = Vec::new();
     for d in decls {
         if let Decl::Class(c) = d {
             if !c.is_enum {
@@ -597,6 +603,28 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                         native_state: None,
                     }));
                     entries.push((entry.name.name.clone(), klio_runtime::Value::Instance(inst)));
+                    // Lower each ctor arg as a 0-arg thunk; the Vm
+                    // runs them at startup and patches the result
+                    // into the entry instance's primary-param field.
+                    if !entry.args.is_empty() {
+                        let mut fids: Vec<klio_ir::FuncId> = Vec::with_capacity(entry.args.len());
+                        for (idx, arg) in entry.args.iter().enumerate() {
+                            let fid = klio_ir::lower::lower_expr_as_thunk(
+                                &mut module,
+                                arg,
+                                &format!(
+                                    "__enum_arg_{}_{}_{idx}",
+                                    c.name.name, entry.name.name
+                                ),
+                            );
+                            fids.push(fid);
+                        }
+                        enum_entry_arg_inits.push((
+                            c.name.name.clone(),
+                            entry.name.name.clone(),
+                            fids,
+                        ));
+                    }
                 }
                 *class_def.enum_entries.borrow_mut() = entries;
             }
@@ -782,5 +810,6 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         main: main_id,
         object_names,
         companion_singletons,
+        enum_entry_arg_inits,
     }
 }

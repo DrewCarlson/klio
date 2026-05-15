@@ -74,6 +74,8 @@ pub struct Vm {
     /// set_field on a `Value::Class` falls back to the companion
     /// instance's field when the name isn't on the class itself.
     companion_singletons: std::collections::HashMap<String, String>,
+    /// Enum-entry ctor-arg thunks to evaluate at startup.
+    enum_entry_arg_inits: Vec<(String, String, Vec<klio_ir::FuncId>)>,
     /// Runtime-lowered method bodies for anonymous-object / local
     /// classes, indexed by `(class name, method name) -> (Module, FuncId)`.
     /// The IR module is immutable after build, so methods declared
@@ -135,6 +137,7 @@ impl Vm {
             top_level_props: Vec::new(),
             object_names: Vec::new(),
             companion_singletons: std::collections::HashMap::new(),
+            enum_entry_arg_inits: Vec::new(),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
         }
@@ -156,6 +159,7 @@ impl Vm {
         vm.top_level_props = built.top_level_props;
         vm.object_names = built.object_names;
         vm.companion_singletons = built.companion_singletons;
+        vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
         (vm, main)
     }
 
@@ -198,6 +202,60 @@ impl Vm {
                     .map_err(VmError::from)?
             };
             self.globals.borrow_mut().define(name, v);
+        }
+        // Patch enum-entry instance fields with evaluated ctor args.
+        let enum_inits: Vec<(String, String, Vec<klio_ir::FuncId>)> =
+            self.enum_entry_arg_inits.clone();
+        for (cls_name, entry_name, fids) in &enum_inits {
+            let class_def = match self.classes.borrow().get(cls_name).cloned() {
+                Some(d) => d,
+                None => continue,
+            };
+            let param_names: Vec<String> = class_def
+                .primary_params
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+            let entry_inst = class_def
+                .enum_entries
+                .borrow()
+                .iter()
+                .find(|(n, _)| n == entry_name)
+                .map(|(_, v)| v.clone());
+            let entry_inst = match entry_inst {
+                Some(klio_runtime::Value::Instance(i)) => i,
+                _ => continue,
+            };
+            for (idx, fid) in fids.iter().enumerate() {
+                let init_func = match module.funcs.get(fid.0 as usize).cloned() {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let v = {
+                    let mut host = VmHost {
+                        globals: Rc::clone(&self.globals),
+                        module: Rc::clone(&module),
+                        scheduler: &mut *self.scheduler,
+                        out,
+                        instance_id_counter: &mut self.instance_id_counter,
+                        classes: Rc::clone(&self.classes),
+                        body_prop_inits: &self.body_prop_inits,
+                        instance_prop_getters: &self.instance_prop_getters,
+                        instance_prop_setters: &self.instance_prop_setters,
+                        parent_ctor_args: &self.parent_ctor_args,
+                        init_blocks: &self.init_blocks,
+                        extension_props: &self.extension_props,
+                        anon_methods: Rc::clone(&self.anon_methods),
+                        companion_singletons: &self.companion_singletons,
+                        closures: &mut self.closures,
+                    };
+                    klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
+                        .map_err(VmError::from)?
+                };
+                if let Some(pname) = param_names.get(idx) {
+                    entry_inst.borrow_mut().define(pname, v);
+                }
+            }
         }
         // Allocate one instance per `object Foo { … }` decl and
         // publish it as a global so bare-name `Foo` references
