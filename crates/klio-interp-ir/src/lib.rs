@@ -2959,6 +2959,31 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         descending: *descending,
                     });
                 }
+                "then" | "thenComparing" | "thenDescending" | "thenComparator" if args.len() == 1 => {
+                    let invert = name == "thenDescending";
+                    match &args[0] {
+                        klio_runtime::Value::Comparator { steps: other_steps, descending: other_desc } => {
+                            let mut chain: Vec<(klio_runtime::Value, bool)> = (**steps).clone();
+                            for (sel, d) in other_steps.iter() {
+                                chain.push((sel.clone(), *d ^ other_desc ^ invert));
+                            }
+                            return Ok(klio_runtime::Value::Comparator {
+                                steps: Rc::new(chain),
+                                descending: *descending,
+                            });
+                        }
+                        klio_runtime::Value::Lambda { .. }
+                        | klio_runtime::Value::IrClosure { .. } => {
+                            let mut chain: Vec<(klio_runtime::Value, bool)> = (**steps).clone();
+                            chain.push((args[0].clone(), invert));
+                            return Ok(klio_runtime::Value::Comparator {
+                                steps: Rc::new(chain),
+                                descending: *descending,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
                 "reversed" if args.is_empty() => {
                     return Ok(klio_runtime::Value::Comparator {
                         steps: Rc::clone(steps),
