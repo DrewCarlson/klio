@@ -376,6 +376,24 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
             classes.insert(c.name.name.clone(), def);
         }
     }
+    // Resolve runtime parent + interface references so dispatch
+    // walks (call_member supertype chain, instance_of class
+    // hierarchy, qualified_this outer walks) follow the source-
+    // declared chain. Single inheritance picks the first
+    // non-interface supertype; the rest are added as interfaces.
+    let class_table_snapshot: std::collections::HashMap<String, Rc<ClassDef>> =
+        classes.clone();
+    for (_, def) in &classes {
+        for sup_name in &def.supertype_names {
+            if let Some(sup_def) = class_table_snapshot.get(sup_name) {
+                if sup_def.is_interface {
+                    def.interfaces.borrow_mut().push(Rc::clone(sup_def));
+                } else if def.parent.borrow().is_none() {
+                    *def.parent.borrow_mut() = Some(Rc::clone(sup_def));
+                }
+            }
+        }
+    }
 
     BuiltModule {
         module: Rc::new(module),
