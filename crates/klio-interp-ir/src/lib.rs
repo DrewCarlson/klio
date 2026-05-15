@@ -48,6 +48,17 @@ pub struct Vm {
 struct ClosureInfo {
     body_func: klio_ir::FuncId,
     n_params: usize,
+    /// Capture names, in the same order as the runtime captures
+    /// vec. Lets the Vm's `read_lambda_capture` host method map a
+    /// name back to the captured value index.
+    capture_names: Vec<String>,
+    /// Live capture values. Stored as Rc<RefCell<...>> so the
+    /// lambda body's StoreGlobal writes propagate (the dispatch
+    /// path layers each captured name into a per-call env, then
+    /// reads back into this vec). The outer-frame
+    /// WritebackCaptures Inst observes the updated values via
+    /// `read_lambda_capture`.
+    captures: Rc<RefCell<Vec<klio_runtime::Value>>>,
 }
 
 impl Vm {
@@ -330,7 +341,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         &mut self,
         params: &[String],
         _body: &klio_ast::Block,
-        _captured_names: &[String],
+        captured_names: &[String],
         captures: Vec<klio_runtime::Value>,
         _absorb_return: bool,
         body_func: Option<klio_ir::FuncId>,
@@ -341,14 +352,46 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             )
         })?;
         let id = self.closures.len() as u64;
+        let cell = Rc::new(RefCell::new(captures.clone()));
         self.closures.push(ClosureInfo {
             body_func,
             n_params: params.len(),
+            capture_names: captured_names.to_vec(),
+            captures: cell,
         });
         Ok(klio_runtime::Value::IrClosure {
             id,
             captures: Rc::new(captures),
         })
+    }
+
+    fn read_lambda_capture(
+        &mut self,
+        lambda: &klio_runtime::Value,
+        name: &str,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        if let klio_runtime::Value::IrClosure { id, .. } = lambda {
+            let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
+            })?;
+            for (idx, cap_name) in info.capture_names.iter().enumerate() {
+                if cap_name == name {
+                    return Ok(info
+                        .captures
+                        .borrow()
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or(klio_runtime::Value::Null));
+                }
+            }
+            return Err(klio_ir::eval::EvalError::Unbound(format!(
+                "capture `{name}` not found in lambda"
+            )));
+        }
+        Err(klio_ir::eval::EvalError::Type(format!(
+            "read_lambda_capture on non-lambda value `{}`",
+            lambda.type_fqn()
+        )))
     }
 
     fn call_member(
@@ -557,7 +600,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         args: &[klio_runtime::Value],
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
-        if let klio_runtime::Value::IrClosure { id, captures } = callable {
+        if let klio_runtime::Value::IrClosure { id, .. } = callable {
             let info = self
                 .closures
                 .get(*id as usize)
@@ -578,26 +621,53 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             for i in 0..info.n_params {
                 call_args.push(args.get(i).cloned().unwrap_or(klio_runtime::Value::Null));
             }
-            let capture_values: Vec<klio_runtime::Value> = (**captures).clone();
+            let capture_values: Vec<klio_runtime::Value> = info.captures.borrow().clone();
             let module = Rc::clone(&self.module);
-            let mut host = VmHost {
-                globals: Rc::clone(&self.globals),
-                module: Rc::clone(&self.module),
-                scheduler: &mut *self.scheduler,
-                out,
-                instance_id_counter: &mut *self.instance_id_counter,
-                classes: self.classes,
-                body_prop_inits: self.body_prop_inits,
-                closures: &mut *self.closures,
+            // Mutable-capture support: pre-define each captured name
+            // in a fresh env layered on top of globals so the body's
+            // StoreGlobal writes land in the env, then read back the
+            // updated values into the closure's captures so the
+            // outer-frame WritebackCaptures Inst sees them.
+            let scoped_env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(
+                Rc::clone(&self.globals),
+            )));
+            for (n, v) in info.capture_names.iter().zip(capture_values.iter()) {
+                scoped_env.borrow_mut().define(n.clone(), v.clone());
+            }
+            let result = {
+                let mut host = VmHost {
+                    globals: Rc::clone(&scoped_env),
+                    module: Rc::clone(&self.module),
+                    scheduler: &mut *self.scheduler,
+                    out,
+                    instance_id_counter: &mut *self.instance_id_counter,
+                    classes: self.classes,
+                    body_prop_inits: self.body_prop_inits,
+                    closures: &mut *self.closures,
+                };
+                klio_ir::eval::eval_with_captures(
+                    &module,
+                    &func,
+                    call_args,
+                    capture_values,
+                    &mut host,
+                )
             };
-            return klio_ir::eval::eval_with_captures(
-                &module,
-                &func,
-                call_args,
-                capture_values,
-                &mut host,
-            )
-            .map_err(|e| klio_runtime::RuntimeError::Type(format!("{e}")));
+            // Read back updated capture values into the closure's
+            // captures cell so subsequent reads (and the outer
+            // WritebackCaptures) see them.
+            let new_captures: Vec<klio_runtime::Value> = info
+                .capture_names
+                .iter()
+                .map(|n| {
+                    scoped_env
+                        .borrow()
+                        .lookup(n)
+                        .unwrap_or(klio_runtime::Value::Null)
+                })
+                .collect();
+            *info.captures.borrow_mut() = new_captures;
+            return result.map_err(|e| klio_runtime::RuntimeError::Type(format!("{e}")));
         }
         if let klio_runtime::Value::Intrinsic { func, .. } = callable {
             let mut child = VmIntrinsicHost {
