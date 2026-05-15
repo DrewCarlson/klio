@@ -8776,6 +8776,8 @@ impl<'r> Checker<'r> {
                     is_lateinit: false,
                     is_const: false,
                     is_inline: false,
+                    is_expect: false,
+                    is_actual: false,
                     setter_visibility: None,
                     span: p.name.span,
                     visibility: p.visibility,

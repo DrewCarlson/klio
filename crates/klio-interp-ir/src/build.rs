@@ -322,6 +322,8 @@ fn synthesize_class_from_object(o: &klio_ast::ObjectDecl) -> klio_ast::Class {
         is_companion: false,
         is_enum: false,
         is_sealed: false,
+        is_expect: false,
+        is_actual: false,
         is_open: false,
         is_abstract: false,
         is_inner: false,
@@ -719,6 +721,29 @@ fn build_module_with_overrides(
             }
         }
     }
+    // Pre-collect actual-name sets so the closures used below can
+    // skip `expect` declarations that have a matching `actual`.
+    let actual_func_names_set: std::collections::HashSet<String> = all_decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Function(f) if f.is_actual => Some(f.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let actual_class_names_set: std::collections::HashSet<String> = all_decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Class(c) if c.is_actual => Some(c.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+    // Drop superseded `expect` decls so every downstream pass sees
+    // only the active definition for each name.
+    all_decls.retain(|d| match d {
+        Decl::Function(f) => !(f.is_expect && actual_func_names_set.contains(&f.name.name)),
+        Decl::Class(c) => !(c.is_expect && actual_class_names_set.contains(&c.name.name)),
+        _ => true,
+    });
     let decls: &[Decl] = &all_decls;
 
     // Map every class declaration by simple name so class-to-class
@@ -747,7 +772,10 @@ fn build_module_with_overrides(
     // Reserve a stub Func slot per top-level function so call-site
     // lowering can resolve forward references. Tracks stub ids in
     // declaration order so overload-name collisions (`fun atomic(Int)`
-    // + `fun atomic(Long)` + …) each get their own slot.
+    // + `fun atomic(Long)` + …) each get their own slot. Note that
+    // `expect` decls already shadowed by an `actual` were dropped
+    // from `decls` above, so the cursor + lower-body pass sees only
+    // active definitions.
     let mut stub_ids: Vec<klio_ir::FuncId> = Vec::new();
     for d in decls {
         if let Decl::Function(f) = d {

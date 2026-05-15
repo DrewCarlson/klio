@@ -306,6 +306,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                                 is_fun_interface: true,
                                 is_value: false,
                                 is_annotation: false,
+                                is_expect: flags.is_expect,
+                                is_actual: flags.is_actual,
                             },
                             visibility,
                             annotations,
@@ -347,6 +349,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                         is_fun_interface: false,
                         is_value,
                         is_annotation: flags.is_annotation,
+                        is_expect: flags.is_expect,
+                        is_actual: flags.is_actual,
                     },
                     visibility,
                     annotations,
@@ -481,6 +485,12 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     } else if text == "suspend" {
                         flags.is_suspend = true;
                         flags.suspend_span = Some(self.current_span());
+                        self.bump();
+                    } else if text == "expect" {
+                        flags.is_expect = true;
+                        self.bump();
+                    } else if text == "actual" {
+                        flags.is_actual = true;
                         self.bump();
                     } else if matches!(text, "final" | "external") {
                         self.bump();
@@ -647,6 +657,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             is_fun_interface,
             is_value,
             is_annotation,
+            is_expect,
+            is_actual,
         } = mods;
         let kw = self.bump(); // `class` / `interface`
         let is_interface = matches!(kw.kind, TokenKind::Keyword(Keyword::Interface));
@@ -735,6 +747,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             is_fun_interface,
             is_value,
             is_annotation,
+            is_expect,
+            is_actual,
             enum_entries,
             members,
             visibility,
@@ -878,6 +892,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             is_fun_interface: false,
             is_value: false,
             is_annotation: false,
+            is_expect: false,
+            is_actual: false,
             enum_entries: Vec::new(),
             members,
             visibility,
@@ -1524,6 +1540,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             is_infix: flags.is_infix,
             is_tailrec: flags.is_tailrec,
             is_suspend: flags.is_suspend,
+            is_expect: flags.is_expect,
+            is_actual: flags.is_actual,
             visibility: flags.visibility,
             annotations: flags.annotations,
             span: kw.span.join(end),
@@ -1907,6 +1925,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             is_lateinit: flags.is_lateinit,
             is_const: flags.is_const,
             is_inline: flags.is_inline,
+            is_expect: flags.is_expect,
+            is_actual: flags.is_actual,
             setter_visibility,
             visibility: flags.visibility,
             annotations: flags.annotations,
@@ -2332,6 +2352,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                                 is_fun_interface: true,
                                 is_value: false,
                                 is_annotation: false,
+                                is_expect: flags.is_expect,
+                                is_actual: flags.is_actual,
                             },
                             visibility,
                             annotations,
@@ -2401,6 +2423,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                         is_fun_interface: false,
                         is_value,
                         is_annotation: flags.is_annotation,
+                        is_expect: flags.is_expect,
+                        is_actual: flags.is_actual,
                     },
                     visibility,
                     annotations,
@@ -3971,6 +3995,8 @@ struct ClassModifiers {
     is_fun_interface: bool,
     is_value: bool,
     is_annotation: bool,
+    is_expect: bool,
+    is_actual: bool,
 }
 
 #[derive(Default, Clone)]
@@ -3992,6 +4018,8 @@ struct ModifierFlags {
     is_value: bool,
     is_annotation: bool,
     is_suspend: bool,
+    is_expect: bool,
+    is_actual: bool,
     /// Span of the `suspend` modifier when one was consumed. Used to point
     /// the user at the modifier when emitting the rejection diagnostic on
     /// constructors / accessors / anonymous functions / delegation

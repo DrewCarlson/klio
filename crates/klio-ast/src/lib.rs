@@ -136,6 +136,17 @@ pub struct Function {
     /// call site to this function is required to be inside a suspending
     /// context.
     pub is_suspend: bool,
+    /// `expect fun foo(): R` — declaration without a body, awaiting
+    /// an `actual` impl supplied by the host (native binding) or a
+    /// platform-specific Kotlin source. Bodies are forbidden; the
+    /// IR build skips lowering and the dispatch fast path relies on
+    /// the installed `actual` binding.
+    #[serde(default)]
+    pub is_expect: bool,
+    /// `actual fun foo(): R = …` — the platform-side counterpart
+    /// to an `expect` declaration with the same signature.
+    #[serde(default)]
+    pub is_actual: bool,
     pub visibility: Visibility,
     pub annotations: Vec<Annotation>,
     pub span: Span,
@@ -253,6 +264,14 @@ pub struct Property {
     /// allowed to have a backing field (no initializer, no `field`-using
     /// accessor). Spec §4.3.4.
     pub is_inline: bool,
+    /// `expect val/var foo: T` — declaration without an
+    /// initializer or getter body; awaits an `actual` impl.
+    #[serde(default)]
+    pub is_expect: bool,
+    /// `actual val/var foo: T = …` — supplies the body for an
+    /// `expect` declaration with the same name + signature.
+    #[serde(default)]
+    pub is_actual: bool,
     /// Per-setter visibility recorded when the source uses bodyless
     /// `private set` / `protected set` etc. on a `var`. None means the
     /// setter inherits the property visibility. Spec §4.6.
@@ -348,6 +367,14 @@ pub struct Class {
     /// Typeck enforces shape constraints on the class body and parameter
     /// types.
     pub is_annotation: bool,
+    /// `expect class Foo` — declaration awaiting an `actual class Foo`
+    /// counterpart. Bodies / constructor bodies may be empty.
+    #[serde(default)]
+    pub is_expect: bool,
+    /// `actual class Foo` — concrete impl matched to an `expect class`
+    /// by simple name.
+    #[serde(default)]
+    pub is_actual: bool,
     pub enum_entries: Vec<EnumEntry>,
     pub members: Vec<Decl>,
     pub visibility: Visibility,
