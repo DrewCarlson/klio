@@ -4693,14 +4693,14 @@ fn seq_empty(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn seq_generate_sequence(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     use klio_runtime::{SequenceData, SequenceSource};
     match ctx.args {
-        [lam @ Value::Lambda { .. }] => Ok(Value::Sequence(Rc::new(SequenceData {
+        [lam @ (Value::Lambda { .. } | Value::IrClosure { .. })] => Ok(Value::Sequence(Rc::new(SequenceData {
             source: SequenceSource::Generate {
                 seed: None,
                 next: Box::new(lam.clone()),
             },
             ops: Vec::new(),
         }))),
-        [seed, lam @ Value::Lambda { .. }] => {
+        [seed, lam @ (Value::Lambda { .. } | Value::IrClosure { .. })] => {
             let seeded = if matches!(seed, Value::Null) {
                 None
             } else {
