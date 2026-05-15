@@ -981,10 +981,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     fields.push((param.name.clone(), value.clone()));
                 }
             }
+            // Body-property defaults for runtime-registered local
+            // classes — literal-only inits, since there's no
+            // lowered thunk on a non-IR class.
+            for p in &cls.body_properties {
+                if let Some(init) = &p.init {
+                    let v = simple_literal(init).unwrap_or(klio_runtime::Value::Null);
+                    fields.push((p.name.clone(), v));
+                } else if p.getter.is_none() && p.delegate.is_none() {
+                    fields.push((p.name.clone(), klio_runtime::Value::Null));
+                }
+            }
+            let default_outer = self
+                .class_default_outer
+                .borrow()
+                .get(&cls.name)
+                .cloned();
             let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
                 class: Rc::clone(cls),
                 fields,
-                outer: None,
+                outer: default_outer,
                 identity,
                 native_state: None,
             }));
@@ -3760,6 +3776,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 all.push(inst_value.clone());
                 all.extend_from_slice(args);
                 let v = klio_ir::eval::eval_with(&module, &func, all, self)?;
+                inst.borrow_mut().fields.push((p.name.clone(), v));
+            } else if let Some(init_expr) = p.init.as_ref() {
+                // Runtime-registered class (no lowered thunk):
+                // evaluate the property's init via simple_literal
+                // (covers literal-only inits used in local class
+                // declarations).
+                let v = simple_literal(init_expr).unwrap_or(klio_runtime::Value::Null);
                 inst.borrow_mut().fields.push((p.name.clone(), v));
             } else if p.getter.is_none() && p.delegate.is_none() {
                 inst.borrow_mut()
