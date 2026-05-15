@@ -880,6 +880,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }));
             return Ok(klio_runtime::Value::Instance(inst));
         }
+        // `propRef(receiver)` — invoking a Value::PropertyRef as a
+        // callable reads the named field from the first arg.
+        if let klio_runtime::Value::PropertyRef { name } = callee {
+            if args.len() == 1 {
+                return self.get_field(&args[0], name);
+            }
+        }
         if let klio_runtime::Value::IrClosure { id, captures } = callee {
             let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
@@ -2245,6 +2252,32 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         },
                     ));
                 }
+            }
+        }
+        // PropertyRef invocation: `nameRef.get(p)` / `nameRef.call(p)`
+        // reads the named property from the receiver. `hashCode`
+        // and `equals` route to structural equality on the name.
+        if let klio_runtime::Value::PropertyRef { name: pname } = receiver {
+            match (name, args.len()) {
+                ("get" | "call" | "invoke", 1) => {
+                    return self.get_field(&args[0], pname);
+                }
+                ("hashCode", 0) => {
+                    return Ok(klio_runtime::Value::new_int(
+                        value_structural_hash(receiver) as i64,
+                    ));
+                }
+                ("equals", 1) => {
+                    return Ok(klio_runtime::Value::Bool(
+                        klio_runtime::Value::structural_eq(receiver, &args[0]),
+                    ));
+                }
+                ("toString", 0) => {
+                    return Ok(klio_runtime::Value::String(Rc::new(format!(
+                        "property {pname}"
+                    ))));
+                }
+                _ => {}
             }
         }
         // Enum entries compare by ordinal natively. `Color.RED <
