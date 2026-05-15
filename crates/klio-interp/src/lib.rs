@@ -11787,6 +11787,68 @@ fn expr_refers_to_this(expr: &klio_ast::Expr) -> bool {
     }
 }
 
+/// True when `block` contains a bare (unlabeled) `return` expression.
+/// Inside a Kotlin lambda this is a *non-local* return out of the
+/// enclosing function. The IR lowers it as a plain Terminator::Return,
+/// which would terminate the lambda's Func instead — so IR-first
+/// dispatch must skip lambdas whose body has one.
+fn block_contains_bare_return(block: &klio_ast::Block) -> bool {
+    fn expr_has_bare_return(e: &klio_ast::Expr) -> bool {
+        use klio_ast::Expr::*;
+        match e {
+            Return { label: None, .. } => true,
+            Return { .. } => false,
+            Lambda { .. } | AnonFun { .. } => false,
+            Call { callee, args, .. } => {
+                expr_has_bare_return(callee) || args.iter().any(expr_has_bare_return)
+            }
+            Member { receiver, .. } => expr_has_bare_return(receiver),
+            Binary { lhs, rhs, .. } => expr_has_bare_return(lhs) || expr_has_bare_return(rhs),
+            Unary { expr, .. } | Postfix { expr, .. } => expr_has_bare_return(expr),
+            If { cond, then_branch, else_branch, .. } => {
+                expr_has_bare_return(cond)
+                    || expr_has_bare_return(then_branch)
+                    || else_branch.as_deref().map_or(false, expr_has_bare_return)
+            }
+            When { subject, branches, .. } => {
+                subject.as_deref().map_or(false, expr_has_bare_return)
+                    || branches.iter().any(|b| expr_has_bare_return(&b.body))
+            }
+            While { cond, body, .. } => {
+                expr_has_bare_return(cond) || expr_has_bare_return(body)
+            }
+            DoWhile { body, cond, .. } => {
+                body.as_deref().map_or(false, expr_has_bare_return)
+                    || expr_has_bare_return(cond)
+            }
+            For { iter, body, .. } => expr_has_bare_return(iter) || expr_has_bare_return(body),
+            Block(b) => block_contains_bare_return(b),
+            Try { body, catches, finally, .. } => {
+                block_contains_bare_return(body)
+                    || catches.iter().any(|c| block_contains_bare_return(&c.body))
+                    || finally.as_ref().map_or(false, block_contains_bare_return)
+            }
+            Labeled { expr, .. } => expr_has_bare_return(expr),
+            Index { receiver, args, .. } => {
+                expr_has_bare_return(receiver) || args.iter().any(expr_has_bare_return)
+            }
+            Spread { expr, .. } => expr_has_bare_return(expr),
+            Throw { value, .. } => expr_has_bare_return(value),
+            As { expr, .. } => expr_has_bare_return(expr),
+            IsCheck { expr, .. } => expr_has_bare_return(expr),
+            _ => false,
+        }
+    }
+    block.stmts.iter().any(|s| match s {
+        klio_ast::Stmt::Expr(e) => expr_has_bare_return(e),
+        klio_ast::Stmt::Assign { target, value, .. } => {
+            expr_has_bare_return(target) || expr_has_bare_return(value)
+        }
+        klio_ast::Stmt::DestructuringDecl { init, .. } => expr_has_bare_return(init),
+        klio_ast::Stmt::Decl(_) => false,
+    })
+}
+
 fn block_refers_to_this(block: &klio_ast::Block) -> bool {
     block.stmts.iter().any(|s| match s {
         klio_ast::Stmt::Expr(e) => expr_refers_to_this(e),
@@ -13881,7 +13943,11 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
         // empty params and `it` references inside the body lower as
         // LoadGlobal("it"), which would fail without a runtime binding.
         if let Some(fid) = body_func {
-            if captured_names.is_empty() && !params.is_empty() {
+            if captured_names.is_empty()
+                && !params.is_empty()
+                && !absorb_return
+                && !block_contains_bare_return(&body_rc)
+            {
                 let sp = body_rc.span;
                 let key = (sp.file.0, sp.start, sp.end);
                 self.interp
