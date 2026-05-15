@@ -188,6 +188,14 @@ impl Vm {
         vm.class_delegates = built.class_delegates;
         vm.func_defaults = built.func_defaults;
         vm.enclosing_class = built.enclosing_class;
+        // Pre-populated enum-entry override methods land in the
+        // same anon_methods side-table the Vm consults for
+        // anon-object + local-class methods.
+        for (key, value) in built.enum_entry_methods {
+            vm.anon_methods
+                .borrow_mut()
+                .insert(key, (value.0, value.1, Vec::new()));
+        }
         (vm, main)
     }
 
@@ -3286,6 +3294,33 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
             let key = (class_name, name.to_string());
+            // Enum entries tagged with __enum_entry_class__ route
+            // method calls to the entry-specific override class
+            // first, before falling back to the enum class's own
+            // members.
+            let entry_tag = inst.borrow().get("__enum_entry_class__");
+            if let Some(klio_runtime::Value::String(tag)) = entry_tag {
+                let entry_key = ((*tag).clone(), name.to_string());
+                let entry_method =
+                    self.anon_methods.borrow().get(&entry_key).cloned();
+                if let Some((module_rc, fid, _)) = entry_method {
+                    let func = module_rc
+                        .funcs
+                        .get(fid.0 as usize)
+                        .cloned()
+                        .ok_or_else(|| {
+                            klio_ir::eval::EvalError::Type(format!(
+                                "enum-entry method FuncId {} out of range",
+                                fid.0
+                            ))
+                        })?;
+                    let mut all: Vec<klio_runtime::Value> =
+                        Vec::with_capacity(args.len() + 1);
+                    all.push(receiver.clone());
+                    all.extend_from_slice(args);
+                    return klio_ir::eval::eval_with(&module_rc, &func, all, self);
+                }
+            }
             let entry = self.anon_methods.borrow().get(&key).cloned();
             if let Some((module_rc, fid, captures)) = entry {
                 let func = module_rc

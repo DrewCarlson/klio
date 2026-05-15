@@ -432,6 +432,20 @@ pub struct BuiltModule {
     /// top-level decls.
     pub enclosing_class:
         std::collections::HashMap<String, String>,
+    /// Pre-lowered method bodies for enum entries with per-entry
+    /// `override fun …` blocks. Keyed by (synth class name,
+    /// method name) where the synth class is `<EnumClass>$<Entry>`.
+    /// The Vm tags each entry instance and routes call_member
+    /// through this table when the entry has its own overrides.
+    pub enum_entry_methods: std::collections::HashMap<
+        (String, String),
+        (std::rc::Rc<klio_ir::Module>, klio_ir::FuncId),
+    >,
+    /// `(enum class name, entry name) -> synth class name` for
+    /// entries whose body declares method overrides. The Vm reads
+    /// this to identify which enum entries have per-entry methods.
+    pub enum_entry_synth_class:
+        std::collections::HashMap<(String, String), String>,
 }
 
 /// Pre-lowered metadata for one secondary constructor. Each entry's
@@ -918,6 +932,12 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // class shape supports per-entry overrides.
     let mut next_id = 1u64;
     let mut enum_entry_arg_inits: Vec<(String, String, Vec<klio_ir::FuncId>)> = Vec::new();
+    let mut enum_entry_methods: std::collections::HashMap<
+        (String, String),
+        (std::rc::Rc<klio_ir::Module>, klio_ir::FuncId),
+    > = std::collections::HashMap::new();
+    let mut enum_entry_synth_class: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
     for d in decls {
         if let Decl::Class(c) = d {
             if !c.is_enum {
@@ -944,6 +964,51 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                         identity: id,
                         native_state: None,
                     }));
+                    // Per-entry method overrides — `RED { override fun
+                    // f() = … }`. Lower each entry-specific method
+                    // body and stash so the Vm can dispatch it
+                    // when the entry instance receives a call.
+                    if !entry.body_members.is_empty() {
+                        let synth_class_name = format!(
+                            "{}${}",
+                            c.name.name, entry.name.name
+                        );
+                        enum_entry_synth_class.insert(
+                            (c.name.name.clone(), entry.name.name.clone()),
+                            synth_class_name.clone(),
+                        );
+                        for em in &entry.body_members {
+                            if let Decl::Function(f) = em {
+                                if f.body.is_none() {
+                                    continue;
+                                }
+                                let mut sub_module = klio_ir::Module::default();
+                                let own: std::collections::HashSet<String> =
+                                    std::collections::HashSet::new();
+                                let func = klio_ir::lower::lower_method(
+                                    &mut sub_module,
+                                    f,
+                                    &synth_class_name,
+                                    &own,
+                                );
+                                let fid = func.id;
+                                let module_rc = std::rc::Rc::new(sub_module);
+                                enum_entry_methods.insert(
+                                    (synth_class_name.clone(), f.name.name.clone()),
+                                    (module_rc, fid),
+                                );
+                            }
+                        }
+                        // Tag the entry instance with its synth
+                        // class so call_member on the instance can
+                        // look up the override.
+                        inst.borrow_mut().fields.push((
+                            "__enum_entry_class__".to_string(),
+                            klio_runtime::Value::String(std::rc::Rc::new(
+                                synth_class_name.clone(),
+                            )),
+                        ));
+                    }
                     entries.push((entry.name.name.clone(), klio_runtime::Value::Instance(inst)));
                     // Lower each ctor arg as a 0-arg thunk; the Vm
                     // runs them at startup and patches the result
@@ -1284,5 +1349,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         class_delegates,
         func_defaults,
         enclosing_class,
+        enum_entry_methods,
+        enum_entry_synth_class,
     }
 }
