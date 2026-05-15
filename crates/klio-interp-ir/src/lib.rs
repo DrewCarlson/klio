@@ -122,6 +122,11 @@ pub struct Vm {
     /// the dispatch fill missing positional args with `Null` (for
     /// implicit-`it` shapes that pass 0 args).
     closures: Vec<ClosureInfo>,
+    /// Overlay of host-bindings registered by loaded packs. Probed
+    /// before `klio_stdlib::implementation` so a pack's
+    /// `kotlinx.atomicfu.AtomicInt.compareAndSet` wins over the
+    /// stdlib's default lookup.
+    installed_bindings: Rc<klio_stdlib::HostBindings>,
 }
 
 #[derive(Clone)]
@@ -181,7 +186,15 @@ impl Vm {
             class_default_outer: Rc::new(RefCell::new(std::collections::HashMap::new())),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
+            installed_bindings: Rc::new(klio_stdlib::HostBindings::new()),
         }
+    }
+
+    /// Install pack-provided host bindings. Probed before
+    /// `klio_stdlib::implementation` during dispatch so a pack's
+    /// FQN-keyed bindings shadow the stdlib's default lookup.
+    pub fn set_installed_bindings(&mut self, bindings: klio_stdlib::HostBindings) {
+        self.installed_bindings = Rc::new(bindings);
     }
 
     /// Build a Vm from a fully-prepared `build::BuiltModule`. The
@@ -261,6 +274,7 @@ impl Vm {
                     func_type_params: &self.func_type_params,
                     top_level_delegated_props: &self.top_level_delegated_props,
                     delegated_body_props: &self.delegated_body_props,
+                    installed_bindings: Rc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
@@ -356,6 +370,7 @@ impl Vm {
                     func_type_params: &self.func_type_params,
                     top_level_delegated_props: &self.top_level_delegated_props,
                     delegated_body_props: &self.delegated_body_props,
+                    installed_bindings: Rc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                         closures: &mut self.closures,
                     };
@@ -403,6 +418,7 @@ impl Vm {
                     func_type_params: &self.func_type_params,
                     top_level_delegated_props: &self.top_level_delegated_props,
                     delegated_body_props: &self.delegated_body_props,
+                    installed_bindings: Rc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
@@ -453,6 +469,7 @@ impl Vm {
             func_type_params: &self.func_type_params,
                     top_level_delegated_props: &self.top_level_delegated_props,
                     delegated_body_props: &self.delegated_body_props,
+                    installed_bindings: Rc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut self.closures,
         };
@@ -528,6 +545,7 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
     top_level_delegated_props: &'a std::collections::HashSet<String>,
     delegated_body_props: &'a std::collections::HashSet<(String, String)>,
+    installed_bindings: Rc<klio_stdlib::HostBindings>,
     class_default_outer:
         Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     closures: &'a mut Vec<ClosureInfo>,
@@ -764,6 +782,95 @@ impl<'a> VmHost<'a> {
         Ok(items)
     }
 
+    /// Score an arg/param compatibility for overload resolution.
+    /// Higher is better. Exact type match wins over `Any`, which
+    /// wins over a type-parameter (`T`) fallback. Returning `None`
+    /// disqualifies the candidate.
+    fn overload_score_arg(
+        &self,
+        param_ty: &klio_ir::TypeRef,
+        arg: &klio_runtime::Value,
+    ) -> Option<i32> {
+        let nm = param_ty.name.as_str();
+        let fqn = arg.type_fqn();
+        let v_ty = fqn.rsplit('.').next().unwrap_or(fqn);
+        if nm == v_ty {
+            return Some(100);
+        }
+        if matches!(nm, "Any" | "Any?") {
+            return Some(10);
+        }
+        if matches!(arg, klio_runtime::Value::Null) && param_ty.nullable {
+            return Some(50);
+        }
+        // Numeric widening: Int → Long, Int → Double, Long → Double.
+        match (nm, v_ty) {
+            ("Long", "Int") => return Some(40),
+            ("Double", "Int") | ("Double", "Long") | ("Float", "Int") => return Some(30),
+            _ => {}
+        }
+        // Generic single-letter type-parameter — accept any.
+        if nm.len() <= 2 && nm.chars().all(|c| c.is_ascii_uppercase()) {
+            return Some(5);
+        }
+        // Unit param type (no info preserved at lower time) — accept
+        // anything but rank lowest so other overloads with concrete
+        // type info still win.
+        if nm == "Unit" {
+            return Some(1);
+        }
+        None
+    }
+
+    fn pick_overload(
+        &self,
+        module: &klio_ir::Module,
+        func: klio_ir::FuncId,
+        args: &[klio_runtime::Value],
+    ) -> Option<klio_ir::FuncId> {
+        let name = module.funcs.get(func.0 as usize)?.name.clone();
+        let candidates: Vec<klio_ir::FuncId> = module
+            .func_index
+            .iter()
+            .filter(|(n, _)| n == &name)
+            .map(|(_, id)| *id)
+            .collect();
+        if candidates.len() < 2 {
+            return None;
+        }
+        let mut best: Option<(klio_ir::FuncId, i32)> = None;
+        for cand in &candidates {
+            let f = module.funcs.get(cand.0 as usize)?;
+            if f.params.len() != args.len() {
+                continue;
+            }
+            let mut total: i32 = 0;
+            let mut ok = true;
+            for (p, a) in f.params.iter().zip(args.iter()) {
+                match self.overload_score_arg(&p.ty, a) {
+                    Some(s) => total += s,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && best.map(|(_, s)| total > s).unwrap_or(true) {
+                best = Some((*cand, total));
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    /// Look up an intrinsic by FQN. Probes the pack-supplied
+    /// `installed_bindings` overlay first so a loaded pack's binding
+    /// shadows the stdlib's default implementation.
+    fn lookup_intrinsic(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
+        self.installed_bindings
+            .resolve(fqn)
+            .or_else(|| klio_stdlib::implementation(fqn))
+    }
+
     fn dispatch_intrinsic(
         &mut self,
         func: klio_runtime::StdlibFn,
@@ -797,6 +904,7 @@ impl<'a> VmHost<'a> {
             func_type_params: self.func_type_params,
             top_level_delegated_props: self.top_level_delegated_props,
             delegated_body_props: self.delegated_body_props,
+            installed_bindings: Rc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             instance_id_counter: &mut *self.instance_id_counter,
         };
@@ -919,7 +1027,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             format!("kotlin.comparisons.{name}"),
         ];
         for fqn in &direct_probes {
-            if let Some(func) = klio_stdlib::implementation(fqn) {
+            if let Some(func) = self.lookup_intrinsic(fqn) {
                 // Property-style intrinsic: a 0-arg constant whose
                 // final segment is all uppercase + underscores
                 // (PI, MAX_VALUE, NaN-ish names like NaN itself
@@ -1693,7 +1801,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             format!("kotlin.{name}"),
         ];
         for probe in &probes {
-            if let Some(func) = klio_stdlib::implementation(probe) {
+            if let Some(func) = self.lookup_intrinsic(probe) {
                 let args = [receiver.clone()];
                 return self.dispatch_intrinsic(func, &args);
             }
@@ -2821,6 +2929,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         arg_names: &[Option<String>],
         type_args: &[String],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Overload resolution: when the target function shares its
+        // name with siblings (typical for packs like
+        // `kotlinx.atomicfu` declaring multiple `atomic(...)` shapes),
+        // the IR call site bakes in the first FuncId at lower time —
+        // pick the best match here using the runtime arg types.
+        let func = self.pick_overload(module, func, &args).unwrap_or(func);
         // Bind each call-site type-arg name to a synth
         // `Value::Class` global for the duration of the call so
         // reified type-param reads (`T::class`) resolve. We
@@ -2919,6 +3033,29 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Pack-installed binding overlay: when a loaded pack
+        // registers `<typeFqn>.<name>` the Rust binding shadows the
+        // interpreted shim body. Probe before the IR method walk so
+        // the native fast path always wins.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let snap = inst.borrow();
+            let cls_fqn = snap.class.fqn.clone();
+            let cls_name = snap.class.name.clone();
+            drop(snap);
+            let probes = [
+                format!("{cls_fqn}.{name}"),
+                format!("{cls_name}.{name}"),
+            ];
+            for p in &probes {
+                if let Some(func) = self.installed_bindings.resolve(p) {
+                    let mut all_args: Vec<klio_runtime::Value> =
+                        Vec::with_capacity(args.len() + 1);
+                    all_args.push(receiver.clone());
+                    all_args.extend_from_slice(args);
+                    return self.dispatch_intrinsic(func, &all_args);
+                }
+            }
+        }
         // `Delegates.notNull` / `Delegates.observable` /
         // `Delegates.vetoable` — synthesise the proper
         // `Value::Delegate` directly. The singleton itself is
@@ -2954,17 +3091,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // class-method registrations).
         if let klio_runtime::Value::Intrinsic { fqn, .. } = receiver {
             let probe = format!("{fqn}.{name}");
-            if let Some(func) = klio_stdlib::implementation(&probe) {
+            if let Some(func) = self.lookup_intrinsic(&probe) {
                 return self.dispatch_intrinsic(func, args);
             }
         }
         if let klio_runtime::Value::Class(cls) = receiver {
             let probe_simple = format!("{}.{}", cls.name, name);
-            if let Some(func) = klio_stdlib::implementation(&probe_simple) {
+            if let Some(func) = self.lookup_intrinsic(&probe_simple) {
                 return self.dispatch_intrinsic(func, args);
             }
             let probe_fqn = format!("{}.{}", cls.fqn, name);
-            if let Some(func) = klio_stdlib::implementation(&probe_fqn) {
+            if let Some(func) = self.lookup_intrinsic(&probe_fqn) {
                 return self.dispatch_intrinsic(func, args);
             }
         }
@@ -4042,7 +4179,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             ]
         };
         for probe in &probes {
-            if let Some(func) = klio_stdlib::implementation(probe) {
+            if let Some(func) = self.lookup_intrinsic(probe) {
                 let mut all_args: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
                 all_args.push(receiver.clone());
                 all_args.extend_from_slice(args);
@@ -4184,7 +4321,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     ) {
                         reordered.pop();
                     }
-                    if let Some(func) = klio_stdlib::implementation(probe) {
+                    if let Some(func) = self.lookup_intrinsic(probe) {
                         let mut all_args: Vec<klio_runtime::Value> =
                             Vec::with_capacity(reordered.len() + 1);
                         all_args.push(receiver.clone());
@@ -4812,6 +4949,7 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
     top_level_delegated_props: &'a std::collections::HashSet<String>,
     delegated_body_props: &'a std::collections::HashSet<(String, String)>,
+    installed_bindings: Rc<klio_stdlib::HostBindings>,
     class_default_outer:
         Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     instance_id_counter: &'a mut u64,
@@ -4882,6 +5020,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     func_type_params: self.func_type_params,
             top_level_delegated_props: self.top_level_delegated_props,
             delegated_body_props: self.delegated_body_props,
+            installed_bindings: Rc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut *self.closures,
                 };
@@ -4938,6 +5077,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 func_type_params: self.func_type_params,
             top_level_delegated_props: self.top_level_delegated_props,
             delegated_body_props: self.delegated_body_props,
+            installed_bindings: Rc::clone(&self.installed_bindings),
                 class_default_outer: Rc::clone(&self.class_default_outer),
                 instance_id_counter: &mut *self.instance_id_counter,
             };
@@ -5065,6 +5205,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             func_type_params: self.func_type_params,
             top_level_delegated_props: self.top_level_delegated_props,
             delegated_body_props: self.delegated_body_props,
+            installed_bindings: Rc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut *self.closures,
         };

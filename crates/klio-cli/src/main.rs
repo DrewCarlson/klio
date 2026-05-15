@@ -852,6 +852,114 @@ fn write_pack(out: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// `host_symbol` keys resolve against this merged table, so a
 /// `kotlinx.atomicfu.AtomicInt.compareAndSet` binding wins exactly
 /// when the user has the matching pack loaded.
+/// Walk the local pack cache, parse each pack's AST bundle, and
+/// build a `HostBindings` populated with the Rust-side bindings each
+/// pack declares. The caller prepends `pack_asts` to the user's AST
+/// list before lowering so pack declarations (`AtomicInt`, `Buffer`,
+/// …) participate in IR build. Only packs whose imports actually
+/// appear in the user's source are loaded — keeps unused-pack
+/// declarations out of the module + cuts startup time when no
+/// kotlinx import is present.
+fn load_installed_packs(
+    user_asts: &[klio_ast::KotlinFile],
+) -> (Vec<klio_ast::KotlinFile>, klio_stdlib::HostBindings) {
+    use klio_pack::schema::{decode, AstBundle, BindingManifest, PackManifest};
+    use klio_pack::{section_names, PackReader};
+    let mut out_asts: Vec<klio_ast::KotlinFile> = Vec::new();
+    let mut out_bindings = klio_stdlib::HostBindings::new();
+    let cache = match klio_cache_dir() {
+        Ok(c) => c,
+        Err(_) => return (out_asts, out_bindings),
+    };
+    let entries = match std::fs::read_dir(&cache) {
+        Ok(e) => e,
+        Err(_) => return (out_asts, out_bindings),
+    };
+    let merged = merged_host_bindings();
+    let user_import_prefixes: std::collections::HashSet<String> = user_asts
+        .iter()
+        .flat_map(|f| {
+            f.imports.iter().map(|imp| {
+                imp.path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+        })
+        .collect();
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x != "klio-pack").unwrap_or(true) {
+            continue;
+        }
+        // The stdlib pack ships bytecode the interpreter has already
+        // statically linked; skip it so we don't double-load the
+        // implicit-aliases surface.
+        if p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("stdlib"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let bytes = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let pack = match PackReader::from_bytes(bytes) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let manifest: PackManifest = match pack
+            .read_section(section_names::MANIFEST)
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(|payload| decode(payload).ok())
+        {
+            Some(m) => m,
+            None => continue,
+        };
+        // Only load packs whose `library_id` matches an import the
+        // user actually wrote (prefix match — `kotlinx.coroutines`
+        // is loaded when the source contains `import
+        // kotlinx.coroutines.runBlocking`).
+        let lib_id = &manifest.library_id;
+        let wanted = user_import_prefixes.iter().any(|imp| {
+            imp == lib_id
+                || imp.starts_with(&format!("{lib_id}."))
+                || lib_id.starts_with(&format!("{imp}."))
+        });
+        if !wanted {
+            continue;
+        }
+        if let Ok(Some(payload)) = pack.read_section(section_names::AST) {
+            if let Ok(ast_bundle) = decode::<AstBundle>(&payload) {
+                for f in ast_bundle.files {
+                    out_asts.push(f.kotlin_file);
+                }
+            }
+        }
+        if let Ok(Some(payload)) = pack.read_section(section_names::BINDINGS) {
+            if let Ok(bm) = decode::<BindingManifest>(&payload) {
+                for b in bm.bindings {
+                    if let Some(f) = merged.resolve(&b.host_symbol) {
+                        // HostBindings keys are `'static`; leak the
+                        // FQN string so the entry lives for the rest
+                        // of the process. Pack-load is a one-shot at
+                        // startup, so this is bounded and small.
+                        let leaked: &'static str =
+                            Box::leak(b.fqn.clone().into_boxed_str());
+                        out_bindings.register(leaked, f);
+                    }
+                }
+            }
+        }
+    }
+    (out_asts, out_bindings)
+}
+
 fn merged_host_bindings() -> klio_stdlib::HostBindings {
     let mut out = klio_stdlib::HostBindings::with_stdlib_defaults();
     merge_into(&mut out, klio_kotlinx_atomicfu::host_bindings());
@@ -1203,15 +1311,17 @@ fn run_module_files(paths: &[PathBuf]) -> ExitCode {
         }
         asts.push(ast);
     }
-    let tc = klio_typeck::typecheck_module(&asts, &klio_resolver::resolve_module(&asts));
-    if tc.diagnostics.has_errors() {
-        let _ = tc.diagnostics.render(&map, std::io::stderr());
-        return ExitCode::FAILURE;
-    }
-    let _ = tc;
-    let built = klio_interp_ir::build::build_module_files(&asts);
+    let (pack_asts, pack_bindings) = load_installed_packs(&asts);
+    // Pack ASTs first so the user's main wins when build_module_files
+    // picks a `main` declaration.
+    let mut all_asts: Vec<klio_ast::KotlinFile> =
+        Vec::with_capacity(pack_asts.len() + asts.len());
+    all_asts.extend(pack_asts);
+    all_asts.extend(asts);
+    let built = klio_interp_ir::build::build_module_files(&all_asts);
     let main_id = built.main;
     let (mut vm, _main) = klio_interp_ir::Vm::from_built(built);
+    vm.set_installed_bindings(pack_bindings);
     let Some(main_id) = main_id else {
         eprintln!("runtime error: no main function in module");
         return ExitCode::FAILURE;
@@ -1244,14 +1354,34 @@ fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
     if diags.has_errors() {
         return ExitCode::FAILURE;
     }
-    let r = resolve(&ast);
-    let tc = typecheck(&ast, &r);
-    if tc.diagnostics.has_errors() {
-        let _ = tc.diagnostics.render(&map, std::io::stderr());
-        return ExitCode::FAILURE;
+    let user_asts = vec![ast];
+    let (pack_asts, pack_bindings) = load_installed_packs(&user_asts);
+    if pack_asts.is_empty() {
+        // No packs needed — fall back to the single-file build path.
+        let ast = user_asts.into_iter().next().expect("user ast");
+        let built = klio_interp_ir::build::build_module(&ast);
+        let (mut vm, main) = klio_interp_ir::Vm::from_built(built);
+        vm.set_installed_bindings(pack_bindings);
+        let Some(main_id) = main else {
+            eprintln!("error: no main function found");
+            return ExitCode::FAILURE;
+        };
+        let mut stdout = klio_runtime::StdoutOutput;
+        return match vm.run(main_id, &mut stdout) {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("runtime error: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
-    let built = klio_interp_ir::build::build_module(&ast);
+    let mut all_asts: Vec<klio_ast::KotlinFile> =
+        Vec::with_capacity(pack_asts.len() + user_asts.len());
+    all_asts.extend(pack_asts);
+    all_asts.extend(user_asts);
+    let built = klio_interp_ir::build::build_module_files(&all_asts);
     let (mut vm, main) = klio_interp_ir::Vm::from_built(built);
+    vm.set_installed_bindings(pack_bindings);
     let Some(main_id) = main else {
         eprintln!("error: no main function found");
         return ExitCode::FAILURE;

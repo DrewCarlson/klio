@@ -906,7 +906,11 @@ fn lower_function_body_with_implicit_owner(
         .collect();
     params.extend(f.params.iter().map(|p| crate::Param {
         name: p.name.name.clone(),
-        ty: crate::TypeRef::unit(),
+        ty: crate::TypeRef {
+            name: p.ty.name.name.clone(),
+            nullable: p.ty.nullable,
+            args: Vec::new(),
+        },
         default: None,
         is_property: false,
         is_vararg: p.is_vararg,

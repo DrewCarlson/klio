@@ -499,13 +499,62 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
         decls: Vec::new(),
         span: Span::new(FileId(0), 0, 0),
     };
+    // Per-class FQN overrides: each pack file's `package` header
+    // attaches a `<package>.` prefix to every class declared in
+    // that file. The combined module has `package = None`, so the
+    // build pass would otherwise emit bare-name FQNs and pack
+    // bindings keyed by `kotlinx.atomicfu.AtomicInt.<method>`
+    // wouldn't resolve at dispatch.
+    let mut fqn_overrides: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for f in files {
+        let prefix: String = f
+            .package
+            .as_ref()
+            .map(|p| {
+                p.path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .unwrap_or_default();
+        for d in &f.decls {
+            collect_class_fqns(d, &prefix, &mut fqn_overrides);
+        }
         combined.decls.extend(f.decls.iter().cloned());
     }
-    build_module(&combined)
+    build_module_with_overrides(&combined, &fqn_overrides)
+}
+
+fn collect_class_fqns(
+    d: &Decl,
+    pkg: &str,
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    if let Decl::Class(c) = d {
+        if !pkg.is_empty() {
+            out.insert(c.name.name.clone(), format!("{}.{}", pkg, c.name.name));
+        }
+        for m in &c.members {
+            collect_class_fqns(m, pkg, out);
+        }
+    }
+    if let Decl::Object(o) = d {
+        if !pkg.is_empty() {
+            out.insert(o.name.name.clone(), format!("{}.{}", pkg, o.name.name));
+        }
+    }
 }
 
 pub fn build_module(file: &KotlinFile) -> BuiltModule {
+    build_module_with_overrides(file, &std::collections::HashMap::new())
+}
+
+fn build_module_with_overrides(
+    file: &KotlinFile,
+    fqn_overrides: &std::collections::HashMap<String, String>,
+) -> BuiltModule {
     let mut module = klio_ir::Module::default();
     let package_prefix: String = file
         .package
@@ -683,9 +732,10 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     }
 
     // Reserve a stub Func slot per top-level function so call-site
-    // lowering can resolve forward references.
-    let mut stub_ids: std::collections::HashMap<String, klio_ir::FuncId> =
-        std::collections::HashMap::new();
+    // lowering can resolve forward references. Tracks stub ids in
+    // declaration order so overload-name collisions (`fun atomic(Int)`
+    // + `fun atomic(Long)` + …) each get their own slot.
+    let mut stub_ids: Vec<klio_ir::FuncId> = Vec::new();
     for d in decls {
         if let Decl::Function(f) = d {
             let id = klio_ir::FuncId(module.funcs.len() as u32);
@@ -706,7 +756,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
             if f.is_tailrec {
                 module.tailrec_fn_names.push(f.name.name.clone());
             }
-            stub_ids.insert(f.name.name.clone(), id);
+            stub_ids.push(id);
         }
     }
 
@@ -718,10 +768,12 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     > = std::collections::HashMap::new();
     let mut func_type_params: std::collections::HashMap<klio_ir::FuncId, Vec<String>> =
         std::collections::HashMap::new();
+    let mut stub_cursor: usize = 0;
     for d in decls {
         if let Decl::Function(f) = d {
             let func = klio_ir::lower::lower_function_body_into(&mut module, f, &file_classes);
-            let id = *stub_ids.get(&f.name.name).expect("stub registered above");
+            let id = stub_ids[stub_cursor];
+            stub_cursor += 1;
             let mut placed = func;
             placed.id = id;
             module.funcs[id.0 as usize] = placed;
@@ -948,11 +1000,16 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
             let is_object = object_names.iter().any(|n| n == &c.name.name);
             let def = std::rc::Rc::new(ClassDef {
                 name: c.name.name.clone(),
-                fqn: if package_prefix.is_empty() {
-                    c.name.name.clone()
-                } else {
-                    format!("{}.{}", package_prefix, c.name.name)
-                },
+                fqn: fqn_overrides
+                    .get(&c.name.name)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if package_prefix.is_empty() {
+                            c.name.name.clone()
+                        } else {
+                            format!("{}.{}", package_prefix, c.name.name)
+                        }
+                    }),
                 annotation_names: Vec::new(),
                 primary_params,
                 methods: Vec::new(),
