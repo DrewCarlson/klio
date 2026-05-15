@@ -499,6 +499,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return klio_ir::eval::eval_with(&module, &func, vec![receiver.clone()], self);
             }
         }
+        // Reflection-style property/class accessors on the
+        // synthetic KClass / KProperty values.
+        match receiver {
+            klio_runtime::Value::Class(cls) => match name {
+                "simpleName" => {
+                    return Ok(klio_runtime::Value::String(Rc::new(cls.name.clone())));
+                }
+                "qualifiedName" => {
+                    return Ok(klio_runtime::Value::String(Rc::new(cls.fqn.clone())));
+                }
+                _ => {}
+            },
+            klio_runtime::Value::PropertyRef { name: pname } => match name {
+                "name" | "simpleName" => {
+                    return Ok(klio_runtime::Value::String(Rc::clone(pname)));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
         // `size` on arrays + collections.
         if name == "size" {
             match receiver {
