@@ -12482,13 +12482,6 @@ fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
     h.finish() as i32
 }
 
-fn getter_body_expr(acc: &klio_ast::Accessor) -> Option<klio_ast::Expr> {
-    match &acc.body {
-        klio_ast::FunctionBody::Expr(e) if !expr_uses_field(e) => Some(e.clone()),
-        _ => None,
-    }
-}
-
 /// Replace every bare `field` identifier inside `expr` with a
 /// reference to `prop_name`. Used when lowering a top-level
 /// accessor body to IR — the backing field lives in globals
@@ -12612,40 +12605,6 @@ fn substitute_field_with_this(prop_name: &str, expr: &klio_ast::Expr) -> klio_as
     }
     walk(prop_name, dummy, &mut out);
     out
-}
-
-/// True when `expr` references the implicit `field` identifier
-/// (the property's backing field). Accessors that read or write
-/// `field` need the tree walker's accessor scope to bind it; the
-/// IR fast-path skips them.
-fn expr_uses_field(expr: &klio_ast::Expr) -> bool {
-    use klio_ast::Expr;
-    match expr {
-        Expr::Path { segments, .. } => {
-            segments.len() == 1 && segments[0].name == "field"
-        }
-        Expr::Call { callee, args, .. } => {
-            expr_uses_field(callee) || args.iter().any(expr_uses_field)
-        }
-        Expr::Member { receiver, .. } => expr_uses_field(receiver),
-        Expr::Binary { lhs, rhs, .. } => expr_uses_field(lhs) || expr_uses_field(rhs),
-        Expr::Unary { expr, .. } => expr_uses_field(expr),
-        Expr::Postfix { expr, .. } => expr_uses_field(expr),
-        Expr::IsCheck { expr, .. } | Expr::As { expr, .. } => expr_uses_field(expr),
-        Expr::If { cond, then_branch, else_branch, .. } => {
-            expr_uses_field(cond)
-                || expr_uses_field(then_branch)
-                || else_branch.as_ref().map_or(false, |e| expr_uses_field(e))
-        }
-        Expr::Index { receiver, args, .. } => {
-            expr_uses_field(receiver) || args.iter().any(expr_uses_field)
-        }
-        Expr::Throw { value, .. } => expr_uses_field(value),
-        Expr::Return { value, .. } => value.as_ref().map_or(false, |e| expr_uses_field(e)),
-        Expr::Spread { expr, .. } => expr_uses_field(expr),
-        Expr::Lambda { .. } | Expr::Block { .. } | Expr::When { .. } | Expr::Try { .. } => true,
-        _ => false,
-    }
 }
 
 fn ir_err(e: klio_runtime::RuntimeError) -> klio_ir::eval::EvalError {
