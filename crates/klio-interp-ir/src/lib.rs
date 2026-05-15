@@ -674,7 +674,13 @@ impl<'a> VmHost<'a> {
             out: self.out,
             host: &mut intrinsic_host,
         };
-        func(&mut ctx).map_err(|e| klio_ir::eval::EvalError::Type(format!("{e}")))
+        func(&mut ctx).map_err(|e| match e {
+            // Preserve the thrown Value so the IR evaluator's
+            // try/catch can match the handler against the exception
+            // class. Stringifying here would break `try { … } catch`.
+            klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
+            other => klio_ir::eval::EvalError::Type(format!("{other}")),
+        })
     }
 }
 
