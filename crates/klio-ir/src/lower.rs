@@ -1088,6 +1088,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     Expr::Path { segments, .. } if segments.len() == 1 => {
                         if let Some(home) = b.mutable_home(&segments[0].name) {
                             b.push(Inst::Move { dst: home, src: dst });
+                        } else if b.knows_outer(&segments[0].name) {
+                            let _ = b.record_capture(&segments[0].name);
+                            let n = b
+                                .module
+                                .intern_const(Const::String(segments[0].name.clone()));
+                            b.push(Inst::StoreGlobal { name: n, value: dst });
+                            b.rebind(&segments[0].name, dst);
                         } else {
                             b.rebind(&segments[0].name, dst);
                         }
@@ -2260,6 +2267,18 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             let this_reg = b.resolve("this").unwrap();
                             let field = b.module.intern_const(Const::String(segments[0].name.clone()));
                             b.push(Inst::SetField { receiver: this_reg, field, value: new });
+                        } else if b.knows_outer(&segments[0].name) {
+                            // Lambda-body postfix inc/dec on a
+                            // captured outer var: rebind locally
+                            // and emit StoreGlobal so the caller's
+                            // WritebackCaptures Inst syncs the
+                            // mutation back to the outer reg.
+                            let _ = b.record_capture(&segments[0].name);
+                            let n = b
+                                .module
+                                .intern_const(Const::String(segments[0].name.clone()));
+                            b.push(Inst::StoreGlobal { name: n, value: new });
+                            b.rebind(&segments[0].name, new);
                         } else {
                             b.rebind(&segments[0].name, new);
                         }
