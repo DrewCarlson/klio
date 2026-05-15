@@ -60,6 +60,11 @@ pub struct Vm {
     /// Top-level property initialiser FuncIds. Run at Vm::run start
     /// so globals see the initial values.
     top_level_props: Vec<(String, klio_ir::FuncId)>,
+    /// Names of `object Foo { … }` singletons. Vm::run allocates one
+    /// instance per name at startup (using the synthesised ClassDef in
+    /// `classes`) and inserts it into globals so bare-name `Foo`
+    /// references resolve.
+    object_names: Vec<String>,
     /// Runtime-lowered method bodies for anonymous-object / local
     /// classes, indexed by `(class name, method name) -> (Module, FuncId)`.
     /// The IR module is immutable after build, so methods declared
@@ -118,6 +123,7 @@ impl Vm {
             init_blocks: std::collections::HashMap::new(),
             extension_props: std::collections::HashMap::new(),
             top_level_props: Vec::new(),
+            object_names: Vec::new(),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
         }
@@ -136,6 +142,7 @@ impl Vm {
         vm.init_blocks = built.init_blocks;
         vm.extension_props = built.extension_props;
         vm.top_level_props = built.top_level_props;
+        vm.object_names = built.object_names;
         (vm, main)
     }
 
@@ -176,6 +183,39 @@ impl Vm {
                     .map_err(VmError::from)?
             };
             self.globals.borrow_mut().define(name, v);
+        }
+        // Allocate one instance per `object Foo { … }` decl and
+        // publish it as a global so bare-name `Foo` references
+        // resolve. Each object's class is synthesised in build.rs
+        // alongside regular classes; the singleton runs that class's
+        // primary ctor (parent chain + body props + init blocks)
+        // with zero args.
+        let object_names: Vec<String> = self.object_names.clone();
+        for obj_name in &object_names {
+            let class_id = match module.class_id(obj_name) {
+                Some(id) => id,
+                None => continue,
+            };
+            let inst = {
+                let mut host = VmHost {
+                    globals: Rc::clone(&self.globals),
+                    module: Rc::clone(&module),
+                    scheduler: &mut *self.scheduler,
+                    out,
+                    instance_id_counter: &mut self.instance_id_counter,
+                    classes: Rc::clone(&self.classes),
+                    body_prop_inits: &self.body_prop_inits,
+                    instance_prop_getters: &self.instance_prop_getters,
+                    parent_ctor_args: &self.parent_ctor_args,
+                    init_blocks: &self.init_blocks,
+                    extension_props: &self.extension_props,
+                    anon_methods: Rc::clone(&self.anon_methods),
+                    closures: &mut self.closures,
+                };
+                <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
+                    .map_err(VmError::from)?
+            };
+            self.globals.borrow_mut().define(obj_name, inst);
         }
         let func = module
             .funcs

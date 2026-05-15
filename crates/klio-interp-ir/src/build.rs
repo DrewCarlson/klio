@@ -123,6 +123,43 @@ fn rewrite_block_field(block: &klio_ast::Block, prop: &str) -> klio_ast::Block {
     out
 }
 
+/// Synthesise a `Class` AST node that mirrors an `ObjectDecl`. The
+/// resulting class participates in the regular class-lowering pipeline
+/// (members, supertype delegation, init blocks); a separate
+/// `object_singletons` map then allocates one instance per name and
+/// the Vm publishes it as a global at startup.
+fn synthesize_class_from_object(o: &klio_ast::ObjectDecl) -> klio_ast::Class {
+    let members: Vec<Decl> = o.members.clone();
+    klio_ast::Class {
+        name: o.name.clone(),
+        type_params: Vec::new(),
+        where_bounds: Vec::new(),
+        primary_params: Vec::new(),
+        init_blocks: Vec::new(),
+        supertypes: o.supertypes.clone(),
+        supertype_args: o.supertype_args.clone(),
+        supertype_delegates: o.supertypes.iter().map(|_| None).collect(),
+        is_data: o.is_data,
+        is_companion: false,
+        is_enum: false,
+        is_sealed: false,
+        is_open: false,
+        is_abstract: false,
+        is_inner: false,
+        secondary_ctors: Vec::new(),
+        is_interface: false,
+        is_fun_interface: false,
+        is_value: false,
+        is_annotation: false,
+        enum_entries: Vec::new(),
+        members,
+        visibility: klio_ast::Visibility::Public,
+        primary_ctor_visibility: None,
+        annotations: Vec::new(),
+        span: o.span,
+    }
+}
+
 /// Result of building an IR module from a single Kotlin file.
 pub struct BuiltModule {
     /// The frozen IR module ready for `Vm::run`.
@@ -172,6 +209,10 @@ pub struct BuiltModule {
     /// FuncId of the file's `main`, or `None` when the file has no
     /// `main` entry point.
     pub main: Option<klio_ir::FuncId>,
+    /// Names of `object Foo { … }` singleton declarations in source
+    /// order. The Vm allocates one instance per name at startup and
+    /// publishes it as a global so bare-name `Foo` reads resolve.
+    pub object_names: Vec<String>,
 }
 
 /// Lower a single file's declarations into an IR module. Classes are
@@ -186,17 +227,34 @@ pub struct BuiltModule {
 pub fn build_module(file: &KotlinFile) -> BuiltModule {
     let mut module = klio_ir::Module::default();
 
+    // Synthesise a `Class` for every `object` declaration so the
+    // shared class-lowering pipeline picks them up (members, init,
+    // supertypes, accessors). A separate `object_names` list tells
+    // the Vm to allocate one instance per object at startup.
+    let mut object_names: Vec<String> = Vec::new();
+    let mut all_decls: Vec<Decl> = Vec::with_capacity(file.decls.len());
+    for d in &file.decls {
+        match d {
+            Decl::Object(o) => {
+                object_names.push(o.name.name.clone());
+                all_decls.push(Decl::Class(synthesize_class_from_object(o)));
+            }
+            other => all_decls.push(other.clone()),
+        }
+    }
+    let decls: &[Decl] = &all_decls;
+
     // Map every class declaration by simple name so class-to-class
     // member-name lookups during body lowering have access to the
     // wider file's class shape.
     let mut file_classes: std::collections::HashMap<String, &klio_ast::Class> =
         std::collections::HashMap::new();
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Class(c) = d {
             file_classes.insert(c.name.name.clone(), c);
         }
     }
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Class(c) = d {
             let _ = klio_ir::lower::lower_class_with_file(&mut module, c, &file_classes);
         }
@@ -206,7 +264,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // lowering can resolve forward references.
     let mut stub_ids: std::collections::HashMap<String, klio_ir::FuncId> =
         std::collections::HashMap::new();
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Function(f) = d {
             let id = klio_ir::FuncId(module.funcs.len() as u32);
             module.funcs.push(klio_ir::Func {
@@ -231,7 +289,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
 
     // Lower each function body into its reserved slot.
     let mut main_id: Option<klio_ir::FuncId> = None;
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Function(f) = d {
             let func = klio_ir::lower::lower_function_body_into(&mut module, f, &file_classes);
             let id = *stub_ids.get(&f.name.name).expect("stub registered above");
@@ -255,7 +313,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         std::collections::HashMap::new();
     let mut instance_prop_getters: std::collections::HashMap<(String, String), klio_ir::FuncId> =
         std::collections::HashMap::new();
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Class(c) = d {
             // Collect own-member names so accessor bodies' bare
             // identifiers resolve via this.<name>.
@@ -327,7 +385,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     let globals_for_capture = std::rc::Rc::new(RefCell::new(klio_runtime::Env::new()));
     let mut classes: std::collections::HashMap<String, Rc<ClassDef>> =
         std::collections::HashMap::new();
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Class(c) = d {
             let primary_params: Vec<ClassParamDef> = c
                 .primary_params
@@ -404,7 +462,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // ctor args + body members aren't run — that lands when the IR
     // class shape supports per-entry overrides.
     let mut next_id = 1u64;
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Class(c) = d {
             if !c.is_enum {
                 continue;
@@ -461,7 +519,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // primary-ctor args.
     let mut parent_ctor_args: std::collections::HashMap<String, Vec<klio_ir::FuncId>> =
         std::collections::HashMap::new();
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Class(c) = d {
             for parent_args_opt in &c.supertype_args {
                 if let Some(parent_args) = parent_args_opt {
@@ -492,7 +550,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // Lower each class's init blocks as 1-arg thunks taking `this`.
     let mut init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>> =
         std::collections::HashMap::new();
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Class(c) = d {
             if c.init_blocks.is_empty() {
                 continue;
@@ -532,7 +590,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // `var name = expr` declared at file scope. Each lowers to a
     // 0-arg thunk. Vm::run drives them at startup.
     let mut top_level_props: Vec<(String, klio_ir::FuncId)> = Vec::new();
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Property(p) = d {
             if p.receiver_type.is_some() {
                 continue;
@@ -553,7 +611,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // 1-arg thunk taking the receiver as `this`.
     let mut extension_props: std::collections::HashMap<(String, String), klio_ir::FuncId> =
         std::collections::HashMap::new();
-    for d in &file.decls {
+    for d in decls {
         if let Decl::Property(p) = d {
             if let Some(recv) = &p.receiver_type {
                 if let Some(getter) = &p.getter {
@@ -599,5 +657,6 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         top_level_props,
         extension_props,
         main: main_id,
+        object_names,
     }
 }
