@@ -997,6 +997,25 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return self.get_field(&args[0], name);
             }
         }
+        // Bound method/property reference: synthetic instance
+        // carrying a receiver + method name. Invocation forwards
+        // through the captured receiver (or reads the property on
+        // the first arg for unbound property refs).
+        if let klio_runtime::Value::Instance(inst) = callee {
+            let snap = inst.borrow();
+            let recv = snap.get("__bound_receiver__");
+            let name_v = snap.get("__bound_name__");
+            drop(snap);
+            if let (Some(recv), Some(klio_runtime::Value::String(name))) =
+                (recv, name_v)
+            {
+                if matches!(&recv, klio_runtime::Value::Class(_)) && args.len() == 1
+                {
+                    return self.get_field(&args[0], &name);
+                }
+                return self.call_member(&recv, &name, args);
+            }
+        }
         if let klio_runtime::Value::IrClosure { id, captures } = callee {
             let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
@@ -1114,6 +1133,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     .find(|(n, _)| n == name)
                 {
                     return Ok(v.clone());
+                }
+            }
+        }
+        // Bound method/property reference field reads:
+        // `nameRef.name` / `.simpleName` resolve to the captured
+        // method name.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let snap = inst.borrow();
+            if snap.get("__bound_receiver__").is_some() {
+                if let Some(klio_runtime::Value::String(n)) = snap.get("__bound_name__") {
+                    match name {
+                        "name" | "simpleName" => {
+                            return Ok(klio_runtime::Value::String(Rc::clone(&n)));
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1525,26 +1560,63 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        // Foo::method / instance::method — produce a callable
-        // closure that, when invoked, dispatches the named member
-        // on the receiver. Bound-method closures store the
-        // receiver as a capture and forward call args to
-        // call_member.
-        let captures = vec![receiver.clone()];
-        let id = self.closures.len() as u64;
-        // Synthesize a 0-Func body that's just a dispatcher.
-        // Since the closure infrastructure expects an IR FuncId,
-        // and we don't want to lower a new Func per ref, return
-        // a Value::BoundMethod-style PropertyRef-ish handle. For
-        // a usable runtime value we instead use a Value::Lambda
-        // with a synthetic dispatcher body — too much. Simplest
-        // is to return Value::PropertyRef as a stand-in (the
-        // value implements `.name` etc.) until reflection lands.
-        let _ = captures;
-        let _ = id;
-        Ok(klio_runtime::Value::PropertyRef {
-            name: Rc::new(name.to_string()),
-        })
+        // `X::class` is a class reference, not a member ref —
+        // return the class itself so `.simpleName` etc. resolve.
+        if name == "class" {
+            return Ok(receiver.clone());
+        }
+        // `recv::method` produces a callable wrapper that, when
+        // invoked, dispatches `recv.method(args)`. We synthesise a
+        // tiny Instance whose `__bound_receiver__` + `__bound_name__`
+        // fields drive the call_value path below.
+        *self.instance_id_counter += 1;
+        let identity = *self.instance_id_counter;
+        let synth_class = Rc::new(klio_runtime::ClassDef {
+            name: format!("$bound_ref${name}"),
+            fqn: format!("$bound_ref${name}"),
+            annotation_names: Vec::new(),
+            primary_params: Vec::new(),
+            methods: Vec::new(),
+            body_properties: Vec::new(),
+            init_blocks: Vec::new(),
+            is_data: false,
+            is_object: false,
+            is_enum: false,
+            is_sealed: false,
+            is_open: false,
+            is_abstract: false,
+            is_inner: false,
+            is_anonymous: true,
+            secondary_ctors: Vec::new(),
+            supertype_names: Vec::new(),
+            parent: RefCell::new(None),
+            interfaces: RefCell::new(Vec::new()),
+            is_interface: false,
+            is_fun_interface: false,
+            parent_ctor_args: Vec::new(),
+            enum_entries: RefCell::new(Vec::new()),
+            companion: RefCell::new(None),
+            enclosing_class: RefCell::new(None),
+            nested_classes: RefCell::new(Vec::new()),
+            captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
+            supertype_delegates: RefCell::new(Vec::new()),
+            delegate_forwarders: RefCell::new(Vec::new()),
+            object_singleton: RefCell::new(None),
+        });
+        let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
+            class: synth_class,
+            fields: vec![
+                ("__bound_receiver__".to_string(), receiver.clone()),
+                (
+                    "__bound_name__".to_string(),
+                    klio_runtime::Value::String(Rc::new(name.to_string())),
+                ),
+            ],
+            outer: None,
+            identity,
+            native_state: None,
+        }));
+        Ok(klio_runtime::Value::Instance(inst))
     }
 
     fn register_class(
@@ -2571,6 +2643,34 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let target = inst.borrow().get("__sam_target__");
             if let Some(target) = target {
                 return self.call_value(&target, args);
+            }
+        }
+        // Bound method/property-reference dispatch: a `recv::member`
+        // wrapper routes calls through the captured receiver + name.
+        // Property refs (receiver is a class) handle `get(arg)` as
+        // a property read on `arg`. Method refs (receiver is an
+        // instance) forward all args through `call_member`.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let snap = inst.borrow();
+            let recv_capt = snap.get("__bound_receiver__");
+            let name_capt = snap.get("__bound_name__");
+            drop(snap);
+            if let (Some(rc), Some(klio_runtime::Value::String(n))) =
+                (recv_capt, name_capt)
+            {
+                if matches!(name, "name" | "simpleName") {
+                    // Field reads on the ref itself; handled by
+                    // get_field.
+                } else if matches!(&rc, klio_runtime::Value::Class(_)) {
+                    // Unbound property reference: `r.get(arg)` /
+                    // `r.invoke(arg)` reads `arg.<n>`.
+                    if matches!(name, "get" | "call" | "invoke") && args.len() == 1 {
+                        return self.get_field(&args[0], &n);
+                    }
+                } else {
+                    // Bound method reference: forward the call.
+                    return self.call_member(&rc, &n, args);
+                }
             }
         }
         // SAM conversion: a callable (lambda / closure / function
