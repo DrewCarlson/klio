@@ -758,6 +758,17 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                     &format!("__top_prop_init_{}", p.name.name),
                 );
                 top_level_props.push((p.name.name.clone(), fid));
+            } else if let Some(delegate) = &p.delegate {
+                // `val X by delegate-expr` — evaluate the delegate
+                // value at startup and store under the property
+                // name. Vm `lookup_global` unwraps `Value::Delegate(Lazy)`
+                // on first read (caches the producer's result).
+                let fid = klio_ir::lower::lower_expr_as_thunk(
+                    &mut module,
+                    delegate,
+                    &format!("__top_prop_delegate_{}", p.name.name),
+                );
+                top_level_props.push((p.name.name.clone(), fid));
             }
         }
     }

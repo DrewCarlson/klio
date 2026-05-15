@@ -611,7 +611,34 @@ impl<'a> VmHost<'a> {
 
 impl<'a> klio_ir::eval::Host for VmHost<'a> {
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
-        if let Some(v) = self.globals.borrow().lookup(name) {
+        let cached = self.globals.borrow().lookup(name);
+        if let Some(v) = cached {
+            // Lazy-delegate auto-resolve: a top-level `val X by lazy { … }`
+            // stores the `Value::Delegate(Lazy)` here; the first read
+            // invokes the producer, caches the result, and returns it.
+            if let klio_runtime::Value::Delegate(d) = &v {
+                let mut state = d.borrow_mut();
+                if let klio_runtime::DelegateKind::Lazy { producer, cached } = &mut *state {
+                    if let Some(c) = cached.clone() {
+                        return Some(c);
+                    }
+                    let prod = producer.clone();
+                    drop(state);
+                    if let Ok(result) =
+                        <Self as klio_ir::eval::Host>::call_value(self, &prod, &[])
+                    {
+                        if let klio_runtime::Value::Delegate(d2) = &v {
+                            if let klio_runtime::DelegateKind::Lazy { cached, .. } =
+                                &mut *d2.borrow_mut()
+                            {
+                                *cached = Some(result.clone());
+                            }
+                        }
+                        return Some(result);
+                    }
+                    return Some(v);
+                }
+            }
             return Some(v);
         }
         // User-class lookup: returning Value::Class lets call sites
