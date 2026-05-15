@@ -401,30 +401,46 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         if let klio_runtime::Value::Instance(inst) = receiver {
-            // Look up an IR-lowered method by walking the IR Class
-            // for the receiver's runtime class. Each method FuncId
-            // names itself, so the simple-name match is enough for
-            // the trivial single-class case. Inherited methods land
-            // when supertype lookup migrates.
+            // Walk the IR class + its supertypes breadth-first
+            // looking for a method matching `name`. The receiver's
+            // runtime ClassDef.supertype_names provides the chain;
+            // each name maps back to a klio_ir::Class via the
+            // module's class_index.
             let class_name = inst.borrow().class.name.clone();
-            let ir_class = self
-                .module
-                .classes
-                .iter()
-                .find(|c| c.name == class_name)
-                .cloned();
-            if let Some(ir_class) = ir_class {
-                for fid in &ir_class.methods {
-                    let func = self.module.funcs.get(fid.0 as usize).cloned();
-                    if let Some(f) = func {
-                        if f.name == name {
-                            let mut all_args: Vec<klio_runtime::Value> =
-                                Vec::with_capacity(args.len() + 1);
-                            all_args.push(receiver.clone());
-                            all_args.extend_from_slice(args);
-                            let module = Rc::clone(&self.module);
-                            return klio_ir::eval::eval_with(&module, &f, all_args, self);
+            let mut queue: std::collections::VecDeque<String> =
+                std::collections::VecDeque::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            queue.push_back(class_name);
+            while let Some(cur_name) = queue.pop_front() {
+                if !seen.insert(cur_name.clone()) {
+                    continue;
+                }
+                let ir_class = self
+                    .module
+                    .classes
+                    .iter()
+                    .find(|c| c.name == cur_name)
+                    .cloned();
+                if let Some(ir_class) = ir_class {
+                    for fid in &ir_class.methods {
+                        if let Some(f) = self.module.funcs.get(fid.0 as usize).cloned() {
+                            if f.name == name {
+                                let mut all_args: Vec<klio_runtime::Value> =
+                                    Vec::with_capacity(args.len() + 1);
+                                all_args.push(receiver.clone());
+                                all_args.extend_from_slice(args);
+                                let module = Rc::clone(&self.module);
+                                return klio_ir::eval::eval_with(&module, &f, all_args, self);
+                            }
                         }
+                    }
+                }
+                // Push runtime supertype names; the Vm's
+                // class_table maps each name back to a ClassDef
+                // whose supertype_names continues the walk.
+                if let Some(def) = self.classes.get(&cur_name) {
+                    for sup in &def.supertype_names {
+                        queue.push_back(sup.clone());
                     }
                 }
             }
