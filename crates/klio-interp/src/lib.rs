@@ -11852,7 +11852,16 @@ fn block_writes_any(block: &klio_ast::Block, names: &[String]) -> bool {
             Binary { lhs, rhs, .. } => {
                 expr_writes_any(lhs, names) || expr_writes_any(rhs, names)
             }
-            Unary { expr, .. } | Postfix { expr, .. } => expr_writes_any(expr, names),
+            Unary { expr, .. } => expr_writes_any(expr, names),
+            Postfix { expr, op, .. } => {
+                // Postfix `++` / `--` mutates the target. Treat a
+                // bare-name target as a write to that capture.
+                let target_write = matches!(
+                    op,
+                    klio_ast::PostfixOp::Inc | klio_ast::PostfixOp::Dec
+                ) && assigns_to(expr, names);
+                target_write || expr_writes_any(expr, names)
+            }
             If { cond, then_branch, else_branch, .. } => {
                 expr_writes_any(cond, names)
                     || expr_writes_any(then_branch, names)
