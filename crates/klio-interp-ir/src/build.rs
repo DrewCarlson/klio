@@ -193,15 +193,18 @@ fn lift_class_recursive(
 ) {
     for m in &c.members {
         if let Decl::Object(co) = m {
-            let comp_name = format!("{}$Companion${}", c.name.name, co.name.name);
-            let mut renamed = co.clone();
-            renamed.name = klio_ast::Ident {
-                name: comp_name.clone(),
-                span: co.name.span,
-            };
-            object_names.push(comp_name.clone());
-            out_decls.push(Decl::Class(synthesize_class_from_object(&renamed)));
-            companion_singletons.insert(c.name.name.clone(), comp_name);
+            // Nested `object Foo { … }` inside a class. Lift as
+            // a standalone singleton class — `Outer.Foo` reads
+            // resolve the global by the bare name.
+            object_names.push(co.name.name.clone());
+            enclosing_class.insert(co.name.name.clone(), c.name.name.clone());
+            let mut extras: std::collections::HashSet<String> =
+                collect_enclosing_member_names(c);
+            for outer_c in enclosing_chain.iter().rev() {
+                extras.extend(collect_enclosing_member_names(outer_c));
+            }
+            nested_outer_members.insert(co.name.name.clone(), extras);
+            out_decls.push(Decl::Class(synthesize_class_from_object(co)));
         } else if let Decl::Class(nested) = m {
             if nested.is_companion {
                 let comp_name =
