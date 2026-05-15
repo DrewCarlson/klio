@@ -1040,6 +1040,33 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
                 cur_outer = outer_inst.borrow().outer.clone();
             }
+            // Enum entry bare-name access: an enum method body
+            // referencing `RED` lowers as `this.RED`. Resolve
+            // through the class's entries table.
+            let class_def = inst.borrow().class.clone();
+            if class_def.is_enum {
+                if let Some((_, v)) = class_def
+                    .enum_entries
+                    .borrow()
+                    .iter()
+                    .find(|(n, _)| n == name)
+                {
+                    return Ok(v.clone());
+                }
+                if name == "entries" {
+                    let items: Vec<klio_runtime::Value> = class_def
+                        .enum_entries
+                        .borrow()
+                        .iter()
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    return Ok(klio_runtime::Value::List {
+                        items: Rc::new(RefCell::new(items)),
+                        mutable: false,
+                        enum_class: Some(Rc::new(class_def.name.clone())),
+                    });
+                }
+            }
             // Nested-class fallback: a method body referencing
             // `State` (a lifted nested class declared inside the
             // outer) lowers as `this.State`. Resolve through the
