@@ -32,6 +32,17 @@ pub struct Vm {
     /// expands to carry the full runtime shape this table shrinks
     /// and eventually goes away.
     classes: std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
+    /// Closure side-table. Each `Value::IrClosure { id, captures }`
+    /// resolves to a `(body_func, n_params)` here. `n_params` lets
+    /// the dispatch fill missing positional args with `Null` (for
+    /// implicit-`it` shapes that pass 0 args).
+    closures: Vec<ClosureInfo>,
+}
+
+#[derive(Clone)]
+struct ClosureInfo {
+    body_func: klio_ir::FuncId,
+    n_params: usize,
 }
 
 impl Vm {
@@ -53,6 +64,7 @@ impl Vm {
             scheduler: Box::new(klio_runtime::InProcessScheduler::new()),
             instance_id_counter: 0,
             classes: std::collections::HashMap::new(),
+            closures: Vec::new(),
         }
     }
 
@@ -86,6 +98,7 @@ impl Vm {
             out,
             instance_id_counter: &mut self.instance_id_counter,
             classes: &self.classes,
+            closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
     }
@@ -117,6 +130,7 @@ struct VmHost<'a> {
     out: &'a mut dyn Output,
     instance_id_counter: &'a mut u64,
     classes: &'a std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
+    closures: &'a mut Vec<ClosureInfo>,
 }
 
 impl<'a> VmHost<'a> {
@@ -158,6 +172,37 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         if let klio_runtime::Value::Intrinsic { func, .. } = callee {
             return self.dispatch_intrinsic(*func, args);
+        }
+        if let klio_runtime::Value::IrClosure { id, captures } = callee {
+            let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
+            })?;
+            let module = Rc::clone(&self.module);
+            let func = module
+                .funcs
+                .get(info.body_func.0 as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    klio_ir::eval::EvalError::Type(format!(
+                        "closure body FuncId {} out of range",
+                        info.body_func.0
+                    ))
+                })?;
+            // Fill missing positional args with Null so an
+            // implicit-`it` lambda invoked with zero args still
+            // initialises the param slot.
+            let mut call_args: Vec<klio_runtime::Value> = Vec::with_capacity(info.n_params);
+            for i in 0..info.n_params {
+                call_args.push(args.get(i).cloned().unwrap_or(klio_runtime::Value::Null));
+            }
+            let capture_values: Vec<klio_runtime::Value> = (**captures).clone();
+            return klio_ir::eval::eval_with_captures(
+                &module,
+                &func,
+                call_args,
+                capture_values,
+                self,
+            );
         }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_value on `{}`",
@@ -204,6 +249,68 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             "Vm::set_field `{name}` on `{}`",
             receiver.type_fqn()
         )))
+    }
+
+    fn call_func(
+        &mut self,
+        module: &klio_ir::Module,
+        func: klio_ir::FuncId,
+        args: Vec<klio_runtime::Value>,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let f = module
+            .funcs
+            .get(func.0 as usize)
+            .cloned()
+            .ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!("unknown FuncId {}", func.0))
+            })?;
+        klio_ir::eval::eval_with(module, &f, args, self)
+    }
+
+    fn call_func_named(
+        &mut self,
+        module: &klio_ir::Module,
+        func: klio_ir::FuncId,
+        args: Vec<klio_runtime::Value>,
+        _arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        self.call_func(module, func, args)
+    }
+
+    fn call_func_typed(
+        &mut self,
+        module: &klio_ir::Module,
+        func: klio_ir::FuncId,
+        args: Vec<klio_runtime::Value>,
+        arg_names: &[Option<String>],
+        _type_args: &[String],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        self.call_func_named(module, func, args, arg_names)
+    }
+
+    fn build_ast_lambda_with_flag_funcid(
+        &mut self,
+        params: &[String],
+        _body: &klio_ast::Block,
+        _captured_names: &[String],
+        captures: Vec<klio_runtime::Value>,
+        _absorb_return: bool,
+        body_func: Option<klio_ir::FuncId>,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let body_func = body_func.ok_or_else(|| {
+            klio_ir::eval::EvalError::Unimplemented(
+                "Vm: lambda lower did not provide body_func".into(),
+            )
+        })?;
+        let id = self.closures.len() as u64;
+        self.closures.push(ClosureInfo {
+            body_func,
+            n_params: params.len(),
+        });
+        Ok(klio_runtime::Value::IrClosure {
+            id,
+            captures: Rc::new(captures),
+        })
     }
 
     fn call_member(
