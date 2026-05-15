@@ -4178,7 +4178,10 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 })
                 .collect();
             *info.captures.borrow_mut() = new_captures;
-            return result.map_err(|e| klio_runtime::RuntimeError::Type(format!("{e}")));
+            return result.map_err(|e| match e {
+                klio_ir::eval::EvalError::Throw(v) => klio_runtime::RuntimeError::Thrown(v),
+                other => klio_runtime::RuntimeError::Type(format!("{other}")),
+            });
         }
         if let klio_runtime::Value::Intrinsic { func, .. } = callable {
             let mut child = VmIntrinsicHost {
