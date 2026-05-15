@@ -82,6 +82,9 @@ pub struct Vm {
     /// Per-class delegation expressions for `: I by g` supertypes.
     class_delegates:
         std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
+    /// Per-function default-arg thunk table.
+    func_defaults:
+        std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     /// Runtime-lowered method bodies for anonymous-object / local
     /// classes, indexed by `(class name, method name) -> (Module, FuncId)`.
     /// The IR module is immutable after build, so methods declared
@@ -146,6 +149,7 @@ impl Vm {
             enum_entry_arg_inits: Vec::new(),
             secondary_ctors: std::collections::HashMap::new(),
             class_delegates: std::collections::HashMap::new(),
+            func_defaults: std::collections::HashMap::new(),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
         }
@@ -170,6 +174,7 @@ impl Vm {
         vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
         vm.secondary_ctors = built.secondary_ctors;
         vm.class_delegates = built.class_delegates;
+        vm.func_defaults = built.func_defaults;
         (vm, main)
     }
 
@@ -208,6 +213,7 @@ impl Vm {
                     companion_singletons: &self.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
                     class_delegates: &self.class_delegates,
+                    func_defaults: &self.func_defaults,
                     closures: &mut self.closures,
                 };
                 klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -261,6 +267,7 @@ impl Vm {
                         companion_singletons: &self.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
                     class_delegates: &self.class_delegates,
+                    func_defaults: &self.func_defaults,
                         closures: &mut self.closures,
                     };
                     klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -301,6 +308,7 @@ impl Vm {
                     companion_singletons: &self.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
                     class_delegates: &self.class_delegates,
+                    func_defaults: &self.func_defaults,
                     closures: &mut self.closures,
                 };
                 <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
@@ -330,6 +338,7 @@ impl Vm {
             companion_singletons: &self.companion_singletons,
             secondary_ctors: &self.secondary_ctors,
             class_delegates: &self.class_delegates,
+            func_defaults: &self.func_defaults,
             closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
@@ -382,6 +391,8 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
     class_delegates:
         &'a std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
+    func_defaults:
+        &'a std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     closures: &'a mut Vec<ClosureInfo>,
 }
 
@@ -643,6 +654,7 @@ impl<'a> VmHost<'a> {
             companion_singletons: self.companion_singletons,
             secondary_ctors: self.secondary_ctors,
             class_delegates: self.class_delegates,
+            func_defaults: self.func_defaults,
             instance_id_counter: &mut *self.instance_id_counter,
         };
         let mut ctx = klio_runtime::CallCtx {
@@ -1946,6 +1958,32 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             .ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown FuncId {}", func.0))
             })?;
+        // Pad missing positional args with each param's default
+        // value (from the registered default-init thunks).
+        let mut args = args;
+        if args.len() < f.params.len() {
+            if let Some(defaults) = self.func_defaults.get(&func).cloned() {
+                for idx in args.len()..f.params.len() {
+                    if let Some(Some(default_fid)) = defaults.get(idx) {
+                        let dfid = *default_fid;
+                        let dfunc = module
+                            .funcs
+                            .get(dfid.0 as usize)
+                            .cloned()
+                            .ok_or_else(|| {
+                                klio_ir::eval::EvalError::Type(format!(
+                                    "default-arg FuncId {} out of range",
+                                    dfid.0
+                                ))
+                            })?;
+                        let v = klio_ir::eval::eval_with(module, &dfunc, Vec::new(), self)?;
+                        args.push(v);
+                    } else {
+                        args.push(klio_runtime::Value::Null);
+                    }
+                }
+            }
+        }
         let args = pack_vararg_args(&f, args);
         klio_ir::eval::eval_with(module, &f, args, self)
     }
@@ -3562,6 +3600,8 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
     class_delegates:
         &'a std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
+    func_defaults:
+        &'a std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     instance_id_counter: &'a mut u64,
 }
 
@@ -3624,6 +3664,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     companion_singletons: self.companion_singletons,
                     secondary_ctors: self.secondary_ctors,
                     class_delegates: self.class_delegates,
+                    func_defaults: self.func_defaults,
                     closures: &mut *self.closures,
                 };
                 klio_ir::eval::eval_with_captures(
@@ -3667,6 +3708,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 companion_singletons: self.companion_singletons,
                 secondary_ctors: self.secondary_ctors,
                 class_delegates: self.class_delegates,
+                func_defaults: self.func_defaults,
                 instance_id_counter: &mut *self.instance_id_counter,
             };
             let mut ctx = klio_runtime::CallCtx {

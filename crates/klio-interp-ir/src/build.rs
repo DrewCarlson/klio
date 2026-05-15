@@ -246,6 +246,12 @@ pub struct BuiltModule {
     /// delegate.
     pub class_delegates:
         std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
+    /// Per-function default-arg thunks. Each entry is keyed by the
+    /// target function's `FuncId` and holds an
+    /// `Option<FuncId>` slot per parameter; `Some(fid)` runs the
+    /// default-init thunk when the caller omits the arg.
+    pub func_defaults:
+        std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
 }
 
 /// Pre-lowered metadata for one secondary constructor. Each entry's
@@ -380,6 +386,10 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
 
     // Lower each function body into its reserved slot.
     let mut main_id: Option<klio_ir::FuncId> = None;
+    let mut func_defaults: std::collections::HashMap<
+        klio_ir::FuncId,
+        Vec<Option<klio_ir::FuncId>>,
+    > = std::collections::HashMap::new();
     for d in decls {
         if let Decl::Function(f) = d {
             let func = klio_ir::lower::lower_function_body_into(&mut module, f, &file_classes);
@@ -391,6 +401,24 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                 main_id = Some(id);
             }
             module.top_level.push(id);
+            // Lower per-param default expressions as 0-arg thunks.
+            // The Vm pads missing args at call_func time.
+            if f.params.iter().any(|p| p.default.is_some()) {
+                let mut slots: Vec<Option<klio_ir::FuncId>> = Vec::with_capacity(f.params.len());
+                for p in &f.params {
+                    if let Some(default_expr) = &p.default {
+                        let fid = klio_ir::lower::lower_expr_as_thunk(
+                            &mut module,
+                            default_expr,
+                            &format!("__default_{}_{}", f.name.name, p.name.name),
+                        );
+                        slots.push(Some(fid));
+                    } else {
+                        slots.push(None);
+                    }
+                }
+                func_defaults.insert(id, slots);
+            }
         }
     }
 
@@ -989,5 +1017,6 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         enum_entry_arg_inits,
         secondary_ctors,
         class_delegates,
+        func_defaults,
     }
 }
