@@ -1292,6 +1292,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => {}
             }
         }
+        // Comparator chaining + reversal.
+        if let klio_runtime::Value::Comparator { steps, descending } = receiver {
+            match name {
+                "thenBy" | "thenByDescending" if args.len() == 1 => {
+                    let mut chain: Vec<(klio_runtime::Value, bool)> = (**steps).clone();
+                    chain.push((args[0].clone(), name == "thenByDescending"));
+                    return Ok(klio_runtime::Value::Comparator {
+                        steps: Rc::new(chain),
+                        descending: *descending,
+                    });
+                }
+                "reversed" if args.is_empty() => {
+                    return Ok(klio_runtime::Value::Comparator {
+                        steps: Rc::clone(steps),
+                        descending: !*descending,
+                    });
+                }
+                _ => {}
+            }
+        }
         // Indexed get/set on Array variants.
         if name == "get" && args.len() == 1 {
             if let klio_runtime::Value::Array { items, .. } = receiver {

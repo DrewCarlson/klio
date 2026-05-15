@@ -723,6 +723,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.sortedBy", coll_iter_sorted_by),
     ("kotlin.collections.Set.sortedBy", coll_iter_sorted_by),
     ("kotlin.collections.MutableSet.sortedBy", coll_iter_sorted_by),
+    ("kotlin.collections.List.sortedWith", coll_iter_sorted_with),
+    ("kotlin.collections.MutableList.sortedWith", coll_iter_sorted_with),
+    ("kotlin.collections.Set.sortedWith", coll_iter_sorted_with),
+    ("kotlin.collections.MutableSet.sortedWith", coll_iter_sorted_with),
     ("kotlin.collections.List.sortedByDescending", coll_iter_sorted_by_desc),
     ("kotlin.collections.MutableList.sortedByDescending", coll_iter_sorted_by_desc),
     ("kotlin.collections.Set.sortedByDescending", coll_iter_sorted_by_desc),
@@ -1436,6 +1440,82 @@ fn coll_iter_sorted_by_impl(ctx: &mut CallCtx, descending: bool, what: &str) -> 
 
 fn coll_iter_sorted_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     coll_iter_sorted_by_impl(ctx, false, "sortedBy")
+}
+
+fn coll_iter_sorted_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity(
+            "sortedWith expects (receiver, comparator)".into(),
+        ));
+    }
+    let items = iterable_items(&ctx.args[0], "sortedWith")?;
+    let comparator = ctx.args[1].clone();
+    let Value::Comparator { steps, descending } = comparator else {
+        return Err(RuntimeError::Type(
+            "sortedWith expects a Comparator argument".into(),
+        ));
+    };
+    let CallCtx { out, host, .. } = ctx;
+    let mut items: Vec<Value> = items;
+    let mut err: Option<RuntimeError> = None;
+    // Empty step list — Comparator.naturalOrder() / reverseOrder():
+    // sort items directly using value-level comparison.
+    if steps.is_empty() {
+        items.sort_by(|a, b| {
+            if err.is_some() {
+                return std::cmp::Ordering::Equal;
+            }
+            match compare_values(a, b) {
+                Ok(o) => if descending { o.reverse() } else { o },
+                Err(e) => {
+                    err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+    } else {
+        // Insertion sort so callbacks can invoke through host.
+        for i in 1..items.len() {
+            let mut j = i;
+            while j > 0 && err.is_none() {
+                let mut ord = std::cmp::Ordering::Equal;
+                for (sel, step_desc) in steps.iter() {
+                    let lhs_arg = items[j - 1].clone();
+                    let rhs_arg = items[j].clone();
+                    let ka = match host.invoke_callable(sel, std::slice::from_ref(&lhs_arg), *out) {
+                        Ok(v) => v,
+                        Err(e) => { err = Some(e); break; }
+                    };
+                    let kb = match host.invoke_callable(sel, std::slice::from_ref(&rhs_arg), *out) {
+                        Ok(v) => v,
+                        Err(e) => { err = Some(e); break; }
+                    };
+                    let o = match compare_values(&ka, &kb) {
+                        Ok(o) => o,
+                        Err(e) => { err = Some(e); break; }
+                    };
+                    let flipped = if *step_desc { o.reverse() } else { o };
+                    if flipped != std::cmp::Ordering::Equal {
+                        ord = flipped;
+                        break;
+                    }
+                }
+                if descending {
+                    ord = ord.reverse();
+                }
+                if matches!(ord, std::cmp::Ordering::Greater) {
+                    items.swap(j - 1, j);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(make_list(items, false))
 }
 
 fn coll_iter_sorted_by_desc(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
