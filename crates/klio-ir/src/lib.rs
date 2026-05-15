@@ -241,6 +241,13 @@ pub enum Inst {
     /// other module-scoped reference. The Host's `lookup_global`
     /// receives the interned name and returns the live value.
     LoadGlobal { dst: Reg, name: ConstId },
+    /// Bare-name read inside a lambda body that doesn't resolve as a
+    /// local / capture / own member. Used when the lambda may be
+    /// invoked with a `this` receiver (scope fns like `apply`). At
+    /// runtime: if `this_idx`'s captured value is an instance with a
+    /// field/method named `name`, read it; otherwise fall back to
+    /// LoadGlobal(name).
+    LoadFromThisOrGlobal { dst: Reg, this_idx: u16, name: ConstId },
     /// Write a global / top-level binding. Mirrors `LoadGlobal` for
     /// the write side: routed through `Host::store_global` so a
     /// delegated top-level property's setter (or a plain top-level

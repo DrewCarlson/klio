@@ -881,6 +881,38 @@ fn exec_inst(
                 .unwrap_or(Value::Unit);
             frame.write(*dst, v);
         }
+        Inst::LoadFromThisOrGlobal { dst, this_idx, name } => {
+            let name_str = match &frame.module.consts[name.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type(
+                    "LoadFromThisOrGlobal: name not a string const".into(),
+                )),
+            };
+            let this_val = frame
+                .captures
+                .get(*this_idx as usize)
+                .cloned()
+                .unwrap_or(Value::Null);
+            // First try resolving as a property/field on the captured
+            // this. Swallow errors so the global fallback fires.
+            let mut resolved: Option<Value> = None;
+            if !matches!(this_val, Value::Null | Value::Unit) {
+                if let Ok(v) = host.get_field(&this_val, &name_str) {
+                    if !matches!(v, Value::Unit) {
+                        resolved = Some(v);
+                    }
+                }
+            }
+            let v = match resolved {
+                Some(v) => v,
+                None => host
+                    .lookup_global_throwing(&name_str)?
+                    .ok_or_else(|| EvalError::Unbound(
+                        format!("unresolved global `{name_str}`"),
+                    ))?,
+            };
+            frame.write(*dst, v);
+        }
         Inst::Index { dst, receiver, index } => {
             let r = frame.read(*receiver);
             let i = frame.read(*index);

@@ -1181,12 +1181,17 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         return dst;
                     }
                 }
-                // Not a local and not a known capture — emit
-                // LoadGlobal so the host resolves against the
-                // interpreter's globals env.
+                // Not a local and not a known capture. Emit a
+                // LoadFromThisOrGlobal that first probes a captured
+                // `this` value (filled by the dispatcher when the
+                // lambda is invoked with a this-binding via scope
+                // fns like `apply`), then falls back to LoadGlobal.
+                // For non-lambda call frames the captured `this` is
+                // Null, so this reduces to a plain LoadGlobal.
+                let this_idx = b.record_capture("this");
                 let dst = b.alloc_reg();
                 let name = b.module.intern_const(Const::String(segments[0].name.clone()));
-                b.push(Inst::LoadGlobal { dst, name });
+                b.push(Inst::LoadFromThisOrGlobal { dst, this_idx, name });
                 return dst;
             }
             // Multi-segment paths (`a.b.c`) lower as a chain of
@@ -2346,10 +2351,19 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         }
         Expr::This { qualifier, .. } => {
             // `this` bare resolves to the implicit first param
-            // bound by `lower_method` / extension lowering.
-            // `this@Q` walks the outer-instance chain via the
-            // host's `qualified_this`.
-            if let Some(this_reg) = b.resolve("this") {
+            // bound by `lower_method` / extension lowering. Inside
+            // a lambda body that hasn't bound `this` locally, fall
+            // back to the captured `this` slot — populated by the
+            // dispatcher when the lambda is called with a
+            // this-binding (scope fns like `apply` / `with`).
+            let this_reg = b.resolve("this").or_else(|| {
+                let idx = b.record_capture("this");
+                let dst = b.alloc_reg();
+                b.push(Inst::LoadCapture { dst, idx });
+                b.bind("this".to_string(), dst);
+                Some(dst)
+            });
+            if let Some(this_reg) = this_reg {
                 if let Some(q) = qualifier {
                     let nm = b.module.intern_const(Const::String(q.name.clone()));
                     let dst = b.alloc_reg();
