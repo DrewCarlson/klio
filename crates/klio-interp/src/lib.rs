@@ -1405,7 +1405,8 @@ impl Interpreter {
                 for m in &c.members {
                     if let Decl::Property(p) = m {
                         if let Some(getter) = &p.getter {
-                            if let Some(body) = getter_body_expr(getter) {
+                            if let klio_ast::FunctionBody::Expr(raw) = &getter.body {
+                                let body = substitute_field_with_this(&p.name.name, raw);
                                 let id = klio_ir::lower::lower_accessor_expr(
                                     &mut module,
                                     &c.name.name,
@@ -1426,7 +1427,8 @@ impl Interpreter {
                                 .first()
                                 .map(|i| i.name.clone())
                                 .unwrap_or_else(|| "value".into());
-                            if let Some(body) = getter_body_expr(setter) {
+                            if let klio_ast::FunctionBody::Expr(raw) = &setter.body {
+                                let body = substitute_field_with_this(&p.name.name, raw);
                                 let id = klio_ir::lower::lower_accessor_expr(
                                     &mut module,
                                     &c.name.name,
@@ -12540,6 +12542,75 @@ fn substitute_field_with(prop_name: &str, expr: &klio_ast::Expr) -> klio_ast::Ex
     }
     let _ = Ident { name: String::new(), span: klio_span::Span::new(klio_span::FileId(0), 0, 0) };
     walk(prop_name, &mut out);
+    out
+}
+
+/// Replace every bare `field` identifier with `this.<prop_name>`
+/// — used for class-body accessor lowering where the backing
+/// field lives on the instance.
+fn substitute_field_with_this(prop_name: &str, expr: &klio_ast::Expr) -> klio_ast::Expr {
+    use klio_ast::{Expr, Ident};
+    use klio_span::{FileId, Span};
+    let dummy = Span::new(FileId(0), 0, 0);
+    let mut out = expr.clone();
+    fn walk(prop: &str, dummy: Span, e: &mut Expr) {
+        use Expr::*;
+        let mut replace = None;
+        if let Path { segments, .. } = e {
+            if segments.len() == 1 && segments[0].name == "field" {
+                replace = Some(Member {
+                    receiver: Box::new(Path {
+                        segments: vec![Ident { name: "this".into(), span: dummy }],
+                        span: dummy,
+                    }),
+                    name: Ident { name: prop.to_string(), span: dummy },
+                    safe: false,
+                    span: dummy,
+                });
+            }
+        }
+        if let Some(r) = replace {
+            *e = r;
+            return;
+        }
+        match e {
+            Call { callee, args, .. } => {
+                walk(prop, dummy, callee);
+                for a in args {
+                    walk(prop, dummy, a);
+                }
+            }
+            Member { receiver, .. } => walk(prop, dummy, receiver),
+            Binary { lhs, rhs, .. } => {
+                walk(prop, dummy, lhs);
+                walk(prop, dummy, rhs);
+            }
+            Unary { expr, .. } | Postfix { expr, .. } => walk(prop, dummy, expr),
+            If { cond, then_branch, else_branch, .. } => {
+                walk(prop, dummy, cond);
+                walk(prop, dummy, then_branch);
+                if let Some(e) = else_branch.as_deref_mut() {
+                    walk(prop, dummy, e);
+                }
+            }
+            Index { receiver, args, .. } => {
+                walk(prop, dummy, receiver);
+                for a in args {
+                    walk(prop, dummy, a);
+                }
+            }
+            IsCheck { expr, .. } | As { expr, .. } => walk(prop, dummy, expr),
+            Throw { value, .. } => walk(prop, dummy, value),
+            Return { value, .. } => {
+                if let Some(v) = value.as_deref_mut() {
+                    walk(prop, dummy, v);
+                }
+            }
+            Spread { expr, .. } => walk(prop, dummy, expr),
+            _ => {}
+        }
+    }
+    walk(prop_name, dummy, &mut out);
     out
 }
 
