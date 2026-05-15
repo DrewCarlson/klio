@@ -914,6 +914,24 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // declared inside a fn body and registered via
         // Inst::RegisterClass.
         if let klio_runtime::Value::Class(cls) = callee {
+            // SAM conversion: `FunInterface { lambda }` constructs a
+            // synthetic instance whose single abstract method
+            // dispatches the lambda body. We allocate a thin
+            // InstanceData whose `fields` carry the lambda under
+            // `__sam_target__`; call_member on this instance routes
+            // any method call back through the lambda.
+            if cls.is_fun_interface && args.len() == 1 {
+                *self.instance_id_counter += 1;
+                let identity = *self.instance_id_counter;
+                let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
+                    class: Rc::clone(cls),
+                    fields: vec![("__sam_target__".to_string(), args[0].clone())],
+                    outer: None,
+                    identity,
+                    native_state: None,
+                }));
+                return Ok(klio_runtime::Value::Instance(inst));
+            }
             let class_id = self
                 .module
                 .class_index
@@ -2454,6 +2472,15 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 klio_runtime::Value::Null
             )));
         }
+        // SAM-instance dispatch: a synthetic `FunInterface { … }`
+        // wrapper carries its lambda under `__sam_target__`. Any
+        // method call on the receiver invokes the stored callable.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let target = inst.borrow().get("__sam_target__");
+            if let Some(target) = target {
+                return self.call_value(&target, args);
+            }
+        }
         // SAM conversion: a callable (lambda / closure / function
         // ref) passed where a `fun interface` is expected accepts
         // any method call by forwarding to the underlying invoke.
@@ -3159,6 +3186,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }));
         }
         if class_def.is_interface {
+            // SAM conversion: `FunInterface(lambda)` direct-call
+            // path wraps the callable in a synthetic instance whose
+            // `__sam_target__` field captures the lambda; method
+            // calls on the result invoke the captured callable.
+            if class_def.is_fun_interface && args.len() == 1 {
+                *self.instance_id_counter += 1;
+                let identity = *self.instance_id_counter;
+                let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
+                    class: Rc::clone(&class_def),
+                    fields: vec![("__sam_target__".to_string(), args[0].clone())],
+                    outer: None,
+                    identity,
+                    native_state: None,
+                }));
+                return Ok(klio_runtime::Value::Instance(inst));
+            }
             return Err(klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
                 fqn: std::rc::Rc::new("kotlin.InstantiationError".to_string()),
                 message: Some(std::rc::Rc::new(format!(
