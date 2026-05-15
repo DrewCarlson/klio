@@ -1133,17 +1133,29 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         // Stdlib member dispatch: probe the receiver's type FQN
         // for a `<typeFqn>.<name>` intrinsic, then for the common
-        // package-extension fallbacks. The intrinsic receives the
-        // receiver as its first arg followed by the user-supplied
-        // args.
+        // package-extension fallbacks. For 0-arg call shapes the
+        // type-prefixed form (property read) wins; for n-arg call
+        // shapes the package-prefixed form (extension fn) wins so
+        // `1..10 step 2` resolves to `kotlin.ranges.step(...)`
+        // rather than the property `IntRange.step`.
         let type_fqn = receiver.type_fqn();
-        let probes = [
-            format!("{type_fqn}.{name}"),
-            format!("kotlin.collections.{name}"),
-            format!("kotlin.text.{name}"),
-            format!("kotlin.ranges.{name}"),
-            format!("kotlin.{name}"),
-        ];
+        let probes: Vec<String> = if args.is_empty() {
+            vec![
+                format!("{type_fqn}.{name}"),
+                format!("kotlin.collections.{name}"),
+                format!("kotlin.text.{name}"),
+                format!("kotlin.ranges.{name}"),
+                format!("kotlin.{name}"),
+            ]
+        } else {
+            vec![
+                format!("kotlin.ranges.{name}"),
+                format!("kotlin.collections.{name}"),
+                format!("kotlin.text.{name}"),
+                format!("{type_fqn}.{name}"),
+                format!("kotlin.{name}"),
+            ]
+        };
         for probe in &probes {
             if let Some(func) = klio_stdlib::implementation(probe) {
                 let mut all_args: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
