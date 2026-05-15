@@ -274,6 +274,13 @@ pub(crate) struct ClassIrTables {
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
     pub top_level_prop_getters: std::collections::HashMap<String, klio_ir::FuncId>,
     pub top_level_prop_setters: std::collections::HashMap<String, klio_ir::FuncId>,
+    /// Map from AST lambda-body pointer to the IR FuncId the lowering
+    /// produced. Consulted by call_lambda paths to dispatch through
+    /// IR rather than the tree walker when the body shape lowered
+    /// cleanly. The key is a raw `Rc<Block>` pointer captured by
+    /// `Value::Lambda` — stable for the lifetime of the lambda
+    /// value.
+    pub lambda_ir_funcs: std::collections::HashMap<usize, klio_ir::FuncId>,
 }
 
 /// One secondary constructor's lowered IR. `delegation_args` is
