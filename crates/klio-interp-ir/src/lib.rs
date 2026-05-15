@@ -585,6 +585,34 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             },
             _ => {}
         }
+        // `lastIndex` / `indices` on arrays + lists + strings.
+        if name == "lastIndex" {
+            let len_opt: Option<i64> = match receiver {
+                klio_runtime::Value::Array { items, .. } => Some(items.borrow().len() as i64),
+                klio_runtime::Value::List { items, .. } => Some(items.borrow().len() as i64),
+                klio_runtime::Value::String(s) => Some(s.chars().count() as i64),
+                _ => None,
+            };
+            if let Some(len) = len_opt {
+                return Ok(klio_runtime::Value::new_int(len - 1));
+            }
+        }
+        if name == "indices" {
+            let len_opt: Option<i64> = match receiver {
+                klio_runtime::Value::Array { items, .. } => Some(items.borrow().len() as i64),
+                klio_runtime::Value::List { items, .. } => Some(items.borrow().len() as i64),
+                klio_runtime::Value::String(s) => Some(s.chars().count() as i64),
+                _ => None,
+            };
+            if let Some(len) = len_opt {
+                return Ok(klio_runtime::Value::Range {
+                    start: 0,
+                    end: len - 1,
+                    step: 1,
+                    kind: klio_runtime::RangeKind::Int,
+                });
+            }
+        }
         // `size` on arrays + collections.
         if name == "size" {
             match receiver {
@@ -1262,6 +1290,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     });
                 }
                 _ => {}
+            }
+        }
+        // Indexed get/set on Array variants.
+        if name == "get" && args.len() == 1 {
+            if let klio_runtime::Value::Array { items, .. } = receiver {
+                if let Some(idx) = args[0].as_i64() {
+                    if let Some(v) = items.borrow().get(idx as usize).cloned() {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
+        if name == "set" && args.len() == 2 {
+            if let klio_runtime::Value::Array { items, .. } = receiver {
+                if let Some(idx) = args[0].as_i64() {
+                    if let Some(slot) = items.borrow_mut().get_mut(idx as usize) {
+                        *slot = args[1].clone();
+                        return Ok(klio_runtime::Value::Unit);
+                    }
+                }
             }
         }
         // Built-in collection in-place mutation operators.
