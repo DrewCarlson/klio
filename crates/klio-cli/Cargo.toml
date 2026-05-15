@@ -16,7 +16,6 @@ klio-lexer       = { workspace = true }
 klio-parser      = { workspace = true }
 klio-resolver    = { workspace = true }
 klio-typeck      = { workspace = true }
-klio-interp      = { workspace = true }
 klio-interp-ir   = { workspace = true }
 klio-ast         = { workspace = true }
 klio-pack        = { workspace = true }
