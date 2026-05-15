@@ -218,6 +218,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let Some(def) = self.classes.borrow().get(name).cloned() {
             return Some(klio_runtime::Value::Class(def));
         }
+        // User-declared top-level function: surface its body via
+        // a synthetic Function value so calls like `val f = ::name;
+        // f(args)` route through Vm::call_value.
+        if let Some(fid) = self.module.func_id(name) {
+            // Wrap the FuncId in a closure with no captures so the
+            // Vm's CallValue path dispatches through eval_with.
+            let func = self.module.funcs.get(fid.0 as usize).cloned()?;
+            let n_params = func.params.len();
+            let id = self.closures.len() as u64;
+            self.closures.push(ClosureInfo {
+                body_func: fid,
+                n_params,
+                capture_names: Vec::new(),
+                captures: Rc::new(RefCell::new(Vec::new())),
+            });
+            return Some(klio_runtime::Value::IrClosure {
+                id,
+                captures: Rc::new(Vec::new()),
+            });
+        }
         // Probe stdlib by FQN for known package surfaces. Covers
         // bare references to `IntArray`, `compareBy`, `buildList`,
         // `naturalOrder`, `PI`, etc. that aren't in IMPLICIT_ALIASES.
