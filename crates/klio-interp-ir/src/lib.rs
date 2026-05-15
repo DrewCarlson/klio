@@ -2231,10 +2231,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         value: &klio_runtime::Value,
         ty: &klio_ir::TypeRef,
     ) -> bool {
-        // `Any` is the universal supertype: every non-null value
-        // is an instance of `Any` (nullable matters separately).
+        // `null is T?` is true for any nullable type. `null is T`
+        // (non-null T) is false.
+        if matches!(value, klio_runtime::Value::Null) {
+            return ty.nullable;
+        }
+        // `Any` is the universal supertype for non-null values.
         if ty.name == "Any" {
-            return !matches!(value, klio_runtime::Value::Null);
+            return true;
         }
         // Dotted nested-class names (`S.A`, `Outer.Inner`) — match
         // by the last segment, which corresponds to the lifted
@@ -4129,18 +4133,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 all.push(inst_value.clone());
                 all.extend_from_slice(args);
                 let v = klio_ir::eval::eval_with(&module, &func, all, self)?;
-                inst.borrow_mut().fields.push((p.name.clone(), v));
+                inst.borrow_mut().define(&p.name, v);
             } else if let Some(init_expr) = p.init.as_ref() {
                 // Runtime-registered class (no lowered thunk):
                 // evaluate the property's init via simple_literal
                 // (covers literal-only inits used in local class
                 // declarations).
                 let v = simple_literal(init_expr).unwrap_or(klio_runtime::Value::Null);
-                inst.borrow_mut().fields.push((p.name.clone(), v));
+                inst.borrow_mut().define(&p.name, v);
             } else if p.getter.is_none() && p.delegate.is_none() {
-                inst.borrow_mut()
-                    .fields
-                    .push((p.name.clone(), klio_runtime::Value::Null));
+                // Only seed a null slot when the field doesn't
+                // already exist — child override inits from a
+                // bottom-up walk have already populated the slot.
+                if inst.borrow().get(&p.name).is_none() {
+                    inst.borrow_mut()
+                        .fields
+                        .push((p.name.clone(), klio_runtime::Value::Null));
+                }
             }
         }
         }
@@ -4532,6 +4541,51 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
 
     fn scheduler(&mut self) -> &mut dyn klio_runtime::Scheduler {
         &mut *self.scheduler
+    }
+
+    fn invoke_method(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+        args: &[klio_runtime::Value],
+        out: &mut dyn Output,
+    ) -> Option<Result<klio_runtime::Value, klio_runtime::RuntimeError>> {
+        // Build a VmHost that shares this IntrinsicHost's tables
+        // and route through call_member so the dispatch picks up
+        // user override methods (`override fun toString()` etc.).
+        let module = Rc::clone(&self.module);
+        let mut host = VmHost {
+            globals: Rc::clone(&self.globals),
+            module: Rc::clone(&module),
+            scheduler: &mut *self.scheduler,
+            out,
+            instance_id_counter: &mut *self.instance_id_counter,
+            classes: Rc::clone(&self.classes),
+            body_prop_inits: self.body_prop_inits,
+            instance_prop_getters: self.instance_prop_getters,
+            instance_prop_setters: self.instance_prop_setters,
+            parent_ctor_args: self.parent_ctor_args,
+            init_blocks: self.init_blocks,
+            extension_props: self.extension_props,
+            anon_methods: Rc::clone(&self.anon_methods),
+            companion_singletons: self.companion_singletons,
+            secondary_ctors: self.secondary_ctors,
+            class_delegates: self.class_delegates,
+            func_defaults: self.func_defaults,
+            enclosing_class: self.enclosing_class,
+            func_type_params: self.func_type_params,
+            class_default_outer: Rc::clone(&self.class_default_outer),
+            closures: &mut *self.closures,
+        };
+        match <VmHost as klio_ir::eval::Host>::call_member(
+            &mut host, receiver, name, args,
+        ) {
+            Ok(v) => Some(Ok(v)),
+            Err(klio_ir::eval::EvalError::Throw(v)) => {
+                Some(Err(klio_runtime::RuntimeError::Thrown(v)))
+            }
+            Err(_) => None,
+        }
     }
 }
 

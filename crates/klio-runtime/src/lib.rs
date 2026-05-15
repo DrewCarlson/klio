@@ -63,6 +63,21 @@ pub trait IntrinsicHost {
         this_value: &Value,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError>;
+
+    /// Invoke a named method on the given receiver value. Used by
+    /// `println` / string-template formatting to dispatch user
+    /// `override fun toString(): String` bodies. Default impl
+    /// returns `None`, signalling the caller to fall back to the
+    /// runtime's structural rendering.
+    fn invoke_method(
+        &mut self,
+        _receiver: &Value,
+        _name: &str,
+        _args: &[Value],
+        _out: &mut dyn Output,
+    ) -> Option<Result<Value, RuntimeError>> {
+        None
+    }
 }
 
 /// Cooperative scheduler the runtime exposes to anything called

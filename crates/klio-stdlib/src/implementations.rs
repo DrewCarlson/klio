@@ -2151,14 +2151,36 @@ pub fn all_fqns() -> impl Iterator<Item = &'static str> {
 // io
 // ============================================================
 
+/// Render a value via its user-overridden `toString()` when one
+/// exists, falling back to the runtime's structural Display
+/// rendering. Used by `println` / `print` so plain-class instances
+/// pick up `override fun toString()` rather than always landing on
+/// the default `ClassName@<hex>` shape.
+fn render_via_user_to_string(
+    ctx: &mut CallCtx,
+    v: &Value,
+) -> String {
+    if matches!(v, Value::Instance(_)) {
+        let CallCtx { out, host, .. } = ctx;
+        if let Some(Ok(Value::String(s))) =
+            host.invoke_method(v, "toString", &[], *out)
+        {
+            return (*s).clone();
+        }
+    }
+    format!("{v}")
+}
+
 fn io_println(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    match ctx.args {
-        [] => {
+    match ctx.args.len() {
+        0 => {
             ctx.out.writeln("");
             Ok(Value::Unit)
         }
-        [v] => {
-            ctx.out.writeln(&format!("{v}"));
+        1 => {
+            let v = ctx.args[0].clone();
+            let rendered = render_via_user_to_string(ctx, &v);
+            ctx.out.writeln(&rendered);
             Ok(Value::Unit)
         }
         _ => Err(RuntimeError::Arity(format!(
@@ -2169,10 +2191,12 @@ fn io_println(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn io_print(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    match ctx.args {
-        [] => Ok(Value::Unit),
-        [v] => {
-            ctx.out.write(&format!("{v}"));
+    match ctx.args.len() {
+        0 => Ok(Value::Unit),
+        1 => {
+            let v = ctx.args[0].clone();
+            let rendered = render_via_user_to_string(ctx, &v);
+            ctx.out.write(&rendered);
             Ok(Value::Unit)
         }
         _ => Err(RuntimeError::Arity(format!(
