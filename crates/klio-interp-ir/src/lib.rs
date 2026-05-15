@@ -1006,6 +1006,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // here means the name isn't an entry.
         if let klio_runtime::Value::Class(cls) = receiver {
             if let Some(comp_name) = self.companion_singletons.get(&cls.name).cloned() {
+                // `Counter.Factory` — the user-declared companion
+                // name resolves to the companion singleton itself.
+                let suffix = format!("$Companion${}", name);
+                if comp_name.ends_with(&suffix) {
+                    if let Some(s) = self.globals.borrow().lookup(&comp_name) {
+                        return Ok(s);
+                    }
+                }
                 if let Some(singleton) = self.globals.borrow().lookup(&comp_name) {
                     if let klio_runtime::Value::Instance(inst) = &singleton {
                         if let Some(v) = inst.borrow().get(name) {
@@ -1014,6 +1022,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 }
             }
+            // Nested-class access on a class receiver: `Outer.Inner`
+            // and `Sealed.Variant` resolve through the module's
+            // global class table.
+            if let Some(def) = self.classes.borrow().get(name).cloned() {
+                return Ok(klio_runtime::Value::Class(def));
+            }
+            // Nested singleton object: `Sealed.Subclass` may be a
+            // synthesised object singleton stored as a global.
+            if let Some(v) = self.globals.borrow().lookup(name) {
+                if matches!(v, klio_runtime::Value::Instance(_)) {
+                    return Ok(v);
+                }
+            }
+            let _ = cls;
         }
         // Top-level extension property: `val T.name get() = ...`
         // — keyed by (receiver simple type, prop name). Falls
