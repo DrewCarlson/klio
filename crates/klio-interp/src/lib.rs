@@ -233,6 +233,14 @@ pub struct Interpreter {
     /// re-enter the same getter. Setters use the same key to avoid
     /// re-entering their setter when assigning through `field`.
     pub(crate) accessor_in_progress: std::collections::HashSet<(u64, String)>,
+    /// Non-zero while the interpreter is running an IR thunk built
+    /// in a local Module (eval_property_init_via_ir creates a fresh
+    /// Module per call). Lambda bodies lowered into the local module
+    /// produce FuncIds that don't index into the file's current_module
+    /// — registering them into module-scoped tables (e.g.
+    /// lambda_ir_funcs) would alias the lambda body onto whichever
+    /// Func happens to share the index in current_module.
+    pub(crate) local_thunk_depth: usize,
 }
 
 /// Read-only view over the interpreter's registry surface — the set
@@ -439,6 +447,7 @@ impl Interpreter {
             pack_known_packages: std::collections::HashSet::new(),
             dispatch_member_via_ast_depth: 0,
             accessor_in_progress: std::collections::HashSet::new(),
+            local_thunk_depth: 0,
         }
     }
 
@@ -1103,7 +1112,10 @@ impl Interpreter {
             module: host_module,
             method_index,
         };
-        match klio_ir::eval::eval_with(&module_rc, &func, Vec::new(), &mut host) {
+        host.interp.local_thunk_depth += 1;
+        let result = klio_ir::eval::eval_with(&module_rc, &func, Vec::new(), &mut host);
+        host.interp.local_thunk_depth -= 1;
+        match result {
             Ok(v) => Some(Ok(v)),
             Err(klio_ir::eval::EvalError::Unsupported(_)) => None,
             Err(klio_ir::eval::EvalError::Throw(v)) => Some(Err(RuntimeError::Thrown(v))),
@@ -13324,7 +13336,9 @@ impl<'a> IrHost<'a> {
             module: std::rc::Rc::clone(&module_rc),
             method_index,
         };
+        child.interp.local_thunk_depth += 1;
         let ir_result = klio_ir::eval::eval_with(&module_rc, &func, thunk_args, &mut child);
+        child.interp.local_thunk_depth -= 1;
         self.interp.dispatch_member_via_ast_depth -= 1;
         match ir_result {
             Ok(v) => return Ok(v),
@@ -14065,7 +14079,16 @@ impl<'a> klio_ir::eval::Host for IrHost<'a> {
             // semantics. Lambda bodies with bare returns are
             // non-local and need the tree walker.
             let return_ok = absorb_return || !block_contains_bare_return(&body_rc);
-            if !params.is_empty()
+            // The FuncId is only meaningful in the active module.
+            // When the lambda is created via a local-module thunk
+            // (e.g. eval_property_init_via_ir), the FuncId points
+            // into that local module rather than the file's
+            // current_module — registering would alias the lambda
+            // body onto whichever Func happens to share the index
+            // in current_module (commonly main, causing recursion).
+            let in_local_thunk = self.interp.local_thunk_depth > 0;
+            if !in_local_thunk
+                && !params.is_empty()
                 && return_ok
                 && !body_writes_capture
             {
