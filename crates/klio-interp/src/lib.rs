@@ -1050,9 +1050,14 @@ impl Interpreter {
     ) -> Option<Result<klio_runtime::Value, RuntimeError>> {
         // Constrain to the conservatively-supported shapes for now —
         // any IR-untranslatable construct (suspend, super, reified
-        // type params) falls back to `eval_expr`. When the file's
-        // module is already built, expose its class / func tables to
-        // the host so the thunk's body can reach declared names.
+        // type params) falls back to `eval_expr`. The thunk is
+        // lowered without a `this` binding, so references to `this`
+        // / `super` / `this@Q` would lower as Const::Unit and silently
+        // produce wrong values. Bail out so the tree walker handles
+        // those.
+        if expr_refers_to_this(init) {
+            return None;
+        }
         let mut module = klio_ir::Module::default();
         let id = klio_ir::lower::lower_expr_as_thunk(&mut module, init, "__init__");
         let module_rc = std::rc::Rc::new(module);
@@ -11710,6 +11715,74 @@ fn make_lateinit_sentinel(name: &str) -> Value {
         message: Some(Rc::new(name.to_string())),
         cause: None,
     }
+}
+
+/// True when `expr` references `this`, `super`, or `this@Q` anywhere in
+/// its subtree. The IR thunk path lowers a bare `Expr::This` /
+/// `Expr::Super` to `Const::Unit` when no `this` reg is bound, silently
+/// producing wrong values. Call sites that lower property initialisers
+/// through IR must skip when this returns true.
+fn expr_refers_to_this(expr: &klio_ast::Expr) -> bool {
+    use klio_ast::Expr::*;
+    match expr {
+        This { .. } | Super { .. } => true,
+        Path { segments, .. } => segments.iter().any(|s| s.name.contains('@')),
+        StringTemplate { parts, .. } => parts.iter().any(|p| match p {
+            klio_ast::StringPart::Interp(e) => expr_refers_to_this(e),
+            klio_ast::StringPart::ShortInterp(id) => id.name.contains('@') || id.name == "this",
+            klio_ast::StringPart::Text(_) => false,
+        }),
+        Member { receiver, .. } => expr_refers_to_this(receiver),
+        Call { callee, args, .. } => {
+            expr_refers_to_this(callee) || args.iter().any(expr_refers_to_this)
+        }
+        Spread { expr: inner, .. } => expr_refers_to_this(inner),
+        Index { receiver, args, .. } => {
+            expr_refers_to_this(receiver) || args.iter().any(expr_refers_to_this)
+        }
+        Unary { expr: inner, .. } | Postfix { expr: inner, .. } => expr_refers_to_this(inner),
+        Binary { lhs, rhs, .. } => expr_refers_to_this(lhs) || expr_refers_to_this(rhs),
+        As { expr: inner, .. } => expr_refers_to_this(inner),
+        IsCheck { expr: inner, .. } => expr_refers_to_this(inner),
+        If { cond, then_branch, else_branch, .. } => {
+            expr_refers_to_this(cond)
+                || expr_refers_to_this(then_branch)
+                || else_branch.as_deref().map_or(false, expr_refers_to_this)
+        }
+        When { subject, branches, .. } => {
+            subject.as_deref().map_or(false, expr_refers_to_this)
+                || branches.iter().any(|b| expr_refers_to_this(&b.body))
+        }
+        Try { body, .. } => block_refers_to_this(body),
+        Block(b) => block_refers_to_this(b),
+        Lambda { body, .. } => block_refers_to_this(body),
+        Return { value, .. } => value.as_deref().map_or(false, expr_refers_to_this),
+        Throw { value, .. } => expr_refers_to_this(value),
+        Labeled { expr: inner, .. } => expr_refers_to_this(inner),
+        While { cond, body, .. } => expr_refers_to_this(cond) || expr_refers_to_this(body),
+        DoWhile { body, cond, .. } => {
+            body.as_deref().map_or(false, expr_refers_to_this) || expr_refers_to_this(cond)
+        }
+        For { iter, body, .. } => expr_refers_to_this(iter) || expr_refers_to_this(body),
+        ObjectExpr { supertype_args, .. } => supertype_args
+            .iter()
+            .filter_map(|o| o.as_ref())
+            .flat_map(|args| args.iter())
+            .any(expr_refers_to_this),
+        MemberRef { receiver, .. } => expr_refers_to_this(receiver),
+        _ => false,
+    }
+}
+
+fn block_refers_to_this(block: &klio_ast::Block) -> bool {
+    block.stmts.iter().any(|s| match s {
+        klio_ast::Stmt::Expr(e) => expr_refers_to_this(e),
+        klio_ast::Stmt::Assign { target, value, .. } => {
+            expr_refers_to_this(target) || expr_refers_to_this(value)
+        }
+        klio_ast::Stmt::DestructuringDecl { init, .. } => expr_refers_to_this(init),
+        klio_ast::Stmt::Decl(_) => false,
+    })
 }
 
 fn lateinit_sentinel_name(v: &Value) -> Option<String> {
