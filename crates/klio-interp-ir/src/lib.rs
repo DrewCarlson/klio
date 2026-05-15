@@ -307,7 +307,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             return self.call_member(callee, "invoke", args);
         }
         // Constructor-like call on a user class value
-        // (`val ctor = ::Foo; ctor(1, 2)`).
+        // (`val ctor = ::Foo; ctor(1, 2)`). Falls through to a
+        // direct ClassDef-based allocation when the class isn't
+        // in the IR module's class_index — covers local classes
+        // declared inside a fn body and registered via
+        // Inst::RegisterClass.
         if let klio_runtime::Value::Class(cls) = callee {
             let class_id = self
                 .module
@@ -318,6 +322,27 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if let Some(class_id) = class_id {
                 return self.new_instance(class_id, args);
             }
+            // Direct allocation for classes that aren't in the IR
+            // module index. The runtime ClassDef carries enough to
+            // bind primary-param properties; init blocks + custom
+            // getters land when local-class lowering grows them.
+            *self.instance_id_counter += 1;
+            let identity = *self.instance_id_counter;
+            let mut fields: Vec<(String, klio_runtime::Value)> =
+                Vec::with_capacity(cls.primary_params.len());
+            for (param, value) in cls.primary_params.iter().zip(args.iter()) {
+                if param.property.is_some() {
+                    fields.push((param.name.clone(), value.clone()));
+                }
+            }
+            let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
+                class: Rc::clone(cls),
+                fields,
+                outer: None,
+                identity,
+                native_state: None,
+            }));
+            return Ok(klio_runtime::Value::Instance(inst));
         }
         if let klio_runtime::Value::IrClosure { id, captures } = callee {
             let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
