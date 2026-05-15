@@ -375,6 +375,68 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         )))
     }
 
+    fn instance_of(
+        &mut self,
+        value: &klio_runtime::Value,
+        ty: &klio_ir::TypeRef,
+    ) -> bool {
+        // Exception values match by walking the builtin Throwable
+        // hierarchy. The default impl returns "kotlin.Throwable" for
+        // every Exception which loses the specific class name —
+        // override so `catch (e: IllegalArgumentException)` matches
+        // the throw site's actual fqn.
+        if let klio_runtime::Value::Exception { fqn, .. } = value {
+            let tail = fqn.rsplit('.').next().unwrap_or(fqn.as_str());
+            if tail == ty.name {
+                return true;
+            }
+            if matches!(ty.name.as_str(), "Throwable" | "Exception" | "Any") {
+                return true;
+            }
+            // Walk the known parent chain (best-effort — full
+            // multi-level walk lives in the runtime). The common
+            // case here is the immediate parent.
+            if matches!(
+                (tail, ty.name.as_str()),
+                ("IllegalArgumentException", "RuntimeException")
+                    | ("IllegalStateException", "RuntimeException")
+                    | ("IndexOutOfBoundsException", "RuntimeException")
+                    | ("NullPointerException", "RuntimeException")
+                    | ("ArithmeticException", "RuntimeException")
+                    | ("ClassCastException", "RuntimeException")
+                    | ("NoSuchElementException", "RuntimeException")
+                    | ("NumberFormatException", "RuntimeException")
+                    | ("UnsupportedOperationException", "RuntimeException")
+                    | ("RuntimeException", "Exception")
+            ) {
+                return true;
+            }
+            return false;
+        }
+        // User-class instance: walk the runtime ClassDef chain.
+        if let klio_runtime::Value::Instance(inst) = value {
+            let mut cur: Option<Rc<klio_runtime::ClassDef>> =
+                Some(Rc::clone(&inst.borrow().class));
+            while let Some(c) = cur {
+                if c.name == ty.name || c.fqn == ty.name {
+                    return true;
+                }
+                if c
+                    .interfaces
+                    .borrow()
+                    .iter()
+                    .any(|i| i.name == ty.name || i.fqn == ty.name)
+                {
+                    return true;
+                }
+                cur = c.parent.borrow().clone();
+            }
+            return false;
+        }
+        let nominal = value.type_fqn();
+        nominal == ty.name || nominal.ends_with(&format!(".{}", ty.name))
+    }
+
     fn call_func(
         &mut self,
         module: &klio_ir::Module,
