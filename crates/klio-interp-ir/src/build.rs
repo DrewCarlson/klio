@@ -570,13 +570,27 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                     own_members.insert(f.name.name.clone());
                 }
             }
+            // Primary ctor params are visible inside init blocks
+            // (whether or not they're `val`/`var` properties). Pass
+            // their names as additional positional params; the Vm
+            // dispatches each init block with `[this, ctor_args...]`.
+            let ctor_param_names: Vec<String> = c
+                .primary_params
+                .iter()
+                .map(|p| p.name.name.clone())
+                .collect();
+            let mut local_params: Vec<&str> = Vec::with_capacity(1 + ctor_param_names.len());
+            local_params.push("this");
+            for n in &ctor_param_names {
+                local_params.push(n.as_str());
+            }
             let mut fids: Vec<klio_ir::FuncId> = Vec::new();
             for (idx, blk) in c.init_blocks.iter().enumerate() {
                 let fid = klio_ir::lower::lower_accessor_block(
                     &mut module,
                     &c.name.name,
                     &own_members,
-                    &["this"],
+                    &local_params,
                     blk,
                     &format!("__init_block_{}_{idx}", c.name.name),
                 );

@@ -1732,18 +1732,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Run init blocks bottom-up across the parent chain so a
         // parent's init runs before its child's. Each init block
         // takes `this` as its sole param.
-        for (cls_name, _) in chain.iter().rev() {
+        for (cls_name, cls_args) in chain.iter().rev() {
             if let Some(fids) = self.init_blocks.get(cls_name).cloned() {
                 for fid in fids {
                     let func = self.module.funcs.get(fid.0 as usize).cloned();
                     if let Some(f) = func {
                         let module = Rc::clone(&self.module);
-                        klio_ir::eval::eval_with(
-                            &module,
-                            &f,
-                            vec![inst_value.clone()],
-                            self,
-                        )?;
+                        let mut all: Vec<klio_runtime::Value> =
+                            Vec::with_capacity(1 + cls_args.len());
+                        all.push(inst_value.clone());
+                        all.extend(cls_args.iter().cloned());
+                        klio_ir::eval::eval_with(&module, &f, all, self)?;
                     }
                 }
             }
