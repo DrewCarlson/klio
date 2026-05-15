@@ -463,6 +463,30 @@ pub fn lower_accessor_expr(
     id
 }
 
+/// Variant of `lower_accessor_expr` for block-body accessors. The
+/// trailing block expression becomes the implicit return value.
+pub fn lower_accessor_block(
+    module: &mut crate::Module,
+    owner_class: &str,
+    own_members: &std::collections::HashSet<String>,
+    params: &[&str],
+    block: &klio_ast::Block,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    let _ = b.set_owner_class(owner_class.to_string());
+    let _ = b.set_own_members(own_members.clone());
+    bind_params(&mut b, params);
+    let v = lower_block(&mut b, block);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
 pub fn lower_unary_expr_as_thunk(
     module: &mut crate::Module,
     param_name: &str,

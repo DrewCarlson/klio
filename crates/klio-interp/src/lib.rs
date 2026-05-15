@@ -1405,18 +1405,37 @@ impl Interpreter {
                 for m in &c.members {
                     if let Decl::Property(p) = m {
                         if let Some(getter) = &p.getter {
-                            if let klio_ast::FunctionBody::Expr(raw) = &getter.body {
-                                let body = substitute_field_with_this(&p.name.name, raw);
-                                let id = klio_ir::lower::lower_accessor_expr(
-                                    &mut module,
-                                    &c.name.name,
-                                    &own_members,
-                                    &["this"],
-                                    &body,
-                                    &format!("__get__{}.{}", c.name.name, p.name.name),
-                                );
+                            let prop_name = p.name.name.clone();
+                            let lowered_id = match &getter.body {
+                                klio_ast::FunctionBody::Expr(raw) => Some({
+                                    let body = substitute_field_with_this(&prop_name, raw);
+                                    klio_ir::lower::lower_accessor_expr(
+                                        &mut module,
+                                        &c.name.name,
+                                        &own_members,
+                                        &["this"],
+                                        &body,
+                                        &format!("__get__{}.{}", c.name.name, prop_name),
+                                    )
+                                }),
+                                klio_ast::FunctionBody::Block(blk) => Some({
+                                    let p2 = prop_name.clone();
+                                    let rewritten = rewrite_block(blk, &move |e| {
+                                        substitute_field_with_this(&p2, e)
+                                    });
+                                    klio_ir::lower::lower_accessor_block(
+                                        &mut module,
+                                        &c.name.name,
+                                        &own_members,
+                                        &["this"],
+                                        &rewritten,
+                                        &format!("__get__{}.{}", c.name.name, prop_name),
+                                    )
+                                }),
+                            };
+                            if let Some(id) = lowered_id {
                                 self.module_registry.class_ir.instance_prop_getters.insert(
-                                    (c.name.name.clone(), p.name.name.clone()),
+                                    (c.name.name.clone(), prop_name),
                                     id,
                                 );
                             }
@@ -12535,6 +12554,33 @@ fn substitute_field_with(prop_name: &str, expr: &klio_ast::Expr) -> klio_ast::Ex
     }
     let _ = Ident { name: String::new(), span: klio_span::Span::new(klio_span::FileId(0), 0, 0) };
     walk(prop_name, &mut out);
+    out
+}
+
+/// Apply a per-expression substitution across every statement in
+/// a block. Used to fan `field` rewrites through block-body
+/// accessors.
+fn rewrite_block<F: Fn(&klio_ast::Expr) -> klio_ast::Expr>(
+    block: &klio_ast::Block,
+    rewrite: &F,
+) -> klio_ast::Block {
+    use klio_ast::Stmt;
+    let mut out = block.clone();
+    for s in &mut out.stmts {
+        match s {
+            Stmt::Expr(e) => *e = rewrite(e),
+            Stmt::Assign { target, value, .. } => {
+                *target = rewrite(target);
+                *value = rewrite(value);
+            }
+            Stmt::Decl(klio_ast::Decl::Property(p)) => {
+                if let Some(init) = &p.init {
+                    p.init = Some(rewrite(init));
+                }
+            }
+            _ => {}
+        }
+    }
     out
 }
 
