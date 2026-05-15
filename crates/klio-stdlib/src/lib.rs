@@ -36,6 +36,55 @@ pub mod text;
 /// Function pointer signature for a Rust-native stdlib intrinsic.
 pub use klio_runtime::StdlibFn;
 
+/// Bare names that resolve through implicit Kotlin imports. `(name, fqn)`
+/// pairs the parser / interpreter installs into globals so identifiers
+/// like `println`, `listOf`, or `IllegalArgumentException` resolve
+/// without an explicit import. Mirrors Kotlin's
+/// `kotlin.*` / `kotlin.io.*` / `kotlin.collections.*` /
+/// `kotlin.text.*` / `kotlin.ranges.*` default imports.
+pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
+    ("print", "kotlin.io.print"),
+    ("println", "kotlin.io.println"),
+    ("readLine", "kotlin.io.readLine"),
+    ("ArithmeticException", "kotlin.ArithmeticException"),
+    ("ClassCastException", "kotlin.ClassCastException"),
+    ("Error", "kotlin.Error"),
+    ("Exception", "kotlin.Exception"),
+    ("IllegalArgumentException", "kotlin.IllegalArgumentException"),
+    ("IllegalStateException", "kotlin.IllegalStateException"),
+    ("IndexOutOfBoundsException", "kotlin.IndexOutOfBoundsException"),
+    ("NoSuchElementException", "kotlin.NoSuchElementException"),
+    ("NullPointerException", "kotlin.NullPointerException"),
+    ("RuntimeException", "kotlin.RuntimeException"),
+    ("Throwable", "kotlin.Throwable"),
+    ("UnsupportedOperationException", "kotlin.UnsupportedOperationException"),
+    ("Pair", "kotlin.Pair"),
+    ("Triple", "kotlin.Triple"),
+    ("emptyList", "kotlin.collections.emptyList"),
+    ("emptyMap", "kotlin.collections.emptyMap"),
+    ("emptySet", "kotlin.collections.emptySet"),
+    ("listOf", "kotlin.collections.listOf"),
+    ("mapOf", "kotlin.collections.mapOf"),
+    ("mutableListOf", "kotlin.collections.mutableListOf"),
+    ("mutableMapOf", "kotlin.collections.mutableMapOf"),
+    ("mutableSetOf", "kotlin.collections.mutableSetOf"),
+    ("setOf", "kotlin.collections.setOf"),
+    ("to", "kotlin.to"),
+    ("ArrayList", "kotlin.collections.ArrayList"),
+    ("HashMap", "kotlin.collections.HashMap"),
+    ("HashSet", "kotlin.collections.HashSet"),
+    ("LinkedHashMap", "kotlin.collections.LinkedHashMap"),
+    ("LinkedHashSet", "kotlin.collections.LinkedHashSet"),
+    ("sequenceOf", "kotlin.sequences.sequenceOf"),
+    ("emptySequence", "kotlin.sequences.emptySequence"),
+    ("generateSequence", "kotlin.sequences.generateSequence"),
+    ("downTo", "kotlin.ranges.downTo"),
+    ("step", "kotlin.ranges.step"),
+    ("until", "kotlin.ranges.until"),
+    ("Regex", "kotlin.text.Regex"),
+    ("StringBuilder", "kotlin.text.StringBuilder"),
+];
+
 pub mod implementations;
 pub mod pack_builder;
 pub use pack_builder::build_stdlib_pack;

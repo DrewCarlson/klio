@@ -22,53 +22,7 @@ pub mod suspend_lower;
 /// Short-name → FQN aliases for stdlib symbols a Kotlin program may
 /// reference without an explicit import. Mirrors the implicit imports the
 /// real Kotlin compiler installs.
-const IMPLICIT_ALIASES: &[(&str, &str)] = &[
-    ("print", "kotlin.io.print"),
-    ("println", "kotlin.io.println"),
-    ("readLine", "kotlin.io.readLine"),
-    // Implicit `kotlin.*` exception constructors mirror Kotlin's default imports.
-    ("ArithmeticException", "kotlin.ArithmeticException"),
-    ("ClassCastException", "kotlin.ClassCastException"),
-    ("Error", "kotlin.Error"),
-    ("Exception", "kotlin.Exception"),
-    ("IllegalArgumentException", "kotlin.IllegalArgumentException"),
-    ("IllegalStateException", "kotlin.IllegalStateException"),
-    ("IndexOutOfBoundsException", "kotlin.IndexOutOfBoundsException"),
-    ("NoSuchElementException", "kotlin.NoSuchElementException"),
-    ("NullPointerException", "kotlin.NullPointerException"),
-    ("RuntimeException", "kotlin.RuntimeException"),
-    ("Throwable", "kotlin.Throwable"),
-    ("UnsupportedOperationException", "kotlin.UnsupportedOperationException"),
-    // Collection constructors / aliases (implicit `kotlin.collections.*` imports).
-    ("Pair", "kotlin.Pair"),
-    ("Triple", "kotlin.Triple"),
-    ("emptyList", "kotlin.collections.emptyList"),
-    ("emptyMap", "kotlin.collections.emptyMap"),
-    ("emptySet", "kotlin.collections.emptySet"),
-    ("listOf", "kotlin.collections.listOf"),
-    ("mapOf", "kotlin.collections.mapOf"),
-    ("mutableListOf", "kotlin.collections.mutableListOf"),
-    ("mutableMapOf", "kotlin.collections.mutableMapOf"),
-    ("mutableSetOf", "kotlin.collections.mutableSetOf"),
-    ("setOf", "kotlin.collections.setOf"),
-    ("to", "kotlin.to"),
-    ("ArrayList", "kotlin.collections.ArrayList"),
-    ("HashMap", "kotlin.collections.HashMap"),
-    ("HashSet", "kotlin.collections.HashSet"),
-    ("LinkedHashMap", "kotlin.collections.LinkedHashMap"),
-    ("LinkedHashSet", "kotlin.collections.LinkedHashSet"),
-    ("sequenceOf", "kotlin.sequences.sequenceOf"),
-    ("emptySequence", "kotlin.sequences.emptySequence"),
-    ("generateSequence", "kotlin.sequences.generateSequence"),
-    // Range progressions — the parser desugars `lhs downTo rhs` etc. to a
-    // call on these bare names.
-    ("downTo", "kotlin.ranges.downTo"),
-    ("step", "kotlin.ranges.step"),
-    ("until", "kotlin.ranges.until"),
-    // `kotlin.text.*` implicit imports.
-    ("Regex", "kotlin.text.Regex"),
-    ("StringBuilder", "kotlin.text.StringBuilder"),
-];
+use klio_stdlib::IMPLICIT_ALIASES;
 
 pub struct Interpreter {
     globals: Rc<RefCell<Env>>,

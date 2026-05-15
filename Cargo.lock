@@ -929,6 +929,7 @@ dependencies = [
  "klio-ir",
  "klio-runtime",
  "klio-span",
+ "klio-stdlib",
  "thiserror",
 ]
 

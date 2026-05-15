@@ -13,5 +13,6 @@ workspace = true
 klio-ir          = { workspace = true }
 klio-runtime     = { workspace = true }
 klio-span        = { workspace = true }
+klio-stdlib      = { workspace = true }
 klio-diagnostics = { workspace = true }
 thiserror        = "2"
