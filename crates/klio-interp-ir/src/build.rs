@@ -154,6 +154,11 @@ pub struct BuiltModule {
     /// up with `{ "Dog" => [thunk(name -> name)] }`.
     pub parent_ctor_args:
         std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    /// `init { ... }` blocks per class. Each FuncId takes `this`
+    /// as its sole param and runs the block's statements in order.
+    /// `new_instance` invokes them after primary-ctor field
+    /// binding + body-property init.
+    pub init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     /// FuncId of the file's `main`, or `None` when the file has no
     /// `main` entry point.
     pub main: Option<klio_ir::FuncId>,
@@ -436,12 +441,52 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         }
     }
 
+    // Lower each class's init blocks as 1-arg thunks taking `this`.
+    let mut init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>> =
+        std::collections::HashMap::new();
+    for d in &file.decls {
+        if let Decl::Class(c) = d {
+            if c.init_blocks.is_empty() {
+                continue;
+            }
+            let mut own_members: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for p in &c.primary_params {
+                if p.property.is_some() {
+                    own_members.insert(p.name.name.clone());
+                }
+            }
+            for m in &c.members {
+                if let Decl::Property(p) = m {
+                    own_members.insert(p.name.name.clone());
+                }
+                if let Decl::Function(f) = m {
+                    own_members.insert(f.name.name.clone());
+                }
+            }
+            let mut fids: Vec<klio_ir::FuncId> = Vec::new();
+            for (idx, blk) in c.init_blocks.iter().enumerate() {
+                let fid = klio_ir::lower::lower_accessor_block(
+                    &mut module,
+                    &c.name.name,
+                    &own_members,
+                    &["this"],
+                    blk,
+                    &format!("__init_block_{}_{idx}", c.name.name),
+                );
+                fids.push(fid);
+            }
+            init_blocks.insert(c.name.name.clone(), fids);
+        }
+    }
+
     BuiltModule {
         module: Rc::new(module),
         classes,
         body_prop_inits,
         instance_prop_getters,
         parent_ctor_args,
+        init_blocks,
         main: main_id,
     }
 }
