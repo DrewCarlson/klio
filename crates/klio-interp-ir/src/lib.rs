@@ -1026,10 +1026,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
     fn register_class_captured(
         &mut self,
         class: &klio_ast::Class,
-        _captured_names: &[String],
-        _captures: Vec<klio_runtime::Value>,
+        captured_names: &[String],
+        captures: Vec<klio_runtime::Value>,
     ) -> Result<(), klio_ir::eval::EvalError> {
-        self.register_class(class)
+        self.register_class(class)?;
+        // Patch the just-registered method entries with the captured
+        // outer-env so dispatch can layer them under globals.
+        let capture_pairs: Vec<(String, klio_runtime::Value)> = captured_names
+            .iter()
+            .cloned()
+            .zip(captures.into_iter())
+            .collect();
+        if capture_pairs.is_empty() {
+            return Ok(());
+        }
+        let mut tbl = self.anon_methods.borrow_mut();
+        for m in &class.members {
+            if let klio_ast::Decl::Function(f) = m {
+                let key = (class.name.name.clone(), f.name.name.clone());
+                if let Some(entry) = tbl.get_mut(&key) {
+                    entry.2 = capture_pairs.clone();
+                }
+            }
+        }
+        Ok(())
     }
 
     fn build_object(
