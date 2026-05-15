@@ -1516,8 +1516,38 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
-        // Comparator chaining + reversal.
+        // Comparator chaining + reversal + compare.
         if let klio_runtime::Value::Comparator { steps, descending } = receiver {
+            if name == "compare" && args.len() == 2 {
+                let a = args[0].clone();
+                let b = args[1].clone();
+                let mut ord = std::cmp::Ordering::Equal;
+                if steps.is_empty() {
+                    ord = klio_stdlib::compare_values(&a, &b)
+                        .map_err(|e| klio_ir::eval::EvalError::Type(format!("{e}")))?;
+                } else {
+                    for (sel, step_desc) in steps.iter() {
+                        let ka = self.call_value(sel, std::slice::from_ref(&a))?;
+                        let kb = self.call_value(sel, std::slice::from_ref(&b))?;
+                        let o = klio_stdlib::compare_values(&ka, &kb)
+                            .map_err(|e| klio_ir::eval::EvalError::Type(format!("{e}")))?;
+                        let flipped = if *step_desc { o.reverse() } else { o };
+                        if flipped != std::cmp::Ordering::Equal {
+                            ord = flipped;
+                            break;
+                        }
+                    }
+                }
+                if *descending {
+                    ord = ord.reverse();
+                }
+                let n: i64 = match ord {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                return Ok(klio_runtime::Value::new_int(n));
+            }
             match name {
                 "thenBy" | "thenByDescending" if args.len() == 1 => {
                     let mut chain: Vec<(klio_runtime::Value, bool)> = (**steps).clone();
