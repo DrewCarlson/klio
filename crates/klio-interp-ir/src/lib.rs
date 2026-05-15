@@ -30,8 +30,9 @@ pub struct Vm {
     /// Per-class runtime metadata produced by `build::build_module`.
     /// The Vm uses these for instance allocation. As IR Class
     /// expands to carry the full runtime shape this table shrinks
-    /// and eventually goes away.
-    classes: std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
+    /// and eventually goes away. Wrapped in RefCell so the Vm can
+    /// register local classes encountered at runtime (Inst::RegisterClass).
+    classes: Rc<RefCell<std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>>>,
     /// Body-property initialiser FuncIds. Invoked during instance
     /// allocation to populate fields for `val/var x: T = expr`
     /// declared in a class body (not primary-ctor params).
@@ -84,7 +85,7 @@ impl Vm {
             globals,
             scheduler: Box::new(klio_runtime::InProcessScheduler::new()),
             instance_id_counter: 0,
-            classes: std::collections::HashMap::new(),
+            classes: Rc::new(RefCell::new(std::collections::HashMap::new())),
             body_prop_inits: std::collections::HashMap::new(),
             instance_prop_getters: std::collections::HashMap::new(),
             closures: Vec::new(),
@@ -97,7 +98,7 @@ impl Vm {
     pub fn from_built(built: build::BuiltModule) -> (Self, Option<klio_ir::FuncId>) {
         let main = built.main;
         let mut vm = Self::new(built.module);
-        vm.classes = built.classes;
+        vm.classes = Rc::new(RefCell::new(built.classes));
         vm.body_prop_inits = built.body_prop_inits;
         vm.instance_prop_getters = built.instance_prop_getters;
         (vm, main)
@@ -122,7 +123,7 @@ impl Vm {
             scheduler: &mut *self.scheduler,
             out,
             instance_id_counter: &mut self.instance_id_counter,
-            classes: &self.classes,
+            classes: Rc::clone(&self.classes),
             body_prop_inits: &self.body_prop_inits,
             instance_prop_getters: &self.instance_prop_getters,
             closures: &mut self.closures,
@@ -156,7 +157,7 @@ struct VmHost<'a> {
     scheduler: &'a mut dyn klio_runtime::Scheduler,
     out: &'a mut dyn Output,
     instance_id_counter: &'a mut u64,
-    classes: &'a std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
+    classes: Rc<RefCell<std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>>>,
     body_prop_inits:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_prop_getters:
@@ -181,7 +182,7 @@ impl<'a> VmHost<'a> {
             module: module_for_intrinsic,
             closures: &mut *self.closures,
             globals: Rc::clone(&self.globals),
-            classes: self.classes,
+            classes: Rc::clone(&self.classes),
             body_prop_inits: self.body_prop_inits,
             instance_prop_getters: self.instance_prop_getters,
             instance_id_counter: &mut *self.instance_id_counter,
@@ -203,8 +204,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // User-class lookup: returning Value::Class lets call sites
         // like `Foo(args)` dispatch through new_instance and lets
         // reflection (`Foo::class`) resolve.
-        if let Some(def) = self.classes.get(name) {
-            return Some(klio_runtime::Value::Class(Rc::clone(def)));
+        if let Some(def) = self.classes.borrow().get(name).cloned() {
+            return Some(klio_runtime::Value::Class(def));
         }
         // Probe stdlib by FQN for known package surfaces. Covers
         // bare references to `IntArray`, `compareBy`, `buildList`,
@@ -393,6 +394,93 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         )))
     }
 
+    fn register_class(
+        &mut self,
+        class: &klio_ast::Class,
+    ) -> Result<(), klio_ir::eval::EvalError> {
+        // Local classes declared inside fn bodies arrive here at
+        // runtime. Synthesise the same ClassDef shape build_module
+        // produces for top-level classes and stash in the Vm's
+        // class table. Body-property + getter lowering for local
+        // classes lives in IR's class registration; here we just
+        // build the runtime shape needed for instance allocation.
+        let primary_params: Vec<klio_runtime::ClassParamDef> = class
+            .primary_params
+            .iter()
+            .map(|p| klio_runtime::ClassParamDef {
+                property: p.property,
+                name: p.name.name.clone(),
+                default: p.default.as_ref().map(|e| Rc::new(e.clone())),
+            })
+            .collect();
+        let body_properties: Vec<klio_runtime::PropertyDef> = class
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                klio_ast::Decl::Property(p) => Some(klio_runtime::PropertyDef {
+                    name: p.name.name.clone(),
+                    mutable: p.mutable,
+                    init: p.init.as_ref().map(|e| Rc::new(e.clone())),
+                    getter: p.getter.as_ref().map(|a| Rc::new(a.clone())),
+                    setter: p.setter.as_ref().map(|a| Rc::new(a.clone())),
+                    delegate: p.delegate.as_ref().map(|e| Rc::new(e.clone())),
+                    is_abstract: p.is_abstract,
+                    is_lateinit: p.is_lateinit,
+                }),
+                _ => None,
+            })
+            .collect();
+        let def = Rc::new(klio_runtime::ClassDef {
+            name: class.name.name.clone(),
+            fqn: class.name.name.clone(),
+            annotation_names: Vec::new(),
+            primary_params,
+            methods: Vec::new(),
+            body_properties,
+            init_blocks: Vec::new(),
+            is_data: class.is_data,
+            is_object: false,
+            is_enum: class.is_enum,
+            is_sealed: class.is_sealed,
+            is_open: class.is_open,
+            is_abstract: class.is_abstract,
+            is_inner: class.is_inner,
+            is_anonymous: false,
+            secondary_ctors: Vec::new(),
+            supertype_names: class
+                .supertypes
+                .iter()
+                .map(|t| t.name.name.clone())
+                .collect(),
+            parent: RefCell::new(None),
+            interfaces: RefCell::new(Vec::new()),
+            is_interface: class.is_interface,
+            is_fun_interface: class.is_fun_interface,
+            parent_ctor_args: Vec::new(),
+            enum_entries: RefCell::new(Vec::new()),
+            companion: RefCell::new(None),
+            enclosing_class: RefCell::new(None),
+            nested_classes: RefCell::new(Vec::new()),
+            captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
+            supertype_delegates: RefCell::new(Vec::new()),
+            delegate_forwarders: RefCell::new(Vec::new()),
+            object_singleton: RefCell::new(None),
+        });
+        self.classes
+            .borrow_mut()
+            .insert(class.name.name.clone(), def);
+        Ok(())
+    }
+
+    fn register_class_captured(
+        &mut self,
+        class: &klio_ast::Class,
+        _captured_names: &[String],
+        _captures: Vec<klio_runtime::Value>,
+    ) -> Result<(), klio_ir::eval::EvalError> {
+        self.register_class(class)
+    }
+
     fn build_object(
         &mut self,
         ast: &klio_ast::Expr,
@@ -505,7 +593,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // dispatch on Q directly.
         let parent_name: Option<String> = if let Some(q) = qualifier {
             Some(q.to_string())
-        } else if let Some(owner_def) = self.classes.get(owner_class) {
+        } else if let Some(owner_def) = self.classes.borrow().get(owner_class).cloned() {
             owner_def.supertype_names.first().cloned()
         } else {
             None
@@ -922,7 +1010,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 // Push runtime supertype names; the Vm's
                 // class_table maps each name back to a ClassDef
                 // whose supertype_names continues the walk.
-                if let Some(def) = self.classes.get(&cur_name) {
+                if let Some(def) = self.classes.borrow().get(&cur_name).cloned() {
                     for sup in &def.supertype_names {
                         queue.push_back(sup.clone());
                     }
@@ -1016,7 +1104,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 class.0
             ))
         })?;
-        let class_def = self.classes.get(&ir_class.name).cloned().ok_or_else(|| {
+        let class_def = self.classes.borrow().get(&ir_class.name).cloned().ok_or_else(|| {
             klio_ir::eval::EvalError::Unimplemented(format!(
                 "Vm::new_instance: no runtime ClassDef registered for `{}`",
                 ir_class.name
@@ -1215,7 +1303,7 @@ struct VmIntrinsicHost<'a> {
     module: Rc<klio_ir::Module>,
     closures: &'a mut Vec<ClosureInfo>,
     globals: Rc<RefCell<klio_runtime::Env>>,
-    classes: &'a std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
+    classes: Rc<RefCell<std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>>>,
     body_prop_inits:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_prop_getters:
@@ -1271,7 +1359,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     scheduler: &mut *self.scheduler,
                     out,
                     instance_id_counter: &mut *self.instance_id_counter,
-                    classes: self.classes,
+                    classes: Rc::clone(&self.classes),
                     body_prop_inits: self.body_prop_inits,
                     instance_prop_getters: self.instance_prop_getters,
                     closures: &mut *self.closures,
@@ -1306,7 +1394,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 module: Rc::clone(&self.module),
                 closures: &mut *self.closures,
                 globals: Rc::clone(&self.globals),
-                classes: self.classes,
+                classes: Rc::clone(&self.classes),
                 body_prop_inits: self.body_prop_inits,
                 instance_prop_getters: self.instance_prop_getters,
                 instance_id_counter: &mut *self.instance_id_counter,
