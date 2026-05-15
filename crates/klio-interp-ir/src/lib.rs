@@ -2355,6 +2355,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // SAM conversion: a callable (lambda / closure / function
+        // ref) passed where a `fun interface` is expected accepts
+        // any method call by forwarding to the underlying invoke.
+        if matches!(
+            receiver,
+            klio_runtime::Value::Lambda { .. }
+                | klio_runtime::Value::IrClosure { .. }
+                | klio_runtime::Value::Function { .. }
+                | klio_runtime::Value::Intrinsic { .. }
+        ) {
+            if name != "invoke" {
+                if let Ok(v) = self.call_value(receiver, args) {
+                    return Ok(v);
+                }
+            }
+        }
         // PropertyRef invocation: `nameRef.get(p)` / `nameRef.call(p)`
         // reads the named property from the receiver. `hashCode`
         // and `equals` route to structural equality on the name.
