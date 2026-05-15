@@ -200,6 +200,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let Some(v) = self.globals.borrow().lookup(name) {
             return Some(v);
         }
+        // User-class lookup: returning Value::Class lets call sites
+        // like `Foo(args)` dispatch through new_instance and lets
+        // reflection (`Foo::class`) resolve.
+        if let Some(def) = self.classes.get(name) {
+            return Some(klio_runtime::Value::Class(Rc::clone(def)));
+        }
         // Probe stdlib by FQN for known package surfaces. Covers
         // bare references to `IntArray`, `compareBy`, `buildList`,
         // `naturalOrder`, `PI`, etc. that aren't in IMPLICIT_ALIASES.
@@ -237,6 +243,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         if let klio_runtime::Value::Intrinsic { func, .. } = callee {
             return self.dispatch_intrinsic(*func, args);
+        }
+        // Constructor-like call on a user class value
+        // (`val ctor = ::Foo; ctor(1, 2)`).
+        if let klio_runtime::Value::Class(cls) = callee {
+            let class_id = self
+                .module
+                .class_index
+                .iter()
+                .find(|(n, _)| *n == cls.name)
+                .map(|(_, id)| *id);
+            if let Some(class_id) = class_id {
+                return self.new_instance(class_id, args);
+            }
         }
         if let klio_runtime::Value::IrClosure { id, captures } = callee {
             let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
