@@ -544,16 +544,6 @@ impl Interpreter {
         Ok(())
     }
 
-    fn read_top_level_property_pub(
-        &mut self,
-        name: &str,
-        out: &mut dyn Output,
-    ) -> Option<Result<klio_runtime::Value, RuntimeError>> {
-        let pdef = self.module_registry.top_level_props.get(name).cloned()?;
-        let env = Rc::clone(&self.globals);
-        Some(self.read_top_level_property(&pdef, &env, out))
-    }
-
     /// True when the named symbol has more than one top-level
     /// overload registered. IR call sites route these through the
     /// tree walker's eval_call so overload resolution picks the
