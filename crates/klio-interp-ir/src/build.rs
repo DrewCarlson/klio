@@ -37,6 +37,12 @@ pub struct BuiltModule {
     /// to express them.
     pub body_prop_inits:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// `(class name, property name) -> FuncId` for body properties
+    /// with a custom getter (`val full: String get() = "$first $last"`).
+    /// The Vm calls these FuncIds (with `this` as the sole arg) when
+    /// `Vm::get_field` is invoked for a custom-getter property.
+    pub instance_prop_getters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// FuncId of the file's `main`, or `None` when the file has no
     /// `main` entry point.
     pub main: Option<klio_ir::FuncId>,
@@ -121,8 +127,27 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // failure at run time.
     let mut body_prop_inits: std::collections::HashMap<(String, String), klio_ir::FuncId> =
         std::collections::HashMap::new();
+    let mut instance_prop_getters: std::collections::HashMap<(String, String), klio_ir::FuncId> =
+        std::collections::HashMap::new();
     for d in &file.decls {
         if let Decl::Class(c) = d {
+            // Collect own-member names so accessor bodies' bare
+            // identifiers resolve via this.<name>.
+            let mut own_members: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for p in &c.primary_params {
+                if p.property.is_some() {
+                    own_members.insert(p.name.name.clone());
+                }
+            }
+            for m in &c.members {
+                if let Decl::Property(p) = m {
+                    own_members.insert(p.name.name.clone());
+                }
+                if let Decl::Function(f) = m {
+                    own_members.insert(f.name.name.clone());
+                }
+            }
             for m in &c.members {
                 if let Decl::Property(p) = m {
                     if let Some(init) = &p.init {
@@ -132,6 +157,20 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                             &format!("__init_prop_{}_{}", c.name.name, p.name.name),
                         );
                         body_prop_inits.insert((c.name.name.clone(), p.name.name.clone()), fid);
+                    }
+                    if let Some(getter) = &p.getter {
+                        if let klio_ast::FunctionBody::Expr(body) = &getter.body {
+                            let fid = klio_ir::lower::lower_accessor_expr(
+                                &mut module,
+                                &c.name.name,
+                                &own_members,
+                                &["this"],
+                                body,
+                                &format!("__get_{}_{}", c.name.name, p.name.name),
+                            );
+                            instance_prop_getters
+                                .insert((c.name.name.clone(), p.name.name.clone()), fid);
+                        }
                     }
                 }
             }
@@ -221,6 +260,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         module: Rc::new(module),
         classes,
         body_prop_inits,
+        instance_prop_getters,
         main: main_id,
     }
 }

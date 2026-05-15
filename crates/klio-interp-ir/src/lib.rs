@@ -37,6 +37,11 @@ pub struct Vm {
     /// declared in a class body (not primary-ctor params).
     body_prop_inits:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Custom getter FuncIds. `Vm::get_field` invokes one when the
+    /// receiver's runtime ClassDef declares a custom getter for
+    /// the named property.
+    instance_prop_getters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// Closure side-table. Each `Value::IrClosure { id, captures }`
     /// resolves to a `(body_func, n_params)` here. `n_params` lets
     /// the dispatch fill missing positional args with `Null` (for
@@ -81,6 +86,7 @@ impl Vm {
             instance_id_counter: 0,
             classes: std::collections::HashMap::new(),
             body_prop_inits: std::collections::HashMap::new(),
+            instance_prop_getters: std::collections::HashMap::new(),
             closures: Vec::new(),
         }
     }
@@ -93,6 +99,7 @@ impl Vm {
         let mut vm = Self::new(built.module);
         vm.classes = built.classes;
         vm.body_prop_inits = built.body_prop_inits;
+        vm.instance_prop_getters = built.instance_prop_getters;
         (vm, main)
     }
 
@@ -117,6 +124,7 @@ impl Vm {
             instance_id_counter: &mut self.instance_id_counter,
             classes: &self.classes,
             body_prop_inits: &self.body_prop_inits,
+            instance_prop_getters: &self.instance_prop_getters,
             closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
@@ -151,6 +159,8 @@ struct VmHost<'a> {
     classes: &'a std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
     body_prop_inits:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    instance_prop_getters:
+        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     closures: &'a mut Vec<ClosureInfo>,
 }
 
@@ -173,6 +183,7 @@ impl<'a> VmHost<'a> {
             globals: Rc::clone(&self.globals),
             classes: self.classes,
             body_prop_inits: self.body_prop_inits,
+            instance_prop_getters: self.instance_prop_getters,
             instance_id_counter: &mut *self.instance_id_counter,
         };
         let mut ctx = klio_runtime::CallCtx {
@@ -257,7 +268,31 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Custom getter — invoke its IR FuncId with the receiver
+        // bound as `this`. Wins over the plain field read so a
+        // `val full: String get() = "$first $last"` shape evaluates
+        // the getter rather than returning a missing-field Null.
         if let klio_runtime::Value::Instance(inst) = receiver {
+            let class_name = inst.borrow().class.name.clone();
+            if let Some(fid) = self
+                .instance_prop_getters
+                .get(&(class_name, name.to_string()))
+                .copied()
+            {
+                let func = self
+                    .module
+                    .funcs
+                    .get(fid.0 as usize)
+                    .cloned()
+                    .ok_or_else(|| {
+                        klio_ir::eval::EvalError::Type(format!(
+                            "getter FuncId {} out of range",
+                            fid.0
+                        ))
+                    })?;
+                let module = Rc::clone(&self.module);
+                return klio_ir::eval::eval_with(&module, &func, vec![receiver.clone()], self);
+            }
             if let Some(v) = inst.borrow().get(name) {
                 return Ok(v);
             }
@@ -831,6 +866,8 @@ struct VmIntrinsicHost<'a> {
     classes: &'a std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>,
     body_prop_inits:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    instance_prop_getters:
+        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_id_counter: &'a mut u64,
 }
 
@@ -884,6 +921,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     instance_id_counter: &mut *self.instance_id_counter,
                     classes: self.classes,
                     body_prop_inits: self.body_prop_inits,
+                    instance_prop_getters: self.instance_prop_getters,
                     closures: &mut *self.closures,
                 };
                 klio_ir::eval::eval_with_captures(
@@ -918,6 +956,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 globals: Rc::clone(&self.globals),
                 classes: self.classes,
                 body_prop_inits: self.body_prop_inits,
+                instance_prop_getters: self.instance_prop_getters,
                 instance_id_counter: &mut *self.instance_id_counter,
             };
             let mut ctx = klio_runtime::CallCtx {
