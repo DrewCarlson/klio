@@ -1936,6 +1936,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if ty.name == "Any" {
             return !matches!(value, klio_runtime::Value::Null);
         }
+        // Generic type-parameter casts (`x as T`) are erased at
+        // runtime — Kotlin matches them unchecked. Single-letter
+        // (or short uppercase) type names are conventionally
+        // generic parameters and have no class entry; treat them
+        // as accept-any-non-null.
+        if matches!(ty.name.as_str(), "T" | "U" | "V" | "K" | "R" | "E" | "X" | "Y" | "Z" | "A" | "B" | "C" | "D")
+        {
+            let is_user_class = self.classes.borrow().contains_key(&ty.name)
+                || self.module.class_id(&ty.name).is_some();
+            if !is_user_class {
+                return !matches!(value, klio_runtime::Value::Null);
+            }
+        }
         // Exception values match by walking the builtin Throwable
         // hierarchy. The default impl returns "kotlin.Throwable" for
         // every Exception which loses the specific class name —
