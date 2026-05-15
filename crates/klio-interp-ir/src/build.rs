@@ -390,6 +390,12 @@ pub struct BuiltModule {
     /// lookup fails.
     pub extension_props:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Extension-property setters keyed by `(receiver type, prop)`.
+    /// The Vm invokes the FuncId with `[receiver, value]` when
+    /// `set_field` targets an extension property declared via
+    /// `var T.x: ... set(value) { … }`.
+    pub extension_prop_setters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// FuncId of the file's `main`, or `None` when the file has no
     /// `main` entry point.
     pub main: Option<klio_ir::FuncId>,
@@ -920,6 +926,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                     _ => None,
                 })
                 .collect();
+            let is_object = object_names.iter().any(|n| n == &c.name.name);
             let def = std::rc::Rc::new(ClassDef {
                 name: c.name.name.clone(),
                 fqn: c.name.name.clone(),
@@ -929,7 +936,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                 body_properties,
                 init_blocks: Vec::new(),
                 is_data: c.is_data,
-                is_object: false,
+                is_object,
                 is_enum: c.is_enum,
                 is_sealed: c.is_sealed,
                 is_open: c.is_open,
@@ -1333,6 +1340,10 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     // 1-arg thunk taking the receiver as `this`.
     let mut extension_props: std::collections::HashMap<(String, String), klio_ir::FuncId> =
         std::collections::HashMap::new();
+    let mut extension_prop_setters: std::collections::HashMap<
+        (String, String),
+        klio_ir::FuncId,
+    > = std::collections::HashMap::new();
     for d in decls {
         if let Decl::Property(p) = d {
             if let Some(recv) = &p.receiver_type {
@@ -1365,6 +1376,46 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                             .insert((recv.name.name.clone(), p.name.name.clone()), fid);
                     }
                 }
+                if let Some(setter) = &p.setter {
+                    let setter_param_name = setter
+                        .params
+                        .first()
+                        .map(|n| n.name.clone())
+                        .unwrap_or_else(|| "value".to_string());
+                    let empty_members = std::collections::HashSet::new();
+                    let fid = match &setter.body {
+                        klio_ast::FunctionBody::Expr(body) => Some(
+                            klio_ir::lower::lower_accessor_expr(
+                                &mut module,
+                                &recv.name.name,
+                                &empty_members,
+                                &["this", setter_param_name.as_str()],
+                                body,
+                                &format!(
+                                    "__ext_set_{}_{}",
+                                    recv.name.name, p.name.name
+                                ),
+                            ),
+                        ),
+                        klio_ast::FunctionBody::Block(blk) => Some(
+                            klio_ir::lower::lower_accessor_block(
+                                &mut module,
+                                &recv.name.name,
+                                &empty_members,
+                                &["this", setter_param_name.as_str()],
+                                blk,
+                                &format!(
+                                    "__ext_set_{}_{}",
+                                    recv.name.name, p.name.name
+                                ),
+                            ),
+                        ),
+                    };
+                    if let Some(fid) = fid {
+                        extension_prop_setters
+                            .insert((recv.name.name.clone(), p.name.name.clone()), fid);
+                    }
+                }
             }
         }
     }
@@ -1379,6 +1430,7 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         init_blocks,
         top_level_props,
         extension_props,
+        extension_prop_setters,
         main: main_id,
         object_names,
         companion_singletons,

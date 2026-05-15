@@ -62,6 +62,9 @@ pub struct Vm {
     /// invokes the FuncId with the receiver as `this`.
     extension_props:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    /// Extension-property setter FuncIds.
+    extension_prop_setters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// Top-level property initialiser FuncIds. Run at Vm::run start
     /// so globals see the initial values.
     top_level_props: Vec<(String, klio_ir::FuncId)>,
@@ -157,6 +160,7 @@ impl Vm {
             parent_ctor_args: std::collections::HashMap::new(),
             init_blocks: std::collections::HashMap::new(),
             extension_props: std::collections::HashMap::new(),
+            extension_prop_setters: std::collections::HashMap::new(),
             top_level_props: Vec::new(),
             object_names: Vec::new(),
             companion_singletons: std::collections::HashMap::new(),
@@ -185,6 +189,7 @@ impl Vm {
         vm.parent_ctor_args = built.parent_ctor_args;
         vm.init_blocks = built.init_blocks;
         vm.extension_props = built.extension_props;
+        vm.extension_prop_setters = built.extension_prop_setters;
         vm.top_level_props = built.top_level_props;
         vm.object_names = built.object_names;
         vm.companion_singletons = built.companion_singletons;
@@ -236,6 +241,7 @@ impl Vm {
                     parent_ctor_args: &self.parent_ctor_args,
                     init_blocks: &self.init_blocks,
                     extension_props: &self.extension_props,
+                    extension_prop_setters: &self.extension_prop_setters,
                     anon_methods: Rc::clone(&self.anon_methods),
                     companion_singletons: &self.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
@@ -293,6 +299,7 @@ impl Vm {
                         parent_ctor_args: &self.parent_ctor_args,
                         init_blocks: &self.init_blocks,
                         extension_props: &self.extension_props,
+                    extension_prop_setters: &self.extension_prop_setters,
                         anon_methods: Rc::clone(&self.anon_methods),
                         companion_singletons: &self.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
@@ -337,6 +344,7 @@ impl Vm {
                     parent_ctor_args: &self.parent_ctor_args,
                     init_blocks: &self.init_blocks,
                     extension_props: &self.extension_props,
+                    extension_prop_setters: &self.extension_prop_setters,
                     anon_methods: Rc::clone(&self.anon_methods),
                     companion_singletons: &self.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
@@ -384,6 +392,7 @@ impl Vm {
             parent_ctor_args: &self.parent_ctor_args,
             init_blocks: &self.init_blocks,
             extension_props: &self.extension_props,
+            extension_prop_setters: &self.extension_prop_setters,
             anon_methods: Rc::clone(&self.anon_methods),
             companion_singletons: &self.companion_singletons,
             secondary_ctors: &self.secondary_ctors,
@@ -446,6 +455,8 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     init_blocks: &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     extension_props:
+        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    extension_prop_setters:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     anon_methods: Rc<RefCell<std::collections::HashMap<
         (String, String),
@@ -721,6 +732,7 @@ impl<'a> VmHost<'a> {
             parent_ctor_args: self.parent_ctor_args,
             init_blocks: self.init_blocks,
             extension_props: self.extension_props,
+            extension_prop_setters: self.extension_prop_setters,
             anon_methods: Rc::clone(&self.anon_methods),
             companion_singletons: self.companion_singletons,
             secondary_ctors: self.secondary_ctors,
@@ -1598,6 +1610,41 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         let bypass_setter = name.starts_with("__klio_field__");
         let real_name = name.strip_prefix("__klio_field__").unwrap_or(name);
+        // Extension-property setter — `var T.x: ... set(value) {…}`
+        // — keyed by `(receiver simple type, prop name)`.
+        if !bypass_setter {
+            let type_fqn = receiver.type_fqn();
+            let recv_simple: String = type_fqn
+                .rsplit('.')
+                .next()
+                .unwrap_or(type_fqn)
+                .to_string();
+            if let Some(fid) = self
+                .extension_prop_setters
+                .get(&(recv_simple, real_name.to_string()))
+                .copied()
+            {
+                let func = self
+                    .module
+                    .funcs
+                    .get(fid.0 as usize)
+                    .cloned()
+                    .ok_or_else(|| {
+                        klio_ir::eval::EvalError::Type(format!(
+                            "ext setter FuncId {} out of range",
+                            fid.0
+                        ))
+                    })?;
+                let module = Rc::clone(&self.module);
+                klio_ir::eval::eval_with(
+                    &module,
+                    &func,
+                    vec![receiver.clone(), value],
+                    self,
+                )?;
+                return Ok(());
+            }
+        }
         if let klio_runtime::Value::Instance(inst) = receiver {
             if !bypass_setter {
                 let class_name = inst.borrow().class.name.clone();
@@ -3358,6 +3405,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             let is_data = inst.borrow().class.is_data;
             let has_user_override = inst.borrow().class.methods.iter().any(|m| m.name == name);
+            let is_object = inst.borrow().class.is_object;
+            if is_data && is_object && !has_user_override && name == "toString" {
+                // `data object` renders as the bare class name even
+                // though `is_data` is set. Short-circuit before the
+                // structural data-class shape below.
+                let i = inst.borrow();
+                return Ok(klio_runtime::Value::String(Rc::new(i.class.name.clone())));
+            }
             if is_data && !has_user_override && args.is_empty() {
                 if let Some(rest) = name.strip_prefix("component") {
                     if let Ok(n) = rest.parse::<usize>() {
@@ -3560,6 +3615,38 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             if args.is_empty() && name == "toString" {
                 let i = inst.borrow();
+                // Enum entries render as the bare entry name unless
+                // the user override fired (the user-method walk
+                // above runs first and wins).
+                if i.class.is_enum {
+                    if let Some(klio_runtime::Value::String(s)) = i.get("name") {
+                        return Ok(klio_runtime::Value::String(Rc::clone(&s)));
+                    }
+                }
+                // Singleton `object` decls — including `data
+                // object` — render as the bare class name.
+                if i.class.is_object {
+                    return Ok(klio_runtime::Value::String(Rc::new(
+                        i.class.name.clone(),
+                    )));
+                }
+                // Data classes render structurally `Name(p1=v1, …)`.
+                if i.class.is_data {
+                    let mut s = String::new();
+                    s.push_str(&i.class.name);
+                    s.push('(');
+                    for (idx, p) in i.class.primary_params.iter().enumerate() {
+                        if idx > 0 {
+                            s.push_str(", ");
+                        }
+                        s.push_str(&p.name);
+                        s.push('=');
+                        let v = i.get(&p.name).unwrap_or(klio_runtime::Value::Null);
+                        s.push_str(&format!("{v}"));
+                    }
+                    s.push(')');
+                    return Ok(klio_runtime::Value::String(Rc::new(s)));
+                }
                 return Ok(klio_runtime::Value::String(Rc::new(format!(
                     "{}@{:x}",
                     i.class.name, i.identity
@@ -4318,6 +4405,8 @@ struct VmIntrinsicHost<'a> {
     init_blocks: &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     extension_props:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    extension_prop_setters:
+        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     anon_methods: Rc<RefCell<std::collections::HashMap<
         (String, String),
         (Rc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
@@ -4393,6 +4482,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     parent_ctor_args: self.parent_ctor_args,
             init_blocks: self.init_blocks,
             extension_props: self.extension_props,
+            extension_prop_setters: self.extension_prop_setters,
             anon_methods: Rc::clone(&self.anon_methods),
                     companion_singletons: self.companion_singletons,
                     secondary_ctors: self.secondary_ctors,
@@ -4443,6 +4533,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 parent_ctor_args: self.parent_ctor_args,
             init_blocks: self.init_blocks,
             extension_props: self.extension_props,
+            extension_prop_setters: self.extension_prop_setters,
             anon_methods: Rc::clone(&self.anon_methods),
                 companion_singletons: self.companion_singletons,
                 secondary_ctors: self.secondary_ctors,
@@ -4567,6 +4658,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             parent_ctor_args: self.parent_ctor_args,
             init_blocks: self.init_blocks,
             extension_props: self.extension_props,
+            extension_prop_setters: self.extension_prop_setters,
             anon_methods: Rc::clone(&self.anon_methods),
             companion_singletons: self.companion_singletons,
             secondary_ctors: self.secondary_ctors,
