@@ -79,6 +79,9 @@ pub struct Vm {
     /// Per-class secondary-ctor dispatch entries.
     secondary_ctors:
         std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
+    /// Per-class delegation expressions for `: I by g` supertypes.
+    class_delegates:
+        std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
     /// Runtime-lowered method bodies for anonymous-object / local
     /// classes, indexed by `(class name, method name) -> (Module, FuncId)`.
     /// The IR module is immutable after build, so methods declared
@@ -142,6 +145,7 @@ impl Vm {
             companion_singletons: std::collections::HashMap::new(),
             enum_entry_arg_inits: Vec::new(),
             secondary_ctors: std::collections::HashMap::new(),
+            class_delegates: std::collections::HashMap::new(),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
         }
@@ -165,6 +169,7 @@ impl Vm {
         vm.companion_singletons = built.companion_singletons;
         vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
         vm.secondary_ctors = built.secondary_ctors;
+        vm.class_delegates = built.class_delegates;
         (vm, main)
     }
 
@@ -202,6 +207,7 @@ impl Vm {
                     anon_methods: Rc::clone(&self.anon_methods),
                     companion_singletons: &self.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
+                    class_delegates: &self.class_delegates,
                     closures: &mut self.closures,
                 };
                 klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -254,6 +260,7 @@ impl Vm {
                         anon_methods: Rc::clone(&self.anon_methods),
                         companion_singletons: &self.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
+                    class_delegates: &self.class_delegates,
                         closures: &mut self.closures,
                     };
                     klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
@@ -293,6 +300,7 @@ impl Vm {
                     anon_methods: Rc::clone(&self.anon_methods),
                     companion_singletons: &self.companion_singletons,
                     secondary_ctors: &self.secondary_ctors,
+                    class_delegates: &self.class_delegates,
                     closures: &mut self.closures,
                 };
                 <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
@@ -321,6 +329,7 @@ impl Vm {
             anon_methods: Rc::clone(&self.anon_methods),
             companion_singletons: &self.companion_singletons,
             secondary_ctors: &self.secondary_ctors,
+            class_delegates: &self.class_delegates,
             closures: &mut self.closures,
         };
         klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
@@ -371,6 +380,8 @@ struct VmHost<'a> {
     companion_singletons: &'a std::collections::HashMap<String, String>,
     secondary_ctors:
         &'a std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
+    class_delegates:
+        &'a std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
     closures: &'a mut Vec<ClosureInfo>,
 }
 
@@ -610,6 +621,7 @@ impl<'a> VmHost<'a> {
             anon_methods: Rc::clone(&self.anon_methods),
             companion_singletons: self.companion_singletons,
             secondary_ctors: self.secondary_ctors,
+            class_delegates: self.class_delegates,
             instance_id_counter: &mut *self.instance_id_counter,
         };
         let mut ctx = klio_runtime::CallCtx {
@@ -1132,6 +1144,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if let Some(func) = klio_stdlib::implementation(probe) {
                 let args = [receiver.clone()];
                 return self.dispatch_intrinsic(func, &args);
+            }
+        }
+        // Class-delegation forwarding for property reads: a
+        // `: I by g` instance's missing fields forward to the
+        // stored delegate.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let delegates: Vec<klio_runtime::Value> = inst
+                .borrow()
+                .fields
+                .iter()
+                .filter_map(|(n, v)| {
+                    if n.starts_with("__delegate__") {
+                        Some(v.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for d in delegates {
+                if let Ok(v) = self.get_field(&d, name) {
+                    if !matches!(v, klio_runtime::Value::Unit) {
+                        return Ok(v);
+                    }
+                }
             }
         }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
@@ -2530,6 +2566,29 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Class-delegation forwarding: when the receiver instance
+        // was constructed with `: I by g`, the stored
+        // `__delegate__<I>` field holds the delegate; forward
+        // unmatched method calls there.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let delegates: Vec<klio_runtime::Value> = inst
+                .borrow()
+                .fields
+                .iter()
+                .filter_map(|(n, v)| {
+                    if n.starts_with("__delegate__") {
+                        Some(v.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for d in delegates {
+                if let Ok(v) = self.call_member(&d, name, args) {
+                    return Ok(v);
+                }
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()
@@ -2844,6 +2903,24 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             native_state: None,
         }));
         let inst_value = klio_runtime::Value::Instance(std::rc::Rc::clone(&inst));
+        // Evaluate class-delegation expressions (`: I by g`) and
+        // store the resulting delegate values on the instance
+        // under `__delegate__<superName>` so call_member can
+        // forward unmatched methods.
+        let class_delegate_thunks = self
+            .class_delegates
+            .get(&class_def.name)
+            .cloned()
+            .unwrap_or_default();
+        for (sup_name, fid) in &class_delegate_thunks {
+            if let Some(func) = self.module.funcs.get(fid.0 as usize).cloned() {
+                let module = Rc::clone(&self.module);
+                let v = klio_ir::eval::eval_with(&module, &func, args.to_vec(), self)?;
+                inst.borrow_mut()
+                    .fields
+                    .push((format!("__delegate__{sup_name}"), v));
+            }
+        }
         if let Some(m) = throwable_message.clone() {
             inst.borrow_mut().fields.push(("message".to_string(), m));
         }
@@ -3067,6 +3144,8 @@ struct VmIntrinsicHost<'a> {
     companion_singletons: &'a std::collections::HashMap<String, String>,
     secondary_ctors:
         &'a std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
+    class_delegates:
+        &'a std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
     instance_id_counter: &'a mut u64,
 }
 
@@ -3128,6 +3207,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             anon_methods: Rc::clone(&self.anon_methods),
                     companion_singletons: self.companion_singletons,
                     secondary_ctors: self.secondary_ctors,
+                    class_delegates: self.class_delegates,
                     closures: &mut *self.closures,
                 };
                 klio_ir::eval::eval_with_captures(
@@ -3170,6 +3250,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             anon_methods: Rc::clone(&self.anon_methods),
                 companion_singletons: self.companion_singletons,
                 secondary_ctors: self.secondary_ctors,
+                class_delegates: self.class_delegates,
                 instance_id_counter: &mut *self.instance_id_counter,
             };
             let mut ctx = klio_runtime::CallCtx {

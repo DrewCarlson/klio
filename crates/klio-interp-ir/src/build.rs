@@ -238,6 +238,14 @@ pub struct BuiltModule {
     /// that doesn't match the primary constructor's signature.
     pub secondary_ctors:
         std::collections::HashMap<String, Vec<SecondaryCtorEntry>>,
+    /// Class delegation entries: `class W(g: Greeter) : Greeter by g`.
+    /// Each tuple is `(supertype simple name, thunk FuncId taking
+    /// primary-ctor params)`. The Vm evaluates these at construction
+    /// time and stores the result under `__delegate__<superName>` on
+    /// the instance; missing methods on `W` then forward to the
+    /// delegate.
+    pub class_delegates:
+        std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
 }
 
 /// Pre-lowered metadata for one secondary constructor. Each entry's
@@ -761,6 +769,47 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         }
     }
 
+    // Per-class delegation expressions: `class W(g: G) : G by g`.
+    // Each supertype with `Some(delegate_expr)` lowers as an
+    // N-arg thunk parameterised on the class's primary-ctor
+    // params; the Vm stores the result at construction time.
+    let mut class_delegates: std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>> =
+        std::collections::HashMap::new();
+    for d in decls {
+        if let Decl::Class(c) = d {
+            if c.supertype_delegates.is_empty() {
+                continue;
+            }
+            let param_names: Vec<String> = c
+                .primary_params
+                .iter()
+                .map(|p| p.name.name.clone())
+                .collect();
+            let param_refs: Vec<&str> =
+                param_names.iter().map(|s| s.as_str()).collect();
+            let mut entries: Vec<(String, klio_ir::FuncId)> = Vec::new();
+            for (sup_idx, delegate_opt) in c.supertype_delegates.iter().enumerate() {
+                if let Some(delegate_expr) = delegate_opt {
+                    let sup_name = c
+                        .supertypes
+                        .get(sup_idx)
+                        .map(|t| t.name.name.clone())
+                        .unwrap_or_default();
+                    let fid = klio_ir::lower::lower_expr_as_param_thunk(
+                        &mut module,
+                        &param_refs,
+                        delegate_expr,
+                        &format!("__class_delegate_{}_{sup_idx}", c.name.name),
+                    );
+                    entries.push((sup_name, fid));
+                }
+            }
+            if !entries.is_empty() {
+                class_delegates.insert(c.name.name.clone(), entries);
+            }
+        }
+    }
+
     // Per-class secondary-ctor lowering. Each entry captures the
     // delegation arg thunks (parameterised on the secondary's
     // params) plus an optional body block thunk taking `[this,
@@ -923,5 +972,6 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         companion_singletons,
         enum_entry_arg_inits,
         secondary_ctors,
+        class_delegates,
     }
 }
