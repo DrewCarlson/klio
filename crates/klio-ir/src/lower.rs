@@ -1208,13 +1208,25 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         return dst;
                     }
                 }
-                // Not a local and not a known capture. Emit a
-                // LoadFromThisOrGlobal that first probes a captured
-                // `this` value (filled by the dispatcher when the
-                // lambda is invoked with a this-binding via scope
-                // fns like `apply`), then falls back to LoadGlobal.
-                // For non-lambda call frames the captured `this` is
-                // Null, so this reduces to a plain LoadGlobal.
+                // Not a local and not a known capture. Inside a
+                // method / extension fn with `this` bound as a
+                // param, try `this.<name>` first via GetField so
+                // smart-casted member reads (`when (this) { is X ->
+                // "$x" }`) resolve through the receiver instance.
+                // Outside that scope fall through to the
+                // LoadFromThisOrGlobal probe.
+                if let Some(this_reg) = b.resolve("this") {
+                    let dst = b.alloc_reg();
+                    let nm = b
+                        .module
+                        .intern_const(Const::String(segments[0].name.clone()));
+                    b.push(Inst::GetField {
+                        dst,
+                        receiver: this_reg,
+                        field: nm,
+                    });
+                    return dst;
+                }
                 let this_idx = b.record_capture("this");
                 let dst = b.alloc_reg();
                 let name = b.module.intern_const(Const::String(segments[0].name.clone()));
@@ -1288,6 +1300,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             let dst = b.alloc_reg();
                             let nm = b.module.intern_const(Const::String(ident.name.clone()));
                             b.push(Inst::GetField { dst, receiver: this_reg, field: nm });
+                            dst
+                        } else if let Some(this_reg) = b.resolve("this") {
+                            // `$name` inside an extension fn /
+                            // method whose receiver param holds the
+                            // referenced field — emit GetField on
+                            // the bound `this` reg. Host get_field
+                            // falls through to globals when the
+                            // field isn't on the instance.
+                            let dst = b.alloc_reg();
+                            let n =
+                                b.module.intern_const(Const::String(ident.name.clone()));
+                            b.push(Inst::GetField {
+                                dst,
+                                receiver: this_reg,
+                                field: n,
+                            });
                             dst
                         } else {
                             // Fall back through the captured `this`
