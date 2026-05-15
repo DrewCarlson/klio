@@ -446,6 +446,11 @@ pub struct BuiltModule {
     /// this to identify which enum entries have per-entry methods.
     pub enum_entry_synth_class:
         std::collections::HashMap<(String, String), String>,
+    /// Per-function type parameter names (in source order). The Vm
+    /// uses this to bind reified type-args as synthesized
+    /// `Value::Class` globals for the duration of the call.
+    pub func_type_params:
+        std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
 }
 
 /// Pre-lowered metadata for one secondary constructor. Each entry's
@@ -689,6 +694,8 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         klio_ir::FuncId,
         Vec<Option<klio_ir::FuncId>>,
     > = std::collections::HashMap::new();
+    let mut func_type_params: std::collections::HashMap<klio_ir::FuncId, Vec<String>> =
+        std::collections::HashMap::new();
     for d in decls {
         if let Decl::Function(f) = d {
             let func = klio_ir::lower::lower_function_body_into(&mut module, f, &file_classes);
@@ -700,6 +707,17 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
                 main_id = Some(id);
             }
             module.top_level.push(id);
+            // Record type-param names so the Vm can bind reified
+            // type args as synth `Value::Class` globals at call
+            // time.
+            if !f.type_params.is_empty() {
+                let names: Vec<String> = f
+                    .type_params
+                    .iter()
+                    .map(|tp| tp.name.name.clone())
+                    .collect();
+                func_type_params.insert(id, names);
+            }
             // Lower per-param default expressions as 0-arg thunks.
             // The Vm pads missing args at call_func time.
             if f.params.iter().any(|p| p.default.is_some()) {
@@ -1371,5 +1389,6 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
         enclosing_class,
         enum_entry_methods,
         enum_entry_synth_class,
+        func_type_params,
     }
 }

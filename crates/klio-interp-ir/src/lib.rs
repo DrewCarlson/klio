@@ -88,6 +88,10 @@ pub struct Vm {
     /// Inner class → outer class name. Used to walk enclosing
     /// chains for nested-companion field reads.
     enclosing_class: std::collections::HashMap<String, String>,
+    /// Per-function type parameter names. The Vm consults this on
+    /// reified-typed calls to bind `T` → `Value::Class(arg)` as a
+    /// global for the duration of the call.
+    func_type_params: std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
     /// Default outer instance to attach to locally-registered
     /// classes. `register_class_captured` snapshots `this` when
     /// the local class is declared inside a method body so the
@@ -161,6 +165,7 @@ impl Vm {
             class_delegates: std::collections::HashMap::new(),
             func_defaults: std::collections::HashMap::new(),
             enclosing_class: std::collections::HashMap::new(),
+            func_type_params: std::collections::HashMap::new(),
             class_default_outer: Rc::new(RefCell::new(std::collections::HashMap::new())),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
@@ -188,6 +193,7 @@ impl Vm {
         vm.class_delegates = built.class_delegates;
         vm.func_defaults = built.func_defaults;
         vm.enclosing_class = built.enclosing_class;
+        vm.func_type_params = built.func_type_params;
         // Pre-populated enum-entry override methods land in the
         // same anon_methods side-table the Vm consults for
         // anon-object + local-class methods.
@@ -236,6 +242,7 @@ impl Vm {
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
                     enclosing_class: &self.enclosing_class,
+                    func_type_params: &self.func_type_params,
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
@@ -292,6 +299,7 @@ impl Vm {
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
                     enclosing_class: &self.enclosing_class,
+                    func_type_params: &self.func_type_params,
                     class_default_outer: Rc::clone(&self.class_default_outer),
                         closures: &mut self.closures,
                     };
@@ -335,6 +343,7 @@ impl Vm {
                     class_delegates: &self.class_delegates,
                     func_defaults: &self.func_defaults,
                     enclosing_class: &self.enclosing_class,
+                    func_type_params: &self.func_type_params,
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
@@ -381,6 +390,7 @@ impl Vm {
             class_delegates: &self.class_delegates,
             func_defaults: &self.func_defaults,
             enclosing_class: &self.enclosing_class,
+            func_type_params: &self.func_type_params,
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut self.closures,
         };
@@ -450,6 +460,8 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     enclosing_class:
         &'a std::collections::HashMap<String, String>,
+    func_type_params:
+        &'a std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
     class_default_outer:
         Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     closures: &'a mut Vec<ClosureInfo>,
@@ -715,6 +727,7 @@ impl<'a> VmHost<'a> {
             class_delegates: self.class_delegates,
             func_defaults: self.func_defaults,
             enclosing_class: self.enclosing_class,
+            func_type_params: self.func_type_params,
             class_default_outer: Rc::clone(&self.class_default_outer),
             instance_id_counter: &mut *self.instance_id_counter,
         };
@@ -852,6 +865,50 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     ))
                 },
             });
+        }
+        // Primitive type names — `Int`, `Long`, `String`, etc. —
+        // resolve to a synthetic `Value::Class` so `Int::class` and
+        // `Int.MAX_VALUE` work. The synthetic ClassDef has the
+        // simple name + a kotlin.* fqn for reflection-style reads.
+        if matches!(
+            name,
+            "Int" | "Long" | "Short" | "Byte" | "Float" | "Double" | "Boolean"
+                | "Char" | "String" | "Unit" | "Any" | "Nothing" | "UInt"
+                | "ULong" | "UShort" | "UByte" | "Number"
+        ) {
+            let def = Rc::new(klio_runtime::ClassDef {
+                name: name.to_string(),
+                fqn: format!("kotlin.{name}"),
+                annotation_names: Vec::new(),
+                primary_params: Vec::new(),
+                methods: Vec::new(),
+                body_properties: Vec::new(),
+                init_blocks: Vec::new(),
+                is_data: false,
+                is_object: false,
+                is_enum: false,
+                is_sealed: false,
+                is_open: false,
+                is_abstract: false,
+                is_inner: false,
+                is_anonymous: false,
+                secondary_ctors: Vec::new(),
+                supertype_names: Vec::new(),
+                parent: RefCell::new(None),
+                interfaces: RefCell::new(Vec::new()),
+                is_interface: false,
+                is_fun_interface: false,
+                parent_ctor_args: Vec::new(),
+                enum_entries: RefCell::new(Vec::new()),
+                companion: RefCell::new(None),
+                enclosing_class: RefCell::new(None),
+                nested_classes: RefCell::new(Vec::new()),
+                captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
+                supertype_delegates: RefCell::new(Vec::new()),
+                delegate_forwarders: RefCell::new(Vec::new()),
+                object_singleton: RefCell::new(None),
+            });
+            return Some(klio_runtime::Value::Class(def));
         }
         // Primitive-companion constants (`Int.MAX_VALUE`, `Double.NaN`,
         // `Long.SIZE_BITS`, …). The IR lowers these as a single
@@ -2363,9 +2420,41 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         func: klio_ir::FuncId,
         args: Vec<klio_runtime::Value>,
         arg_names: &[Option<String>],
-        _type_args: &[String],
+        type_args: &[String],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        self.call_func_named(module, func, args, arg_names)
+        // Bind each call-site type-arg name to a synth
+        // `Value::Class` global for the duration of the call so
+        // reified type-param reads (`T::class`) resolve. We
+        // snapshot any pre-existing bindings, install the new
+        // ones, then restore on exit so concurrent / recursive
+        // calls don't see stale T values.
+        let names: Vec<String> = self
+            .func_type_params
+            .get(&func)
+            .cloned()
+            .unwrap_or_default();
+        let mut saved: Vec<(String, Option<klio_runtime::Value>)> = Vec::new();
+        for (idx, type_name) in names.iter().enumerate() {
+            let arg_name = type_args.get(idx).cloned().unwrap_or_default();
+            if arg_name.is_empty() {
+                continue;
+            }
+            let cls_value = self.lookup_global(&arg_name);
+            saved.push((type_name.clone(), self.globals.borrow().lookup(type_name)));
+            if let Some(v) = cls_value {
+                self.globals.borrow_mut().define(type_name.clone(), v);
+            }
+        }
+        let result = self.call_func_named(module, func, args, arg_names);
+        for (name, prev) in saved.into_iter().rev() {
+            match prev {
+                Some(v) => self.globals.borrow_mut().define(name, v),
+                None => {
+                    self.globals.borrow_mut().remove_local(&name);
+                }
+            }
+        }
+        result
     }
 
     fn build_ast_lambda_with_flag_funcid(
@@ -4203,6 +4292,8 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     enclosing_class:
         &'a std::collections::HashMap<String, String>,
+    func_type_params:
+        &'a std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
     class_default_outer:
         Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     instance_id_counter: &'a mut u64,
@@ -4269,6 +4360,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     class_delegates: self.class_delegates,
                     func_defaults: self.func_defaults,
                     enclosing_class: self.enclosing_class,
+                    func_type_params: self.func_type_params,
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut *self.closures,
                 };
@@ -4318,6 +4410,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 class_delegates: self.class_delegates,
                 func_defaults: self.func_defaults,
                 enclosing_class: self.enclosing_class,
+                func_type_params: self.func_type_params,
                 class_default_outer: Rc::clone(&self.class_default_outer),
                 instance_id_counter: &mut *self.instance_id_counter,
             };
