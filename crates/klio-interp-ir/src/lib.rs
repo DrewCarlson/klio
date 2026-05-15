@@ -1836,7 +1836,25 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // walks one step up the inheritance chain. With `super<Q>`,
         // dispatch on Q directly.
         let parent_name: Option<String> = if let Some(q) = qualifier {
-            Some(q.to_string())
+            // Two cases share the `qualifier` slot:
+            //   * `super<A>.member()` — A is one of the owner's
+            //     supertypes; dispatch directly on A.
+            //   * `super@Q.member()` — Q is an enclosing class
+            //     name; dispatch on Q's own parent.
+            let owner_supers: Vec<String> = self
+                .classes
+                .borrow()
+                .get(owner_class)
+                .map(|d| d.supertype_names.clone())
+                .unwrap_or_default();
+            if owner_supers.iter().any(|s| s == q) {
+                Some(q.to_string())
+            } else {
+                self.classes
+                    .borrow()
+                    .get(q)
+                    .and_then(|d| d.supertype_names.first().cloned())
+            }
         } else if let Some(owner_def) = self.classes.borrow().get(owner_class).cloned() {
             owner_def.supertype_names.first().cloned()
         } else {
