@@ -1263,9 +1263,19 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             b.push(Inst::GetField { dst, receiver: this_reg, field: nm });
                             dst
                         } else {
+                            // Fall back through the captured `this`
+                            // slot — the dispatcher may supply a
+                            // this-binding (scope fns). Reduces to a
+                            // plain global lookup when the captured
+                            // this is null.
+                            let this_idx = b.record_capture("this");
                             let dst = b.alloc_reg();
                             let n = b.module.intern_const(Const::String(ident.name.clone()));
-                            b.push(Inst::LoadGlobal { dst, name: n });
+                            b.push(Inst::LoadFromThisOrGlobal {
+                                dst,
+                                this_idx,
+                                name: n,
+                            });
                             dst
                         }
                     }
