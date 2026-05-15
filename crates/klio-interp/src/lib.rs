@@ -4429,7 +4429,7 @@ impl Interpreter {
             .get(&key)
             .copied()
         {
-            if this_binding.is_none() {
+            {
                 if let Some(module_rc) = self.current_module.clone() {
                     let func = module_rc.funcs[fid.0 as usize].clone();
                     let capture_names: Vec<String> = self
@@ -4439,9 +4439,23 @@ impl Interpreter {
                         .get(&key)
                         .cloned()
                         .unwrap_or_default();
+                    // The synthetic `this` capture slot is filled
+                    // from the dispatch-time this_binding when
+                    // supplied (scope fns), otherwise from the
+                    // captured-env (a lambda nested inside a
+                    // method). LoadFromThisOrGlobal /
+                    // CallMemberOrGlobal at runtime fall back to a
+                    // global lookup when the captured this is null.
                     let captures: Vec<Value> = capture_names
                         .iter()
-                        .map(|n| captured_env.borrow().lookup(n).unwrap_or(Value::Null))
+                        .map(|n| {
+                            if n == "this" {
+                                if let Some(t) = &this_binding {
+                                    return t.clone();
+                                }
+                            }
+                            captured_env.borrow().lookup(n).unwrap_or(Value::Null)
+                        })
                         .collect();
                     let mut call_args: Vec<Value> = Vec::with_capacity(params.len());
                     for (i, _) in params.iter().enumerate() {
