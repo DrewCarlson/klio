@@ -375,6 +375,104 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         )))
     }
 
+    fn build_object(
+        &mut self,
+        ast: &klio_ast::Expr,
+        _captured_names: &[String],
+        _captures: Vec<klio_runtime::Value>,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Minimal anonymous-object support: synthesise an
+        // InstanceData backed by a fresh ClassDef from the AST's
+        // ObjectExpr shape, with no parent ctor chain, no method
+        // body lowering — primary use case is `object { val tag = X }`
+        // markers and `object : SomeInterface { override fun ... }`
+        // SAM-like wrappers used by tests. Full lowering lands when
+        // the IR Class shape supports it.
+        if let klio_ast::Expr::ObjectExpr { members, supertypes, .. } = ast {
+            *self.instance_id_counter += 1;
+            let identity = *self.instance_id_counter;
+            let body_properties: Vec<klio_runtime::PropertyDef> = members
+                .iter()
+                .filter_map(|m| match m {
+                    klio_ast::Decl::Property(p) => Some(klio_runtime::PropertyDef {
+                        name: p.name.name.clone(),
+                        mutable: p.mutable,
+                        init: p.init.as_ref().map(|e| Rc::new(e.clone())),
+                        getter: p.getter.as_ref().map(|a| Rc::new(a.clone())),
+                        setter: p.setter.as_ref().map(|a| Rc::new(a.clone())),
+                        delegate: p.delegate.as_ref().map(|e| Rc::new(e.clone())),
+                        is_abstract: p.is_abstract,
+                        is_lateinit: p.is_lateinit,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            let supertype_names: Vec<String> =
+                supertypes.iter().map(|t| t.name.name.clone()).collect();
+            let class_def = Rc::new(klio_runtime::ClassDef {
+                name: format!("$anon${identity}"),
+                fqn: format!("$anon${identity}"),
+                annotation_names: Vec::new(),
+                primary_params: Vec::new(),
+                methods: Vec::new(),
+                body_properties,
+                init_blocks: Vec::new(),
+                is_data: false,
+                is_object: false,
+                is_enum: false,
+                is_sealed: false,
+                is_open: false,
+                is_abstract: false,
+                is_inner: false,
+                is_anonymous: true,
+                secondary_ctors: Vec::new(),
+                supertype_names,
+                parent: RefCell::new(None),
+                interfaces: RefCell::new(Vec::new()),
+                is_interface: false,
+                is_fun_interface: false,
+                parent_ctor_args: Vec::new(),
+                enum_entries: RefCell::new(Vec::new()),
+                companion: RefCell::new(None),
+                enclosing_class: RefCell::new(None),
+                nested_classes: RefCell::new(Vec::new()),
+                captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
+                supertype_delegates: RefCell::new(Vec::new()),
+                delegate_forwarders: RefCell::new(Vec::new()),
+                object_singleton: RefCell::new(None),
+            });
+            // Initialise body-property fields with literal values
+            // only — anonymous-object property inits with arbitrary
+            // expressions would need a thunk lowered at lower-time,
+            // which the build pass already does for top-level
+            // classes; extending it to anonymous expressions lands
+            // when the IR grows an anon-class shape.
+            let mut fields: Vec<(String, klio_runtime::Value)> = Vec::new();
+            for p in &class_def.body_properties {
+                if let Some(init) = &p.init {
+                    if let Some(v) = simple_literal(init) {
+                        fields.push((p.name.clone(), v));
+                    } else {
+                        fields.push((p.name.clone(), klio_runtime::Value::Null));
+                    }
+                } else {
+                    fields.push((p.name.clone(), klio_runtime::Value::Null));
+                }
+            }
+            let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
+                class: class_def,
+                fields,
+                outer: None,
+                identity,
+                native_state: None,
+            }));
+            return Ok(klio_runtime::Value::Instance(inst));
+        }
+        Err(klio_ir::eval::EvalError::Type(format!(
+            "Vm::build_object: not an ObjectExpr AST node"
+        )))
+    }
+
     fn call_super(
         &mut self,
         receiver: &klio_runtime::Value,
@@ -986,6 +1084,31 @@ fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
         _ => 7i32.hash(&mut h),
     }
     h.finish() as i32
+}
+
+/// Best-effort fold of trivially-literal AST expressions to a
+/// runtime Value. Used by anonymous-object body-property
+/// initialisation where the IR module's full thunk-lowering
+/// hasn't run.
+fn simple_literal(e: &klio_ast::Expr) -> Option<klio_runtime::Value> {
+    use klio_ast::Expr::*;
+    match e {
+        IntLit { value, .. } => Some(klio_runtime::Value::new_int(*value)),
+        FloatLit { value, .. } => Some(klio_runtime::Value::Double(*value)),
+        BoolLit { value, .. } => Some(klio_runtime::Value::Bool(*value)),
+        NullLit { .. } => Some(klio_runtime::Value::Null),
+        CharLit { value, .. } => Some(klio_runtime::Value::Char(*value)),
+        StringTemplate { parts, .. } if parts.iter().all(|p| matches!(p, klio_ast::StringPart::Text(_))) => {
+            let mut s = String::new();
+            for p in parts {
+                if let klio_ast::StringPart::Text(t) = p {
+                    s.push_str(t);
+                }
+            }
+            Some(klio_runtime::Value::String(Rc::new(s)))
+        }
+        _ => None,
+    }
 }
 
 fn materialise_range_items(
