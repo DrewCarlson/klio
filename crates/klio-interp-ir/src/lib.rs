@@ -901,6 +901,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         prim: None,
                     });
                 }
+                klio_runtime::Value::Array { items, prim } => {
+                    let items_clone: Vec<klio_runtime::Value> = items.borrow().clone();
+                    return Ok(klio_runtime::Value::Iterator {
+                        items: Rc::new(RefCell::new(items_clone)),
+                        pos: Rc::new(RefCell::new(0)),
+                        prim: *prim,
+                    });
+                }
                 klio_runtime::Value::String(s) => {
                     let items: Vec<klio_runtime::Value> = s
                         .chars()
