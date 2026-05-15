@@ -1766,13 +1766,65 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Snapshot `this` from the captured outer env (when
         // present) so instances of this local class get an `outer`
         // pointing back at the enclosing scope's receiver.
-        if let Some(this_idx) =
-            captured_names.iter().position(|n| n == "this")
-        {
-            if let Some(this_val) = captures.get(this_idx).cloned() {
-                self.class_default_outer
-                    .borrow_mut()
-                    .insert(class.name.name.clone(), this_val);
+        let captured_this: Option<klio_runtime::Value> = captured_names
+            .iter()
+            .position(|n| n == "this")
+            .and_then(|i| captures.get(i).cloned());
+        if let Some(this_val) = captured_this.clone() {
+            self.class_default_outer
+                .borrow_mut()
+                .insert(class.name.name.clone(), this_val.clone());
+        }
+        // Re-lower the local class's methods with the captured
+        // outer's field + member names merged into own_members,
+        // so bare references to outer properties lower as
+        // `this.X` and resolve via the outer chain at runtime.
+        if let Some(klio_runtime::Value::Instance(this_inst)) = captured_this {
+            let outer_class = this_inst.borrow().class.clone();
+            let mut extras: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for p in &outer_class.primary_params {
+                extras.insert(p.name.clone());
+            }
+            for p in &outer_class.body_properties {
+                extras.insert(p.name.clone());
+            }
+            let mut own_members: std::collections::HashSet<String> = extras.clone();
+            for p in &class.primary_params {
+                if p.property.is_some() {
+                    own_members.insert(p.name.name.clone());
+                }
+            }
+            for m in &class.members {
+                match m {
+                    klio_ast::Decl::Property(p) => {
+                        own_members.insert(p.name.name.clone());
+                    }
+                    klio_ast::Decl::Function(f) => {
+                        own_members.insert(f.name.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            for m in &class.members {
+                if let klio_ast::Decl::Function(f) = m {
+                    if f.body.is_none() {
+                        continue;
+                    }
+                    let mut sub_module = klio_ir::Module::default();
+                    let func = klio_ir::lower::lower_method(
+                        &mut sub_module,
+                        f,
+                        &class.name.name,
+                        &own_members,
+                    );
+                    let fid = func.id;
+                    let module_rc = Rc::new(sub_module);
+                    self.anon_methods.borrow_mut().insert(
+                        (class.name.name.clone(), f.name.name.clone()),
+                        (module_rc, fid, Vec::new()),
+                    );
+                }
             }
         }
         // Patch the just-registered method entries with the captured
