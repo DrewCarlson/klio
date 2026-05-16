@@ -2195,9 +2195,18 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 );
                 let fid = func.id;
                 let module_rc = Rc::new(sub_module);
-                self.anon_methods.borrow_mut().insert(
+                let entry = (module_rc, fid, Vec::new());
+                let mut tbl = self.anon_methods.borrow_mut();
+                tbl.insert(
+                    (
+                        class.name.name.clone(),
+                        format!("{}#{}", f.name.name, f.params.len()),
+                    ),
+                    entry.clone(),
+                );
+                tbl.insert(
                     (class.name.name.clone(), f.name.name.clone()),
-                    (module_rc, fid, Vec::new()),
+                    entry,
                 );
             }
         }
@@ -2268,9 +2277,18 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     );
                     let fid = func.id;
                     let module_rc = Rc::new(sub_module);
-                    self.anon_methods.borrow_mut().insert(
+                    let entry = (module_rc, fid, Vec::new());
+                    let mut tbl = self.anon_methods.borrow_mut();
+                    tbl.insert(
+                        (
+                            class.name.name.clone(),
+                            format!("{}#{}", f.name.name, f.params.len()),
+                        ),
+                        entry.clone(),
+                    );
+                    tbl.insert(
                         (class.name.name.clone(), f.name.name.clone()),
-                        (module_rc, fid, Vec::new()),
+                        entry,
                     );
                 }
             }
@@ -2288,9 +2306,16 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         let mut tbl = self.anon_methods.borrow_mut();
         for m in &class.members {
             if let klio_ast::Decl::Function(f) = m {
-                let key = (class.name.name.clone(), f.name.name.clone());
-                if let Some(entry) = tbl.get_mut(&key) {
-                    entry.2 = capture_pairs.clone();
+                for key in [
+                    (
+                        class.name.name.clone(),
+                        format!("{}#{}", f.name.name, f.params.len()),
+                    ),
+                    (class.name.name.clone(), f.name.name.clone()),
+                ] {
+                    if let Some(entry) = tbl.get_mut(&key) {
+                        entry.2 = capture_pairs.clone();
+                    }
                 }
             }
         }
@@ -2367,9 +2392,18 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     );
                     let fid = func.id;
                     let module_rc = Rc::new(sub_module);
-                    self.anon_methods.borrow_mut().insert(
+                    let entry = (module_rc, fid, capture_pairs.clone());
+                    let mut tbl = self.anon_methods.borrow_mut();
+                    tbl.insert(
+                        (
+                            synth_class_name.clone(),
+                            format!("{}#{}", f.name.name, f.params.len()),
+                        ),
+                        entry.clone(),
+                    );
+                    tbl.insert(
                         (synth_class_name.clone(), f.name.name.clone()),
-                        (module_rc, fid, capture_pairs.clone()),
+                        entry,
                     );
                 }
             }
@@ -4070,6 +4104,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // via Inst::RegisterClass both stash methods in anon_methods.
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
+            // Anon-object / local-class methods are stored under both
+            // an arity-tagged key (`name#argc`) and the plain name.
+            // Prefer the arity match so overloaded members (e.g.
+            // SegmentWriteContext.setUnchecked with 3/4/5/6 args)
+            // dispatch correctly; fall back to the plain name.
+            let arity_name = format!("{name}#{}", args.len());
             let key = (class_name, name.to_string());
             // Enum entries tagged with __enum_entry_class__ route
             // method calls to the entry-specific override class
@@ -4077,9 +4117,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // members.
             let entry_tag = inst.borrow().get("__enum_entry_class__");
             if let Some(klio_runtime::Value::String(tag)) = entry_tag {
+                let entry_arity_key = ((*tag).clone(), arity_name.clone());
                 let entry_key = ((*tag).clone(), name.to_string());
-                let entry_method =
-                    self.anon_methods.borrow().get(&entry_key).cloned();
+                let entry_method = {
+                    let tbl = self.anon_methods.borrow();
+                    tbl.get(&entry_arity_key)
+                        .or_else(|| tbl.get(&entry_key))
+                        .cloned()
+                };
                 if let Some((module_rc, fid, _)) = entry_method {
                     let func = module_rc
                         .funcs
@@ -4098,7 +4143,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return klio_ir::eval::eval_with(&module_rc, &func, all, self);
                 }
             }
-            let entry = self.anon_methods.borrow().get(&key).cloned();
+            let entry = {
+                let tbl = self.anon_methods.borrow();
+                let arity_key = (key.0.clone(), arity_name.clone());
+                tbl.get(&arity_key).or_else(|| tbl.get(&key)).cloned()
+            };
             if let Some((module_rc, fid, captures)) = entry {
                 let func = module_rc
                     .funcs

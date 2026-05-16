@@ -85,6 +85,8 @@ pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
     ("downTo", "kotlin.ranges.downTo"),
     ("step", "kotlin.ranges.step"),
     ("until", "kotlin.ranges.until"),
+    ("minOf", "kotlin.comparisons.minOf"),
+    ("maxOf", "kotlin.comparisons.maxOf"),
     ("Regex", "kotlin.text.Regex"),
     ("StringBuilder", "kotlin.text.StringBuilder"),
 ];

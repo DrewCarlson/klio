@@ -774,6 +774,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Map.getOrElse", map_get_or_else),
     ("kotlin.collections.MutableMap.getOrElse", map_get_or_else),
     ("kotlin.collections.MutableMap.getOrPut", map_get_or_put),
+    ("kotlin.comparisons.minOf", math_min),
+    ("kotlin.comparisons.maxOf", math_max),
     ("kotlin.comparisons.compareBy", cmp_compare_by),
     ("kotlin.comparisons.compareByDescending", cmp_compare_by_descending),
     ("kotlin.comparisons.compareValues", cmp_compare_values),

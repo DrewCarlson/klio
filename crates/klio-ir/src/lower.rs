@@ -1527,6 +1527,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         Expr::Block(block) => lower_block(b, block),
         Expr::Path { segments, .. } => {
             if segments.len() == 1 {
+                // Bare `Unit` is the Unit singleton value (`fun
+                // hintEmit(): Unit = Unit`), not a member read — it
+                // must not fall through to a `this.Unit` field probe
+                // inside a method/extension body.
+                if segments[0].name == "Unit" && b.resolve("Unit").is_none() {
+                    return b.emit_const(Const::Unit);
+                }
                 if let Some(r) = b.resolve(&segments[0].name) {
                     if b.is_boxed(&segments[0].name) {
                         // `r` holds the shared `Value::Cell`; read

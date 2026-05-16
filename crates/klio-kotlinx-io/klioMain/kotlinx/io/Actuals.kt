@@ -29,6 +29,19 @@ internal actual fun Short.reverseBytes(): Short = reverseBytesCommon()
 internal actual fun Int.reverseBytes(): Int = reverseBytesCommon()
 internal actual fun Long.reverseBytes(): Long = reverseBytesCommon()
 
+// Same-type `minOf`/`maxOf` bases. The Kotlin stdlib supplies these
+// on every real platform; kotlinx-io's commonMain `-Util.kt` only
+// declares the mixed Int/Long adapter overloads and delegates down
+// to the same-type form, so without these the adapters recurse
+// forever. Declared `internal` in `kotlinx.io` so the upstream
+// common code resolves them by simple name.
+internal fun minOf(a: Int, b: Int): Int = if (a <= b) a else b
+internal fun minOf(a: Long, b: Long): Long = if (a <= b) a else b
+internal fun minOf(a: Double, b: Double): Double = if (a <= b) a else b
+internal fun maxOf(a: Int, b: Int): Int = if (a >= b) a else b
+internal fun maxOf(a: Long, b: Long): Long = if (a >= b) a else b
+internal fun maxOf(a: Double, b: Double): Double = if (a >= b) a else b
+
 public actual interface RawSink : AutoCloseable {
     public fun write(source: Buffer, byteCount: Long)
     public fun flush()
