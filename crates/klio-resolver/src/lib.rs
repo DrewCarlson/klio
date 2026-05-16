@@ -117,6 +117,11 @@ const BUILTINS: &[&str] = &[
     "println", "print",
     // Stdlib scope functions with contracts (§12.2.5).
     "run", "with", "check", "require", "repeat", "contract",
+    // Threads / monitors. `synchronized` is in `kotlin` (implicitly
+    // imported); `thread` lives in `kotlin.concurrent` and is reached
+    // via `import kotlin.concurrent.thread`, but the use site is a
+    // bare name either way so it resolves through the builtins scope.
+    "synchronized", "thread",
     // Spec §14.5 builder-style inference entry points. Typeck threads the
     // lambda body through `check_builder_call` so member references on the
     // implicit receiver (e.g. `add`, `put`) resolve through the receiver's

@@ -62,20 +62,21 @@ const RUNNABLE: &[&str] = &[
     "mm3_no_oota",
     "mm4_safe_publication",
     "mm5_volatile",
+    "mm6_monitor",
     "mm7_atomics",
+    "mm8_thread_join",
     "mm9_coroutine_hb",
     "mm10_channel_flow",
 ];
 
-// mm7 (atomicfu) is runnable today via the pack-aware runner; the
-// coroutine/monitor/thread rules are gated on their owning stage.
+// Every memory-model rule is now exercised through the pack-aware
+// runner: atomics via atomicfu, coroutine/channel happens-before via
+// the coroutine runtime, and monitors / thread-join via the
+// serialized-interpreter thread semantics.
 
 /// Rules gated on a later stage. `(stem, owning stage)`. Moved into
-/// `RUNNABLE` when that stage lands.
-const GATED: &[(&str, &str)] = &[
-    ("mm6_monitor", "single-lock threads / monitors"),
-    ("mm8_thread_join", "single-lock threads"),
-];
+/// `RUNNABLE` when that stage lands. Empty: no rule is gated today.
+const GATED: &[(&str, &str)] = &[];
 
 #[test]
 fn conformance_runnable() {

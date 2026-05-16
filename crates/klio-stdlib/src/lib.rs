@@ -168,9 +168,20 @@ pub fn is_known_package(package_path: &str) -> bool {
         return true;
     }
     let prefix = format!("{package_path}.");
-    generated::stdlib_symbols()
+    if generated::stdlib_symbols()
         .iter()
         .any(|e| e.package == package_path || e.fqn.starts_with(&prefix))
+    {
+        return true;
+    }
+    // Hand-written intrinsics live outside the mined symbol index
+    // (e.g. `kotlin.concurrent.thread`). A package that owns at least
+    // one such intrinsic is just as real as a mined one.
+    implementations::all_fqns().any(|fqn| {
+        fqn.rsplit_once('.')
+            .map_or(false, |(pkg, _)| pkg == package_path)
+            || fqn.starts_with(&prefix)
+    })
 }
 
 /// Augment the set of packages that [`is_known_package`] recognises.

@@ -11,20 +11,22 @@ expression: "fun main() {\n    greet()\n    println(square(4))\n}\n\nfun greet()
   [5] Builtin require @builtin
   [6] Builtin repeat @builtin
   [7] Builtin contract @builtin
-  [8] Builtin buildList @builtin
-  [9] Builtin buildMap @builtin
-  [10] Builtin buildSet @builtin
-  [11] Builtin sequence @builtin
-  [12] Builtin iterator @builtin
-  [13] TopLevelFunction main @4..8
-  [14] TopLevelFunction greet @55..60
-  [15] TopLevelFunction square @93..99
-  [16] Parameter x @100..101
+  [8] Builtin synchronized @builtin
+  [9] Builtin thread @builtin
+  [10] Builtin buildList @builtin
+  [11] Builtin buildMap @builtin
+  [12] Builtin buildSet @builtin
+  [13] Builtin sequence @builtin
+  [14] Builtin iterator @builtin
+  [15] TopLevelFunction main @4..8
+  [16] TopLevelFunction greet @55..60
+  [17] TopLevelFunction square @93..99
+  [18] Parameter x @100..101
 
 # uses
-  @17..22 -> [14] greet (TopLevelFunction)
+  @17..22 -> [16] greet (TopLevelFunction)
   @29..36 -> [0] println (Builtin)
-  @37..43 -> [15] square (TopLevelFunction)
+  @37..43 -> [17] square (TopLevelFunction)
   @69..76 -> [0] println (Builtin)
-  @115..116 -> [16] x (Parameter)
-  @119..120 -> [16] x (Parameter)
+  @115..116 -> [18] x (Parameter)
+  @119..120 -> [18] x (Parameter)

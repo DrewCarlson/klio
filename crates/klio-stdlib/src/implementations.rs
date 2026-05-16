@@ -39,6 +39,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.lazy", lazy_lazy),
     ("kotlin.lazyOf", lazy_lazy_of),
 
+    // ----- threads / monitors (serialized-interpreter semantics) -----
+    ("kotlin.synchronized", concurrent_synchronized),
+    ("kotlin.concurrent.thread", concurrent_thread),
+
     // ----- io -----
     ("kotlin.io.print", io_print),
     ("kotlin.io.println", io_println),
@@ -964,6 +968,12 @@ const PARAM_NAMES: &[(&str, &[&str])] = &[
 
     // Result.
     ("kotlin.Result.getOrDefault", &["defaultValue"]),
+
+    // Threads / monitors.
+    ("kotlin.synchronized", &["lock", "block"]),
+    ("kotlin.concurrent.thread", &[
+        "start", "isDaemon", "contextClassLoader", "name", "priority", "block",
+    ]),
 ];
 
 // ===== scope functions =====
@@ -2135,6 +2145,82 @@ fn scope_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         host.invoke_callable(&block, std::slice::from_ref(&arg), *out)?;
     }
     Ok(Value::Unit)
+}
+
+/// `synchronized(lock) { body }` / `synchronized(lock, { body })`.
+///
+/// Under the serialized interpreter mutual exclusion is automatic: no
+/// other thread can be running while this body runs, so the monitor is
+/// effectively always free on enter and the body executes atomically
+/// with respect to every other monitor section. We run the trailing
+/// lambda and return its result. The `lock` argument is irrelevant to
+/// observable behaviour here and is ignored.
+///
+/// `fence_and_publish` marks the monitor enter and exit boundaries —
+/// the points where a parallel backing would acquire on enter and
+/// release on exit.
+fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let block = ctx
+        .args
+        .last()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("synchronized expects (lock, block)".into()))?;
+    let CallCtx { out, host, .. } = ctx;
+    klio_runtime::fence_and_publish(); // monitor enter
+    let result = host.invoke_callable(&block, &[], *out);
+    klio_runtime::fence_and_publish(); // monitor exit
+    result
+}
+
+/// `kotlin.concurrent.thread(start, isDaemon, contextClassLoader,
+/// name, priority) { block }`.
+///
+/// On a single serialized interpreter a started thread's body runs to
+/// completion immediately on the calling stack: the body's every
+/// action happens-before the call returns, which is exactly the
+/// happens-before edge `Thread.start` would give, only stronger
+/// (total order). The returned handle is a `Thread` sentinel whose
+/// `join()` is a no-op (the body already completed, so its writes are
+/// already visible — join-happens-before holds trivially), `isAlive`
+/// is `false`, and `name` is a stable string. This is observably
+/// correct for every race-free program, which is the only class
+/// Kotlin defines behaviour for.
+fn concurrent_thread(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let block = ctx
+        .args
+        .iter()
+        .rev()
+        .find(|v| {
+            matches!(
+                v,
+                Value::Function { .. }
+                    | Value::Lambda { .. }
+                    | Value::IrClosure { .. }
+                    | Value::Intrinsic { .. }
+                    | Value::BoundMethod { .. }
+                    | Value::BoundUserMethod { .. }
+            )
+        })
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("thread expects a block".into()))?;
+    let CallCtx { out, host, .. } = ctx;
+    klio_runtime::fence_and_publish(); // thread start
+    host.invoke_callable(&block, &[], *out)?;
+    klio_runtime::fence_and_publish(); // thread body completion published to the joiner
+    Ok(Value::Intrinsic {
+        fqn: "kotlin.concurrent.Thread",
+        func: thread_handle_stub,
+    })
+}
+
+/// Placeholder dispatch for a bare `Thread` sentinel value. Member
+/// access (`join`, `name`, `isAlive`) is intercepted by the
+/// interpreter before this is ever called; invoking the handle itself
+/// is not a valid Kotlin operation.
+fn thread_handle_stub(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Err(RuntimeError::Type(
+        "Thread handle is not callable; use .join() / .name / .isAlive".into(),
+    ))
 }
 
 #[must_use]

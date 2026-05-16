@@ -41,6 +41,28 @@ impl<T: ?Sized> Clone for ObjRef<T> {
     fn clone(&self) -> Self { Self(Rc::clone(&self.0)) }
 }
 
+/// The single memory-model seam where a release/acquire pair would be
+/// emitted under a parallel backing.
+///
+/// Kotlin's memory model defines program behaviour only for race-free
+/// programs, and for those the observable result is whatever a
+/// sequentially consistent execution produces. KLIO interprets on one
+/// thread and serializes every action, so every execution is already
+/// sequentially consistent: monitor enter/exit, thread start, and
+/// thread join impose no ordering that the single instruction stream
+/// does not already guarantee. This function is therefore an
+/// intentional no-op.
+///
+/// It exists as a named site so the ordering points are real in the
+/// code rather than implicit. It is invoked conceptually at the
+/// memory-model boundaries — `synchronized` enter and exit, and
+/// `thread` start and `Thread.join`. When a future stage gives KLIO a
+/// truly parallel backing, this is the one place that grows real
+/// `Acquire`/`Release` fences (and where the `ObjRef` heap handle
+/// gains its publication barrier); call sites do not change.
+#[inline(always)]
+pub fn fence_and_publish() {}
+
 /// Function pointer signature for a Rust-native stdlib intrinsic.
 ///
 /// `CallCtx::args` carries the call arguments. For member access (`x.f()`

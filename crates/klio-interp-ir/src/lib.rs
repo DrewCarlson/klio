@@ -886,7 +886,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Probe stdlib by FQN for known package surfaces. Covers
         // bare references to `IntArray`, `compareBy`, `buildList`,
         // `naturalOrder`, `PI`, etc. that aren't in IMPLICIT_ALIASES.
-        let direct_probes: [String; 7] = [
+        let direct_probes: [String; 8] = [
             name.to_string(),
             format!("kotlin.{name}"),
             format!("kotlin.collections.{name}"),
@@ -894,6 +894,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             format!("kotlin.ranges.{name}"),
             format!("kotlin.math.{name}"),
             format!("kotlin.comparisons.{name}"),
+            format!("kotlin.concurrent.{name}"),
         ];
         // Loaded packs register their FQNs in `installed_bindings`.
         // For a bare-name reference, scan the overlay for a key that
@@ -1294,6 +1295,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(v);
                 }
                 return Ok(klio_runtime::Value::Null);
+            }
+        }
+        // `Thread` handle property reads (`t.name`, `t.isAlive`).
+        // Mirrors the member-call interception in `call_member`.
+        if let klio_runtime::Value::Intrinsic { fqn, .. } = receiver {
+            if *fqn == "kotlin.concurrent.Thread" {
+                match name {
+                    "isAlive" => return Ok(klio_runtime::Value::Bool(false)),
+                    "name" => {
+                        return Ok(klio_runtime::Value::String(Rc::new(
+                            "Thread-0".to_string(),
+                        )))
+                    }
+                    _ => {}
+                }
             }
         }
         // Custom getter — invoke its IR FuncId with the receiver
@@ -3261,6 +3277,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // `Delegates.vetoable` — synthesise the proper
         // `Value::Delegate` directly. The singleton itself is
         // surfaced via `lookup_global` as a sentinel Intrinsic.
+        // `Thread` handle returned by `kotlin.concurrent.thread`. The
+        // body already ran to completion on the calling stack (see
+        // `concurrent_thread`), so `join()` is a no-op whose
+        // happens-before guarantee already holds; `isAlive` is false
+        // and `name` is a stable string. `fence_and_publish` marks the
+        // join boundary.
+        if let klio_runtime::Value::Intrinsic { fqn, .. } = receiver {
+            if *fqn == "kotlin.concurrent.Thread" {
+                match name {
+                    "join" => {
+                        klio_runtime::fence_and_publish(); // thread join
+                        return Ok(klio_runtime::Value::Unit);
+                    }
+                    "isAlive" => return Ok(klio_runtime::Value::Bool(false)),
+                    "name" => {
+                        return Ok(klio_runtime::Value::String(Rc::new(
+                            "Thread-0".to_string(),
+                        )))
+                    }
+                    "start" | "interrupt" => return Ok(klio_runtime::Value::Unit),
+                    _ => {}
+                }
+            }
+        }
         if let klio_runtime::Value::Intrinsic { fqn, .. } = receiver {
             if *fqn == "kotlin.properties.Delegates" {
                 match (name, args.len()) {

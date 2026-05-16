@@ -11,12 +11,14 @@ expression: "import kotlin.foo.*\n\nfun main() {}\n"
   [5] Builtin require @builtin
   [6] Builtin repeat @builtin
   [7] Builtin contract @builtin
-  [8] Builtin buildList @builtin
-  [9] Builtin buildMap @builtin
-  [10] Builtin buildSet @builtin
-  [11] Builtin sequence @builtin
-  [12] Builtin iterator @builtin
-  [13] TopLevelFunction main @25..29
+  [8] Builtin synchronized @builtin
+  [9] Builtin thread @builtin
+  [10] Builtin buildList @builtin
+  [11] Builtin buildMap @builtin
+  [12] Builtin buildSet @builtin
+  [13] Builtin sequence @builtin
+  [14] Builtin iterator @builtin
+  [15] TopLevelFunction main @25..29
 
 # uses
 

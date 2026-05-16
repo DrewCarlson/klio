@@ -11,12 +11,14 @@ expression: "fun main() {\n    println(banana)\n}\n"
   [5] Builtin require @builtin
   [6] Builtin repeat @builtin
   [7] Builtin contract @builtin
-  [8] Builtin buildList @builtin
-  [9] Builtin buildMap @builtin
-  [10] Builtin buildSet @builtin
-  [11] Builtin sequence @builtin
-  [12] Builtin iterator @builtin
-  [13] TopLevelFunction main @4..8
+  [8] Builtin synchronized @builtin
+  [9] Builtin thread @builtin
+  [10] Builtin buildList @builtin
+  [11] Builtin buildMap @builtin
+  [12] Builtin buildSet @builtin
+  [13] Builtin sequence @builtin
+  [14] Builtin iterator @builtin
+  [15] TopLevelFunction main @4..8
 
 # uses
   @17..24 -> [0] println (Builtin)
