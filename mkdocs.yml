@@ -60,6 +60,8 @@ nav:
     - Pipeline Overview: architecture/pipeline.md
     - The Vm: architecture/interpreter.md
     - Standard Library: architecture/stdlib.md
+    - Concurrency: architecture/concurrency.md
+    - Memory Model: architecture/memory-model.md
     - Diagnostics: architecture/diagnostics.md
   - Packs:
     - What is a Pack?: packs/overview.md
