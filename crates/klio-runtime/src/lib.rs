@@ -6,15 +6,42 @@
 //! the other.
 #![allow(unsafe_code)] // `ObjRef`'s adaptive cell; see its safety docs.
 
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
+
+/// Synchronization primitives for [`AdaptiveCell`]. Under `cfg(loom)`
+/// the atomic `state`, the `Mutex` lock, and the data `UnsafeCell`
+/// resolve to loom's instrumented models so the publication protocol
+/// can be exhaustively model-checked; under every normal build they
+/// resolve to the `std` equivalents and the generated code is
+/// behaviorally identical to a direct `std` use. `flag` stays a
+/// `std::cell::Cell` in both builds: it is single-owner by the
+/// protocol and loom intentionally does not model non-atomic cells.
+mod cell_sync {
+    #[cfg(loom)]
+    pub(crate) use loom::cell::UnsafeCell;
+    #[cfg(loom)]
+    pub(crate) use loom::sync::atomic::{AtomicU8, Ordering};
+    #[cfg(loom)]
+    pub(crate) use loom::sync::{Mutex, MutexGuard};
+
+    #[cfg(not(loom))]
+    pub(crate) use std::cell::UnsafeCell;
+    #[cfg(not(loom))]
+    pub(crate) use std::sync::atomic::{AtomicU8, Ordering};
+    #[cfg(not(loom))]
+    pub(crate) use std::sync::{Mutex, MutexGuard};
+
+    pub(crate) use std::cell::Cell;
+}
+
+use cell_sync::{AtomicU8, Cell, Ordering, UnsafeCell};
 
 /// Adaptive interior-mutable cell behind [`ObjRef`].
 ///
@@ -46,7 +73,7 @@ use thiserror::Error;
 struct AdaptiveCell<T: ?Sized> {
     state: AtomicU8,
     flag: Cell<isize>,
-    lock: Mutex<()>,
+    lock: cell_sync::Mutex<()>,
     data: UnsafeCell<T>,
 }
 
@@ -62,8 +89,56 @@ impl<T> AdaptiveCell<T> {
         Self {
             state: AtomicU8::new(UNSHARED),
             flag: Cell::new(0),
-            lock: Mutex::new(()),
+            lock: cell_sync::Mutex::new(()),
             data: UnsafeCell::new(v),
+        }
+    }
+}
+
+impl<T: ?Sized> AdaptiveCell<T> {
+    /// Run `f` with a const pointer to the cell's data. The single
+    /// place the data `UnsafeCell`'s access shape diverges: `std`'s
+    /// `UnsafeCell::get` vs loom's `UnsafeCell::with`. Callers must
+    /// uphold the borrow protocol exactly as before; this only
+    /// abstracts pointer acquisition.
+    #[inline(always)]
+    fn with_data_ptr<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+        #[cfg(loom)]
+        {
+            self.data.with(|p| f(p))
+        }
+        #[cfg(not(loom))]
+        {
+            f(self.data.get())
+        }
+    }
+
+    /// Run `f` with a mutable pointer to the cell's data. See
+    /// [`Self::with_data_ptr`]; mirrors loom's `UnsafeCell::with_mut`.
+    #[inline(always)]
+    fn with_data_ptr_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+        #[cfg(loom)]
+        {
+            self.data.with_mut(|p| f(p))
+        }
+        #[cfg(not(loom))]
+        {
+            f(self.data.get())
+        }
+    }
+
+    /// Acquire the per-cell lock that serializes access once the cell
+    /// is `SHARED`. `std` `Mutex` can poison (recovered via
+    /// `into_inner`); loom's never does.
+    #[inline(always)]
+    fn lock_shared(&self) -> cell_sync::MutexGuard<'_, ()> {
+        #[cfg(loom)]
+        {
+            self.lock.lock().unwrap()
+        }
+        #[cfg(not(loom))]
+        {
+            self.lock.lock().unwrap_or_else(|e| e.into_inner())
         }
     }
 }
@@ -111,7 +186,7 @@ impl<T: ?Sized> ObjRef<T> {
     fn try_borrow(&self) -> Option<ObjGuard<'_, T>> {
         let cell = &*self.0;
         let _guard = (cell.state.load(Ordering::Acquire) == SHARED)
-            .then(|| cell.lock.lock().unwrap_or_else(|e| e.into_inner()));
+            .then(|| cell.lock_shared());
         let f = cell.flag.get();
         if f < 0 {
             return None;
@@ -127,7 +202,7 @@ impl<T: ?Sized> ObjRef<T> {
     pub fn try_borrow_mut(&self) -> Result<ObjGuardMut<'_, T>, BorrowMutError> {
         let cell = &*self.0;
         let _guard = (cell.state.load(Ordering::Acquire) == SHARED)
-            .then(|| cell.lock.lock().unwrap_or_else(|e| e.into_inner()));
+            .then(|| cell.lock_shared());
         if cell.flag.get() != 0 {
             return Err(BorrowMutError);
         }
@@ -162,7 +237,7 @@ impl<T: ?Sized> ObjRef<T> {
 
     #[must_use]
     pub fn as_ptr(&self) -> *const T {
-        self.0.data.get()
+        self.0.with_data_ptr(|p| p)
     }
 }
 
@@ -186,13 +261,15 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjRef<T> {
 /// Shared-borrow guard. Restores the borrow count on drop.
 pub struct ObjGuard<'a, T: ?Sized> {
     cell: &'a AdaptiveCell<T>,
-    _shared: Option<std::sync::MutexGuard<'a, ()>>,
+    _shared: Option<cell_sync::MutexGuard<'a, ()>>,
 }
 impl<T: ?Sized> Deref for ObjGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY: a shared borrow is live (flag > 0).
-        unsafe { &*self.cell.data.get() }
+        // SAFETY: a shared borrow is live (flag > 0). The pointer is
+        // valid for the cell's lifetime and the guard outlives this
+        // reference.
+        self.cell.with_data_ptr(|p| unsafe { &*p })
     }
 }
 impl<T: ?Sized> Drop for ObjGuard<'_, T> {
@@ -214,19 +291,19 @@ impl<T: ?Sized + fmt::Display> fmt::Display for ObjGuard<'_, T> {
 /// Mutable-borrow guard. Restores the borrow flag on drop.
 pub struct ObjGuardMut<'a, T: ?Sized> {
     cell: &'a AdaptiveCell<T>,
-    _shared: Option<std::sync::MutexGuard<'a, ()>>,
+    _shared: Option<cell_sync::MutexGuard<'a, ()>>,
 }
 impl<T: ?Sized> Deref for ObjGuardMut<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         // SAFETY: an exclusive borrow is live (flag == -1).
-        unsafe { &*self.cell.data.get() }
+        self.cell.with_data_ptr(|p| unsafe { &*p })
     }
 }
 impl<T: ?Sized> DerefMut for ObjGuardMut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: an exclusive borrow is live (flag == -1).
-        unsafe { &mut *self.cell.data.get() }
+        self.cell.with_data_ptr_mut(|p| unsafe { &mut *p })
     }
 }
 impl<T: ?Sized> Drop for ObjGuardMut<'_, T> {

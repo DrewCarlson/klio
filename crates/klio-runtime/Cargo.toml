@@ -11,5 +11,14 @@ klio-ast   = { workspace = true }
 thiserror = { workspace = true }
 regex     = "1"
 
+# `loom` models AdaptiveCell's atomics/Mutex/UnsafeCell only when the
+# build is invoked with `RUSTFLAGS="--cfg loom"`. The cfg gate means
+# it is never resolved, downloaded, or linked into a normal build;
+# `cargo build/test` without the flag is unaffected. It is a regular
+# (not dev) dependency because the lib's `cell_sync` module itself
+# references `loom::{sync,cell}` under `cfg(loom)`.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [lints]
 workspace = true
