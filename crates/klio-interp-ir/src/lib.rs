@@ -266,7 +266,7 @@ impl Vm {
                             .unwrap_or(false);
                         if has_provide {
                             let prop_ref = klio_runtime::Value::PropertyRef {
-                                name: Rc::new(name.clone()),
+                                name: Arc::new(name.clone()),
                             };
                             if let Ok(replacement) =
                                 <VmHost as klio_ir::eval::Host>::call_member(
@@ -803,7 +803,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if let Some(v) = cached.clone() {
                 if matches!(v, klio_runtime::Value::Instance(_)) {
                     let prop_ref = klio_runtime::Value::PropertyRef {
-                        name: Rc::new(name.to_string()),
+                        name: Arc::new(name.to_string()),
                     };
                     if let Ok(result) = <Self as klio_ir::eval::Host>::call_member(
                         self,
@@ -881,7 +881,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             });
             return Some(klio_runtime::Value::IrClosure {
                 id,
-                captures: Rc::new(Vec::new()),
+                captures: Arc::new(Vec::new()),
             });
         }
         // Probe stdlib by FQN for known package surfaces. Covers
@@ -1017,7 +1017,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if let Some(d) = existing {
                 if matches!(d, klio_runtime::Value::Instance(_)) {
                     let prop_ref = klio_runtime::Value::PropertyRef {
-                        name: Rc::new(name.to_string()),
+                        name: Arc::new(name.to_string()),
                     };
                     <Self as klio_ir::eval::Host>::call_member(
                         self,
@@ -1050,7 +1050,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         on_change: on_change.clone(),
                     };
                     let prop_ref = klio_runtime::Value::PropertyRef {
-                        name: Rc::new(name.to_string()),
+                        name: Arc::new(name.to_string()),
                     };
                     let _ = <Self as klio_ir::eval::Host>::call_value(
                         self,
@@ -1075,8 +1075,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if let klio_runtime::DelegateKind::NotNull { value: None, .. } = &*d.borrow() {
                 return Err(klio_ir::eval::EvalError::Throw(
                     klio_runtime::Value::Exception {
-                        fqn: Rc::new("kotlin.IllegalStateException".to_string()),
-                        message: Some(Rc::new(format!(
+                        fqn: Arc::new("kotlin.IllegalStateException".to_string()),
+                        message: Some(Arc::new(format!(
                             "Property {} should be initialized before get.",
                             name
                         ))),
@@ -1305,7 +1305,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 match name {
                     "isAlive" => return Ok(klio_runtime::Value::Bool(false)),
                     "name" => {
-                        return Ok(klio_runtime::Value::String(Rc::new(
+                        return Ok(klio_runtime::Value::String(Arc::new(
                             "Thread-0".to_string(),
                         )))
                     }
@@ -1333,7 +1333,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: Some(Rc::new(cls.name.clone())),
+                        enum_class: Some(Arc::new(cls.name.clone())),
                     });
                 }
                 if let Some((_, v)) = cls
@@ -1355,7 +1355,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 if let Some(klio_runtime::Value::String(n)) = snap.get("__bound_name__") {
                     match name {
                         "name" | "simpleName" => {
-                            return Ok(klio_runtime::Value::String(Rc::clone(&n)));
+                            return Ok(klio_runtime::Value::String(Arc::clone(&n)));
                         }
                         _ => {}
                     }
@@ -1371,7 +1371,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 if let Some(f) = self.module.funcs.get(info.body_func.0 as usize) {
                     match name {
                         "name" => {
-                            return Ok(klio_runtime::Value::String(Rc::new(
+                            return Ok(klio_runtime::Value::String(Arc::new(
                                 f.name.clone(),
                             )));
                         }
@@ -1380,7 +1380,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 .params
                                 .iter()
                                 .map(|p| {
-                                    klio_runtime::Value::String(Rc::new(p.name.clone()))
+                                    klio_runtime::Value::String(Arc::new(p.name.clone()))
                                 })
                                 .collect();
                             return Ok(klio_runtime::Value::List {
@@ -1463,10 +1463,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         match receiver {
             klio_runtime::Value::Class(cls) => match name {
                 "simpleName" => {
-                    return Ok(klio_runtime::Value::String(Rc::new(cls.name.clone())));
+                    return Ok(klio_runtime::Value::String(Arc::new(cls.name.clone())));
                 }
                 "qualifiedName" => {
-                    return Ok(klio_runtime::Value::String(Rc::new(cls.fqn.clone())));
+                    return Ok(klio_runtime::Value::String(Arc::new(cls.fqn.clone())));
                 }
                 "isData" => return Ok(klio_runtime::Value::Bool(cls.is_data)),
                 "isOpen" => return Ok(klio_runtime::Value::Bool(cls.is_open)),
@@ -1504,20 +1504,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     {
                         if let Some(f) = self.module.funcs.get(fid.0 as usize) {
                             items.push(klio_runtime::Value::PropertyRef {
-                                name: Rc::new(f.name.clone()),
+                                name: Arc::new(f.name.clone()),
                             });
                         }
                     }
                     for p in &cls.primary_params {
                         if p.property.is_some() {
                             items.push(klio_runtime::Value::PropertyRef {
-                                name: Rc::new(p.name.clone()),
+                                name: Arc::new(p.name.clone()),
                             });
                         }
                     }
                     for p in &cls.body_properties {
                         items.push(klio_runtime::Value::PropertyRef {
-                            name: Rc::new(p.name.clone()),
+                            name: Arc::new(p.name.clone()),
                         });
                     }
                     return Ok(klio_runtime::Value::List {
@@ -1534,7 +1534,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             if let Some(c) = self.classes.borrow().get(n).cloned() {
                                 klio_runtime::Value::Class(c)
                             } else {
-                                klio_runtime::Value::String(Rc::new(n.clone()))
+                                klio_runtime::Value::String(Arc::new(n.clone()))
                             }
                         })
                         .collect();
@@ -1562,7 +1562,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             },
             klio_runtime::Value::PropertyRef { name: pname } => match name {
                 "name" | "simpleName" => {
-                    return Ok(klio_runtime::Value::String(Rc::clone(pname)));
+                    return Ok(klio_runtime::Value::String(Arc::clone(pname)));
                 }
                 _ => {}
             },
@@ -1623,7 +1623,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 let raw = inst.borrow().get(name);
                 if let Some(d) = raw {
                     let prop_ref = klio_runtime::Value::PropertyRef {
-                        name: Rc::new(name.to_string()),
+                        name: Arc::new(name.to_string()),
                     };
                     return <Self as klio_ir::eval::Host>::call_member(
                         self,
@@ -1667,11 +1667,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     if is_lateinit {
                         return Err(klio_ir::eval::EvalError::Throw(
                             klio_runtime::Value::Exception {
-                                fqn: Rc::new(
+                                fqn: Arc::new(
                                     "kotlin.UninitializedPropertyAccessException"
                                         .to_string(),
                                 ),
-                                message: Some(Rc::new(format!(
+                                message: Some(Arc::new(format!(
                                     "lateinit property {name} has not been initialized"
                                 ))),
                                 cause: None,
@@ -1707,10 +1707,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 Some(x) => Ok(x),
                                 None => Err(klio_ir::eval::EvalError::Throw(
                                     klio_runtime::Value::Exception {
-                                        fqn: Rc::new(
+                                        fqn: Arc::new(
                                             "kotlin.IllegalStateException".into(),
                                         ),
-                                        message: Some(Rc::new(format!(
+                                        message: Some(Arc::new(format!(
                                             "Property {name} should be initialized before get."
                                         ))),
                                         cause: None,
@@ -1809,7 +1809,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: Some(Rc::new(class_def.name.clone())),
+                        enum_class: Some(Arc::new(class_def.name.clone())),
                     });
                 }
             }
@@ -1949,7 +1949,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let raw = inst.borrow().get(real_name);
                     if let Some(d) = raw {
                         let prop_ref = klio_runtime::Value::PropertyRef {
-                            name: Rc::new(real_name.to_string()),
+                            name: Arc::new(real_name.to_string()),
                         };
                         <Self as klio_ir::eval::Host>::call_member(
                             self,
@@ -2105,7 +2105,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 ("__bound_receiver__".to_string(), receiver.clone()),
                 (
                     "__bound_name__".to_string(),
-                    klio_runtime::Value::String(Rc::new(name.to_string())),
+                    klio_runtime::Value::String(Arc::new(name.to_string())),
                 ),
             ],
             outer: None,
@@ -3141,7 +3141,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         });
         Ok(klio_runtime::Value::IrClosure {
             id,
-            captures: Rc::new(captures),
+            captures: Arc::new(captures),
         })
     }
 
@@ -3209,8 +3209,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             Some(x) => Ok(x),
                             None => Err(klio_ir::eval::EvalError::Throw(
                                 klio_runtime::Value::Exception {
-                                    fqn: Rc::new("kotlin.IllegalStateException".into()),
-                                    message: Some(Rc::new(
+                                    fqn: Arc::new("kotlin.IllegalStateException".into()),
+                                    message: Some(Arc::new(
                                         "Property should be initialized before get.".into(),
                                     )),
                                     cause: None,
@@ -3293,7 +3293,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                     "isAlive" => return Ok(klio_runtime::Value::Bool(false)),
                     "name" => {
-                        return Ok(klio_runtime::Value::String(Rc::new(
+                        return Ok(klio_runtime::Value::String(Arc::new(
                             "Thread-0".to_string(),
                         )))
                     }
@@ -3590,7 +3590,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return Ok(klio_runtime::Value::List {
                     items: klio_runtime::ObjRef::new(items),
                     mutable: false,
-                    enum_class: Some(Rc::new(cls.name.clone())),
+                    enum_class: Some(Arc::new(cls.name.clone())),
                 });
             }
             // Enum.valueOf("X") — find entry by name.
@@ -3606,10 +3606,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                     return Err(klio_ir::eval::EvalError::Throw(
                         klio_runtime::Value::Exception {
-                            fqn: std::rc::Rc::new(
+                            fqn: std::sync::Arc::new(
                                 "kotlin.IllegalArgumentException".to_string(),
                             ),
-                            message: Some(std::rc::Rc::new(format!(
+                            message: Some(std::sync::Arc::new(format!(
                                 "No enum constant {}.{}",
                                 cls.fqn, s
                             ))),
@@ -3702,7 +3702,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::new_int(h.finish() as i64));
                 }
                 ("toString", 0) => {
-                    return Ok(klio_runtime::Value::String(Rc::new(format!(
+                    return Ok(klio_runtime::Value::String(Arc::new(format!(
                         "class {}", a.name
                     ))));
                 }
@@ -3731,7 +3731,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         {
                             match name {
                                 "name" => {
-                                    return Ok(klio_runtime::Value::String(Rc::new(
+                                    return Ok(klio_runtime::Value::String(Arc::new(
                                         f.name.clone(),
                                     )));
                                 }
@@ -3740,7 +3740,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                         .params
                                         .iter()
                                         .map(|p| {
-                                            klio_runtime::Value::String(Rc::new(
+                                            klio_runtime::Value::String(Arc::new(
                                                 p.name.clone(),
                                             ))
                                         })
@@ -3777,7 +3777,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     ));
                 }
                 ("toString", 0) => {
-                    return Ok(klio_runtime::Value::String(Rc::new(format!(
+                    return Ok(klio_runtime::Value::String(Arc::new(format!(
                         "property {pname}"
                     ))));
                 }
@@ -3909,7 +3909,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let mut chain: Vec<(klio_runtime::Value, bool)> = (**steps).clone();
                     chain.push((args[0].clone(), name == "thenByDescending"));
                     return Ok(klio_runtime::Value::Comparator {
-                        steps: Rc::new(chain),
+                        steps: Arc::new(chain),
                         descending: *descending,
                     });
                 }
@@ -3922,7 +3922,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 chain.push((sel.clone(), *d ^ other_desc ^ invert));
                             }
                             return Ok(klio_runtime::Value::Comparator {
-                                steps: Rc::new(chain),
+                                steps: Arc::new(chain),
                                 descending: *descending,
                             });
                         }
@@ -3931,7 +3931,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             let mut chain: Vec<(klio_runtime::Value, bool)> = (**steps).clone();
                             chain.push((args[0].clone(), invert));
                             return Ok(klio_runtime::Value::Comparator {
-                                steps: Rc::new(chain),
+                                steps: Arc::new(chain),
                                 descending: *descending,
                             });
                         }
@@ -3940,7 +3940,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
                 "reversed" if args.is_empty() => {
                     return Ok(klio_runtime::Value::Comparator {
-                        steps: Rc::clone(steps),
+                        steps: Arc::clone(steps),
                         descending: !*descending,
                     });
                 }
@@ -4047,7 +4047,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             _ => None,
                         })
                         .collect();
-                    return Ok(klio_runtime::Value::String(Rc::new(s)));
+                    return Ok(klio_runtime::Value::String(Arc::new(s)));
                 }
                 _ => {}
             }
@@ -4157,8 +4157,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let p = *pos.borrow();
                     let v = items.borrow().get(p).cloned().ok_or_else(|| {
                         klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
-                            fqn: Rc::new("kotlin.NoSuchElementException".to_string()),
-                            message: Some(Rc::new("iterator exhausted".into())),
+                            fqn: Arc::new("kotlin.NoSuchElementException".to_string()),
+                            message: Some(Arc::new("iterator exhausted".into())),
                             cause: None,
                         })
                     })?;
@@ -4216,7 +4216,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 // though `is_data` is set. Short-circuit before the
                 // structural data-class shape below.
                 let i = inst.borrow();
-                return Ok(klio_runtime::Value::String(Rc::new(i.class.name.clone())));
+                return Ok(klio_runtime::Value::String(Arc::new(i.class.name.clone())));
             }
             if is_data && !has_user_override && args.is_empty() {
                 if let Some(rest) = name.strip_prefix("component") {
@@ -4246,7 +4246,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         s.push_str(&format!("{v}"));
                     }
                     s.push(')');
-                    return Ok(klio_runtime::Value::String(Rc::new(s)));
+                    return Ok(klio_runtime::Value::String(Arc::new(s)));
                 }
                 if name == "hashCode" {
                     let i = inst.borrow();
@@ -4451,13 +4451,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 // above runs first and wins).
                 if i.class.is_enum {
                     if let Some(klio_runtime::Value::String(s)) = i.get("name") {
-                        return Ok(klio_runtime::Value::String(Rc::clone(&s)));
+                        return Ok(klio_runtime::Value::String(Arc::clone(&s)));
                     }
                 }
                 // Singleton `object` decls — including `data
                 // object` — render as the bare class name.
                 if i.class.is_object {
-                    return Ok(klio_runtime::Value::String(Rc::new(
+                    return Ok(klio_runtime::Value::String(Arc::new(
                         i.class.name.clone(),
                     )));
                 }
@@ -4476,9 +4476,9 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         s.push_str(&format!("{v}"));
                     }
                     s.push(')');
-                    return Ok(klio_runtime::Value::String(Rc::new(s)));
+                    return Ok(klio_runtime::Value::String(Arc::new(s)));
                 }
-                return Ok(klio_runtime::Value::String(Rc::new(format!(
+                return Ok(klio_runtime::Value::String(Arc::new(format!(
                     "{}@{:x}",
                     i.class.fqn, i.identity
                 ))));
@@ -4824,8 +4824,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         })?;
         if class_def.is_abstract {
             return Err(klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
-                fqn: std::rc::Rc::new("kotlin.InstantiationError".to_string()),
-                message: Some(std::rc::Rc::new(format!(
+                fqn: std::sync::Arc::new("kotlin.InstantiationError".to_string()),
+                message: Some(std::sync::Arc::new(format!(
                     "Cannot create an instance of an abstract class: {}",
                     class_def.name
                 ))),
@@ -4850,8 +4850,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return Ok(klio_runtime::Value::Instance(inst));
             }
             return Err(klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
-                fqn: std::rc::Rc::new("kotlin.InstantiationError".to_string()),
-                message: Some(std::rc::Rc::new(format!(
+                fqn: std::sync::Arc::new("kotlin.InstantiationError".to_string()),
+                message: Some(std::sync::Arc::new(format!(
                     "Cannot create an instance of an interface: {}",
                     class_def.name
                 ))),
@@ -5295,7 +5295,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             .unwrap_or(false);
                         if has_provide {
                             let prop_ref = klio_runtime::Value::PropertyRef {
-                                name: Rc::new(p.name.clone()),
+                                name: Arc::new(p.name.clone()),
                             };
                             if let Ok(rep) = <Self as klio_ir::eval::Host>::call_member(
                                 self,
@@ -5495,7 +5495,7 @@ fn simple_literal(e: &klio_ast::Expr) -> Option<klio_runtime::Value> {
                     s.push_str(t);
                 }
             }
-            Some(klio_runtime::Value::String(Rc::new(s)))
+            Some(klio_runtime::Value::String(Arc::new(s)))
         }
         _ => None,
     }

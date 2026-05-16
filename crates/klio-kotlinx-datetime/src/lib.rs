@@ -13,7 +13,7 @@
 //! Top-level arithmetic, formatting of `LocalDate` / `LocalTime` /
 //! `LocalDateTime`, and operator dispatch are pure-Kotlin in the shim.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
@@ -45,7 +45,7 @@ fn current_nanos_of_second(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn current_system_tz_id(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let id = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
-    Ok(Value::String(Rc::new(id)))
+    Ok(Value::String(Arc::new(id)))
 }
 
 fn arg_long(ctx: &CallCtx, idx: usize) -> Result<i64, RuntimeError> {
@@ -137,7 +137,7 @@ fn instant_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let dt = Utc.timestamp_opt(epoch_sec, nanos).single().ok_or_else(|| {
         RuntimeError::Type(format!("invalid epoch seconds: {epoch_sec}"))
     })?;
-    Ok(Value::String(Rc::new(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))))
+    Ok(Value::String(Arc::new(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))))
 }
 
 fn parse_instant(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

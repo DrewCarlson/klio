@@ -7,7 +7,7 @@
 //! `expect fun` on the Kotlin side. This keeps the pack faithful to
 //! upstream's "common code + thin platform actuals" structure.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use klio_runtime::{CallCtx, PrimitiveArrayKind, RuntimeError, Value};
 
@@ -53,7 +53,7 @@ fn base64_encode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     use base64::Engine;
     let data = arg_bytes(ctx, 0)?;
     let s = base64::engine::general_purpose::STANDARD.encode(&data);
-    Ok(Value::String(Rc::new(s)))
+    Ok(Value::String(Arc::new(s)))
 }
 
 fn base64_decode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -76,7 +76,7 @@ fn hex_encode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     for b in data {
         out.push_str(&format!("{b:02x}"));
     }
-    Ok(Value::String(Rc::new(out)))
+    Ok(Value::String(Arc::new(out)))
 }
 
 fn hex_decode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

@@ -1215,7 +1215,7 @@ fn build_module_with_overrides(
                     let mut fields: Vec<(String, klio_runtime::Value)> = Vec::new();
                     fields.push((
                         "name".to_string(),
-                        klio_runtime::Value::String(std::rc::Rc::new(entry.name.name.clone())),
+                        klio_runtime::Value::String(std::sync::Arc::new(entry.name.name.clone())),
                     ));
                     fields.push((
                         "ordinal".to_string(),
@@ -1268,7 +1268,7 @@ fn build_module_with_overrides(
                         // look up the override.
                         inst.borrow_mut().fields.push((
                             "__enum_entry_class__".to_string(),
-                            klio_runtime::Value::String(std::rc::Rc::new(
+                            klio_runtime::Value::String(std::sync::Arc::new(
                                 synth_class_name.clone(),
                             )),
                         ));

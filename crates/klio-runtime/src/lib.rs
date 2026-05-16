@@ -505,7 +505,7 @@ pub enum Value {
     /// kotlinc-native byte-identically.
     Float(f32),
     Bool(bool),
-    String(Rc<String>),
+    String(Arc<String>),
     Char(char),
     Null,
     /// Inclusive integer progression with a signed step. `1..10` is
@@ -516,7 +516,7 @@ pub enum Value {
     Range { start: i64, end: i64, step: i64, kind: RangeKind },
     Function { decl: Arc<klio_ast::Function>, env: Rc<RefCell<Env>> },
     Lambda {
-        params: Rc<Vec<String>>,
+        params: Arc<Vec<String>>,
         body: Arc<klio_ast::Block>,
         env: Rc<RefCell<Env>>,
         /// `true` when produced by an anonymous-function expression
@@ -533,7 +533,7 @@ pub enum Value {
     /// back to a `(module, body_func, captures)` triple at call
     /// time. Distinct from `Value::Lambda` (which carries an AST
     /// block + env tied to the tree walker).
-    IrClosure { id: u64, captures: Rc<Vec<Value>> },
+    IrClosure { id: u64, captures: Arc<Vec<Value>> },
     /// A method intrinsic bound to a specific receiver — produced by member
     /// access like `s.uppercase`. Calling it invokes `func` with the receiver
     /// prepended to the user arguments.
@@ -541,11 +541,11 @@ pub enum Value {
     /// A user-method reference bound to a specific instance — produced by
     /// `instance::method`. Calling it dispatches through the method
     /// resolution chain on `receiver` with the caller's arguments.
-    BoundUserMethod { receiver: ObjRef<InstanceData>, method: Rc<MethodDef> },
+    BoundUserMethod { receiver: ObjRef<InstanceData>, method: Arc<MethodDef> },
     /// A thrown value, modeled as a Kotlin Throwable. Carries an FQN
     /// (e.g. `kotlin.IllegalArgumentException`), an optional message, and
     /// an optional cause (another Throwable) per spec §3.12.
-    Exception { fqn: Rc<String>, message: Option<Rc<String>>, cause: Option<Box<Value>> },
+    Exception { fqn: Arc<String>, message: Option<Arc<String>>, cause: Option<Box<Value>> },
     /// `kotlin.collections.List` / `MutableList`. The mutability tag drives
     /// `type_fqn` and any mutability checks; the storage is shared.
     /// `enum_class` is `Some(name)` for the result of `EnumName.entries` /
@@ -554,7 +554,7 @@ pub enum Value {
     List {
         items: ObjRef<Vec<Value>>,
         mutable: bool,
-        enum_class: Option<Rc<String>>,
+        enum_class: Option<Arc<String>>,
     },
     /// `kotlin.Array<T>` and the primitive-array siblings (`IntArray`,
     /// `DoubleArray`, …). Fixed-size, mutable element storage. The
@@ -586,7 +586,7 @@ pub enum Value {
     /// first non-equal step wins. The outer `descending` flag is the
     /// "reversed" toggle that flips every step's effective direction
     /// (built by `Comparator.reversed`).
-    Comparator { steps: Rc<Vec<(Value, bool)>>, descending: bool },
+    Comparator { steps: Arc<Vec<(Value, bool)>>, descending: bool },
     /// A user-declared class. Calling it constructs an `Instance`. Holds the
     /// declaration plus the env it was declared in (for resolving names from
     /// method bodies, supertypes, etc.).
@@ -621,19 +621,19 @@ pub enum Value {
     /// `.name: String` member is the only feature delegate `getValue` /
     /// `setValue` calls reach for; anything richer waits on a reflection
     /// surface.
-    PropertyRef { name: Rc<String> },
+    PropertyRef { name: Arc<String> },
     /// `kotlin.text.Regex`. Carries the source pattern plus a compiled
     /// Rust regex. The compiled object is shared via `Rc` so cloning a
     /// `Value::Regex` is cheap.
-    Regex(Rc<RegexData>),
+    Regex(Arc<RegexData>),
     /// `kotlin.text.MatchResult` — single match outcome produced by
     /// `Regex.find` / `Regex.matchEntire` / `Regex.findAll` iteration.
     /// Holds the originating regex + input so `next()` can resume.
-    Match(Rc<MatchData>),
+    Match(Arc<MatchData>),
     /// `kotlin.text.MatchGroup` — one captured group of a `MatchResult`.
     /// `value` is the matched substring; `start`/`end_inclusive` are
     /// Kotlin char-indices into the original input.
-    MatchGroup { value: Rc<String>, start: i64, end_inclusive: i64 },
+    MatchGroup { value: Arc<String>, start: i64, end_inclusive: i64 },
     /// `kotlin.text.StringBuilder` — mutable string buffer. Shared
     /// storage so `sb1 === sb2` semantics hold across cloned values.
     StringBuilder(ObjRef<String>),
@@ -658,7 +658,7 @@ impl Value {
 /// Compiled regex + the original pattern source. Cheap to clone via `Rc`.
 #[derive(Debug)]
 pub struct RegexData {
-    pub pattern: Rc<String>,
+    pub pattern: Arc<String>,
     pub re: regex::Regex,
 }
 
@@ -666,19 +666,19 @@ pub struct RegexData {
 /// enough state to resume scanning via `MatchResult.next()`.
 #[derive(Debug)]
 pub struct MatchData {
-    pub input: Rc<String>,
+    pub input: Arc<String>,
     /// Index 0 is the whole match; later indices are capture groups.
     /// `None` means a group did not participate in this match.
     pub groups: Vec<Option<MatchGroupData>>,
     /// Byte offset in `input` immediately after the matched span — used
     /// by `next()` to advance past the current match.
     pub end_byte: usize,
-    pub regex: Rc<RegexData>,
+    pub regex: Arc<RegexData>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MatchGroupData {
-    pub value: Rc<String>,
+    pub value: Arc<String>,
     pub start: i64,
     pub end_inclusive: i64,
 }
@@ -847,7 +847,7 @@ pub enum SuspendTransition {
 #[derive(Debug)]
 pub struct SuspendFrame {
     pub decl: Arc<klio_ast::Function>,
-    pub body: Rc<SuspendBody>,
+    pub body: Arc<SuspendBody>,
     pub env: Rc<RefCell<Env>>,
     /// Locals introduced by val/var statements in earlier states.
     /// Survives across suspensions because each state writes/reads
@@ -1388,7 +1388,7 @@ pub struct SequenceData {
 #[derive(Debug, Clone)]
 pub enum SequenceSource {
     /// Eager-known elements. Built by `asSequence` / `sequenceOf`.
-    Items(Rc<Vec<Value>>),
+    Items(Arc<Vec<Value>>),
     /// `generateSequence(seed) { it -> next }`. `seed` is `None` for the
     /// nullary form `generateSequence { nextOrNull }` — that variant emits
     /// values from the lambda until it returns `null`.
@@ -2661,7 +2661,7 @@ mod tests {
         let entries = Value::List {
             items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
-            enum_class: Some(Rc::new("Color".to_string())),
+            enum_class: Some(Arc::new("Color".to_string())),
         };
         assert!(entries.is_runtime_type("List"));
         assert!(entries.is_runtime_type("EnumEntries"));
@@ -2683,7 +2683,7 @@ mod tests {
         let entries = Value::List {
             items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
-            enum_class: Some(Rc::new("Color".to_string())),
+            enum_class: Some(Arc::new("Color".to_string())),
         };
         assert_eq!(entries.type_fqn(), "kotlin.collections.List");
     }

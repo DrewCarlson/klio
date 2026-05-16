@@ -841,7 +841,7 @@ fn exec_inst(
                 let ls = stringify(host, &l)?;
                 let rs = stringify(host, &r)?;
                 let combined = format!("{ls}{rs}");
-                frame.write(*dst, Value::String(std::rc::Rc::new(combined)));
+                frame.write(*dst, Value::String(std::sync::Arc::new(combined)));
                 return Ok(());
             }
             // User-class operator dispatch: when an operand is a
@@ -893,7 +893,7 @@ fn exec_inst(
             let v = frame.read(*src);
             if matches!(v, Value::Null) {
                 let exc = Value::Exception {
-                    fqn: std::rc::Rc::new("kotlin.NullPointerException".into()),
+                    fqn: std::sync::Arc::new("kotlin.NullPointerException".into()),
                     message: None,
                     cause: None,
                 };
@@ -1092,8 +1092,8 @@ fn exec_inst(
                 // Failed unchecked cast raises ClassCastException
                 // so user `catch (e: ClassCastException)` arms fire.
                 let exc = Value::Exception {
-                    fqn: std::rc::Rc::new("kotlin.ClassCastException".into()),
-                    message: Some(std::rc::Rc::new(format!(
+                    fqn: std::sync::Arc::new("kotlin.ClassCastException".into()),
+                    message: Some(std::sync::Arc::new(format!(
                         "cast to `{}` failed",
                         ty.name
                     ))),
@@ -1241,7 +1241,7 @@ fn exec_inst(
             };
             frame.write(
                 *dst,
-                Value::PropertyRef { name: std::rc::Rc::new(name_str) },
+                Value::PropertyRef { name: std::sync::Arc::new(name_str) },
             );
         }
         Inst::MemberRef { dst, receiver, name } => {
@@ -1327,7 +1327,7 @@ fn const_to_value(c: &Const) -> Value {
         Const::Float(f) => Value::Float(*f),
         Const::Bool(b) => Value::Bool(*b),
         Const::Char(c) => Value::Char(*c),
-        Const::String(s) => Value::String(std::rc::Rc::new(s.clone())),
+        Const::String(s) => Value::String(std::sync::Arc::new(s.clone())),
         Const::Null => Value::Null,
     }
 }
@@ -1444,8 +1444,8 @@ fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 
 fn arith_exc(msg: &str) -> EvalError {
     EvalError::Throw(Value::Exception {
-        fqn: std::rc::Rc::new("kotlin.ArithmeticException".into()),
-        message: Some(std::rc::Rc::new(msg.into())),
+        fqn: std::sync::Arc::new("kotlin.ArithmeticException".into()),
+        message: Some(std::sync::Arc::new(msg.into())),
         cause: None,
     })
 }
@@ -1664,17 +1664,17 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::StringConcat, a, b) => {
             let mut s = render_value(a);
             s.push_str(&render_value(b));
-            Ok(Value::String(std::rc::Rc::new(s)))
+            Ok(Value::String(std::sync::Arc::new(s)))
         }
         (BinOp::Add, Value::String(a), b) => {
             let mut s = a.as_str().to_string();
             s.push_str(&render_value(b));
-            Ok(Value::String(std::rc::Rc::new(s)))
+            Ok(Value::String(std::sync::Arc::new(s)))
         }
         (BinOp::Add, a, Value::String(b)) => {
             let mut s = render_value(a);
             s.push_str(b.as_str());
-            Ok(Value::String(std::rc::Rc::new(s)))
+            Ok(Value::String(std::sync::Arc::new(s)))
         }
         _ => Err(EvalError::Type(format!(
             "BinOp::{op:?} on {l:?} and {r:?}"

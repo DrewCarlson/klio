@@ -12,7 +12,7 @@
 //! the shim can rebuild a `HttpResponse` without the native side
 //! having to construct Kotlin instances.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use klio_runtime::{CallCtx, PrimitiveArrayKind, RuntimeError, Value};
 
@@ -53,7 +53,7 @@ fn arg_string_array(ctx: &CallCtx, idx: usize) -> Result<Vec<String>, RuntimeErr
 }
 
 fn make_string_array(values: Vec<String>) -> Value {
-    let items: Vec<Value> = values.into_iter().map(|s| Value::String(Rc::new(s))).collect();
+    let items: Vec<Value> = values.into_iter().map(|s| Value::String(Arc::new(s))).collect();
     Value::Array {
         items: klio_runtime::ObjRef::new(items),
         prim: None,

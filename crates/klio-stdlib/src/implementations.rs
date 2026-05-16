@@ -13,6 +13,7 @@
 
 use std::io::BufRead;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use klio_runtime::{CallCtx, ObjRef, RuntimeError, StdlibFn, Value};
 
@@ -1188,8 +1189,8 @@ fn coll_iter_reduce(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut iter = items.into_iter();
     let Some(mut acc) = iter.next() else {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.UnsupportedOperationException".into()),
-            message: Some(Rc::new("Empty collection can't be reduced.".into())),
+            fqn: Arc::new("kotlin.UnsupportedOperationException".into()),
+            message: Some(Arc::new("Empty collection can't be reduced.".into())),
             cause: None,
         }));
     };
@@ -1567,8 +1568,8 @@ fn coll_iter_extreme(ctx: &mut CallCtx, want_max: bool, what: &str) -> Result<Va
         });
     }
     best.ok_or_else(|| RuntimeError::Thrown(Value::Exception {
-        fqn: Rc::new("kotlin.NoSuchElementException".into()),
-        message: Some(Rc::new("Collection is empty.".into())),
+        fqn: Arc::new("kotlin.NoSuchElementException".into()),
+        message: Some(Arc::new("Collection is empty.".into())),
         cause: None,
     }))
 }
@@ -1870,7 +1871,7 @@ fn cmp_comparator_sam(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         ));
     }
     Ok(Value::Comparator {
-        steps: Rc::new(vec![(lam, false)]),
+        steps: Arc::new(vec![(lam, false)]),
         descending: false,
     })
 }
@@ -1880,7 +1881,7 @@ fn cmp_compare_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     for a in ctx.args {
         steps.push((a.clone(), false));
     }
-    Ok(Value::Comparator { steps: Rc::new(steps), descending: false })
+    Ok(Value::Comparator { steps: Arc::new(steps), descending: false })
 }
 
 fn cmp_compare_by_descending(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -1888,7 +1889,7 @@ fn cmp_compare_by_descending(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     for a in ctx.args {
         steps.push((a.clone(), true));
     }
-    Ok(Value::Comparator { steps: Rc::new(steps), descending: false })
+    Ok(Value::Comparator { steps: Arc::new(steps), descending: false })
 }
 
 fn cmp_compare_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -2032,7 +2033,7 @@ fn builders_build_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         host.invoke_callable_with_this(&block, &[], &sb, *out)?;
     }
     let Value::StringBuilder(s) = sb else { unreachable!() };
-    Ok(Value::String(Rc::new(s.borrow().clone())))
+    Ok(Value::String(Arc::new(s.borrow().clone())))
 }
 
 fn contract_msg(ctx: &mut CallCtx, default: &str) -> Result<String, RuntimeError> {
@@ -2057,8 +2058,8 @@ fn contract_require(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let msg = contract_msg(ctx, "Failed requirement.")?;
     Err(RuntimeError::Thrown(Value::Exception {
-        fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-        message: Some(Rc::new(msg)),
+        fqn: Arc::new("kotlin.IllegalArgumentException".into()),
+        message: Some(Arc::new(msg)),
         cause: None,
     }))
 }
@@ -2073,8 +2074,8 @@ fn contract_check(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let msg = contract_msg(ctx, "Check failed.")?;
     Err(RuntimeError::Thrown(Value::Exception {
-        fqn: Rc::new("kotlin.IllegalStateException".into()),
-        message: Some(Rc::new(msg)),
+        fqn: Arc::new("kotlin.IllegalStateException".into()),
+        message: Some(Arc::new(msg)),
         cause: None,
     }))
 }
@@ -2086,8 +2087,8 @@ fn contract_error(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         other => format!("{other}"),
     };
     Err(RuntimeError::Thrown(Value::Exception {
-        fqn: Rc::new("kotlin.IllegalStateException".into()),
-        message: Some(Rc::new(msg)),
+        fqn: Arc::new("kotlin.IllegalStateException".into()),
+        message: Some(Arc::new(msg)),
         cause: None,
     }))
 }
@@ -2099,8 +2100,8 @@ fn contract_todo(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         None => "An operation is not implemented.".to_string(),
     };
     Err(RuntimeError::Thrown(Value::Exception {
-        fqn: Rc::new("kotlin.NotImplementedError".into()),
-        message: Some(Rc::new(msg)),
+        fqn: Arc::new("kotlin.NotImplementedError".into()),
+        message: Some(Arc::new(msg)),
         cause: None,
     }))
 }
@@ -2112,8 +2113,8 @@ fn contract_require_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let msg = contract_msg(ctx, "Required value was null.")?;
     Err(RuntimeError::Thrown(Value::Exception {
-        fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-        message: Some(Rc::new(msg)),
+        fqn: Arc::new("kotlin.IllegalArgumentException".into()),
+        message: Some(Arc::new(msg)),
         cause: None,
     }))
 }
@@ -2125,8 +2126,8 @@ fn contract_check_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let msg = contract_msg(ctx, "Required value was null.")?;
     Err(RuntimeError::Thrown(Value::Exception {
-        fqn: Rc::new("kotlin.IllegalStateException".into()),
-        message: Some(Rc::new(msg)),
+        fqn: Arc::new("kotlin.IllegalStateException".into()),
+        message: Some(Arc::new(msg)),
         cause: None,
     }))
 }
@@ -2309,7 +2310,7 @@ fn io_read_line(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
                     buf.pop();
                 }
             }
-            Ok(Value::String(Rc::new(buf)))
+            Ok(Value::String(Arc::new(buf)))
         }
         Err(e) => Err(RuntimeError::Type(format!("readLine failed: {e}"))),
     }
@@ -2488,7 +2489,7 @@ fn arg2<'a>(ctx: &'a CallCtx<'_>, what: &str) -> Result<(&'a Value, &'a Value), 
 // String members (receiver in args[0])
 // ============================================================
 
-fn recv_string<'a>(args: &'a [Value], what: &str) -> Result<&'a Rc<String>, RuntimeError> {
+fn recv_string<'a>(args: &'a [Value], what: &str) -> Result<&'a Arc<String>, RuntimeError> {
     match args.first() {
         Some(Value::String(s)) => Ok(s),
         Some(other) => Err(RuntimeError::Type(format!(
@@ -2538,12 +2539,12 @@ fn string_is_not_blank(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn string_uppercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.uppercase")?;
-    Ok(Value::String(Rc::new(s.to_uppercase())))
+    Ok(Value::String(Arc::new(s.to_uppercase())))
 }
 
 fn string_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.lowercase")?;
-    Ok(Value::String(Rc::new(s.to_lowercase())))
+    Ok(Value::String(Arc::new(s.to_lowercase())))
 }
 
 fn string_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -2555,7 +2556,7 @@ fn string_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut joined = String::with_capacity(s.len());
     joined.push_str(s);
     joined.push_str(&format!("{other}"));
-    Ok(Value::String(Rc::new(joined)))
+    Ok(Value::String(Arc::new(joined)))
 }
 
 fn string_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -2597,7 +2598,7 @@ fn string_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         )));
     }
     let out: String = chars[start as usize..end as usize].iter().collect();
-    Ok(Value::String(Rc::new(out)))
+    Ok(Value::String(Arc::new(out)))
 }
 
 fn string_starts_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -2669,7 +2670,7 @@ fn string_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
                 "replace(Regex, replacement: String) — lambda form not supported".into(),
             )),
         };
-        return Ok(Value::String(Rc::new(
+        return Ok(Value::String(Arc::new(
             r.re.replace_all(s, repl.as_str()).into_owned(),
         )));
     }
@@ -2685,20 +2686,20 @@ fn string_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             .ok_or_else(|| RuntimeError::Arity("replace requires new".into()))?,
         "replace",
     )?;
-    Ok(Value::String(Rc::new(s.replace(&old, &new))))
+    Ok(Value::String(Arc::new(s.replace(&old, &new))))
 }
 
 fn string_trim(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.trim")?;
-    Ok(Value::String(Rc::new(s.trim().to_string())))
+    Ok(Value::String(Arc::new(s.trim().to_string())))
 }
 fn string_trim_start(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.trimStart")?;
-    Ok(Value::String(Rc::new(s.trim_start().to_string())))
+    Ok(Value::String(Arc::new(s.trim_start().to_string())))
 }
 fn string_trim_end(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.trimEnd")?;
-    Ok(Value::String(Rc::new(s.trim_end().to_string())))
+    Ok(Value::String(Arc::new(s.trim_end().to_string())))
 }
 
 fn string_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -2712,19 +2713,19 @@ fn string_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Some(format!("Count `n` must be non-negative, but was {n}")),
         )));
     }
-    Ok(Value::String(Rc::new(s.repeat(*n as usize))))
+    Ok(Value::String(Arc::new(s.repeat(*n as usize))))
 }
 
 fn string_reversed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.reversed")?;
-    Ok(Value::String(Rc::new(s.chars().rev().collect())))
+    Ok(Value::String(Arc::new(s.chars().rev().collect())))
 }
 
 fn string_pad_start(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (s, target, pad) = string_pad_args(ctx, "padStart")?;
     let cur = s.chars().count();
     if cur >= target {
-        return Ok(Value::String(Rc::new((**s).clone())));
+        return Ok(Value::String(Arc::new((**s).clone())));
     }
     let needed = target - cur;
     let mut out = String::with_capacity(s.len() + needed);
@@ -2732,14 +2733,14 @@ fn string_pad_start(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         out.push(pad);
     }
     out.push_str(s);
-    Ok(Value::String(Rc::new(out)))
+    Ok(Value::String(Arc::new(out)))
 }
 
 fn string_pad_end(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (s, target, pad) = string_pad_args(ctx, "padEnd")?;
     let cur = s.chars().count();
     if cur >= target {
-        return Ok(Value::String(Rc::new((**s).clone())));
+        return Ok(Value::String(Arc::new((**s).clone())));
     }
     let needed = target - cur;
     let mut out = String::with_capacity(s.len() + needed);
@@ -2747,14 +2748,14 @@ fn string_pad_end(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     for _ in 0..needed {
         out.push(pad);
     }
-    Ok(Value::String(Rc::new(out)))
+    Ok(Value::String(Arc::new(out)))
 }
 
 #[allow(clippy::type_complexity)]
 fn string_pad_args<'a>(
     ctx: &'a CallCtx<'_>,
     what: &str,
-) -> Result<(&'a Rc<String>, usize, char), RuntimeError> {
+) -> Result<(&'a Arc<String>, usize, char), RuntimeError> {
     let s = recv_string(ctx.args, what)?;
     let target = match ctx.args.get(1) {
         Some(Value::Int(n)) if *n >= 0 => *n as usize,
@@ -2860,7 +2861,7 @@ fn string_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         };
         let items: Vec<Value> = parts
             .into_iter()
-            .map(|p| Value::String(Rc::new(p.to_string())))
+            .map(|p| Value::String(Arc::new(p.to_string())))
             .collect();
         return Ok(make_list(items, false));
     }
@@ -2874,10 +2875,10 @@ fn string_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
     };
     let parts: Vec<Value> = if delim.is_empty() {
-        s.chars().map(|c| Value::String(Rc::new(c.to_string()))).collect()
+        s.chars().map(|c| Value::String(Arc::new(c.to_string()))).collect()
     } else {
         s.split(&delim)
-            .map(|p| Value::String(Rc::new(p.to_string())))
+            .map(|p| Value::String(Arc::new(p.to_string())))
             .collect()
     };
     Ok(make_list(parts, false))
@@ -2890,8 +2891,8 @@ fn string_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     if *size <= 0 {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-            message: Some(Rc::new(format!("Size {size} must be greater than zero."))),
+            fqn: Arc::new("kotlin.IllegalArgumentException".into()),
+            message: Some(Arc::new(format!("Size {size} must be greater than zero."))),
             cause: None,
         }));
     }
@@ -2902,7 +2903,7 @@ fn string_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     while i < chars.len() {
         let end = (i + size).min(chars.len());
         let chunk: String = chars[i..end].iter().collect();
-        out.push(Value::String(Rc::new(chunk)));
+        out.push(Value::String(Arc::new(chunk)));
         i += size;
     }
     Ok(make_list(out, false))
@@ -2915,8 +2916,8 @@ fn string_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     if *size <= 0 {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-            message: Some(Rc::new(format!("size {size} must be greater than zero."))),
+            fqn: Arc::new("kotlin.IllegalArgumentException".into()),
+            message: Some(Arc::new(format!("size {size} must be greater than zero."))),
             cause: None,
         }));
     }
@@ -2932,8 +2933,8 @@ fn string_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     if step <= 0 {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-            message: Some(Rc::new(format!("step {step} must be greater than zero."))),
+            fqn: Arc::new("kotlin.IllegalArgumentException".into()),
+            message: Some(Arc::new(format!("step {step} must be greater than zero."))),
             cause: None,
         }));
     }
@@ -2946,10 +2947,10 @@ fn string_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         let end = i + size;
         if end <= chars.len() {
             let win: String = chars[i..end].iter().collect();
-            out.push(Value::String(Rc::new(win)));
+            out.push(Value::String(Arc::new(win)));
         } else if partial {
             let win: String = chars[i..].iter().collect();
-            out.push(Value::String(Rc::new(win)));
+            out.push(Value::String(Arc::new(win)));
         } else {
             break;
         }
@@ -3075,7 +3076,7 @@ fn char_is_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn char_uppercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let c = recv_char(ctx.args, "Char.uppercase")?;
     let mut up = c.to_uppercase();
-    Ok(Value::String(Rc::new(up.next().map_or(String::new(), |x| {
+    Ok(Value::String(Arc::new(up.next().map_or(String::new(), |x| {
         let rest: String = up.collect();
         format!("{x}{rest}")
     }))))
@@ -3083,13 +3084,13 @@ fn char_uppercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn char_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let c = recv_char(ctx.args, "Char.lowercase")?;
     let mut lo = c.to_lowercase();
-    Ok(Value::String(Rc::new(lo.next().map_or(String::new(), |x| {
+    Ok(Value::String(Arc::new(lo.next().map_or(String::new(), |x| {
         let rest: String = lo.collect();
         format!("{x}{rest}")
     }))))
 }
 fn char_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::String(Rc::new(recv_char(ctx.args, "Char.toString")?.to_string())))
+    Ok(Value::String(Arc::new(recv_char(ctx.args, "Char.toString")?.to_string())))
 }
 fn char_digit_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let c = recv_char(ctx.args, "Char.digitToInt")?;
@@ -3130,7 +3131,7 @@ fn int_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Some(format!("radix {radix} was not in valid range 2..36")),
         )));
     }
-    Ok(Value::String(Rc::new(int_to_radix_string(n, radix as u32))))
+    Ok(Value::String(Arc::new(int_to_radix_string(n, radix as u32))))
 }
 
 fn int_to_radix_string(n: i64, radix: u32) -> String {
@@ -3238,7 +3239,7 @@ fn unsigned_to_float(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn unsigned_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = recv_unsigned(ctx.args, "toString")?;
-    Ok(Value::String(std::rc::Rc::new(v.to_string())))
+    Ok(Value::String(std::sync::Arc::new(v.to_string())))
 }
 
 // Float receiver conversions.
@@ -3263,7 +3264,7 @@ fn float_to_byte(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn float_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let d = recv_float(ctx.args, "Float.toString")?;
-    Ok(Value::String(Rc::new(klio_runtime::kotlin_float_to_string(d))))
+    Ok(Value::String(Arc::new(klio_runtime::kotlin_float_to_string(d))))
 }
 fn float_is_nan(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Bool(recv_float(ctx.args, "Float.isNaN")?.is_nan()))
@@ -3369,7 +3370,7 @@ fn long_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Some(format!("radix {radix} was not in valid range 2..36")),
         )));
     }
-    Ok(Value::String(Rc::new(int_to_radix_string(n, radix as u32))))
+    Ok(Value::String(Arc::new(int_to_radix_string(n, radix as u32))))
 }
 fn long_compare_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let a = recv_int(ctx.args, "Long.compareTo")?;
@@ -3404,7 +3405,7 @@ fn recv_float(args: &[Value], what: &str) -> Result<f32, RuntimeError> {
 
 fn double_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let d = recv_double(ctx.args, "Double.toString")?;
-    Ok(Value::String(Rc::new(klio_runtime::kotlin_double_to_string(d))))
+    Ok(Value::String(Arc::new(klio_runtime::kotlin_double_to_string(d))))
 }
 fn double_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::new_int(f64_to_i32_kotlin(recv_double(ctx.args, "Double.toInt")?)))
@@ -3495,7 +3496,7 @@ fn bool_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(Value::Bool(b)) = ctx.args.first() else {
         return Err(RuntimeError::Type("Boolean.toString requires a Boolean".into()));
     };
-    Ok(Value::String(Rc::new(b.to_string())))
+    Ok(Value::String(Arc::new(b.to_string())))
 }
 
 // ============================================================
@@ -3504,8 +3505,8 @@ fn bool_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn make_exception(fqn: &str, message: Option<String>) -> Value {
     Value::Exception {
-        fqn: Rc::new(fqn.to_string()),
-        message: message.map(Rc::new),
+        fqn: Arc::new(fqn.to_string()),
+        message: message.map(Arc::new),
         cause: None,
     }
 }
@@ -3546,8 +3547,8 @@ fn build_exception(ctx: &CallCtx<'_>, fqn: &str) -> Result<Value, RuntimeError> 
         }
     };
     Ok(Value::Exception {
-        fqn: Rc::new(fqn.to_string()),
-        message: message.map(Rc::new),
+        fqn: Arc::new(fqn.to_string()),
+        message: message.map(Arc::new),
         cause,
     })
 }
@@ -3607,14 +3608,14 @@ fn throwable_message(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     Ok(message
         .as_ref()
-        .map_or(Value::Null, |m| Value::String(Rc::clone(m))))
+        .map_or(Value::Null, |m| Value::String(Arc::clone(m))))
 }
 
 fn throwable_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(v @ Value::Exception { .. }) = ctx.args.first() else {
         return Err(RuntimeError::Type("toString requires a Throwable receiver".into()));
     };
-    Ok(Value::String(Rc::new(format!("{v}"))))
+    Ok(Value::String(Arc::new(format!("{v}"))))
 }
 
 fn throwable_cause(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -3870,8 +3871,8 @@ fn coll_list_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let i = *idx;
     if i < 0 || (i as usize) >= borrow.len() {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.IndexOutOfBoundsException".into()),
-            message: Some(Rc::new(format!(
+            fqn: Arc::new("kotlin.IndexOutOfBoundsException".into()),
+            message: Some(Arc::new(format!(
                 "Index {i} out of bounds for length {}",
                 borrow.len()
             ))),
@@ -3891,16 +3892,16 @@ fn coll_list_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             }
         }
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Rc::new("Collection contains no element matching the predicate.".into())),
+            fqn: Arc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Arc::new("Collection contains no element matching the predicate.".into())),
             cause: None,
         }));
     }
     let it = recv_list_items(ctx.args, "List.first")?;
     it.borrow().first().cloned().ok_or_else(|| {
         RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Rc::new("List is empty.".into())),
+            fqn: Arc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Arc::new("List is empty.".into())),
             cause: None,
         })
     })
@@ -3917,16 +3918,16 @@ fn coll_list_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             }
         }
         return found.ok_or_else(|| RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Rc::new("Collection contains no element matching the predicate.".into())),
+            fqn: Arc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Arc::new("Collection contains no element matching the predicate.".into())),
             cause: None,
         }));
     }
     let it = recv_list_items(ctx.args, "List.last")?;
     it.borrow().last().cloned().ok_or_else(|| {
         RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Rc::new("List is empty.".into())),
+            fqn: Arc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Arc::new("List is empty.".into())),
             cause: None,
         })
     })
@@ -4010,11 +4011,11 @@ fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         out.push_str(&truncated);
     }
     out.push_str(&postfix);
-    Ok(Value::String(Rc::new(out)))
+    Ok(Value::String(Arc::new(out)))
 }
 fn coll_list_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = ctx.args.first().ok_or_else(|| RuntimeError::Type("List.toString requires a receiver".into()))?;
-    Ok(Value::String(Rc::new(format!("{v}"))))
+    Ok(Value::String(Arc::new(format!("{v}"))))
 }
 
 fn coll_mut_list_add(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -4038,8 +4039,8 @@ fn coll_mut_list_add(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         let idx = *i as usize;
         if *i < 0 || idx > borrow.len() {
             return Err(RuntimeError::Thrown(Value::Exception {
-                fqn: Rc::new("kotlin.IndexOutOfBoundsException".into()),
-                message: Some(Rc::new(format!(
+                fqn: Arc::new("kotlin.IndexOutOfBoundsException".into()),
+                message: Some(Arc::new(format!(
                     "Index {i} out of bounds for length {}",
                     borrow.len()
                 ))),
@@ -4059,8 +4060,8 @@ fn coll_mut_list_remove_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut borrow = it.borrow_mut();
     if *i < 0 || (*i as usize) >= borrow.len() {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.IndexOutOfBoundsException".into()),
-            message: Some(Rc::new(format!(
+            fqn: Arc::new("kotlin.IndexOutOfBoundsException".into()),
+            message: Some(Arc::new(format!(
                 "Index {i} out of bounds for length {}",
                 borrow.len()
             ))),
@@ -4543,8 +4544,8 @@ fn list_take_count(ctx: &CallCtx<'_>, what: &str) -> Result<i64, RuntimeError> {
     };
     if n < 0 {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-            message: Some(Rc::new(format!("Requested element count {n} is less than zero."))),
+            fqn: Arc::new("kotlin.IllegalArgumentException".into()),
+            message: Some(Arc::new(format!("Requested element count {n} is less than zero."))),
             cause: None,
         }));
     }
@@ -4590,8 +4591,8 @@ fn coll_list_slice(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             for i in range_iter_int(*start, *end, *step) {
                 if i < 0 || i >= len {
                     return Err(RuntimeError::Thrown(Value::Exception {
-                        fqn: Rc::new("kotlin.IndexOutOfBoundsException".into()),
-                        message: Some(Rc::new(format!(
+                        fqn: Arc::new("kotlin.IndexOutOfBoundsException".into()),
+                        message: Some(Arc::new(format!(
                             "Index {i} out of bounds for length {len}"
                         ))),
                         cause: None,
@@ -4611,8 +4612,8 @@ fn coll_list_slice(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
                 };
                 if i < 0 || i >= len {
                     return Err(RuntimeError::Thrown(Value::Exception {
-                        fqn: Rc::new("kotlin.IndexOutOfBoundsException".into()),
-                        message: Some(Rc::new(format!(
+                        fqn: Arc::new("kotlin.IndexOutOfBoundsException".into()),
+                        message: Some(Arc::new(format!(
                             "Index {i} out of bounds for length {len}"
                         ))),
                         cause: None,
@@ -4641,8 +4642,8 @@ fn coll_list_sublist(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let len = borrow.len() as i64;
     if from < 0 || to > len || from > to {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.IndexOutOfBoundsException".into()),
-            message: Some(Rc::new(format!(
+            fqn: Arc::new("kotlin.IndexOutOfBoundsException".into()),
+            message: Some(Arc::new(format!(
                 "fromIndex: {from}, toIndex: {to}, size: {len}"
             ))),
             cause: None,
@@ -4694,8 +4695,8 @@ fn coll_list_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     if *size <= 0 {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-            message: Some(Rc::new(format!("Size {size} must be greater than zero."))),
+            fqn: Arc::new("kotlin.IllegalArgumentException".into()),
+            message: Some(Arc::new(format!("Size {size} must be greater than zero."))),
             cause: None,
         }));
     }
@@ -4718,8 +4719,8 @@ fn coll_list_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     if *size <= 0 {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-            message: Some(Rc::new(format!("size {size} must be greater than zero."))),
+            fqn: Arc::new("kotlin.IllegalArgumentException".into()),
+            message: Some(Arc::new(format!("size {size} must be greater than zero."))),
             cause: None,
         }));
     }
@@ -4730,8 +4731,8 @@ fn coll_list_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     if step <= 0 {
         return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-            message: Some(Rc::new(format!("step {step} must be greater than zero."))),
+            fqn: Arc::new("kotlin.IllegalArgumentException".into()),
+            message: Some(Arc::new(format!("step {step} must be greater than zero."))),
             cause: None,
         }));
     }
@@ -4963,7 +4964,7 @@ fn coll_set_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn coll_set_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = ctx.args.first().ok_or_else(|| RuntimeError::Type("Set.toString requires a receiver".into()))?;
-    Ok(Value::String(Rc::new(format!("{v}"))))
+    Ok(Value::String(Arc::new(format!("{v}"))))
 }
 fn coll_mut_set_add(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_set_items(ctx.args, "MutableSet.add")?;
@@ -5070,7 +5071,7 @@ fn coll_map_entries(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn coll_map_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = ctx.args.first().ok_or_else(|| RuntimeError::Type("Map.toString requires a receiver".into()))?;
-    Ok(Value::String(Rc::new(format!("{v}"))))
+    Ok(Value::String(Arc::new(format!("{v}"))))
 }
 fn coll_mut_map_put(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "MutableMap.put")?;
@@ -5124,7 +5125,7 @@ fn pair_second(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn pair_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = recv_pair(ctx.args, "Pair.toString")?;
-    Ok(Value::String(Rc::new(format!("{v}"))))
+    Ok(Value::String(Arc::new(format!("{v}"))))
 }
 
 // ============================================================
@@ -5135,7 +5136,7 @@ fn pair_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// `sequenceOf`, and `emptySequence`.
 fn make_sequence(items: Vec<Value>) -> Value {
     Value::Sequence(Rc::new(klio_runtime::SequenceData {
-        source: klio_runtime::SequenceSource::Items(Rc::new(items)),
+        source: klio_runtime::SequenceSource::Items(Arc::new(items)),
         ops: Vec::new(),
     }))
 }
@@ -5199,7 +5200,7 @@ fn seq_generate_sequence(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// Fast-path Sequence terminal ops handle the special case of an
 /// `Items`-source Sequence with no ops. Anything more (intermediate ops,
 /// generator sources) goes through `klio-interp`'s lazy materialize path.
-fn recv_seq_eager(args: &[Value], what: &str) -> Result<Option<Rc<Vec<Value>>>, RuntimeError> {
+fn recv_seq_eager(args: &[Value], what: &str) -> Result<Option<Arc<Vec<Value>>>, RuntimeError> {
     let Some(Value::Sequence(data)) = args.first() else {
         return Err(RuntimeError::Type(format!("{what} requires a Sequence receiver")));
     };
@@ -5207,7 +5208,7 @@ fn recv_seq_eager(args: &[Value], what: &str) -> Result<Option<Rc<Vec<Value>>>, 
         return Ok(None);
     }
     match &data.source {
-        klio_runtime::SequenceSource::Items(items) => Ok(Some(Rc::clone(items))),
+        klio_runtime::SequenceSource::Items(items) => Ok(Some(Arc::clone(items))),
         _ => Ok(None),
     }
 }
@@ -5254,8 +5255,8 @@ fn seq_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     items.first().cloned().ok_or_else(|| {
         RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Rc::new("Sequence is empty.".into())),
+            fqn: Arc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Arc::new("Sequence is empty.".into())),
             cause: None,
         })
     })
@@ -5268,8 +5269,8 @@ fn seq_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     items.last().cloned().ok_or_else(|| {
         RuntimeError::Thrown(Value::Exception {
-            fqn: Rc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Rc::new("Sequence is empty.".into())),
+            fqn: Arc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Arc::new("Sequence is empty.".into())),
             cause: None,
         })
     })
@@ -5279,7 +5280,7 @@ fn seq_to_string(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // Stable parity for that string is meaningless (it embeds the heap
     // address), so we emit a deterministic placeholder. Programs that need
     // a useful value should call `.toList()` before printing.
-    Ok(Value::String(Rc::new("kotlin.sequences.Sequence".to_string())))
+    Ok(Value::String(Arc::new("kotlin.sequences.Sequence".to_string())))
 }
 
 fn map_entry_key(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5300,7 +5301,7 @@ fn map_entry_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             "Map.Entry.toString requires a Map.Entry receiver".into(),
         ));
     };
-    Ok(Value::String(Rc::new(format!("{v}"))))
+    Ok(Value::String(Arc::new(format!("{v}"))))
 }
 
 // ============================================================
@@ -5328,8 +5329,8 @@ fn ranges_step(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             let n = step_arg.as_i64().unwrap();
             if n <= 0 {
                 return Err(RuntimeError::Thrown(Value::Exception {
-                    fqn: Rc::new("kotlin.IllegalArgumentException".into()),
-                    message: Some(Rc::new(format!(
+                    fqn: Arc::new("kotlin.IllegalArgumentException".into()),
+                    message: Some(Arc::new(format!(
                         "Step must be positive, was: {n}."
                     ))),
                     cause: None,
@@ -5413,7 +5414,7 @@ fn range_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(v @ Value::Range { .. }) = ctx.args.first() else {
         return Err(RuntimeError::Type("toString requires a Range receiver".into()));
     };
-    Ok(Value::String(Rc::new(format!("{v}"))))
+    Ok(Value::String(Arc::new(format!("{v}"))))
 }
 
 fn range_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5512,7 +5513,7 @@ fn string_substring_before(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(i) => s[..i].to_string(),
         None => missing,
     };
-    Ok(Value::String(Rc::new(out)))
+    Ok(Value::String(Arc::new(out)))
 }
 
 fn string_substring_after(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5530,7 +5531,7 @@ fn string_substring_after(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(i) => s[i + delim.len()..].to_string(),
         None => missing,
     };
-    Ok(Value::String(Rc::new(out)))
+    Ok(Value::String(Arc::new(out)))
 }
 
 fn string_substring_before_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5548,7 +5549,7 @@ fn string_substring_before_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError
         Some(i) => s[..i].to_string(),
         None => missing,
     };
-    Ok(Value::String(Rc::new(out)))
+    Ok(Value::String(Arc::new(out)))
 }
 
 fn string_substring_after_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5566,7 +5567,7 @@ fn string_substring_after_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
         Some(i) => s[i + delim.len()..].to_string(),
         None => missing,
     };
-    Ok(Value::String(Rc::new(out)))
+    Ok(Value::String(Arc::new(out)))
 }
 
 fn string_replace_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5579,7 +5580,7 @@ fn string_replace_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         ctx.args.get(2).ok_or_else(|| RuntimeError::Arity("replaceFirst requires new".into()))?,
         "replaceFirst",
     )?;
-    Ok(Value::String(Rc::new(s.replacen(&old, &new, 1))))
+    Ok(Value::String(Arc::new(s.replacen(&old, &new, 1))))
 }
 
 fn string_trim_indent(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5609,7 +5610,7 @@ fn string_trim_indent(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     while out_lines.last().map_or(false, |l| l.is_empty()) {
         out_lines.pop();
     }
-    Ok(Value::String(Rc::new(out_lines.join("\n"))))
+    Ok(Value::String(Arc::new(out_lines.join("\n"))))
 }
 
 fn string_trim_margin(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5637,7 +5638,7 @@ fn string_trim_margin(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if out_lines.last().map_or(false, |l| l.chars().all(char::is_whitespace) && l.is_empty()) {
         out_lines.pop();
     }
-    Ok(Value::String(Rc::new(out_lines.join("\n"))))
+    Ok(Value::String(Arc::new(out_lines.join("\n"))))
 }
 
 fn string_lines(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5646,7 +5647,7 @@ fn string_lines(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
     let items: Vec<Value> = normalized
         .split('\n')
-        .map(|p| Value::String(Rc::new(p.to_string())))
+        .map(|p| Value::String(Arc::new(p.to_string())))
         .collect();
     Ok(make_list(items, false))
 }
@@ -6200,7 +6201,7 @@ fn triple_third(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn triple_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = recv_triple(ctx.args, "Triple.toString")?;
-    Ok(Value::String(Rc::new(format!("{v}"))))
+    Ok(Value::String(Arc::new(format!("{v}"))))
 }
 fn triple_to_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Value::Triple(a, b, c) = recv_triple(ctx.args, "Triple.toList")? else { unreachable!() };
@@ -6214,11 +6215,11 @@ fn triple_to_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn comparator_natural_order(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // Empty step chain — the interp's sort path treats an empty-step
     // Comparator as "compare items directly via the natural order".
-    Ok(Value::Comparator { steps: Rc::new(Vec::new()), descending: false })
+    Ok(Value::Comparator { steps: Arc::new(Vec::new()), descending: false })
 }
 
 fn comparator_reverse_order(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::Comparator { steps: Rc::new(Vec::new()), descending: true })
+    Ok(Value::Comparator { steps: Arc::new(Vec::new()), descending: true })
 }
 
 // ============================================================
@@ -6404,7 +6405,7 @@ fn result_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     } else {
         format!("Failure({})", payload)
     };
-    Ok(Value::String(Rc::new(s)))
+    Ok(Value::String(Arc::new(s)))
 }
 
 // ============================================================
@@ -6413,9 +6414,9 @@ fn result_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 use klio_runtime::{MatchData, MatchGroupData, RegexData};
 
-fn regex_arg(args: &[Value], what: &str) -> Result<Rc<RegexData>, RuntimeError> {
+fn regex_arg(args: &[Value], what: &str) -> Result<Arc<RegexData>, RuntimeError> {
     match args.first() {
-        Some(Value::Regex(r)) => Ok(Rc::clone(r)),
+        Some(Value::Regex(r)) => Ok(Arc::clone(r)),
         _ => Err(RuntimeError::Type(format!("{what} requires a Regex receiver"))),
     }
 }
@@ -6464,11 +6465,11 @@ fn preprocess_pattern(src: &str) -> String {
     out
 }
 
-fn compile_regex(pattern: &str) -> Result<Rc<RegexData>, RuntimeError> {
+fn compile_regex(pattern: &str) -> Result<Arc<RegexData>, RuntimeError> {
     let prepared = preprocess_pattern(pattern);
     match regex::Regex::new(&prepared) {
-        Ok(re) => Ok(Rc::new(RegexData {
-            pattern: Rc::new(pattern.to_string()),
+        Ok(re) => Ok(Arc::new(RegexData {
+            pattern: Arc::new(pattern.to_string()),
             re,
         })),
         Err(e) => Err(RuntimeError::Thrown(make_exception(
@@ -6482,7 +6483,7 @@ fn byte_to_char(s: &str, byte: usize) -> i64 {
     s[..byte].chars().count() as i64
 }
 
-fn build_match(re: &Rc<RegexData>, input: &Rc<String>, caps: regex::Captures<'_>) -> MatchData {
+fn build_match(re: &Arc<RegexData>, input: &Arc<String>, caps: regex::Captures<'_>) -> MatchData {
     let mut groups: Vec<Option<MatchGroupData>> = Vec::with_capacity(caps.len());
     for i in 0..caps.len() {
         match caps.get(i) {
@@ -6496,7 +6497,7 @@ fn build_match(re: &Rc<RegexData>, input: &Rc<String>, caps: regex::Captures<'_>
                     end_char - 1
                 };
                 groups.push(Some(MatchGroupData {
-                    value: Rc::new(m.as_str().to_string()),
+                    value: Arc::new(m.as_str().to_string()),
                     start,
                     end_inclusive,
                 }));
@@ -6506,10 +6507,10 @@ fn build_match(re: &Rc<RegexData>, input: &Rc<String>, caps: regex::Captures<'_>
     }
     let end_byte = caps.get(0).map_or(0, |m| m.end());
     MatchData {
-        input: Rc::clone(input),
+        input: Arc::clone(input),
         groups,
         end_byte,
-        regex: Rc::clone(re),
+        regex: Arc::clone(re),
     }
 }
 
@@ -6523,12 +6524,12 @@ fn regex_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn regex_pattern(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let r = regex_arg(ctx.args, "Regex.pattern")?;
-    Ok(Value::String(Rc::clone(&r.pattern)))
+    Ok(Value::String(Arc::clone(&r.pattern)))
 }
 
 fn regex_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let r = regex_arg(ctx.args, "Regex.toString")?;
-    Ok(Value::String(Rc::clone(&r.pattern)))
+    Ok(Value::String(Arc::clone(&r.pattern)))
 }
 
 fn regex_matches(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -6577,7 +6578,7 @@ fn regex_find(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let caps = r.re.captures_at(&s, start);
     match caps {
-        Some(c) => Ok(Value::Match(Rc::new(build_match(&r, &s, c)))),
+        Some(c) => Ok(Value::Match(Arc::new(build_match(&r, &s, c)))),
         None => Ok(Value::Null),
     }
 }
@@ -6590,7 +6591,7 @@ fn regex_find_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let mut items = Vec::new();
     for caps in r.re.captures_iter(&s) {
-        items.push(Value::Match(Rc::new(build_match(&r, &s, caps))));
+        items.push(Value::Match(Arc::new(build_match(&r, &s, caps))));
     }
     Ok(make_sequence(items))
 }
@@ -6604,7 +6605,7 @@ fn regex_match_entire(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(caps) = r.re.captures(&s) else { return Ok(Value::Null) };
     let m0 = caps.get(0).unwrap();
     if m0.start() == 0 && m0.end() == s.len() {
-        Ok(Value::Match(Rc::new(build_match(&r, &s, caps))))
+        Ok(Value::Match(Arc::new(build_match(&r, &s, caps))))
     } else {
         Ok(Value::Null)
     }
@@ -6629,7 +6630,7 @@ fn regex_match_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let Some(caps) = r.re.captures_at(&s, byte) else { return Ok(Value::Null) };
     if caps.get(0).is_some_and(|m| m.start() == byte) {
-        Ok(Value::Match(Rc::new(build_match(&r, &s, caps))))
+        Ok(Value::Match(Arc::new(build_match(&r, &s, caps))))
     } else {
         Ok(Value::Null)
     }
@@ -6654,7 +6655,7 @@ fn regex_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             "Regex.replace lambda form not supported here".into(),
         )),
     };
-    Ok(Value::String(Rc::new(r.re.replace_all(&s, repl.as_str()).into_owned())))
+    Ok(Value::String(Arc::new(r.re.replace_all(&s, repl.as_str()).into_owned())))
 }
 
 fn regex_replace_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -6669,7 +6670,7 @@ fn regex_replace_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             "Regex.replaceFirst requires a String replacement".into(),
         )),
     };
-    Ok(Value::String(Rc::new(r.re.replace(&s, repl.as_str()).into_owned())))
+    Ok(Value::String(Arc::new(r.re.replace(&s, repl.as_str()).into_owned())))
 }
 
 fn regex_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -6690,7 +6691,7 @@ fn regex_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let items: Vec<Value> = parts
         .into_iter()
-        .map(|p| Value::String(Rc::new(p.to_string())))
+        .map(|p| Value::String(Arc::new(p.to_string())))
         .collect();
     Ok(make_list(items, false))
 }
@@ -6722,7 +6723,7 @@ fn regex_static_escape(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             "Regex.escape requires a String literal".into(),
         )),
     };
-    Ok(Value::String(Rc::new(kotlin_literal_escape(&s))))
+    Ok(Value::String(Arc::new(kotlin_literal_escape(&s))))
 }
 
 fn regex_from_literal(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -6750,12 +6751,12 @@ fn regex_static_escape_replacement(ctx: &mut CallCtx) -> Result<Value, RuntimeEr
         }
         out.push(c);
     }
-    Ok(Value::String(Rc::new(out)))
+    Ok(Value::String(Arc::new(out)))
 }
 
-fn match_arg(args: &[Value], what: &str) -> Result<Rc<MatchData>, RuntimeError> {
+fn match_arg(args: &[Value], what: &str) -> Result<Arc<MatchData>, RuntimeError> {
     match args.first() {
-        Some(Value::Match(m)) => Ok(Rc::clone(m)),
+        Some(Value::Match(m)) => Ok(Arc::clone(m)),
         _ => Err(RuntimeError::Type(format!(
             "{what} requires a MatchResult receiver"
         ))),
@@ -6767,7 +6768,7 @@ fn match_result_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let g0 = m.groups.first().and_then(|g| g.as_ref()).ok_or_else(|| {
         RuntimeError::Type("MatchResult has no whole-match group".into())
     })?;
-    Ok(Value::String(Rc::clone(&g0.value)))
+    Ok(Value::String(Arc::clone(&g0.value)))
 }
 
 fn match_result_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -6784,8 +6785,8 @@ fn match_result_group_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .groups
         .iter()
         .map(|g| match g {
-            Some(gd) => Value::String(Rc::clone(&gd.value)),
-            None => Value::String(Rc::new(String::new())),
+            Some(gd) => Value::String(Arc::clone(&gd.value)),
+            None => Value::String(Arc::new(String::new())),
         })
         .collect();
     Ok(make_list(items, false))
@@ -6798,7 +6799,7 @@ fn match_result_groups(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .iter()
         .map(|g| match g {
             Some(gd) => Value::MatchGroup {
-                value: Rc::clone(&gd.value),
+                value: Arc::clone(&gd.value),
                 start: gd.start,
                 end_inclusive: gd.end_inclusive,
             },
@@ -6826,7 +6827,7 @@ fn match_result_next(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Ok(Value::Null);
     }
     match m.regex.re.captures_at(&m.input, start) {
-        Some(c) => Ok(Value::Match(Rc::new(build_match(&m.regex, &m.input, c)))),
+        Some(c) => Ok(Value::Match(Arc::new(build_match(&m.regex, &m.input, c)))),
         None => Ok(Value::Null),
     }
 }
@@ -6834,14 +6835,14 @@ fn match_result_next(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn match_result_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let m = match_arg(ctx.args, "MatchResult.toString")?;
     let g0 = m.groups.first().and_then(|g| g.as_ref());
-    Ok(Value::String(Rc::new(
+    Ok(Value::String(Arc::new(
         g0.map(|g| (*g.value).clone()).unwrap_or_default(),
     )))
 }
 
 fn match_group_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     match ctx.args.first() {
-        Some(Value::MatchGroup { value, .. }) => Ok(Value::String(Rc::clone(value))),
+        Some(Value::MatchGroup { value, .. }) => Ok(Value::String(Arc::clone(value))),
         _ => Err(RuntimeError::Type(
             "MatchGroup.value requires a MatchGroup receiver".into(),
         )),
@@ -6937,7 +6938,7 @@ fn string_builder_length(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn string_builder_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.toString")?;
-    Ok(Value::String(Rc::new(sb.borrow().clone())))
+    Ok(Value::String(Arc::new(sb.borrow().clone())))
 }
 
 fn string_builder_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -7110,7 +7111,7 @@ fn string_builder_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let sb_byte = sb_char_byte(&buf, start).unwrap();
     let eb_byte = sb_char_byte(&buf, end).unwrap();
-    Ok(Value::String(Rc::new(buf[sb_byte..eb_byte].to_string())))
+    Ok(Value::String(Arc::new(buf[sb_byte..eb_byte].to_string())))
 }
 
 // ============================================================
@@ -7123,7 +7124,7 @@ fn string_format_static(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         _ => return Err(RuntimeError::Type("format requires a format String".into())),
     };
     let args: Vec<Value> = ctx.args[1..].to_vec();
-    Ok(Value::String(Rc::new(format_kotlin(&fmt, &args)?)))
+    Ok(Value::String(Arc::new(format_kotlin(&fmt, &args)?)))
 }
 
 fn string_format_member(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -7479,7 +7480,7 @@ fn char_titlecase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // U+01C8, U+01CB, U+01F2) and a handful of compatibility lowercase chars
     // map to a multi-char title form; we approximate via uppercase().
     let s: String = c.to_uppercase().collect();
-    Ok(Value::String(Rc::new(s)))
+    Ok(Value::String(Arc::new(s)))
 }
 
 fn char_titlecase_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -7543,33 +7544,33 @@ mod tests {
 
     #[test]
     fn string_length_counts_chars_not_bytes() {
-        let s = Value::String(Rc::new("héllo".to_string()));
+        let s = Value::String(Arc::new("héllo".to_string()));
         assert!(matches!(call(string_length, &[s]), Ok(Value::Int(5))));
     }
 
     #[test]
     fn string_get_returns_char() {
-        let s = Value::String(Rc::new("abc".to_string()));
+        let s = Value::String(Arc::new("abc".to_string()));
         assert!(matches!(call(string_get, &[s, Value::Int(1)]), Ok(Value::Char('b'))));
     }
 
     #[test]
     fn string_get_out_of_bounds_throws() {
-        let s = Value::String(Rc::new("abc".to_string()));
+        let s = Value::String(Arc::new("abc".to_string()));
         let err = call(string_get, &[s, Value::Int(99)]).unwrap_err();
         assert!(matches!(err, RuntimeError::Thrown(Value::Exception { .. })));
     }
 
     #[test]
     fn string_substring_two_args() {
-        let s = Value::String(Rc::new("abcdef".to_string()));
+        let s = Value::String(Arc::new("abcdef".to_string()));
         let Ok(Value::String(out)) = call(string_substring, &[s, Value::Int(1), Value::Int(4)]) else { panic!() };
         assert_eq!(*out, "bcd");
     }
 
     #[test]
     fn string_repeat_and_reversed() {
-        let s = Value::String(Rc::new("ab".to_string()));
+        let s = Value::String(Arc::new("ab".to_string()));
         let Ok(Value::String(r)) = call(string_repeat, &[s.clone(), Value::Int(3)]) else { panic!() };
         assert_eq!(*r, "ababab");
         let Ok(Value::String(rev)) = call(string_reversed, &[s]) else { panic!() };
@@ -7639,10 +7640,10 @@ mod tests {
 
     #[test]
     fn string_substring_before_after() {
-        let s = Value::String(Rc::new("a.b.c".to_string()));
-        let Ok(Value::String(before)) = call(string_substring_before, &[s.clone(), Value::String(Rc::new(".".into()))]) else { panic!() };
+        let s = Value::String(Arc::new("a.b.c".to_string()));
+        let Ok(Value::String(before)) = call(string_substring_before, &[s.clone(), Value::String(Arc::new(".".into()))]) else { panic!() };
         assert_eq!(*before, "a");
-        let Ok(Value::String(after)) = call(string_substring_after_last, &[s, Value::String(Rc::new(".".into()))]) else { panic!() };
+        let Ok(Value::String(after)) = call(string_substring_after_last, &[s, Value::String(Arc::new(".".into()))]) else { panic!() };
         assert_eq!(*after, "c");
     }
 
@@ -7663,10 +7664,10 @@ mod tests {
 
     #[test]
     fn map_get_or_default_falls_back() {
-        let m = make_map(vec![(Value::String(Rc::new("a".into())), Value::Int(1))], false);
-        let Ok(v) = call(coll_map_get_or_default, &[m.clone(), Value::String(Rc::new("a".into())), Value::Int(99)]) else { panic!() };
+        let m = make_map(vec![(Value::String(Arc::new("a".into())), Value::Int(1))], false);
+        let Ok(v) = call(coll_map_get_or_default, &[m.clone(), Value::String(Arc::new("a".into())), Value::Int(99)]) else { panic!() };
         assert!(matches!(v, Value::Int(1)));
-        let Ok(v) = call(coll_map_get_or_default, &[m, Value::String(Rc::new("z".into())), Value::Int(99)]) else { panic!() };
+        let Ok(v) = call(coll_map_get_or_default, &[m, Value::String(Arc::new("z".into())), Value::Int(99)]) else { panic!() };
         assert!(matches!(v, Value::Int(99)));
     }
 
@@ -7679,15 +7680,15 @@ mod tests {
 
     #[test]
     fn string_lines_splits_on_all_line_separators() {
-        let s = Value::String(Rc::new("a\nb\r\nc\rd".to_string()));
+        let s = Value::String(Arc::new("a\nb\r\nc\rd".to_string()));
         let Ok(Value::List { items, .. }) = call(string_lines, &[s]) else { panic!() };
         assert_eq!(items.borrow().len(), 4);
     }
 
     #[test]
     fn regex_find_returns_match() {
-        let re = call(regex_ctor, &[Value::String(Rc::new(r"\d+".into()))]).unwrap();
-        let v = call(regex_find, &[re, Value::String(Rc::new("abc 123 def".into()))]).unwrap();
+        let re = call(regex_ctor, &[Value::String(Arc::new(r"\d+".into()))]).unwrap();
+        let v = call(regex_find, &[re, Value::String(Arc::new("abc 123 def".into()))]).unwrap();
         let Value::Match(m) = v else { panic!() };
         assert_eq!(*m.groups[0].as_ref().unwrap().value, "123");
     }
@@ -7695,7 +7696,7 @@ mod tests {
     #[test]
     fn string_builder_append_and_length() {
         let sb = call(string_builder_ctor, &[]).unwrap();
-        call(string_builder_append, &[sb.clone(), Value::String(Rc::new("ab".into()))]).unwrap();
+        call(string_builder_append, &[sb.clone(), Value::String(Arc::new("ab".into()))]).unwrap();
         call(string_builder_append, &[sb.clone(), Value::Int(7)]).unwrap();
         let Value::Int(n) = call(string_builder_length, &[sb.clone()]).unwrap() else { panic!() };
         assert_eq!(n, 3);
@@ -7705,10 +7706,10 @@ mod tests {
 
     #[test]
     fn format_basic_specifiers() {
-        let fmt = Value::String(Rc::new("%d-%s".into()));
+        let fmt = Value::String(Arc::new("%d-%s".into()));
         let Value::String(s) = call(
             string_format_static,
-            &[fmt, Value::Int(7), Value::String(Rc::new("x".into()))],
+            &[fmt, Value::Int(7), Value::String(Arc::new("x".into()))],
         ).unwrap() else { panic!() };
         assert_eq!(&*s, "7-x");
     }
@@ -7717,7 +7718,7 @@ mod tests {
     fn excn_constructors_carry_message() {
         let Ok(Value::Exception { fqn, message, .. }) = call(
             excn_illegal_argument,
-            &[Value::String(Rc::new("bad".into()))],
+            &[Value::String(Arc::new("bad".into()))],
         ) else { panic!() };
         assert_eq!(*fqn, "kotlin.IllegalArgumentException");
         assert_eq!(message.as_deref().map(|s| s.as_str()), Some("bad"));
