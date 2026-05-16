@@ -18,19 +18,46 @@ use std::collections::HashSet;
 
 use klio_runtime::{CallCtx, RuntimeError, Value};
 
-// Layer-2 library state, scoped to the interpreting thread (one set
-// per thread via `thread_local!`). This sits inside the publication
-// boundary alongside `klio_interp_ir::ExecState`: cancellation
-// tokens, the scheduler queue, and rendezvous slots belong to the
-// thread driving the coroutines and are never shared directly.
-thread_local! {
-    static CANCELLED_TOKENS: RefCell<HashSet<i64>> = RefCell::new(HashSet::new());
-    static NEXT_TOKEN: RefCell<i64> = const { RefCell::new(1) };
-    static SCHED_QUEUE: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+/// Layer-2 coroutine library state for one interpreting thread —
+/// the single owned per-thread context for this crate, alongside
+/// `klio_interp_ir::ExecState`. It sits inside the publication
+/// boundary: cancellation tokens, the scheduler queue, and
+/// rendezvous-slot counter belong to the thread driving the
+/// coroutines and are never shared across threads directly. One
+/// grouped struct (rather than scattered statics) so each OS thread
+/// gets exactly one, and so the boundary is one named thing.
+struct CoroutineRegistry {
+    /// Cancelled cancellation-token ids.
+    cancelled_tokens: HashSet<i64>,
+    /// Monotonic cancellation-token id counter.
+    next_token: i64,
+    /// Opaque scheduler-handle FIFO.
+    sched_queue: Vec<i64>,
     /// Monotonic slot-id counter. A slot is an opaque rendezvous
     /// point: a coroutine parks indefinitely on it and an explicit
     /// event (job completion, channel item) resumes it.
-    static NEXT_SLOT: RefCell<i64> = const { RefCell::new(1) };
+    next_slot: i64,
+}
+
+impl CoroutineRegistry {
+    fn new() -> Self {
+        Self {
+            cancelled_tokens: HashSet::new(),
+            next_token: 1,
+            sched_queue: Vec::new(),
+            next_slot: 1,
+        }
+    }
+}
+
+thread_local! {
+    static CORO_REG: RefCell<CoroutineRegistry> =
+        RefCell::new(CoroutineRegistry::new());
+}
+
+/// Run `f` against this thread's coroutine registry.
+fn with_reg<R>(f: impl FnOnce(&mut CoroutineRegistry) -> R) -> R {
+    CORO_REG.with(|r| f(&mut r.borrow_mut()))
 }
 
 klio_stdlib::host_bindings! {
@@ -112,10 +139,9 @@ fn current_time_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn token_create(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let id = NEXT_TOKEN.with(|c| {
-        let mut b = c.borrow_mut();
-        let id = *b;
-        *b = b.wrapping_add(1);
+    let id = with_reg(|r| {
+        let id = r.next_token;
+        r.next_token = r.next_token.wrapping_add(1);
         id
     });
     Ok(Value::Long(id))
@@ -127,7 +153,7 @@ fn token_cancel(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(Value::Int(i)) => *i as i64,
         _ => return Err(RuntimeError::Type("tokenCancel: argument must be Long".into())),
     };
-    CANCELLED_TOKENS.with(|c| c.borrow_mut().insert(id));
+    with_reg(|r| r.cancelled_tokens.insert(id));
     Ok(Value::Unit)
 }
 
@@ -140,7 +166,7 @@ fn token_is_cancelled(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if id == 0 {
         return Ok(Value::Bool(false));
     }
-    let is_cancelled = CANCELLED_TOKENS.with(|c| c.borrow().contains(&id));
+    let is_cancelled = with_reg(|r| r.cancelled_tokens.contains(&id));
     Ok(Value::Bool(is_cancelled))
 }
 
@@ -150,7 +176,7 @@ fn scheduler_enqueue(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(Value::Int(i)) => *i as i64,
         _ => return Err(RuntimeError::Type("schedulerEnqueue: argument must be Long".into())),
     };
-    SCHED_QUEUE.with(|q| q.borrow_mut().push(h));
+    with_reg(|r| r.sched_queue.push(h));
     Ok(Value::Unit)
 }
 
@@ -187,10 +213,9 @@ fn schedule_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// indefinite parking: a coroutine parks on a slot and an explicit
 /// event resumes it (job completion, channel handoff).
 fn new_slot(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let id = NEXT_SLOT.with(|c| {
-        let mut b = c.borrow_mut();
-        let id = *b;
-        *b = b.wrapping_add(1);
+    let id = with_reg(|r| {
+        let id = r.next_slot;
+        r.next_slot = r.next_slot.wrapping_add(1);
         id
     });
     Ok(Value::Long(id))
@@ -234,10 +259,9 @@ fn resume_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn scheduler_drain_count(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let count = SCHED_QUEUE.with(|q| {
-        let mut b = q.borrow_mut();
-        let n = b.len() as i32;
-        b.clear();
+    let count = with_reg(|r| {
+        let n = r.sched_queue.len() as i32;
+        r.sched_queue.clear();
         n
     });
     Ok(Value::new_int(count as i64))
