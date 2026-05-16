@@ -22,6 +22,10 @@ thread_local! {
     static CANCELLED_TOKENS: RefCell<HashSet<i64>> = RefCell::new(HashSet::new());
     static NEXT_TOKEN: RefCell<i64> = const { RefCell::new(1) };
     static SCHED_QUEUE: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    /// Monotonic slot-id counter. A slot is an opaque rendezvous
+    /// point: a coroutine parks indefinitely on it and an explicit
+    /// event (job completion, channel item) resumes it.
+    static NEXT_SLOT: RefCell<i64> = const { RefCell::new(1) };
 }
 
 klio_stdlib::host_bindings! {
@@ -35,6 +39,9 @@ klio_stdlib::host_bindings! {
         "kotlinx.coroutines.__kxco_schedulerDrainCount" => scheduler_drain_count,
         "kotlinx.coroutines.__kxco_spawn"               => spawn_launch_block,
         "kotlinx.coroutines.__kxco_scheduleResume"      => schedule_resume,
+        "kotlinx.coroutines.__kxco_newSlot"             => new_slot,
+        "kotlinx.coroutines.__kxco_parkSlot"            => park_slot,
+        "kotlinx.coroutines.__kxco_resumeSlot"          => resume_slot,
         "kotlinx.coroutines.runBlocking"                => run_blocking,
         "kotlinx.coroutines.delay"                      => delay_top_level,
         "kotlinx.coroutines.yield"                      => yield_now,
@@ -168,6 +175,56 @@ fn schedule_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         ));
     };
     ctx.host.scheduler().schedule_resume(cont);
+    Ok(Value::Unit)
+}
+
+/// `__kxco_newSlot()` — a fresh unique slot id. Slots back
+/// indefinite parking: a coroutine parks on a slot and an explicit
+/// event resumes it (job completion, channel handoff).
+fn new_slot(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let id = NEXT_SLOT.with(|c| {
+        let mut b = c.borrow_mut();
+        let id = *b;
+        *b = b.wrapping_add(1);
+        id
+    });
+    Ok(Value::Long(id))
+}
+
+/// `__kxco_parkSlot(slot)` — record that the current coroutine is
+/// waiting on `slot`, then suspend indefinitely. The active
+/// interceptor binds the resulting parked token to the slot so a
+/// later `__kxco_resumeSlot(slot)` can resume exactly this
+/// activation.
+fn park_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let slot = match ctx.args.first() {
+        Some(Value::Long(l)) => *l,
+        Some(Value::Int(i)) => *i as i64,
+        _ => {
+            return Err(RuntimeError::Type(
+                "__kxco_parkSlot: argument must be Long".into(),
+            ))
+        }
+    };
+    ctx.host.coroutine_park_slot(slot);
+    Err(RuntimeError::Suspend(-1))
+}
+
+/// `__kxco_resumeSlot(slot)` — make the coroutine waiting on `slot`
+/// ready. No-op if nothing is parked on it yet; the Kotlin waiter
+/// re-checks its condition after each park so a missed resume just
+/// causes a re-park.
+fn resume_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let slot = match ctx.args.first() {
+        Some(Value::Long(l)) => *l,
+        Some(Value::Int(i)) => *i as i64,
+        _ => {
+            return Err(RuntimeError::Type(
+                "__kxco_resumeSlot: argument must be Long".into(),
+            ))
+        }
+    };
+    ctx.host.coroutine_resume_slot(slot);
     Ok(Value::Unit)
 }
 

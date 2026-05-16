@@ -145,6 +145,20 @@ pub trait IntrinsicHost {
     ) -> Result<(), RuntimeError> {
         self.invoke_callable_with_this(block, &[], scope, out).map(|_| ())
     }
+
+    /// Record that the activation about to suspend indefinitely is
+    /// waiting on `slot`. The active interceptor associates the next
+    /// indefinitely-parked token with this slot so a later
+    /// `coroutine_resume_slot(slot)` can resume it. Default impl is a
+    /// no-op (no cooperative driver).
+    fn coroutine_park_slot(&mut self, _slot: i64) {}
+
+    /// Make the coroutine waiting on `slot` ready, if any is parked.
+    /// Searches the interceptor stack top-down so a nested scope can
+    /// resume a waiter parked by an outer one. No-op if nothing is
+    /// waiting on the slot (the waiter must re-check its condition
+    /// after each park). Default impl is a no-op.
+    fn coroutine_resume_slot(&mut self, _slot: i64) {}
 }
 
 /// Cooperative scheduler the runtime exposes to anything called

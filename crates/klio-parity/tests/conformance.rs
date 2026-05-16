@@ -58,10 +58,13 @@ fn check(stem: &str) {
 /// Rules with no unimplemented dependency — enforced now.
 const RUNNABLE: &[&str] = &[
     "mm1_no_tearing",
+    "mm2_drf_sc",
     "mm3_no_oota",
     "mm4_safe_publication",
     "mm5_volatile",
     "mm7_atomics",
+    "mm9_coroutine_hb",
+    "mm10_channel_flow",
 ];
 
 // mm7 (atomicfu) is runnable today via the pack-aware runner; the
@@ -70,9 +73,6 @@ const RUNNABLE: &[&str] = &[
 /// Rules gated on a later stage. `(stem, owning stage)`. Moved into
 /// `RUNNABLE` when that stage lands.
 const GATED: &[(&str, &str)] = &[
-    ("mm2_drf_sc", "cooperative correctness"),
-    ("mm9_coroutine_hb", "cooperative correctness"),
-    ("mm10_channel_flow", "cooperative correctness"),
     ("mm6_monitor", "single-lock threads / monitors"),
     ("mm8_thread_join", "single-lock threads"),
 ];

@@ -758,6 +758,7 @@ pub fn lower_expr_as_param_thunk(
 ) -> crate::FuncId {
     let mut b = FuncBuilder::new(module);
     bind_params(&mut b, params);
+    b.set_param_thunk(true);
     let v = lower_expr(&mut b, expr);
     b.terminate(Terminator::Return(Some(v)));
     let func = b.finish(name, name, crate::TypeRef::unit());
@@ -1654,7 +1655,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // smart-casted member reads (`when (this) { is X ->
                 // "$x" }`) resolve through the receiver instance.
                 // Outside that scope fall through to the
-                // LoadFromThisOrGlobal probe.
+                // LoadFromThisOrGlobal probe. A default-arg thunk
+                // runs in the declaring scope, not as a member of
+                // the receiver, so a bare name there must take the
+                // this-or-global probe (resolving top-level objects
+                // like `EmptyCoroutineContext`) instead.
+                if !b.is_param_thunk() {
                 if let Some(this_reg) = b.resolve("this") {
                     let dst = b.alloc_reg();
                     let nm = b
@@ -1666,6 +1672,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         field: nm,
                     });
                     return dst;
+                }
                 }
                 let this_idx = b.record_capture("this");
                 let dst = b.alloc_reg();
@@ -4117,11 +4124,19 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             // top-level binding; route it through the BinOp +
             // StoreGlobal path below so top-level `var` compound
             // assigns + delegated-property setters fire.
+            // A boxed var or a captured outer binding is an
+            // assignable variable, not a `val` whose value type
+            // declares an `<op>Assign` operator. Excluding both
+            // keeps a second compound-assign (after the first
+            // rebinds the name to a plain reg) on the rebind path
+            // instead of mis-dispatching `plusAssign` on the Int.
             let path_is_val = matches!(
                 target,
                 Expr::Path { segments, .. }
                     if segments.len() == 1
                         && !b.is_mutable(&segments[0].name)
+                        && !b.is_boxed(&segments[0].name)
+                        && !b.knows_outer(&segments[0].name)
                         && b.resolve(&segments[0].name).is_some()
             );
             if !matches!(op, klio_ast::AssignOp::Assign) && path_is_val {

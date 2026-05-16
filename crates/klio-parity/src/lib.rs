@@ -906,6 +906,7 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
         .ok_or("workspace root")?;
     let shims = [
         ws.join("crates/klio-kotlinx-coroutines/shim/kotlinx/coroutines/Coroutines.kt"),
+        ws.join("crates/klio-kotlinx-coroutines/shim/kotlinx/coroutines/channels/Channels.kt"),
         ws.join("crates/klio-kotlinx-atomicfu/shim/kotlinx/atomicfu/AtomicFU.kt"),
     ];
 

@@ -85,6 +85,12 @@ pub struct FuncBuilder<'a> {
     local_fns: std::collections::HashSet<String>,
     is_lambda_body: bool,
     is_inline: bool,
+    /// True while lowering a default-argument thunk. A default
+    /// expression executes in the declaring function's scope, not as
+    /// a member of the (extension) receiver — so an unqualified name
+    /// that isn't a known member must resolve as a global/this probe
+    /// rather than a hard `this.<name>` field read.
+    is_param_thunk: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +130,7 @@ impl<'a> FuncBuilder<'a> {
             local_fns: std::collections::HashSet::new(),
             is_lambda_body: false,
             is_inline: false,
+            is_param_thunk: false,
         }
     }
 
@@ -296,6 +303,12 @@ impl<'a> FuncBuilder<'a> {
     }
     pub fn has_own_member(&self, name: &str) -> bool {
         self.own_members.contains(name)
+    }
+    pub fn set_param_thunk(&mut self, on: bool) {
+        self.is_param_thunk = on;
+    }
+    pub fn is_param_thunk(&self) -> bool {
+        self.is_param_thunk
     }
     pub fn set_tailrec_self(&mut self, name: String) {
         self.tailrec_self = Some(name);

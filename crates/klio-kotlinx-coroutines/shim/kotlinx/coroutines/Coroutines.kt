@@ -13,7 +13,12 @@
 package kotlinx.coroutines
 
 import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.EmptyCoroutineContext
+
+// Concrete empty context. kotlin.coroutines.EmptyCoroutineContext
+// is a known type symbol but carries no runtime object; the
+// builders only need an inert default value, so the shim provides
+// its own and the API surface stays self-contained.
+object EmptyCoroutineContext : CoroutineContext
 
 // --- internal native helpers (bound natively by the klio host) ----
 
@@ -35,6 +40,15 @@ internal fun __kxco_schedulerDrainCount(): Int = 0
 // runBlocking body returns.
 internal fun __kxco_spawn(block: () -> Unit): Unit = Unit
 internal fun __kxco_scheduleResume(cont: Any): Unit = Unit
+
+// Slot rendezvous primitives. A slot is an opaque host-side id; a
+// coroutine parks indefinitely on it via __kxco_parkSlot and an
+// explicit event (job completion, channel handoff) wakes it via
+// __kxco_resumeSlot. Park always re-checks its guard in a loop so a
+// resume that races ahead of the park is harmless.
+internal fun __kxco_newSlot(): Long = 0L
+internal fun __kxco_parkSlot(slot: Long): Unit = Unit
+internal fun __kxco_resumeSlot(slot: Long): Unit = Unit
 
 // `runBlocking` bridges the non-suspending world into a coroutine:
 // it builds a fresh scope, runs the suspend block to completion on
@@ -59,6 +73,7 @@ interface Job {
 class CompletableJob internal constructor() : Job {
     private var _active: Boolean = true
     private var _cancelled: Boolean = false
+    private val slot: Long = __kxco_newSlot()
     override val tokenId: Long = __kxco_tokenCreate()
 
     override val isActive: Boolean get() = _active && !_cancelled && !__kxco_tokenIsCancelled(tokenId)
@@ -69,26 +84,51 @@ class CompletableJob internal constructor() : Job {
         _cancelled = true
         _active = false
         __kxco_tokenCancel(tokenId)
+        __kxco_resumeSlot(slot)
     }
 
     override suspend fun join() {
-        // klio's scheduler drives every queued task to completion
-        // before runBlocking returns, so by the time anyone holds a
-        // Job they can call join() against, the task has finished
-        // — join is a no-op observation.
+        // Park until the child runs to completion. The while
+        // re-check absorbs a resume that races ahead of the park.
+        while (_active) __kxco_parkSlot(slot)
     }
 
-    internal fun markCompleted() { _active = false }
+    internal fun markCompleted() {
+        _active = false
+        __kxco_resumeSlot(slot)
+    }
 }
 
-class Deferred<T> internal constructor(private val value: T) : Job {
-    override val isActive: Boolean = false
-    override val isCompleted: Boolean = true
-    override val isCancelled: Boolean = false
-    override val tokenId: Long = 0L
-    override fun cancel() {}
-    override suspend fun join() {}
-    suspend fun await(): T = value
+class Deferred<T> internal constructor() : Job {
+    private var _done: Boolean = false
+    private var _result: T? = null
+    private var _cancelled: Boolean = false
+    private val slot: Long = __kxco_newSlot()
+    override val tokenId: Long = __kxco_tokenCreate()
+
+    override val isActive: Boolean get() = !_done && !_cancelled
+    override val isCompleted: Boolean get() = _done
+    override val isCancelled: Boolean get() = _cancelled
+
+    override fun cancel() {
+        _cancelled = true
+        __kxco_resumeSlot(slot)
+    }
+
+    override suspend fun join() {
+        while (!_done) __kxco_parkSlot(slot)
+    }
+
+    internal fun complete(value: T) {
+        _result = value
+        _done = true
+        __kxco_resumeSlot(slot)
+    }
+
+    suspend fun await(): T {
+        while (!_done) __kxco_parkSlot(slot)
+        return _result as T
+    }
 }
 
 interface CoroutineScope {
@@ -146,11 +186,15 @@ fun <T> CoroutineScope.async(
     context: CoroutineContext = EmptyCoroutineContext,
     block: suspend CoroutineScope.() -> T,
 ): Deferred<T> {
-    // The result is produced once the child completes; structured
-    // concurrency means the enclosing runBlocking drives it to
-    // done before `await()` is observed.
-    val result: T = runBlocking { block(this) }
-    return Deferred(result)
+    val deferred = Deferred<T>()
+    val scope = this
+    // Spawn the body as a sibling coroutine; it interleaves at
+    // suspension points and resumes the awaiter on completion.
+    __kxco_spawn {
+        val r = block(scope)
+        deferred.complete(r)
+    }
+    return deferred
 }
 
 // `delay` / `yield` are host-bound (kotlinx.coroutines.delay /
@@ -164,54 +208,156 @@ fun CoroutineScope.ensureActive() {
     if (!isActive) throw CancellationException("scope is no longer active")
 }
 
+// These run on the cooperative driver already (they are `suspend`
+// funs invoked from inside runBlocking), so the block runs inline
+// on the same driver — nesting a fresh runBlocking here would
+// re-enter and corrupt the scheduler. The single-threaded model
+// ignores the dispatcher.
 suspend fun <T> withContext(context: CoroutineContext, block: suspend CoroutineScope.() -> T): T {
-    return runBlocking { block(this) }
+    return block(GlobalScope)
 }
 
-// supervisorScope: a scope whose children's failures do not cancel
-// the parent. Without proper structured concurrency, this is just
-// a tagged scope, but it matches upstream's surface so user code
-// compiles.
 suspend fun <T> supervisorScope(block: suspend CoroutineScope.() -> T): T {
-    return runBlocking { block(this) }
+    return block(GlobalScope)
 }
 
-// coroutineScope: structured-concurrency equivalent; same shape.
 suspend fun <T> coroutineScope(block: suspend CoroutineScope.() -> T): T {
-    return runBlocking { block(this) }
+    return block(GlobalScope)
 }
 
-class Channel<T> internal constructor(private val capacity: Int = -1) {
-    private val items: ArrayDeque<T> = ArrayDeque()
+class ClosedReceiveChannelException(message: String) : Exception(message)
+class ClosedSendChannelException(message: String) : Exception(message)
+
+interface ChannelIterator<T> {
+    suspend operator fun hasNext(): Boolean
+    operator fun next(): T
+}
+
+// Rendezvous (capacity 0/-1) and buffered channels. send suspends
+// until a receiver takes the item (or buffer space frees); receive
+// suspends until an item is available or the channel is closed and
+// drained. Waiters park on slots; the counterpart resumes the
+// oldest waiter. Park loops re-check their guard so a resume that
+// races ahead of the park is harmless.
+class Channel<T> internal constructor(private val capacity: Int = 0) {
+    private val items: MutableList<T> = mutableListOf()
     private var closed: Boolean = false
+    private val sendWaiters: MutableList<Long> = mutableListOf()
+    private val recvWaiters: MutableList<Long> = mutableListOf()
+
+    private fun bufferLimit(): Int = if (capacity > 0) capacity else 0
+
+    private fun wakeOneReceiver() {
+        if (recvWaiters.isNotEmpty()) __kxco_resumeSlot(recvWaiters.removeAt(0))
+    }
+
+    private fun wakeOneSender() {
+        if (sendWaiters.isNotEmpty()) __kxco_resumeSlot(sendWaiters.removeAt(0))
+    }
+
+    private fun wakeAllReceivers() {
+        while (recvWaiters.isNotEmpty()) __kxco_resumeSlot(recvWaiters.removeAt(0))
+    }
 
     suspend fun send(value: T) {
-        if (closed) throw IllegalStateException("Channel is closed")
-        items.addLast(value)
+        if (closed) throw ClosedSendChannelException("Channel was closed")
+        // Park the sender until a receiver is waiting or there is
+        // buffer space. A pending receiver consumes directly.
+        while (true) {
+            if (closed) throw ClosedSendChannelException("Channel was closed")
+            if (recvWaiters.isNotEmpty() || items.size < bufferLimit()) {
+                items.add(value)
+                wakeOneReceiver()
+                return
+            }
+            val slot = __kxco_newSlot()
+            sendWaiters.add(slot)
+            __kxco_parkSlot(slot)
+        }
     }
 
     fun trySend(value: T): Boolean {
         if (closed) return false
-        items.addLast(value)
-        return true
+        if (recvWaiters.isNotEmpty() || items.size < bufferLimit()) {
+            items.add(value)
+            wakeOneReceiver()
+            return true
+        }
+        return false
     }
 
     suspend fun receive(): T {
-        if (items.isEmpty()) throw IllegalStateException("Channel is empty")
-        return items.removeFirst()
+        while (true) {
+            if (items.isNotEmpty()) {
+                val v = items.removeAt(0)
+                wakeOneSender()
+                return v
+            }
+            if (closed) throw ClosedReceiveChannelException("Channel was closed")
+            val slot = __kxco_newSlot()
+            recvWaiters.add(slot)
+            __kxco_parkSlot(slot)
+        }
     }
 
     fun tryReceive(): T? {
         if (items.isEmpty()) return null
-        return items.removeFirst()
+        val v = items.removeAt(0)
+        wakeOneSender()
+        return v
     }
 
-    fun close() { closed = true }
+    fun close() {
+        closed = true
+        // Closing wakes every blocked receiver so they observe the
+        // close (and every sender so it throws).
+        wakeAllReceivers()
+        while (sendWaiters.isNotEmpty()) __kxco_resumeSlot(sendWaiters.removeAt(0))
+    }
+
+    // Drain one element, suspending until available; returns false
+    // once the channel is closed and empty. The iterator drives
+    // `for (v in ch)` off this.
+    internal suspend fun pull(): Boolean {
+        while (true) {
+            if (items.isNotEmpty()) {
+                pulled = items.removeAt(0)
+                hasPulled = true
+                wakeOneSender()
+                return true
+            }
+            if (closed) return false
+            val slot = __kxco_newSlot()
+            recvWaiters.add(slot)
+            __kxco_parkSlot(slot)
+        }
+    }
+
+    private var pulled: T? = null
+    private var hasPulled: Boolean = false
+
+    internal fun takePulled(): T {
+        if (!hasPulled) throw NoSuchElementException("channel is closed")
+        val v = pulled as T
+        hasPulled = false
+        pulled = null
+        return v
+    }
+
+    operator fun iterator(): ChannelIterator<T> = ChannelIteratorImpl(this)
+
     val isClosedForReceive: Boolean get() = closed && items.isEmpty()
     val isClosedForSend: Boolean get() = closed
     val isEmpty: Boolean get() = items.isEmpty()
     val size: Int get() = items.size
 }
 
-fun <T> Channel(): Channel<T> = Channel()
+class ChannelIteratorImpl<T> internal constructor(
+    private val ch: Channel<T>,
+) : ChannelIterator<T> {
+    override suspend fun hasNext(): Boolean = ch.pull()
+    override fun next(): T = ch.takePulled()
+}
+
+fun <T> Channel(): Channel<T> = Channel(0)
 fun <T> Channel(capacity: Int): Channel<T> = Channel(capacity)

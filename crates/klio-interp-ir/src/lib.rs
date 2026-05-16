@@ -2931,6 +2931,56 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Pad missing positional args with each param's default
         // value (from the registered default-init thunks).
         let mut args = args;
+        // Kotlin trailing-lambda rule: when fewer args are supplied
+        // than params and the last param is a function type while a
+        // default-valued param sits before it, the final supplied
+        // callable is the trailing lambda and binds the *last*
+        // param; the gap params fall back to their defaults. Without
+        // this the lambda would slot into the first (defaulted)
+        // param and the real last param would be left unbound.
+        if args.len() < f.params.len() && args.len() >= 1 {
+            let last_is_fn = f
+                .params
+                .last()
+                .map(|p| is_function_type(&p.ty))
+                .unwrap_or(false);
+            let trailing_is_callable =
+                args.last().map(value_is_callable).unwrap_or(false);
+            if last_is_fn && trailing_is_callable {
+                let lead = args.len() - 1;
+                let last_param = f.params.len() - 1;
+                if lead < last_param {
+                    if let Some(defaults) = self.func_defaults.get(&func).cloned() {
+                        let trailing = args.pop().unwrap();
+                        for idx in lead..last_param {
+                            if let Some(Some(default_fid)) = defaults.get(idx) {
+                                let dfid = *default_fid;
+                                let dfunc = module
+                                    .funcs
+                                    .get(dfid.0 as usize)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        klio_ir::eval::EvalError::Type(format!(
+                                            "default-arg FuncId {} out of range",
+                                            dfid.0
+                                        ))
+                                    })?;
+                                let v = klio_ir::eval::eval_with(
+                                    module,
+                                    &dfunc,
+                                    args.clone(),
+                                    self,
+                                )?;
+                                args.push(v);
+                            } else {
+                                args.push(klio_runtime::Value::Null);
+                            }
+                        }
+                        args.push(trailing);
+                    }
+                }
+            }
+        }
         if args.len() < f.params.len() {
             if let Some(defaults) = self.func_defaults.get(&func).cloned() {
                 for idx in args.len()..f.params.len() {
@@ -5300,6 +5350,27 @@ fn pack_vararg_args(
 /// the trailing-arg padding `Vm::call_func` does for top-level
 /// functions so a local `fun f(a, b = a + 1)` called `f(1)` yields
 /// `b == 2`.
+/// A `TypeRef` denoting a Kotlin function type — `() -> T` lowers
+/// to a `FunctionN` / `kotlin.FunctionN` nominal, or carries an
+/// arrow in the rendered name.
+fn is_function_type(ty: &klio_ir::TypeRef) -> bool {
+    let n = ty.name.rsplit('.').next().unwrap_or(&ty.name);
+    n.starts_with("Function") || ty.name.contains("->")
+}
+
+/// Whether a runtime value can be invoked as `f(...)`.
+fn value_is_callable(v: &klio_runtime::Value) -> bool {
+    matches!(
+        v,
+        klio_runtime::Value::IrClosure { .. }
+            | klio_runtime::Value::Lambda { .. }
+            | klio_runtime::Value::Function { .. }
+            | klio_runtime::Value::Intrinsic { .. }
+            | klio_runtime::Value::BoundMethod { .. }
+            | klio_runtime::Value::PropertyRef { .. }
+    )
+}
+
 fn pad_args_with_defaults<H: klio_ir::eval::Host>(
     module: &klio_ir::Module,
     n_params: usize,
@@ -5533,6 +5604,14 @@ struct CooperativeInterceptor {
     ready: std::collections::VecDeque<u64>,
     /// Child `launch` blocks queued during the active scope.
     launched: Vec<klio_runtime::Value>,
+    /// Set by `__kxco_parkSlot` immediately before the activation
+    /// unwinds with an indefinite suspend; consumed by the next
+    /// `intercept_suspend` to bind that token to the slot.
+    pending_slot: Option<i64>,
+    /// slot id → token of the activation parked on that slot. An
+    /// explicit `__kxco_resumeSlot(slot)` moves the token into
+    /// `ready` and clears the entry.
+    slot_to_token: std::collections::HashMap<i64, u64>,
 }
 
 impl CooperativeInterceptor {
@@ -5546,6 +5625,8 @@ impl CooperativeInterceptor {
             parked: std::collections::HashMap::new(),
             ready: std::collections::VecDeque::new(),
             launched: Vec::new(),
+            pending_slot: None,
+            slot_to_token: std::collections::HashMap::new(),
         }
     }
 
@@ -5581,8 +5662,31 @@ impl CooperativeInterceptor {
         if state.wake_in_millis == 0 {
             self.ready.push_back(token);
         }
+        if state.wake_in_millis < 0 {
+            if let Some(slot) = self.pending_slot.take() {
+                self.slot_to_token.insert(slot, token);
+            }
+        }
         self.parked.insert(token, (state, wake_at));
         token
+    }
+
+    /// Seam: record the slot the next indefinitely-parked
+    /// activation is waiting on (set by `__kxco_parkSlot`).
+    fn set_pending_slot(&mut self, slot: i64) {
+        self.pending_slot = Some(slot);
+    }
+
+    /// Seam: if a token is waiting on `slot`, move it into the ready
+    /// queue and clear the mapping. Returns whether a waiter was
+    /// found.
+    fn resume_slot(&mut self, slot: i64) -> bool {
+        if let Some(token) = self.slot_to_token.remove(&slot) {
+            self.ready.push_back(token);
+            true
+        } else {
+            false
+        }
     }
 
     /// Seam: take the child `launch` blocks queued this round.
@@ -5710,12 +5814,13 @@ impl<'a> VmIntrinsicHost<'a> {
         this: Option<&klio_runtime::Value>,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        let klio_runtime::Value::IrClosure { id, .. } = callable else {
+        let klio_runtime::Value::IrClosure { id, captures } = callable else {
             return Err(klio_ir::eval::EvalError::Type(format!(
                 "coroutine block is not a closure: `{}`",
                 callable.type_fqn()
             )));
         };
+        let live_captures: Vec<klio_runtime::Value> = (**captures).clone();
         let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
             klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
         })?;
@@ -5749,15 +5854,23 @@ impl<'a> VmIntrinsicHost<'a> {
         while call_args.len() < info.n_params {
             call_args.push(klio_runtime::Value::Null);
         }
+        // Prefer the live captures carried on the closure Value (a
+        // runtime-created closure boxes its captured bindings here);
+        // fall back to the ClosureInfo cell for closures whose Value
+        // carries none (e.g. top-level fn wrappers).
+        let mut capture_values: Vec<klio_runtime::Value> =
+            if live_captures.len() == info.capture_names.len() {
+                live_captures
+            } else {
+                info.captures.borrow().clone()
+            };
         if let Some(t) = this {
             if let Some(idx) = info.capture_names.iter().position(|n| n == "this") {
-                let mut cap = info.captures.borrow_mut();
-                if idx < cap.len() {
-                    cap[idx] = t.clone();
+                if idx < capture_values.len() {
+                    capture_values[idx] = t.clone();
                 }
             }
         }
-        let capture_values: Vec<klio_runtime::Value> = info.captures.borrow().clone();
         let scoped_env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(
             Rc::clone(&self.globals),
         )));
@@ -5998,6 +6111,25 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             // No active runBlocking — run the child eagerly.
             self.invoke_callable(block, &[], _out).map(|_| ())
         }
+    }
+
+    fn coroutine_park_slot(&mut self, slot: i64) {
+        CORO_STACK.with(|s| {
+            if let Some(top) = s.borrow_mut().last_mut() {
+                top.set_pending_slot(slot);
+            }
+        });
+    }
+
+    fn coroutine_resume_slot(&mut self, slot: i64) {
+        CORO_STACK.with(|s| {
+            let mut stk = s.borrow_mut();
+            for interceptor in stk.iter_mut().rev() {
+                if interceptor.resume_slot(slot) {
+                    break;
+                }
+            }
+        });
     }
 
     fn invoke_callable(
