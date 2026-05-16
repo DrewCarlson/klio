@@ -403,16 +403,20 @@ pub struct FrameSnapshot {
     pub resume_reg: Option<Reg>,
 }
 
-/// A parked coroutine: a stack of frame snapshots (outermost first,
-/// innermost last) plus the scheduler token the driver uses to
-/// resume it.
+/// Layer 1 — a parked activation: a stack of frame snapshots
+/// (outermost first, innermost last) plus the token the interceptor
+/// uses to resume it. This is pure suspend mechanism: it carries no
+/// thread, dispatcher, or timing policy of its own.
 #[derive(Debug, Clone)]
 pub struct SuspendState {
     pub token: u64,
     pub frames: Vec<FrameSnapshot>,
-    /// Virtual-time wakeup the suspending primitive requested:
-    /// `>= 0` resumes after that many ms of virtual time, `< 0`
-    /// parks indefinitely until an explicit resume.
+    /// Opaque Layer-2 resume directive, set by the suspending API
+    /// (a `kotlinx.coroutines` primitive) and interpreted only by
+    /// the interceptor — never by Layer 1. The default cooperative
+    /// interceptor reads it as virtual-time millis: `>= 0` resumes
+    /// after that much virtual time, `< 0` parks indefinitely until
+    /// an explicit resume.
     pub wake_in_millis: i64,
     /// Transient: set by the suspending call instruction to its
     /// destination register, consumed by the enclosing block loop

@@ -5475,10 +5475,21 @@ struct VmIntrinsicHost<'a> {
     instance_id_counter: &'a mut u64,
 }
 
-/// Per-`runBlocking` cooperative scheduler state. A stack of these
-/// supports nested `runBlocking` / `coroutineScope`.
+/// Layer 2 — the default `ContinuationInterceptor`.
+///
+/// This is the only place coroutine *scheduling* happens. The core
+/// suspend engine (Layer 1, `klio_ir::eval`) is dispatcher- and
+/// time-agnostic: it only pauses an activation into a
+/// `SuspendState` and resumes one. Every decision about *when* and
+/// in what order parked activations resume — the cooperative ready
+/// queue and virtual-time advance — lives here, behind the named
+/// seam below, so a later thread-dispatching interceptor can
+/// replace it without touching Layer 1.
+///
+/// A stack of these supports nested `runBlocking` /
+/// `coroutineScope`.
 #[derive(Default)]
-struct CoroSched {
+struct CooperativeInterceptor {
     next_token: u64,
     virtual_now: i64,
     /// token → (parked activation, virtual-time wakeup; i64::MAX =
@@ -5490,8 +5501,84 @@ struct CoroSched {
     launched: Vec<klio_runtime::Value>,
 }
 
+impl CooperativeInterceptor {
+    /// Seam: intercept a freshly-suspended activation. Assigns a
+    /// token, decodes the Layer-2 resume directive carried in
+    /// `wake_in_millis` (negative = park indefinitely, `0` = ready
+    /// now, positive = wake after that much virtual time), and
+    /// records it. Returns the token so the driver can recognise
+    /// the root's completion.
+    fn intercept_suspend(&mut self, mut state: klio_ir::eval::SuspendState) -> u64 {
+        self.next_token += 1;
+        let token = self.next_token;
+        state.token = token;
+        let wake_at = if state.wake_in_millis < 0 {
+            i64::MAX
+        } else {
+            self.virtual_now + state.wake_in_millis
+        };
+        if state.wake_in_millis == 0 {
+            self.ready.push_back(token);
+        }
+        self.parked.insert(token, (state, wake_at));
+        token
+    }
+
+    /// Seam: take the child `launch` blocks queued this round.
+    fn drain_launched(&mut self) -> Vec<klio_runtime::Value> {
+        std::mem::take(&mut self.launched)
+    }
+
+    /// Seam: queue a child `launch` block.
+    fn enqueue_launch(&mut self, block: klio_runtime::Value) {
+        self.launched.push(block);
+    }
+
+    /// Seam: next ready token, if any.
+    fn next_ready(&mut self) -> Option<u64> {
+        self.ready.pop_front()
+    }
+
+    /// Seam: take the parked activation for a token.
+    fn take_parked(&mut self, token: u64) -> Option<(klio_ir::eval::SuspendState, i64)> {
+        self.parked.remove(&token)
+    }
+
+    /// Seam: nothing ready — advance virtual time to the soonest
+    /// timer and arm every activation due then. Returns whether any
+    /// progress was made.
+    fn advance_virtual_time(&mut self) -> bool {
+        let soonest = self
+            .parked
+            .values()
+            .map(|(_, w)| *w)
+            .filter(|w| *w != i64::MAX)
+            .min();
+        if let Some(t) = soonest {
+            if t > self.virtual_now {
+                self.virtual_now = t;
+            }
+            let now = self.virtual_now;
+            let mut due: Vec<u64> = self
+                .parked
+                .iter()
+                .filter(|(_, (_, w))| *w != i64::MAX && *w <= now)
+                .map(|(k, _)| *k)
+                .collect();
+            due.sort_unstable();
+            for tok in &due {
+                self.ready.push_back(*tok);
+            }
+            !due.is_empty()
+        } else {
+            false
+        }
+    }
+}
+
 thread_local! {
-    static CORO_STACK: RefCell<Vec<CoroSched>> = const { RefCell::new(Vec::new()) };
+    static CORO_STACK: RefCell<Vec<CooperativeInterceptor>> =
+        const { RefCell::new(Vec::new()) };
     /// Classes whose instance shell is mid-construction for a
     /// non-delegating secondary constructor. While a class is on this
     /// stack, `new_instance` skips secondary dispatch and builds the
@@ -5692,37 +5779,33 @@ impl<'a> VmIntrinsicHost<'a> {
         klio_ir::eval::resume_continuation(&module, state, value, &mut host)
     }
 
-    /// Park a freshly-suspended activation in the active scheduler,
-    /// assigning it a token and a virtual-time wakeup. Returns the
-    /// token so the driver can recognise the root's completion.
-    fn park(&self, mut state: klio_ir::eval::SuspendState) -> u64 {
+    /// Hand a freshly-suspended Layer-1 activation to the active
+    /// interceptor (Layer 2). Returns the token so the driver can
+    /// recognise the root's completion.
+    fn park(&self, state: klio_ir::eval::SuspendState) -> u64 {
         CORO_STACK.with(|s| {
-            let mut stk = s.borrow_mut();
-            let sched = stk.last_mut().expect("park outside runBlocking");
-            sched.next_token += 1;
-            let token = sched.next_token;
-            state.token = token;
-            let wake_at = if state.wake_in_millis < 0 {
-                i64::MAX
-            } else {
-                sched.virtual_now + state.wake_in_millis
-            };
-            if state.wake_in_millis == 0 {
-                sched.ready.push_back(token);
-            }
-            sched.parked.insert(token, (state, wake_at));
-            token
+            s.borrow_mut()
+                .last_mut()
+                .expect("park outside runBlocking")
+                .intercept_suspend(state)
         })
     }
 
-    /// The cooperative event loop behind `runBlocking`.
+    /// Layer 2 — the default interceptor's dispatch loop, the engine
+    /// behind `runBlocking`. Drives Layer-1 activations: it never
+    /// inspects the suspend mechanism, only parks/resumes through
+    /// the interceptor seam.
     fn drive_run_blocking(
         &mut self,
         block: &klio_runtime::Value,
         scope: &klio_runtime::Value,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
-        CORO_STACK.with(|s| s.borrow_mut().push(CoroSched::default()));
+        /// Run `f` against the active interceptor.
+        fn with_top<R>(f: impl FnOnce(&mut CooperativeInterceptor) -> R) -> R {
+            CORO_STACK.with(|s| f(s.borrow_mut().last_mut().expect("no active runBlocking")))
+        }
+        CORO_STACK.with(|s| s.borrow_mut().push(CooperativeInterceptor::default()));
         let map_err = |e: klio_ir::eval::EvalError| -> klio_runtime::RuntimeError {
             match e {
                 klio_ir::eval::EvalError::Throw(v) => klio_runtime::RuntimeError::Thrown(v),
@@ -5749,11 +5832,8 @@ impl<'a> VmIntrinsicHost<'a> {
         }
         loop {
             // 1. Start any queued child launches.
-            let launched: Vec<klio_runtime::Value> = CORO_STACK.with(|s| {
-                let mut stk = s.borrow_mut();
-                let sched = stk.last_mut().unwrap();
-                std::mem::take(&mut sched.launched)
-            });
+            let launched: Vec<klio_runtime::Value> =
+                with_top(CooperativeInterceptor::drain_launched);
             let mut progressed = !launched.is_empty();
             for child in launched {
                 match self.eval_closure_raw(&child, &[], Some(scope), out) {
@@ -5770,15 +5850,9 @@ impl<'a> VmIntrinsicHost<'a> {
                 }
             }
             // 2. Resume a ready coroutine, if any.
-            let next_ready = CORO_STACK.with(|s| {
-                let mut stk = s.borrow_mut();
-                stk.last_mut().unwrap().ready.pop_front()
-            });
+            let next_ready = with_top(CooperativeInterceptor::next_ready);
             if let Some(tok) = next_ready {
-                let entry = CORO_STACK.with(|s| {
-                    let mut stk = s.borrow_mut();
-                    stk.last_mut().unwrap().parked.remove(&tok)
-                });
+                let entry = with_top(|i| i.take_parked(tok));
                 if let Some((st, _)) = entry {
                     progressed = true;
                     match self.resume_raw(st, klio_runtime::Value::Unit, out) {
@@ -5807,35 +5881,7 @@ impl<'a> VmIntrinsicHost<'a> {
             }
             // 3. No ready coroutine — advance virtual time to the
             //    nearest timer and arm every coroutine due then.
-            let advanced = CORO_STACK.with(|s| {
-                let mut stk = s.borrow_mut();
-                let sched = stk.last_mut().unwrap();
-                let soonest = sched
-                    .parked
-                    .values()
-                    .map(|(_, w)| *w)
-                    .filter(|w| *w != i64::MAX)
-                    .min();
-                if let Some(t) = soonest {
-                    if t > sched.virtual_now {
-                        sched.virtual_now = t;
-                    }
-                    let now = sched.virtual_now;
-                    let mut due: Vec<u64> = sched
-                        .parked
-                        .iter()
-                        .filter(|(_, (_, w))| *w != i64::MAX && *w <= now)
-                        .map(|(k, _)| *k)
-                        .collect();
-                    due.sort_unstable();
-                    for tok in &due {
-                        sched.ready.push_back(*tok);
-                    }
-                    !due.is_empty()
-                } else {
-                    false
-                }
-            });
+            let advanced = with_top(CooperativeInterceptor::advance_virtual_time);
             if advanced {
                 continue;
             }
@@ -5870,8 +5916,8 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
     ) -> Result<(), klio_runtime::RuntimeError> {
         let queued = CORO_STACK.with(|s| {
             let mut stk = s.borrow_mut();
-            if let Some(sched) = stk.last_mut() {
-                sched.launched.push(block.clone());
+            if let Some(interceptor) = stk.last_mut() {
+                interceptor.enqueue_launch(block.clone());
                 true
             } else {
                 false

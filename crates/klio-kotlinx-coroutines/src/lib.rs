@@ -1,22 +1,17 @@
-//! Native bindings for `kotlinx.coroutines`.
+//! Layer 2 — the `kotlinx.coroutines` library.
 //!
-//! klio runs single-threaded, so `runBlocking`, `launch`, and
-//! `async` execute their blocks to completion immediately on the
-//! caller's stack. The high-level API (Dispatchers, CoroutineScope,
-//! Job, Channel) lives in the Kotlin shim. The only thing the host
-//! needs to supply is `delay(millis: Long)` — sleeping via the
-//! standard library so a long-running `runBlocking` block does not
-//! spin the CPU.
-
-//! Cooperative coroutines runtime backing the kotlinx.coroutines
-//! shim.
-//!
-//! klio runs single-threaded, so the runtime is a small in-process
-//! cooperative scheduler: a FIFO queue of opaque task handles plus a
-//! cancellation-token registry shared between Jobs and their bodies.
-//! Suspension points (delay, yield, withContext) can call back into
-//! the scheduler; the Kotlin shim observes cancellation tokens
-//! through `__kxco_tokenIsCancelled`.
+//! This crate is a *client* of the Layer-1 core suspend engine
+//! (`klio_ir::eval`): the high-level API (Dispatchers,
+//! CoroutineScope, Job, Channel, builders) lives in the Kotlin
+//! shim, and the few host hooks here only translate library calls
+//! into Layer-1 suspension. `delay`/`yield` raise a suspension
+//! carrying an opaque resume directive; the default cooperative
+//! interceptor (in `klio-interp-ir`) decides when the parked
+//! activation resumes. The host never schedules from here — that is
+//! the interceptor's sole responsibility — and the core suspend
+//! engine never interprets the directive. A cancellation-token
+//! registry is shared between Jobs and their bodies; the Kotlin
+//! shim observes it through `__kxco_tokenIsCancelled`.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
