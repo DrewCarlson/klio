@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -310,10 +311,10 @@ pub enum Value {
     /// honors `step`'s sign. `kind` distinguishes `IntRange` (values widen to
     /// `Value::Int`) from `LongRange` (values widen to `Value::Long`).
     Range { start: i64, end: i64, step: i64, kind: RangeKind },
-    Function { decl: Rc<klio_ast::Function>, env: Rc<RefCell<Env>> },
+    Function { decl: Arc<klio_ast::Function>, env: Rc<RefCell<Env>> },
     Lambda {
         params: Rc<Vec<String>>,
-        body: Rc<klio_ast::Block>,
+        body: Arc<klio_ast::Block>,
         env: Rc<RefCell<Env>>,
         /// `true` when produced by an anonymous-function expression
         /// (`fun (x: Int): R = ...`). A bare `return` inside the body is
@@ -642,7 +643,7 @@ pub enum SuspendTransition {
 /// state to run, and the caller's continuation.
 #[derive(Debug)]
 pub struct SuspendFrame {
-    pub decl: Rc<klio_ast::Function>,
+    pub decl: Arc<klio_ast::Function>,
     pub body: Rc<SuspendBody>,
     pub env: Rc<RefCell<Env>>,
     /// Locals introduced by val/var statements in earlier states.
@@ -701,7 +702,7 @@ pub struct ClassDef {
     /// initializer expression runs against the instance scope during
     /// construction.
     pub body_properties: Vec<PropertyDef>,
-    pub init_blocks: Vec<Rc<klio_ast::Block>>,
+    pub init_blocks: Vec<Arc<klio_ast::Block>>,
     pub is_data: bool,
     pub is_object: bool,
     /// `true` for an `enum class`. The entry instances live on
@@ -729,7 +730,7 @@ pub struct ClassDef {
     /// Constructor argument expressions for the parent class, captured at
     /// declaration time from `: Parent(args)`. Evaluated in the subclass's
     /// constructor env when an instance is built.
-    pub parent_ctor_args: Vec<Rc<klio_ast::Expr>>,
+    pub parent_ctor_args: Vec<Arc<klio_ast::Expr>>,
     /// `true` when the declaration carried the `open` modifier.
     pub is_open: bool,
     /// `true` for an `abstract class`. Direct instantiation is rejected; the
@@ -743,7 +744,7 @@ pub struct ClassDef {
     /// expression. Drives the `Foo$N@hash` form used by `toString`.
     pub is_anonymous: bool,
     /// Secondary constructors. The order is the source-declared order.
-    pub secondary_ctors: Vec<Rc<klio_ast::SecondaryCtor>>,
+    pub secondary_ctors: Vec<Arc<klio_ast::SecondaryCtor>>,
     /// Eagerly-constructed enum entries in source order. Each value is a
     /// `Value::Instance` whose class is either this `ClassDef` or a
     /// synthetic per-entry subclass when the entry declared an override
@@ -797,7 +798,7 @@ pub struct SupertypeDelegate {
     pub interface: Option<Rc<ClassDef>>,
     /// Delegate expression — evaluated in the primary-ctor parameter
     /// scope at construction.
-    pub expr: Rc<klio_ast::Expr>,
+    pub expr: Arc<klio_ast::Expr>,
     /// Field key on the instance where the resolved delegate value lives.
     pub field_key: String,
 }
@@ -808,13 +809,13 @@ pub struct ClassParamDef {
     /// isn't a property.
     pub property: Option<bool>,
     pub name: String,
-    pub default: Option<Rc<klio_ast::Expr>>,
+    pub default: Option<Arc<klio_ast::Expr>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MethodDef {
     pub name: String,
-    pub decl: Rc<klio_ast::Function>,
+    pub decl: Arc<klio_ast::Function>,
     pub is_operator: bool,
     pub is_open: bool,
     pub is_override: bool,
@@ -843,16 +844,16 @@ pub struct MethodDef {
 pub struct PropertyDef {
     pub name: String,
     pub mutable: bool,
-    pub init: Option<Rc<klio_ast::Expr>>,
+    pub init: Option<Arc<klio_ast::Expr>>,
     /// Custom getter body, if the source declared `get() = …` / `get() { … }`.
-    pub getter: Option<Rc<klio_ast::Accessor>>,
+    pub getter: Option<Arc<klio_ast::Accessor>>,
     /// Custom setter body, if the source declared `set(value) { … }`.
-    pub setter: Option<Rc<klio_ast::Accessor>>,
+    pub setter: Option<Arc<klio_ast::Accessor>>,
     /// `val foo by expr` — the delegate expression. Evaluated once at
     /// instance construction; its result is stored under
     /// `__delegate$<name>` in the instance field map and consulted on
     /// every read/write of the property.
-    pub delegate: Option<Rc<klio_ast::Expr>>,
+    pub delegate: Option<Arc<klio_ast::Expr>>,
     /// `true` when the property was declared `abstract`. Such properties
     /// have no `init` and serve as a contract for subclasses.
     pub is_abstract: bool,

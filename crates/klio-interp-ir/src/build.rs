@@ -13,6 +13,7 @@
 //! * Reflection metadata population (W8)
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use std::cell::RefCell;
 
@@ -344,7 +345,7 @@ fn synthesize_class_from_object(o: &klio_ast::ObjectDecl) -> klio_ast::Class {
 /// Result of building an IR module from a single Kotlin file.
 pub struct BuiltModule {
     /// The frozen IR module ready for `Vm::run`.
-    pub module: Rc<klio_ir::Module>,
+    pub module: Arc<klio_ir::Module>,
     /// Per-class runtime metadata, keyed by simple class name. The
     /// Vm uses these when allocating instances. As the IR Class
     /// grows to carry the full runtime shape (methods, supertypes,
@@ -447,7 +448,7 @@ pub struct BuiltModule {
     /// through this table when the entry has its own overrides.
     pub enum_entry_methods: std::collections::HashMap<
         (String, String),
-        (std::rc::Rc<klio_ir::Module>, klio_ir::FuncId),
+        (std::sync::Arc<klio_ir::Module>, klio_ir::FuncId),
     >,
     /// `(enum class name, entry name) -> synth class name` for
     /// entries whose body declares method overrides. The Vm reads
@@ -1115,7 +1116,7 @@ fn build_module_with_overrides(
                 .map(|p| ClassParamDef {
                     property: p.property,
                     name: p.name.name.clone(),
-                    default: p.default.as_ref().map(|e| std::rc::Rc::new(e.clone())),
+                    default: p.default.as_ref().map(|e| std::sync::Arc::new(e.clone())),
                 })
                 .collect();
             let body_properties: Vec<PropertyDef> = c
@@ -1125,10 +1126,10 @@ fn build_module_with_overrides(
                     Decl::Property(p) => Some(PropertyDef {
                         name: p.name.name.clone(),
                         mutable: p.mutable,
-                        init: p.init.as_ref().map(|e| std::rc::Rc::new(e.clone())),
-                        getter: p.getter.as_ref().map(|a| std::rc::Rc::new(a.clone())),
-                        setter: p.setter.as_ref().map(|a| std::rc::Rc::new(a.clone())),
-                        delegate: p.delegate.as_ref().map(|e| std::rc::Rc::new(e.clone())),
+                        init: p.init.as_ref().map(|e| std::sync::Arc::new(e.clone())),
+                        getter: p.getter.as_ref().map(|a| std::sync::Arc::new(a.clone())),
+                        setter: p.setter.as_ref().map(|a| std::sync::Arc::new(a.clone())),
+                        delegate: p.delegate.as_ref().map(|e| std::sync::Arc::new(e.clone())),
                         is_abstract: p.is_abstract,
                         is_lateinit: p.is_lateinit,
                     }),
@@ -1164,7 +1165,7 @@ fn build_module_with_overrides(
                 secondary_ctors: c
                     .secondary_ctors
                     .iter()
-                    .map(|sc| std::rc::Rc::new(sc.clone()))
+                    .map(|sc| std::sync::Arc::new(sc.clone()))
                     .collect(),
                 supertype_names: c
                     .supertypes
@@ -1197,7 +1198,7 @@ fn build_module_with_overrides(
     let mut enum_entry_arg_inits: Vec<(String, String, Vec<klio_ir::FuncId>)> = Vec::new();
     let mut enum_entry_methods: std::collections::HashMap<
         (String, String),
-        (std::rc::Rc<klio_ir::Module>, klio_ir::FuncId),
+        (std::sync::Arc<klio_ir::Module>, klio_ir::FuncId),
     > = std::collections::HashMap::new();
     let mut enum_entry_synth_class: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
@@ -1255,7 +1256,7 @@ fn build_module_with_overrides(
                                     &own,
                                 );
                                 let fid = func.id;
-                                let module_rc = std::rc::Rc::new(sub_module);
+                                let module_rc = std::sync::Arc::new(sub_module);
                                 enum_entry_methods.insert(
                                     (synth_class_name.clone(), f.name.name.clone()),
                                     (module_rc, fid),
@@ -1679,7 +1680,7 @@ fn build_module_with_overrides(
         local_fn_defaults,
     };
     BuiltModule {
-        module: Rc::new(module),
+        module: Arc::new(module),
         classes,
         body_prop_inits,
         instance_prop_getters,

@@ -15,6 +15,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub use klio_runtime::Output;
 
@@ -23,7 +24,7 @@ pub mod build;
 /// One Vm instance executes a single program against the IR module
 /// produced by the front end.
 pub struct Vm {
-    module: Rc<klio_ir::Module>,
+    module: Arc<klio_ir::Module>,
     globals: Rc<RefCell<klio_runtime::Env>>,
     scheduler: Box<dyn klio_runtime::Scheduler>,
     instance_id_counter: u64,
@@ -93,7 +94,7 @@ pub struct Vm {
     /// modules and dispatch from this table.
     anon_methods: Rc<RefCell<std::collections::HashMap<
         (String, String),
-        (Rc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
+        (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>>,
     /// Closure side-table. Each `Value::IrClosure { id, captures }`
     /// resolves to a `(body_func, n_params)` here. `n_params` lets
@@ -104,7 +105,7 @@ pub struct Vm {
     /// before `klio_stdlib::implementation` so a pack's
     /// `kotlinx.atomicfu.AtomicInt.compareAndSet` wins over the
     /// stdlib's default lookup.
-    installed_bindings: Rc<klio_stdlib::HostBindings>,
+    installed_bindings: Arc<klio_stdlib::HostBindings>,
 }
 
 #[derive(Clone)]
@@ -129,7 +130,7 @@ impl Vm {
     /// aliases (`print`, `println`, `listOf`, ...) are installed
     /// into globals up front so identifiers covered by Kotlin's
     /// default imports resolve without an explicit `import`.
-    pub fn new(module: Rc<klio_ir::Module>) -> Self {
+    pub fn new(module: Arc<klio_ir::Module>) -> Self {
         let mut env = klio_runtime::Env::new();
         for (name, fqn) in klio_stdlib::IMPLICIT_ALIASES {
             if let Some(func) = klio_stdlib::implementation(fqn) {
@@ -158,7 +159,7 @@ impl Vm {
             class_default_outer: Rc::new(RefCell::new(std::collections::HashMap::new())),
             anon_methods: Rc::new(RefCell::new(std::collections::HashMap::new())),
             closures: Vec::new(),
-            installed_bindings: Rc::new(klio_stdlib::HostBindings::new()),
+            installed_bindings: Arc::new(klio_stdlib::HostBindings::new()),
         }
     }
 
@@ -166,7 +167,7 @@ impl Vm {
     /// `klio_stdlib::implementation` during dispatch so a pack's
     /// FQN-keyed bindings shadow the stdlib's default lookup.
     pub fn set_installed_bindings(&mut self, bindings: klio_stdlib::HostBindings) {
-        self.installed_bindings = Rc::new(bindings);
+        self.installed_bindings = Arc::new(bindings);
     }
 
     /// Build a Vm from a fully-prepared `build::BuiltModule`. The
@@ -206,7 +207,7 @@ impl Vm {
         main: klio_ir::FuncId,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, VmError> {
-        let module = Rc::clone(&self.module);
+        let module = Arc::clone(&self.module);
         // Run top-level property initialisers before main so global
         // reads against the env see the initial values.
         let inits: Vec<(String, klio_ir::FuncId)> = self.top_level_props.clone();
@@ -219,7 +220,7 @@ impl Vm {
             let v = {
                 let mut host = VmHost {
                     globals: Rc::clone(&self.globals),
-                    module: Rc::clone(&module),
+                    module: Arc::clone(&module),
                     scheduler: &mut *self.scheduler,
                     out,
                     instance_id_counter: &mut self.instance_id_counter,
@@ -240,7 +241,7 @@ impl Vm {
                     func_type_params: &self.module.registry.func_type_params,
                     top_level_delegated_props: &self.module.registry.top_level_delegated_props,
                     delegated_body_props: &self.module.registry.delegated_body_props,
-                    installed_bindings: Rc::clone(&self.installed_bindings),
+                    installed_bindings: Arc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
@@ -315,7 +316,7 @@ impl Vm {
                 let v = {
                     let mut host = VmHost {
                         globals: Rc::clone(&self.globals),
-                        module: Rc::clone(&module),
+                        module: Arc::clone(&module),
                         scheduler: &mut *self.scheduler,
                         out,
                         instance_id_counter: &mut self.instance_id_counter,
@@ -336,7 +337,7 @@ impl Vm {
                     func_type_params: &self.module.registry.func_type_params,
                     top_level_delegated_props: &self.module.registry.top_level_delegated_props,
                     delegated_body_props: &self.module.registry.delegated_body_props,
-                    installed_bindings: Rc::clone(&self.installed_bindings),
+                    installed_bindings: Arc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                         closures: &mut self.closures,
                     };
@@ -363,7 +364,7 @@ impl Vm {
             let inst = {
                 let mut host = VmHost {
                     globals: Rc::clone(&self.globals),
-                    module: Rc::clone(&module),
+                    module: Arc::clone(&module),
                     scheduler: &mut *self.scheduler,
                     out,
                     instance_id_counter: &mut self.instance_id_counter,
@@ -384,7 +385,7 @@ impl Vm {
                     func_type_params: &self.module.registry.func_type_params,
                     top_level_delegated_props: &self.module.registry.top_level_delegated_props,
                     delegated_body_props: &self.module.registry.delegated_body_props,
-                    installed_bindings: Rc::clone(&self.installed_bindings),
+                    installed_bindings: Arc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut self.closures,
                 };
@@ -414,7 +415,7 @@ impl Vm {
             .clone();
         let mut host = VmHost {
             globals: Rc::clone(&self.globals),
-            module: Rc::clone(&module),
+            module: Arc::clone(&module),
             scheduler: &mut *self.scheduler,
             out,
             instance_id_counter: &mut self.instance_id_counter,
@@ -435,7 +436,7 @@ impl Vm {
             func_type_params: &self.module.registry.func_type_params,
                     top_level_delegated_props: &self.module.registry.top_level_delegated_props,
                     delegated_body_props: &self.module.registry.delegated_body_props,
-                    installed_bindings: Rc::clone(&self.installed_bindings),
+                    installed_bindings: Arc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut self.closures,
         };
@@ -476,7 +477,7 @@ impl From<klio_ir::eval::EvalError> for VmError {
 /// failure surfaces are easy to identify and migrate one by one.
 struct VmHost<'a> {
     globals: Rc<RefCell<klio_runtime::Env>>,
-    module: Rc<klio_ir::Module>,
+    module: Arc<klio_ir::Module>,
     scheduler: &'a mut dyn klio_runtime::Scheduler,
     out: &'a mut dyn Output,
     instance_id_counter: &'a mut u64,
@@ -496,7 +497,7 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     anon_methods: Rc<RefCell<std::collections::HashMap<
         (String, String),
-        (Rc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
+        (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>>,
     companion_singletons: &'a std::collections::HashMap<String, String>,
     secondary_ctors:
@@ -511,7 +512,7 @@ struct VmHost<'a> {
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
     top_level_delegated_props: &'a std::collections::HashSet<String>,
     delegated_body_props: &'a std::collections::HashSet<(String, String)>,
-    installed_bindings: Rc<klio_stdlib::HostBindings>,
+    installed_bindings: Arc<klio_stdlib::HostBindings>,
     class_default_outer:
         Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     closures: &'a mut Vec<ClosureInfo>,
@@ -529,7 +530,7 @@ impl<'a> VmHost<'a> {
         &mut self,
         seq_val: &klio_runtime::Value,
     ) -> Result<Vec<klio_runtime::Value>, klio_ir::eval::EvalError> {
-        let module_for_intrinsic = Rc::clone(&self.module);
+        let module_for_intrinsic = Arc::clone(&self.module);
         let mut intrinsic_host = VmIntrinsicHost {
             scheduler: &mut *self.scheduler,
             module: module_for_intrinsic,
@@ -552,7 +553,7 @@ impl<'a> VmHost<'a> {
             func_type_params: &self.module.registry.func_type_params,
             top_level_delegated_props: &self.module.registry.top_level_delegated_props,
             delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Rc::clone(&self.installed_bindings),
+            installed_bindings: Arc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             instance_id_counter: &mut *self.instance_id_counter,
         };
@@ -736,7 +737,7 @@ impl<'a> VmHost<'a> {
         // module. This lets HOF stdlib bindings (`map`, `forEach`,
         // scope fns) call back into IR-lowered lambda bodies
         // natively, without bouncing through klio-interp.
-        let module_for_intrinsic = Rc::clone(&self.module);
+        let module_for_intrinsic = Arc::clone(&self.module);
         let mut intrinsic_host = VmIntrinsicHost {
             scheduler: &mut *self.scheduler,
             module: module_for_intrinsic,
@@ -759,7 +760,7 @@ impl<'a> VmHost<'a> {
             func_type_params: &self.module.registry.func_type_params,
             top_level_delegated_props: &self.module.registry.top_level_delegated_props,
             delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Rc::clone(&self.installed_bindings),
+            installed_bindings: Arc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             instance_id_counter: &mut *self.instance_id_counter,
         };
@@ -1202,7 +1203,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
             })?;
-            let module = Rc::clone(&self.module);
+            let module = Arc::clone(&self.module);
             let func = module
                 .funcs
                 .get(info.body_func.0 as usize)
@@ -1453,7 +1454,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         fid.0
                     ))
                 })?;
-                let module = Rc::clone(&self.module);
+                let module = Arc::clone(&self.module);
                 return klio_ir::eval::eval_with(&module, &func, vec![receiver.clone()], self);
             }
         }
@@ -1648,7 +1649,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             fid.0
                         ))
                     })?;
-                let module = Rc::clone(&self.module);
+                let module = Arc::clone(&self.module);
                 return klio_ir::eval::eval_with(&module, &func, vec![receiver.clone()], self);
             }
             if let Some(v) = inst.borrow().get(name) {
@@ -1928,7 +1929,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             fid.0
                         ))
                     })?;
-                let module = Rc::clone(&self.module);
+                let module = Arc::clone(&self.module);
                 klio_ir::eval::eval_with(
                     &module,
                     &func,
@@ -1975,7 +1976,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 fid.0
                             ))
                         })?;
-                    let module = Rc::clone(&self.module);
+                    let module = Arc::clone(&self.module);
                     klio_ir::eval::eval_with(
                         &module,
                         &func,
@@ -2130,7 +2131,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             .map(|p| klio_runtime::ClassParamDef {
                 property: p.property,
                 name: p.name.name.clone(),
-                default: p.default.as_ref().map(|e| Rc::new(e.clone())),
+                default: p.default.as_ref().map(|e| Arc::new(e.clone())),
             })
             .collect();
         let body_properties: Vec<klio_runtime::PropertyDef> = class
@@ -2140,10 +2141,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 klio_ast::Decl::Property(p) => Some(klio_runtime::PropertyDef {
                     name: p.name.name.clone(),
                     mutable: p.mutable,
-                    init: p.init.as_ref().map(|e| Rc::new(e.clone())),
-                    getter: p.getter.as_ref().map(|a| Rc::new(a.clone())),
-                    setter: p.setter.as_ref().map(|a| Rc::new(a.clone())),
-                    delegate: p.delegate.as_ref().map(|e| Rc::new(e.clone())),
+                    init: p.init.as_ref().map(|e| Arc::new(e.clone())),
+                    getter: p.getter.as_ref().map(|a| Arc::new(a.clone())),
+                    setter: p.setter.as_ref().map(|a| Arc::new(a.clone())),
+                    delegate: p.delegate.as_ref().map(|e| Arc::new(e.clone())),
                     is_abstract: p.is_abstract,
                     is_lateinit: p.is_lateinit,
                 }),
@@ -2225,7 +2226,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     &own_members,
                 );
                 let fid = func.id;
-                let module_rc = Rc::new(sub_module);
+                let module_rc = Arc::new(sub_module);
                 let entry = (module_rc, fid, Vec::new());
                 let mut tbl = self.anon_methods.borrow_mut();
                 tbl.insert(
@@ -2307,7 +2308,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         &own_members,
                     );
                     let fid = func.id;
-                    let module_rc = Rc::new(sub_module);
+                    let module_rc = Arc::new(sub_module);
                     let entry = (module_rc, fid, Vec::new());
                     let mut tbl = self.anon_methods.borrow_mut();
                     tbl.insert(
@@ -2422,7 +2423,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         &own_members,
                     );
                     let fid = func.id;
-                    let module_rc = Rc::new(sub_module);
+                    let module_rc = Arc::new(sub_module);
                     let entry = (module_rc, fid, capture_pairs.clone());
                     let mut tbl = self.anon_methods.borrow_mut();
                     tbl.insert(
@@ -2444,10 +2445,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     klio_ast::Decl::Property(p) => Some(klio_runtime::PropertyDef {
                         name: p.name.name.clone(),
                         mutable: p.mutable,
-                        init: p.init.as_ref().map(|e| Rc::new(e.clone())),
-                        getter: p.getter.as_ref().map(|a| Rc::new(a.clone())),
-                        setter: p.setter.as_ref().map(|a| Rc::new(a.clone())),
-                        delegate: p.delegate.as_ref().map(|e| Rc::new(e.clone())),
+                        init: p.init.as_ref().map(|e| Arc::new(e.clone())),
+                        getter: p.getter.as_ref().map(|a| Arc::new(a.clone())),
+                        setter: p.setter.as_ref().map(|a| Arc::new(a.clone())),
+                        delegate: p.delegate.as_ref().map(|e| Arc::new(e.clone())),
                         is_abstract: p.is_abstract,
                         is_lateinit: p.is_lateinit,
                     }),
@@ -2607,7 +2608,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 Vec::with_capacity(args.len() + 1);
                             all.push(receiver.clone());
                             all.extend_from_slice(args);
-                            let module = Rc::clone(&self.module);
+                            let module = Arc::clone(&self.module);
                             return klio_ir::eval::eval_with(&module, &func, all, self);
                         }
                     }
@@ -4424,7 +4425,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         // into an array (the implicit `this` is now
                         // in `all_args`, so packing aligns).
                         let all_args = pack_vararg_args(&f, all_args);
-                        let module = Rc::clone(&self.module);
+                        let module = Arc::clone(&self.module);
                         return klio_ir::eval::eval_with(&module, &f, all_args, self);
                     }
                 }
@@ -4620,7 +4621,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 // call_func pads defaulted params, packs varargs and
                 // honours a pack-installed binding that shadows a
                 // bodyless `expect` extension.
-                let module = Rc::clone(&self.module);
+                let module = Arc::clone(&self.module);
                 return self.call_func(&module, fid, all);
             }
         }
@@ -4882,7 +4883,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 .cloned()
                 .unwrap_or_default();
             if let Some(entry) = entries.iter().find(|e| e.param_count == args.len()) {
-                let module = Rc::clone(&self.module);
+                let module = Arc::clone(&self.module);
                 let mut target_args: Vec<klio_runtime::Value> =
                     Vec::with_capacity(entry.delegation_arg_thunks.len());
                 for fid in &entry.delegation_arg_thunks {
@@ -5131,7 +5132,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 self.module.funcs.get(fid.0 as usize).cloned()
                             {
                                 let v = klio_ir::eval::eval_with(
-                                    &Rc::clone(&self.module),
+                                    &Arc::clone(&self.module),
                                     &func,
                                     cur_args.clone(),
                                     self,
@@ -5166,7 +5167,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         fid.0
                     ))
                 })?;
-                let module = Rc::clone(&self.module);
+                let module = Arc::clone(&self.module);
                 let v = klio_ir::eval::eval_with(&module, &func, cur_args.clone(), self)?;
                 parent_args.push(v);
             }
@@ -5221,7 +5222,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             .unwrap_or_default();
         for (sup_name, fid) in &class_delegate_thunks {
             if let Some(func) = self.module.funcs.get(fid.0 as usize).cloned() {
-                let module = Rc::clone(&self.module);
+                let module = Arc::clone(&self.module);
                 let v = klio_ir::eval::eval_with(&module, &func, args.to_vec(), self)?;
                 inst.borrow_mut()
                     .fields
@@ -5266,7 +5267,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             fid.0
                         ))
                     })?;
-                let module = Rc::clone(&self.module);
+                let module = Arc::clone(&self.module);
                 let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(1 + args.len());
                 all.push(inst_value.clone());
                 all.extend_from_slice(args);
@@ -5335,7 +5336,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 for fid in fids {
                     let func = self.module.funcs.get(fid.0 as usize).cloned();
                     if let Some(f) = func {
-                        let module = Rc::clone(&self.module);
+                        let module = Arc::clone(&self.module);
                         let mut all: Vec<klio_runtime::Value> =
                             Vec::with_capacity(1 + cls_args.len());
                         all.push(inst_value.clone());
@@ -5544,7 +5545,7 @@ fn materialise_range_items(
 /// same closure / class / globals tables the outer Vm uses.
 struct VmIntrinsicHost<'a> {
     scheduler: &'a mut dyn klio_runtime::Scheduler,
-    module: Rc<klio_ir::Module>,
+    module: Arc<klio_ir::Module>,
     closures: &'a mut Vec<ClosureInfo>,
     globals: Rc<RefCell<klio_runtime::Env>>,
     classes: Rc<RefCell<std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>>>,
@@ -5563,7 +5564,7 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     anon_methods: Rc<RefCell<std::collections::HashMap<
         (String, String),
-        (Rc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
+        (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>>,
     companion_singletons: &'a std::collections::HashMap<String, String>,
     secondary_ctors:
@@ -5578,7 +5579,7 @@ struct VmIntrinsicHost<'a> {
         &'a std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
     top_level_delegated_props: &'a std::collections::HashSet<String>,
     delegated_body_props: &'a std::collections::HashSet<(String, String)>,
-    installed_bindings: Rc<klio_stdlib::HostBindings>,
+    installed_bindings: Arc<klio_stdlib::HostBindings>,
     class_default_outer:
         Rc<RefCell<std::collections::HashMap<String, klio_runtime::Value>>>,
     instance_id_counter: &'a mut u64,
@@ -5842,7 +5843,7 @@ impl<'a> VmIntrinsicHost<'a> {
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         let mut host = VmHost {
             globals: Rc::clone(&self.globals),
-            module: Rc::clone(&self.module),
+            module: Arc::clone(&self.module),
             scheduler: &mut *self.scheduler,
             out,
             instance_id_counter: &mut *self.instance_id_counter,
@@ -5863,7 +5864,7 @@ impl<'a> VmIntrinsicHost<'a> {
             func_type_params: &self.module.registry.func_type_params,
             top_level_delegated_props: &self.module.registry.top_level_delegated_props,
             delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Rc::clone(&self.installed_bindings),
+            installed_bindings: Arc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut *self.closures,
         };
@@ -5944,11 +5945,11 @@ impl<'a> VmIntrinsicHost<'a> {
         for (n, v) in info.capture_names.iter().zip(capture_values.iter()) {
             scoped_env.borrow_mut().define(n.clone(), v.clone());
         }
-        let module = Rc::clone(&self.module);
+        let module = Arc::clone(&self.module);
         let result = {
             let mut host = VmHost {
                 globals: Rc::clone(&scoped_env),
-                module: Rc::clone(&self.module),
+                module: Arc::clone(&self.module),
                 scheduler: &mut *self.scheduler,
                 out,
                 instance_id_counter: &mut *self.instance_id_counter,
@@ -5969,7 +5970,7 @@ impl<'a> VmIntrinsicHost<'a> {
                 func_type_params: &self.module.registry.func_type_params,
                 top_level_delegated_props: &self.module.registry.top_level_delegated_props,
                 delegated_body_props: &self.module.registry.delegated_body_props,
-                installed_bindings: Rc::clone(&self.installed_bindings),
+                installed_bindings: Arc::clone(&self.installed_bindings),
                 class_default_outer: Rc::clone(&self.class_default_outer),
                 closures: &mut *self.closures,
             };
@@ -5997,10 +5998,10 @@ impl<'a> VmIntrinsicHost<'a> {
         value: klio_runtime::Value,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        let module = Rc::clone(&self.module);
+        let module = Arc::clone(&self.module);
         let mut host = VmHost {
             globals: Rc::clone(&self.globals),
-            module: Rc::clone(&module),
+            module: Arc::clone(&module),
             scheduler: &mut *self.scheduler,
             out,
             instance_id_counter: &mut *self.instance_id_counter,
@@ -6021,7 +6022,7 @@ impl<'a> VmIntrinsicHost<'a> {
             func_type_params: &self.module.registry.func_type_params,
             top_level_delegated_props: &self.module.registry.top_level_delegated_props,
             delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Rc::clone(&self.installed_bindings),
+            installed_bindings: Arc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut *self.closures,
         };
@@ -6225,7 +6226,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             let defaults =
                 self.func_defaults.get(&info.body_func).cloned();
             let capture_values: Vec<klio_runtime::Value> = info.captures.borrow().clone();
-            let module = Rc::clone(&self.module);
+            let module = Arc::clone(&self.module);
             // Mutable-capture support: pre-define each captured name
             // in a fresh env layered on top of globals so the body's
             // StoreGlobal writes land in the env, then read back the
@@ -6240,7 +6241,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             let result = {
                 let mut host = VmHost {
                     globals: Rc::clone(&scoped_env),
-                    module: Rc::clone(&self.module),
+                    module: Arc::clone(&self.module),
                     scheduler: &mut *self.scheduler,
                     out,
                     instance_id_counter: &mut *self.instance_id_counter,
@@ -6261,7 +6262,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     func_type_params: &self.module.registry.func_type_params,
             top_level_delegated_props: &self.module.registry.top_level_delegated_props,
             delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Rc::clone(&self.installed_bindings),
+            installed_bindings: Arc::clone(&self.installed_bindings),
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut *self.closures,
                 };
@@ -6324,7 +6325,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         if let klio_runtime::Value::Intrinsic { func, .. } = callable {
             let mut child = VmIntrinsicHost {
                 scheduler: &mut *self.scheduler,
-                module: Rc::clone(&self.module),
+                module: Arc::clone(&self.module),
                 closures: &mut *self.closures,
                 globals: Rc::clone(&self.globals),
                 classes: Rc::clone(&self.classes),
@@ -6344,7 +6345,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 func_type_params: &self.module.registry.func_type_params,
             top_level_delegated_props: &self.module.registry.top_level_delegated_props,
             delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Rc::clone(&self.installed_bindings),
+            installed_bindings: Arc::clone(&self.installed_bindings),
                 class_default_outer: Rc::clone(&self.class_default_outer),
                 instance_id_counter: &mut *self.instance_id_counter,
             };
@@ -6452,10 +6453,10 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         // Build a VmHost that shares this IntrinsicHost's tables
         // and route through call_member so the dispatch picks up
         // user override methods (`override fun toString()` etc.).
-        let module = Rc::clone(&self.module);
+        let module = Arc::clone(&self.module);
         let mut host = VmHost {
             globals: Rc::clone(&self.globals),
-            module: Rc::clone(&module),
+            module: Arc::clone(&module),
             scheduler: &mut *self.scheduler,
             out,
             instance_id_counter: &mut *self.instance_id_counter,
@@ -6476,7 +6477,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             func_type_params: &self.module.registry.func_type_params,
             top_level_delegated_props: &self.module.registry.top_level_delegated_props,
             delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Rc::clone(&self.installed_bindings),
+            installed_bindings: Arc::clone(&self.installed_bindings),
             class_default_outer: Rc::clone(&self.class_default_outer),
             closures: &mut *self.closures,
         };
@@ -6525,7 +6526,7 @@ mod tests {
         module.func_index.push(("main".into(), main_id));
         module.top_level.push(main_id);
 
-        let mut vm = Vm::new(Rc::new(module));
+        let mut vm = Vm::new(Arc::new(module));
         let mut out = StringOut::default();
         let v = vm.run(main_id, &mut out).unwrap();
         match v {
@@ -6561,7 +6562,7 @@ mod tests {
         module.func_index.push(("main".into(), main_id));
         module.top_level.push(main_id);
 
-        let mut vm = Vm::new(Rc::new(module));
+        let mut vm = Vm::new(Arc::new(module));
         let mut out = StringOut::default();
         vm.run(main_id, &mut out).unwrap();
         assert_eq!(out.0, "hello\n");
