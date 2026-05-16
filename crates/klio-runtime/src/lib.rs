@@ -486,7 +486,7 @@ pub enum Value {
     /// state machine elected to pause; the carried frame is the
     /// continuation entry point that, when resumed, will drive
     /// execution forward.
-    CoroutineSuspended(Rc<RefCell<SuspendFrame>>),
+    CoroutineSuspended(ObjRef<SuspendFrame>),
     Int(i32),
     Long(i64),
     Short(i16),
@@ -883,8 +883,8 @@ pub enum PausedResume {
 /// `runBlocking` drains.
 #[derive(Debug, Clone)]
 pub enum SuspendCallerCont {
-    Frame(Rc<RefCell<SuspendFrame>>),
-    HostSlot(Rc<RefCell<Option<Result<Value, Value>>>>),
+    Frame(ObjRef<SuspendFrame>),
+    HostSlot(ObjRef<Option<Result<Value, Value>>>),
 }
 
 /// A declared Kotlin class as the interpreter sees it at runtime.
