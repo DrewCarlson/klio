@@ -780,6 +780,16 @@ fn build_module_with_overrides(
             file_classes.insert(c.name.name.clone(), c);
         }
     }
+    // Pre-register every class name so `class_id` resolves
+    // regardless of declaration order: a method body may reference a
+    // class declared later in the module (kotlinx-io's `Buffer`
+    // methods use `Segment` / `SegmentPool`, both declared after
+    // `Buffer`). `add_class` reuses these reserved slots.
+    for d in decls {
+        if let Decl::Class(c) = d {
+            module.reserve_class(&c.name.name);
+        }
+    }
     for d in decls {
         if let Decl::Class(c) = d {
             let empty = std::collections::HashSet::new();

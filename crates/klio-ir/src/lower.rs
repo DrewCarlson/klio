@@ -1560,6 +1560,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         return dst;
                     }
                 }
+                // A bare name that is a known class is a class
+                // reference (`Segment.SIZE`, `Segment.new()`), not an
+                // implicit `this.<name>` member read. This must beat
+                // the `this`-prefix probe below: inside an instance
+                // or object method `this` is bound, and without this
+                // check `Segment` would lower to `this.Segment` and
+                // miss. The class value flows into get_field /
+                // call_member which forward to the companion.
+                if b.module.class_id(&segments[0].name).is_some() {
+                    let dst = b.alloc_reg();
+                    let n = b
+                        .module
+                        .intern_const(Const::String(segments[0].name.clone()));
+                    b.push(Inst::LoadGlobal { dst, name: n });
+                    return dst;
+                }
                 // Not a local and not a known capture. Inside a
                 // method / extension fn with `this` bound as a
                 // param, try `this.<name>` first via GetField so

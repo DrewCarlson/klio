@@ -561,12 +561,44 @@ impl Module {
             .map(|(_, id)| *id)
     }
 
-    /// Register a class declaration and return its id.
+    /// Register a class declaration and return its id. If the name
+    /// was previously [`reserve_class`](Self::reserve_class)d, the
+    /// reserved slot/id is reused so forward references that resolved
+    /// to that id stay valid.
     pub fn add_class(&mut self, mut class: Class) -> ClassId {
+        if let Some(&(_, id)) = self.class_index.iter().find(|(n, _)| n == &class.name) {
+            class.id = id;
+            self.classes[id.0 as usize] = class;
+            return id;
+        }
         let id = ClassId(self.classes.len() as u32);
         class.id = id;
         self.class_index.push((class.name.clone(), id));
         self.classes.push(class);
+        id
+    }
+
+    /// Pre-register a class name so `class_id` resolves it before its
+    /// body is lowered. Makes cross-class references order-independent
+    /// (a method body can name a class declared later in the module).
+    /// The placeholder is overwritten by the real definition when
+    /// `add_class` runs for the same name.
+    pub fn reserve_class(&mut self, name: &str) -> ClassId {
+        if let Some(&(_, id)) = self.class_index.iter().find(|(n, _)| n == name) {
+            return id;
+        }
+        let id = ClassId(self.classes.len() as u32);
+        self.class_index.push((name.to_string(), id));
+        self.classes.push(Class {
+            id,
+            name: name.to_string(),
+            fqn: name.to_string(),
+            primary_params: Vec::new(),
+            methods: Vec::new(),
+            init_block: None,
+            companion: None,
+            supertypes: Vec::new(),
+        });
         id
     }
 }
