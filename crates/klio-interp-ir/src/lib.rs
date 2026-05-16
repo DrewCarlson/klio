@@ -600,12 +600,30 @@ impl<'a> VmHost<'a> {
         // doesn't preserve the arrow shape, so accept any callable at
         // a low score — concrete-type params still outrank it and
         // arity does the real disambiguation between overloads.
-        if matches!(
-            arg,
-            klio_runtime::Value::Lambda { .. }
-                | klio_runtime::Value::IrClosure { .. }
-        ) || arg.type_fqn().starts_with("kotlin.Function")
-        {
+        let arg_arity: Option<usize> = match arg {
+            klio_runtime::Value::Lambda { params, .. } => Some(params.len()),
+            klio_runtime::Value::IrClosure { id, .. } => {
+                self.closures.get(*id as usize).map(|c| c.n_params)
+            }
+            _ => None,
+        };
+        let is_callable = arg_arity.is_some()
+            || arg.type_fqn().starts_with("kotlin.Function");
+        if is_callable {
+            // `FunctionN` carries the expected lambda arity. Rank an
+            // exact match high so overloads differing only in the
+            // functional parameter's shape are disambiguated; a
+            // mismatch still scores (low) rather than disqualifying,
+            // to stay tolerant of receiver-style function types.
+            if let Some(expected) = nm.strip_prefix("Function") {
+                if let Ok(want) = expected.parse::<usize>() {
+                    return Some(match arg_arity {
+                        Some(got) if got == want => 90,
+                        Some(_) => 2,
+                        None => 15,
+                    });
+                }
+            }
             return Some(15);
         }
         // Generic single-letter type-parameter — accept any.

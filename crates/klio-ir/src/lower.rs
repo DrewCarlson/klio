@@ -1109,6 +1109,19 @@ pub fn lower_function_body_into(
     lower_function_body(module, f, file_classes)
 }
 
+/// Lowered name for a parameter's declared type. A function type
+/// `(A, B) -> R` is tagged `Function2` (arity = number of parameters,
+/// receiver excluded) so runtime overload resolution can match a
+/// lambda argument by its parameter count — the only way to tell
+/// apart overloads that differ solely in the shape of a functional
+/// parameter (e.g. kotlinx-io's two `UnsafeBufferOperations.writeToTail`).
+fn lowered_type_name(ty: &klio_ast::TypeRef) -> String {
+    if let Some(ft) = &ty.function {
+        return format!("Function{}", ft.params.len());
+    }
+    ty.name.name.clone()
+}
+
 fn lower_function_body(
     module: &mut crate::Module,
     f: &klio_ast::Function,
@@ -1240,7 +1253,7 @@ fn lower_function_body_with_implicit_owner(
     params.extend(f.params.iter().map(|p| crate::Param {
         name: p.name.name.clone(),
         ty: crate::TypeRef {
-            name: p.ty.name.name.clone(),
+            name: lowered_type_name(&p.ty),
             nullable: p.ty.nullable,
             args: Vec::new(),
         },
