@@ -3,8 +3,54 @@ id = "kotlinx.io"
 version = "0.9.0"
 abi = 1
 implicit_packages = []
-source_roots = ["upstream", "klioMain"]
 auto_bindings = true
+
+# Real upstream kotlinx-io 0.9.0 commonMain, consumed directly from
+# the in-pack git submodule at `upstream/` (no vendored copies). The
+# curated `include` set is exactly the common sources klio's
+# `klioMain` actuals satisfy; the rest of the upstream tree
+# (filesystem `files/`, platform source sets, tests) is excluded by
+# omission. Bumping the version = updating the submodule + reviewing
+# this list.
+
+[[source]]
+root = "upstream/core/common/src"
+include = [
+    "-CommonPlatform.kt",
+    "-Util.kt",
+    "Annotations.kt",
+    "Buffer.kt",
+    "Buffers.kt",
+    "ByteStrings.kt",
+    "Core.kt",
+    "PeekSource.kt",
+    "RawSink.kt",
+    "RawSource.kt",
+    "RealSink.kt",
+    "RealSource.kt",
+    "Segment.kt",
+    "SegmentPool.kt",
+    "Sink.kt",
+    "Sinks.kt",
+    "Source.kt",
+    "Sources.kt",
+    "Utf8.kt",
+    "internal/-Utf8.kt",
+    "unsafe/UnsafeBufferOperations.kt",
+]
+
+[[source]]
+root = "upstream/bytestring/common/src"
+include = [
+    "-Platform.kt",
+    "ByteString.kt",
+    "ByteStringBuilder.kt",
+    "unsafe/Annotations.kt",
+    "unsafe/UnsafeByteStringOperations.kt",
+]
+
+[[source]]
+root = "klioMain"
 
 [[deps]]
 id = "stdlib"

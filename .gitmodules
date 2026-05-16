@@ -1,12 +1,12 @@
 [submodule "third-party/kotlinx/kotlinx-datetime"]
-	path = third-party/kotlinx/kotlinx-datetime
+	path = crates/klio-kotlinx-datetime/upstream
 	url = https://github.com/Kotlin/kotlinx-datetime
 [submodule "third-party/kotlinx/kotlinx-coroutines"]
-	path = third-party/kotlinx/kotlinx-coroutines
+	path = crates/klio-kotlinx-coroutines/upstream
 	url = https://github.com/Kotlin/kotlinx.coroutines
 [submodule "third-party/kotlinx/kotlinx-atomicfu"]
-	path = third-party/kotlinx/kotlinx-atomicfu
+	path = crates/klio-kotlinx-atomicfu/upstream
 	url = https://github.com/Kotlin/kotlinx-atomicfu
 [submodule "third-party/kotlinx/kotlinx-io"]
-	path = third-party/kotlinx/kotlinx-io
+	path = crates/klio-kotlinx-io/upstream
 	url = https://github.com/Kotlin/kotlinx-io
