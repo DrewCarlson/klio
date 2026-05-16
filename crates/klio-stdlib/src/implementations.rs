@@ -2245,20 +2245,64 @@ fn math_abs(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
 }
 
-fn math_min(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    match ctx.args {
-        [Value::Int(a), Value::Int(b)] => Ok(Value::Int((*a).min(*b))),
-        [Value::Double(a), Value::Double(b)] => Ok(Value::Double(a.min(*b))),
-        _ => Err(RuntimeError::Type("min requires two Int or two Double args".into())),
+/// Numeric `min`/`max` over any Kotlin number pair (Byte/Short/Int/
+/// Long/Float/Double, including mixed). Doubles as the
+/// `kotlin.comparisons.minOf`/`maxOf` and `kotlin.math.min`/`max`
+/// implementation. Integral pairs keep an integral result (widened
+/// to the larger of the two so e.g. `minOf(Long, Int)` is a Long);
+/// any floating operand promotes the result to Double.
+fn num_extreme(args: &[Value], want_min: bool, what: &str) -> Result<Value, RuntimeError> {
+    let [a, b] = args else {
+        return Err(RuntimeError::Arity(format!("{what} expects 2 arguments")));
+    };
+    fn as_f(v: &Value) -> Option<f64> {
+        match v {
+            Value::Int(x) => Some(*x as f64),
+            Value::Long(x) => Some(*x as f64),
+            Value::Short(x) => Some(*x as f64),
+            Value::Byte(x) => Some(*x as f64),
+            Value::Float(x) => Some(*x as f64),
+            Value::Double(x) => Some(*x),
+            _ => None,
+        }
+    }
+    fn as_i(v: &Value) -> Option<i64> {
+        match v {
+            Value::Int(x) => Some(*x as i64),
+            Value::Long(x) => Some(*x),
+            Value::Short(x) => Some(*x as i64),
+            Value::Byte(x) => Some(*x as i64),
+            _ => None,
+        }
+    }
+    let floating = matches!(a, Value::Double(_) | Value::Float(_))
+        || matches!(b, Value::Double(_) | Value::Float(_));
+    if floating {
+        let (x, y) = (
+            as_f(a).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
+            as_f(b).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
+        );
+        return Ok(Value::Double(if want_min { x.min(y) } else { x.max(y) }));
+    }
+    let (x, y) = (
+        as_i(a).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
+        as_i(b).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
+    );
+    let r = if want_min { x.min(y) } else { x.max(y) };
+    // Widen to Long if either operand was Long; otherwise Int.
+    if matches!(a, Value::Long(_)) || matches!(b, Value::Long(_)) {
+        Ok(Value::Long(r))
+    } else {
+        Ok(Value::Int(r as i32))
     }
 }
 
+fn math_min(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    num_extreme(ctx.args, true, "min")
+}
+
 fn math_max(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    match ctx.args {
-        [Value::Int(a), Value::Int(b)] => Ok(Value::Int((*a).max(*b))),
-        [Value::Double(a), Value::Double(b)] => Ok(Value::Double(a.max(*b))),
-        _ => Err(RuntimeError::Type("max requires two Int or two Double args".into())),
-    }
+    num_extreme(ctx.args, false, "max")
 }
 
 fn math_sqrt(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
