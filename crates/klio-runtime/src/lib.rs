@@ -239,6 +239,14 @@ impl<T: ?Sized> ObjRef<T> {
     pub fn as_ptr(&self) -> *const T {
         self.0.with_data_ptr(|p| p)
     }
+
+    /// Address-stable identity of the backing cell, usable as a key in
+    /// a visited set when walking a (possibly cyclic) value graph.
+    /// Two `ObjRef`s with this same value share the same cell.
+    #[must_use]
+    pub fn identity(&self) -> usize {
+        self.as_ptr() as *const () as usize
+    }
 }
 
 impl<T: ?Sized> Clone for ObjRef<T> {
@@ -2667,6 +2675,344 @@ impl Env {
     }
 }
 
+impl Value {
+    /// Publish every `ObjRef` reachable from this value so the whole
+    /// graph is sound to observe from another OS thread. The soundness
+    /// primitive a value graph must pass through before it can cross a
+    /// thread boundary: `publish()` establishes the happens-before that
+    /// `ObjRef`'s `unsafe impl Send/Sync` relies on.
+    ///
+    /// Cycle-safe. Kotlin object graphs, `Env` parent chains, `Cell`
+    /// self-references, and `ClassDef` parent/enclosing links are all
+    /// cyclic; recursion is guarded by a visited set keyed on each
+    /// cell's address-stable [`ObjRef::identity`]. `publish()` itself
+    /// is idempotent, so revisiting a cell is harmless — the visited
+    /// check exists purely to guarantee termination.
+    ///
+    /// Over-approximates by design: when in doubt a reachable cell is
+    /// published. It never under-publishes.
+    pub fn publish_deep(&self) {
+        let mut seen = std::collections::HashSet::new();
+        publish_value(self, &mut seen);
+    }
+}
+
+/// Publish (and recurse through) one `ObjRef`. Publishing is always
+/// safe and idempotent; the visited set only bounds recursion. Returns
+/// `true` when this is the first visit (caller should recurse into the
+/// contents), `false` when the cell was already walked.
+fn mark_cell<T: ?Sized>(r: &ObjRef<T>, seen: &mut std::collections::HashSet<usize>) -> bool {
+    r.publish();
+    seen.insert(r.identity())
+}
+
+fn publish_env(env: &Env, seen: &mut std::collections::HashSet<usize>) {
+    for v in env.vars.values() {
+        publish_value(v, seen);
+    }
+    if let Some(parent) = &env.parent {
+        if mark_cell(parent, seen) {
+            publish_env(&parent.borrow(), seen);
+        }
+    }
+}
+
+fn publish_classdef(cls: &Arc<ClassDef>, seen: &mut std::collections::HashSet<usize>) {
+    // Key ClassDef walks on the Arc identity so parent/enclosing cycles
+    // terminate even though the Arc itself carries no ObjRef cell.
+    let arc_id = Arc::as_ptr(cls) as *const () as usize;
+    if !seen.insert(arc_id) {
+        return;
+    }
+    if mark_cell(&cls.parent, seen) {
+        if let Some(p) = cls.parent.borrow().as_ref() {
+            publish_classdef(p, seen);
+        }
+    }
+    if mark_cell(&cls.interfaces, seen) {
+        for iface in cls.interfaces.borrow().iter() {
+            publish_classdef(iface, seen);
+        }
+    }
+    if mark_cell(&cls.enum_entries, seen) {
+        for (_, v) in cls.enum_entries.borrow().iter() {
+            publish_value(v, seen);
+        }
+    }
+    if mark_cell(&cls.companion, seen) {
+        if let Some(c) = cls.companion.borrow().as_ref() {
+            if mark_cell(c, seen) {
+                publish_instance(&c.borrow(), seen);
+            }
+        }
+    }
+    if mark_cell(&cls.enclosing_class, seen) {
+        if let Some(e) = cls.enclosing_class.borrow().as_ref() {
+            publish_classdef(e, seen);
+        }
+    }
+    if mark_cell(&cls.nested_classes, seen) {
+        for (_, nested) in cls.nested_classes.borrow().iter() {
+            publish_classdef(nested, seen);
+        }
+    }
+    if mark_cell(&cls.captured_env, seen) {
+        publish_env(&cls.captured_env.borrow(), seen);
+    }
+    if mark_cell(&cls.supertype_delegates, seen) {
+        // SupertypeDelegate carries only resolved ClassDefs and
+        // immutable Arc<Expr>; recurse the resolved interfaces.
+        for d in cls.supertype_delegates.borrow().iter() {
+            if let Some(iface) = &d.interface {
+                publish_classdef(iface, seen);
+            }
+        }
+    }
+    if mark_cell(&cls.delegate_forwarders, seen) {
+        for m in cls.delegate_forwarders.borrow().iter() {
+            if let Some(v) = &m.sam_lambda {
+                publish_value(v, seen);
+            }
+        }
+    }
+    if mark_cell(&cls.object_singleton, seen) {
+        if let Some(s) = cls.object_singleton.borrow().as_ref() {
+            if mark_cell(s, seen) {
+                publish_instance(&s.borrow(), seen);
+            }
+        }
+    }
+    // Methods can carry SAM-converted lambda values that close over
+    // the graph; publish those too.
+    for m in &cls.methods {
+        if let Some(v) = &m.sam_lambda {
+            publish_value(v, seen);
+        }
+    }
+}
+
+fn publish_instance(inst: &InstanceData, seen: &mut std::collections::HashSet<usize>) {
+    publish_classdef(&inst.class, seen);
+    for (_, v) in &inst.fields {
+        publish_value(v, seen);
+    }
+    if let Some(outer) = &inst.outer {
+        publish_value(outer, seen);
+    }
+}
+
+fn publish_suspend_frame(frame: &SuspendFrame, seen: &mut std::collections::HashSet<usize>) {
+    if mark_cell(&frame.env, seen) {
+        publish_env(&frame.env.borrow(), seen);
+    }
+    for (_, v) in &frame.locals {
+        publish_value(v, seen);
+    }
+    match &frame.caller {
+        Some(SuspendCallerCont::Frame(f)) => {
+            if mark_cell(f, seen) {
+                publish_suspend_frame(&f.borrow(), seen);
+            }
+        }
+        Some(SuspendCallerCont::HostSlot(slot)) => {
+            if mark_cell(slot, seen) {
+                if let Some(res) = slot.borrow().as_ref() {
+                    match res {
+                        Ok(v) | Err(v) => publish_value(v, seen),
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    if let Some(pr) = frame.paused_resume.borrow().as_ref() {
+        match pr {
+            PausedResume::Resumed(v) | PausedResume::Failed(v) => publish_value(v, seen),
+        }
+    }
+}
+
+fn publish_delegate(kind: &DelegateKind, seen: &mut std::collections::HashSet<usize>) {
+    match kind {
+        DelegateKind::Lazy { producer, cached } => {
+            publish_value(producer, seen);
+            if let Some(c) = cached {
+                publish_value(c, seen);
+            }
+        }
+        DelegateKind::Observable { value, on_change } => {
+            publish_value(value, seen);
+            publish_value(on_change, seen);
+        }
+        DelegateKind::NotNull { value, .. } => {
+            if let Some(v) = value {
+                publish_value(v, seen);
+            }
+        }
+    }
+}
+
+fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
+    match v {
+        // Scalars / immutable Arc leaves: no ObjRef, nothing to publish.
+        Value::Unit
+        | Value::Int(_)
+        | Value::Long(_)
+        | Value::Short(_)
+        | Value::Byte(_)
+        | Value::UInt(_)
+        | Value::ULong(_)
+        | Value::UShort(_)
+        | Value::UByte(_)
+        | Value::Double(_)
+        | Value::Float(_)
+        | Value::Bool(_)
+        | Value::String(_)
+        | Value::Char(_)
+        | Value::Null
+        | Value::Range { .. }
+        | Value::Intrinsic { .. }
+        | Value::BoundMethod { .. }
+        | Value::PropertyRef { .. }
+        | Value::Regex(_)
+        | Value::Match(_)
+        | Value::MatchGroup { .. } => {}
+
+        Value::List { items, .. }
+        | Value::Array { items, .. }
+        | Value::Set { items, .. } => {
+            if mark_cell(items, seen) {
+                for elem in items.borrow().iter() {
+                    publish_value(elem, seen);
+                }
+            }
+        }
+        Value::Iterator { items, pos, .. } => {
+            if mark_cell(items, seen) {
+                for elem in items.borrow().iter() {
+                    publish_value(elem, seen);
+                }
+            }
+            mark_cell(pos, seen);
+        }
+        Value::Map { entries, .. } => {
+            if mark_cell(entries, seen) {
+                for (k, val) in entries.borrow().iter() {
+                    publish_value(k, seen);
+                    publish_value(val, seen);
+                }
+            }
+        }
+
+        Value::Instance(inst) => {
+            if mark_cell(inst, seen) {
+                publish_instance(&inst.borrow(), seen);
+            }
+        }
+        Value::BoundUserMethod { receiver, .. } => {
+            if mark_cell(receiver, seen) {
+                publish_instance(&receiver.borrow(), seen);
+            }
+        }
+        Value::BoundInnerClass { class, outer } => {
+            publish_classdef(class, seen);
+            if mark_cell(outer, seen) {
+                publish_instance(&outer.borrow(), seen);
+            }
+        }
+        Value::Class(cls) => publish_classdef(cls, seen),
+
+        Value::Cell(c) => {
+            if mark_cell(c, seen) {
+                publish_value(&c.borrow(), seen);
+            }
+        }
+        Value::Delegate(d) => {
+            if mark_cell(d, seen) {
+                publish_delegate(&d.borrow(), seen);
+            }
+        }
+        Value::StringBuilder(sb) => {
+            // String leaf: publish the cell, no inner ObjRef.
+            mark_cell(sb, seen);
+        }
+
+        Value::Function { env, .. } | Value::Lambda { env, .. } => {
+            if mark_cell(env, seen) {
+                publish_env(&env.borrow(), seen);
+            }
+        }
+        Value::CoroutineSuspended(frame) => {
+            if mark_cell(frame, seen) {
+                publish_suspend_frame(&frame.borrow(), seen);
+            }
+        }
+
+        Value::Pair(a, b) => {
+            publish_value(a, seen);
+            publish_value(b, seen);
+        }
+        Value::Triple(a, b, c) => {
+            publish_value(a, seen);
+            publish_value(b, seen);
+            publish_value(c, seen);
+        }
+        Value::MapEntry { key, value } => {
+            publish_value(key, seen);
+            publish_value(value, seen);
+        }
+        Value::Result { payload, .. } => publish_value(payload, seen),
+        Value::Exception { cause, .. } => {
+            if let Some(c) = cause {
+                publish_value(c, seen);
+            }
+        }
+
+        Value::IrClosure { captures, .. } => {
+            for cap in captures.iter() {
+                publish_value(cap, seen);
+            }
+        }
+        Value::Comparator { steps, .. } => {
+            for (step, _) in steps.iter() {
+                publish_value(step, seen);
+            }
+        }
+        Value::Sequence(seq) => {
+            match &seq.source {
+                SequenceSource::Items(items) => {
+                    for elem in items.iter() {
+                        publish_value(elem, seen);
+                    }
+                }
+                SequenceSource::Generate { seed, next } => {
+                    if let Some(s) = seed {
+                        publish_value(s, seen);
+                    }
+                    publish_value(next, seen);
+                }
+            }
+            for op in &seq.ops {
+                match op {
+                    SeqOp::Map(v)
+                    | SeqOp::Filter(v)
+                    | SeqOp::FilterNot(v)
+                    | SeqOp::TakeWhile(v)
+                    | SeqOp::DropWhile(v)
+                    | SeqOp::FlatMap(v)
+                    | SeqOp::DistinctBy(v)
+                    | SeqOp::SortedBy(v, _)
+                    | SeqOp::SortedWith(v) => publish_value(v, seen),
+                    SeqOp::Take(_)
+                    | SeqOp::Drop(_)
+                    | SeqOp::Distinct
+                    | SeqOp::Sorted(_) => {}
+                }
+            }
+        }
+    }
+}
+
 /// The whole point of the value-model migration: a `Value` (and the
 /// interpreter state reachable through it) can be sent and shared
 /// across OS threads. If a future change reintroduces an `Rc` /
@@ -2765,6 +3111,109 @@ mod tests {
         };
         assert!(plain.is_runtime_type("List"));
         assert!(!plain.is_runtime_type("EnumEntries"));
+    }
+
+    #[test]
+    fn publish_deep_nested_graph_publishes_every_cell() {
+        // List -> Instance -> field Map -> Cell
+        let cell = ObjRef::new(Value::Int(7));
+        let map_entries = ObjRef::new(vec![(
+            Value::String(Arc::new("k".into())),
+            Value::Cell(cell.clone()),
+        )]);
+        let map = Value::Map { entries: map_entries.clone(), mutable: true };
+        let cls = make_class("Holder", false, false, false);
+        let inst = ObjRef::new(InstanceData {
+            class: cls,
+            fields: vec![("m".into(), map)],
+            outer: None,
+            identity: 1,
+            native_state: None,
+        });
+        let items = ObjRef::new(vec![Value::Instance(inst.clone())]);
+        let root = Value::List { items: items.clone(), mutable: false, enum_class: None };
+
+        assert!(!items.is_shared());
+        assert!(!inst.is_shared());
+        assert!(!map_entries.is_shared());
+        assert!(!cell.is_shared());
+
+        root.publish_deep();
+
+        assert!(items.is_shared());
+        assert!(inst.is_shared());
+        assert!(map_entries.is_shared());
+        assert!(cell.is_shared());
+        // captured_env of the embedded ClassDef is reached too.
+        if let Value::Instance(i) = &Value::Instance(inst.clone()) {
+            assert!(i.borrow().class.captured_env.is_shared());
+        }
+    }
+
+    #[test]
+    fn publish_deep_cyclic_graph_terminates() {
+        // Instance whose field is a Cell pointing back to the instance.
+        let cls = make_class("Node", false, false, false);
+        let inst = ObjRef::new(InstanceData {
+            class: cls,
+            fields: Vec::new(),
+            outer: None,
+            identity: 1,
+            native_state: None,
+        });
+        let cell = ObjRef::new(Value::Instance(inst.clone()));
+        inst.borrow_mut()
+            .fields
+            .push(("self".into(), Value::Cell(cell.clone())));
+
+        // Env whose parent chain loops back on itself.
+        let env_cell: ObjRef<Env> = ObjRef::new(Env::new());
+        env_cell.borrow_mut().parent = Some(env_cell.clone());
+        env_cell
+            .borrow_mut()
+            .define("here", Value::Instance(inst.clone()));
+        let lam = Value::Lambda {
+            params: Arc::new(Vec::new()),
+            body: Arc::new(klio_ast::Block {
+                stmts: Vec::new(),
+                span: klio_span::Span::new(klio_span::FileId(0), 0, 0),
+            }),
+            env: env_cell.clone(),
+            absorb_return: false,
+        };
+
+        Value::Instance(inst.clone()).publish_deep();
+        lam.publish_deep();
+
+        assert!(inst.is_shared());
+        assert!(cell.is_shared());
+        assert!(env_cell.is_shared());
+    }
+
+    #[test]
+    fn publish_deep_is_idempotent() {
+        let cell = ObjRef::new(Value::Int(1));
+        let items = ObjRef::new(vec![Value::Cell(cell.clone())]);
+        let root = Value::List { items: items.clone(), mutable: true, enum_class: None };
+
+        root.publish_deep();
+        root.publish_deep();
+
+        assert!(items.is_shared());
+        assert!(cell.is_shared());
+    }
+
+    #[test]
+    fn publish_deep_scalars_are_noops() {
+        Value::Int(42).publish_deep();
+        Value::String(Arc::new("hi".into())).publish_deep();
+        Value::Null.publish_deep();
+        Value::Unit.publish_deep();
+        Value::IrClosure {
+            id: 0,
+            captures: Arc::new(vec![Value::Int(1), Value::Bool(true)]),
+        }
+        .publish_deep();
     }
 
     #[test]
