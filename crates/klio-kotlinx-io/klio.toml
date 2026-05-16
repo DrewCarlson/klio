@@ -3,7 +3,7 @@ id = "kotlinx.io"
 version = "0.9.0"
 abi = 1
 implicit_packages = []
-source_roots = ["shim"]
+source_roots = ["upstream", "klioMain"]
 auto_bindings = true
 
 [[deps]]
