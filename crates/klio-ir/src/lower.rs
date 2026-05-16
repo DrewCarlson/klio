@@ -1974,18 +1974,60 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let r = lower_expr(b, a);
                 arg_regs.push(r);
             }
-            let args_start = if arg_regs.is_empty() {
+            // An extension/member fn lowers `this` as its implicit
+            // first param. A bare call to one (`proc(a, b) { … }`
+            // from inside another extension) must prepend the active
+            // receiver, exactly like the non-lambda Call path —
+            // otherwise the args shift by one and a lambda argument
+            // lands in a value parameter.
+            let mut run_regs: Vec<Reg> = Vec::with_capacity(arg_regs.len() + 1);
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1 {
+                    let needs_this = b
+                        .module
+                        .func_id(&segments[0].name)
+                        .and_then(|fid| b.module.funcs.get(fid.0 as usize))
+                        .map(|f| {
+                            f.params.first().map(|p| p.name == "this").unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if needs_this {
+                        let this_reg = b.resolve("this").or_else(|| {
+                            if b.knows_outer("this") || b.is_lambda_body() {
+                                let idx = b.record_capture("this");
+                                let d = b.alloc_reg();
+                                b.push(Inst::LoadCapture { dst: d, idx });
+                                b.bind("this".to_string(), d);
+                                Some(d)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(tr) = this_reg {
+                            run_regs.push(tr);
+                        }
+                    }
+                }
+            }
+            run_regs.extend_from_slice(&arg_regs);
+            let n_args = run_regs.len() as u8;
+            let args_start = if run_regs.is_empty() {
                 Reg(0)
             } else {
                 let start = b.alloc_reg();
-                b.push(Inst::Move { dst: start, src: arg_regs[0] });
-                for r in &arg_regs[1..] {
+                b.push(Inst::Move { dst: start, src: run_regs[0] });
+                for r in &run_regs[1..] {
                     let slot = b.alloc_reg();
                     b.push(Inst::Move { dst: slot, src: *r });
                 }
                 start
             };
-            let arg_names = intern_arg_names(b.module, ast_arg_names);
+            let mut arg_names = intern_arg_names(b.module, ast_arg_names);
+            // Keep arg-name slots aligned with the (possibly
+            // this-prepended) positional run.
+            while arg_names.len() < run_regs.len() {
+                arg_names.insert(0, None);
+            }
             let dst = b.alloc_reg();
             let Expr::Path { segments, .. } = callee.as_ref() else { unreachable!() };
             if segments.len() == 1 {
@@ -1995,7 +2037,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         dst,
                         func: func_id,
                         args: args_start,
-                        n_args: args.len() as u8,
+                        n_args,
                         arg_names,
                         type_args,
                     });
@@ -2005,7 +2047,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         dst,
                         callee: callee_r,
                         args: args_start,
-                        n_args: args.len() as u8,
+                        n_args,
                         arg_names,
                     });
                 }
@@ -2015,7 +2057,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     dst,
                     callee: callee_r,
                     args: args_start,
-                    n_args: args.len() as u8,
+                    n_args,
                     arg_names,
                 });
             }

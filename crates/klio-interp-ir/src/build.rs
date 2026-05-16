@@ -829,11 +829,27 @@ fn build_module_with_overrides(
                         format!("{}.{}", package_prefix, f.name.name)
                     }
                 });
+            // Forward-reference stub. Seed an implicit `this` first
+            // param for an extension function so a call lowered
+            // before the real body (which prepends the receiver) can
+            // still detect `needs_this`. The real definition replaces
+            // this slot when its body is lowered.
+            let stub_params: Vec<klio_ir::Param> = if f.receiver_type.is_some() {
+                vec![klio_ir::Param {
+                    name: "this".to_string(),
+                    ty: klio_ir::TypeRef::unit(),
+                    default: None,
+                    is_property: false,
+                    is_vararg: false,
+                }]
+            } else {
+                Vec::new()
+            };
             module.funcs.push(klio_ir::Func {
                 id,
                 name: f.name.name.clone(),
                 fqn,
-                params: Vec::new(),
+                params: stub_params,
                 return_ty: klio_ir::TypeRef::unit(),
                 n_locals: 0,
                 blocks: Vec::new(),

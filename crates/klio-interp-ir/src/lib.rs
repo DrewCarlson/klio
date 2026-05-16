@@ -3857,6 +3857,31 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         mutable: false,
                     });
                 }
+                // `CharArray.concatToString()` /
+                // `concatToString(startIndex, endIndex)` — join the
+                // Char elements (used by kotlinx-io's
+                // commonToUtf8String).
+                ("concatToString", 0) | ("concatToString", 2) => {
+                    let chars = items.borrow();
+                    let (start, end) = if args.len() == 2 {
+                        let s = args[0].as_i64().unwrap_or(0).max(0) as usize;
+                        let e = args[1]
+                            .as_i64()
+                            .unwrap_or(chars.len() as i64)
+                            .max(0) as usize;
+                        (s.min(chars.len()), e.min(chars.len()))
+                    } else {
+                        (0, chars.len())
+                    };
+                    let s: String = chars[start..end.max(start)]
+                        .iter()
+                        .filter_map(|v| match v {
+                            klio_runtime::Value::Char(c) => Some(*c),
+                            _ => None,
+                        })
+                        .collect();
+                    return Ok(klio_runtime::Value::String(Rc::new(s)));
+                }
                 _ => {}
             }
         }

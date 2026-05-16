@@ -1398,6 +1398,23 @@ fn arith_exc(msg: &str) -> EvalError {
 
 fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
     use Value::{Bool, Double, Int, Long};
+    // Kotlin promotes `Byte`/`Short` to `Int` in arithmetic and
+    // comparison (`b0 >= 0` where `b0: Byte`). Widen and re-dispatch;
+    // the promoted operands are `Int`, so this recurses at most once.
+    let promote = |v: &Value| -> Option<Value> {
+        match v {
+            Value::Byte(b) => Some(Int(*b as i32)),
+            Value::Short(s) => Some(Int(*s as i32)),
+            _ => None,
+        }
+    };
+    if (promote(l).is_some() || promote(r).is_some())
+        && !matches!(op, BinOp::StringConcat)
+    {
+        let nl = promote(l).unwrap_or_else(|| l.clone());
+        let nr = promote(r).unwrap_or_else(|| r.clone());
+        return apply_binop(op, &nl, &nr);
+    }
     match (op, l, r) {
         (BinOp::Add, Int(a), Int(b)) => Ok(Int(a.wrapping_add(*b))),
         (BinOp::Sub, Int(a), Int(b)) => Ok(Int(a.wrapping_sub(*b))),
