@@ -1769,7 +1769,7 @@ mod source_selection_tests {
             ("crates/klio-kotlinx-coroutines", &["shim"], &["shim/"]),
             ("crates/klio-kotlinx-io", &["upstream", "klioMain"], &["upstream/Buffer.kt"]),
             ("crates/klio-kotlinx-datetime", &["shim"], &["shim/"]),
-            ("crates/klio-kotlinx-atomicfu", &["shim"], &["shim/"]),
+            ("crates/klio-kotlinx-atomicfu", &["klioMain"], &["klioMain/"]),
             ("crates/klio-ktor-client", &["shim"], &["shim/"]),
         ];
         for (pack, roots, _known_pat) in cases {

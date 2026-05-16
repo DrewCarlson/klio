@@ -2602,6 +2602,48 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                 }
             }
+            // Package-qualified call to a user / pack top-level
+            // function: `kotlinx.atomicfu.atomic(0)`. `func_index` is
+            // keyed by simple name (the package prefix lives on the
+            // decl's `fqn`), so resolve the trailing segment and emit
+            // the same `Inst::Call` the bare-name form uses — eval's
+            // `pick_overload` then selects the right shape by runtime
+            // arg types. Only fires when the tail names a module
+            // function, so intrinsic FQNs (`kotlin.math.abs`) still
+            // take the LoadGlobal path below.
+            if let Expr::Member { .. } = callee.as_ref() {
+                if let Some(fqn) = collect_dotted_fqn(callee) {
+                    if let (Some(head), Some(tail)) =
+                        (fqn.split('.').next(), fqn.rsplit('.').next())
+                    {
+                        if tail != fqn
+                            && is_package_head(head)
+                            && b.resolve(head).is_none()
+                            && !b.knows_outer(head)
+                            && b.module.class_id(head).is_none()
+                            && b.resolve("this").is_none()
+                        {
+                            if let Some(func_id) = b.module.func_id(tail) {
+                                let (args_start, n_args) = lower_arg_run(b, args);
+                                let arg_names =
+                                    intern_arg_names(b.module, ast_arg_names);
+                                let type_args =
+                                    intern_type_args(b.module, ast_type_args);
+                                let dst = b.alloc_reg();
+                                b.push(Inst::Call {
+                                    dst,
+                                    func: func_id,
+                                    args: args_start,
+                                    n_args,
+                                    arg_names,
+                                    type_args,
+                                });
+                                return dst;
+                            }
+                        }
+                    }
+                }
+            }
             // Fully-qualified callee like `kotlin.math.abs(x)` →
             // resolve the FQN as a global and CallValue against the
             // resulting intrinsic / function value. Avoids the

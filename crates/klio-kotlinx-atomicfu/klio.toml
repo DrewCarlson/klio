@@ -3,11 +3,28 @@ id = "kotlinx.atomicfu"
 version = "0.32.1"
 abi = 1
 implicit_packages = []
-source_roots = ["shim"]
-# Rust crate's `host_bindings()` already declares every binding —
-# auto_bindings asks the pack builder to pull them straight from
-# the merged host registry so we don't duplicate the list here.
 auto_bindings = true
+
+# Upstream kotlinx-atomicfu 0.32.1 commonMain, consumed straight from
+# the in-pack git submodule. `include` curates exactly the `expect`
+# API surface klio can parse + resolve; intrinsic-only files
+# (JS-mangling actuals, native locks) are excluded and re-declared in
+# klioMain where klio needs them.
+[[source]]
+root = "upstream/atomicfu/src/commonMain/kotlin"
+include = [
+    "kotlinx/atomicfu/AtomicFU.common.kt",
+    "kotlinx/atomicfu/Trace.common.kt",
+    "kotlinx/atomicfu/TraceFormat.kt",
+    "kotlinx/atomicfu/MangledJsNames.kt",
+    "kotlinx/atomicfu/OptionalJsName.kt",
+]
+
+# klio-supplied platform actuals for every consumed upstream `expect`.
+# Bodies are thin Kotlin; the Rust host bindings in src/lib.rs win at
+# dispatch for the atomic ops.
+[[source]]
+root = "klioMain"
 
 [[deps]]
 id = "stdlib"

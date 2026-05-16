@@ -875,11 +875,204 @@ pub fn run_with_ktc(file: &Path) -> Result<String, String> {
     Ok(joined)
 }
 
+/// One source root parsed out of a pack's `klio.toml`: either a
+/// plain `source_roots` string (no filters) or a `[[source]]` table
+/// with `include`/`exclude`. Mirrors the pack builder's shape so
+/// `run_with_packs` collects exactly the files the installed pack
+/// would carry.
+struct ManifestRoot {
+    root: String,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+/// Match `rel` (a slash-normalized path relative to a source root)
+/// against one pattern. Same forms the pack builder accepts: exact,
+/// trailing-`/` directory prefix, leading-`*` suffix glob, trailing-`*`
+/// prefix glob.
+fn manifest_pat_match(rel: &str, pat: &str) -> bool {
+    if let Some(prefix) = pat.strip_suffix('/') {
+        return rel == prefix || rel.starts_with(pat);
+    }
+    if let Some(suffix) = pat.strip_prefix('*') {
+        return rel.ends_with(suffix);
+    }
+    if let Some(prefix) = pat.strip_suffix('*') {
+        return rel.starts_with(prefix);
+    }
+    rel == pat
+}
+
+/// Minimal reader for the two `klio.toml` shapes the in-repo kotlinx
+/// packs use: top-level `source_roots = ["a", "b"]` and any number of
+/// `[[source]]` tables carrying `root` / `include` / `exclude`. This
+/// is intentionally not a general TOML parser — it understands just
+/// enough to mirror the pack builder so the conformance harness loads
+/// each pack the same way an installed `.klio-pack` would.
+fn parse_manifest_roots(toml: &str) -> Vec<ManifestRoot> {
+    fn string_array(rest: &str) -> Vec<String> {
+        rest.trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .filter_map(|s| {
+                let t = s.trim().trim_matches('"');
+                (!t.is_empty()).then(|| t.to_string())
+            })
+            .collect()
+    }
+
+    // Coalesce multi-line arrays into one logical line so
+    // `include = [\n "a",\n "b",\n]` parses as a single `key = [...]`
+    // statement. Comments are stripped per physical line first.
+    let mut logical: Vec<String> = Vec::new();
+    let mut pending: Option<String> = None;
+    for raw in toml.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if let Some(buf) = pending.as_mut() {
+            buf.push(' ');
+            buf.push_str(line);
+            if line.contains(']') {
+                logical.push(pending.take().unwrap());
+            }
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        // An array value whose `]` hasn't appeared yet starts a
+        // continuation buffer.
+        if line.contains('[') && !line.contains(']') && line.contains('=') {
+            pending = Some(line.to_string());
+            continue;
+        }
+        logical.push(line.to_string());
+    }
+    if let Some(buf) = pending.take() {
+        logical.push(buf);
+    }
+
+    let mut plain: Vec<String> = Vec::new();
+    let mut tables: Vec<ManifestRoot> = Vec::new();
+    let mut cur: Option<ManifestRoot> = None;
+    let mut in_source_table = false;
+    for line in &logical {
+        let line = line.as_str();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "[[source]]" {
+            if let Some(c) = cur.take() {
+                tables.push(c);
+            }
+            cur = Some(ManifestRoot { root: String::new(), include: Vec::new(), exclude: Vec::new() });
+            in_source_table = true;
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(c) = cur.take() {
+                tables.push(c);
+            }
+            in_source_table = false;
+            continue;
+        }
+        let Some((key, val)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        let val = val.trim();
+        if in_source_table {
+            let Some(c) = cur.as_mut() else { continue };
+            match key {
+                "root" => c.root = val.trim_matches('"').to_string(),
+                "include" => c.include = string_array(val),
+                "exclude" => c.exclude = string_array(val),
+                _ => {}
+            }
+        } else if key == "source_roots" {
+            plain = string_array(val);
+        }
+    }
+    if let Some(c) = cur.take() {
+        tables.push(c);
+    }
+
+    let mut out: Vec<ManifestRoot> = plain
+        .into_iter()
+        .map(|root| ManifestRoot { root, include: Vec::new(), exclude: Vec::new() })
+        .collect();
+    out.extend(tables);
+    out
+}
+
+/// Recursively collect every `.kt` file under `dir`, returning paths
+/// relative to `dir` (slash-normalized).
+fn walk_kt(dir: &Path, base: &Path, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::path);
+    for e in entries {
+        let p = e.path();
+        if p.is_dir() {
+            walk_kt(&p, base, out);
+        } else if p.extension().map(|x| x == "kt").unwrap_or(false) {
+            let rel = p
+                .strip_prefix(base)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, p));
+        }
+    }
+}
+
+/// Collect a pack's Kotlin sources by reading its `klio.toml`
+/// `source_roots` / `[[source]]` tables and applying the same
+/// include/exclude selection the pack builder uses. Returns absolute
+/// paths sorted by their root-relative path, deduplicated.
+fn collect_manifest_sources(pack_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let toml_path = pack_dir.join("klio.toml");
+    let toml = std::fs::read_to_string(&toml_path)
+        .map_err(|e| format!("read {}: {e}", toml_path.display()))?;
+    let mut roots = parse_manifest_roots(&toml);
+    if roots.is_empty() {
+        roots.push(ManifestRoot {
+            root: "src".to_string(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+        });
+    }
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut picked: Vec<(String, PathBuf)> = Vec::new();
+    for r in &roots {
+        let root_path = pack_dir.join(&r.root);
+        if !root_path.is_dir() {
+            continue;
+        }
+        let mut found: Vec<(String, PathBuf)> = Vec::new();
+        walk_kt(&root_path, &root_path, &mut found);
+        for (rel, abs) in found {
+            let included = r.include.is_empty()
+                || r.include.iter().any(|pat| manifest_pat_match(&rel, pat));
+            if !included {
+                continue;
+            }
+            if r.exclude.iter().any(|pat| manifest_pat_match(&rel, pat)) {
+                continue;
+            }
+            if seen.insert(abs.clone()) {
+                picked.push((rel, abs));
+            }
+        }
+    }
+    picked.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(picked.into_iter().map(|(_, p)| p).collect())
+}
+
 /// Run a `.kt` file through the `klio` interpreter library with the
 /// in-repo kotlinx packs (coroutines, atomicfu) loaded and their
 /// host bindings installed — the same shape the `klio` binary uses,
-/// but sourced from the workspace shim trees so it is independent of
-/// `~/.klio/packs`. Used by the memory-model conformance suite.
+/// but sourced from each pack's `klio.toml` manifest so it is
+/// independent of `~/.klio/packs`. Used by the memory-model
+/// conformance suite.
 pub fn run_with_packs(file: &Path) -> Result<String, String> {
     fn parse(
         map: &mut SourceMap,
@@ -904,29 +1097,36 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
         .and_then(|p| p.parent())
         .map(PathBuf::from)
         .ok_or("workspace root")?;
-    let shims = [
-        ws.join("crates/klio-kotlinx-coroutines/shim/kotlinx/coroutines/Coroutines.kt"),
-        ws.join("crates/klio-kotlinx-coroutines/shim/kotlinx/coroutines/channels/Channels.kt"),
-        ws.join("crates/klio-kotlinx-atomicfu/shim/kotlinx/atomicfu/AtomicFU.kt"),
+    // Drive every in-repo kotlinx pack off its own `klio.toml`
+    // `source_roots` / `[[source]]` tables instead of a hard-coded
+    // file list, so the atomicfu pack picks up its curated upstream
+    // commonMain + klioMain actuals. Coroutines still declares
+    // `source_roots = ["shim"]`, so its collected set is byte-for-byte
+    // the two files the old hard-coded list named.
+    let pack_dirs = [
+        ws.join("crates/klio-kotlinx-coroutines"),
+        ws.join("crates/klio-kotlinx-atomicfu"),
     ];
 
     let mut map = SourceMap::new();
     let mut asts: Vec<klio_ast::KotlinFile> = Vec::new();
-    for shim in &shims {
-        let text = std::fs::read_to_string(shim).map_err(|e| e.to_string())?;
-        let ast = parse(&mut map, shim, text)?;
-        if let Some(pkg) = &ast.package {
-            let path = pkg
-                .path
-                .iter()
-                .map(|i| i.name.as_str())
-                .collect::<Vec<_>>()
-                .join(".");
-            if !path.is_empty() {
-                klio_stdlib::register_known_package(path);
+    for pack_dir in &pack_dirs {
+        for src_path in collect_manifest_sources(pack_dir)? {
+            let text = std::fs::read_to_string(&src_path).map_err(|e| e.to_string())?;
+            let ast = parse(&mut map, &src_path, text)?;
+            if let Some(pkg) = &ast.package {
+                let path = pkg
+                    .path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if !path.is_empty() {
+                    klio_stdlib::register_known_package(path);
+                }
             }
+            asts.push(ast);
         }
-        asts.push(ast);
     }
     let user_src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
     asts.push(parse(&mut map, file, user_src)?);

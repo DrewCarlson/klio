@@ -1189,6 +1189,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return Some(v);
             }
         }
+        // Package-qualified reference (not a call) to a user / pack
+        // top-level class: `kotlinx.atomicfu.AtomicInt::class`. The
+        // class table is keyed by simple name (the package prefix
+        // lives on each decl's `fqn`), so retry the trailing segment.
+        // Reached only after every other probe returned `None`, so a
+        // name that already resolves is untouched. Package-qualified
+        // *calls* are routed through `Inst::Call` at lower time so
+        // they keep overload resolution; this only covers bare refs.
+        if let Some((_, tail)) = name.rsplit_once('.') {
+            if tail != name && !tail.is_empty() {
+                if let Some(def) = self.classes.borrow().get(tail).cloned() {
+                    return Some(klio_runtime::Value::Class(def));
+                }
+            }
+        }
         None
     }
 

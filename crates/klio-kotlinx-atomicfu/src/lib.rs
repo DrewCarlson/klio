@@ -2,10 +2,11 @@
 //!
 //! klio runs single-threaded, so the "atomic" operations are
 //! trivially atomic: every binding mutates the instance's `value`
-//! field directly. The Kotlin shim (under `shim/`) declares the
-//! class shapes and exposes the surface area; these bindings shadow
-//! the shim method bodies at dispatch time via the
-//! `installed_bindings` table on the interpreter.
+//! field directly. The pack consumes upstream atomicfu commonMain
+//! `expect` declarations plus klio `actual`s (under `klioMain/`)
+//! that declare the class shapes; these bindings shadow the actual
+//! method bodies at dispatch time via the `installed_bindings`
+//! table on the interpreter.
 
 use klio_runtime::{CallCtx, RuntimeError, StdlibFn, Value};
 use klio_stdlib::HostBindings;
