@@ -91,6 +91,30 @@ pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
     ("StringBuilder", "kotlin.text.StringBuilder"),
 ];
 
+/// True when `name` is a top-level stdlib *function* (a builder /
+/// factory / IO / comparison helper), as opposed to an extension or
+/// infix function on a receiver, a type, or an exception. Used by
+/// member dispatch to avoid mis-classifying a bare call like
+/// `listOf(1, 2)` (inside a receiver-typed lambda) as
+/// `receiver.listOf(...)`: these names resolve to the top-level
+/// function in Kotlin, never to a member of an arbitrary receiver.
+///
+/// Derived from [`IMPLICIT_ALIASES`] (the source of truth for which
+/// bare names are stdlib top-level entities): take the lowercase
+/// entries (functions, not types/exceptions) and exclude the few
+/// that genuinely are receiver/infix extensions.
+pub fn is_toplevel_function(name: &str) -> bool {
+    // `to`, `downTo`, `step`, `until` are infix extensions on a
+    // receiver — they legitimately dispatch with a receiver.
+    const RECEIVER_INFIX: &[&str] = &["to", "downTo", "step", "until"];
+    if RECEIVER_INFIX.contains(&name) {
+        return false;
+    }
+    IMPLICIT_ALIASES.iter().any(|(alias, _)| {
+        *alias == name && alias.chars().next().is_some_and(|c| c.is_lowercase())
+    })
+}
+
 pub mod implementations;
 pub mod pack_builder;
 pub use pack_builder::build_stdlib_pack;

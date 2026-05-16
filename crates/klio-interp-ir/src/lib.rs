@@ -4346,12 +4346,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 format!("kotlin.{name}"),
             ]
         };
-        for probe in &probes {
-            if let Some(func) = self.lookup_intrinsic(probe) {
-                let mut all_args: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
-                all_args.push(receiver.clone());
-                all_args.extend_from_slice(args);
-                return self.dispatch_intrinsic(func, &all_args);
+        // A top-level stdlib function (`listOf`, `mutableListOf`,
+        // `minOf`, `println`, …) is never a member or extension of an
+        // arbitrary receiver. Skip the speculative receiver-prepend
+        // probe for these so a bare call inside a receiver-typed
+        // lambda (e.g. `runBlocking { listOf(1, 2) }`) resolves to
+        // the top-level function instead of `receiver.listOf(...)`.
+        if !klio_stdlib::is_toplevel_function(name) {
+            for probe in &probes {
+                if let Some(func) = self.lookup_intrinsic(probe) {
+                    let mut all_args: Vec<klio_runtime::Value> =
+                        Vec::with_capacity(args.len() + 1);
+                    all_args.push(receiver.clone());
+                    all_args.extend_from_slice(args);
+                    return self.dispatch_intrinsic(func, &all_args);
+                }
             }
         }
         // Extension fn fallback: a user-defined `fun T.name(...)`
