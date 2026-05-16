@@ -405,6 +405,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Set.intersect", coll_set_intersect),
     ("kotlin.collections.Set.minus", coll_set_minus),
     ("kotlin.collections.Set.plus", coll_set_plus),
+    ("kotlin.collections.Map.plus", coll_map_plus),
+    ("kotlin.collections.Map.minus", coll_map_minus),
+    ("kotlin.collections.MutableMap.plus", coll_map_plus),
+    ("kotlin.collections.MutableMap.minus", coll_map_minus),
     ("kotlin.collections.Set.subtract", coll_set_subtract),
     ("kotlin.collections.Set.toString", coll_set_to_string),
     ("kotlin.collections.Set.union", coll_set_union),
@@ -4770,6 +4774,57 @@ fn coll_set_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .cloned()
         .collect();
     Ok(Value::Set { items: Rc::new(std::cell::RefCell::new(out)), mutable: false })
+}
+
+/// `Map + Pair` / `Map + Map` / `Map + Iterable<Pair>` — returns a
+/// new map with the entries added (existing keys overwritten,
+/// last-write-wins via `make_map`).
+fn coll_map_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let entries = recv_map_entries(ctx.args, "Map.plus")?;
+    let mut out: Vec<(Value, Value)> = entries.borrow().clone();
+    let Some(arg) = ctx.args.get(1) else {
+        return Err(RuntimeError::Arity("plus requires an argument".into()));
+    };
+    let mut add_pair = |out: &mut Vec<(Value, Value)>, p: &Value| {
+        if let Value::Pair(k, v) = p {
+            out.push(((**k).clone(), (**v).clone()));
+        }
+    };
+    match arg {
+        Value::Pair(_, _) => add_pair(&mut out, arg),
+        Value::Map { entries: e, .. } => out.extend(e.borrow().clone()),
+        Value::List { items, .. } | Value::Set { items, .. } => {
+            for p in items.borrow().iter() {
+                add_pair(&mut out, p);
+            }
+        }
+        _ => {
+            return Err(RuntimeError::Type(
+                "Map.plus expects a Pair, Map, or Iterable<Pair>".into(),
+            ))
+        }
+    }
+    Ok(make_map(out, false))
+}
+
+/// `Map - key` / `Map - Iterable<key>` — returns a new map without
+/// the given key(s).
+fn coll_map_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let entries = recv_map_entries(ctx.args, "Map.minus")?;
+    let Some(arg) = ctx.args.get(1) else {
+        return Err(RuntimeError::Arity("minus requires an argument".into()));
+    };
+    let keys: Vec<Value> = match arg {
+        Value::List { items, .. } | Value::Set { items, .. } => items.borrow().clone(),
+        single => vec![single.clone()],
+    };
+    let out: Vec<(Value, Value)> = entries
+        .borrow()
+        .iter()
+        .filter(|(k, _)| !keys.iter().any(|rk| Value::structural_eq(rk, k)))
+        .cloned()
+        .collect();
+    Ok(make_map(out, false))
 }
 
 fn coll_set_union(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

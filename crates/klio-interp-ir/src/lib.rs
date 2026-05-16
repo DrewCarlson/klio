@@ -4481,6 +4481,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // `IntRange`/`LongRange`/`CharRange` is `Iterable`: the
+        // higher-order collection ops are extension functions on
+        // Iterable, not range-specific. Materialise the range to a
+        // List and re-dispatch so every list op (map/filter/fold/
+        // flatMap/forEach/associate/groupBy/…) works uniformly.
+        // Reached only after range-specific handling and the stdlib
+        // `kotlin.ranges.*` probe, so it never shadows them.
+        if let klio_runtime::Value::Range { start, end, step, kind } = receiver {
+            let items = materialise_range_items(*start, *end, *step, *kind);
+            let as_list = klio_runtime::Value::List {
+                items: Rc::new(RefCell::new(items)),
+                mutable: false,
+                enum_class: None,
+            };
+            return self.call_member(&as_list, name, args);
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()
@@ -4553,7 +4569,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 if let Some(params) = klio_stdlib::param_names(probe) {
                     let mut slots: Vec<Option<klio_runtime::Value>> =
                         vec![None; params.len()];
-                    let mut positional_idx = 0usize;
+                    // 1. Bind every named argument to its slot.
+                    let mut positionals: Vec<klio_runtime::Value> = Vec::new();
                     for (i, a) in args.iter().enumerate() {
                         if let Some(Some(arg_name)) = arg_names.get(i) {
                             if let Some(pos) =
@@ -4562,10 +4579,31 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 slots[pos] = Some(a.clone());
                             }
                         } else {
-                            if positional_idx < params.len() {
-                                slots[positional_idx] = Some(a.clone());
+                            positionals.push(a.clone());
+                        }
+                    }
+                    // 2. A trailing lambda binds to the last
+                    //    parameter (Kotlin's trailing-lambda rule:
+                    //    `joinToString(separator = "; ") { … }` puts
+                    //    the transform in `transform`, not slot 0).
+                    if matches!(
+                        positionals.last(),
+                        Some(klio_runtime::Value::IrClosure { .. })
+                            | Some(klio_runtime::Value::Lambda { .. })
+                    ) && !params.is_empty()
+                        && slots[params.len() - 1].is_none()
+                    {
+                        slots[params.len() - 1] = positionals.pop();
+                    }
+                    // 3. Remaining positionals fill empty slots
+                    //    left-to-right (skipping named-filled ones).
+                    let mut pit = positionals.into_iter();
+                    for slot in slots.iter_mut() {
+                        if slot.is_none() {
+                            match pit.next() {
+                                Some(v) => *slot = Some(v),
+                                None => break,
                             }
-                            positional_idx += 1;
                         }
                     }
                     let mut reordered: Vec<klio_runtime::Value> = slots
@@ -5333,6 +5371,48 @@ thread_local! {
 }
 
 impl<'a> VmIntrinsicHost<'a> {
+    /// Construct an instance through the full constructor pipeline.
+    /// The intrinsic child host has no `new_instance` of its own, so
+    /// build a transient `VmHost` over the same shared state (the
+    /// pattern `eval_closure_raw` uses) and delegate. Lets a
+    /// constructor reference (`::Box`, `Outer::Nested`) be invoked
+    /// uniformly from stdlib higher-order ops like `map`/`fold`.
+    fn construct(
+        &mut self,
+        class_id: klio_ir::ClassId,
+        args: &[klio_runtime::Value],
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let mut host = VmHost {
+            globals: Rc::clone(&self.globals),
+            module: Rc::clone(&self.module),
+            scheduler: &mut *self.scheduler,
+            out,
+            instance_id_counter: &mut *self.instance_id_counter,
+            classes: Rc::clone(&self.classes),
+            body_prop_inits: self.body_prop_inits,
+            instance_prop_getters: self.instance_prop_getters,
+            instance_prop_setters: self.instance_prop_setters,
+            parent_ctor_args: self.parent_ctor_args,
+            init_blocks: self.init_blocks,
+            extension_props: self.extension_props,
+            extension_prop_setters: self.extension_prop_setters,
+            anon_methods: Rc::clone(&self.anon_methods),
+            companion_singletons: &self.module.registry.companion_singletons,
+            secondary_ctors: self.secondary_ctors,
+            class_delegates: self.class_delegates,
+            func_defaults: self.func_defaults,
+            enclosing_class: &self.module.registry.enclosing_class,
+            func_type_params: &self.module.registry.func_type_params,
+            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
+            delegated_body_props: &self.module.registry.delegated_body_props,
+            installed_bindings: Rc::clone(&self.installed_bindings),
+            class_default_outer: Rc::clone(&self.class_default_outer),
+            closures: &mut *self.closures,
+        };
+        <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, args)
+    }
+
     /// Evaluate an `IrClosure` and return the *raw* EvalError so the
     /// coroutine driver can observe `Suspended`. Mirrors the
     /// closure-setup half of `invoke_callable` (capture env, param
@@ -5772,6 +5852,23 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 }
                 other => klio_runtime::RuntimeError::Type(format!("{other}")),
             });
+        }
+        // A class value used as a function is a constructor
+        // reference (`::Box`, `Outer::Nested`, passed to `map`/`fold`
+        // etc.) — invoking it builds an instance.
+        if let klio_runtime::Value::Class(def) = callable {
+            if let Some(class_id) = self.module.class_id(&def.name) {
+                return self.construct(class_id, args, out)
+                .map_err(|e| match e {
+                    klio_ir::eval::EvalError::Throw(v) => {
+                        klio_runtime::RuntimeError::Thrown(v)
+                    }
+                    klio_ir::eval::EvalError::NonLocalReturn(v) => {
+                        klio_runtime::RuntimeError::Return(v)
+                    }
+                    other => klio_runtime::RuntimeError::Type(format!("{other}")),
+                });
+            }
         }
         if let klio_runtime::Value::Intrinsic { func, .. } = callable {
             let mut child = VmIntrinsicHost {

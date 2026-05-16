@@ -844,6 +844,19 @@ fn exec_inst(
             // Value::Instance, route through the host's
             // call_member for the matching operator method
             // (plus/minus/times/div/rem/compareTo/equals/etc.).
+            // Collection `+` / `-` operators: `map + pair`,
+            // `list + elem`, `set - x` are stdlib operator functions
+            // (`plus`/`minus`) on the left collection. Route them
+            // through call_member so the stdlib intrinsic handles
+            // the merge/remove, just like a user `operator fun`.
+            if matches!(*op, BinOp::Add | BinOp::Sub)
+                && matches!(l, Value::Map { .. } | Value::List { .. } | Value::Set { .. })
+            {
+                let method = if matches!(*op, BinOp::Add) { "plus" } else { "minus" };
+                let result = host.call_member(&l, method, std::slice::from_ref(&r))?;
+                frame.write(*dst, result);
+                return Ok(());
+            }
             if let Some(method) = operator_method(*op) {
                 if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
                     let result = host.call_member(&l, method, std::slice::from_ref(&r))?;

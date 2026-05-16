@@ -3140,6 +3140,20 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             dst
         }
         Expr::MemberRef { receiver, name, .. } => {
+            // `Outer::Nested` where `Nested` is a (nested) class is a
+            // constructor reference, not a bound member ref — load
+            // the class value so it is callable, exactly like the
+            // no-receiver `::Ctor` form. The receiver here is just a
+            // type qualifier with no runtime value.
+            if name.name != "class"
+                && matches!(receiver.as_ref(), Expr::Path { .. })
+                && b.module.class_id(&name.name).is_some()
+            {
+                let dst = b.alloc_reg();
+                let nm = b.module.intern_const(Const::String(name.name.clone()));
+                b.push(Inst::LoadGlobal { dst, name: nm });
+                return dst;
+            }
             let recv = lower_expr(b, receiver);
             let dst = b.alloc_reg();
             let nm = b.module.intern_const(Const::String(name.name.clone()));
