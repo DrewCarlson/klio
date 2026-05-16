@@ -450,6 +450,12 @@ pub struct ObjectDecl {
     /// `componentN`, and user-declared `equals`/`hashCode` overrides are
     /// rejected.
     pub is_data: bool,
+    /// `expect object` — a platform-supplied singleton whose actual
+    /// definition appears in a platform source set.
+    pub is_expect: bool,
+    /// `actual object` — the platform definition that supersedes a
+    /// matching `expect object`.
+    pub is_actual: bool,
     pub span: Span,
 }
 

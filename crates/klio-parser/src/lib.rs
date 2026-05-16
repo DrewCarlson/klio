@@ -362,7 +362,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     self.parse_companion_object_as_class(flags.visibility, flags.annotations)
                         .map(Decl::Class)
                 } else {
-                    self.parse_object(flags.is_data).map(Decl::Object)
+                    self.parse_object(flags.is_data, flags.is_expect, flags.is_actual)
+                        .map(Decl::Object)
                 }
             }
             TokenKind::Keyword(Keyword::Typealias) => {
@@ -903,13 +904,27 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         })
     }
 
-    fn parse_object(&mut self, is_data: bool) -> Option<ObjectDecl> {
+    fn parse_object(
+        &mut self,
+        is_data: bool,
+        is_expect: bool,
+        is_actual: bool,
+    ) -> Option<ObjectDecl> {
         let kw = self.bump(); // `object`
         let name = self.parse_ident("object name")?;
         let (supertypes, supertype_args) = self.parse_optional_supertypes();
         let (members, _init, _sec) = self.parse_class_body();
         let end = self.tokens[self.pos.saturating_sub(1)].span;
-        Some(ObjectDecl { name, supertypes, supertype_args, members, is_data, span: kw.span.join(end) })
+        Some(ObjectDecl {
+            name,
+            supertypes,
+            supertype_args,
+            members,
+            is_data,
+            is_expect,
+            is_actual,
+            span: kw.span.join(end),
+        })
     }
 
     fn parse_optional_supertypes(&mut self) -> (Vec<TypeRef>, Vec<Option<Vec<Expr>>>) {
@@ -2437,7 +2452,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 // and falls through to expression parsing.
                 let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
                 if matches!(next, Some(TokenKind::Ident)) {
-                    self.parse_object(flags.is_data).map(|o| Stmt::Decl(Decl::Object(o)))
+                    self.parse_object(flags.is_data, flags.is_expect, flags.is_actual)
+                        .map(|o| Stmt::Decl(Decl::Object(o)))
                 } else {
                     // Roll back modifiers so the expression parser sees
                     // `object` at the head.

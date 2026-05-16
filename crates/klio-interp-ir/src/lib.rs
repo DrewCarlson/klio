@@ -4542,10 +4542,75 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         }
                         leaf
                     } else {
-                        return Err(klio_ir::eval::EvalError::Unimplemented(format!(
-                            "Vm::new_instance: secondary ctor super-delegation for `{}` (no parent class def)",
-                            class_def.name
-                        )));
+                        // No user ClassDef for the parent — it's a
+                        // built-in. For the Throwable hierarchy the
+                        // `super(...)` args are the conventional
+                        // `(message, cause)` pair, so allocate the
+                        // leaf shell and bind those fields directly
+                        // (mirrors the primary-ctor Throwable path).
+                        // This is what makes `expect open class
+                        // IOException : Exception { constructor(...) }`
+                        // and friends usable.
+                        let parent_name = class_def
+                            .supertype_names
+                            .first()
+                            .cloned()
+                            .unwrap_or_default();
+                        let is_throwable_name = matches!(
+                            parent_name.as_str(),
+                            "Throwable"
+                                | "Exception"
+                                | "RuntimeException"
+                                | "Error"
+                                | "IOException"
+                                | "EOFException"
+                                | "IllegalArgumentException"
+                                | "IllegalStateException"
+                                | "IndexOutOfBoundsException"
+                                | "NullPointerException"
+                                | "ClassCastException"
+                                | "ArithmeticException"
+                                | "NumberFormatException"
+                                | "NoSuchElementException"
+                                | "ConcurrentModificationException"
+                                | "UnsupportedOperationException"
+                        );
+                        if !is_throwable_name {
+                            return Err(klio_ir::eval::EvalError::Unimplemented(format!(
+                                "Vm::new_instance: secondary ctor super-delegation for `{}` (no parent class def)",
+                                class_def.name
+                            )));
+                        }
+                        let leaf = <Self as klio_ir::eval::Host>::new_instance(
+                            self,
+                            class,
+                            &[],
+                        )?;
+                        if let klio_runtime::Value::Instance(leaf_inst) = &leaf {
+                            let mut i = leaf_inst.borrow_mut();
+                            // `super(message)` / `super(cause)` /
+                            // `super(message, cause)`: a lone
+                            // Throwable arg is the cause, a lone
+                            // String/null is the message.
+                            match target_args.as_slice() {
+                                [only] => {
+                                    let is_cause = matches!(
+                                        only,
+                                        klio_runtime::Value::Instance(_)
+                                    );
+                                    let key = if is_cause { "cause" } else { "message" };
+                                    i.fields.retain(|(n, _)| n != key);
+                                    i.fields.push((key.to_string(), only.clone()));
+                                }
+                                [msg, cause, ..] => {
+                                    i.fields.retain(|(n, _)| n != "message" && n != "cause");
+                                    i.fields.push(("message".to_string(), msg.clone()));
+                                    i.fields.push(("cause".to_string(), cause.clone()));
+                                }
+                                [] => {}
+                            }
+                        }
+                        leaf
                     }
                 } else {
                     <Self as klio_ir::eval::Host>::new_instance(

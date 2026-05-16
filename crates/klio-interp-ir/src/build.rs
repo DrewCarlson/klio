@@ -322,8 +322,8 @@ fn synthesize_class_from_object(o: &klio_ast::ObjectDecl) -> klio_ast::Class {
         is_companion: false,
         is_enum: false,
         is_sealed: false,
-        is_expect: false,
-        is_actual: false,
+        is_expect: o.is_expect,
+        is_actual: o.is_actual,
         is_open: false,
         is_abstract: false,
         is_inner: false,
@@ -601,10 +601,26 @@ fn build_module_with_overrides(
     > = std::collections::HashMap::new();
     let mut enclosing_class: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // An `actual object Foo` supersedes a matching `expect object
+    // Foo`. Collect actual-object names up front so the superseded
+    // `expect` singleton is neither synthesised into a class nor
+    // registered in `object_names` (a bodyless duplicate would
+    // shadow the real definition and break member dispatch).
+    let actual_object_names: std::collections::HashSet<String> = file
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Object(o) if o.is_actual => Some(o.name.name.clone()),
+            _ => None,
+        })
+        .collect();
     let mut all_decls: Vec<Decl> = Vec::with_capacity(file.decls.len());
     for d in &file.decls {
         match d {
             Decl::Object(o) => {
+                if o.is_expect && actual_object_names.contains(&o.name.name) {
+                    continue;
+                }
                 object_names.push(o.name.name.clone());
                 all_decls.push(Decl::Class(synthesize_class_from_object(o)));
             }
@@ -737,11 +753,19 @@ fn build_module_with_overrides(
             _ => None,
         })
         .collect();
+    let actual_object_names_set: std::collections::HashSet<String> = all_decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Object(o) if o.is_actual => Some(o.name.name.clone()),
+            _ => None,
+        })
+        .collect();
     // Drop superseded `expect` decls so every downstream pass sees
     // only the active definition for each name.
     all_decls.retain(|d| match d {
         Decl::Function(f) => !(f.is_expect && actual_func_names_set.contains(&f.name.name)),
         Decl::Class(c) => !(c.is_expect && actual_class_names_set.contains(&c.name.name)),
+        Decl::Object(o) => !(o.is_expect && actual_object_names_set.contains(&o.name.name)),
         _ => true,
     });
     let decls: &[Decl] = &all_decls;
