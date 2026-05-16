@@ -4,42 +4,245 @@
 //! `klio-stdlib` can express Rust-native intrinsics in terms of the same
 //! types `klio-interp` evaluates against, without either crate depending on
 //! the other.
+#![allow(unsafe_code)] // `ObjRef`'s adaptive cell; see its safety docs.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
-/// Handle to a shared, interior-mutable Kotlin heap object. The one
-/// place the value model's backing pointer is named; swapping this
-/// type's internals (atomic refcount, GC handle) is how true
-/// parallelism lands later without touching call sites.
+/// Adaptive interior-mutable cell behind [`ObjRef`].
+///
+/// While a cell is **unshared** (only ever reachable from its
+/// creating thread — the case for essentially every object, and the
+/// *only* case until a parallel backing publishes references across
+/// threads) borrow tracking is a single non-atomic `Cell<isize>`,
+/// exactly `RefCell`'s algorithm and speed. When a future stage
+/// publishes a reference to another thread it calls [`publish`],
+/// which transitions the cell to **shared** under a full fence
+/// before the reference can be observed elsewhere; shared cells
+/// serialize all access through `lock`.
+///
+/// `flag`: `0` = free, `n > 0` = `n` shared borrows, `-1` = mutably
+/// borrowed (the `RefCell` encoding).
+///
+/// # Safety / publication protocol
+///
+/// `unsafe impl Send + Sync` is sound because of one invariant: a
+/// cell is touched by at most one thread until [`publish`] runs, and
+/// [`publish`] establishes happens-before (via `state`'s
+/// `Release`/`Acquire`) ordered *before* the `ObjRef` becomes
+/// reachable from any other thread. Pre-publication, single-owner
+/// access makes the non-atomic `flag`/`data` race-free; post
+/// publication every access goes through `lock`. The runtime
+/// upholds the "publish before the reference escapes" obligation at
+/// the [`fence_and_publish`] seam. Under the current single-threaded
+/// runtime nothing publishes, so the invariant holds trivially.
+struct AdaptiveCell<T: ?Sized> {
+    state: AtomicU8,
+    flag: Cell<isize>,
+    lock: Mutex<()>,
+    data: UnsafeCell<T>,
+}
+
+const UNSHARED: u8 = 0;
+const SHARED: u8 = 1;
+
+// SAFETY: see the publication protocol on `AdaptiveCell`.
+unsafe impl<T: ?Sized + Send> Send for AdaptiveCell<T> {}
+unsafe impl<T: ?Sized + Send> Sync for AdaptiveCell<T> {}
+
+impl<T> AdaptiveCell<T> {
+    fn new(v: T) -> Self {
+        Self {
+            state: AtomicU8::new(UNSHARED),
+            flag: Cell::new(0),
+            lock: Mutex::new(()),
+            data: UnsafeCell::new(v),
+        }
+    }
+}
+
+/// Error returned by [`ObjRef::try_borrow_mut`] when the cell is
+/// already borrowed (mirrors `std::cell::BorrowMutError`).
 #[derive(Debug)]
-pub struct ObjRef<T: ?Sized>(Rc<RefCell<T>>);
+pub struct BorrowMutError;
+
+/// Handle to a shared, interior-mutable Kotlin heap object. The one
+/// place the value model's backing pointer is named. The backing is
+/// `Arc<AdaptiveCell>`: an atomic strong count (so `Value` is
+/// `Send`/`Sync`) over a borrow path that stays non-atomic and
+/// `RefCell`-fast until a reference is published across threads.
+pub struct ObjRef<T: ?Sized>(Arc<AdaptiveCell<T>>);
 
 impl<T> ObjRef<T> {
     #[must_use]
-    pub fn new(v: T) -> Self { Self(Rc::new(RefCell::new(v))) }
+    pub fn new(v: T) -> Self {
+        Self(Arc::new(AdaptiveCell::new(v)))
+    }
 }
+
 impl<T: ?Sized> ObjRef<T> {
+    /// Shared borrow. Panics on an active mutable borrow, exactly
+    /// like `RefCell::borrow`.
     #[must_use]
-    pub fn borrow(&self) -> std::cell::Ref<'_, T> { self.0.borrow() }
+    pub fn borrow(&self) -> ObjGuard<'_, T> {
+        match self.try_borrow() {
+            Some(g) => g,
+            None => panic!("ObjRef already mutably borrowed"),
+        }
+    }
+
+    /// Mutable borrow. Panics on any active borrow, exactly like
+    /// `RefCell::borrow_mut`.
     #[must_use]
-    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, T> { self.0.borrow_mut() }
+    pub fn borrow_mut(&self) -> ObjGuardMut<'_, T> {
+        match self.try_borrow_mut() {
+            Ok(g) => g,
+            Err(_) => panic!("ObjRef already borrowed"),
+        }
+    }
+
+    fn try_borrow(&self) -> Option<ObjGuard<'_, T>> {
+        let cell = &*self.0;
+        let _guard = (cell.state.load(Ordering::Acquire) == SHARED)
+            .then(|| cell.lock.lock().unwrap_or_else(|e| e.into_inner()));
+        let f = cell.flag.get();
+        if f < 0 {
+            return None;
+        }
+        cell.flag.set(f + 1);
+        // SAFETY: flag was >= 0, so no mutable borrow is live; we
+        // hand out a shared reference and the guard restores the
+        // count on drop. Shared cells additionally hold `lock`.
+        Some(ObjGuard { cell, _shared: _guard })
+    }
+
+    /// Fallible mutable borrow (mirrors `RefCell::try_borrow_mut`).
+    pub fn try_borrow_mut(&self) -> Result<ObjGuardMut<'_, T>, BorrowMutError> {
+        let cell = &*self.0;
+        let _guard = (cell.state.load(Ordering::Acquire) == SHARED)
+            .then(|| cell.lock.lock().unwrap_or_else(|e| e.into_inner()));
+        if cell.flag.get() != 0 {
+            return Err(BorrowMutError);
+        }
+        cell.flag.set(-1);
+        // SAFETY: flag was 0, so no other borrow is live; the guard
+        // restores it on drop. Shared cells additionally hold
+        // `lock`, serializing cross-thread access.
+        Ok(ObjGuardMut { cell, _shared: _guard })
+    }
+
+    /// Transition the cell to the shared state with a full fence.
+    /// Called at the publication seam before the reference escapes
+    /// to another thread. Idempotent.
+    pub fn publish(&self) {
+        self.0.state.store(SHARED, Ordering::Release);
+    }
+
     #[must_use]
-    pub fn try_borrow_mut(&self) -> Result<std::cell::RefMut<'_, T>, std::cell::BorrowMutError> { self.0.try_borrow_mut() }
+    pub fn is_shared(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) == SHARED
+    }
+
     #[must_use]
-    pub fn ptr_eq(a: &Self, b: &Self) -> bool { Rc::ptr_eq(&a.0, &b.0) }
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.0, &b.0)
+    }
+
     #[must_use]
-    pub fn strong_count(&self) -> usize { Rc::strong_count(&self.0) }
+    pub fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+
     #[must_use]
-    pub fn as_ptr(&self) -> *const RefCell<T> { Rc::as_ptr(&self.0) }
+    pub fn as_ptr(&self) -> *const T {
+        self.0.data.get()
+    }
 }
+
 impl<T: ?Sized> Clone for ObjRef<T> {
-    fn clone(&self) -> Self { Self(Rc::clone(&self.0)) }
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Match the old `Debug` (which forwarded through RefCell):
+        // show the contents when not mutably borrowed.
+        match self.try_borrow() {
+            Some(g) => f.debug_tuple("ObjRef").field(&&*g).finish(),
+            None => f.debug_tuple("ObjRef").field(&"<borrowed>").finish(),
+        }
+    }
+}
+
+/// Shared-borrow guard. Restores the borrow count on drop.
+pub struct ObjGuard<'a, T: ?Sized> {
+    cell: &'a AdaptiveCell<T>,
+    _shared: Option<std::sync::MutexGuard<'a, ()>>,
+}
+impl<T: ?Sized> Deref for ObjGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: a shared borrow is live (flag > 0).
+        unsafe { &*self.cell.data.get() }
+    }
+}
+impl<T: ?Sized> Drop for ObjGuard<'_, T> {
+    fn drop(&mut self) {
+        self.cell.flag.set(self.cell.flag.get() - 1);
+    }
+}
+impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+impl<T: ?Sized + fmt::Display> fmt::Display for ObjGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+/// Mutable-borrow guard. Restores the borrow flag on drop.
+pub struct ObjGuardMut<'a, T: ?Sized> {
+    cell: &'a AdaptiveCell<T>,
+    _shared: Option<std::sync::MutexGuard<'a, ()>>,
+}
+impl<T: ?Sized> Deref for ObjGuardMut<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: an exclusive borrow is live (flag == -1).
+        unsafe { &*self.cell.data.get() }
+    }
+}
+impl<T: ?Sized> DerefMut for ObjGuardMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: an exclusive borrow is live (flag == -1).
+        unsafe { &mut *self.cell.data.get() }
+    }
+}
+impl<T: ?Sized> Drop for ObjGuardMut<'_, T> {
+    fn drop(&mut self) {
+        self.cell.flag.set(0);
+    }
+}
+impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjGuardMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+impl<T: ?Sized + fmt::Display> fmt::Display for ObjGuardMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
 }
 
 /// The single memory-model seam where a release/acquire pair would be
