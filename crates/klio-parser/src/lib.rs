@@ -46,17 +46,60 @@ pub struct Parser<'src, 'tok> {
     /// supertype-list entry of the form `: I by expr`, so the class body's
     /// opening brace isn't swallowed as `expr { … }`.
     suppress_trailing_lambda: bool,
+    /// Per-token flag: `true` when the token sits inside an unclosed
+    /// `(` or `[` (not `{`). Kotlin treats newlines as soft inside
+    /// round/square brackets — an expression may break before or
+    /// after a binary/infix operator there — but significant inside
+    /// `{ … }` blocks. Precomputed so it is O(1) regardless of how
+    /// the cursor advances.
+    nl_soft: Vec<bool>,
 }
 
 impl<'src, 'tok> Parser<'src, 'tok> {
     #[must_use]
     pub fn new(_file: FileId, src: &'src str, tokens: &'tok [Token]) -> Self {
+        // Depth of enclosing `(` / `[` for every token. The closing
+        // bracket itself reports the *outer* depth; tokens strictly
+        // between the brackets report depth > 0. `{` is intentionally
+        // ignored so block statements keep newline-as-separator.
+        let mut nl_soft = Vec::with_capacity(tokens.len());
+        let mut depth: u32 = 0;
+        for t in tokens {
+            match t.kind {
+                TokenKind::RParen | TokenKind::RBracket => {
+                    depth = depth.saturating_sub(1);
+                    nl_soft.push(depth > 0);
+                }
+                TokenKind::LParen | TokenKind::LBracket => {
+                    nl_soft.push(depth > 0);
+                    depth += 1;
+                }
+                _ => nl_soft.push(depth > 0),
+            }
+        }
         Self {
             src,
             tokens,
             pos: 0,
             diagnostics: DiagnosticSink::new(),
             suppress_trailing_lambda: false,
+            nl_soft,
+        }
+    }
+
+    /// Are newlines soft at the cursor (inside `(`/`[`)? When true,
+    /// the expression grammar may continue across a line break
+    /// before or after a binary/infix operator.
+    fn nl_is_soft(&self) -> bool {
+        self.nl_soft.get(self.pos).copied().unwrap_or(false)
+    }
+
+    /// Skip newline tokens, but only where they are soft (inside
+    /// round/square brackets). A no-op elsewhere, so block-level
+    /// statement separation is unaffected.
+    fn skip_soft_nl(&mut self) {
+        while matches!(self.peek_kind(), TokenKind::Newline) && self.nl_is_soft() {
+            self.pos += 1;
         }
     }
 
@@ -2544,7 +2587,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
 
     fn parse_disjunction(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_conjunction()?;
-        while matches!(self.peek_kind(), TokenKind::PipePipe) {
+        loop {
+            self.skip_soft_nl();
+            if !matches!(self.peek_kind(), TokenKind::PipePipe) {
+                break;
+            }
             self.bump();
             self.skip_nl();
             let rhs = self.parse_conjunction()?;
@@ -2556,7 +2603,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
 
     fn parse_conjunction(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_equality()?;
-        while matches!(self.peek_kind(), TokenKind::AmpAmp) {
+        loop {
+            self.skip_soft_nl();
+            if !matches!(self.peek_kind(), TokenKind::AmpAmp) {
+                break;
+            }
             self.bump();
             self.skip_nl();
             let rhs = self.parse_equality()?;
@@ -2569,6 +2620,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     fn parse_equality(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_comparison()?;
         loop {
+            self.skip_soft_nl();
             let op = match self.peek_kind() {
                 TokenKind::EqEq => BinOp::Eq,
                 TokenKind::BangEq => BinOp::Neq,
@@ -2588,6 +2640,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     fn parse_comparison(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_named_checks()?;
         loop {
+            self.skip_soft_nl();
             // `in` / `!in` live at the comparison precedence level (Kotlin spec).
             // `!in` is the two tokens `!` then `in`. Recognized only when not
             // followed by a type — `!is` is handled inside parse_named_checks.
@@ -2626,6 +2679,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     fn parse_named_checks(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_elvis()?;
         loop {
+            self.skip_soft_nl();
             let negated = match self.peek_kind() {
                 TokenKind::Keyword(Keyword::Is) => false,
                 k if k.is_bang() => {
@@ -2649,7 +2703,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
 
     fn parse_elvis(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_infix_fn()?;
-        while matches!(self.peek_kind(), TokenKind::QuestionColon) {
+        loop {
+            self.skip_soft_nl();
+            if !matches!(self.peek_kind(), TokenKind::QuestionColon) {
+                break;
+            }
             self.bump();
             self.skip_nl();
             let rhs = self.parse_infix_fn()?;
@@ -2667,6 +2725,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     fn parse_infix_fn(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_range()?;
         loop {
+            self.skip_soft_nl();
             if !matches!(self.peek_kind(), TokenKind::Ident) {
                 break;
             }
@@ -2699,12 +2758,19 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         Some(lhs)
     }
 
-    /// After tentatively reading an infix-candidate identifier, peek one
-    /// token ahead to confirm an expression continues on the same line.
-    /// We do not cross a Newline (statement boundary), and we reject
-    /// trailing punctuation that cannot begin an expression.
+    /// After tentatively reading an infix-candidate identifier, peek
+    /// ahead to confirm an expression continues. A Newline normally
+    /// ends the statement, but inside `(`/`[` (soft newlines) the
+    /// right operand may legally start on the following line, so we
+    /// look past soft newlines there.
     fn lookahead_infix_rhs_starter(&self) -> bool {
-        let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
+        let mut i = self.pos + 1;
+        if self.nl_soft.get(self.pos).copied().unwrap_or(false) {
+            while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+                i += 1;
+            }
+        }
+        let next = self.tokens.get(i).map(|t| &t.kind);
         match next {
             None
             | Some(TokenKind::Newline)
@@ -2726,6 +2792,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     fn parse_range(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_additive()?;
         loop {
+            self.skip_soft_nl();
             let op = match self.peek_kind() {
                 TokenKind::DotDot => BinOp::Range,
                 TokenKind::DotDotLess => BinOp::RangeUntil,
@@ -2743,6 +2810,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     fn parse_additive(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_multiplicative()?;
         loop {
+            self.skip_soft_nl();
             let op = match self.peek_kind() {
                 TokenKind::Plus => BinOp::Add,
                 TokenKind::Minus => BinOp::Sub,
@@ -2760,6 +2828,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     fn parse_multiplicative(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_as()?;
         loop {
+            self.skip_soft_nl();
             let op = match self.peek_kind() {
                 TokenKind::Star => BinOp::Mul,
                 TokenKind::Slash => BinOp::Div,
