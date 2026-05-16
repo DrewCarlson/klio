@@ -4834,8 +4834,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 .secondary_ctors
                 .get(&class_def.name)
                 .map_or(false, |v| v.iter().any(|e| e.param_count == args.len()));
-        let shell_guarded = CTOR_SHELL_GUARD
-            .with(|g| g.borrow().iter().any(|n| n == &class_def.name));
+        let shell_guarded = with_ctor_guard(|g| g.borrow().iter().any(|n| n == &class_def.name));
         if !shell_guarded && (args.len() != n_primary || zero_primary_secondary) {
             let entries = self
                 .secondary_ctors
@@ -4982,12 +4981,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     // fields + body-prop inits + init blocks) under a
                     // recursion guard so this very constructor isn't
                     // re-dispatched.
-                    CTOR_SHELL_GUARD
-                        .with(|g| g.borrow_mut().push(class_def.name.clone()));
+                    with_ctor_guard(|g| g.borrow_mut().push(class_def.name.clone()));
                     let shell = <Self as klio_ir::eval::Host>::new_instance(
                         self, class, &[],
                     );
-                    CTOR_SHELL_GUARD.with(|g| {
+                    with_ctor_guard(|g| {
                         g.borrow_mut().pop();
                     });
                     shell?
@@ -5749,15 +5747,44 @@ impl CooperativeInterceptor {
     }
 }
 
-thread_local! {
-    static CORO_STACK: RefCell<Vec<CooperativeInterceptor>> =
-        const { RefCell::new(Vec::new()) };
+/// The per-thread interpreter execution context — the single named
+/// home for state that belongs to *one* interpreting thread.
+///
+/// This is the publication boundary. Everything in here is private
+/// to the thread running the Vm; nothing in it may be shared with
+/// another thread directly. When real threads land, each gets its
+/// own `ExecState`, and the only legal cross-thread transfer of a
+/// Kotlin value is through the fence-and-publish primitive — never
+/// by reaching into another thread's `ExecState`. Process-global
+/// configuration that is deliberately shared (e.g. the
+/// `klio-stdlib` known-packages registry) lives *outside* this
+/// boundary by design and is documented as such where it is
+/// defined.
+#[derive(Default)]
+struct ExecState {
+    /// Cooperative interceptor stack (nested `runBlocking` /
+    /// `coroutineScope`).
+    coro: RefCell<Vec<CooperativeInterceptor>>,
     /// Classes whose instance shell is mid-construction for a
-    /// non-delegating secondary constructor. While a class is on this
-    /// stack, `new_instance` skips secondary dispatch and builds the
-    /// primary shell, so a `constructor() { … }` body that re-enters
-    /// `new_instance` doesn't recurse into itself forever.
-    static CTOR_SHELL_GUARD: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// non-delegating secondary constructor. While a class is on
+    /// this stack, `new_instance` skips secondary dispatch and
+    /// builds the primary shell, so a `constructor() { … }` body
+    /// that re-enters `new_instance` doesn't recurse forever.
+    ctor_guard: RefCell<Vec<String>>,
+}
+
+thread_local! {
+    static EXEC: ExecState = ExecState::default();
+}
+
+/// Run `f` against this thread's coroutine interceptor stack.
+fn with_coro<R>(f: impl FnOnce(&RefCell<Vec<CooperativeInterceptor>>) -> R) -> R {
+    EXEC.with(|e| f(&e.coro))
+}
+
+/// Run `f` against this thread's constructor-shell recursion guard.
+fn with_ctor_guard<R>(f: impl FnOnce(&RefCell<Vec<String>>) -> R) -> R {
+    EXEC.with(|e| f(&e.ctor_guard))
 }
 
 impl<'a> VmIntrinsicHost<'a> {
@@ -5965,7 +5992,7 @@ impl<'a> VmIntrinsicHost<'a> {
     /// interceptor (Layer 2). Returns the token so the driver can
     /// recognise the root's completion.
     fn park(&self, state: klio_ir::eval::SuspendState) -> u64 {
-        CORO_STACK.with(|s| {
+        with_coro(|s| {
             s.borrow_mut()
                 .last_mut()
                 .expect("park outside runBlocking")
@@ -5985,9 +6012,9 @@ impl<'a> VmIntrinsicHost<'a> {
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
         /// Run `f` against the active interceptor.
         fn with_top<R>(f: impl FnOnce(&mut CooperativeInterceptor) -> R) -> R {
-            CORO_STACK.with(|s| f(s.borrow_mut().last_mut().expect("no active runBlocking")))
+            with_coro(|s| f(s.borrow_mut().last_mut().expect("no active runBlocking")))
         }
-        CORO_STACK.with(|s| s.borrow_mut().push(CooperativeInterceptor::new()));
+        with_coro(|s| s.borrow_mut().push(CooperativeInterceptor::new()));
         let map_err = |e: klio_ir::eval::EvalError| -> klio_runtime::RuntimeError {
             match e {
                 klio_ir::eval::EvalError::Throw(v) => klio_runtime::RuntimeError::Thrown(v),
@@ -6006,7 +6033,7 @@ impl<'a> VmIntrinsicHost<'a> {
                 root_token = Some(self.park(*st));
             }
             Err(e) => {
-                CORO_STACK.with(|s| {
+                with_coro(|s| {
                     s.borrow_mut().pop();
                 });
                 return Err(map_err(e));
@@ -6024,7 +6051,7 @@ impl<'a> VmIntrinsicHost<'a> {
                         self.park(*st);
                     }
                     Err(e) => {
-                        CORO_STACK.with(|s| {
+                        with_coro(|s| {
                             s.borrow_mut().pop();
                         });
                         return Err(map_err(e));
@@ -6052,7 +6079,7 @@ impl<'a> VmIntrinsicHost<'a> {
                             }
                         }
                         Err(e) => {
-                            CORO_STACK.with(|s| {
+                            with_coro(|s| {
                                 s.borrow_mut().pop();
                             });
                             return Err(map_err(e));
@@ -6073,7 +6100,7 @@ impl<'a> VmIntrinsicHost<'a> {
                 break;
             }
         }
-        CORO_STACK.with(|s| {
+        with_coro(|s| {
             s.borrow_mut().pop();
         });
         Ok(root_value.unwrap_or(klio_runtime::Value::Unit))
@@ -6096,7 +6123,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         _scope: &klio_runtime::Value,
         _out: &mut dyn Output,
     ) -> Result<(), klio_runtime::RuntimeError> {
-        let queued = CORO_STACK.with(|s| {
+        let queued = with_coro(|s| {
             let mut stk = s.borrow_mut();
             if let Some(interceptor) = stk.last_mut() {
                 interceptor.enqueue_launch(block.clone());
@@ -6114,7 +6141,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
     }
 
     fn coroutine_park_slot(&mut self, slot: i64) {
-        CORO_STACK.with(|s| {
+        with_coro(|s| {
             if let Some(top) = s.borrow_mut().last_mut() {
                 top.set_pending_slot(slot);
             }
@@ -6122,7 +6149,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
     }
 
     fn coroutine_resume_slot(&mut self, slot: i64) {
-        CORO_STACK.with(|s| {
+        with_coro(|s| {
             let mut stk = s.borrow_mut();
             for interceptor in stk.iter_mut().rev() {
                 if interceptor.resume_slot(slot) {

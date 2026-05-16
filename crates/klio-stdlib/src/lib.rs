@@ -184,6 +184,13 @@ pub fn register_known_package(package_path: impl Into<String>) {
     }
 }
 
+/// Process-global resolver configuration: the set of package names
+/// loaded packs have registered. This is deliberately *outside* the
+/// per-thread interpreter execution context / publication boundary
+/// (see `klio_interp_ir::ExecState`): it is set-up-time
+/// configuration, not Kotlin heap state, written as packs install
+/// and read-only during execution. It is already `Mutex`-guarded
+/// and therefore safe to share across interpreter threads as-is.
 static EXTRA_KNOWN_PACKAGES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::OnceLock::new();

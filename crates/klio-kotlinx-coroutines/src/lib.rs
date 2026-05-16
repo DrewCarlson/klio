@@ -18,6 +18,11 @@ use std::collections::HashSet;
 
 use klio_runtime::{CallCtx, RuntimeError, Value};
 
+// Layer-2 library state, scoped to the interpreting thread (one set
+// per thread via `thread_local!`). This sits inside the publication
+// boundary alongside `klio_interp_ir::ExecState`: cancellation
+// tokens, the scheduler queue, and rendezvous slots belong to the
+// thread driving the coroutines and are never shared directly.
 thread_local! {
     static CANCELLED_TOKENS: RefCell<HashSet<i64>> = RefCell::new(HashSet::new());
     static NEXT_TOKEN: RefCell<i64> = const { RefCell::new(1) };
