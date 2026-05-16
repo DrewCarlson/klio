@@ -47,7 +47,7 @@ pub fn host_bindings() -> HostBindings {
 
 fn receiver_instance<'a>(
     ctx: &'a CallCtx,
-) -> Result<&'a std::rc::Rc<std::cell::RefCell<klio_runtime::InstanceData>>, RuntimeError> {
+) -> Result<&'a klio_runtime::ObjRef<klio_runtime::InstanceData>, RuntimeError> {
     match ctx.args.first() {
         Some(Value::Instance(inst)) => Ok(inst),
         _ => Err(RuntimeError::Type(
@@ -56,7 +56,7 @@ fn receiver_instance<'a>(
     }
 }
 
-fn int_field(inst: &std::cell::RefCell<klio_runtime::InstanceData>) -> Result<i64, RuntimeError> {
+fn int_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result<i64, RuntimeError> {
     match inst.borrow().get("value") {
         Some(Value::Int(i)) => Ok(i as i64),
         Some(Value::Long(l)) => Ok(l),
@@ -66,7 +66,7 @@ fn int_field(inst: &std::cell::RefCell<klio_runtime::InstanceData>) -> Result<i6
     }
 }
 
-fn long_field(inst: &std::cell::RefCell<klio_runtime::InstanceData>) -> Result<i64, RuntimeError> {
+fn long_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result<i64, RuntimeError> {
     match inst.borrow().get("value") {
         Some(Value::Long(l)) => Ok(l),
         Some(Value::Int(i)) => Ok(i as i64),
@@ -76,7 +76,7 @@ fn long_field(inst: &std::cell::RefCell<klio_runtime::InstanceData>) -> Result<i
     }
 }
 
-fn bool_field(inst: &std::cell::RefCell<klio_runtime::InstanceData>) -> Result<bool, RuntimeError> {
+fn bool_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result<bool, RuntimeError> {
     match inst.borrow().get("value") {
         Some(Value::Bool(b)) => Ok(b),
         _ => Err(RuntimeError::Type(
@@ -104,15 +104,15 @@ fn arg_bool(ctx: &CallCtx, idx: usize) -> Result<bool, RuntimeError> {
     }
 }
 
-fn store_int(inst: &std::cell::RefCell<klio_runtime::InstanceData>, v: i64) {
+fn store_int(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>, v: i64) {
     inst.borrow_mut().define("value", Value::new_int(v));
 }
 
-fn store_long(inst: &std::cell::RefCell<klio_runtime::InstanceData>, v: i64) {
+fn store_long(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>, v: i64) {
     inst.borrow_mut().define("value", Value::Long(v));
 }
 
-fn store_bool(inst: &std::cell::RefCell<klio_runtime::InstanceData>, v: bool) {
+fn store_bool(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>, v: bool) {
     inst.borrow_mut().define("value", Value::Bool(v));
 }
 

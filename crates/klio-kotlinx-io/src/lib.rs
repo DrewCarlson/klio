@@ -7,7 +7,6 @@
 //! `expect fun` on the Kotlin side. This keeps the pack faithful to
 //! upstream's "common code + thin platform actuals" structure.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use klio_runtime::{CallCtx, PrimitiveArrayKind, RuntimeError, Value};
@@ -64,9 +63,9 @@ fn base64_decode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .decode(s.as_bytes())
         .map_err(|e| RuntimeError::Type(format!("base64 decode: {e}")))?;
     Ok(Value::Array {
-        items: Rc::new(RefCell::new(
+        items: klio_runtime::ObjRef::new(
             bytes.into_iter().map(|b| Value::Byte(b as i8)).collect(),
-        )),
+        ),
         prim: Some(PrimitiveArrayKind::Byte),
     })
 }
@@ -97,9 +96,9 @@ fn hex_decode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         bytes.push(((hi << 4) | lo) as u8);
     }
     Ok(Value::Array {
-        items: Rc::new(RefCell::new(
+        items: klio_runtime::ObjRef::new(
             bytes.into_iter().map(|b| Value::Byte(b as i8)).collect(),
-        )),
+        ),
         prim: Some(PrimitiveArrayKind::Byte),
     })
 }

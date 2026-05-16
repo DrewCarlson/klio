@@ -1202,7 +1202,7 @@ fn exec_inst(
             frame.write(
                 *dst,
                 Value::List {
-                    items: std::rc::Rc::new(std::cell::RefCell::new(items)),
+                    items: klio_runtime::ObjRef::new(items),
                     mutable: false,
                     enum_class: None,
                 },

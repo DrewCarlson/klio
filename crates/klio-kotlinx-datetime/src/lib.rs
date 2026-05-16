@@ -13,7 +13,6 @@
 //! Top-level arithmetic, formatting of `LocalDate` / `LocalTime` /
 //! `LocalDateTime`, and operator dispatch are pure-Kotlin in the shim.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
@@ -82,7 +81,7 @@ fn parse_tz(id: &str) -> Option<Tz> {
 fn make_long_array(values: &[i64]) -> Value {
     let items: Vec<Value> = values.iter().map(|v| Value::Long(*v)).collect();
     Value::Array {
-        items: Rc::new(RefCell::new(items)),
+        items: klio_runtime::ObjRef::new(items),
         prim: Some(PrimitiveArrayKind::Long),
     }
 }

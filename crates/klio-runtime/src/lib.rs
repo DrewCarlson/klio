@@ -12,6 +12,35 @@ use std::rc::Rc;
 
 use thiserror::Error;
 
+/// Handle to a shared, interior-mutable Kotlin heap object. The one
+/// place the value model's backing pointer is named; swapping this
+/// type's internals (atomic refcount, GC handle) is how true
+/// parallelism lands later without touching call sites.
+#[derive(Debug)]
+pub struct ObjRef<T: ?Sized>(Rc<RefCell<T>>);
+
+impl<T> ObjRef<T> {
+    #[must_use]
+    pub fn new(v: T) -> Self { Self(Rc::new(RefCell::new(v))) }
+}
+impl<T: ?Sized> ObjRef<T> {
+    #[must_use]
+    pub fn borrow(&self) -> std::cell::Ref<'_, T> { self.0.borrow() }
+    #[must_use]
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, T> { self.0.borrow_mut() }
+    #[must_use]
+    pub fn try_borrow_mut(&self) -> Result<std::cell::RefMut<'_, T>, std::cell::BorrowMutError> { self.0.try_borrow_mut() }
+    #[must_use]
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool { Rc::ptr_eq(&a.0, &b.0) }
+    #[must_use]
+    pub fn strong_count(&self) -> usize { Rc::strong_count(&self.0) }
+    #[must_use]
+    pub fn as_ptr(&self) -> *const RefCell<T> { Rc::as_ptr(&self.0) }
+}
+impl<T: ?Sized> Clone for ObjRef<T> {
+    fn clone(&self) -> Self { Self(Rc::clone(&self.0)) }
+}
+
 /// Function pointer signature for a Rust-native stdlib intrinsic.
 ///
 /// `CallCtx::args` carries the call arguments. For member access (`x.f()`
@@ -272,7 +301,7 @@ pub enum Value {
     /// A user-method reference bound to a specific instance — produced by
     /// `instance::method`. Calling it dispatches through the method
     /// resolution chain on `receiver` with the caller's arguments.
-    BoundUserMethod { receiver: Rc<RefCell<InstanceData>>, method: Rc<MethodDef> },
+    BoundUserMethod { receiver: ObjRef<InstanceData>, method: Rc<MethodDef> },
     /// A thrown value, modeled as a Kotlin Throwable. Carries an FQN
     /// (e.g. `kotlin.IllegalArgumentException`), an optional message, and
     /// an optional cause (another Throwable) per spec §3.12.
@@ -283,7 +312,7 @@ pub enum Value {
     /// `EnumName.values()`, tagging the list as a `kotlin.enums.EnumEntries`
     /// for `is`-checks; `None` for ordinary user lists.
     List {
-        items: Rc<RefCell<Vec<Value>>>,
+        items: ObjRef<Vec<Value>>,
         mutable: bool,
         enum_class: Option<Rc<String>>,
     },
@@ -293,15 +322,15 @@ pub enum Value {
     /// `type_fqn()` so member dispatch and `is`-checks see e.g.
     /// `kotlin.IntArray` rather than the generic object array.
     Array {
-        items: Rc<RefCell<Vec<Value>>>,
+        items: ObjRef<Vec<Value>>,
         prim: Option<PrimitiveArrayKind>,
     },
     /// `kotlin.collections.Set` / `MutableSet`. Vec-backed with linear-scan
     /// uniqueness, matching `LinkedHashSet` semantics (insertion order).
-    Set { items: Rc<RefCell<Vec<Value>>>, mutable: bool },
+    Set { items: ObjRef<Vec<Value>>, mutable: bool },
     /// `kotlin.collections.Map` / `MutableMap`. Vec-backed, insertion-ordered
     /// (mirrors `LinkedHashMap`, which is Kotlin's default Map impl).
-    Map { entries: Rc<RefCell<Vec<(Value, Value)>>>, mutable: bool },
+    Map { entries: ObjRef<Vec<(Value, Value)>>, mutable: bool },
     /// `kotlin.Pair`. `to` constructs one.
     Pair(Box<Value>, Box<Value>),
     /// `kotlin.Triple`. Built by `Triple(a, b, c)`.
@@ -326,9 +355,9 @@ pub enum Value {
     /// the source navigates `outer.Inner` (or refers to `Inner` unqualified
     /// inside an outer-class method, where `this` is the outer instance).
     /// Calling it constructs an `Instance` with `InstanceData.outer = Some(outer)`.
-    BoundInnerClass { class: Rc<ClassDef>, outer: Rc<RefCell<InstanceData>> },
+    BoundInnerClass { class: Rc<ClassDef>, outer: ObjRef<InstanceData> },
     /// A live instance of a user-declared class.
-    Instance(Rc<RefCell<InstanceData>>),
+    Instance(ObjRef<InstanceData>),
     /// `kotlin.sequences.Sequence<T>`. Lazy: a source plus a chain of
     /// pipeline ops. Terminal ops drive the pull, so unbounded generators
     /// (`generateSequence { … }`) only emit as many items as the terminal
@@ -339,15 +368,15 @@ pub enum Value {
     /// vector; `prim` tags the typed-iterator variant so `is`-checks and
     /// `next{TYPE}` dispatch resolve correctly.
     Iterator {
-        items: Rc<RefCell<Vec<Value>>>,
-        pos: Rc<RefCell<usize>>,
+        items: ObjRef<Vec<Value>>,
+        pos: ObjRef<usize>,
         prim: Option<PrimitiveArrayKind>,
     },
     /// A built-in property delegate produced by `lazy { … }` /
     /// `Delegates.observable(...)` / `Delegates.notNull()`. Carries the
     /// state the delegate needs across calls (cached value, change
     /// callback, etc.).
-    Delegate(Rc<RefCell<DelegateKind>>),
+    Delegate(ObjRef<DelegateKind>),
     /// `::foo` — a lightweight property/function reference. The
     /// `.name: String` member is the only feature delegate `getValue` /
     /// `setValue` calls reach for; anything richer waits on a reflection
@@ -367,22 +396,22 @@ pub enum Value {
     MatchGroup { value: Rc<String>, start: i64, end_inclusive: i64 },
     /// `kotlin.text.StringBuilder` — mutable string buffer. Shared
     /// storage so `sb1 === sb2` semantics hold across cloned values.
-    StringBuilder(Rc<RefCell<String>>),
+    StringBuilder(ObjRef<String>),
     /// Boxed local `var` captured by a closure (Kotlin's
     /// `Ref.ObjectRef`). The declaring scope and every capturing
-    /// lambda hold the same `Rc<RefCell<…>>`, so an assignment from
+    /// lambda hold the same `ObjRef`, so an assignment from
     /// a coroutine / nested closure is immediately visible at the
     /// declaration site. Created by `Inst::MakeCell`; only ever
     /// touched through `Inst::CellGet` / `Inst::CellSet` — it never
     /// escapes to user-visible value operations.
-    Cell(Rc<RefCell<Value>>),
+    Cell(ObjRef<Value>),
 }
 
 impl Value {
     /// Wrap a value in a fresh capture cell.
     #[must_use]
     pub fn new_cell(v: Value) -> Value {
-        Value::Cell(Rc::new(RefCell::new(v)))
+        Value::Cell(ObjRef::new(v))
     }
 }
 
@@ -691,7 +720,7 @@ pub struct ClassDef {
     /// class is bound to the env, so `class Outer { companion {
     /// val X = Outer() } }` can resolve `Outer` during its
     /// companion's init. Construction sites set this once.
-    pub companion: RefCell<Option<Rc<RefCell<InstanceData>>>>,
+    pub companion: RefCell<Option<ObjRef<InstanceData>>>,
     /// For a companion-object class (`is_object: true` built from a
     /// `companion object` declaration), this points back to the enclosing
     /// class. Lets the interpreter expose enum entries / `entries` inside
@@ -719,7 +748,7 @@ pub struct ClassDef {
     /// their singleton at file load and bind it in globals; nested
     /// objects (including ones inside sealed classes) need lazy
     /// construction the first time `Outer.NestedObj` is read.
-    pub object_singleton: RefCell<Option<Rc<RefCell<InstanceData>>>>,
+    pub object_singleton: RefCell<Option<ObjRef<InstanceData>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -813,7 +842,7 @@ pub struct InstanceData {
     /// Opaque per-instance state owned by a native host binding —
     /// kotlinx.io's `Buffer` stashes its byte queue here, for
     /// example. Lifecycle is tied to the instance: the state is
-    /// dropped when the last `Rc<RefCell<InstanceData>>` clone is
+    /// dropped when the last `ObjRef<InstanceData>` clone is
     /// released, no side-map cleanup needed.
     pub native_state: Option<NativeState>,
 }
@@ -882,8 +911,8 @@ impl ClassDef {
     /// `Counter.inc()` default body that runs on a class implementing
     /// `Counter`).
     #[must_use]
-    pub fn all_companions(self: &Rc<Self>) -> Vec<Rc<RefCell<InstanceData>>> {
-        let mut out: Vec<Rc<RefCell<InstanceData>>> = Vec::new();
+    pub fn all_companions(self: &Rc<Self>) -> Vec<ObjRef<InstanceData>> {
+        let mut out: Vec<ObjRef<InstanceData>> = Vec::new();
         let mut seen: Vec<*const ClassDef> = Vec::new();
         collect_companions_walk(self, &mut out, &mut seen);
         out
@@ -930,7 +959,7 @@ impl ClassDef {
 
 fn collect_companions_walk(
     cls: &Rc<ClassDef>,
-    out: &mut Vec<Rc<RefCell<InstanceData>>>,
+    out: &mut Vec<ObjRef<InstanceData>>,
     seen: &mut Vec<*const ClassDef>,
 ) {
     let ptr = Rc::as_ptr(cls);
@@ -939,7 +968,7 @@ fn collect_companions_walk(
     }
     seen.push(ptr);
     if let Some(c) = cls.companion.borrow().as_ref() {
-        out.push(Rc::clone(c));
+        out.push(c.clone());
     }
     if let Some(parent) = cls.parent.borrow().clone() {
         collect_companions_walk(&parent, out, seen);
@@ -2005,7 +2034,7 @@ impl Value {
             }
             (Class(a), Class(b)) => a.fqn == b.fqn,
             (Instance(a), Instance(b)) => {
-                if Rc::ptr_eq(a, b) {
+                if ObjRef::ptr_eq(a, b) {
                     return true;
                 }
                 let aa = a.borrow();
@@ -2362,13 +2391,13 @@ mod tests {
     #[test]
     fn plain_instance_display_uses_class_at_hex() {
         let cls = make_class("Foo", false, false, false);
-        let inst = Rc::new(RefCell::new(InstanceData {
+        let inst = ObjRef::new(InstanceData {
             class: cls,
             fields: Vec::new(),
             outer: None,
             identity: 0x2a,
             native_state: None,
-        }));
+        });
         assert_eq!(format!("{}", Value::Instance(inst)), "Foo@2a");
     }
 
@@ -2377,20 +2406,20 @@ mod tests {
         // Data classes still render via the data-class form; identity is
         // irrelevant. (Field rendering exercised by integration tests.)
         let cls = make_class("D", true, false, false);
-        let inst = Rc::new(RefCell::new(InstanceData {
+        let inst = ObjRef::new(InstanceData {
             class: cls,
             fields: Vec::new(),
             outer: None,
             identity: 99,
             native_state: None,
-        }));
+        });
         assert_eq!(format!("{}", Value::Instance(inst)), "D()");
     }
 
     #[test]
     fn enum_entries_is_runtime_type_matches_both() {
         let entries = Value::List {
-            items: Rc::new(RefCell::new(vec![Value::Int(1)])),
+            items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
             enum_class: Some(Rc::new("Color".to_string())),
         };
@@ -2399,7 +2428,7 @@ mod tests {
         assert!(entries.is_runtime_type("Collection"));
 
         let plain = Value::List {
-            items: Rc::new(RefCell::new(vec![Value::Int(1)])),
+            items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
             enum_class: None,
         };
@@ -2412,7 +2441,7 @@ mod tests {
         // Stdlib member dispatch keys on type_fqn — EnumEntries values must
         // continue to dispatch through `kotlin.collections.List`.
         let entries = Value::List {
-            items: Rc::new(RefCell::new(vec![Value::Int(1)])),
+            items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
             enum_class: Some(Rc::new("Color".to_string())),
         };

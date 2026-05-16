@@ -1115,13 +1115,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if cls.is_fun_interface && args.len() == 1 {
                 *self.instance_id_counter += 1;
                 let identity = *self.instance_id_counter;
-                let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
+                let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                     class: Rc::clone(cls),
                     fields: vec![("__sam_target__".to_string(), args[0].clone())],
                     outer: None,
                     identity,
                     native_state: None,
-                }));
+                });
                 return Ok(klio_runtime::Value::Instance(inst));
             }
             let class_id = self
@@ -1162,13 +1162,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 .borrow()
                 .get(&cls.name)
                 .cloned();
-            let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
+            let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                 class: Rc::clone(cls),
                 fields,
                 outer: default_outer,
                 identity,
                 native_state: None,
-            }));
+            });
             return Ok(klio_runtime::Value::Instance(inst));
         }
         // `propRef(receiver)` — invoking a Value::PropertyRef as a
@@ -1239,7 +1239,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let fixed = info.n_params.saturating_sub(1);
                     packed.extend(args[fixed..].iter().cloned());
                     call_args[info.n_params - 1] = klio_runtime::Value::Array {
-                        items: Rc::new(RefCell::new(packed)),
+                        items: klio_runtime::ObjRef::new(packed),
                         prim: None,
                     };
                 } else if last.is_vararg
@@ -1251,7 +1251,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         packed.extend(args[fixed..].iter().cloned());
                     }
                     call_args[info.n_params - 1] = klio_runtime::Value::Array {
-                        items: Rc::new(RefCell::new(packed)),
+                        items: klio_runtime::ObjRef::new(packed),
                         prim: None,
                     };
                 }
@@ -1314,7 +1314,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .map(|(_, v)| v.clone())
                         .collect();
                     return Ok(klio_runtime::Value::List {
-                        items: Rc::new(RefCell::new(items)),
+                        items: klio_runtime::ObjRef::new(items),
                         mutable: false,
                         enum_class: Some(Rc::new(cls.name.clone())),
                     });
@@ -1367,7 +1367,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 })
                                 .collect();
                             return Ok(klio_runtime::Value::List {
-                                items: Rc::new(RefCell::new(items)),
+                                items: klio_runtime::ObjRef::new(items),
                                 mutable: false,
                                 enum_class: None,
                             });
@@ -1504,7 +1504,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         });
                     }
                     return Ok(klio_runtime::Value::List {
-                        items: Rc::new(RefCell::new(items)),
+                        items: klio_runtime::ObjRef::new(items),
                         mutable: false,
                         enum_class: None,
                     });
@@ -1522,7 +1522,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         })
                         .collect();
                     return Ok(klio_runtime::Value::List {
-                        items: Rc::new(RefCell::new(items)),
+                        items: klio_runtime::ObjRef::new(items),
                         mutable: false,
                         enum_class: None,
                     });
@@ -1536,7 +1536,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .map(|c| klio_runtime::Value::Class(Rc::clone(c)))
                         .collect();
                     return Ok(klio_runtime::Value::List {
-                        items: Rc::new(RefCell::new(items)),
+                        items: klio_runtime::ObjRef::new(items),
                         mutable: false,
                         enum_class: None,
                     });
@@ -1790,7 +1790,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .map(|(_, v)| v.clone())
                         .collect();
                     return Ok(klio_runtime::Value::List {
-                        items: Rc::new(RefCell::new(items)),
+                        items: klio_runtime::ObjRef::new(items),
                         mutable: false,
                         enum_class: Some(Rc::new(class_def.name.clone())),
                     });
@@ -2082,7 +2082,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             delegate_forwarders: RefCell::new(Vec::new()),
             object_singleton: RefCell::new(None),
         });
-        let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
+        let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
             class: synth_class,
             fields: vec![
                 ("__bound_receiver__".to_string(), receiver.clone()),
@@ -2094,7 +2094,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             outer: None,
             identity,
             native_state: None,
-        }));
+        });
         Ok(klio_runtime::Value::Instance(inst))
     }
 
@@ -2514,13 +2514,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 }
             }
-            let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
+            let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                 class: class_def,
                 fields,
                 outer: None,
                 identity,
                 native_state: None,
-            }));
+            });
             return Ok(klio_runtime::Value::Instance(inst));
         }
         Err(klio_ir::eval::EvalError::Type(format!(
@@ -2632,12 +2632,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             while let Some(klio_runtime::Value::Instance(o_inst)) = outer.clone() {
                 let cls = o_inst.borrow().class.clone();
                 if cls.name == qualifier || cls.fqn == qualifier {
-                    return Ok(klio_runtime::Value::Instance(Rc::clone(&o_inst)));
+                    return Ok(klio_runtime::Value::Instance(o_inst.clone()));
                 }
                 let mut p = cls.parent.borrow().clone();
                 while let Some(c) = p {
                     if c.name == qualifier || c.fqn == qualifier {
-                        return Ok(klio_runtime::Value::Instance(Rc::clone(&o_inst)));
+                        return Ok(klio_runtime::Value::Instance(o_inst.clone()));
                     }
                     p = c.parent.borrow().clone();
                 }
@@ -3215,20 +3215,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if *fqn == "kotlin.properties.Delegates" {
                 match (name, args.len()) {
                     ("notNull", 0) => {
-                        return Ok(klio_runtime::Value::Delegate(Rc::new(RefCell::new(
+                        return Ok(klio_runtime::Value::Delegate(klio_runtime::ObjRef::new(
                             klio_runtime::DelegateKind::NotNull {
                                 value: None,
                                 name: String::new(),
                             },
-                        ))));
+                            )));
                     }
                     ("observable", 2) => {
-                        return Ok(klio_runtime::Value::Delegate(Rc::new(RefCell::new(
+                        return Ok(klio_runtime::Value::Delegate(klio_runtime::ObjRef::new(
                             klio_runtime::DelegateKind::Observable {
                                 value: args[0].clone(),
                                 on_change: args[1].clone(),
                             },
-                        ))));
+                            )));
                     }
                     _ => {}
                 }
@@ -3265,16 +3265,16 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 klio_runtime::Value::List { items, .. } => {
                     let items_clone: Vec<klio_runtime::Value> = items.borrow().clone();
                     return Ok(klio_runtime::Value::Iterator {
-                        items: Rc::new(RefCell::new(items_clone)),
-                        pos: Rc::new(RefCell::new(0)),
+                        items: klio_runtime::ObjRef::new(items_clone),
+                        pos: klio_runtime::ObjRef::new(0),
                         prim: None,
                     });
                 }
                 klio_runtime::Value::Set { items, .. } => {
                     let items_clone: Vec<klio_runtime::Value> = items.borrow().clone();
                     return Ok(klio_runtime::Value::Iterator {
-                        items: Rc::new(RefCell::new(items_clone)),
-                        pos: Rc::new(RefCell::new(0)),
+                        items: klio_runtime::ObjRef::new(items_clone),
+                        pos: klio_runtime::ObjRef::new(0),
                         prim: None,
                     });
                 }
@@ -3288,24 +3288,24 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         })
                         .collect();
                     return Ok(klio_runtime::Value::Iterator {
-                        items: Rc::new(RefCell::new(entries_clone)),
-                        pos: Rc::new(RefCell::new(0)),
+                        items: klio_runtime::ObjRef::new(entries_clone),
+                        pos: klio_runtime::ObjRef::new(0),
                         prim: None,
                     });
                 }
                 klio_runtime::Value::Range { start, end, step, kind } => {
                     let items = materialise_range_items(*start, *end, *step, *kind);
                     return Ok(klio_runtime::Value::Iterator {
-                        items: Rc::new(RefCell::new(items)),
-                        pos: Rc::new(RefCell::new(0)),
+                        items: klio_runtime::ObjRef::new(items),
+                        pos: klio_runtime::ObjRef::new(0),
                         prim: None,
                     });
                 }
                 klio_runtime::Value::Array { items, prim } => {
                     let items_clone: Vec<klio_runtime::Value> = items.borrow().clone();
                     return Ok(klio_runtime::Value::Iterator {
-                        items: Rc::new(RefCell::new(items_clone)),
-                        pos: Rc::new(RefCell::new(0)),
+                        items: klio_runtime::ObjRef::new(items_clone),
+                        pos: klio_runtime::ObjRef::new(0),
                         prim: *prim,
                     });
                 }
@@ -3315,8 +3315,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .map(klio_runtime::Value::Char)
                         .collect();
                     return Ok(klio_runtime::Value::Iterator {
-                        items: Rc::new(RefCell::new(items)),
-                        pos: Rc::new(RefCell::new(0)),
+                        items: klio_runtime::ObjRef::new(items),
+                        pos: klio_runtime::ObjRef::new(0),
                         prim: None,
                     });
                 }
@@ -3375,7 +3375,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if terminal {
                 let items = self.materialise_sequence(receiver)?;
                 let as_list = klio_runtime::Value::List {
-                    items: Rc::new(RefCell::new(items)),
+                    items: klio_runtime::ObjRef::new(items),
                     mutable: false,
                     enum_class: None,
                 };
@@ -3457,7 +3457,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             self, class_id, args,
                         )?;
                         if let klio_runtime::Value::Instance(i) = &v {
-                            i.borrow_mut().outer = Some(klio_runtime::Value::Instance(Rc::clone(outer_inst)));
+                            i.borrow_mut().outer = Some(klio_runtime::Value::Instance(outer_inst.clone()));
                         }
                         return Ok(v);
                     }
@@ -3497,7 +3497,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     .map(|(_, v)| v.clone())
                     .collect();
                 return Ok(klio_runtime::Value::List {
-                    items: Rc::new(RefCell::new(items)),
+                    items: klio_runtime::ObjRef::new(items),
                     mutable: false,
                     enum_class: Some(Rc::new(cls.name.clone())),
                 });
@@ -3655,7 +3655,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                         })
                                         .collect();
                                     return Ok(klio_runtime::Value::List {
-                                        items: Rc::new(RefCell::new(items)),
+                                        items: klio_runtime::ObjRef::new(items),
                                         mutable: false,
                                         enum_class: None,
                                     });
@@ -3744,7 +3744,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         }
                     }
                     return Ok(klio_runtime::Value::List {
-                        items: Rc::new(RefCell::new(sorted)),
+                        items: klio_runtime::ObjRef::new(sorted),
                         mutable: false,
                         enum_class: None,
                     });
@@ -3905,7 +3905,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 ("toList", 0) => {
                     let v: Vec<klio_runtime::Value> = items.borrow().clone();
                     return Ok(klio_runtime::Value::List {
-                        items: Rc::new(RefCell::new(v)),
+                        items: klio_runtime::ObjRef::new(v),
                         mutable: false,
                         enum_class: None,
                     });
@@ -3913,7 +3913,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 ("toMutableList", 0) => {
                     let v: Vec<klio_runtime::Value> = items.borrow().clone();
                     return Ok(klio_runtime::Value::List {
-                        items: Rc::new(RefCell::new(v)),
+                        items: klio_runtime::ObjRef::new(v),
                         mutable: true,
                         enum_class: None,
                     });
@@ -3921,7 +3921,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 ("asList", 0) => {
                     let v: Vec<klio_runtime::Value> = items.borrow().clone();
                     return Ok(klio_runtime::Value::List {
-                        items: Rc::new(RefCell::new(v)),
+                        items: klio_runtime::ObjRef::new(v),
                         mutable: false,
                         enum_class: None,
                     });
@@ -3929,7 +3929,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 ("toSet", 0) => {
                     let v: Vec<klio_runtime::Value> = items.borrow().clone();
                     return Ok(klio_runtime::Value::Set {
-                        items: Rc::new(RefCell::new(v)),
+                        items: klio_runtime::ObjRef::new(v),
                         mutable: false,
                     });
                 }
@@ -4398,7 +4398,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
             if args.len() == 1 && name == "equals" {
                 if let klio_runtime::Value::Instance(o) = &args[0] {
-                    let same = Rc::ptr_eq(inst, o);
+                    let same = klio_runtime::ObjRef::ptr_eq(inst, o);
                     return Ok(klio_runtime::Value::Bool(same));
                 }
                 return Ok(klio_runtime::Value::Bool(false));
@@ -4457,7 +4457,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let klio_runtime::Value::Range { start, end, step, kind } = receiver {
             let items = materialise_range_items(*start, *end, *step, *kind);
             let as_list = klio_runtime::Value::List {
-                items: Rc::new(RefCell::new(items)),
+                items: klio_runtime::ObjRef::new(items),
                 mutable: false,
                 enum_class: None,
             };
@@ -4749,13 +4749,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if class_def.is_fun_interface && args.len() == 1 {
                 *self.instance_id_counter += 1;
                 let identity = *self.instance_id_counter;
-                let inst = Rc::new(RefCell::new(klio_runtime::InstanceData {
+                let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                     class: Rc::clone(&class_def),
                     fields: vec![("__sam_target__".to_string(), args[0].clone())],
                     outer: None,
                     identity,
                     native_state: None,
-                }));
+                });
                 return Ok(klio_runtime::Value::Instance(inst));
             }
             return Err(klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
@@ -5104,14 +5104,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // body-property initialisers can reference `this` (and read
         // already-bound fields). Body props get appended into the
         // same instance after the init thunks run.
-        let inst = std::rc::Rc::new(std::cell::RefCell::new(klio_runtime::InstanceData {
+        let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
             class: class_def.clone(),
             fields,
             outer: None,
             identity,
             native_state: None,
-        }));
-        let inst_value = klio_runtime::Value::Instance(std::rc::Rc::clone(&inst));
+        });
+        let inst_value = klio_runtime::Value::Instance(inst.clone());
         // Attach a stored default-outer if the class was
         // registered inside a method body via Inst::RegisterClass —
         // lets `this@Outer.X` and outer-field reads resolve.
@@ -5284,7 +5284,7 @@ fn pack_vararg_args(
             let rest: Vec<klio_runtime::Value> =
                 args.into_iter().skip(fixed).collect();
             out.push(klio_runtime::Value::Array {
-                items: Rc::new(RefCell::new(rest)),
+                items: klio_runtime::ObjRef::new(rest),
                 prim: None,
             });
             return out;

@@ -1220,13 +1220,13 @@ fn build_module_with_overrides(
                         "ordinal".to_string(),
                         klio_runtime::Value::new_int(ordinal as i64),
                     ));
-                    let inst = std::rc::Rc::new(RefCell::new(klio_runtime::InstanceData {
+                    let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                         class: std::rc::Rc::clone(&class_def),
                         fields,
                         outer: None,
                         identity: id,
                         native_state: None,
-                    }));
+                    });
                     // Per-entry method overrides — `RED { override fun
                     // f() = … }`. Lower each entry-specific method
                     // body and stash so the Vm can dispatch it

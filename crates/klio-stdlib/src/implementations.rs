@@ -14,7 +14,7 @@
 use std::io::BufRead;
 use std::rc::Rc;
 
-use klio_runtime::{CallCtx, RuntimeError, StdlibFn, Value};
+use klio_runtime::{CallCtx, ObjRef, RuntimeError, StdlibFn, Value};
 
 const TABLE: &[(&str, StdlibFn)] = &[
     // ----- scope functions (lambda-driven) -----
@@ -1744,7 +1744,7 @@ fn map_get_or_put(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Value::Map { entries, .. } = &recv else {
         return Err(RuntimeError::Type("getOrPut requires a MutableMap receiver".into()));
     };
-    let entries_rc = Rc::clone(entries);
+    let entries_rc = entries.clone();
     let key = ctx.args[1].clone();
     if let Some((_, v)) = entries_rc.borrow().iter().find(|(k, _)| Value::structural_eq(k, &key)) {
         return Ok(v.clone());
@@ -1776,7 +1776,7 @@ fn array_ctor_impl(
     let n = array_size_arg(&ctx.args[0], name)?;
     if ctx.args.len() == 1 {
         let items: Vec<Value> = (0..n).map(|_| default.clone()).collect();
-        return Ok(Value::Array { items: Rc::new(RefCell::new(items)), prim });
+        return Ok(Value::Array { items: ObjRef::new(items), prim });
     }
     let block = ctx.args[1].clone();
     let CallCtx { out, host, .. } = ctx;
@@ -1785,7 +1785,7 @@ fn array_ctor_impl(
         let v = host.invoke_callable(&block, &[Value::Int(i as i32)], *out)?;
         items.push(v);
     }
-    Ok(Value::Array { items: Rc::new(RefCell::new(items)), prim })
+    Ok(Value::Array { items: ObjRef::new(items), prim })
 }
 
 fn array_ctor_generic(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -1937,9 +1937,9 @@ fn lazy_lazy(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Arity("lazy expects (block)".into()));
     }
     let producer = ctx.args[0].clone();
-    Ok(Value::Delegate(Rc::new(RefCell::new(
+    Ok(Value::Delegate(ObjRef::new(
         klio_runtime::DelegateKind::Lazy { producer, cached: None },
-    ))))
+    )))
 }
 
 fn lazy_lazy_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -1947,9 +1947,9 @@ fn lazy_lazy_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Arity("lazyOf expects (value)".into()));
     }
     let v = ctx.args[0].clone();
-    Ok(Value::Delegate(Rc::new(RefCell::new(
+    Ok(Value::Delegate(ObjRef::new(
         klio_runtime::DelegateKind::Lazy { producer: Value::Null, cached: Some(v) },
-    ))))
+    )))
 }
 
 fn builders_build_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -1958,7 +1958,7 @@ fn builders_build_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let block = ctx.args[ctx.args.len() - 1].clone();
     let buildable = Value::List {
-        items: Rc::new(RefCell::new(Vec::new())),
+        items: ObjRef::new(Vec::new()),
         mutable: true,
         enum_class: None,
     };
@@ -1976,7 +1976,7 @@ fn builders_build_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let block = ctx.args[ctx.args.len() - 1].clone();
     let buildable = Value::List {
-        items: Rc::new(RefCell::new(Vec::new())),
+        items: ObjRef::new(Vec::new()),
         mutable: true,
         enum_class: None,
     };
@@ -1991,7 +1991,7 @@ fn builders_build_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             deduped.push(v.clone());
         }
     }
-    Ok(Value::Set { items: Rc::new(RefCell::new(deduped)), mutable: false })
+    Ok(Value::Set { items: ObjRef::new(deduped), mutable: false })
 }
 
 fn builders_build_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -2000,7 +2000,7 @@ fn builders_build_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let block = ctx.args[ctx.args.len() - 1].clone();
     let buildable = Value::Map {
-        entries: Rc::new(RefCell::new(Vec::new())),
+        entries: ObjRef::new(Vec::new()),
         mutable: true,
     };
     {
@@ -2016,7 +2016,7 @@ fn builders_build_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Arity("buildString expects (block)".into()));
     }
     let block = ctx.args[0].clone();
-    let sb = Value::StringBuilder(Rc::new(RefCell::new(String::new())));
+    let sb = Value::StringBuilder(ObjRef::new(String::new()));
     {
         let CallCtx { out, host, .. } = ctx;
         host.invoke_callable_with_this(&block, &[], &sb, *out)?;
@@ -3542,10 +3542,8 @@ fn throwable_cause(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 // Collections
 // ============================================================
 
-use std::cell::RefCell;
-
 fn make_list(items: Vec<Value>, mutable: bool) -> Value {
-    Value::List { items: Rc::new(RefCell::new(items)), mutable, enum_class: None }
+    Value::List { items: ObjRef::new(items), mutable, enum_class: None }
 }
 
 fn make_set(items: Vec<Value>, mutable: bool) -> Value {
@@ -3555,7 +3553,7 @@ fn make_set(items: Vec<Value>, mutable: bool) -> Value {
             deduped.push(v);
         }
     }
-    Value::Set { items: Rc::new(RefCell::new(deduped)), mutable }
+    Value::Set { items: ObjRef::new(deduped), mutable }
 }
 
 fn make_map(entries: Vec<(Value, Value)>, mutable: bool) -> Value {
@@ -3568,7 +3566,7 @@ fn make_map(entries: Vec<(Value, Value)>, mutable: bool) -> Value {
             out.push((k, v));
         }
     }
-    Value::Map { entries: Rc::new(RefCell::new(out)), mutable }
+    Value::Map { entries: ObjRef::new(out), mutable }
 }
 
 fn pair_args(ctx: &CallCtx<'_>) -> Result<(Value, Value), RuntimeError> {
@@ -3592,79 +3590,79 @@ fn coll_list_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn coll_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: None,
     })
 }
 fn coll_int_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::Int),
     })
 }
 fn coll_long_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::Long),
     })
 }
 fn coll_short_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::Short),
     })
 }
 fn coll_byte_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::Byte),
     })
 }
 fn coll_double_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::Double),
     })
 }
 fn coll_float_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::Float),
     })
 }
 fn coll_bool_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::Boolean),
     })
 }
 fn coll_char_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::Char),
     })
 }
 fn coll_uint_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::UInt),
     })
 }
 fn coll_ulong_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::ULong),
     })
 }
 fn coll_ushort_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::UShort),
     })
 }
 fn coll_ubyte_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
-        items: std::rc::Rc::new(std::cell::RefCell::new(ctx.args.to_vec())),
+        items: ObjRef::new(ctx.args.to_vec()),
         prim: Some(klio_runtime::PrimitiveArrayKind::UByte),
     })
 }
@@ -3758,9 +3756,9 @@ fn coll_hash_set_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 // ----- List / MutableList helpers -----
 
-fn recv_list_items<'a>(args: &'a [Value], what: &str) -> Result<Rc<RefCell<Vec<Value>>>, RuntimeError> {
+fn recv_list_items<'a>(args: &'a [Value], what: &str) -> Result<ObjRef<Vec<Value>>, RuntimeError> {
     match args.first() {
-        Some(Value::List { items, .. }) => Ok(Rc::clone(items)),
+        Some(Value::List { items, .. }) => Ok(items.clone()),
         _ => Err(RuntimeError::Type(format!("{what} requires a List receiver"))),
     }
 }
@@ -4755,7 +4753,7 @@ fn coll_set_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
         single => push(&mut out, single.clone()),
     }
-    Ok(Value::Set { items: Rc::new(std::cell::RefCell::new(out)), mutable: false })
+    Ok(Value::Set { items: ObjRef::new(out), mutable: false })
 }
 
 fn coll_set_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -4773,7 +4771,7 @@ fn coll_set_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .filter(|v| !removals.iter().any(|r| Value::structural_eq(r, v)))
         .cloned()
         .collect();
-    Ok(Value::Set { items: Rc::new(std::cell::RefCell::new(out)), mutable: false })
+    Ok(Value::Set { items: ObjRef::new(out), mutable: false })
 }
 
 /// `Map + Pair` / `Map + Map` / `Map + Iterable<Pair>` — returns a
@@ -4845,7 +4843,7 @@ fn coll_set_intersect(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .filter(|v| other.iter().any(|o| Value::structural_eq(o, v)))
         .cloned()
         .collect();
-    Ok(Value::Set { items: Rc::new(std::cell::RefCell::new(out)), mutable: false })
+    Ok(Value::Set { items: ObjRef::new(out), mutable: false })
 }
 fn coll_set_subtract(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     coll_set_minus(ctx)
@@ -4853,9 +4851,9 @@ fn coll_set_subtract(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 // ----- Set helpers -----
 
-fn recv_set_items<'a>(args: &'a [Value], what: &str) -> Result<Rc<RefCell<Vec<Value>>>, RuntimeError> {
+fn recv_set_items<'a>(args: &'a [Value], what: &str) -> Result<ObjRef<Vec<Value>>, RuntimeError> {
     match args.first() {
-        Some(Value::Set { items, .. }) => Ok(Rc::clone(items)),
+        Some(Value::Set { items, .. }) => Ok(items.clone()),
         _ => Err(RuntimeError::Type(format!("{what} requires a Set receiver"))),
     }
 }
@@ -4916,9 +4914,9 @@ fn coll_mut_set_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn recv_map_entries<'a>(
     args: &'a [Value],
     what: &str,
-) -> Result<Rc<RefCell<Vec<(Value, Value)>>>, RuntimeError> {
+) -> Result<ObjRef<Vec<(Value, Value)>>, RuntimeError> {
     match args.first() {
-        Some(Value::Map { entries, .. }) => Ok(Rc::clone(entries)),
+        Some(Value::Map { entries, .. }) => Ok(entries.clone()),
         _ => Err(RuntimeError::Type(format!("{what} requires a Map receiver"))),
     }
 }
@@ -6782,9 +6780,9 @@ fn match_group_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 // StringBuilder
 // ============================================================
 
-fn sb_arg(args: &[Value], what: &str) -> Result<Rc<RefCell<String>>, RuntimeError> {
+fn sb_arg(args: &[Value], what: &str) -> Result<ObjRef<String>, RuntimeError> {
     match args.first() {
-        Some(Value::StringBuilder(s)) => Ok(Rc::clone(s)),
+        Some(Value::StringBuilder(s)) => Ok(s.clone()),
         _ => Err(RuntimeError::Type(format!(
             "{what} requires a StringBuilder receiver"
         ))),
@@ -6808,7 +6806,7 @@ fn string_builder_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             "StringBuilder takes 0 or 1 argument".into(),
         )),
     };
-    Ok(Value::StringBuilder(Rc::new(RefCell::new(seed))))
+    Ok(Value::StringBuilder(ObjRef::new(seed)))
 }
 
 fn append_value(buf: &mut String, v: &Value) {
