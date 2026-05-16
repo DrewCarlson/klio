@@ -32,6 +32,11 @@ enum Cmd {
         /// directly with no AST evaluator.
         #[arg(long = "ir-vm")]
         ir_vm: bool,
+        /// Use deterministic virtual time for coroutines (`delay`
+        /// advances a logical clock instantly) instead of the
+        /// default wall-clock.
+        #[arg(long = "virtual-time")]
+        virtual_time: bool,
     },
     /// Type-check `.kt` files and emit diagnostics. Exit 1 on any error.
     Check {
@@ -183,16 +188,23 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Lex { file } => run_lex(&file),
         Cmd::Parse { file } => run_parse(&file),
-        Cmd::Run { files, ir_vm: _ } => match files.as_slice() {
-            [] => {
-                eprintln!("usage: klio run <file.kt> [<file2.kt> ...]");
-                ExitCode::from(2)
+        Cmd::Run { files, ir_vm: _, virtual_time } => {
+            if virtual_time {
+                klio_interp_ir::set_coroutine_time_mode(
+                    klio_interp_ir::TimeMode::Virtual,
+                );
             }
-            // The IR-native Vm is the only `run` path now. The
-            // legacy `--ir-vm` flag is accepted but ignored.
-            [single] => run_file_ir_vm(single),
-            many => run_module_files(many),
-        },
+            match files.as_slice() {
+                [] => {
+                    eprintln!("usage: klio run <file.kt> [<file2.kt> ...]");
+                    ExitCode::from(2)
+                }
+                // The IR-native Vm is the only `run` path now. The
+                // legacy `--ir-vm` flag is accepted but ignored.
+                [single] => run_file_ir_vm(single),
+                many => run_module_files(many),
+            }
+        }
         Cmd::Check { files, format } => run_check(&files, format),
         Cmd::Repl => run_repl(),
         Cmd::Pack { cmd } => run_pack(cmd),

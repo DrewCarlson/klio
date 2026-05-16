@@ -854,6 +854,7 @@ pub fn run_with_ktc(file: &Path) -> Result<String, String> {
     if diags.has_errors() {
         return Err(format!("parse diagnostics: {:?}", diags.diagnostics()));
     }
+    klio_interp_ir::set_coroutine_time_mode(klio_interp_ir::TimeMode::Virtual);
     let mut out = CaptureOutput::default();
     let r = klio_resolver::resolve(&ast);
     let _ = klio_typeck::typecheck(&ast, &r);
@@ -937,6 +938,9 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
         bindings.register(sym, f);
     }
 
+    // Conformance / smoke determinism: timed coroutine programs are
+    // only byte-deterministic under virtual time.
+    klio_interp_ir::set_coroutine_time_mode(klio_interp_ir::TimeMode::Virtual);
     for ast in &asts {
         let r = klio_resolver::resolve(ast);
         let _ = klio_typeck::typecheck(ast, &r);

@@ -5475,6 +5475,36 @@ struct VmIntrinsicHost<'a> {
     instance_id_counter: &'a mut u64,
 }
 
+/// How the default interceptor interprets a `delay` directive.
+/// `Wall` (the default) consumes real wall-clock time, matching the
+/// JVM. `Virtual` advances a logical clock instantly — deterministic
+/// and fast, used by the test scheduler and the parity / conformance
+/// harnesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeMode {
+    #[default]
+    Wall,
+    Virtual,
+}
+
+thread_local! {
+    static COROUTINE_TIME_MODE: std::cell::Cell<TimeMode> =
+        const { std::cell::Cell::new(TimeMode::Wall) };
+}
+
+/// Set the coroutine time mode for the current thread. The default
+/// is [`TimeMode::Wall`]; tests and the parity/conformance harnesses
+/// opt into [`TimeMode::Virtual`] for determinism.
+pub fn set_coroutine_time_mode(mode: TimeMode) {
+    COROUTINE_TIME_MODE.with(|m| m.set(mode));
+}
+
+/// Current coroutine time mode for this thread.
+#[must_use]
+pub fn coroutine_time_mode() -> TimeMode {
+    COROUTINE_TIME_MODE.with(std::cell::Cell::get)
+}
+
 /// Layer 2 — the default `ContinuationInterceptor`.
 ///
 /// This is the only place coroutine *scheduling* happens. The core
@@ -5488,8 +5518,12 @@ struct VmIntrinsicHost<'a> {
 ///
 /// A stack of these supports nested `runBlocking` /
 /// `coroutineScope`.
-#[derive(Default)]
 struct CooperativeInterceptor {
+    mode: TimeMode,
+    /// Wall-clock origin; `delay` deadlines are measured from here.
+    /// Set lazily on first use so an all-virtual run never reads the
+    /// clock.
+    started: Option<std::time::Instant>,
     next_token: u64,
     virtual_now: i64,
     /// token → (parked activation, virtual-time wakeup; i64::MAX =
@@ -5502,12 +5536,39 @@ struct CooperativeInterceptor {
 }
 
 impl CooperativeInterceptor {
+    /// Fresh interceptor honoring this thread's time mode.
+    fn new() -> Self {
+        Self {
+            mode: coroutine_time_mode(),
+            started: None,
+            next_token: 0,
+            virtual_now: 0,
+            parked: std::collections::HashMap::new(),
+            ready: std::collections::VecDeque::new(),
+            launched: Vec::new(),
+        }
+    }
+
+    /// Current clock reading in millis: the logical clock under
+    /// `Virtual`, elapsed wall-clock since first use under `Wall`.
+    fn now_millis(&mut self) -> i64 {
+        match self.mode {
+            TimeMode::Virtual => self.virtual_now,
+            TimeMode::Wall => {
+                let start = *self
+                    .started
+                    .get_or_insert_with(std::time::Instant::now);
+                start.elapsed().as_millis() as i64
+            }
+        }
+    }
+
     /// Seam: intercept a freshly-suspended activation. Assigns a
     /// token, decodes the Layer-2 resume directive carried in
     /// `wake_in_millis` (negative = park indefinitely, `0` = ready
-    /// now, positive = wake after that much virtual time), and
-    /// records it. Returns the token so the driver can recognise
-    /// the root's completion.
+    /// now, positive = wake that much later on the active clock),
+    /// and records it. Returns the token so the driver can
+    /// recognise the root's completion.
     fn intercept_suspend(&mut self, mut state: klio_ir::eval::SuspendState) -> u64 {
         self.next_token += 1;
         let token = self.next_token;
@@ -5515,7 +5576,7 @@ impl CooperativeInterceptor {
         let wake_at = if state.wake_in_millis < 0 {
             i64::MAX
         } else {
-            self.virtual_now + state.wake_in_millis
+            self.now_millis() + state.wake_in_millis
         };
         if state.wake_in_millis == 0 {
             self.ready.push_back(token);
@@ -5544,35 +5605,43 @@ impl CooperativeInterceptor {
         self.parked.remove(&token)
     }
 
-    /// Seam: nothing ready — advance virtual time to the soonest
-    /// timer and arm every activation due then. Returns whether any
-    /// progress was made.
-    fn advance_virtual_time(&mut self) -> bool {
+    /// Seam: nothing ready — advance the clock to the soonest timer
+    /// and arm every activation due then. Under `Virtual` the clock
+    /// jumps instantly; under `Wall` the thread sleeps until the
+    /// real deadline. Returns whether any progress was made.
+    fn advance_time(&mut self) -> bool {
         let soonest = self
             .parked
             .values()
             .map(|(_, w)| *w)
             .filter(|w| *w != i64::MAX)
             .min();
-        if let Some(t) = soonest {
-            if t > self.virtual_now {
-                self.virtual_now = t;
+        let Some(t) = soonest else { return false };
+        match self.mode {
+            TimeMode::Virtual => {
+                if t > self.virtual_now {
+                    self.virtual_now = t;
+                }
             }
-            let now = self.virtual_now;
-            let mut due: Vec<u64> = self
-                .parked
-                .iter()
-                .filter(|(_, (_, w))| *w != i64::MAX && *w <= now)
-                .map(|(k, _)| *k)
-                .collect();
-            due.sort_unstable();
-            for tok in &due {
-                self.ready.push_back(*tok);
+            TimeMode::Wall => {
+                let wait = (t - self.now_millis()).max(0);
+                if wait > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(wait as u64));
+                }
             }
-            !due.is_empty()
-        } else {
-            false
         }
+        let now = self.now_millis();
+        let mut due: Vec<u64> = self
+            .parked
+            .iter()
+            .filter(|(_, (_, w))| *w != i64::MAX && *w <= now)
+            .map(|(k, _)| *k)
+            .collect();
+        due.sort_unstable();
+        for tok in &due {
+            self.ready.push_back(*tok);
+        }
+        !due.is_empty()
     }
 }
 
@@ -5805,7 +5874,7 @@ impl<'a> VmIntrinsicHost<'a> {
         fn with_top<R>(f: impl FnOnce(&mut CooperativeInterceptor) -> R) -> R {
             CORO_STACK.with(|s| f(s.borrow_mut().last_mut().expect("no active runBlocking")))
         }
-        CORO_STACK.with(|s| s.borrow_mut().push(CooperativeInterceptor::default()));
+        CORO_STACK.with(|s| s.borrow_mut().push(CooperativeInterceptor::new()));
         let map_err = |e: klio_ir::eval::EvalError| -> klio_runtime::RuntimeError {
             match e {
                 klio_ir::eval::EvalError::Throw(v) => klio_runtime::RuntimeError::Thrown(v),
@@ -5881,7 +5950,7 @@ impl<'a> VmIntrinsicHost<'a> {
             }
             // 3. No ready coroutine — advance virtual time to the
             //    nearest timer and arm every coroutine due then.
-            let advanced = with_top(CooperativeInterceptor::advance_virtual_time);
+            let advanced = with_top(CooperativeInterceptor::advance_time);
             if advanced {
                 continue;
             }
