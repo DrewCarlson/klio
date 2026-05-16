@@ -3182,10 +3182,13 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 Some(inner)
             }
             TokenKind::LBrace => {
-                if self.looks_like_lambda() {
+                // A brace in expression position is always a function
+                // literal in Kotlin (there is no block-expression);
+                // `{ it + 1 }` assigned to a function-typed val is a
+                // lambda, not a block. `parse_lambda_literal` handles
+                // the no-`->` (implicit `it` / zero-arg) form.
+                {
                     self.parse_lambda_literal()
-                } else {
-                    self.parse_block().map(Expr::Block)
                 }
             }
             TokenKind::Keyword(Keyword::Fun) => self.parse_anon_fun(),
@@ -3373,6 +3376,13 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     /// bodies so a non-block body can be an assignment like
     /// `if (c) x = v`.
     fn parse_control_structure_body(&mut self) -> Option<Expr> {
+        // Kotlin grammar: `controlStructureBody : block | statement`.
+        // A leading `{` here is the body *block*, not a lambda — the
+        // lambda reading only applies in true expression position
+        // (`val f = { … }`), which `parse_primary` handles.
+        if matches!(self.peek_kind(), TokenKind::LBrace) {
+            return self.parse_block().map(Expr::Block);
+        }
         let save = self.pos;
         let expr = self.parse_expr()?;
         let op = match self.peek_kind() {

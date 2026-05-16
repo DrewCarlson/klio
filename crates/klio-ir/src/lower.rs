@@ -2191,12 +2191,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
                     if let Some(reg) = b.resolve(&segments[0].name) {
+                        // A boxed `var` (captured + reassigned, e.g. a
+                        // recursive `lateinit var f = { … f(…) … }`)
+                        // holds a shared Cell; unwrap it to the
+                        // current callable before invoking.
+                        let callee_reg = if b.is_boxed(&segments[0].name) {
+                            let c = b.alloc_reg();
+                            b.push(Inst::CellGet { dst: c, cell: reg });
+                            c
+                        } else {
+                            reg
+                        };
                         let (args_start, count) = lower_arg_run(b, args);
                         let arg_names = intern_arg_names(b.module, ast_arg_names);
                         let dst = b.alloc_reg();
                         b.push(Inst::CallValue {
                             dst,
-                            callee: reg,
+                            callee: callee_reg,
                             args: args_start,
                             n_args: count,
                             arg_names,

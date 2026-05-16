@@ -91,3 +91,15 @@ cargo run -p klio-cli -- run examples/<name>.kt
 | `user_exception_hierarchy.kt` | `throw` / `try` / `catch` / `finally` over a user exception hierarchy. |
 | `reflection_lite.kt`       | `::class`, `::member`, basic `KClass` introspection.           |
 | `m6b_taste.kt`             | Exceptions, lambdas, scope functions, and the broad numeric/string/char intrinsic surface together. |
+
+## Integration showcases
+
+These exercise many features together — the kind of "tricky but
+valid" Kotlin a real program mixes — and are each byte-identical to
+`kotlinc`.
+
+| File                       | Exercises                                                      |
+|----------------------------|----------------------------------------------------------------|
+| `complex_sealed_dsl.kt`    | Sealed-interface hierarchy, generics, deeply nested lambdas, operator overloading (`get`/`plus`/`invoke`), data-class destructuring, constructor references, a small expression-evaluator DSL, `Map + Pair`, range higher-order ops. |
+| `complex_oop_delegation.kt`| Interface delegation (`by`), custom property delegates (`getValue`/`setValue`), generic declaration-site variance, `enum` with abstract members, inner/nested classes, companion factories with `vararg`, `operator fun invoke`, `infix`, `by lazy`, local extension functions. |
+| `complex_lambdas_generics.kt`| Deeply nested lambdas/closures, function composition and currying, memoization via a captured map, a recursive closure through a `lateinit var`, a generic recursive `Tree` with `fold`/`map`, tail recursion, lambda pipelines via `fold`, closure-over-mutable, generic `zipWith`. |

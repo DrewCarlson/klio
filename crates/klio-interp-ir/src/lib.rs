@@ -4441,6 +4441,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // `IntRange`/`LongRange`/`CharRange` is `Iterable`. By here
+        // the range-specific intrinsics (`step`, `contains`,
+        // `reversed`, `toList`, …) have had their probe; anything
+        // left is a generic Iterable op, so materialise to a List
+        // and re-dispatch *before* the user-extension fallback. This
+        // makes a range take the exact same path as a List (so
+        // `(0..3).map { }` resolves to the stdlib List.map and isn't
+        // hijacked by an unrelated user `fun Tree<T>.map`).
+        if let klio_runtime::Value::Range { start, end, step, kind } = receiver {
+            let items = materialise_range_items(*start, *end, *step, *kind);
+            let as_list = klio_runtime::Value::List {
+                items: Rc::new(RefCell::new(items)),
+                mutable: false,
+                enum_class: None,
+            };
+            return self.call_member(&as_list, name, args);
+        }
         // Extension fn fallback: a user-defined `fun T.name(...)`
         // lowers as a top-level fn whose first param is the
         // receiver. Look it up by simple name and dispatch with
@@ -4558,22 +4575,6 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 }
             }
-        }
-        // `IntRange`/`LongRange`/`CharRange` is `Iterable`: the
-        // higher-order collection ops are extension functions on
-        // Iterable, not range-specific. Materialise the range to a
-        // List and re-dispatch so every list op (map/filter/fold/
-        // flatMap/forEach/associate/groupBy/…) works uniformly.
-        // Reached only after range-specific handling and the stdlib
-        // `kotlin.ranges.*` probe, so it never shadows them.
-        if let klio_runtime::Value::Range { start, end, step, kind } = receiver {
-            let items = materialise_range_items(*start, *end, *step, *kind);
-            let as_list = klio_runtime::Value::List {
-                items: Rc::new(RefCell::new(items)),
-                mutable: false,
-                enum_class: None,
-            };
-            return self.call_member(&as_list, name, args);
         }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
