@@ -1,5 +1,6 @@
 ---
 source: crates/klio-resolver/tests/corpus.rs
+assertion_line: 73
 expression: "fun main() {\n    greet()\n    println(square(4))\n}\n\nfun greet() {\n    println(\"hello\")\n}\n\nfun square(x: Int): Int = x * x\n"
 ---
 # symbols
@@ -13,20 +14,21 @@ expression: "fun main() {\n    greet()\n    println(square(4))\n}\n\nfun greet()
   [7] Builtin contract @builtin
   [8] Builtin synchronized @builtin
   [9] Builtin thread @builtin
-  [10] Builtin buildList @builtin
-  [11] Builtin buildMap @builtin
-  [12] Builtin buildSet @builtin
-  [13] Builtin sequence @builtin
-  [14] Builtin iterator @builtin
-  [15] TopLevelFunction main @4..8
-  [16] TopLevelFunction greet @55..60
-  [17] TopLevelFunction square @93..99
-  [18] Parameter x @100..101
+  [10] Builtin Thread @builtin
+  [11] Builtin buildList @builtin
+  [12] Builtin buildMap @builtin
+  [13] Builtin buildSet @builtin
+  [14] Builtin sequence @builtin
+  [15] Builtin iterator @builtin
+  [16] TopLevelFunction main @4..8
+  [17] TopLevelFunction greet @55..60
+  [18] TopLevelFunction square @93..99
+  [19] Parameter x @100..101
 
 # uses
-  @17..22 -> [16] greet (TopLevelFunction)
+  @17..22 -> [17] greet (TopLevelFunction)
   @29..36 -> [0] println (Builtin)
-  @37..43 -> [17] square (TopLevelFunction)
+  @37..43 -> [18] square (TopLevelFunction)
   @69..76 -> [0] println (Builtin)
-  @115..116 -> [18] x (Parameter)
-  @119..120 -> [18] x (Parameter)
+  @115..116 -> [19] x (Parameter)
+  @119..120 -> [19] x (Parameter)

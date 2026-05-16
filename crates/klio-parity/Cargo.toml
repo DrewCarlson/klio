@@ -9,6 +9,12 @@ license.workspace = true
 name = "klio-parity"
 path = "src/main.rs"
 
+[features]
+# Phase-F bake-off: forward the tracing-GC `ObjRef` backing so the
+# parity/conformance/litmus suites can run under the gc backing. Off
+# by default; the production build is the unchanged Arc backing.
+gc = ["klio-runtime/gc", "klio-interp-ir/gc"]
+
 [dependencies]
 klio-span    = { workspace = true }
 klio-ast     = { workspace = true }

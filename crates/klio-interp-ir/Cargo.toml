@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Phase-F bake-off: forward the tracing-GC `ObjRef` backing. Off by
+# default; the production build is the unchanged Arc backing.
+gc = ["klio-runtime/gc"]
+
 [lints]
 workspace = true
 

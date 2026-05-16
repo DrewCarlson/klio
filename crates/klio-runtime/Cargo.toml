@@ -5,6 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Off by default: the production backing stays `Arc<AdaptiveCell>`,
+# untouched. With `--features gc`, `ObjRef::new` additionally registers
+# every cell in a global stop-the-world mark/sweep tracing heap whose
+# sweep releases the heap's retaining handle for cells unreachable from
+# the Vm's registered roots. The public `ObjRef` API and observable
+# Kotlin semantics are identical under both backings; `gc` is the
+# Phase-F bake-off comparison backing, retained behind the flag.
+gc = []
+
 [dependencies]
 klio-span  = { workspace = true }
 klio-ast   = { workspace = true }

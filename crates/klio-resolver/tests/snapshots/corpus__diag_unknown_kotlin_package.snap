@@ -1,5 +1,6 @@
 ---
 source: crates/klio-resolver/tests/corpus.rs
+assertion_line: 78
 expression: "import kotlin.bogus.Thing\n\nfun main() {\n    println(\"hi\")\n}\n"
 ---
 # symbols
@@ -13,12 +14,13 @@ expression: "import kotlin.bogus.Thing\n\nfun main() {\n    println(\"hi\")\n}\n
   [7] Builtin contract @builtin
   [8] Builtin synchronized @builtin
   [9] Builtin thread @builtin
-  [10] Builtin buildList @builtin
-  [11] Builtin buildMap @builtin
-  [12] Builtin buildSet @builtin
-  [13] Builtin sequence @builtin
-  [14] Builtin iterator @builtin
-  [15] TopLevelFunction main @31..35
+  [10] Builtin Thread @builtin
+  [11] Builtin buildList @builtin
+  [12] Builtin buildMap @builtin
+  [13] Builtin buildSet @builtin
+  [14] Builtin sequence @builtin
+  [15] Builtin iterator @builtin
+  [16] TopLevelFunction main @31..35
 
 # uses
   @44..51 -> [0] println (Builtin)

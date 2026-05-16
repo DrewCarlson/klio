@@ -43,6 +43,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // ----- threads / monitors (serialized-interpreter semantics) -----
     ("kotlin.synchronized", concurrent_synchronized),
     ("kotlin.concurrent.thread", concurrent_thread),
+    ("kotlin.concurrent.Thread.sleep", concurrent_thread_sleep),
+    ("kotlin.concurrent.Thread.currentThread", concurrent_thread_current),
 
     // ----- io -----
     ("kotlin.io.print", io_print),
@@ -975,6 +977,7 @@ const PARAM_NAMES: &[(&str, &[&str])] = &[
     ("kotlin.concurrent.thread", &[
         "start", "isDaemon", "contextClassLoader", "name", "priority", "block",
     ]),
+    ("kotlin.concurrent.Thread.sleep", &["millis"]),
 ];
 
 // ===== scope functions =====
@@ -2277,6 +2280,55 @@ fn concurrent_thread(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let CallCtx { out, host, .. } = ctx;
     klio_runtime::fence_and_publish(); // thread start
     let id = host.spawn_os_thread(&block, *out)?;
+    Ok(Value::BoundMethod {
+        fqn: "kotlin.concurrent.Thread",
+        func: thread_handle_stub,
+        receiver: Box::new(Value::Long(id as i64)),
+    })
+}
+
+/// `Thread.sleep(millis: Long)` / `Thread.sleep(millis: Int)`.
+///
+/// A real `std::thread::sleep`: the calling OS thread blocks for the
+/// requested duration. Combined with `kotlin.concurrent.thread`'s real
+/// `std::thread::spawn`, N threads each sleeping for D run in ~D wall
+/// time, not ~N·D — genuine parallel suspension, not a busy spin.
+fn concurrent_thread_sleep(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let millis = match ctx.args.first() {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => i64::from(*v),
+        Some(Value::Short(v)) => i64::from(*v),
+        Some(Value::Byte(v)) => i64::from(*v),
+        _ => {
+            return Err(RuntimeError::Type(
+                "Thread.sleep expects a Long or Int millisecond argument".into(),
+            ))
+        }
+    };
+    if millis > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(millis as u64));
+    }
+    Ok(Value::Unit)
+}
+
+/// `Thread.currentThread()` — a `Thread` sentinel for the calling OS
+/// thread. Its `.name` is a stable per-thread string derived from the
+/// OS thread id, so two calls on the same thread report the same name
+/// and distinct threads report distinct names; `.isAlive` is `true`
+/// (the calling thread is, by definition, running).
+fn concurrent_thread_current(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let raw = format!("{:?}", std::thread::current().id());
+    // `ThreadId(N)` -> N; fall back to a hash of the debug string.
+    let id: u64 = raw
+        .trim_start_matches("ThreadId(")
+        .trim_end_matches(')')
+        .parse()
+        .unwrap_or_else(|_| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            raw.hash(&mut h);
+            h.finish()
+        });
     Ok(Value::BoundMethod {
         fqn: "kotlin.concurrent.Thread",
         func: thread_handle_stub,

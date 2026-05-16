@@ -12,6 +12,10 @@ dhat = ["dep:dhat"]
 # Run the reference Kotlin compilers (kotlinc-native, JVM kotlinc). Off by
 # default so a vanilla `cargo bench` doesn't pull the toolchains.
 ref = []
+# Phase-F bake-off: forward the tracing-GC `ObjRef` backing so the
+# single-thread benchmark can be measured under the gc backing. Off by
+# default; the production benchmark is the unchanged Arc backing.
+gc = ["klio-runtime/gc", "klio-interp-ir/gc", "klio-parity/gc"]
 
 [dependencies]
 klio-span     = { workspace = true }

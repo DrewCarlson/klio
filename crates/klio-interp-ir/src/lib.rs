@@ -426,6 +426,35 @@ impl Vm {
         main: klio_ir::FuncId,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, VmError> {
+        // Under the tracing-GC backing the globals env and the class
+        // table are the live roots: every reachable Kotlin object is
+        // reachable through one of them. Register them once before
+        // execution (and before any thread spawn) so the collector's
+        // mark phase has a complete root set — the same root set
+        // `publish_env_deep` uses for cross-thread publication.
+        #[cfg(feature = "gc")]
+        {
+            klio_runtime::gc::register_root_env(&self.globals);
+            klio_runtime::gc::register_root_value(klio_runtime::Value::Map {
+                entries: {
+                    // The class table is `ObjRef<HashMap<..>>`, not a
+                    // `Value`; wrap a clone of its entries so the
+                    // tracer reaches every `ClassDef` graph too.
+                    let m = self.classes.borrow();
+                    let entries: Vec<(klio_runtime::Value, klio_runtime::Value)> = m
+                        .values()
+                        .map(|c| {
+                            (
+                                klio_runtime::Value::Null,
+                                klio_runtime::Value::Class(Arc::clone(c)),
+                            )
+                        })
+                        .collect();
+                    klio_runtime::ObjRef::new(entries)
+                },
+                mutable: false,
+            });
+        }
         let result = self.run_inner(main);
         // Replay the recorded call sequence verbatim into the
         // caller's real sink. A single-threaded program recorded
@@ -1074,6 +1103,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
                 return Some(klio_runtime::Value::Intrinsic { fqn: leaked, func });
             }
+        }
+        // `Thread` static surface — a synthetic intrinsic value that
+        // exposes `Thread.sleep(ms)` and `Thread.currentThread()`. The
+        // static-call probe routes `Thread.sleep` / `Thread.currentThread`
+        // through the `kotlin.concurrent.Thread.*` stdlib bindings; the
+        // BoundMethod sentinel returned by `currentThread` reuses the
+        // same `.name`/`.isAlive`/`.join` member interception as the
+        // handle from `kotlin.concurrent.thread`.
+        if name == "Thread" {
+            return Some(klio_runtime::Value::Intrinsic {
+                fqn: "kotlin.concurrent.Thread",
+                func: |_ctx| {
+                    Err(klio_runtime::RuntimeError::Type(
+                        "Thread: use Thread.sleep(ms) / Thread.currentThread()".into(),
+                    ))
+                },
+            });
         }
         // `Delegates` singleton — a synthetic intrinsic value that
         // exposes `notNull`, `observable`, and `vetoable` member

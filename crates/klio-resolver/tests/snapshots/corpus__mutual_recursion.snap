@@ -1,5 +1,6 @@
 ---
 source: crates/klio-resolver/tests/corpus.rs
+assertion_line: 74
 expression: "fun even(n: Int): Boolean = if (n == 0) true else odd(n - 1)\nfun odd(n: Int): Boolean = if (n == 0) false else even(n - 1)\n\nfun main() {\n    println(even(10))\n}\n"
 ---
 # symbols
@@ -13,23 +14,24 @@ expression: "fun even(n: Int): Boolean = if (n == 0) true else odd(n - 1)\nfun o
   [7] Builtin contract @builtin
   [8] Builtin synchronized @builtin
   [9] Builtin thread @builtin
-  [10] Builtin buildList @builtin
-  [11] Builtin buildMap @builtin
-  [12] Builtin buildSet @builtin
-  [13] Builtin sequence @builtin
-  [14] Builtin iterator @builtin
-  [15] TopLevelFunction even @4..8
-  [16] TopLevelFunction odd @65..68
-  [17] TopLevelFunction main @128..132
-  [18] Parameter n @9..10
-  [19] Parameter n @69..70
+  [10] Builtin Thread @builtin
+  [11] Builtin buildList @builtin
+  [12] Builtin buildMap @builtin
+  [13] Builtin buildSet @builtin
+  [14] Builtin sequence @builtin
+  [15] Builtin iterator @builtin
+  [16] TopLevelFunction even @4..8
+  [17] TopLevelFunction odd @65..68
+  [18] TopLevelFunction main @128..132
+  [19] Parameter n @9..10
+  [20] Parameter n @69..70
 
 # uses
-  @32..33 -> [18] n (Parameter)
-  @50..53 -> [16] odd (TopLevelFunction)
-  @54..55 -> [18] n (Parameter)
-  @92..93 -> [19] n (Parameter)
-  @111..115 -> [15] even (TopLevelFunction)
-  @116..117 -> [19] n (Parameter)
+  @32..33 -> [19] n (Parameter)
+  @50..53 -> [17] odd (TopLevelFunction)
+  @54..55 -> [19] n (Parameter)
+  @92..93 -> [20] n (Parameter)
+  @111..115 -> [16] even (TopLevelFunction)
+  @116..117 -> [20] n (Parameter)
   @141..148 -> [0] println (Builtin)
-  @149..153 -> [15] even (TopLevelFunction)
+  @149..153 -> [16] even (TopLevelFunction)

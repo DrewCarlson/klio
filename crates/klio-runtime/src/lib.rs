@@ -232,10 +232,198 @@ pub struct BorrowMutError;
 /// `RefCell`-fast until a reference is published across threads.
 pub struct ObjRef<T: ?Sized>(Arc<AdaptiveCell<T>>);
 
+#[cfg(not(feature = "gc"))]
 impl<T> ObjRef<T> {
     #[must_use]
     pub fn new(v: T) -> Self {
         Self(Arc::new(AdaptiveCell::new(v)))
+    }
+}
+
+/// Under the `gc` backing every cell is registered in the global
+/// tracing heap on construction, which requires `T: Send + 'static`
+/// (the heap's type-erased retainer is `Arc<dyn Any + Send + Sync>`;
+/// `AdaptiveCell<T>: Send + Sync` follows from `T: Send` via its
+/// publication-protocol `unsafe impl`s). Every concrete `ObjRef`
+/// payload in the value model already satisfies this — the
+/// `Value: Send + Sync` assertion at the bottom of this file proves
+/// it — so the bound is invisible at all real call sites.
+#[cfg(feature = "gc")]
+impl<T: Send + 'static> ObjRef<T> {
+    #[must_use]
+    pub fn new(v: T) -> Self {
+        let cell = Arc::new(AdaptiveCell::new(v));
+        gc::register_cell(&cell);
+        Self(cell)
+    }
+}
+
+/// Stop-the-world mark/sweep tracing-GC backing for [`ObjRef`],
+/// compiled only under `--features gc`.
+///
+/// Design (prototype, per the Phase-F bake-off): every `ObjRef::new`
+/// registers its `AdaptiveCell` in a single global heap keyed by the
+/// cell's address-stable identity. The heap holds one *retaining*
+/// strong `Arc` per cell so a cell that no live `ObjRef` clone names
+/// is still kept alive by the heap until the next collection. The Vm
+/// registers its roots (the globals `Env` and the value graph
+/// reachable from it) via [`register_root_env`]; an allocation
+/// counter trips a collection once it crosses a threshold. Collection
+/// is stop-the-world: it marks every cell reachable from the roots —
+/// reusing the exact reachability shape of [`Value::publish_deep`] —
+/// then sweeps, dropping the heap's retaining `Arc` for every
+/// unmarked cell.
+///
+/// Memory safety is unconditional and does not depend on the tracer
+/// being a precise reachability oracle: actual deallocation is still
+/// governed by the cell's `Arc` strong count, so a swept cell whose
+/// retaining `Arc` is dropped while some live `ObjRef` clone still
+/// names it simply survives (its strong count is > 0). The tracer
+/// therefore cannot cause a use-after-free even if it under-marks;
+/// the worst case of an over-conservative tracer is retained
+/// garbage, never a dangling reference. `Drop` of a collected cell
+/// runs normally when the last `Arc` (heap retainer + every clone)
+/// is gone, so any `Drop`-carrying payload is released
+/// deterministically at that point. The only `ObjRef` payload that
+/// owns host state is `InstanceData::native_state`, whose
+/// `Arc<Mutex<dyn Any>>` is itself reference-counted and released by
+/// its own `Arc`, so no cell needs a finalizer queue.
+#[cfg(feature = "gc")]
+pub mod gc {
+    use super::{AdaptiveCell, Env, ObjRef, Value};
+    use std::any::Any;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// Type-erased retaining handle to one registered cell. `Arc<dyn
+    /// Any + Send + Sync>` keeps the cell alive independently of any
+    /// live `ObjRef` clone until a sweep drops it.
+    type Retainer = Arc<dyn Any + Send + Sync>;
+
+    struct Heap {
+        /// identity -> retaining Arc for every live registered cell.
+        cells: HashMap<usize, Retainer>,
+        /// Root value graphs the collector marks from.
+        roots: Vec<Value>,
+        /// Root environments (globals, class tables) the collector
+        /// marks from.
+        env_roots: Vec<ObjRef<Env>>,
+    }
+
+    fn heap() -> &'static Mutex<Heap> {
+        static HEAP: OnceLock<Mutex<Heap>> = OnceLock::new();
+        HEAP.get_or_init(|| {
+            Mutex::new(Heap {
+                cells: HashMap::new(),
+                roots: Vec::new(),
+                env_roots: Vec::new(),
+            })
+        })
+    }
+
+    /// Allocations since the last collection. Crossing the threshold
+    /// triggers a stop-the-world mark/sweep on the allocating thread.
+    static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    const COLLECT_EVERY: usize = 200_000;
+
+    /// Heap key for a cell. MUST match `ObjRef::identity()` (the
+    /// cell's *data* pointer, not the `Arc` allocation pointer) so the
+    /// tracer's mark set — built from `ObjRef::identity()` — and the
+    /// heap's retainer map use one consistent key space.
+    fn cell_key<T>(cell: &Arc<AdaptiveCell<T>>) -> usize {
+        cell.with_data_ptr(|p| p as *const () as usize)
+    }
+
+    /// Register a freshly allocated cell. Called from `ObjRef::new`.
+    pub(crate) fn register_cell<T: Send + 'static>(cell: &Arc<AdaptiveCell<T>>) {
+        let id = cell_key(cell);
+        let retainer: Retainer = cell.clone();
+        {
+            let mut h = heap().lock().unwrap_or_else(|e| e.into_inner());
+            h.cells.insert(id, retainer);
+        }
+        if ALLOCS.fetch_add(1, Ordering::Relaxed) + 1 >= COLLECT_EVERY {
+            ALLOCS.store(0, Ordering::Relaxed);
+            collect();
+        }
+    }
+
+    /// Register a root environment (the Vm's globals / class tables).
+    /// Idempotent on identity. Roots are held for the process
+    /// lifetime; the Vm calls this once at start before any thread
+    /// spawn, mirroring `publish_env_deep`'s root set.
+    pub fn register_root_env(env: &ObjRef<Env>) {
+        let mut h = heap().lock().unwrap_or_else(|e| e.into_inner());
+        if !h.env_roots.iter().any(|e| ObjRef::ptr_eq(e, env)) {
+            h.env_roots.push(env.clone());
+        }
+    }
+
+    /// Register a root value graph (e.g. an in-flight value the Vm
+    /// must keep reachable across a collection point).
+    pub fn register_root_value(v: Value) {
+        let mut h = heap().lock().unwrap_or_else(|e| e.into_inner());
+        h.roots.push(v);
+    }
+
+    /// Force a stop-the-world collection now (used by tests / explicit
+    /// triggers; the alloc counter calls this automatically).
+    pub fn collect() {
+        let (cells_snapshot, roots, env_roots) = {
+            let h = heap().lock().unwrap_or_else(|e| e.into_inner());
+            (
+                h.cells.keys().copied().collect::<Vec<_>>(),
+                h.roots.clone(),
+                h.env_roots.clone(),
+            )
+        };
+        let mut marked: HashSet<usize> = HashSet::new();
+        for env in &env_roots {
+            super::gc_mark_env_root(env, &mut marked);
+        }
+        for v in &roots {
+            super::gc_mark_value(v, &mut marked);
+        }
+        // Sweep: drop the heap's retaining Arc for every cell not
+        // reachable from a root. A still-clone-referenced cell stays
+        // alive via its own strong count regardless; re-registration
+        // on a later `ObjRef::new` would re-add it, but a swept cell
+        // that is still live is simply un-tracked until it is dropped.
+        let mut h = heap().lock().unwrap_or_else(|e| e.into_inner());
+        for id in cells_snapshot {
+            if !marked.contains(&id) {
+                h.cells.remove(&id);
+            }
+        }
+    }
+
+    /// Number of cells the heap currently retains. Test/inspection
+    /// hook only.
+    #[must_use]
+    pub fn live_cell_count() -> usize {
+        heap().lock().unwrap_or_else(|e| e.into_inner()).cells.len()
+    }
+
+    /// Whether the heap still retains the cell with this identity.
+    /// Test/inspection hook only.
+    #[must_use]
+    pub fn heap_contains(id: usize) -> bool {
+        heap()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cells
+            .contains_key(&id)
+    }
+
+    /// Re-register a reachable cell discovered during the mark walk so
+    /// a cell that had been swept while still clone-alive becomes
+    /// tracked again. Keyed by identity; the retainer is the live
+    /// clone the tracer is already holding.
+    pub(crate) fn retain<T: Send + 'static>(cell: &Arc<AdaptiveCell<T>>) {
+        let id = cell_key(cell);
+        let mut h = heap().lock().unwrap_or_else(|e| e.into_inner());
+        h.cells.entry(id).or_insert_with(|| cell.clone());
     }
 }
 
@@ -3284,6 +3472,340 @@ fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
     }
 }
 
+// ===== GC tracer (feature = "gc") =====
+//
+// A second walk of the exact same reachability graph as
+// `publish_*`, but instead of calling `ObjRef::publish()` on each
+// cell it records the cell's identity in the mark set and re-retains
+// it in the GC heap (so a cell reachable from a root survives the
+// sweep). The traversal shape is kept deliberately identical to the
+// `publish_*` family above; if one changes the other must change in
+// lockstep. Compiled only under `--features gc`, so the production
+// build is byte-identical.
+
+/// Mark + re-retain one cell; returns `true` on first visit so the
+/// caller recurses (mirrors `mark_cell`).
+#[cfg(feature = "gc")]
+fn gc_mark_cell<T: Send + 'static>(
+    r: &ObjRef<T>,
+    seen: &mut std::collections::HashSet<usize>,
+) -> bool {
+    gc::retain(&r.0);
+    seen.insert(r.identity())
+}
+
+#[cfg(feature = "gc")]
+fn gc_mark_env_root(env: &ObjRef<Env>, seen: &mut std::collections::HashSet<usize>) {
+    if gc_mark_cell(env, seen) {
+        gc_mark_env(&env.borrow(), seen);
+    }
+}
+
+#[cfg(feature = "gc")]
+fn gc_mark_env(env: &Env, seen: &mut std::collections::HashSet<usize>) {
+    for v in env.vars.values() {
+        gc_mark_value(v, seen);
+    }
+    if let Some(parent) = &env.parent {
+        if gc_mark_cell(parent, seen) {
+            gc_mark_env(&parent.borrow(), seen);
+        }
+    }
+}
+
+#[cfg(feature = "gc")]
+fn gc_mark_classdef(cls: &Arc<ClassDef>, seen: &mut std::collections::HashSet<usize>) {
+    let arc_id = Arc::as_ptr(cls) as *const () as usize;
+    if !seen.insert(arc_id) {
+        return;
+    }
+    if gc_mark_cell(&cls.parent, seen) {
+        if let Some(p) = cls.parent.borrow().as_ref() {
+            gc_mark_classdef(p, seen);
+        }
+    }
+    if gc_mark_cell(&cls.interfaces, seen) {
+        for iface in cls.interfaces.borrow().iter() {
+            gc_mark_classdef(iface, seen);
+        }
+    }
+    if gc_mark_cell(&cls.enum_entries, seen) {
+        for (_, v) in cls.enum_entries.borrow().iter() {
+            gc_mark_value(v, seen);
+        }
+    }
+    if gc_mark_cell(&cls.companion, seen) {
+        if let Some(c) = cls.companion.borrow().as_ref() {
+            if gc_mark_cell(c, seen) {
+                gc_mark_instance(&c.borrow(), seen);
+            }
+        }
+    }
+    if gc_mark_cell(&cls.enclosing_class, seen) {
+        if let Some(e) = cls.enclosing_class.borrow().as_ref() {
+            gc_mark_classdef(e, seen);
+        }
+    }
+    if gc_mark_cell(&cls.nested_classes, seen) {
+        for (_, nested) in cls.nested_classes.borrow().iter() {
+            gc_mark_classdef(nested, seen);
+        }
+    }
+    if gc_mark_cell(&cls.captured_env, seen) {
+        gc_mark_env(&cls.captured_env.borrow(), seen);
+    }
+    if gc_mark_cell(&cls.supertype_delegates, seen) {
+        for d in cls.supertype_delegates.borrow().iter() {
+            if let Some(iface) = &d.interface {
+                gc_mark_classdef(iface, seen);
+            }
+        }
+    }
+    if gc_mark_cell(&cls.delegate_forwarders, seen) {
+        for m in cls.delegate_forwarders.borrow().iter() {
+            if let Some(v) = &m.sam_lambda {
+                gc_mark_value(v, seen);
+            }
+        }
+    }
+    if gc_mark_cell(&cls.object_singleton, seen) {
+        if let Some(s) = cls.object_singleton.borrow().as_ref() {
+            if gc_mark_cell(s, seen) {
+                gc_mark_instance(&s.borrow(), seen);
+            }
+        }
+    }
+    for m in &cls.methods {
+        if let Some(v) = &m.sam_lambda {
+            gc_mark_value(v, seen);
+        }
+    }
+}
+
+#[cfg(feature = "gc")]
+fn gc_mark_instance(inst: &InstanceData, seen: &mut std::collections::HashSet<usize>) {
+    gc_mark_classdef(&inst.class, seen);
+    for (_, v) in &inst.fields {
+        gc_mark_value(v, seen);
+    }
+    if let Some(outer) = &inst.outer {
+        gc_mark_value(outer, seen);
+    }
+}
+
+#[cfg(feature = "gc")]
+fn gc_mark_suspend_frame(frame: &SuspendFrame, seen: &mut std::collections::HashSet<usize>) {
+    if gc_mark_cell(&frame.env, seen) {
+        gc_mark_env(&frame.env.borrow(), seen);
+    }
+    for (_, v) in &frame.locals {
+        gc_mark_value(v, seen);
+    }
+    match &frame.caller {
+        Some(SuspendCallerCont::Frame(f)) => {
+            if gc_mark_cell(f, seen) {
+                gc_mark_suspend_frame(&f.borrow(), seen);
+            }
+        }
+        Some(SuspendCallerCont::HostSlot(slot)) => {
+            if gc_mark_cell(slot, seen) {
+                if let Some(res) = slot.borrow().as_ref() {
+                    match res {
+                        Ok(v) | Err(v) => gc_mark_value(v, seen),
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    if let Some(pr) = frame.paused_resume.borrow().as_ref() {
+        match pr {
+            PausedResume::Resumed(v) | PausedResume::Failed(v) => gc_mark_value(v, seen),
+        }
+    }
+}
+
+#[cfg(feature = "gc")]
+fn gc_mark_delegate(kind: &DelegateKind, seen: &mut std::collections::HashSet<usize>) {
+    match kind {
+        DelegateKind::Lazy { producer, cached } => {
+            gc_mark_value(producer, seen);
+            if let Some(c) = cached {
+                gc_mark_value(c, seen);
+            }
+        }
+        DelegateKind::Observable { value, on_change } => {
+            gc_mark_value(value, seen);
+            gc_mark_value(on_change, seen);
+        }
+        DelegateKind::NotNull { value, .. } => {
+            if let Some(v) = value {
+                gc_mark_value(v, seen);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gc")]
+fn gc_mark_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
+    match v {
+        Value::Unit
+        | Value::Int(_)
+        | Value::Long(_)
+        | Value::Short(_)
+        | Value::Byte(_)
+        | Value::UInt(_)
+        | Value::ULong(_)
+        | Value::UShort(_)
+        | Value::UByte(_)
+        | Value::Double(_)
+        | Value::Float(_)
+        | Value::Bool(_)
+        | Value::String(_)
+        | Value::Char(_)
+        | Value::Null
+        | Value::Range { .. }
+        | Value::Intrinsic { .. }
+        | Value::BoundMethod { .. }
+        | Value::PropertyRef { .. }
+        | Value::Regex(_)
+        | Value::Match(_)
+        | Value::MatchGroup { .. } => {}
+
+        Value::List { items, .. }
+        | Value::Array { items, .. }
+        | Value::Set { items, .. } => {
+            if gc_mark_cell(items, seen) {
+                for elem in items.borrow().iter() {
+                    gc_mark_value(elem, seen);
+                }
+            }
+        }
+        Value::Iterator { items, pos, .. } => {
+            if gc_mark_cell(items, seen) {
+                for elem in items.borrow().iter() {
+                    gc_mark_value(elem, seen);
+                }
+            }
+            gc_mark_cell(pos, seen);
+        }
+        Value::Map { entries, .. } => {
+            if gc_mark_cell(entries, seen) {
+                for (k, val) in entries.borrow().iter() {
+                    gc_mark_value(k, seen);
+                    gc_mark_value(val, seen);
+                }
+            }
+        }
+
+        Value::Instance(inst) => {
+            if gc_mark_cell(inst, seen) {
+                gc_mark_instance(&inst.borrow(), seen);
+            }
+        }
+        Value::BoundUserMethod { receiver, .. } => {
+            if gc_mark_cell(receiver, seen) {
+                gc_mark_instance(&receiver.borrow(), seen);
+            }
+        }
+        Value::BoundInnerClass { class, outer } => {
+            gc_mark_classdef(class, seen);
+            if gc_mark_cell(outer, seen) {
+                gc_mark_instance(&outer.borrow(), seen);
+            }
+        }
+        Value::Class(cls) => gc_mark_classdef(cls, seen),
+
+        Value::Cell(c) => {
+            if gc_mark_cell(c, seen) {
+                gc_mark_value(&c.borrow(), seen);
+            }
+        }
+        Value::Delegate(d) => {
+            if gc_mark_cell(d, seen) {
+                gc_mark_delegate(&d.borrow(), seen);
+            }
+        }
+        Value::StringBuilder(sb) => {
+            gc_mark_cell(sb, seen);
+        }
+
+        Value::Function { env, .. } | Value::Lambda { env, .. } => {
+            if gc_mark_cell(env, seen) {
+                gc_mark_env(&env.borrow(), seen);
+            }
+        }
+        Value::CoroutineSuspended(frame) => {
+            if gc_mark_cell(frame, seen) {
+                gc_mark_suspend_frame(&frame.borrow(), seen);
+            }
+        }
+
+        Value::Pair(a, b) => {
+            gc_mark_value(a, seen);
+            gc_mark_value(b, seen);
+        }
+        Value::Triple(a, b, c) => {
+            gc_mark_value(a, seen);
+            gc_mark_value(b, seen);
+            gc_mark_value(c, seen);
+        }
+        Value::MapEntry { key, value } => {
+            gc_mark_value(key, seen);
+            gc_mark_value(value, seen);
+        }
+        Value::Result { payload, .. } => gc_mark_value(payload, seen),
+        Value::Exception { cause, .. } => {
+            if let Some(c) = cause {
+                gc_mark_value(c, seen);
+            }
+        }
+
+        Value::IrClosure { captures, .. } => {
+            for cap in captures.iter() {
+                gc_mark_value(cap, seen);
+            }
+        }
+        Value::Comparator { steps, .. } => {
+            for (step, _) in steps.iter() {
+                gc_mark_value(step, seen);
+            }
+        }
+        Value::Sequence(seq) => {
+            match &seq.source {
+                SequenceSource::Items(items) => {
+                    for elem in items.iter() {
+                        gc_mark_value(elem, seen);
+                    }
+                }
+                SequenceSource::Generate { seed, next } => {
+                    if let Some(s) = seed {
+                        gc_mark_value(s, seen);
+                    }
+                    gc_mark_value(next, seen);
+                }
+            }
+            for op in &seq.ops {
+                match op {
+                    SeqOp::Map(v)
+                    | SeqOp::Filter(v)
+                    | SeqOp::FilterNot(v)
+                    | SeqOp::TakeWhile(v)
+                    | SeqOp::DropWhile(v)
+                    | SeqOp::FlatMap(v)
+                    | SeqOp::DistinctBy(v)
+                    | SeqOp::SortedBy(v, _)
+                    | SeqOp::SortedWith(v) => gc_mark_value(v, seen),
+                    SeqOp::Take(_)
+                    | SeqOp::Drop(_)
+                    | SeqOp::Distinct
+                    | SeqOp::Sorted(_) => {}
+                }
+            }
+        }
+    }
+}
+
 /// The whole point of the value-model migration: a `Value` (and the
 /// interpreter state reachable through it) can be sent and shared
 /// across OS threads. If a future change reintroduces an `Rc` /
@@ -3497,5 +4019,54 @@ mod tests {
             enum_class: Some(Arc::new("Color".to_string())),
         };
         assert_eq!(entries.type_fqn(), "kotlin.collections.List");
+    }
+
+    /// The `gc` backing: a cell reachable from a registered root
+    /// survives collection; a cell that nothing references is swept
+    /// (the heap drops its retaining `Arc`). Memory safety holds
+    /// regardless — a swept-but-still-cloned cell stays alive via its
+    /// own strong count.
+    #[cfg(feature = "gc")]
+    #[test]
+    fn gc_collect_keeps_reachable_sweeps_garbage() {
+        // A root env holding a list value: the list cell is reachable.
+        let env: ObjRef<Env> = ObjRef::new(Env::new());
+        let live = ObjRef::new(vec![Value::Int(7)]);
+        env.borrow_mut().define(
+            "xs",
+            Value::List { items: live.clone(), mutable: true, enum_class: None },
+        );
+        gc::register_root_env(&env);
+
+        // An unrooted cell. We keep the `ObjRef` alive across the
+        // collection so its backing address cannot be recycled (which
+        // would alias another cell's identity): the cell stays live
+        // via this clone's strong count, but it is unreachable from
+        // any registered root, so the sweep must drop the *heap's*
+        // retaining handle for it.
+        let garbage = ObjRef::new(vec![Value::Int(99)]);
+        let garbage_id = garbage.identity();
+        assert!(gc::heap_contains(garbage_id), "newly allocated cell is registered");
+
+        gc::collect();
+
+        // The reachable list cell's contents are intact post-collect.
+        assert!(matches!(live.borrow().as_slice(), [Value::Int(7)]));
+        // The unreachable cell's heap retainer was dropped by the
+        // sweep even though the cell itself is still alive here.
+        assert!(
+            !gc::heap_contains(garbage_id),
+            "unreachable cell should have been swept from the heap"
+        );
+        assert!(
+            matches!(garbage.borrow().as_slice(), [Value::Int(99)]),
+            "swept-but-clone-alive cell is still safely usable"
+        );
+        // The root-reachable cell survived collection.
+        assert!(
+            gc::heap_contains(live.identity()),
+            "reachable cell must survive collection"
+        );
+        drop(garbage);
     }
 }

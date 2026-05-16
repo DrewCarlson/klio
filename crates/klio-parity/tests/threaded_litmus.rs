@@ -68,6 +68,7 @@ const RUNNABLE: &[&str] = &[
     "tl_async_parallel",
     "tl_withcontext_io",
     "tl_dispatch_many",
+    "tl_thread_sleep",
 ];
 
 /// Guarantees that only become meaningful with real OS-thread

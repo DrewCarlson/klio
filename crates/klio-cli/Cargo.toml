@@ -9,6 +9,12 @@ license.workspace = true
 name = "klio"
 path = "src/main.rs"
 
+[features]
+# Phase-F bake-off: forward the tracing-GC `ObjRef` backing so the
+# `klio` binary can run the parallel-throughput comparison under the
+# gc backing. Off by default; production is the unchanged Arc backing.
+gc = ["klio-runtime/gc", "klio-interp-ir/gc"]
+
 [dependencies]
 klio-span        = { workspace = true }
 klio-diagnostics = { workspace = true }

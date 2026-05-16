@@ -121,7 +121,10 @@ const BUILTINS: &[&str] = &[
     // imported); `thread` lives in `kotlin.concurrent` and is reached
     // via `import kotlin.concurrent.thread`, but the use site is a
     // bare name either way so it resolves through the builtins scope.
-    "synchronized", "thread",
+    // `Thread` is the class whose statics (`Thread.sleep`,
+    // `Thread.currentThread`) resolve through the builtins scope as a
+    // bare name.
+    "synchronized", "thread", "Thread",
     // Spec §14.5 builder-style inference entry points. Typeck threads the
     // lambda body through `check_builder_call` so member references on the
     // implicit receiver (e.g. `add`, `put`) resolve through the receiver's
