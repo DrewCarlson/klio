@@ -2607,36 +2607,52 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // most class methods aren't shadowed by
                     // locals — gate the arm narrowly on "name is
                     // a known param of the enclosing fn".
-                    let is_enclosing_param = b
-                        .resolve(&name.name)
-                        .is_some()
-                        && b.is_param(&name.name);
-                    if is_enclosing_param {
-                        if let Some(local_reg) = b.resolve(&name.name) {
-                            let recv = lower_expr(b, receiver);
-                            let n = args.len();
-                            let args_start = if n > 0 { b.alloc_reg() } else { Reg(0) };
-                            if n > 0 {
-                                let mut arg_slots: Vec<Reg> = vec![args_start];
-                                for _ in 1..n {
-                                    arg_slots.push(b.alloc_reg());
-                                }
-                                for (slot, a) in arg_slots.iter().zip(args.iter()) {
-                                    let r = lower_expr(b, a);
-                                    b.push(Inst::Move { dst: *slot, src: r });
-                                }
-                            }
-                            let dst = b.alloc_reg();
-                            b.push(Inst::CallValueWithThis {
-                                dst,
-                                callee: local_reg,
-                                receiver: recv,
-                                args: args_start,
-                                n_args: n as u8,
-                                arg_names: Vec::new(),
-                            });
-                            return dst;
+                    // A bound local named `name` shadows any member:
+                    // `recv.name(args)` invokes that local. This
+                    // covers a local extension function (`fun
+                    // List<T>.mid() = …`, whose closure takes the
+                    // receiver as its implicit `this` param) and a
+                    // receiver-typed lambda parameter (`block: T.() ->
+                    // R`). In both cases the receiver is the first
+                    // positional argument (the closure's param 0 is
+                    // `this`), so a plain CallValue suffices and we
+                    // avoid the unsupported call_value_with_this.
+                    // Only a local *function* (or function-typed
+                    // param like `block: T.() -> R`) shadows
+                    // `recv.name()` — a local `val`/`var` of the same
+                    // name must NOT hijack a stdlib/member call
+                    // (`val sorted = …; xs.sorted()` is the member).
+                    let local_callable = (b.is_local_fn(&name.name)
+                        || b.is_param(&name.name))
+                        && b.resolve(&name.name).is_some();
+                    if local_callable {
+                        let local_reg = b.resolve(&name.name).unwrap();
+                        // Evaluate receiver + args into temp regs
+                        // first, then lay them out in a fresh
+                        // contiguous run (arg evaluation can itself
+                        // allocate regs, so the run must be built
+                        // after).
+                        let recv = lower_expr(b, receiver);
+                        let mut vals: Vec<Reg> = Vec::with_capacity(args.len() + 1);
+                        vals.push(recv);
+                        for a in args {
+                            vals.push(lower_expr(b, a));
                         }
+                        let args_start = b.alloc_reg();
+                        b.push(Inst::Move { dst: args_start, src: vals[0] });
+                        for v in &vals[1..] {
+                            let slot = b.alloc_reg();
+                            b.push(Inst::Move { dst: slot, src: *v });
+                        }
+                        let dst = b.alloc_reg();
+                        b.push(Inst::CallValue {
+                            dst,
+                            callee: local_reg,
+                            args: args_start,
+                            n_args: vals.len() as u8,
+                            arg_names: Vec::new(),
+                        });
+                        return dst;
                     }
                     // `super.method(...)` — emit `CallSuper` so the
                     // host walks the parent class chain rather
@@ -3366,6 +3382,19 @@ fn lower_lambda_body_capturing_kind(
     let mut placed = func;
     placed.id = id;
     placed.is_lambda = is_lambda;
+    // Record the bound parameter names so runtime dispatch can find
+    // an implicit `this` (a local extension function's receiver) by
+    // name, not just by capture slot.
+    placed.params = names
+        .iter()
+        .map(|n| crate::Param {
+            name: (*n).to_string(),
+            ty: crate::TypeRef::unit(),
+            default: None,
+            is_property: false,
+            is_vararg: false,
+        })
+        .collect();
     module.funcs.push(placed);
     (id, captured)
 }
@@ -3814,8 +3843,19 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             if let Some(body) = body_block {
                 let outer_names: std::collections::HashSet<String> = b.visible_names();
                 let outer_boxed = b.boxed_vars_snapshot();
-                let param_idents: Vec<klio_ast::Ident> =
+                // A local *extension* function (`fun List<T>.mid() =
+                // …`) binds its receiver as the implicit first `this`
+                // param, so the body's bare member refs (`sorted()`,
+                // `size`) resolve. Call sites prepend the receiver.
+                let is_ext = f.receiver_type.is_some();
+                let mut param_idents: Vec<klio_ast::Ident> =
                     f.params.iter().map(|p| p.name.clone()).collect();
+                if is_ext {
+                    param_idents.insert(
+                        0,
+                        klio_ast::Ident { name: "this".to_string(), span: dummy_span },
+                    );
+                }
                 let (body_func, captured_names) = lower_lambda_body_capturing(
                     b.module,
                     &param_idents,
@@ -3827,8 +3867,11 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     .iter()
                     .map(|n| resolve_capture(b, n))
                     .collect();
-                let param_names: Vec<String> =
+                let mut param_names: Vec<String> =
                     f.params.iter().map(|p| p.name.name.clone()).collect();
+                if is_ext {
+                    param_names.insert(0, "this".to_string());
+                }
                 let dst = b.alloc_reg();
                 b.push(Inst::AstLambda {
                     dst,
@@ -3840,6 +3883,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     body_func: Some(body_func),
                 });
                 b.bind(f.name.name.clone(), dst);
+                b.mark_local_fn(&f.name.name);
             }
             None
         }

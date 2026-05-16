@@ -993,11 +993,26 @@ fn exec_inst(
             };
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
-            let this_val = frame
+            let mut this_val = frame
                 .captures
                 .get(*this_idx as usize)
                 .cloned()
                 .unwrap_or(Value::Null);
+            // The receiver may be the enclosing function's `this`
+            // *parameter* (extension / member / local-extension-fn
+            // body) rather than a lambda capture. When the capture
+            // slot is empty, fall back to that param so a bare member
+            // call (`sorted()`, `toInt()`) dispatches on the
+            // receiver instead of escaping to a global.
+            if matches!(this_val, Value::Null | Value::Unit) {
+                if let Some(idx) =
+                    frame.func.params.iter().position(|p| p.name == "this")
+                {
+                    if let Some(v) = frame.params.get(idx) {
+                        this_val = v.clone();
+                    }
+                }
+            }
             let mut resolved: Option<Value> = None;
             if !matches!(this_val, Value::Null | Value::Unit) {
                 if let Ok(v) = host.call_member_named(
@@ -1034,6 +1049,28 @@ fn exec_inst(
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
             let result = host.new_instance_named(*class, &arg_values, &names)?;
+            // A bare `Inner(args)` inside a member of the enclosing
+            // class is `this@Outer.Inner(args)` — an `inner class`
+            // captures the enclosing instance. Wire its `outer` from
+            // the current `this` param when the qualified-receiver
+            // construction path didn't already set it.
+            if let Value::Instance(inst) = &result {
+                let needs_outer = {
+                    let b = inst.borrow();
+                    b.class.is_inner && b.outer.is_none()
+                };
+                if needs_outer {
+                    if let Some(this_idx) =
+                        frame.func.params.iter().position(|p| p.name == "this")
+                    {
+                        if let Some(this_val @ Value::Instance(_)) =
+                            frame.params.get(this_idx)
+                        {
+                            inst.borrow_mut().outer = Some(this_val.clone());
+                        }
+                    }
+                }
+            }
             frame.write(*dst, result);
         }
         Inst::InstanceOf { dst, src, ty } => {

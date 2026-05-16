@@ -78,6 +78,11 @@ pub struct FuncBuilder<'a> {
     /// (e.g. a builder lambda) rather than a member of the
     /// receiver.
     param_names: std::collections::HashSet<String>,
+    /// Names declared as *local functions* (`fun foo() …` inside a
+    /// body). A `recv.foo()` call resolves to such a local (it may
+    /// be a local extension fn) — but a local `val`/`var` of the
+    /// same name must NOT hijack member-call syntax.
+    local_fns: std::collections::HashSet<String>,
     is_lambda_body: bool,
     is_inline: bool,
 }
@@ -116,6 +121,7 @@ impl<'a> FuncBuilder<'a> {
             own_members: std::collections::HashSet::new(),
             tailrec_self: None,
             param_names: std::collections::HashSet::new(),
+            local_fns: std::collections::HashSet::new(),
             is_lambda_body: false,
             is_inline: false,
         }
@@ -296,6 +302,12 @@ impl<'a> FuncBuilder<'a> {
     }
     pub fn tailrec_self(&self) -> Option<&str> {
         self.tailrec_self.as_deref()
+    }
+    pub fn mark_local_fn(&mut self, name: &str) {
+        self.local_fns.insert(name.to_string());
+    }
+    pub fn is_local_fn(&self, name: &str) -> bool {
+        self.local_fns.contains(name)
     }
     pub fn mark_param(&mut self, name: &str) {
         self.param_names.insert(name.to_string());

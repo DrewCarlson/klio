@@ -3108,6 +3108,77 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Built-in delegate protocol: `delegate.getValue(thisRef,
+        // prop)` / `setValue(thisRef, prop, v)` for a `by lazy { }`,
+        // `Delegates.observable`, `notNull()`, etc. The delegated
+        // class-body / top-level property read explicitly invokes
+        // this, so a `Value::Delegate` receiver must honour it.
+        if let klio_runtime::Value::Delegate(d) = receiver {
+            match name {
+                "getValue" => {
+                    let state = d.borrow().clone();
+                    return match state {
+                        klio_runtime::DelegateKind::Lazy { producer, cached } => {
+                            if let Some(c) = cached {
+                                return Ok(c);
+                            }
+                            let result = <Self as klio_ir::eval::Host>::call_value(
+                                self, &producer, &[],
+                            )?;
+                            if let klio_runtime::DelegateKind::Lazy { cached, .. } =
+                                &mut *d.borrow_mut()
+                            {
+                                *cached = Some(result.clone());
+                            }
+                            Ok(result)
+                        }
+                        klio_runtime::DelegateKind::Observable { value, .. } => Ok(value),
+                        klio_runtime::DelegateKind::NotNull { value, .. } => match value {
+                            Some(x) => Ok(x),
+                            None => Err(klio_ir::eval::EvalError::Throw(
+                                klio_runtime::Value::Exception {
+                                    fqn: Rc::new("kotlin.IllegalStateException".into()),
+                                    message: Some(Rc::new(
+                                        "Property should be initialized before get.".into(),
+                                    )),
+                                    cause: None,
+                                },
+                            )),
+                        },
+                    };
+                }
+                "setValue" => {
+                    if let Some(new_v) = args.get(2) {
+                        let mut st = d.borrow_mut();
+                        match &mut *st {
+                            klio_runtime::DelegateKind::Lazy { cached, .. } => {
+                                *cached = Some(new_v.clone());
+                            }
+                            klio_runtime::DelegateKind::Observable {
+                                value, on_change,
+                            } => {
+                                let old = value.clone();
+                                *value = new_v.clone();
+                                let cb = on_change.clone();
+                                drop(st);
+                                if !matches!(cb, klio_runtime::Value::Null) {
+                                    let _ = <Self as klio_ir::eval::Host>::call_value(
+                                        self,
+                                        &cb,
+                                        &[klio_runtime::Value::Null, old, new_v.clone()],
+                                    );
+                                }
+                            }
+                            klio_runtime::DelegateKind::NotNull { value, .. } => {
+                                *value = Some(new_v.clone());
+                            }
+                        }
+                    }
+                    return Ok(klio_runtime::Value::Unit);
+                }
+                _ => {}
+            }
+        }
         // Pack-installed binding overlay: when a loaded pack
         // registers `<typeFqn>.<name>` the Rust binding shadows the
         // interpreted shim body. Probe before the IR method walk so
@@ -4175,6 +4246,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         Vec::with_capacity(args.len() + 1);
                     all.push(receiver.clone());
                     all.extend_from_slice(args);
+                    let all = pack_vararg_args(&func, all);
                     return klio_ir::eval::eval_with(&module_rc, &func, all, self);
                 }
             }
@@ -4198,6 +4270,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     Vec::with_capacity(args.len() + 1);
                 all.push(receiver.clone());
                 all.extend_from_slice(args);
+                let all = pack_vararg_args(&func, all);
                 // Layer captured outer-env names onto globals for the
                 // duration of the method call so the body's
                 // bare-name globals resolve to the captured values.
@@ -4251,6 +4324,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             Vec::with_capacity(args.len() + 1);
                         all_args.push(receiver.clone());
                         all_args.extend_from_slice(args);
+                        // A method/companion fn with a trailing
+                        // `vararg` needs its variadic tail collected
+                        // into an array (the implicit `this` is now
+                        // in `all_args`, so packing aligns).
+                        let all_args = pack_vararg_args(&f, all_args);
                         let module = Rc::clone(&self.module);
                         return klio_ir::eval::eval_with(&module, &f, all_args, self);
                     }
