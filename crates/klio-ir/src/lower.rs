@@ -1596,6 +1596,26 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     b.push(Inst::LoadGlobal { dst, name: n });
                     return dst;
                 }
+                // A bare builtin type name used as a qualifier
+                // (`Long.MAX_VALUE`, `Int.SIZE_BITS`) is a
+                // type/companion reference, not `this.<Type>`. Skip
+                // the hard `this`-prefix GetField below and use the
+                // this-or-global probe so it resolves the same way it
+                // does at top level (the primitive-companion table).
+                if matches!(
+                    segments[0].name.as_str(),
+                    "Int" | "Long" | "Short" | "Byte" | "Double" | "Float"
+                        | "Char" | "Boolean" | "String" | "UInt" | "ULong"
+                        | "UShort" | "UByte"
+                ) {
+                    let this_idx = b.record_capture("this");
+                    let dst = b.alloc_reg();
+                    let name = b
+                        .module
+                        .intern_const(Const::String(segments[0].name.clone()));
+                    b.push(Inst::LoadFromThisOrGlobal { dst, this_idx, name });
+                    return dst;
+                }
                 // Not a local and not a known capture. Inside a
                 // method / extension fn with `this` bound as a
                 // param, try `this.<name>` first via GetField so

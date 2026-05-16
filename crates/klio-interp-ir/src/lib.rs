@@ -1845,6 +1845,16 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // `Long.MAX_VALUE` / `Int.SIZE_BITS` / `Double.NaN` where the
+        // qualifier resolved to the primitive's class value (e.g. a
+        // bare `Long` inside a method body). Consult the stdlib
+        // primitive-companion table by the class's simple name.
+        if let klio_runtime::Value::Class(def) = receiver {
+            let simple = def.name.rsplit('.').next().unwrap_or(&def.name);
+            if let Some(v) = klio_stdlib::primitive_companion_const(simple, name) {
+                return Ok(v);
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::get_field `{name}` on `{}`",
             receiver.type_fqn()
