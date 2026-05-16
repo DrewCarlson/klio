@@ -4308,6 +4308,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Companion-method forwarding: `Foo.bar(...)` where the
+        // receiver is the class itself dispatches to `bar` declared
+        // in `Foo`'s companion object. Mirrors the companion-field
+        // forwarding in `get_field`; needed when a top-level
+        // function shares the class's name so the qualifier resolves
+        // to the class value rather than the companion.
+        if let klio_runtime::Value::Class(cls) = receiver {
+            let simple = cls.name.rsplit('.').next().unwrap_or(&cls.name).to_string();
+            let comp_name = self
+                .module
+                .registry
+                .companion_singletons
+                .get(&cls.name)
+                .or_else(|| self.module.registry.companion_singletons.get(&simple))
+                .cloned();
+            if let Some(comp_name) = comp_name {
+                let singleton = self.globals.borrow().lookup(&comp_name);
+                if let Some(singleton @ klio_runtime::Value::Instance(_)) = singleton {
+                    if let Ok(v) = self.call_member(&singleton, name, args) {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()
