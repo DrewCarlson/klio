@@ -1006,12 +1006,16 @@ dependencies = [
 name = "klio-parity"
 version = "0.1.0"
 dependencies = [
+ "klio-ast",
  "klio-interp-ir",
+ "klio-kotlinx-atomicfu",
+ "klio-kotlinx-coroutines",
  "klio-lexer",
  "klio-parser",
  "klio-resolver",
  "klio-runtime",
  "klio-span",
+ "klio-stdlib",
  "klio-typeck",
 ]
 

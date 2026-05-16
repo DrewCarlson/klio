@@ -11,12 +11,16 @@ path = "src/main.rs"
 
 [dependencies]
 klio-span    = { workspace = true }
+klio-ast     = { workspace = true }
 klio-lexer   = { workspace = true }
 klio-parser  = { workspace = true }
 klio-interp-ir = { workspace = true }
 klio-runtime = { workspace = true }
 klio-resolver = { workspace = true }
 klio-typeck   = { workspace = true }
+klio-stdlib   = { workspace = true }
+klio-kotlinx-coroutines = { workspace = true }
+klio-kotlinx-atomicfu   = { workspace = true }
 
 [lints]
 workspace = true
