@@ -1229,6 +1229,7 @@ fn lower_function_body_with_implicit_owner(
     if f.is_tailrec {
         let _ = b.set_tailrec_self(f.name.name.clone());
     }
+    b.set_inline(f.is_inline);
     if let Some(klio_ast::FunctionBody::Block(blk)) = &f.body {
         b.set_boxed_vars(compute_boxed_vars(&blk.stmts));
     }

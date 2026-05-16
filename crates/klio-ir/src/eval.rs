@@ -580,7 +580,12 @@ fn run_frame<'a>(
                 Ok(()) => {}
                 Err(EvalError::Throw(v)) => { thrown = Some(v); break; }
                 Err(EvalError::NonLocalReturn(v)) => {
-                    if frame.func.is_lambda {
+                    // A non-local return unwinds through the lambda
+                    // frame *and* through any inline-function frames
+                    // it was passed into, landing in the function
+                    // that wrote the lambda (Kotlin allows non-local
+                    // return only via inline functions).
+                    if frame.func.is_lambda || frame.func.is_inline {
                         return Err(EvalError::NonLocalReturn(v));
                     }
                     return Ok(v);
@@ -647,7 +652,7 @@ fn run_frame<'a>(
             }
             Terminator::NonLocalReturn(r) => {
                 let v = r.map(|r| frame.read(r)).unwrap_or(Value::Unit);
-                if frame.func.is_lambda {
+                if frame.func.is_lambda || frame.func.is_inline {
                     return Err(EvalError::NonLocalReturn(v));
                 }
                 return Ok(v);

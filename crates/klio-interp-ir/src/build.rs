@@ -841,6 +841,7 @@ fn build_module_with_overrides(
                 is_suspend: false,
                 is_tailrec: f.is_tailrec,
                 is_lambda: false,
+                is_inline: f.is_inline,
             });
             module.func_index.push((f.name.name.clone(), id));
             if f.is_tailrec {

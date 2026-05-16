@@ -79,6 +79,7 @@ pub struct FuncBuilder<'a> {
     /// receiver.
     param_names: std::collections::HashSet<String>,
     is_lambda_body: bool,
+    is_inline: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +117,7 @@ impl<'a> FuncBuilder<'a> {
             tailrec_self: None,
             param_names: std::collections::HashSet::new(),
             is_lambda_body: false,
+            is_inline: false,
         }
     }
 
@@ -180,6 +182,10 @@ impl<'a> FuncBuilder<'a> {
         names: std::collections::HashSet<String>,
     ) {
         self.outer_names = names;
+    }
+
+    pub fn set_inline(&mut self, inline: bool) {
+        self.is_inline = inline;
     }
 
     pub fn is_lambda_body(&self) -> bool {
@@ -439,6 +445,7 @@ impl<'a> FuncBuilder<'a> {
         is_suspend: false,
         is_tailrec: self.tailrec_self.is_some(),
         is_lambda: false,
+        is_inline: self.is_inline,
         }
     }
 }

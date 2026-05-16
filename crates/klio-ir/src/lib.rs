@@ -439,6 +439,12 @@ pub struct Func {
     /// of being caught locally.
     #[serde(default)]
     pub is_lambda: bool,
+    /// True for `inline fun`. A non-local `return` from a lambda
+    /// passed to an inline function unwinds *through* this frame
+    /// (back to the function that wrote the lambda) rather than
+    /// being caught here.
+    #[serde(default)]
+    pub is_inline: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
