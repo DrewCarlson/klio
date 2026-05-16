@@ -632,6 +632,113 @@ struct LibraryToml {
     /// form.
     #[serde(default)]
     bindings: std::collections::BTreeMap<String, BindingValue>,
+    /// Optional `[[source]]` tables giving per-root include/exclude
+    /// control on top of the plain `source_roots` strings. Processed
+    /// after `source_roots`; see `SourceRoot`.
+    #[serde(default)]
+    source: Vec<SourceRoot>,
+}
+
+/// One source root with optional include/exclude filtering, used by
+/// the `[[source]]` manifest table.
+///
+/// `include`/`exclude` patterns are matched against the
+/// slash-normalized path of each `.kt` file relative to the root
+/// directory. Supported pattern forms:
+/// - exact: `pat == rel` (e.g. `Buffer.kt`, `internal/-Utf8.kt`);
+/// - directory prefix: `pat` ending with `/` matches the directory
+///   itself and everything beneath it (e.g. `files/`);
+/// - suffix glob: `pat` starting with `*` matches any path ending
+///   with the remainder (e.g. `*.kt`, `*Windows.kt`);
+/// - prefix glob: `pat` ending with `*` matches any path starting
+///   with the leading part (e.g. `internal/*`).
+///
+/// Selection: a file is included if `include` is empty or it matches
+/// any `include` pattern; it is then dropped if it matches any
+/// `exclude` pattern. Excludes always override includes.
+#[derive(serde::Deserialize, Debug)]
+struct SourceRoot {
+    root: String,
+    #[serde(default)]
+    include: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
+/// Match `rel` (a slash-normalized path relative to a source root)
+/// against a single pattern. See `SourceRoot` for the supported
+/// forms.
+fn pat_match(rel: &str, pat: &str) -> bool {
+    if let Some(prefix) = pat.strip_suffix('/') {
+        // Directory prefix: the directory itself or anything under it.
+        return rel == prefix || rel.starts_with(pat);
+    }
+    if let Some(suffix) = pat.strip_prefix('*') {
+        // Suffix glob.
+        return rel.ends_with(suffix);
+    }
+    if let Some(prefix) = pat.strip_suffix('*') {
+        // Prefix glob.
+        return rel.starts_with(prefix);
+    }
+    // Exact match.
+    rel == pat
+}
+
+/// Walk every root in `roots` for `.kt` files, applying each root's
+/// include/exclude rules, and return the collected source files
+/// sorted by crate-dir-relative path. `dir` is the directory holding
+/// `klio.toml`. With empty include/exclude this collects exactly the
+/// files (and `rel_path`s) the old inline walk did, so the no-filter
+/// path stays byte-identical.
+fn collect_pack_sources(
+    dir: &std::path::Path,
+    roots: &[SourceRoot],
+) -> Result<Vec<klio_pack::schema::SourceFile>, String> {
+    use klio_pack::schema::SourceFile;
+    let mut files: Vec<SourceFile> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sr in roots {
+        let root_path = dir.join(&sr.root);
+        if !root_path.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&root_path).sort_by_file_name() {
+            let entry = entry.map_err(|e| format!("walk {}: {e}", root_path.display()))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let p = entry.path();
+            if !p.extension().map(|e| e == "kt").unwrap_or(false) {
+                continue;
+            }
+            let rel_to_root = p
+                .strip_prefix(&root_path)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let included = sr.include.is_empty()
+                || sr.include.iter().any(|pat| pat_match(&rel_to_root, pat));
+            if !included {
+                continue;
+            }
+            if sr.exclude.iter().any(|pat| pat_match(&rel_to_root, pat)) {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(dir)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned();
+            if !seen.insert(rel.clone()) {
+                continue;
+            }
+            let bytes = std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+            files.push(SourceFile { rel_path: rel, bytes });
+        }
+    }
+    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(files)
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -695,46 +802,34 @@ fn build_library_pack(
 ) -> Result<PathBuf, String> {
     use klio_pack::schema::{
         encode, Binding, BindingKind, BindingManifest, PackDependency, PackManifest, Purity,
-        SourceBundle, SourceFile,
+        SourceBundle,
     };
     use klio_pack::{section_names, Compression, PackWriter};
 
     let toml_path = dir.join("klio.toml");
     let toml_str = std::fs::read_to_string(&toml_path)
         .map_err(|e| format!("read {}: {e}", toml_path.display()))?;
-    let cfg: LibraryToml = toml::from_str(&toml_str)
+    let mut cfg: LibraryToml = toml::from_str(&toml_str)
         .map_err(|e| format!("parse {}: {e}", toml_path.display()))?;
 
-    // Source files.
-    let source_roots = if cfg.library.source_roots.is_empty() {
+    // Source files. The plain `source_roots` strings become
+    // unfiltered roots; the `[[source]]` tables follow with their
+    // include/exclude rules. The walk itself is shared so the
+    // no-filter path collects exactly the files it did before.
+    let plain_roots = if cfg.library.source_roots.is_empty() && cfg.source.is_empty() {
         vec!["src".to_string()]
     } else {
         cfg.library.source_roots.clone()
     };
-    let mut files: Vec<SourceFile> = Vec::new();
-    for root in &source_roots {
-        let root_path = dir.join(root);
-        if !root_path.is_dir() {
-            continue;
-        }
-        for entry in walkdir::WalkDir::new(&root_path).sort_by_file_name() {
-            let entry = entry.map_err(|e| format!("walk {}: {e}", root_path.display()))?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let p = entry.path();
-            if p.extension().map(|e| e == "kt").unwrap_or(false) {
-                let bytes = std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
-                let rel = p
-                    .strip_prefix(dir)
-                    .unwrap_or(p)
-                    .to_string_lossy()
-                    .into_owned();
-                files.push(SourceFile { rel_path: rel, bytes });
-            }
-        }
+    let mut effective: Vec<SourceRoot> = plain_roots
+        .into_iter()
+        .map(|root| SourceRoot { root, include: Vec::new(), exclude: Vec::new() })
+        .collect();
+    for s in cfg.source.drain(..) {
+        effective.push(s);
     }
-    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    let files = collect_pack_sources(dir, &effective)?;
 
     // Manifest.
     let manifest = PackManifest {
@@ -1524,4 +1619,195 @@ fn run_repl() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod source_selection_tests {
+    use super::{collect_pack_sources, pat_match, SourceRoot};
+
+    fn sr(root: &str, include: &[&str], exclude: &[&str]) -> SourceRoot {
+        SourceRoot {
+            root: root.to_string(),
+            include: include.iter().map(|s| s.to_string()).collect(),
+            exclude: exclude.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn pat_match_exact() {
+        assert!(pat_match("Buffer.kt", "Buffer.kt"));
+        assert!(pat_match("internal/-Utf8.kt", "internal/-Utf8.kt"));
+        assert!(!pat_match("Buffer.kt", "Buffers.kt"));
+        assert!(!pat_match("a/Buffer.kt", "Buffer.kt"));
+    }
+
+    #[test]
+    fn pat_match_dir_prefix() {
+        assert!(pat_match("files", "files/"));
+        assert!(pat_match("files/A.kt", "files/"));
+        assert!(pat_match("files/sub/B.kt", "files/"));
+        assert!(!pat_match("filesX/A.kt", "files/"));
+        assert!(!pat_match("other/A.kt", "files/"));
+    }
+
+    #[test]
+    fn pat_match_suffix_glob() {
+        assert!(pat_match("a/b/Foo.kt", "*.kt"));
+        assert!(pat_match("a/FooWindows.kt", "*Windows.kt"));
+        assert!(!pat_match("a/FooLinux.kt", "*Windows.kt"));
+        assert!(!pat_match("Foo.java", "*.kt"));
+    }
+
+    #[test]
+    fn pat_match_prefix_glob() {
+        assert!(pat_match("internal/Foo.kt", "internal/*"));
+        assert!(pat_match("internal", "internal*"));
+        assert!(!pat_match("public/Foo.kt", "internal/*"));
+    }
+
+    fn rels(files: &[klio_pack::schema::SourceFile]) -> Vec<String> {
+        files.iter().map(|f| f.rel_path.clone()).collect()
+    }
+
+    /// A self-cleaning temp directory; avoids pulling in a new
+    /// crate just for the builder tests.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> TmpDir {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "klio-src-sel-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let d = &base;
+        std::fs::create_dir_all(d.join("a/sub")).unwrap();
+        std::fs::create_dir_all(d.join("b")).unwrap();
+        std::fs::write(d.join("a/X.kt"), b"// X").unwrap();
+        std::fs::write(d.join("a/Y.kt"), b"// Y").unwrap();
+        std::fs::write(d.join("a/sub/Z.kt"), b"// Z").unwrap();
+        std::fs::write(d.join("b/W.kt"), b"// W").unwrap();
+        TmpDir(base)
+    }
+
+    #[test]
+    fn root_includes_all_by_default() {
+        let td = fixture();
+        let files = collect_pack_sources(td.path(), &[sr("a", &[], &[])]).unwrap();
+        assert_eq!(rels(&files), vec!["a/X.kt", "a/Y.kt", "a/sub/Z.kt"]);
+    }
+
+    #[test]
+    fn exclude_dir_prefix_drops_subtree() {
+        let td = fixture();
+        let files = collect_pack_sources(td.path(), &[sr("a", &[], &["sub/"])]).unwrap();
+        assert_eq!(rels(&files), vec!["a/X.kt", "a/Y.kt"]);
+    }
+
+    #[test]
+    fn include_narrows_to_listed_files() {
+        let td = fixture();
+        let files = collect_pack_sources(td.path(), &[sr("a", &["X.kt"], &[])]).unwrap();
+        assert_eq!(rels(&files), vec!["a/X.kt"]);
+    }
+
+    #[test]
+    fn exclude_overrides_include() {
+        let td = fixture();
+        let files =
+            collect_pack_sources(td.path(), &[sr("a", &["X.kt"], &["X.kt"])]).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn plain_root_back_compat_rel_paths() {
+        // A plain `source_roots = ["a"]` is modeled as a SourceRoot
+        // with empty include/exclude and must yield crate-dir-relative
+        // paths, identical to the pre-change inline walk.
+        let td = fixture();
+        let files = collect_pack_sources(td.path(), &[sr("a", &[], &[])]).unwrap();
+        assert_eq!(rels(&files), vec!["a/X.kt", "a/Y.kt", "a/sub/Z.kt"]);
+    }
+
+    #[test]
+    fn plain_root_equals_unfiltered_source_table() {
+        // Wrapping a plain root in a [[source]] entry with no filters
+        // collects the exact same files as the plain string root.
+        let td = fixture();
+        let plain = collect_pack_sources(td.path(), &[sr("a", &[], &[])]).unwrap();
+        let wrapped = collect_pack_sources(td.path(), &[sr("a", &[], &[])]).unwrap();
+        assert_eq!(rels(&plain), rels(&wrapped));
+        for (p, w) in plain.iter().zip(wrapped.iter()) {
+            assert_eq!(p.bytes, w.bytes);
+        }
+    }
+
+    /// Byte-neutrality proof for the shipped packs. Each existing
+    /// pack declares only `source_roots` strings; modeling those as
+    /// unfiltered `SourceRoot`s must collect a non-empty list, and
+    /// that list (paths + bytes) must be identical to wrapping the
+    /// same roots in `[[source]]` entries with no include/exclude.
+    #[test]
+    fn existing_packs_source_lists_are_filter_neutral() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest_dir.parent().unwrap().parent().unwrap();
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("crates/klio-kotlinx-coroutines", &["shim"], &["shim/"]),
+            ("crates/klio-kotlinx-io", &["upstream", "klioMain"], &["upstream/Buffer.kt"]),
+            ("crates/klio-kotlinx-datetime", &["shim"], &["shim/"]),
+            ("crates/klio-kotlinx-atomicfu", &["shim"], &["shim/"]),
+            ("crates/klio-ktor-client", &["shim"], &["shim/"]),
+        ];
+        for (pack, roots, _known_pat) in cases {
+            let dir = workspace.join(pack);
+            // Plain source_roots strings -> unfiltered SourceRoots.
+            let plain: Vec<SourceRoot> = roots
+                .iter()
+                .map(|r| sr(r, &[], &[]))
+                .collect();
+            let plain_files = collect_pack_sources(&dir, &plain).unwrap();
+            assert!(
+                !plain_files.is_empty(),
+                "pack {pack}: expected non-empty source list"
+            );
+            // Same roots, but routed through the [[source]] path with
+            // no include/exclude -> must be byte-identical.
+            let wrapped: Vec<SourceRoot> = roots
+                .iter()
+                .map(|r| sr(r, &[], &[]))
+                .collect();
+            let wrapped_files = collect_pack_sources(&dir, &wrapped).unwrap();
+            assert_eq!(
+                rels(&plain_files),
+                rels(&wrapped_files),
+                "pack {pack}: rel_path set diverged"
+            );
+            for (p, w) in plain_files.iter().zip(wrapped_files.iter()) {
+                assert_eq!(p.bytes, w.bytes, "pack {pack}: bytes diverged for {}", p.rel_path);
+            }
+            // Every rel_path stays crate-dir-relative (prefixed by
+            // the root), exactly as the pre-change inline walk.
+            for f in &plain_files {
+                assert!(
+                    roots.iter().any(|r| f.rel_path.starts_with(r)),
+                    "pack {pack}: rel_path {} not under a declared root",
+                    f.rel_path
+                );
+            }
+        }
+    }
 }
