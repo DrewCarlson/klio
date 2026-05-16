@@ -595,6 +595,19 @@ impl<'a> VmHost<'a> {
             ("Double", "Int") | ("Double", "Long") | ("Float", "Int") => return Some(30),
             _ => {}
         }
+        // A callable argument (lambda / closure / bound method)
+        // against a function-typed parameter. The lowered param type
+        // doesn't preserve the arrow shape, so accept any callable at
+        // a low score — concrete-type params still outrank it and
+        // arity does the real disambiguation between overloads.
+        if matches!(
+            arg,
+            klio_runtime::Value::Lambda { .. }
+                | klio_runtime::Value::IrClosure { .. }
+        ) || arg.type_fqn().starts_with("kotlin.Function")
+        {
+            return Some(15);
+        }
         // Generic single-letter type-parameter — accept any.
         if nm.len() <= 2 && nm.chars().all(|c| c.is_ascii_uppercase()) {
             return Some(5);
