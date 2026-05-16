@@ -10,20 +10,21 @@ expression: "fun main() {\n    greet()\n    println(square(4))\n}\n\nfun greet()
   [4] Builtin check @builtin
   [5] Builtin require @builtin
   [6] Builtin repeat @builtin
-  [7] Builtin buildList @builtin
-  [8] Builtin buildMap @builtin
-  [9] Builtin buildSet @builtin
-  [10] Builtin sequence @builtin
-  [11] Builtin iterator @builtin
-  [12] TopLevelFunction main @4..8
-  [13] TopLevelFunction greet @55..60
-  [14] TopLevelFunction square @93..99
-  [15] Parameter x @100..101
+  [7] Builtin contract @builtin
+  [8] Builtin buildList @builtin
+  [9] Builtin buildMap @builtin
+  [10] Builtin buildSet @builtin
+  [11] Builtin sequence @builtin
+  [12] Builtin iterator @builtin
+  [13] TopLevelFunction main @4..8
+  [14] TopLevelFunction greet @55..60
+  [15] TopLevelFunction square @93..99
+  [16] Parameter x @100..101
 
 # uses
-  @17..22 -> [13] greet (TopLevelFunction)
+  @17..22 -> [14] greet (TopLevelFunction)
   @29..36 -> [0] println (Builtin)
-  @37..43 -> [14] square (TopLevelFunction)
+  @37..43 -> [15] square (TopLevelFunction)
   @69..76 -> [0] println (Builtin)
-  @115..116 -> [15] x (Parameter)
-  @119..120 -> [15] x (Parameter)
+  @115..116 -> [16] x (Parameter)
+  @119..120 -> [16] x (Parameter)

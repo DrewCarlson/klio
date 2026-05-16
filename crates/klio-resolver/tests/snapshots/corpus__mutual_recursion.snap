@@ -10,23 +10,24 @@ expression: "fun even(n: Int): Boolean = if (n == 0) true else odd(n - 1)\nfun o
   [4] Builtin check @builtin
   [5] Builtin require @builtin
   [6] Builtin repeat @builtin
-  [7] Builtin buildList @builtin
-  [8] Builtin buildMap @builtin
-  [9] Builtin buildSet @builtin
-  [10] Builtin sequence @builtin
-  [11] Builtin iterator @builtin
-  [12] TopLevelFunction even @4..8
-  [13] TopLevelFunction odd @65..68
-  [14] TopLevelFunction main @128..132
-  [15] Parameter n @9..10
-  [16] Parameter n @69..70
+  [7] Builtin contract @builtin
+  [8] Builtin buildList @builtin
+  [9] Builtin buildMap @builtin
+  [10] Builtin buildSet @builtin
+  [11] Builtin sequence @builtin
+  [12] Builtin iterator @builtin
+  [13] TopLevelFunction even @4..8
+  [14] TopLevelFunction odd @65..68
+  [15] TopLevelFunction main @128..132
+  [16] Parameter n @9..10
+  [17] Parameter n @69..70
 
 # uses
-  @32..33 -> [15] n (Parameter)
-  @50..53 -> [13] odd (TopLevelFunction)
-  @54..55 -> [15] n (Parameter)
-  @92..93 -> [16] n (Parameter)
-  @111..115 -> [12] even (TopLevelFunction)
-  @116..117 -> [16] n (Parameter)
+  @32..33 -> [16] n (Parameter)
+  @50..53 -> [14] odd (TopLevelFunction)
+  @54..55 -> [16] n (Parameter)
+  @92..93 -> [17] n (Parameter)
+  @111..115 -> [13] even (TopLevelFunction)
+  @116..117 -> [17] n (Parameter)
   @141..148 -> [0] println (Builtin)
-  @149..153 -> [12] even (TopLevelFunction)
+  @149..153 -> [13] even (TopLevelFunction)

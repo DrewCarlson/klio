@@ -2069,6 +2069,19 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     return lower_expr(b, &args[0]);
                 }
             }
+            // `contract { … }` (kotlin.contracts) is a compile-time
+            // marker with no runtime effect. Its lambda is a DSL of
+            // `returns()/implies(...)` calls that must NOT execute, so
+            // drop the whole call and yield Unit.
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1
+                    && segments[0].name == "contract"
+                    && args.len() == 1
+                    && matches!(args[0], Expr::Lambda { .. })
+                {
+                    return b.emit_const(Const::Unit);
+                }
+            }
             // Self-call inside a tailrec fn → TailJump terminator
             // instead of a regular Call. Re-binds params and
             // restarts the function's entry block.

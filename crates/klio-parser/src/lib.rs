@@ -204,6 +204,13 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.skip_nl();
         let start = self.current_span();
 
+        // File-use-site annotations (`@file:Suppress(...)`,
+        // `@file:OptIn(...)`, `@file:JvmName(...)`) precede the
+        // package header in Kotlin. Consume them up front; klio
+        // doesn't act on them, but the parser must not treat them as
+        // a declaration sitting before `package`.
+        self.skip_file_annotations();
+
         let package = self.parse_package_header();
         let imports = self.parse_imports();
 
@@ -671,6 +678,33 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     /// flattened annotation list. Useful at sites that don't go through
     /// `skip_modifiers_with_flags` (params, type parameters, type-refs,
     /// enum entries, when-bindings).
+    /// Consume leading `@file:...` annotations (only file-use-site
+    /// ones, so a leading `@JvmName fun` on a package-less file keeps
+    /// its annotation). Result is discarded — klio doesn't act on
+    /// file annotations.
+    fn skip_file_annotations(&mut self) {
+        loop {
+            self.skip_nl();
+            if !self.peek_kind().is_at() {
+                break;
+            }
+            let is_file = matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident)
+            ) && self.text(self.tokens[self.pos + 1].span) == "file"
+                && matches!(
+                    self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                    Some(TokenKind::Colon)
+                );
+            if !is_file {
+                break;
+            }
+            if self.parse_annotation_set().is_none() {
+                break;
+            }
+        }
+    }
+
     fn parse_annotations(&mut self) -> Vec<Annotation> {
         let mut out = Vec::new();
         loop {
@@ -2764,11 +2798,13 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     /// right operand may legally start on the following line, so we
     /// look past soft newlines there.
     fn lookahead_infix_rhs_starter(&self) -> bool {
+        // We have already read a valid infix-function name on this
+        // line; it demands a right operand, so a following newline is
+        // a continuation (`(a) or\n (b)`), not a statement boundary —
+        // look past it regardless of bracket nesting.
         let mut i = self.pos + 1;
-        if self.nl_soft.get(self.pos).copied().unwrap_or(false) {
-            while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
-                i += 1;
-            }
+        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+            i += 1;
         }
         let next = self.tokens.get(i).map(|t| &t.kind);
         match next {
@@ -3969,6 +4005,37 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     /// Returns the param list (empty if no `->` is present) and a list of
     /// destructuring statements that the caller should prepend to the body
     /// — one `val (a, b, …) = $$dest_<i>` per destructured slot.
+    /// Does the `{ … }` at the cursor have a `params ->` header?
+    /// True iff an `Arrow` token occurs at the lambda's own nesting
+    /// level (depth 0) before its closing `}`. Nested lambdas /
+    /// function types / `when` arrows sit at depth > 0 and are
+    /// ignored. Non-mutating.
+    fn lambda_has_header(&self) -> bool {
+        let mut depth: i32 = 0;
+        let mut i = self.pos;
+        while let Some(t) = self.tokens.get(i) {
+            match &t.kind {
+                TokenKind::Arrow if depth == 0 => return true,
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
+                    depth += 1;
+                }
+                TokenKind::RParen | TokenKind::RBracket => {
+                    depth -= 1;
+                }
+                TokenKind::RBrace => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn parse_lambda_header(&mut self) -> (Vec<Ident>, Vec<Stmt>) {
         let save = self.pos;
         let mut params = Vec::new();
@@ -3977,6 +4044,14 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         // Empty `{ -> ... }` form: arrow at front, no params.
         if matches!(self.peek_kind(), TokenKind::Arrow) {
             self.bump();
+            return (params, dest_stmts);
+        }
+        // A header exists only if a `->` appears at the lambda's top
+        // level before its closing `}`. Without this guard a body
+        // that opens with `(` — e.g. `{ ((if (c) a else b) + x) }` —
+        // is misparsed as a destructuring parameter list, emitting
+        // diagnostics that can't be unwound on backtrack.
+        if !self.lambda_has_header() {
             return (params, dest_stmts);
         }
         // `(ident (: Type)?, …)` destructured param OR

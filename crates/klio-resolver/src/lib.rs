@@ -116,7 +116,7 @@ impl Resolution {
 const BUILTINS: &[&str] = &[
     "println", "print",
     // Stdlib scope functions with contracts (§12.2.5).
-    "run", "with", "check", "require", "repeat",
+    "run", "with", "check", "require", "repeat", "contract",
     // Spec §14.5 builder-style inference entry points. Typeck threads the
     // lambda body through `check_builder_call` so member references on the
     // implicit receiver (e.g. `add`, `put`) resolve through the receiver's

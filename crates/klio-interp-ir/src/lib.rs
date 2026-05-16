@@ -2866,7 +2866,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                     dfid.0
                                 ))
                             })?;
-                        let v = klio_ir::eval::eval_with(module, &dfunc, Vec::new(), self)?;
+                        // The thunk binds the parameters preceding
+                        // this one, so a default like `endIndex =
+                        // s.length` can read earlier args.
+                        let v = klio_ir::eval::eval_with(module, &dfunc, args.clone(), self)?;
                         args.push(v);
                     } else {
                         args.push(klio_runtime::Value::Null);
@@ -4248,41 +4251,48 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // and `byteString.encodeBase64()` resolve to their own
             // overloads rather than the first-declared one.
             let want = args.len() + 1;
-            let candidates: Vec<klio_ir::Func> = self
+            // Accept an extension whose declared arity is >= the
+            // supplied (receiver + args) count when every trailing
+            // unsupplied parameter has a default — kotlinx-io's
+            // `fun Sink.writeString(s, startIndex = 0, endIndex =
+            // s.length)` is called as `sink.writeString("x")`.
+            let candidates: Vec<(klio_ir::FuncId, klio_ir::Func)> = self
                 .module
                 .func_index
                 .iter()
                 .filter(|(n, _)| n == name)
-                .filter_map(|(_, fid)| self.module.funcs.get(fid.0 as usize).cloned())
-                .filter(|f| f.params.len() == want)
+                .filter_map(|(_, fid)| {
+                    self.module
+                        .funcs
+                        .get(fid.0 as usize)
+                        .cloned()
+                        .map(|f| (*fid, f))
+                })
+                .filter(|(_fid, f)| !f.params.is_empty() && f.params.len() >= want)
                 .collect();
             let chosen = if candidates.len() <= 1 {
                 candidates.into_iter().next()
             } else {
-                let mut best: Option<(klio_ir::Func, i32)> = None;
-                for f in candidates {
+                let mut best: Option<((klio_ir::FuncId, klio_ir::Func), i32)> = None;
+                for (fid, f) in candidates {
                     let score = self
                         .overload_score_arg(&f.params[0].ty, receiver)
                         .unwrap_or(-1);
                     if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
-                        best = Some((f, score));
+                        best = Some(((fid, f), score));
                     }
                 }
-                best.map(|(f, _)| f)
+                best.map(|(c, _)| c)
             };
-            if let Some(func) = chosen {
+            if let Some((fid, _func)) = chosen {
                 let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
                 all.push(receiver.clone());
                 all.extend_from_slice(args);
-                // A pack-installed binding shadows the extension's
-                // (possibly bodyless `expect`) Kotlin source —
-                // e.g. `expect fun ByteArray.encodeBase64()` with
-                // a native `actual`.
-                if let Some(intrinsic) = self.installed_bindings.resolve(&func.fqn) {
-                    return self.dispatch_intrinsic(intrinsic, &all);
-                }
+                // call_func pads defaulted params, packs varargs and
+                // honours a pack-installed binding that shadows a
+                // bodyless `expect` extension.
                 let module = Rc::clone(&self.module);
-                return klio_ir::eval::eval_with(&module, &func, all, self);
+                return self.call_func(&module, fid, all);
             }
         }
         // Class-delegation forwarding: when the receiver instance

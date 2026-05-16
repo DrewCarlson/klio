@@ -890,11 +890,33 @@ fn build_module_with_overrides(
             // Lower per-param default expressions as 0-arg thunks.
             // The Vm pads missing args at call_func time.
             if f.params.iter().any(|p| p.default.is_some()) {
-                let mut slots: Vec<Option<klio_ir::FuncId>> = Vec::with_capacity(f.params.len());
-                for p in &f.params {
+                // The lowered fn may carry implicit leading params
+                // (an extension/method receiver bound as `this`).
+                // `func_defaults` is indexed by *lowered* param
+                // position (that's how call_func reads it), so pad
+                // `offset` empty leading slots and lower each default
+                // thunk binding the lowered param prefix — a default
+                // like `endIndex = s.length` then resolves `s`
+                // against the args call_func has accumulated.
+                let lowered_names: Vec<String> = module
+                    .funcs
+                    .get(id.0 as usize)
+                    .map(|lf| lf.params.iter().map(|p| p.name.clone()).collect())
+                    .unwrap_or_default();
+                let offset = lowered_names.len().saturating_sub(f.params.len());
+                let name_refs: Vec<&str> =
+                    lowered_names.iter().map(|s| s.as_str()).collect();
+                let mut slots: Vec<Option<klio_ir::FuncId>> =
+                    Vec::with_capacity(lowered_names.len().max(f.params.len()));
+                for _ in 0..offset {
+                    slots.push(None);
+                }
+                for (idx, p) in f.params.iter().enumerate() {
                     if let Some(default_expr) = &p.default {
-                        let fid = klio_ir::lower::lower_expr_as_thunk(
+                        let bind_upto = (offset + idx).min(name_refs.len());
+                        let fid = klio_ir::lower::lower_expr_as_param_thunk(
                             &mut module,
+                            &name_refs[..bind_upto],
                             default_expr,
                             &format!("__default_{}_{}", f.name.name, p.name.name),
                         );

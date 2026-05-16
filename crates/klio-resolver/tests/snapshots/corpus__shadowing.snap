@@ -10,18 +10,19 @@ expression: "fun main() {\n    val x = 1\n    val x = 2\n    println(x)\n}\n"
   [4] Builtin check @builtin
   [5] Builtin require @builtin
   [6] Builtin repeat @builtin
-  [7] Builtin buildList @builtin
-  [8] Builtin buildMap @builtin
-  [9] Builtin buildSet @builtin
-  [10] Builtin sequence @builtin
-  [11] Builtin iterator @builtin
-  [12] TopLevelFunction main @4..8
-  [13] LocalProperty x @21..22
-  [14] LocalProperty x @35..36
+  [7] Builtin contract @builtin
+  [8] Builtin buildList @builtin
+  [9] Builtin buildMap @builtin
+  [10] Builtin buildSet @builtin
+  [11] Builtin sequence @builtin
+  [12] Builtin iterator @builtin
+  [13] TopLevelFunction main @4..8
+  [14] LocalProperty x @21..22
+  [15] LocalProperty x @35..36
 
 # uses
   @45..52 -> [0] println (Builtin)
-  @53..54 -> [14] x (LocalProperty)
+  @53..54 -> [15] x (LocalProperty)
 
 # diagnostics
   [R0002] Warning `x` shadows an earlier binding @35..36
