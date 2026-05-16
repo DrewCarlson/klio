@@ -470,6 +470,33 @@ pub trait IntrinsicHost {
     /// waiting on the slot (the waiter must re-check its condition
     /// after each park). Default impl is a no-op.
     fn coroutine_resume_slot(&mut self, _slot: i64) {}
+
+    /// Spawn `block` on a real OS thread and return an opaque thread
+    /// id usable with [`join_os_thread`]. The default impl runs
+    /// `block` eagerly on the calling stack (preserving the legacy
+    /// serialized behaviour for hosts without a Vm) and returns `0`.
+    /// The Vm overrides this with a true `std::thread::spawn`; the
+    /// escaping value graph is published before the thread starts.
+    fn spawn_os_thread(
+        &mut self,
+        block: &Value,
+        out: &mut dyn Output,
+    ) -> Result<u64, RuntimeError> {
+        self.invoke_callable(block, &[], out).map(|_| 0)
+    }
+
+    /// Join the OS thread previously returned by [`spawn_os_thread`],
+    /// propagating any error the thread body threw. Default impl is a
+    /// no-op (the eager default already ran the body to completion).
+    fn join_os_thread(&mut self, _id: u64) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    /// Whether the OS thread with this id is still running. Default
+    /// impl reports `false` (the eager default already completed).
+    fn os_thread_alive(&mut self, _id: u64) -> bool {
+        false
+    }
 }
 
 /// Cooperative scheduler the runtime exposes to anything called
@@ -2452,6 +2479,47 @@ pub trait Output {
     }
 }
 
+/// One recorded output call. A [`RecordingSink`] logs the exact
+/// `write`/`writeln` sequence so it can later be replayed verbatim
+/// into any `Output`, byte-for-byte and call-for-call.
+#[derive(Clone)]
+pub enum OutOp {
+    Write(String),
+    WriteLn(String),
+}
+
+/// `Send` sink that records the exact call sequence instead of
+/// formatting eagerly. The root thread and every spawned thread
+/// share one of these behind a `Mutex` (via [`SharedOutput`]); when
+/// the program finishes, [`RecordingSink::replay_into`] reproduces
+/// the calls in order on the caller's real sink. Because the replay
+/// is the identical call sequence, a single-threaded program's
+/// output is byte-identical to writing the caller's sink directly.
+#[derive(Default)]
+pub struct RecordingSink {
+    pub ops: Vec<OutOp>,
+}
+
+impl RecordingSink {
+    pub fn replay_into(&mut self, out: &mut dyn Output) {
+        for op in self.ops.drain(..) {
+            match op {
+                OutOp::Write(s) => out.write(&s),
+                OutOp::WriteLn(s) => out.writeln(&s),
+            }
+        }
+    }
+}
+
+impl Output for RecordingSink {
+    fn writeln(&mut self, s: &str) {
+        self.ops.push(OutOp::WriteLn(s.to_string()));
+    }
+    fn write(&mut self, s: &str) {
+        self.ops.push(OutOp::Write(s.to_string()));
+    }
+}
+
 pub struct StdoutOutput;
 impl Output for StdoutOutput {
     fn writeln(&mut self, s: &str) {
@@ -2482,6 +2550,44 @@ impl Output for CaptureOutput {
     }
     fn write(&mut self, s: &str) {
         self.partial.push_str(s);
+    }
+}
+
+/// A `Send` output sink shared by every OS thread of one program.
+///
+/// All threads (the root and every `kotlin.concurrent.thread` child)
+/// write through the same `Arc<Mutex<dyn Output + Send>>`, so a
+/// `println` is serialized at write granularity. Kotlin does not
+/// define an ordering for racy output; the litmus programs gate their
+/// prints behind join / `synchronized` so the observable order stays
+/// deterministic.
+///
+/// Single-thread behaviour is byte-identical to writing the inner sink
+/// directly: there is exactly one writer, the mutex is uncontended,
+/// and `write`/`writeln` forward verbatim in the same program order.
+#[derive(Clone, Default)]
+pub struct SharedOutput(Arc<std::sync::Mutex<RecordingSink>>);
+
+impl SharedOutput {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replay every recorded call, in order, into the caller's real
+    /// sink, then clear the recording. Called once after the run and
+    /// every spawned thread have completed.
+    pub fn replay_into(&self, out: &mut dyn Output) {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        g.replay_into(out);
+    }
+}
+
+impl Output for SharedOutput {
+    fn writeln(&mut self, s: &str) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).writeln(s);
+    }
+    fn write(&mut self, s: &str) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).write(s);
     }
 }
 
@@ -2676,6 +2782,27 @@ impl Env {
 }
 
 impl Value {
+    /// Address-stable identity for use as a `synchronized` monitor
+    /// key. Reference types (instances, containers, cells, builders)
+    /// return their backing cell's stable address so two handles to
+    /// the same Kotlin object map to the same monitor. Value types
+    /// have no identity and return `None` — the caller falls back to
+    /// a single shared monitor for them (matching the JVM, where
+    /// boxing makes such locks effectively global).
+    #[must_use]
+    pub fn lock_identity(&self) -> Option<usize> {
+        match self {
+            Value::Instance(i) => Some(i.identity()),
+            Value::List { items, .. }
+            | Value::Array { items, .. }
+            | Value::Set { items, .. } => Some(items.identity()),
+            Value::Map { entries, .. } => Some(entries.identity()),
+            Value::Cell(c) => Some(c.identity()),
+            Value::StringBuilder(s) => Some(s.identity()),
+            _ => None,
+        }
+    }
+
     /// Publish every `ObjRef` reachable from this value so the whole
     /// graph is sound to observe from another OS thread. The soundness
     /// primitive a value graph must pass through before it can cross a
@@ -2695,6 +2822,16 @@ impl Value {
         let mut seen = std::collections::HashSet::new();
         publish_value(self, &mut seen);
     }
+}
+
+/// Publish every `ObjRef` reachable from an environment (its bound
+/// values and the whole parent chain). Used to make the program's
+/// globals sound to observe from a freshly spawned OS thread.
+pub fn publish_env_deep(env: &ObjRef<Env>) {
+    let mut seen = std::collections::HashSet::new();
+    env.publish();
+    seen.insert(env.identity());
+    publish_env(&env.borrow(), &mut seen);
 }
 
 /// Publish (and recurse through) one `ObjRef`. Publishing is always

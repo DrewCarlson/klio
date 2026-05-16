@@ -2148,28 +2148,93 @@ fn scope_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Unit)
 }
 
+/// State of one reentrant monitor: which thread (if any) currently
+/// owns it and how deep its nesting is.
+struct MonitorState {
+    owner: Option<std::thread::ThreadId>,
+    depth: usize,
+}
+
+/// Process-wide monitor table keyed by the lock value's object
+/// identity. Value-type locks (no identity) all share a single
+/// monitor under the sentinel key `0`.
+fn monitor_for(key: usize) -> Arc<(std::sync::Mutex<MonitorState>, std::sync::Condvar)> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    type Reg = std::sync::Mutex<
+        HashMap<usize, Arc<(std::sync::Mutex<MonitorState>, std::sync::Condvar)>>,
+    >;
+    static REGISTRY: OnceLock<Reg> = OnceLock::new();
+    let reg = REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut g = reg.lock().unwrap_or_else(|e| e.into_inner());
+    g.entry(key)
+        .or_insert_with(|| {
+            Arc::new((
+                std::sync::Mutex::new(MonitorState { owner: None, depth: 0 }),
+                std::sync::Condvar::new(),
+            ))
+        })
+        .clone()
+}
+
 /// `synchronized(lock) { body }` / `synchronized(lock, { body })`.
 ///
-/// Under the serialized interpreter mutual exclusion is automatic: no
-/// other thread can be running while this body runs, so the monitor is
-/// effectively always free on enter and the body executes atomically
-/// with respect to every other monitor section. We run the trailing
-/// lambda and return its result. The `lock` argument is irrelevant to
-/// observable behaviour here and is ignored.
-///
-/// `fence_and_publish` marks the monitor enter and exit boundaries —
-/// the points where a parallel backing would acquire on enter and
-/// release on exit.
+/// A real reentrant monitor keyed by the `lock` argument's object
+/// identity: distinct locks run concurrently, the same lock
+/// serializes, and the same thread re-entering the same lock does
+/// not self-deadlock (Kotlin/JVM monitors are reentrant). The body
+/// runs with the monitor held; it is released (even on a thrown
+/// exception) before returning. `fence_and_publish` marks the
+/// monitor enter and exit boundaries.
 fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let lock = ctx.args.first().cloned().unwrap_or(Value::Unit);
     let block = ctx
         .args
         .last()
         .cloned()
         .ok_or_else(|| RuntimeError::Arity("synchronized expects (lock, block)".into()))?;
-    let CallCtx { out, host, .. } = ctx;
+    let key = lock.lock_identity().unwrap_or(0);
+    let mon = monitor_for(key);
+    let me = std::thread::current().id();
+
+    // Acquire (reentrant): block until the monitor is free or already
+    // owned by this thread, then take/deepen ownership.
+    {
+        let mut st = mon.0.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match st.owner {
+                Some(o) if o == me => {
+                    st.depth += 1;
+                    break;
+                }
+                None => {
+                    st.owner = Some(me);
+                    st.depth = 1;
+                    break;
+                }
+                Some(_) => {
+                    st = mon.1.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
+    }
     klio_runtime::fence_and_publish(); // monitor enter
+
+    let CallCtx { out, host, .. } = ctx;
     let result = host.invoke_callable(&block, &[], *out);
+
     klio_runtime::fence_and_publish(); // monitor exit
+    // Release one level; wake a waiter when fully released.
+    {
+        let mut st = mon.0.lock().unwrap_or_else(|e| e.into_inner());
+        if st.depth > 0 {
+            st.depth -= 1;
+        }
+        if st.depth == 0 {
+            st.owner = None;
+            mon.1.notify_one();
+        }
+    }
     result
 }
 
@@ -2204,13 +2269,18 @@ fn concurrent_thread(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         })
         .cloned()
         .ok_or_else(|| RuntimeError::Arity("thread expects a block".into()))?;
+    // `thread(start = false) { … }` — leading boolean positional /
+    // named arg of `false` means the caller will `.start()` it
+    // explicitly. Without a real deferred-start handle we still spawn
+    // (the body runs concurrently regardless); a later `.start()` is
+    // a no-op. Defaulting to start=true matches the common case.
     let CallCtx { out, host, .. } = ctx;
     klio_runtime::fence_and_publish(); // thread start
-    host.invoke_callable(&block, &[], *out)?;
-    klio_runtime::fence_and_publish(); // thread body completion published to the joiner
-    Ok(Value::Intrinsic {
+    let id = host.spawn_os_thread(&block, *out)?;
+    Ok(Value::BoundMethod {
         fqn: "kotlin.concurrent.Thread",
         func: thread_handle_stub,
+        receiver: Box::new(Value::Long(id as i64)),
     })
 }
 

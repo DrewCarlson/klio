@@ -60,7 +60,12 @@ fn check(stem: &str) {
 
 /// Guarantees that hold under the serialized interpreter today —
 /// enforced now.
-const RUNNABLE: &[&str] = &["tl_smoke"];
+const RUNNABLE: &[&str] = &[
+    "tl_smoke",
+    "tl_thread_join",
+    "tl_sync_counter",
+    "tl_parallel_partition",
+];
 
 /// Guarantees that only become meaningful with real OS-thread
 /// spawning. `(stem, blocker)`. Each moves into `RUNNABLE` when its

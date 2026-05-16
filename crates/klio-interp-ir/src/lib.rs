@@ -14,11 +14,64 @@
 //! reference; the new Vm runs alongside under `--ir-vm`.
 
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 pub use klio_runtime::Output;
 
 pub mod build;
+
+/// Build-time-immutable program metadata. Produced once by
+/// `build::build_module` and shared O(1) by `Arc` with every OS
+/// thread the program spawns (`kotlin.concurrent.thread`). Nothing
+/// here is mutated after construction, so sharing it across threads
+/// needs no synchronization.
+pub struct ProgramImage {
+    module: Arc<klio_ir::Module>,
+    body_prop_inits:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    instance_prop_getters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    instance_prop_setters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    parent_ctor_args:
+        std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    extension_props:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    extension_prop_setters:
+        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    secondary_ctors:
+        std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
+    class_delegates:
+        std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
+    func_defaults:
+        std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
+    installed_bindings: Arc<klio_stdlib::HostBindings>,
+}
+
+/// Lambda/closure side-table shared across every OS thread of one
+/// program. Indices (`Value::IrClosure { id }`) are append-stable —
+/// `push` only ever extends — so a `Mutex<Vec<_>>` keeps cross-thread
+/// closure creation sound while every existing id stays valid.
+#[derive(Clone)]
+pub struct SharedClosures(Arc<Mutex<Vec<ClosureInfo>>>);
+
+impl SharedClosures {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Vec::new())))
+    }
+    fn get(&self, id: usize) -> Option<ClosureInfo> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+    }
+    /// Append `info`, returning its stable id.
+    fn push(&self, info: ClosureInfo) -> u64 {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let id = g.len() as u64;
+        g.push(info);
+        id
+    }
+}
 
 /// One Vm instance executes a single program against the IR module
 /// produced by the front end.
@@ -26,90 +79,101 @@ pub struct Vm {
     module: Arc<klio_ir::Module>,
     globals: klio_runtime::ObjRef<klio_runtime::Env>,
     scheduler: Box<dyn klio_runtime::Scheduler>,
-    instance_id_counter: u64,
+    /// Process-wide monotonic instance-id source. Shared (atomically)
+    /// across every OS thread so ids stay unique program-wide.
+    instance_id_counter: Arc<AtomicU64>,
     /// Per-class runtime metadata produced by `build::build_module`.
-    /// The Vm uses these for instance allocation. As IR Class
-    /// expands to carry the full runtime shape this table shrinks
-    /// and eventually goes away. Wrapped in RefCell so the Vm can
-    /// register local classes encountered at runtime (Inst::RegisterClass).
+    /// Shared by handle with spawned threads.
     classes: klio_runtime::ObjRef<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>,
-    /// Body-property initialiser FuncIds. Invoked during instance
-    /// allocation to populate fields for `val/var x: T = expr`
-    /// declared in a class body (not primary-ctor params).
-    body_prop_inits:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    /// Custom getter FuncIds. `Vm::get_field` invokes one when the
-    /// receiver's runtime ClassDef declares a custom getter for
-    /// the named property.
-    instance_prop_getters:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    /// Custom setter FuncIds. `Vm::set_field` invokes one when the
-    /// receiver's runtime ClassDef declares a custom setter for
-    /// the named property.
-    instance_prop_setters:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    /// Per-class parent-ctor arg thunks. `new_instance` invokes
-    /// each thunk with the class's own primary args to compute the
-    /// values passed to the parent's primary ctor.
-    parent_ctor_args:
-        std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
-    /// Per-class init-block FuncIds (each takes `this` as the sole
-    /// param). `new_instance` runs them in declaration order after
-    /// the parent-ctor chain + body-property init.
-    init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
-    /// Top-level extension property getters keyed by
-    /// `(receiver-type-simple-name, prop-name)`. `Vm::get_field`
-    /// invokes the FuncId with the receiver as `this`.
-    extension_props:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    /// Extension-property setter FuncIds.
-    extension_prop_setters:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// Top-level property initialiser FuncIds. Run at Vm::run start
     /// so globals see the initial values.
     top_level_props: Vec<(String, klio_ir::FuncId)>,
     /// Enum-entry ctor-arg thunks to evaluate at startup.
     enum_entry_arg_inits: Vec<(String, String, Vec<klio_ir::FuncId>)>,
-    /// Per-class secondary-ctor dispatch entries.
-    secondary_ctors:
-        std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
-    /// Per-class delegation expressions for `: I by g` supertypes.
-    class_delegates:
-        std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
-    /// Per-function default-arg thunk table.
-    func_defaults:
-        std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     /// Default outer instance to attach to locally-registered
-    /// classes. `register_class_captured` snapshots `this` when
-    /// the local class is declared inside a method body so the
-    /// resulting Local() instances can resolve `this@Outer` and
-    /// outer-field reads through `inst.outer`.
+    /// classes. Shared by handle with spawned threads.
     class_default_outer:
         klio_runtime::ObjRef<std::collections::HashMap<String, klio_runtime::Value>>,
     /// Runtime-lowered method bodies for anonymous-object / local
-    /// classes, indexed by `(class name, method name) -> (Module, FuncId)`.
-    /// The IR module is immutable after build, so methods declared
-    /// inside runtime-built classes lower into per-method side
-    /// modules and dispatch from this table.
+    /// classes. Shared by handle with spawned threads.
     anon_methods: klio_runtime::ObjRef<std::collections::HashMap<
         (String, String),
         (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>,
-    /// Closure side-table. Each `Value::IrClosure { id, captures }`
-    /// resolves to a `(body_func, n_params)` here. `n_params` lets
-    /// the dispatch fill missing positional args with `Null` (for
-    /// implicit-`it` shapes that pass 0 args).
-    closures: Vec<ClosureInfo>,
-    /// Overlay of host-bindings registered by loaded packs. Probed
-    /// before `klio_stdlib::implementation` so a pack's
-    /// `kotlinx.atomicfu.AtomicInt.compareAndSet` wins over the
-    /// stdlib's default lookup.
-    installed_bindings: Arc<klio_stdlib::HostBindings>,
+    /// Closure side-table, shared (mutex) across threads so a thread
+    /// body can create lambdas without invalidating existing ids.
+    closures: SharedClosures,
+    /// Build-time-immutable program metadata, shared O(1) by `Arc`
+    /// with every spawned OS thread.
+    prog: Arc<ProgramImage>,
+    /// Shared serialized stdout sink. The root and every spawned
+    /// thread write through this so concurrent `println` is
+    /// serialized; single-threaded ordering is byte-identical.
+    out_sink: klio_runtime::SharedOutput,
+    /// Host-side registry of live spawned-thread join handles, keyed
+    /// by the opaque id handed back to `Thread.join`.
+    threads: Arc<Mutex<std::collections::HashMap<u64, ThreadEntry>>>,
+}
+
+/// One spawned OS thread tracked by the host. The `JoinHandle`
+/// yields the thread body's terminal result (an error string carries
+/// a thrown Kotlin Throwable rendered for the joiner).
+struct ThreadEntry {
+    handle: Option<std::thread::JoinHandle<Result<(), klio_runtime::RuntimeError>>>,
+}
+
+/// `Send` capture of the shared program state for a new OS thread.
+/// Built by [`Vm::spawn_child`] on the parent, moved into the
+/// `std::thread::spawn` closure, then turned back into a [`Vm`] with
+/// [`SendableVmSeed::materialize`] on the new thread. Every field is
+/// an owned shared handle (`Arc` / `ObjRef` / atomic), so the seed
+/// outlives the spawning call and carries no borrow.
+pub struct SendableVmSeed {
+    module: Arc<klio_ir::Module>,
+    globals: klio_runtime::ObjRef<klio_runtime::Env>,
+    instance_id_counter: Arc<AtomicU64>,
+    classes: klio_runtime::ObjRef<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>,
+    prog: Arc<ProgramImage>,
+    anon_methods: klio_runtime::ObjRef<std::collections::HashMap<
+        (String, String),
+        (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
+    >>,
+    class_default_outer:
+        klio_runtime::ObjRef<std::collections::HashMap<String, klio_runtime::Value>>,
+    closures: SharedClosures,
+    out_sink: klio_runtime::SharedOutput,
+    threads: Arc<Mutex<std::collections::HashMap<u64, ThreadEntry>>>,
+}
+
+impl SendableVmSeed {
+    /// Materialize a child `Vm` on the current (new) OS thread. The
+    /// child shares the parent's program image, globals, classes,
+    /// closure table, id counter, and stdout sink; it gets its own
+    /// fresh cooperative scheduler (coroutine state is `thread_local`
+    /// already).
+    pub fn materialize(self) -> Vm {
+        Vm {
+            module: self.module,
+            globals: self.globals,
+            scheduler: Box::new(klio_runtime::InProcessScheduler::new()),
+            instance_id_counter: self.instance_id_counter,
+            classes: self.classes,
+            top_level_props: Vec::new(),
+            enum_entry_arg_inits: Vec::new(),
+            class_default_outer: self.class_default_outer,
+            anon_methods: self.anon_methods,
+            closures: self.closures,
+            prog: self.prog,
+            out_sink: self.out_sink,
+            threads: self.threads,
+        }
+    }
 }
 
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Vm>();
+    assert_send::<SendableVmSeed>();
 };
 
 #[derive(Clone)]
@@ -143,35 +207,44 @@ impl Vm {
         }
         let globals = klio_runtime::ObjRef::new(env);
         Self {
-            module,
+            module: Arc::clone(&module),
             globals,
             scheduler: Box::new(klio_runtime::InProcessScheduler::new()),
-            instance_id_counter: 0,
+            instance_id_counter: Arc::new(AtomicU64::new(0)),
             classes: klio_runtime::ObjRef::new(std::collections::HashMap::new()),
-            body_prop_inits: std::collections::HashMap::new(),
-            instance_prop_getters: std::collections::HashMap::new(),
-            instance_prop_setters: std::collections::HashMap::new(),
-            parent_ctor_args: std::collections::HashMap::new(),
-            init_blocks: std::collections::HashMap::new(),
-            extension_props: std::collections::HashMap::new(),
-            extension_prop_setters: std::collections::HashMap::new(),
             top_level_props: Vec::new(),
             enum_entry_arg_inits: Vec::new(),
-            secondary_ctors: std::collections::HashMap::new(),
-            class_delegates: std::collections::HashMap::new(),
-            func_defaults: std::collections::HashMap::new(),
             class_default_outer: klio_runtime::ObjRef::new(std::collections::HashMap::new()),
             anon_methods: klio_runtime::ObjRef::new(std::collections::HashMap::new()),
-            closures: Vec::new(),
-            installed_bindings: Arc::new(klio_stdlib::HostBindings::new()),
+            closures: SharedClosures::new(),
+            prog: Arc::new(ProgramImage {
+                module,
+                body_prop_inits: std::collections::HashMap::new(),
+                instance_prop_getters: std::collections::HashMap::new(),
+                instance_prop_setters: std::collections::HashMap::new(),
+                parent_ctor_args: std::collections::HashMap::new(),
+                init_blocks: std::collections::HashMap::new(),
+                extension_props: std::collections::HashMap::new(),
+                extension_prop_setters: std::collections::HashMap::new(),
+                secondary_ctors: std::collections::HashMap::new(),
+                class_delegates: std::collections::HashMap::new(),
+                func_defaults: std::collections::HashMap::new(),
+                installed_bindings: Arc::new(klio_stdlib::HostBindings::new()),
+            }),
+            out_sink: klio_runtime::SharedOutput::new(),
+            threads: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
     /// Install pack-provided host bindings. Probed before
     /// `klio_stdlib::implementation` during dispatch so a pack's
-    /// FQN-keyed bindings shadow the stdlib's default lookup.
+    /// FQN-keyed bindings shadow the stdlib's default lookup. Called
+    /// before `run` (and before any thread spawn), so the program
+    /// image is still uniquely owned and can be rebuilt in place.
     pub fn set_installed_bindings(&mut self, bindings: klio_stdlib::HostBindings) {
-        self.installed_bindings = Arc::new(bindings);
+        let prog = Arc::get_mut(&mut self.prog)
+            .expect("set_installed_bindings before run / thread spawn");
+        prog.installed_bindings = Arc::new(bindings);
     }
 
     /// Build a Vm from a fully-prepared `build::BuiltModule`. The
@@ -179,20 +252,24 @@ impl Vm {
     /// IR module and the synthesised runtime ClassDef table.
     pub fn from_built(built: build::BuiltModule) -> (Self, Option<klio_ir::FuncId>) {
         let main = built.main;
-        let mut vm = Self::new(built.module);
+        let mut vm = Self::new(Arc::clone(&built.module));
         vm.classes = klio_runtime::ObjRef::new(built.classes);
-        vm.body_prop_inits = built.body_prop_inits;
-        vm.instance_prop_getters = built.instance_prop_getters;
-        vm.instance_prop_setters = built.instance_prop_setters;
-        vm.parent_ctor_args = built.parent_ctor_args;
-        vm.init_blocks = built.init_blocks;
-        vm.extension_props = built.extension_props;
-        vm.extension_prop_setters = built.extension_prop_setters;
         vm.top_level_props = built.top_level_props;
         vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
-        vm.secondary_ctors = built.secondary_ctors;
-        vm.class_delegates = built.class_delegates;
-        vm.func_defaults = built.func_defaults;
+        vm.prog = Arc::new(ProgramImage {
+            module: built.module,
+            body_prop_inits: built.body_prop_inits,
+            instance_prop_getters: built.instance_prop_getters,
+            instance_prop_setters: built.instance_prop_setters,
+            parent_ctor_args: built.parent_ctor_args,
+            init_blocks: built.init_blocks,
+            extension_props: built.extension_props,
+            extension_prop_setters: built.extension_prop_setters,
+            secondary_ctors: built.secondary_ctors,
+            class_delegates: built.class_delegates,
+            func_defaults: built.func_defaults,
+            installed_bindings: Arc::new(klio_stdlib::HostBindings::new()),
+        });
         // Pre-populated enum-entry override methods land in the
         // same anon_methods side-table the Vm consults for
         // anon-object + local-class methods.
@@ -204,14 +281,104 @@ impl Vm {
         (vm, main)
     }
 
-    /// Run the program's `main` function. Stdout is routed through
-    /// `out`. Returns the value `main` returned (typically Unit).
+    /// Build a `VmHost` bound to this Vm's shared state for the
+    /// duration of one evaluation. The immutable program image,
+    /// closure table, id counter, and stdout sink are shared by
+    /// handle; only the scheduler and `out` are borrowed.
+    fn make_host<'s>(&'s mut self, out: &'s mut dyn Output) -> VmHost<'s> {
+        VmHost {
+            globals: self.globals.clone(),
+            module: Arc::clone(&self.module),
+            scheduler: &mut *self.scheduler,
+            out,
+            instance_id_counter: Arc::clone(&self.instance_id_counter),
+            classes: self.classes.clone(),
+            prog: Arc::clone(&self.prog),
+            anon_methods: self.anon_methods.clone(),
+            class_default_outer: self.class_default_outer.clone(),
+            closures: self.closures.clone(),
+            out_sink: self.out_sink.clone(),
+            threads: Arc::clone(&self.threads),
+        }
+    }
+
+    /// A `Send` snapshot of every handle a freshly spawned OS thread
+    /// needs to materialize its own child `Vm`. Holding it does not
+    /// keep the parent thread's borrows alive — every field is an
+    /// owned `Arc`/`ObjRef`/atomic.
+    pub fn spawn_child(&self) -> SendableVmSeed {
+        SendableVmSeed {
+            module: Arc::clone(&self.module),
+            globals: self.globals.clone(),
+            instance_id_counter: Arc::clone(&self.instance_id_counter),
+            classes: self.classes.clone(),
+            prog: Arc::clone(&self.prog),
+            anon_methods: self.anon_methods.clone(),
+            class_default_outer: self.class_default_outer.clone(),
+            closures: self.closures.clone(),
+            out_sink: self.out_sink.clone(),
+            threads: Arc::clone(&self.threads),
+        }
+    }
+
+    /// Invoke a thread-body callable on this (child) Vm, writing
+    /// through the shared serialized sink. Used by the spawned-thread
+    /// closure; the result is published by the caller before the
+    /// joiner observes it.
+    fn run_thread_block(
+        &mut self,
+        block: &klio_runtime::Value,
+    ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        use klio_runtime::IntrinsicHost;
+        let mut sink = self.out_sink.clone();
+        let mut host = self.make_host(&mut sink);
+        let mut sink2 = host.out_sink.clone();
+        let mut intrinsic = VmIntrinsicHost {
+            scheduler: &mut *host.scheduler,
+            module: Arc::clone(&host.module),
+            closures: host.closures.clone(),
+            globals: host.globals.clone(),
+            classes: host.classes.clone(),
+            prog: Arc::clone(&host.prog),
+            anon_methods: host.anon_methods.clone(),
+            class_default_outer: host.class_default_outer.clone(),
+            instance_id_counter: Arc::clone(&host.instance_id_counter),
+            out_sink: host.out_sink.clone(),
+            threads: Arc::clone(&host.threads),
+        };
+        intrinsic.invoke_callable(block, &[], &mut sink2)
+    }
+
+    /// Run the program's `main` function.
+    ///
+    /// All evaluation — the root thread and every spawned
+    /// `kotlin.concurrent.thread` child — writes through one shared
+    /// serialized sink (`out_sink`). When the run (and every joined
+    /// thread) completes, the accumulated output is drained into the
+    /// caller's `out` in order. A single-threaded program has exactly
+    /// one writer, so the drained bytes and their ordering are
+    /// identical to writing `out` directly.
     pub fn run(
         &mut self,
         main: klio_ir::FuncId,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, VmError> {
+        let result = self.run_inner(main);
+        // Replay the recorded call sequence verbatim into the
+        // caller's real sink. A single-threaded program recorded
+        // exactly the calls it would have made directly, so the
+        // bytes and their order are identical.
+        self.out_sink.replay_into(out);
+        result
+    }
+
+    fn run_inner(
+        &mut self,
+        main: klio_ir::FuncId,
+    ) -> Result<klio_runtime::Value, VmError> {
         let module = Arc::clone(&self.module);
+        let mut out_sink = self.out_sink.clone();
+        let out: &mut dyn Output = &mut out_sink;
         // Run top-level property initialisers before main so global
         // reads against the env see the initial values.
         let inits: Vec<(String, klio_ir::FuncId)> = self.top_level_props.clone();
@@ -222,36 +389,10 @@ impl Vm {
                 .cloned()
                 .ok_or(VmError::InvalidMain)?;
             let v = {
-                let mut host = VmHost {
-                    globals: self.globals.clone(),
-                    module: Arc::clone(&module),
-                    scheduler: &mut *self.scheduler,
-                    out,
-                    instance_id_counter: &mut self.instance_id_counter,
-                    classes: self.classes.clone(),
-                    body_prop_inits: &self.body_prop_inits,
-                    instance_prop_getters: &self.instance_prop_getters,
-                    instance_prop_setters: &self.instance_prop_setters,
-                    parent_ctor_args: &self.parent_ctor_args,
-                    init_blocks: &self.init_blocks,
-                    extension_props: &self.extension_props,
-                    extension_prop_setters: &self.extension_prop_setters,
-                    anon_methods: self.anon_methods.clone(),
-                    companion_singletons: &self.module.registry.companion_singletons,
-                    secondary_ctors: &self.secondary_ctors,
-                    class_delegates: &self.class_delegates,
-                    func_defaults: &self.func_defaults,
-                    enclosing_class: &self.module.registry.enclosing_class,
-                    func_type_params: &self.module.registry.func_type_params,
-                    top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-                    delegated_body_props: &self.module.registry.delegated_body_props,
-                    installed_bindings: Arc::clone(&self.installed_bindings),
-                    class_default_outer: self.class_default_outer.clone(),
-                    closures: &mut self.closures,
-                };
+                let mut host = self.make_host(out);
                 let mut v = klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
                     .map_err(VmError::from)?;
-                if self.module.registry.top_level_delegated_props.contains(name) {
+                if module.registry.top_level_delegated_props.contains(name) {
                     if let klio_runtime::Value::Instance(ref inst) = v {
                         let dcls_name = inst.borrow().class.name.clone();
                         let has_provide = module
@@ -318,33 +459,7 @@ impl Vm {
                     None => continue,
                 };
                 let v = {
-                    let mut host = VmHost {
-                        globals: self.globals.clone(),
-                        module: Arc::clone(&module),
-                        scheduler: &mut *self.scheduler,
-                        out,
-                        instance_id_counter: &mut self.instance_id_counter,
-                        classes: self.classes.clone(),
-                        body_prop_inits: &self.body_prop_inits,
-                        instance_prop_getters: &self.instance_prop_getters,
-                        instance_prop_setters: &self.instance_prop_setters,
-                        parent_ctor_args: &self.parent_ctor_args,
-                        init_blocks: &self.init_blocks,
-                        extension_props: &self.extension_props,
-                    extension_prop_setters: &self.extension_prop_setters,
-                        anon_methods: self.anon_methods.clone(),
-                        companion_singletons: &self.module.registry.companion_singletons,
-                    secondary_ctors: &self.secondary_ctors,
-                    class_delegates: &self.class_delegates,
-                    func_defaults: &self.func_defaults,
-                    enclosing_class: &self.module.registry.enclosing_class,
-                    func_type_params: &self.module.registry.func_type_params,
-                    top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-                    delegated_body_props: &self.module.registry.delegated_body_props,
-                    installed_bindings: Arc::clone(&self.installed_bindings),
-                    class_default_outer: self.class_default_outer.clone(),
-                        closures: &mut self.closures,
-                    };
+                    let mut host = self.make_host(out);
                     klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
                         .map_err(VmError::from)?
                 };
@@ -366,33 +481,7 @@ impl Vm {
                 None => continue,
             };
             let inst = {
-                let mut host = VmHost {
-                    globals: self.globals.clone(),
-                    module: Arc::clone(&module),
-                    scheduler: &mut *self.scheduler,
-                    out,
-                    instance_id_counter: &mut self.instance_id_counter,
-                    classes: self.classes.clone(),
-                    body_prop_inits: &self.body_prop_inits,
-                    instance_prop_getters: &self.instance_prop_getters,
-                    instance_prop_setters: &self.instance_prop_setters,
-                    parent_ctor_args: &self.parent_ctor_args,
-                    init_blocks: &self.init_blocks,
-                    extension_props: &self.extension_props,
-                    extension_prop_setters: &self.extension_prop_setters,
-                    anon_methods: self.anon_methods.clone(),
-                    companion_singletons: &self.module.registry.companion_singletons,
-                    secondary_ctors: &self.secondary_ctors,
-                    class_delegates: &self.class_delegates,
-                    func_defaults: &self.func_defaults,
-                    enclosing_class: &self.module.registry.enclosing_class,
-                    func_type_params: &self.module.registry.func_type_params,
-                    top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-                    delegated_body_props: &self.module.registry.delegated_body_props,
-                    installed_bindings: Arc::clone(&self.installed_bindings),
-                    class_default_outer: self.class_default_outer.clone(),
-                    closures: &mut self.closures,
-                };
+                let mut host = self.make_host(out);
                 <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
                     .map_err(VmError::from)?
             };
@@ -417,34 +506,42 @@ impl Vm {
             .get(main.0 as usize)
             .ok_or(VmError::InvalidMain)?
             .clone();
-        let mut host = VmHost {
-            globals: self.globals.clone(),
-            module: Arc::clone(&module),
-            scheduler: &mut *self.scheduler,
-            out,
-            instance_id_counter: &mut self.instance_id_counter,
-            classes: self.classes.clone(),
-            body_prop_inits: &self.body_prop_inits,
-            instance_prop_getters: &self.instance_prop_getters,
-            instance_prop_setters: &self.instance_prop_setters,
-            parent_ctor_args: &self.parent_ctor_args,
-            init_blocks: &self.init_blocks,
-            extension_props: &self.extension_props,
-            extension_prop_setters: &self.extension_prop_setters,
-            anon_methods: self.anon_methods.clone(),
-            companion_singletons: &self.module.registry.companion_singletons,
-            secondary_ctors: &self.secondary_ctors,
-            class_delegates: &self.class_delegates,
-            func_defaults: &self.func_defaults,
-            enclosing_class: &self.module.registry.enclosing_class,
-            func_type_params: &self.module.registry.func_type_params,
-                    top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-                    delegated_body_props: &self.module.registry.delegated_body_props,
-                    installed_bindings: Arc::clone(&self.installed_bindings),
-            class_default_outer: self.class_default_outer.clone(),
-            closures: &mut self.closures,
+        let result = {
+            let mut host = self.make_host(out);
+            klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host)
+                .map_err(VmError::from)
         };
-        klio_ir::eval::eval_with(&module, &func, Vec::new(), &mut host).map_err(VmError::from)
+        // Join every still-running spawned thread before returning so
+        // a program that omits an explicit `join()` does not lose a
+        // child's writes (and the process does not outlive them). A
+        // child that threw surfaces here only if `main` itself did
+        // not already fail.
+        let pending: Vec<u64> = {
+            let g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+            g.keys().copied().collect()
+        };
+        for id in pending {
+            let handle = {
+                let mut g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+                g.get_mut(&id).and_then(|e| e.handle.take())
+            };
+            if let Some(h) = handle {
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) if result.is_ok() => {
+                        return Err(VmError::Eval(format!("{e}")));
+                    }
+                    Ok(Err(_)) => {}
+                    Err(_) if result.is_ok() => {
+                        return Err(VmError::Eval(
+                            "spawned thread panicked".into(),
+                        ));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        result
     }
 }
 
@@ -484,45 +581,49 @@ struct VmHost<'a> {
     module: Arc<klio_ir::Module>,
     scheduler: &'a mut dyn klio_runtime::Scheduler,
     out: &'a mut dyn Output,
-    instance_id_counter: &'a mut u64,
+    instance_id_counter: Arc<AtomicU64>,
     classes: klio_runtime::ObjRef<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>,
-    body_prop_inits:
-        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    instance_prop_getters:
-        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    instance_prop_setters:
-        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    parent_ctor_args:
-        &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
-    init_blocks: &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
-    extension_props:
-        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    extension_prop_setters:
-        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    prog: Arc<ProgramImage>,
     anon_methods: klio_runtime::ObjRef<std::collections::HashMap<
         (String, String),
         (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>,
-    companion_singletons: &'a std::collections::HashMap<String, String>,
-    secondary_ctors:
-        &'a std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
-    class_delegates:
-        &'a std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
-    func_defaults:
-        &'a std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
-    enclosing_class:
-        &'a std::collections::HashMap<String, String>,
-    func_type_params:
-        &'a std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
-    top_level_delegated_props: &'a std::collections::HashSet<String>,
-    delegated_body_props: &'a std::collections::HashSet<(String, String)>,
-    installed_bindings: Arc<klio_stdlib::HostBindings>,
     class_default_outer:
         klio_runtime::ObjRef<std::collections::HashMap<String, klio_runtime::Value>>,
-    closures: &'a mut Vec<ClosureInfo>,
+    closures: SharedClosures,
+    out_sink: klio_runtime::SharedOutput,
+    threads: Arc<Mutex<std::collections::HashMap<u64, ThreadEntry>>>,
 }
 
 impl<'a> VmHost<'a> {
+    /// Join the spawned OS thread `id`, propagating a thrown
+    /// Throwable as a `RuntimeError`. Idempotent: a second join (or
+    /// an unknown id) is a no-op since the happens-before edge was
+    /// already established. `fence_and_publish` marks the boundary.
+    fn join_spawned(&mut self, id: u64) -> Result<(), klio_runtime::RuntimeError> {
+        let handle = {
+            let mut g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+            g.get_mut(&id).and_then(|e| e.handle.take())
+        };
+        let Some(handle) = handle else {
+            return Ok(());
+        };
+        let res = handle.join().map_err(|_| {
+            klio_runtime::RuntimeError::Type("spawned thread panicked".into())
+        })?;
+        klio_runtime::fence_and_publish(); // thread join
+        res
+    }
+
+    /// Whether spawned thread `id` is still running.
+    fn thread_alive(&self, id: u64) -> bool {
+        let g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+        match g.get(&id) {
+            Some(e) => e.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false),
+            None => false,
+        }
+    }
+
     /// Drive a lazy `Value::Sequence` to completion. Each upstream
     /// item flows through the pipeline ops by invoking the user
     /// lambdas via `self.call_value`. Sorting ops buffer-and-emit.
@@ -534,34 +635,20 @@ impl<'a> VmHost<'a> {
         &mut self,
         seq_val: &klio_runtime::Value,
     ) -> Result<Vec<klio_runtime::Value>, klio_ir::eval::EvalError> {
-        let module_for_intrinsic = Arc::clone(&self.module);
         let mut intrinsic_host = VmIntrinsicHost {
             scheduler: &mut *self.scheduler,
-            module: module_for_intrinsic,
-            closures: &mut *self.closures,
+            module: Arc::clone(&self.module),
+            closures: self.closures.clone(),
             globals: self.globals.clone(),
             classes: self.classes.clone(),
-            body_prop_inits: self.body_prop_inits,
-            instance_prop_getters: self.instance_prop_getters,
-            instance_prop_setters: self.instance_prop_setters,
-            parent_ctor_args: self.parent_ctor_args,
-            init_blocks: self.init_blocks,
-            extension_props: self.extension_props,
-            extension_prop_setters: self.extension_prop_setters,
+            prog: Arc::clone(&self.prog),
             anon_methods: self.anon_methods.clone(),
-            companion_singletons: &self.module.registry.companion_singletons,
-            secondary_ctors: self.secondary_ctors,
-            class_delegates: self.class_delegates,
-            func_defaults: self.func_defaults,
-            enclosing_class: &self.module.registry.enclosing_class,
-            func_type_params: &self.module.registry.func_type_params,
-            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-            delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Arc::clone(&self.installed_bindings),
             class_default_outer: self.class_default_outer.clone(),
-            instance_id_counter: &mut *self.instance_id_counter,
+            instance_id_counter: Arc::clone(&self.instance_id_counter),
+            out_sink: self.out_sink.clone(),
+            threads: Arc::clone(&self.threads),
         };
-        klio_stdlib::materialise_sequence(seq_val, &mut intrinsic_host, self.out)
+        klio_stdlib::materialise_sequence(seq_val, &mut intrinsic_host, &mut *self.out)
             .map_err(|e| match e {
                 klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
                 other => klio_ir::eval::EvalError::Type(format!("{other}")),
@@ -726,7 +813,7 @@ impl<'a> VmHost<'a> {
     /// `installed_bindings` overlay first so a loaded pack's binding
     /// shadows the stdlib's default implementation.
     fn lookup_intrinsic(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
-        self.installed_bindings
+        self.prog.installed_bindings
             .resolve(fqn)
             .or_else(|| klio_stdlib::implementation(fqn))
     }
@@ -741,36 +828,22 @@ impl<'a> VmHost<'a> {
         // module. This lets HOF stdlib bindings (`map`, `forEach`,
         // scope fns) call back into IR-lowered lambda bodies
         // natively, without bouncing through klio-interp.
-        let module_for_intrinsic = Arc::clone(&self.module);
         let mut intrinsic_host = VmIntrinsicHost {
             scheduler: &mut *self.scheduler,
-            module: module_for_intrinsic,
-            closures: &mut *self.closures,
+            module: Arc::clone(&self.module),
+            closures: self.closures.clone(),
             globals: self.globals.clone(),
             classes: self.classes.clone(),
-            body_prop_inits: self.body_prop_inits,
-            instance_prop_getters: self.instance_prop_getters,
-            instance_prop_setters: self.instance_prop_setters,
-            parent_ctor_args: self.parent_ctor_args,
-            init_blocks: self.init_blocks,
-            extension_props: self.extension_props,
-            extension_prop_setters: self.extension_prop_setters,
+            prog: Arc::clone(&self.prog),
             anon_methods: self.anon_methods.clone(),
-            companion_singletons: &self.module.registry.companion_singletons,
-            secondary_ctors: self.secondary_ctors,
-            class_delegates: self.class_delegates,
-            func_defaults: self.func_defaults,
-            enclosing_class: &self.module.registry.enclosing_class,
-            func_type_params: &self.module.registry.func_type_params,
-            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-            delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Arc::clone(&self.installed_bindings),
             class_default_outer: self.class_default_outer.clone(),
-            instance_id_counter: &mut *self.instance_id_counter,
+            instance_id_counter: Arc::clone(&self.instance_id_counter),
+            out_sink: self.out_sink.clone(),
+            threads: Arc::clone(&self.threads),
         };
         let mut ctx = klio_runtime::CallCtx {
             args,
-            out: self.out,
+            out: &mut *self.out,
             host: &mut intrinsic_host,
         };
         func(&mut ctx).map_err(|e| match e {
@@ -876,8 +949,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // Vm's CallValue path dispatches through eval_with.
             let func = self.module.funcs.get(fid.0 as usize).cloned()?;
             let n_params = func.params.len();
-            let id = self.closures.len() as u64;
-            self.closures.push(ClosureInfo {
+            let id = self.closures.push(ClosureInfo {
                 body_func: fid,
                 n_params,
                 capture_names: Vec::new(),
@@ -909,7 +981,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // package.
         {
             let suffix = format!(".{name}");
-            let entry: Option<(&'static str, klio_runtime::StdlibFn)> = self
+            let entry: Option<(&'static str, klio_runtime::StdlibFn)> = self.prog
                 .installed_bindings
                 .entries()
                 .find(|(k, _)| k.ends_with(&suffix))
@@ -1119,8 +1191,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // `__sam_target__`; call_member on this instance routes
             // any method call back through the lambda.
             if cls.is_fun_interface && args.len() == 1 {
-                *self.instance_id_counter += 1;
-                let identity = *self.instance_id_counter;
+                let identity = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                 let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                     class: Arc::clone(cls),
                     fields: vec![("__sam_target__".to_string(), args[0].clone())],
@@ -1143,8 +1214,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // module index. The runtime ClassDef carries enough to
             // bind primary-param properties; init blocks + custom
             // getters land when local-class lowering grows them.
-            *self.instance_id_counter += 1;
-            let identity = *self.instance_id_counter;
+            let identity = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
             let mut fields: Vec<(String, klio_runtime::Value)> =
                 Vec::with_capacity(cls.primary_params.len());
             for (param, value) in cls.primary_params.iter().zip(args.iter()) {
@@ -1204,7 +1274,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
         }
         if let klio_runtime::Value::IrClosure { id, captures } = callee {
-            let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
+            let info = self.closures.get(*id as usize).ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
             })?;
             let module = Arc::clone(&self.module);
@@ -1222,7 +1292,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // top-level fn: e.g. a closure-of `kotlinx.datetime.__kxdt_*`
             // dispatches the Rust binding instead of running the
             // shim placeholder body.
-            if let Some(intrinsic) = self.installed_bindings.resolve(&func.fqn) {
+            if let Some(intrinsic) = self.prog.installed_bindings.resolve(&func.fqn) {
                 return self.dispatch_intrinsic(intrinsic, args);
             }
             // Fill missing positional args from the target's
@@ -1231,7 +1301,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // Pack trailing vararg args into an Array when the
             // target's last param is marked vararg.
             let defaults =
-                self.func_defaults.get(&info.body_func).cloned();
+                self.prog.func_defaults.get(&info.body_func).cloned();
             let mut call_args = pad_args_with_defaults(
                 &module,
                 info.n_params,
@@ -1304,14 +1374,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         // `Thread` handle property reads (`t.name`, `t.isAlive`).
         // Mirrors the member-call interception in `call_member`.
-        if let klio_runtime::Value::Intrinsic { fqn, .. } = receiver {
+        if let klio_runtime::Value::BoundMethod { fqn, receiver: tid, .. } = receiver {
             if *fqn == "kotlin.concurrent.Thread" {
+                let id = match **tid {
+                    klio_runtime::Value::Long(v) => v as u64,
+                    _ => 0,
+                };
                 match name {
-                    "isAlive" => return Ok(klio_runtime::Value::Bool(false)),
+                    "isAlive" => {
+                        return Ok(klio_runtime::Value::Bool(self.thread_alive(id)))
+                    }
                     "name" => {
-                        return Ok(klio_runtime::Value::String(Arc::new(
-                            "Thread-0".to_string(),
-                        )))
+                        return Ok(klio_runtime::Value::String(Arc::new(format!(
+                            "klio-thread-{id}"
+                        ))))
                     }
                     _ => {}
                 }
@@ -1371,7 +1447,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // the lowered Func; surface its metadata as field reads so
         // user code can introspect a callable.
         if let klio_runtime::Value::IrClosure { id, .. } = receiver {
-            if let Some(info) = self.closures.get(*id as usize).cloned() {
+            if let Some(info) = self.closures.get(*id as usize) {
                 if let Some(f) = self.module.funcs.get(info.body_func.0 as usize) {
                     match name {
                         "name" => {
@@ -1448,7 +1524,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             };
             if let Some(fid) = self
-                .extension_props
+                .prog.extension_props
                 .get(&(recv_simple, name.to_string()))
                 .copied()
             {
@@ -1620,7 +1696,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
-            if self
+            if self.module.registry
                 .delegated_body_props
                 .contains(&(class_name.clone(), name.to_string()))
             {
@@ -1637,7 +1713,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     );
                 }
             }
-            if let Some(fid) = self
+            if let Some(fid) = self.prog
                 .instance_prop_getters
                 .get(&(class_name.clone(), name.to_string()))
                 .copied()
@@ -1780,7 +1856,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         // companions chain `Inner` → `Outer` so
                         // bare-name lookups for outer companion
                         // statics resolve.
-                        cur_outer = self
+                        cur_outer = self.module.registry
                             .enclosing_class
                             .get(&cls.name)
                             .cloned()
@@ -1917,7 +1993,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     f.rsplit('.').next().unwrap_or(f).to_string()
                 }
             };
-            if let Some(fid) = self
+            if let Some(fid) = self.prog
                 .extension_prop_setters
                 .get(&(recv_simple, real_name.to_string()))
                 .copied()
@@ -1946,7 +2022,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             if !bypass_setter {
                 let class_name = inst.borrow().class.name.clone();
-                if self
+                if self.module.registry
                     .delegated_body_props
                     .contains(&(class_name.clone(), real_name.to_string()))
                 {
@@ -1964,7 +2040,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         return Ok(());
                     }
                 }
-                if let Some(fid) = self
+                if let Some(fid) = self.prog
                     .instance_prop_setters
                     .get(&(class_name, real_name.to_string()))
                     .copied()
@@ -2069,8 +2145,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // invoked, dispatches `recv.method(args)`. We synthesise a
         // tiny Instance whose `__bound_receiver__` + `__bound_name__`
         // fields drive the call_value path below.
-        *self.instance_id_counter += 1;
-        let identity = *self.instance_id_counter;
+        let identity = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         let synth_class = Arc::new(klio_runtime::ClassDef {
             name: format!("$bound_ref${name}"),
             fqn: format!("$bound_ref${name}"),
@@ -2377,8 +2452,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // SAM-like wrappers used by tests. Full lowering lands when
         // the IR Class shape supports it.
         if let klio_ast::Expr::ObjectExpr { members, supertypes, supertype_args, .. } = ast {
-            *self.instance_id_counter += 1;
-            let identity = *self.instance_id_counter;
+            let identity = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
             // Lower each method body into a per-method side
             // module + FuncId. dispatch at call_member time.
             let synth_class_name = format!("$anon${identity}");
@@ -2945,7 +3019,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Pack-installed binding fast path: a top-level function whose
         // package-qualified FQN matches a registered binding shadows
         // the shim body shipped in source.
-        if let Some(intrinsic) = self.installed_bindings.resolve(&f.fqn) {
+        if let Some(intrinsic) = self.prog.installed_bindings.resolve(&f.fqn) {
             let v = self.dispatch_intrinsic(intrinsic, &args)?;
             return Ok(v);
         }
@@ -2971,7 +3045,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 let lead = args.len() - 1;
                 let last_param = f.params.len() - 1;
                 if lead < last_param {
-                    if let Some(defaults) = self.func_defaults.get(&func).cloned() {
+                    if let Some(defaults) = self.prog.func_defaults.get(&func).cloned() {
                         let trailing = args.pop().unwrap();
                         for idx in lead..last_param {
                             if let Some(Some(default_fid)) = defaults.get(idx) {
@@ -3003,7 +3077,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
         }
         if args.len() < f.params.len() {
-            if let Some(defaults) = self.func_defaults.get(&func).cloned() {
+            if let Some(defaults) = self.prog.func_defaults.get(&func).cloned() {
                 for idx in args.len()..f.params.len() {
                     if let Some(Some(default_fid)) = defaults.get(idx) {
                         let dfid = *default_fid;
@@ -3092,7 +3166,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // snapshot any pre-existing bindings, install the new
         // ones, then restore on exit so concurrent / recursive
         // calls don't see stale T values.
-        let names: Vec<String> = self
+        let names: Vec<String> = self.module.registry
             .func_type_params
             .get(&func)
             .cloned()
@@ -3135,9 +3209,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 "Vm: lambda lower did not provide body_func".into(),
             )
         })?;
-        let id = self.closures.len() as u64;
         let cell = klio_runtime::ObjRef::new(captures.clone());
-        self.closures.push(ClosureInfo {
+        let id = self.closures.push(ClosureInfo {
             body_func,
             n_params: params.len(),
             capture_names: captured_names.to_vec(),
@@ -3155,7 +3228,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         if let klio_runtime::Value::IrClosure { id, .. } = lambda {
-            let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
+            let info = self.closures.get(*id as usize).ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
             })?;
             for (idx, cap_name) in info.capture_names.iter().enumerate() {
@@ -3269,7 +3342,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 format!("{cls_name}.{name}"),
             ];
             for p in &probes {
-                if let Some(func) = self.installed_bindings.resolve(p) {
+                if let Some(func) = self.prog.installed_bindings.resolve(p) {
                     let mut all_args: Vec<klio_runtime::Value> =
                         Vec::with_capacity(args.len() + 1);
                     all_args.push(receiver.clone());
@@ -3288,18 +3361,33 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // happens-before guarantee already holds; `isAlive` is false
         // and `name` is a stable string. `fence_and_publish` marks the
         // join boundary.
-        if let klio_runtime::Value::Intrinsic { fqn, .. } = receiver {
+        if let klio_runtime::Value::BoundMethod { fqn, receiver: tid, .. } = receiver {
             if *fqn == "kotlin.concurrent.Thread" {
+                let id = match **tid {
+                    klio_runtime::Value::Long(v) => v as u64,
+                    _ => 0,
+                };
                 match name {
                     "join" => {
-                        klio_runtime::fence_and_publish(); // thread join
-                        return Ok(klio_runtime::Value::Unit);
+                        return self
+                            .join_spawned(id)
+                            .map(|()| klio_runtime::Value::Unit)
+                            .map_err(|e| match e {
+                                klio_runtime::RuntimeError::Thrown(v) => {
+                                    klio_ir::eval::EvalError::Throw(v)
+                                }
+                                other => {
+                                    klio_ir::eval::EvalError::Type(format!("{other}"))
+                                }
+                            });
                     }
-                    "isAlive" => return Ok(klio_runtime::Value::Bool(false)),
+                    "isAlive" => {
+                        return Ok(klio_runtime::Value::Bool(self.thread_alive(id)))
+                    }
                     "name" => {
-                        return Ok(klio_runtime::Value::String(Arc::new(
-                            "Thread-0".to_string(),
-                        )))
+                        return Ok(klio_runtime::Value::String(Arc::new(format!(
+                            "klio-thread-{id}"
+                        ))))
                     }
                     "start" | "interrupt" => return Ok(klio_runtime::Value::Unit),
                     _ => {}
@@ -3730,7 +3818,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
             if args.is_empty() {
                 if let klio_runtime::Value::IrClosure { id, .. } = receiver {
-                    if let Some(info) = self.closures.get(*id as usize).cloned() {
+                    if let Some(info) = self.closures.get(*id as usize) {
                         if let Some(f) = self.module.funcs.get(info.body_func.0 as usize)
                         {
                             match name {
@@ -4842,8 +4930,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // `__sam_target__` field captures the lambda; method
             // calls on the result invoke the captured callable.
             if class_def.is_fun_interface && args.len() == 1 {
-                *self.instance_id_counter += 1;
-                let identity = *self.instance_id_counter;
+                let identity = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                 let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                     class: Arc::clone(&class_def),
                     fields: vec![("__sam_target__".to_string(), args[0].clone())],
@@ -4875,13 +4962,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // still route to the matching secondary so its body runs —
         // otherwise the instance is left with uninitialised fields.
         let zero_primary_secondary = n_primary == 0
-            && self
+            && self.prog
                 .secondary_ctors
                 .get(&class_def.name)
                 .map_or(false, |v| v.iter().any(|e| e.param_count == args.len()));
         let shell_guarded = with_ctor_guard(|g| g.borrow().iter().any(|n| n == &class_def.name));
         if !shell_guarded && (args.len() != n_primary || zero_primary_secondary) {
-            let entries = self
+            let entries = self.prog
                 .secondary_ctors
                 .get(&class_def.name)
                 .cloned()
@@ -5084,8 +5171,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             )));
         }
         let args = effective_args.as_slice();
-        *self.instance_id_counter += 1;
-        let identity = *self.instance_id_counter;
+        let identity = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         let mut fields: Vec<(String, klio_runtime::Value)> =
             Vec::with_capacity(class_def.primary_params.len() + class_def.body_properties.len());
         // Walk the parent ctor chain top-down: each parent gets
@@ -5130,7 +5216,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 );
                 let parent_def = self.classes.borrow().get(&pname).cloned();
                 if is_throwable_name && parent_def.is_none() {
-                    if let Some(thunks) = self.parent_ctor_args.get(&cur_class).cloned() {
+                    if let Some(thunks) = self.prog.parent_ctor_args.get(&cur_class).cloned() {
                         for (idx, fid) in thunks.iter().enumerate() {
                             if let Some(func) =
                                 self.module.funcs.get(fid.0 as usize).cloned()
@@ -5152,7 +5238,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
-        while let Some(thunks) = self.parent_ctor_args.get(&cur_class).cloned() {
+        while let Some(thunks) = self.prog.parent_ctor_args.get(&cur_class).cloned() {
             let cur_def = self.classes.borrow().get(&cur_class).cloned();
             let parent_name = cur_def
                 .as_ref()
@@ -5219,7 +5305,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // store the resulting delegate values on the instance
         // under `__delegate__<superName>` so call_member can
         // forward unmatched methods.
-        let class_delegate_thunks = self
+        let class_delegate_thunks = self.prog
             .class_delegates
             .get(&class_def.name)
             .cloned()
@@ -5255,7 +5341,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // override the same name.
         for cls in chain_classes.iter().rev() {
         for p in &cls.body_properties {
-            if let Some(fid) = self
+            if let Some(fid) = self.prog
                 .body_prop_inits
                 .get(&(cls.name.clone(), p.name.clone()))
                 .copied()
@@ -5276,7 +5362,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 all.push(inst_value.clone());
                 all.extend_from_slice(args);
                 let mut v = klio_ir::eval::eval_with(&module, &func, all, self)?;
-                if self
+                if self.module.registry
                     .delegated_body_props
                     .contains(&(cls.name.clone(), p.name.clone()))
                 {
@@ -5336,7 +5422,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // parent's init runs before its child's. Each init block
         // takes `this` as its sole param.
         for (cls_name, cls_args) in chain.iter().rev() {
-            if let Some(fids) = self.init_blocks.get(cls_name).cloned() {
+            if let Some(fids) = self.prog.init_blocks.get(cls_name).cloned() {
                 for fid in fids {
                     let func = self.module.funcs.get(fid.0 as usize).cloned();
                     if let Some(f) = func {
@@ -5550,43 +5636,19 @@ fn materialise_range_items(
 struct VmIntrinsicHost<'a> {
     scheduler: &'a mut dyn klio_runtime::Scheduler,
     module: Arc<klio_ir::Module>,
-    closures: &'a mut Vec<ClosureInfo>,
+    closures: SharedClosures,
     globals: klio_runtime::ObjRef<klio_runtime::Env>,
     classes: klio_runtime::ObjRef<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>,
-    body_prop_inits:
-        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    instance_prop_getters:
-        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    instance_prop_setters:
-        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    parent_ctor_args:
-        &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
-    init_blocks: &'a std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
-    extension_props:
-        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    extension_prop_setters:
-        &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    prog: Arc<ProgramImage>,
     anon_methods: klio_runtime::ObjRef<std::collections::HashMap<
         (String, String),
         (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
     >>,
-    companion_singletons: &'a std::collections::HashMap<String, String>,
-    secondary_ctors:
-        &'a std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
-    class_delegates:
-        &'a std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
-    func_defaults:
-        &'a std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
-    enclosing_class:
-        &'a std::collections::HashMap<String, String>,
-    func_type_params:
-        &'a std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
-    top_level_delegated_props: &'a std::collections::HashSet<String>,
-    delegated_body_props: &'a std::collections::HashSet<(String, String)>,
-    installed_bindings: Arc<klio_stdlib::HostBindings>,
     class_default_outer:
         klio_runtime::ObjRef<std::collections::HashMap<String, klio_runtime::Value>>,
-    instance_id_counter: &'a mut u64,
+    instance_id_counter: Arc<AtomicU64>,
+    out_sink: klio_runtime::SharedOutput,
+    threads: Arc<Mutex<std::collections::HashMap<u64, ThreadEntry>>>,
 }
 
 /// How the default interceptor interprets a `delay` directive.
@@ -5833,6 +5895,43 @@ fn with_ctor_guard<R>(f: impl FnOnce(&RefCell<Vec<String>>) -> R) -> R {
 }
 
 impl<'a> VmIntrinsicHost<'a> {
+    /// Build a transient `VmHost` over the same shared state, bound
+    /// to `out` for the duration of one delegated evaluation.
+    fn vm_host<'s>(&'s mut self, out: &'s mut dyn Output) -> VmHost<'s> {
+        VmHost {
+            globals: self.globals.clone(),
+            module: Arc::clone(&self.module),
+            scheduler: &mut *self.scheduler,
+            out,
+            instance_id_counter: Arc::clone(&self.instance_id_counter),
+            classes: self.classes.clone(),
+            prog: Arc::clone(&self.prog),
+            anon_methods: self.anon_methods.clone(),
+            class_default_outer: self.class_default_outer.clone(),
+            closures: self.closures.clone(),
+            out_sink: self.out_sink.clone(),
+            threads: Arc::clone(&self.threads),
+        }
+    }
+
+    /// A sibling `VmIntrinsicHost` over the same shared state, used
+    /// when an intrinsic recursively dispatches another intrinsic.
+    fn child_host(&mut self) -> VmIntrinsicHost<'_> {
+        VmIntrinsicHost {
+            scheduler: &mut *self.scheduler,
+            module: Arc::clone(&self.module),
+            closures: self.closures.clone(),
+            globals: self.globals.clone(),
+            classes: self.classes.clone(),
+            prog: Arc::clone(&self.prog),
+            anon_methods: self.anon_methods.clone(),
+            class_default_outer: self.class_default_outer.clone(),
+            instance_id_counter: Arc::clone(&self.instance_id_counter),
+            out_sink: self.out_sink.clone(),
+            threads: Arc::clone(&self.threads),
+        }
+    }
+
     /// Construct an instance through the full constructor pipeline.
     /// The intrinsic child host has no `new_instance` of its own, so
     /// build a transient `VmHost` over the same shared state (the
@@ -5845,33 +5944,7 @@ impl<'a> VmIntrinsicHost<'a> {
         args: &[klio_runtime::Value],
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        let mut host = VmHost {
-            globals: self.globals.clone(),
-            module: Arc::clone(&self.module),
-            scheduler: &mut *self.scheduler,
-            out,
-            instance_id_counter: &mut *self.instance_id_counter,
-            classes: self.classes.clone(),
-            body_prop_inits: self.body_prop_inits,
-            instance_prop_getters: self.instance_prop_getters,
-            instance_prop_setters: self.instance_prop_setters,
-            parent_ctor_args: self.parent_ctor_args,
-            init_blocks: self.init_blocks,
-            extension_props: self.extension_props,
-            extension_prop_setters: self.extension_prop_setters,
-            anon_methods: self.anon_methods.clone(),
-            companion_singletons: &self.module.registry.companion_singletons,
-            secondary_ctors: self.secondary_ctors,
-            class_delegates: self.class_delegates,
-            func_defaults: self.func_defaults,
-            enclosing_class: &self.module.registry.enclosing_class,
-            func_type_params: &self.module.registry.func_type_params,
-            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-            delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Arc::clone(&self.installed_bindings),
-            class_default_outer: self.class_default_outer.clone(),
-            closures: &mut *self.closures,
-        };
+        let mut host = self.vm_host(out);
         <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, args)
     }
 
@@ -5893,7 +5966,7 @@ impl<'a> VmIntrinsicHost<'a> {
             )));
         };
         let live_captures: Vec<klio_runtime::Value> = (**captures).clone();
-        let info = self.closures.get(*id as usize).cloned().ok_or_else(|| {
+        let info = self.closures.get(*id as usize).ok_or_else(|| {
             klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
         })?;
         let func = self
@@ -5956,27 +6029,14 @@ impl<'a> VmIntrinsicHost<'a> {
                 module: Arc::clone(&self.module),
                 scheduler: &mut *self.scheduler,
                 out,
-                instance_id_counter: &mut *self.instance_id_counter,
+                instance_id_counter: Arc::clone(&self.instance_id_counter),
                 classes: self.classes.clone(),
-                body_prop_inits: self.body_prop_inits,
-                instance_prop_getters: self.instance_prop_getters,
-                instance_prop_setters: self.instance_prop_setters,
-                parent_ctor_args: self.parent_ctor_args,
-                init_blocks: self.init_blocks,
-                extension_props: self.extension_props,
-                extension_prop_setters: self.extension_prop_setters,
+                prog: Arc::clone(&self.prog),
                 anon_methods: self.anon_methods.clone(),
-                companion_singletons: &self.module.registry.companion_singletons,
-                secondary_ctors: self.secondary_ctors,
-                class_delegates: self.class_delegates,
-                func_defaults: self.func_defaults,
-                enclosing_class: &self.module.registry.enclosing_class,
-                func_type_params: &self.module.registry.func_type_params,
-                top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-                delegated_body_props: &self.module.registry.delegated_body_props,
-                installed_bindings: Arc::clone(&self.installed_bindings),
                 class_default_outer: self.class_default_outer.clone(),
-                closures: &mut *self.closures,
+                closures: self.closures.clone(),
+                out_sink: self.out_sink.clone(),
+                threads: Arc::clone(&self.threads),
             };
             klio_ir::eval::eval_with_captures(
                 &module,
@@ -6003,33 +6063,7 @@ impl<'a> VmIntrinsicHost<'a> {
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         let module = Arc::clone(&self.module);
-        let mut host = VmHost {
-            globals: self.globals.clone(),
-            module: Arc::clone(&module),
-            scheduler: &mut *self.scheduler,
-            out,
-            instance_id_counter: &mut *self.instance_id_counter,
-            classes: self.classes.clone(),
-            body_prop_inits: self.body_prop_inits,
-            instance_prop_getters: self.instance_prop_getters,
-            instance_prop_setters: self.instance_prop_setters,
-            parent_ctor_args: self.parent_ctor_args,
-            init_blocks: self.init_blocks,
-            extension_props: self.extension_props,
-            extension_prop_setters: self.extension_prop_setters,
-            anon_methods: self.anon_methods.clone(),
-            companion_singletons: &self.module.registry.companion_singletons,
-            secondary_ctors: self.secondary_ctors,
-            class_delegates: self.class_delegates,
-            func_defaults: self.func_defaults,
-            enclosing_class: &self.module.registry.enclosing_class,
-            func_type_params: &self.module.registry.func_type_params,
-            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-            delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Arc::clone(&self.installed_bindings),
-            class_default_outer: self.class_default_outer.clone(),
-            closures: &mut *self.closures,
-        };
+        let mut host = self.vm_host(out);
         klio_ir::eval::resume_continuation(&module, state, value, &mut host)
     }
 
@@ -6214,7 +6248,6 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             let info = self
                 .closures
                 .get(*id as usize)
-                .cloned()
                 .ok_or_else(|| klio_runtime::RuntimeError::Type(format!(
                     "unknown IrClosure id {id}"
                 )))?;
@@ -6228,7 +6261,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     info.body_func.0
                 )))?;
             let defaults =
-                self.func_defaults.get(&info.body_func).cloned();
+                self.prog.func_defaults.get(&info.body_func).cloned();
             let capture_values: Vec<klio_runtime::Value> = info.captures.borrow().clone();
             let module = Arc::clone(&self.module);
             // Mutable-capture support: pre-define each captured name
@@ -6248,27 +6281,14 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     module: Arc::clone(&self.module),
                     scheduler: &mut *self.scheduler,
                     out,
-                    instance_id_counter: &mut *self.instance_id_counter,
+                    instance_id_counter: Arc::clone(&self.instance_id_counter),
                     classes: self.classes.clone(),
-                    body_prop_inits: self.body_prop_inits,
-                    instance_prop_getters: self.instance_prop_getters,
-                    instance_prop_setters: self.instance_prop_setters,
-                    parent_ctor_args: self.parent_ctor_args,
-            init_blocks: self.init_blocks,
-            extension_props: self.extension_props,
-            extension_prop_setters: self.extension_prop_setters,
-            anon_methods: self.anon_methods.clone(),
-                    companion_singletons: &self.module.registry.companion_singletons,
-                    secondary_ctors: self.secondary_ctors,
-                    class_delegates: self.class_delegates,
-                    func_defaults: self.func_defaults,
-                    enclosing_class: &self.module.registry.enclosing_class,
-                    func_type_params: &self.module.registry.func_type_params,
-            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-            delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Arc::clone(&self.installed_bindings),
+                    prog: Arc::clone(&self.prog),
+                    anon_methods: self.anon_methods.clone(),
                     class_default_outer: self.class_default_outer.clone(),
-                    closures: &mut *self.closures,
+                    closures: self.closures.clone(),
+                    out_sink: self.out_sink.clone(),
+                    threads: Arc::clone(&self.threads),
                 };
                 match pad_args_with_defaults(
                     &module,
@@ -6327,32 +6347,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             }
         }
         if let klio_runtime::Value::Intrinsic { func, .. } = callable {
-            let mut child = VmIntrinsicHost {
-                scheduler: &mut *self.scheduler,
-                module: Arc::clone(&self.module),
-                closures: &mut *self.closures,
-                globals: self.globals.clone(),
-                classes: self.classes.clone(),
-                body_prop_inits: self.body_prop_inits,
-                instance_prop_getters: self.instance_prop_getters,
-                instance_prop_setters: self.instance_prop_setters,
-                parent_ctor_args: self.parent_ctor_args,
-            init_blocks: self.init_blocks,
-            extension_props: self.extension_props,
-            extension_prop_setters: self.extension_prop_setters,
-            anon_methods: self.anon_methods.clone(),
-                companion_singletons: &self.module.registry.companion_singletons,
-                secondary_ctors: self.secondary_ctors,
-                class_delegates: self.class_delegates,
-                func_defaults: self.func_defaults,
-                enclosing_class: &self.module.registry.enclosing_class,
-                func_type_params: &self.module.registry.func_type_params,
-            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-            delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Arc::clone(&self.installed_bindings),
-                class_default_outer: self.class_default_outer.clone(),
-                instance_id_counter: &mut *self.instance_id_counter,
-            };
+            let mut child = self.child_host();
             let mut ctx = klio_runtime::CallCtx {
                 args,
                 out,
@@ -6383,7 +6378,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         // in lambda bodies). The capture is overridden via the
         // closure's captures cell before invoke.
         if let klio_runtime::Value::IrClosure { id, .. } = callable {
-            let info = self.closures.get(*id as usize).cloned();
+            let info = self.closures.get(*id as usize);
             if let Some(info) = info {
                 // Override the captured `this` slot, if present.
                 let prior_this: Option<klio_runtime::Value> = info
@@ -6457,34 +6452,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         // Build a VmHost that shares this IntrinsicHost's tables
         // and route through call_member so the dispatch picks up
         // user override methods (`override fun toString()` etc.).
-        let module = Arc::clone(&self.module);
-        let mut host = VmHost {
-            globals: self.globals.clone(),
-            module: Arc::clone(&module),
-            scheduler: &mut *self.scheduler,
-            out,
-            instance_id_counter: &mut *self.instance_id_counter,
-            classes: self.classes.clone(),
-            body_prop_inits: self.body_prop_inits,
-            instance_prop_getters: self.instance_prop_getters,
-            instance_prop_setters: self.instance_prop_setters,
-            parent_ctor_args: self.parent_ctor_args,
-            init_blocks: self.init_blocks,
-            extension_props: self.extension_props,
-            extension_prop_setters: self.extension_prop_setters,
-            anon_methods: self.anon_methods.clone(),
-            companion_singletons: &self.module.registry.companion_singletons,
-            secondary_ctors: self.secondary_ctors,
-            class_delegates: self.class_delegates,
-            func_defaults: self.func_defaults,
-            enclosing_class: &self.module.registry.enclosing_class,
-            func_type_params: &self.module.registry.func_type_params,
-            top_level_delegated_props: &self.module.registry.top_level_delegated_props,
-            delegated_body_props: &self.module.registry.delegated_body_props,
-            installed_bindings: Arc::clone(&self.installed_bindings),
-            class_default_outer: self.class_default_outer.clone(),
-            closures: &mut *self.closures,
-        };
+        let mut host = self.vm_host(out);
         match <VmHost as klio_ir::eval::Host>::call_member(
             &mut host, receiver, name, args,
         ) {
@@ -6493,6 +6461,107 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 Some(Err(klio_runtime::RuntimeError::Thrown(v)))
             }
             Err(_) => None,
+        }
+    }
+
+    /// Spawn `block` on a real OS thread.
+    ///
+    /// The escaping value graph (`block` and the shared roots the
+    /// child may observe) is `publish_deep`'d *before* the thread
+    /// starts, which is the happens-before that `ObjRef`'s
+    /// `unsafe impl Send` requires. Over-publishing is safe; cells
+    /// the child creates after spawn are thread-local to it until it
+    /// republishes them, which is fine.
+    fn spawn_os_thread(
+        &mut self,
+        block: &klio_runtime::Value,
+        _out: &mut dyn Output,
+    ) -> Result<u64, klio_runtime::RuntimeError> {
+        // Publish the escaping block and every shared root the child
+        // can reach so observing them from the new thread is sound.
+        block.publish_deep();
+        klio_runtime::publish_env_deep(&self.globals);
+        for def in self.classes.borrow().values() {
+            klio_runtime::Value::Class(Arc::clone(def)).publish_deep();
+        }
+        for v in self.class_default_outer.borrow().values() {
+            v.publish_deep();
+        }
+        self.classes.publish();
+        self.anon_methods.publish();
+        self.class_default_outer.publish();
+        klio_runtime::fence_and_publish(); // thread start
+
+        let seed = SendableVmSeed {
+            module: Arc::clone(&self.module),
+            globals: self.globals.clone(),
+            instance_id_counter: Arc::clone(&self.instance_id_counter),
+            classes: self.classes.clone(),
+            prog: Arc::clone(&self.prog),
+            anon_methods: self.anon_methods.clone(),
+            class_default_outer: self.class_default_outer.clone(),
+            closures: self.closures.clone(),
+            out_sink: self.out_sink.clone(),
+            threads: Arc::clone(&self.threads),
+        };
+        let block = block.clone();
+        let time_mode = coroutine_time_mode();
+        let id = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed);
+
+        let handle = std::thread::Builder::new()
+            .name(format!("klio-thread-{id}"))
+            .spawn(move || -> Result<(), klio_runtime::RuntimeError> {
+                set_coroutine_time_mode(time_mode);
+                let mut vm = seed.materialize();
+                let r = vm.run_thread_block(&block);
+                klio_runtime::fence_and_publish(); // body completion → joiner
+                match r {
+                    Ok(v) => {
+                        v.publish_deep();
+                        Ok(())
+                    }
+                    Err(klio_runtime::RuntimeError::Return(v)) => {
+                        v.publish_deep();
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+            .map_err(|e| {
+                klio_runtime::RuntimeError::Type(format!(
+                    "failed to spawn OS thread: {e}"
+                ))
+            })?;
+
+        self.threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, ThreadEntry { handle: Some(handle) });
+        Ok(id)
+    }
+
+    fn join_os_thread(&mut self, id: u64) -> Result<(), klio_runtime::RuntimeError> {
+        let handle = {
+            let mut g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+            g.get_mut(&id).and_then(|e| e.handle.take())
+        };
+        let Some(handle) = handle else {
+            // Already joined (idempotent) or unknown id — the
+            // happens-before edge was established by the first join.
+            return Ok(());
+        };
+        let res = handle.join().map_err(|_| {
+            klio_runtime::RuntimeError::Type("spawned thread panicked".into())
+        })?;
+        klio_runtime::fence_and_publish(); // thread join
+        res
+    }
+
+    fn os_thread_alive(&mut self, id: u64) -> bool {
+        let g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+        match g.get(&id) {
+            Some(e) => e.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false),
+            None => false,
         }
     }
 }
