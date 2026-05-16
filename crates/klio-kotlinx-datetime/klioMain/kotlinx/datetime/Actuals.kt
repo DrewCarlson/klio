@@ -1,9 +1,29 @@
-// Klio shim for kotlinx-datetime.
+// klio platform layer for kotlinx-datetime.
 //
-// Surface area follows kotlinx.datetime's public API. The host
-// bindings in klio-kotlinx-datetime/src/lib.rs supply native helpers
-// (system clock, chrono-backed tz conversions, ISO parsing); the rest
-// of the API is implemented here in pure Kotlin against those helpers.
+// Upstream kotlinx-datetime 0.8.0 core commonMain declares every
+// value type (LocalDate/Time/DateTime, TimeZone, Clock,
+// DateTimePeriod, DateTimeUnit, plus the `kotlin.time.Instant`
+// extensions) only as `expect` / extensions over machinery klio
+// does not have (kotlinx-serialization runtime, the
+// kotlinx.datetime.format parser-combinator DSL, the internal IANA
+// tz database + Tzfile reader, stdlib `kotlin.time.Instant`). The
+// only commonMain files klio consumes verbatim are the self-
+// contained `Month` / `DayOfWeek` enums + factories and the public
+// exception types (see klio.toml `[[source]]`).
+//
+// This file is the klio-supplied platform layer: the concrete value
+// types and operators the consumer needs, implemented in thin Kotlin
+// over the Rust host bindings in this crate (src/lib.rs) — system
+// clock, chrono-backed Instant<->LocalDateTime conversion, ISO
+// parse/format, calendar arithmetic. `Month` / `DayOfWeek` are NOT
+// declared here; `LocalDate.month` / `LocalDateTime.month` resolve to
+// the real upstream `Month` enum via upstream's own `Month(number)`
+// factory, so the consumed upstream code is on the live path.
+//
+// Limitation: TimeZone is backed by chrono-tz in the host (real IANA
+// rules for conversion), but the pure-Kotlin tz database, the format
+// DSL, and serialization are intentionally absent. Anything depending
+// on those is out of scope for this pack.
 
 package kotlinx.datetime
 
@@ -133,6 +153,12 @@ class Duration internal constructor(
 }
 
 class LocalDate(val year: Int, val monthNumber: Int, val dayOfMonth: Int) : Comparable<LocalDate> {
+    // Bridges to the real upstream `Month` enum (consumed verbatim
+    // from core/common/src/Month.kt) via upstream's own `Month(number)`
+    // factory, so the consumed upstream code is exercised on the live
+    // value-type path.
+    val month: Month get() = Month(monthNumber)
+
     override fun compareTo(other: LocalDate): Int {
         if (year != other.year) return year.compareTo(other.year)
         if (monthNumber != other.monthNumber) return monthNumber.compareTo(other.monthNumber)
@@ -181,6 +207,7 @@ class LocalDateTime(val date: LocalDate, val time: LocalTime) : Comparable<Local
 
     val year: Int get() = date.year
     val monthNumber: Int get() = date.monthNumber
+    val month: Month get() = date.month
     val dayOfMonth: Int get() = date.dayOfMonth
     val hour: Int get() = time.hour
     val minute: Int get() = time.minute
@@ -209,7 +236,7 @@ class TimeZone internal constructor(val id: String) {
         fun currentSystemDefault(): TimeZone = TimeZone(__kxdt_currentSystemTimeZoneId())
         fun of(zoneId: String): TimeZone {
             if (!__kxdt_validateTimeZone(zoneId)) {
-                throw IllegalArgumentException("Unknown time-zone id: $zoneId")
+                throw IllegalTimeZoneException("Unknown time-zone id: $zoneId")
             }
             return TimeZone(zoneId)
         }
@@ -239,8 +266,8 @@ object SystemClock : Clock {
 
 // ---------- DateTimePeriod ----------
 //
-// Calendar-aware delta. Used with Instant.plus(period, timeZone) so
-// month/day arithmetic respects DST and varying month lengths via
+// Calendar-aware delta. Used with Instant.plusPeriod(period, timeZone)
+// so month/day arithmetic respects DST and varying month lengths via
 // the host's chrono backend.
 
 class DateTimePeriod(
@@ -320,14 +347,10 @@ fun Instant.minusPeriod(period: DateTimePeriod, timeZone: TimeZone): Instant = p
 // follows upstream kotlinx.datetime: DateBased for whole-day units
 // (Day/Week/Month/Year/etc.) and TimeBased for sub-day units
 // (Nanosecond/Microsecond/Millisecond/Second/Minute/Hour). The
-// shim plus host binding compose into Instant.plus(value, unit, tz)
-// — calendar-aware for date units, fixed-nanosecond for time units.
+// klio surface plus host binding compose into Instant.plus(value,
+// unit, tz) — calendar-aware for date units, fixed-nanosecond for
+// time units.
 
-// DateTimeUnit's hierarchy. The concrete TimeBasedImpl /
-// DateBasedImpl carriers are simple data carriers; the abstract
-// parents (TimeBased / DateBased) live inside DateTimeUnit as
-// nested classes so callers can write `TimeBased`
-// and `DateBased`.
 class TimeBased(val nanoseconds: Long) {
     operator fun times(scalar: Int): TimeBased = TimeBased(nanoseconds * scalar.toLong())
 }
@@ -378,8 +401,8 @@ fun Instant.minusDateUnit(value: Int, unit: DateBased, timeZone: TimeZone): Inst
 //
 // kotlin.time-style fluent builders: `5.seconds`, `2L.hours`, etc.
 // These return kotlinx.datetime.Duration, matching the rest of this
-// shim. kotlin.time.Duration interop is deferred until stdlib carries
-// it as a first-class type.
+// layer. kotlin.time.Duration interop is deferred until stdlib
+// carries it as a first-class type.
 
 val Int.nanoseconds: Duration get() = Duration(0L, this)
 val Int.microseconds: Duration get() = Duration(0L, this * 1_000)

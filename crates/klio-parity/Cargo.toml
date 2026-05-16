@@ -27,6 +27,8 @@ klio-typeck   = { workspace = true }
 klio-stdlib   = { workspace = true }
 klio-kotlinx-coroutines = { workspace = true }
 klio-kotlinx-atomicfu   = { workspace = true }
+klio-kotlinx-datetime   = { workspace = true }
+klio-kotlinx-io         = { workspace = true }
 
 [lints]
 workspace = true

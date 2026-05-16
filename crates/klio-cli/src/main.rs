@@ -1768,7 +1768,7 @@ mod source_selection_tests {
         let cases: &[(&str, &[&str], &[&str])] = &[
             ("crates/klio-kotlinx-coroutines", &["shim"], &["shim/"]),
             ("crates/klio-kotlinx-io", &["upstream", "klioMain"], &["upstream/Buffer.kt"]),
-            ("crates/klio-kotlinx-datetime", &["shim"], &["shim/"]),
+            ("crates/klio-kotlinx-datetime", &["klioMain"], &["klioMain/"]),
             ("crates/klio-kotlinx-atomicfu", &["klioMain"], &["klioMain/"]),
             ("crates/klio-ktor-client", &["shim"], &["shim/"]),
         ];

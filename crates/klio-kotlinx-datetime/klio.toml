@@ -3,8 +3,40 @@ id = "kotlinx.datetime"
 version = "0.8.0"
 abi = 1
 implicit_packages = []
-source_roots = ["shim"]
 auto_bindings = true
+
+# Upstream kotlinx-datetime 0.8.0 core commonMain, consumed straight
+# from the in-pack git submodule. `include` curates exactly the files
+# klio can parse + resolve verbatim with no machinery it lacks: the
+# self-contained Month / DayOfWeek enums + factories and the public
+# exception types. Every other commonMain file is an `expect`
+# declaration whose `actual` lives in core/commonKotlin and pulls in
+# kotlinx-serialization (`@Serializable(with = ...)`), the
+# kotlinx.datetime.format parser-combinator DSL, the internal IANA
+# tz database + Tzfile binary reader, and stdlib `kotlin.time.Instant`
+# / `kotlin.time.Duration`; none of which klio has. Several of those
+# files also use syntax klio's parser does not yet accept (qualified
+# function-type receivers `A.B.() -> Unit`, qualified anonymous-object
+# supertypes, nested-type params in `(x: A.B)` position). They are
+# excluded and the consumer-facing surface is supplied by klioMain.
+[[source]]
+root = "upstream/core/common/src"
+include = [
+    "Month.kt",
+    "DayOfWeek.kt",
+    "Exceptions.kt",
+    "OverloadMarker.kt",
+]
+
+# klio-supplied platform layer. Declares the value types and operators
+# (Instant, LocalDate/Time/DateTime, TimeZone, Duration, Clock,
+# DateTimePeriod, DateTimeUnit, conversions) that upstream commonMain
+# only declares as `expect`. Bodies are thin Kotlin over the Rust host
+# bindings in src/lib.rs (system clock, chrono-backed tz conversion,
+# ISO parse/format, calendar arithmetic). Month / DayOfWeek are NOT
+# redeclared here; they come from the real upstream files above.
+[[source]]
+root = "klioMain"
 
 [[deps]]
 id = "stdlib"

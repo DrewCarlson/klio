@@ -1165,6 +1165,106 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
     Ok(joined)
 }
 
+/// Run a `.kt` file with every in-repo kotlinx pack loaded
+/// (coroutines, atomicfu, datetime, io) off each pack's own
+/// `klio.toml` manifest plus all their Rust host bindings — the
+/// shape the `klio` binary uses for the full kotlinx demo, but
+/// sourced from the workspace so it is independent of
+/// `~/.klio/packs`. Kept separate from `run_with_packs` so the
+/// memory-model conformance / litmus suites that call the latter
+/// see an unchanged pack set.
+pub fn run_with_all_packs(file: &Path) -> Result<String, String> {
+    fn parse(
+        map: &mut SourceMap,
+        path: &Path,
+        text: String,
+    ) -> Result<klio_ast::KotlinFile, String> {
+        let id = map.add(path, text);
+        let src = map.get(id).source.clone();
+        let lexed = Lexer::new(id, &src).tokenize();
+        if lexed.diagnostics.has_errors() {
+            return Err(format!("lex: {:?}", lexed.diagnostics.diagnostics()));
+        }
+        let (ast, diags) = KtParser::new(id, &src, &lexed.tokens).parse_file();
+        if diags.has_errors() {
+            return Err(format!("parse: {:?}", diags.diagnostics()));
+        }
+        Ok(ast)
+    }
+
+    let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .ok_or("workspace root")?;
+    let pack_dirs = [
+        ws.join("crates/klio-kotlinx-coroutines"),
+        ws.join("crates/klio-kotlinx-atomicfu"),
+        ws.join("crates/klio-kotlinx-datetime"),
+        ws.join("crates/klio-kotlinx-io"),
+    ];
+
+    let mut map = SourceMap::new();
+    let mut asts: Vec<klio_ast::KotlinFile> = Vec::new();
+    for pack_dir in &pack_dirs {
+        for src_path in collect_manifest_sources(pack_dir)? {
+            let text = std::fs::read_to_string(&src_path).map_err(|e| e.to_string())?;
+            let ast = parse(&mut map, &src_path, text)?;
+            if let Some(pkg) = &ast.package {
+                let path = pkg
+                    .path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if !path.is_empty() {
+                    klio_stdlib::register_known_package(path);
+                }
+            }
+            asts.push(ast);
+        }
+    }
+    let user_src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+    asts.push(parse(&mut map, file, user_src)?);
+
+    let mut bindings = klio_stdlib::HostBindings::with_stdlib_defaults();
+    for (sym, f) in klio_kotlinx_coroutines::host_bindings().entries() {
+        bindings.register(sym, f);
+    }
+    for (sym, f) in klio_kotlinx_atomicfu::host_bindings().entries() {
+        bindings.register(sym, f);
+    }
+    for (sym, f) in klio_kotlinx_datetime::host_bindings().entries() {
+        bindings.register(sym, f);
+    }
+    for (sym, f) in klio_kotlinx_io::host_bindings().entries() {
+        bindings.register(sym, f);
+    }
+
+    klio_interp_ir::set_coroutine_time_mode(klio_interp_ir::TimeMode::Virtual);
+    for ast in &asts {
+        let r = klio_resolver::resolve(ast);
+        let _ = klio_typeck::typecheck(ast, &r);
+    }
+    let built = klio_interp_ir::build::build_module_files(&asts);
+    let Some(main_id) = built.main else {
+        return Err("no main function in module".into());
+    };
+    let (mut vm, _main) = Vm::from_built(built);
+    vm.set_installed_bindings(bindings);
+    let mut out = CaptureOutput::default();
+    vm.run(main_id, &mut out)
+        .map_err(|e| format!("runtime error: {e}"))?;
+    if !out.cur.is_empty() {
+        out.lines.push(std::mem::take(&mut out.cur));
+    }
+    let mut joined = out.lines.join("\n");
+    if !joined.is_empty() {
+        joined.push('\n');
+    }
+    Ok(joined)
+}
+
 /// Full parity check: compile + run both compilers, return a report.
 pub fn check(file: &Path) -> Result<ParityReport, ParityError> {
     let jar = compile_with_kotlinc(file)?;

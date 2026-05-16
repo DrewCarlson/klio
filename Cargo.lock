@@ -1025,6 +1025,8 @@ dependencies = [
  "klio-interp-ir",
  "klio-kotlinx-atomicfu",
  "klio-kotlinx-coroutines",
+ "klio-kotlinx-datetime",
+ "klio-kotlinx-io",
  "klio-lexer",
  "klio-parser",
  "klio-resolver",
