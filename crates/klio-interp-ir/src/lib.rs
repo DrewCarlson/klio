@@ -4502,7 +4502,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // delegation arg thunks, recurse for `: this(...)`, then
         // run the optional body block.
         let n_primary = class_def.primary_params.len();
-        if args.len() != n_primary {
+        // A class with no primary constructor (e.g. kotlinx-io's
+        // `Segment`, all `private constructor(...)`) initialises its
+        // fields only in a secondary constructor body. When the arg
+        // count happens to equal the (empty) primary's, dispatch must
+        // still route to the matching secondary so its body runs —
+        // otherwise the instance is left with uninitialised fields.
+        let zero_primary_secondary = n_primary == 0
+            && self
+                .secondary_ctors
+                .get(&class_def.name)
+                .map_or(false, |v| v.iter().any(|e| e.param_count == args.len()));
+        let shell_guarded = CTOR_SHELL_GUARD
+            .with(|g| g.borrow().iter().any(|n| n == &class_def.name));
+        if !shell_guarded && (args.len() != n_primary || zero_primary_secondary) {
             let entries = self
                 .secondary_ctors
                 .get(&class_def.name)
@@ -4636,10 +4649,27 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         }
                         leaf
                     }
-                } else {
+                } else if entry.is_this {
+                    // `: this(args)` — delegate to a sibling
+                    // constructor with the resolved arguments.
                     <Self as klio_ir::eval::Host>::new_instance(
                         self, class, &target_args,
                     )?
+                } else {
+                    // `CtorDelegation::None` — implicit `super()`.
+                    // Build the primary instance shell (default
+                    // fields + body-prop inits + init blocks) under a
+                    // recursion guard so this very constructor isn't
+                    // re-dispatched.
+                    CTOR_SHELL_GUARD
+                        .with(|g| g.borrow_mut().push(class_def.name.clone()));
+                    let shell = <Self as klio_ir::eval::Host>::new_instance(
+                        self, class, &[],
+                    );
+                    CTOR_SHELL_GUARD.with(|g| {
+                        g.borrow_mut().pop();
+                    });
+                    shell?
                 };
                 // Body block — evaluate with `[this, ctor_params...]`.
                 if let Some(body_fid) = entry.body {
@@ -5145,6 +5175,12 @@ struct CoroSched {
 
 thread_local! {
     static CORO_STACK: RefCell<Vec<CoroSched>> = const { RefCell::new(Vec::new()) };
+    /// Classes whose instance shell is mid-construction for a
+    /// non-delegating secondary constructor. While a class is on this
+    /// stack, `new_instance` skips secondary dispatch and builds the
+    /// primary shell, so a `constructor() { … }` body that re-enters
+    /// `new_instance` doesn't recurse into itself forever.
+    static CTOR_SHELL_GUARD: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 impl<'a> VmIntrinsicHost<'a> {

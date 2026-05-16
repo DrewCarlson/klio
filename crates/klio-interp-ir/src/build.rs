@@ -473,6 +473,11 @@ pub struct BuiltModule {
 pub struct SecondaryCtorEntry {
     pub param_count: usize,
     pub is_super: bool,
+    /// `true` for an explicit `: this(...)` delegation. Distinguishes
+    /// it from `CtorDelegation::None` (implicit `super()`), which also
+    /// has `is_super == false` but must build the instance shell
+    /// rather than re-dispatch a sibling constructor.
+    pub is_this: bool,
     pub delegation_arg_thunks: Vec<klio_ir::FuncId>,
     /// Optional body block lowered as a 1-arg fn taking `this`.
     pub body: Option<klio_ir::FuncId>,
@@ -1431,10 +1436,10 @@ fn build_module_with_overrides(
                     sc.params.iter().map(|p| p.name.name.clone()).collect();
                 let param_refs: Vec<&str> =
                     param_names.iter().map(|s| s.as_str()).collect();
-                let (delegation_args, is_super) = match &sc.delegation {
-                    klio_ast::CtorDelegation::This(args) => (args.clone(), false),
-                    klio_ast::CtorDelegation::Super(args) => (args.clone(), true),
-                    klio_ast::CtorDelegation::None => (Vec::new(), false),
+                let (delegation_args, is_super, is_this) = match &sc.delegation {
+                    klio_ast::CtorDelegation::This(args) => (args.clone(), false, true),
+                    klio_ast::CtorDelegation::Super(args) => (args.clone(), true, false),
+                    klio_ast::CtorDelegation::None => (Vec::new(), false, false),
                 };
                 let mut arg_fids: Vec<klio_ir::FuncId> =
                     Vec::with_capacity(delegation_args.len());
@@ -1466,6 +1471,7 @@ fn build_module_with_overrides(
                 entries.push(SecondaryCtorEntry {
                     param_count: sc.params.len(),
                     is_super,
+                    is_this,
                     delegation_arg_thunks: arg_fids,
                     body: body_fid,
                 });

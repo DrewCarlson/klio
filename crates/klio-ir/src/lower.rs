@@ -2275,7 +2275,24 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // class dispatch (including IR-native FuncId lookup)
             // fires.
             if let Expr::Path { segments, .. } = callee.as_ref() {
+                // A bare contract call carrying a trailing lazy-message
+                // lambda — `require(cond) { "msg" }` / `check(...) {
+                // ... }` — is the stdlib contract, not a same-named
+                // member. kotlinx-io's `Buffer` implements
+                // `Source.require(byteCount: Long)`, which would
+                // otherwise capture `require(boolean) { ... }` and run
+                // the Boolean condition through the `Long` member.
+                // Kotlin resolves this by applicability; here the
+                // trailing lambda is the discriminator (the member
+                // takes no lambda).
+                let contract_with_msg = segments.len() == 1
+                    && matches!(
+                        segments[0].name.as_str(),
+                        "require" | "check" | "checkNotNull"
+                    )
+                    && matches!(args.last(), Some(Expr::Lambda { .. }));
                 if segments.len() == 1
+                    && !contract_with_msg
                     && b.resolve(&segments[0].name).is_none()
                     && !b.knows_outer(&segments[0].name)
                     // Only emit this.name(...) when the owning
