@@ -2072,7 +2072,30 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // Path-callee with a registered top-level fn → Call{func}.
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
-                    if let Some(func_id) = b.module.func_id(&segments[0].name) {
+                    // When a class and a top-level function share this
+                    // name (e.g. kotlinx-io's `class ByteString` plus
+                    // the `fun ByteString(bytes)` factory), the call
+                    // is a constructor invocation whenever the
+                    // function isn't applicable to the supplied
+                    // argument count. Defer to the NewInstance path
+                    // below so the Vm's ctor overload resolution
+                    // picks the right (possibly private/secondary)
+                    // constructor. Only kicks in on the
+                    // class+function name clash, so ordinary
+                    // default/vararg calls are unaffected.
+                    let shadowed_by_class = b
+                        .module
+                        .class_id(&segments[0].name)
+                        .is_some()
+                        && b
+                            .module
+                            .func_id(&segments[0].name)
+                            .and_then(|fid| b.module.funcs.get(fid.0 as usize))
+                            .map(|f| f.params.len() != args.len())
+                            .unwrap_or(false);
+                    if let Some(func_id) =
+                        b.module.func_id(&segments[0].name).filter(|_| !shadowed_by_class)
+                    {
                         // Extension fn called by its bare name from inside
                         // a receiver-typed scope: prepend the active
                         // `this` reg so `this.launch(block)` flows through
