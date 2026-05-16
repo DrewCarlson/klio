@@ -25,7 +25,7 @@ pub mod build;
 /// produced by the front end.
 pub struct Vm {
     module: Arc<klio_ir::Module>,
-    globals: Rc<RefCell<klio_runtime::Env>>,
+    globals: klio_runtime::ObjRef<klio_runtime::Env>,
     scheduler: Box<dyn klio_runtime::Scheduler>,
     instance_id_counter: u64,
     /// Per-class runtime metadata produced by `build::build_module`.
@@ -137,7 +137,7 @@ impl Vm {
                 env.define(*name, klio_runtime::Value::Intrinsic { fqn, func });
             }
         }
-        let globals = Rc::new(RefCell::new(env));
+        let globals = klio_runtime::ObjRef::new(env);
         Self {
             module,
             globals,
@@ -219,7 +219,7 @@ impl Vm {
                 .ok_or(VmError::InvalidMain)?;
             let v = {
                 let mut host = VmHost {
-                    globals: Rc::clone(&self.globals),
+                    globals: self.globals.clone(),
                     module: Arc::clone(&module),
                     scheduler: &mut *self.scheduler,
                     out,
@@ -315,7 +315,7 @@ impl Vm {
                 };
                 let v = {
                     let mut host = VmHost {
-                        globals: Rc::clone(&self.globals),
+                        globals: self.globals.clone(),
                         module: Arc::clone(&module),
                         scheduler: &mut *self.scheduler,
                         out,
@@ -363,7 +363,7 @@ impl Vm {
             };
             let inst = {
                 let mut host = VmHost {
-                    globals: Rc::clone(&self.globals),
+                    globals: self.globals.clone(),
                     module: Arc::clone(&module),
                     scheduler: &mut *self.scheduler,
                     out,
@@ -414,7 +414,7 @@ impl Vm {
             .ok_or(VmError::InvalidMain)?
             .clone();
         let mut host = VmHost {
-            globals: Rc::clone(&self.globals),
+            globals: self.globals.clone(),
             module: Arc::clone(&module),
             scheduler: &mut *self.scheduler,
             out,
@@ -476,7 +476,7 @@ impl From<klio_ir::eval::EvalError> for VmError {
 /// `EvalError::Unimplemented` (carrying the surface name) so the
 /// failure surfaces are easy to identify and migrate one by one.
 struct VmHost<'a> {
-    globals: Rc<RefCell<klio_runtime::Env>>,
+    globals: klio_runtime::ObjRef<klio_runtime::Env>,
     module: Arc<klio_ir::Module>,
     scheduler: &'a mut dyn klio_runtime::Scheduler,
     out: &'a mut dyn Output,
@@ -535,7 +535,7 @@ impl<'a> VmHost<'a> {
             scheduler: &mut *self.scheduler,
             module: module_for_intrinsic,
             closures: &mut *self.closures,
-            globals: Rc::clone(&self.globals),
+            globals: self.globals.clone(),
             classes: Rc::clone(&self.classes),
             body_prop_inits: self.body_prop_inits,
             instance_prop_getters: self.instance_prop_getters,
@@ -742,7 +742,7 @@ impl<'a> VmHost<'a> {
             scheduler: &mut *self.scheduler,
             module: module_for_intrinsic,
             closures: &mut *self.closures,
-            globals: Rc::clone(&self.globals),
+            globals: self.globals.clone(),
             classes: Rc::clone(&self.classes),
             body_prop_inits: self.body_prop_inits,
             instance_prop_getters: self.instance_prop_getters,
@@ -988,7 +988,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 companion: RefCell::new(None),
                 enclosing_class: RefCell::new(None),
                 nested_classes: RefCell::new(Vec::new()),
-                captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
+                captured_env: klio_runtime::ObjRef::new(klio_runtime::Env::new()),
                 supertype_delegates: RefCell::new(Vec::new()),
                 delegate_forwarders: RefCell::new(Vec::new()),
                 object_singleton: RefCell::new(None),
@@ -2094,7 +2094,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             companion: RefCell::new(None),
             enclosing_class: RefCell::new(None),
             nested_classes: RefCell::new(Vec::new()),
-            captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
+            captured_env: klio_runtime::ObjRef::new(klio_runtime::Env::new()),
             supertype_delegates: RefCell::new(Vec::new()),
             delegate_forwarders: RefCell::new(Vec::new()),
             object_singleton: RefCell::new(None),
@@ -2182,7 +2182,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             companion: RefCell::new(None),
             enclosing_class: RefCell::new(None),
             nested_classes: RefCell::new(Vec::new()),
-            captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
+            captured_env: klio_runtime::ObjRef::new(klio_runtime::Env::new()),
             supertype_delegates: RefCell::new(Vec::new()),
             delegate_forwarders: RefCell::new(Vec::new()),
             object_singleton: RefCell::new(None),
@@ -2484,7 +2484,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 companion: RefCell::new(None),
                 enclosing_class: RefCell::new(None),
                 nested_classes: RefCell::new(Vec::new()),
-                captured_env: Rc::new(RefCell::new(klio_runtime::Env::new())),
+                captured_env: klio_runtime::ObjRef::new(klio_runtime::Env::new()),
                 supertype_delegates: RefCell::new(Vec::new()),
                 delegate_forwarders: RefCell::new(Vec::new()),
                 object_singleton: RefCell::new(None),
@@ -4370,11 +4370,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 // Layer captured outer-env names onto globals for the
                 // duration of the method call so the body's
                 // bare-name globals resolve to the captured values.
-                let prev = Rc::clone(&self.globals);
+                let prev = self.globals.clone();
                 if !captures.is_empty() {
-                    let scoped = Rc::new(RefCell::new(
-                        klio_runtime::Env::with_parent(Rc::clone(&prev)),
-                    ));
+                    let scoped = klio_runtime::ObjRef::new(
+                        klio_runtime::Env::with_parent(prev.clone()),
+                    );
                     for (n, v) in &captures {
                         scoped.borrow_mut().define(n.clone(), v.clone());
                     }
@@ -5547,7 +5547,7 @@ struct VmIntrinsicHost<'a> {
     scheduler: &'a mut dyn klio_runtime::Scheduler,
     module: Arc<klio_ir::Module>,
     closures: &'a mut Vec<ClosureInfo>,
-    globals: Rc<RefCell<klio_runtime::Env>>,
+    globals: klio_runtime::ObjRef<klio_runtime::Env>,
     classes: Rc<RefCell<std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>>>,
     body_prop_inits:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
@@ -5842,7 +5842,7 @@ impl<'a> VmIntrinsicHost<'a> {
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         let mut host = VmHost {
-            globals: Rc::clone(&self.globals),
+            globals: self.globals.clone(),
             module: Arc::clone(&self.module),
             scheduler: &mut *self.scheduler,
             out,
@@ -5939,16 +5939,16 @@ impl<'a> VmIntrinsicHost<'a> {
                 }
             }
         }
-        let scoped_env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(
-            Rc::clone(&self.globals),
-        )));
+        let scoped_env = klio_runtime::ObjRef::new(klio_runtime::Env::with_parent(
+            self.globals.clone(),
+        ));
         for (n, v) in info.capture_names.iter().zip(capture_values.iter()) {
             scoped_env.borrow_mut().define(n.clone(), v.clone());
         }
         let module = Arc::clone(&self.module);
         let result = {
             let mut host = VmHost {
-                globals: Rc::clone(&scoped_env),
+                globals: scoped_env.clone(),
                 module: Arc::clone(&self.module),
                 scheduler: &mut *self.scheduler,
                 out,
@@ -6000,7 +6000,7 @@ impl<'a> VmIntrinsicHost<'a> {
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         let module = Arc::clone(&self.module);
         let mut host = VmHost {
-            globals: Rc::clone(&self.globals),
+            globals: self.globals.clone(),
             module: Arc::clone(&module),
             scheduler: &mut *self.scheduler,
             out,
@@ -6232,15 +6232,15 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             // StoreGlobal writes land in the env, then read back the
             // updated values into the closure's captures so the
             // outer-frame WritebackCaptures Inst sees them.
-            let scoped_env = Rc::new(RefCell::new(klio_runtime::Env::with_parent(
-                Rc::clone(&self.globals),
-            )));
+            let scoped_env = klio_runtime::ObjRef::new(klio_runtime::Env::with_parent(
+                self.globals.clone(),
+            ));
             for (n, v) in info.capture_names.iter().zip(capture_values.iter()) {
                 scoped_env.borrow_mut().define(n.clone(), v.clone());
             }
             let result = {
                 let mut host = VmHost {
-                    globals: Rc::clone(&scoped_env),
+                    globals: scoped_env.clone(),
                     module: Arc::clone(&self.module),
                     scheduler: &mut *self.scheduler,
                     out,
@@ -6327,7 +6327,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 scheduler: &mut *self.scheduler,
                 module: Arc::clone(&self.module),
                 closures: &mut *self.closures,
-                globals: Rc::clone(&self.globals),
+                globals: self.globals.clone(),
                 classes: Rc::clone(&self.classes),
                 body_prop_inits: self.body_prop_inits,
                 instance_prop_getters: self.instance_prop_getters,
@@ -6455,7 +6455,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         // user override methods (`override fun toString()` etc.).
         let module = Arc::clone(&self.module);
         let mut host = VmHost {
-            globals: Rc::clone(&self.globals),
+            globals: self.globals.clone(),
             module: Arc::clone(&module),
             scheduler: &mut *self.scheduler,
             out,

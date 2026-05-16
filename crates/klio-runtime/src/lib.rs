@@ -514,11 +514,11 @@ pub enum Value {
     /// honors `step`'s sign. `kind` distinguishes `IntRange` (values widen to
     /// `Value::Int`) from `LongRange` (values widen to `Value::Long`).
     Range { start: i64, end: i64, step: i64, kind: RangeKind },
-    Function { decl: Arc<klio_ast::Function>, env: Rc<RefCell<Env>> },
+    Function { decl: Arc<klio_ast::Function>, env: ObjRef<Env> },
     Lambda {
         params: Arc<Vec<String>>,
         body: Arc<klio_ast::Block>,
-        env: Rc<RefCell<Env>>,
+        env: ObjRef<Env>,
         /// `true` when produced by an anonymous-function expression
         /// (`fun (x: Int): R = ...`). A bare `return` inside the body is
         /// a local return and is absorbed at the call boundary. `false`
@@ -848,7 +848,7 @@ pub enum SuspendTransition {
 pub struct SuspendFrame {
     pub decl: Arc<klio_ast::Function>,
     pub body: Arc<SuspendBody>,
-    pub env: Rc<RefCell<Env>>,
+    pub env: ObjRef<Env>,
     /// Locals introduced by val/var statements in earlier states.
     /// Survives across suspensions because each state writes/reads
     /// here instead of pushing a transient frame.
@@ -971,7 +971,7 @@ pub struct ClassDef {
     pub nested_classes: RefCell<Vec<(String, Rc<ClassDef>)>>,
     /// Captured env in which the class was declared (for closure-like
     /// resolution in method bodies).
-    pub captured_env: Rc<RefCell<Env>>,
+    pub captured_env: ObjRef<Env>,
     /// Inheritance-delegation table: for each delegated supertype entry,
     /// the supertype name and the expression that produces the delegate
     /// instance. Evaluated once during construction; the resulting value
@@ -2467,7 +2467,7 @@ pub fn kotlin_double_to_string(d: f64) -> String {
 
 #[derive(Debug, Default, Clone)]
 pub struct Env {
-    parent: Option<Rc<RefCell<Env>>>,
+    parent: Option<ObjRef<Env>>,
     vars: HashMap<String, Value>,
 }
 
@@ -2478,7 +2478,7 @@ impl Env {
     }
 
     #[must_use]
-    pub fn with_parent(parent: Rc<RefCell<Env>>) -> Self {
+    pub fn with_parent(parent: ObjRef<Env>) -> Self {
         Self { parent: Some(parent), vars: HashMap::new() }
     }
 
@@ -2517,13 +2517,13 @@ impl Env {
     pub fn lookup_excluding(
         &self,
         name: &str,
-        stop_at: &Rc<RefCell<Env>>,
+        stop_at: &ObjRef<Env>,
     ) -> Option<Value> {
         if let Some(v) = self.vars.get(name) {
             return Some(v.clone());
         }
         let parent = self.parent.as_ref()?;
-        if Rc::ptr_eq(parent, stop_at) {
+        if ObjRef::ptr_eq(parent, stop_at) {
             return None;
         }
         parent.borrow().lookup_excluding(name, stop_at)
@@ -2621,7 +2621,7 @@ mod tests {
             companion: RefCell::new(None),
             enclosing_class: RefCell::new(None),
             nested_classes: RefCell::new(Vec::new()),
-            captured_env: Rc::new(RefCell::new(Env::new())),
+            captured_env: ObjRef::new(Env::new()),
             supertype_delegates: RefCell::new(Vec::new()),
             delegate_forwarders: RefCell::new(Vec::new()),
             object_singleton: RefCell::new(None),

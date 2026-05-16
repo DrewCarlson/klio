@@ -1105,7 +1105,7 @@ fn build_module_with_overrides(
     // file. Future workstreams move these fields onto the IR Class
     // (methods, init blocks, supertypes, secondary ctors, ...); for
     // now the Vm uses these for the instance-allocation shape.
-    let globals_for_capture = std::rc::Rc::new(RefCell::new(klio_runtime::Env::new()));
+    let globals_for_capture = klio_runtime::ObjRef::new(klio_runtime::Env::new());
     let mut classes: std::collections::HashMap<String, Rc<ClassDef>> =
         std::collections::HashMap::new();
     for d in decls {
@@ -1181,7 +1181,7 @@ fn build_module_with_overrides(
                 companion: RefCell::new(None),
                 enclosing_class: RefCell::new(None),
                 nested_classes: RefCell::new(Vec::new()),
-                captured_env: std::rc::Rc::clone(&globals_for_capture),
+                captured_env: globals_for_capture.clone(),
                 supertype_delegates: RefCell::new(Vec::new()),
                 delegate_forwarders: RefCell::new(Vec::new()),
                 object_singleton: RefCell::new(None),
