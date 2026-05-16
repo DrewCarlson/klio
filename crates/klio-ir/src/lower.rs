@@ -2181,6 +2181,30 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     return b.emit_const(Const::Unit);
                 }
             }
+            // A single-name callee that resolves to a local binding
+            // or parameter is a value invocation — the local
+            // shadows any same-named top-level function. Critical
+            // when packs collide with a lambda parameter name:
+            // kotlinx-io's `processUtf16Chars(yield: (Char)->Unit)`
+            // calls `yield(...)`, which must hit the parameter, not
+            // kotlinx.coroutines' suspend `yield()`.
+            if let Expr::Path { segments, .. } = callee.as_ref() {
+                if segments.len() == 1 {
+                    if let Some(reg) = b.resolve(&segments[0].name) {
+                        let (args_start, count) = lower_arg_run(b, args);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let dst = b.alloc_reg();
+                        b.push(Inst::CallValue {
+                            dst,
+                            callee: reg,
+                            args: args_start,
+                            n_args: count,
+                            arg_names,
+                        });
+                        return dst;
+                    }
+                }
+            }
             // Path-callee with a registered top-level fn → Call{func}.
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {

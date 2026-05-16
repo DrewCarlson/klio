@@ -4388,11 +4388,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let chosen = if candidates.len() <= 1 {
                 candidates.into_iter().next()
             } else {
+                // Score the receiver (param 0) *and* every value
+                // argument against the declared parameter types, so
+                // overloads that differ only in an argument type are
+                // resolved correctly (`Byte.and(Int)` vs
+                // `Byte.and(Long)` for `byte and 0xffL`). An exact
+                // declared arity is also preferred over a
+                // defaulted-tail match.
                 let mut best: Option<((klio_ir::FuncId, klio_ir::Func), i32)> = None;
                 for (fid, f) in candidates {
-                    let score = self
+                    let mut score = self
                         .overload_score_arg(&f.params[0].ty, receiver)
                         .unwrap_or(-1);
+                    for (i, a) in args.iter().enumerate() {
+                        if let Some(p) = f.params.get(i + 1) {
+                            score += self.overload_score_arg(&p.ty, a).unwrap_or(-1);
+                        }
+                    }
+                    if f.params.len() == want {
+                        score += 5;
+                    }
                     if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
                         best = Some(((fid, f), score));
                     }
