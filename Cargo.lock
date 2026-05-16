@@ -1069,6 +1069,7 @@ dependencies = [
  "klio-ast",
  "klio-span",
  "loom",
+ "parking_lot",
  "regex",
  "thiserror",
 ]

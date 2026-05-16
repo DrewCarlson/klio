@@ -10,6 +10,11 @@ klio-span  = { workspace = true }
 klio-ast   = { workspace = true }
 thiserror = { workspace = true }
 regex     = "1"
+# Shared `AdaptiveCell`s use a reader/writer lock so parallel reads of
+# a published Kotlin object run concurrently while writes stay
+# exclusive; `read_recursive()` keeps same-thread nested shared
+# borrows (e.g. reading a list while iterating it) deadlock-free.
+parking_lot = { workspace = true }
 
 # `loom` models AdaptiveCell's atomics/Mutex/UnsafeCell only when the
 # build is invoked with `RUSTFLAGS="--cfg loom"`. The cfg gate means

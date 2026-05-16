@@ -16,27 +16,37 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 /// Synchronization primitives for [`AdaptiveCell`]. Under `cfg(loom)`
-/// the atomic `state`, the `Mutex` lock, and the data `UnsafeCell`
-/// resolve to loom's instrumented models so the publication protocol
-/// can be exhaustively model-checked; under every normal build they
-/// resolve to the `std` equivalents and the generated code is
-/// behaviorally identical to a direct `std` use. `flag` stays a
-/// `std::cell::Cell` in both builds: it is single-owner by the
-/// protocol and loom intentionally does not model non-atomic cells.
+/// the atomic `state`, the reader/writer `lock`, and the data
+/// `UnsafeCell` resolve to loom's instrumented models so the
+/// publication protocol can be exhaustively model-checked; under
+/// every normal build they resolve to `parking_lot`/`std`
+/// equivalents and the generated code is behaviorally identical to a
+/// direct use. `flag` stays a `std::cell::Cell` in both builds: it is
+/// single-owner by the protocol and loom intentionally does not model
+/// non-atomic cells.
+///
+/// The `SHARED` lock is a *reader/writer* lock: many concurrent
+/// shared `borrow()`s, one exclusive `borrow_mut()`. The non-loom
+/// build uses `parking_lot::RwLock`, whose `read_recursive()` lets
+/// the same thread take nested shared borrows of one cell (the
+/// interpreter reads a list while iterating it) without deadlock.
+/// loom's `RwLock` has no recursive read, but every loom scenario
+/// holds at most one borrow per thread at a time, so plain `read()`
+/// models the protocol faithfully.
 mod cell_sync {
     #[cfg(loom)]
     pub(crate) use loom::cell::UnsafeCell;
     #[cfg(loom)]
     pub(crate) use loom::sync::atomic::{AtomicU8, Ordering};
     #[cfg(loom)]
-    pub(crate) use loom::sync::{Mutex, MutexGuard};
+    pub(crate) use loom::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+    #[cfg(not(loom))]
+    pub(crate) use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
     #[cfg(not(loom))]
     pub(crate) use std::cell::UnsafeCell;
     #[cfg(not(loom))]
     pub(crate) use std::sync::atomic::{AtomicU8, Ordering};
-    #[cfg(not(loom))]
-    pub(crate) use std::sync::{Mutex, MutexGuard};
 
     pub(crate) use std::cell::Cell;
 }
@@ -47,16 +57,18 @@ use cell_sync::{AtomicU8, Cell, Ordering, UnsafeCell};
 ///
 /// While a cell is **unshared** (only ever reachable from its
 /// creating thread — the case for essentially every object, and the
-/// *only* case until a parallel backing publishes references across
-/// threads) borrow tracking is a single non-atomic `Cell<isize>`,
-/// exactly `RefCell`'s algorithm and speed. When a future stage
-/// publishes a reference to another thread it calls [`publish`],
-/// which transitions the cell to **shared** under a full fence
-/// before the reference can be observed elsewhere; shared cells
-/// serialize all access through `lock`.
+/// *only* case until a reference is published across threads) borrow
+/// tracking is a single non-atomic `Cell<isize>`, exactly
+/// `RefCell`'s algorithm and speed. When the runtime publishes a
+/// reference to another thread it calls [`publish`], which
+/// transitions the cell to **shared** under a release fence before
+/// the reference can be observed elsewhere; shared cells mediate all
+/// access through `lock`, a reader/writer lock — any number of
+/// concurrent shared `borrow()`s, an exclusive `borrow_mut()`.
 ///
 /// `flag`: `0` = free, `n > 0` = `n` shared borrows, `-1` = mutably
-/// borrowed (the `RefCell` encoding).
+/// borrowed (the `RefCell` encoding). Only the UNSHARED path touches
+/// `flag`; the SHARED path's discipline is the RwLock itself.
 ///
 /// # Safety / publication protocol
 ///
@@ -66,14 +78,59 @@ use cell_sync::{AtomicU8, Cell, Ordering, UnsafeCell};
 /// `Release`/`Acquire`) ordered *before* the `ObjRef` becomes
 /// reachable from any other thread. Pre-publication, single-owner
 /// access makes the non-atomic `flag`/`data` race-free; post
-/// publication every access goes through `lock`. The runtime
-/// upholds the "publish before the reference escapes" obligation at
-/// the [`fence_and_publish`] seam. Under the current single-threaded
-/// runtime nothing publishes, so the invariant holds trivially.
+/// publication every access goes through `lock`'s acquire/release.
+/// The runtime upholds the "publish before the reference escapes"
+/// obligation at the [`fence_and_publish`] seam (escaping graphs are
+/// `publish_deep`'d before a thread is spawned).
+///
+/// # Normative fence matrix
+///
+/// This is the authoritative statement of every memory-model seam in
+/// KLIO and the concrete Rust mechanism that establishes the
+/// happens-before edge it requires. Kotlin's memory model only
+/// defines behaviour for data-race-free programs (modulo the
+/// no-out-of-thin-air / no-tearing floor that holds even for racy
+/// programs); each seam below provides at least the ordering the
+/// model demands.
+///
+/// - **Shared-object field access** — every `borrow()`/`borrow_mut()`
+///   on a `SHARED` cell acquires this `AdaptiveCell`'s RwLock (read
+///   or write) and releases it on guard drop. The lock's
+///   acquire/release plus the `state` `Release` (in [`publish`]) /
+///   `Acquire` (in every borrow's state load) pair is the
+///   happens-before edge: a write under a write guard
+///   happens-before any later read/write under a guard on the same
+///   cell. Concurrent readers run in parallel; a writer is exclusive
+///   against all readers and writers.
+/// - **`synchronized` / monitor** — lowered to a process-wide
+///   reentrant monitor whose `Mutex` + `Condvar` provide the
+///   monitor-enter (acquire) / monitor-exit (release) edge, so an
+///   unlock happens-before the next lock of the same monitor.
+/// - **`@Volatile`** — *subsumed, by deliberate and sound design*.
+///   Every field access on a *shared* instance already goes through
+///   this RwLock, which gives sequentially-consistent ordering for
+///   *all* fields of the object, not just one. Lock-mediated shared
+///   access is strictly stronger than per-field volatile (it orders
+///   the whole object, and a `borrow_mut` is a full release of every
+///   field), so `@Volatile` needs no extra per-field fence under
+///   this model: `lock ≥ volatile`. A `@Volatile` field on an
+///   *unshared* instance is single-owner and needs no fence either.
+/// - **Atomics (`kotlinx.atomicfu`)** — backed directly by Rust's
+///   `core::sync::atomic` operations with their specified orderings;
+///   the atomic op *is* the fence.
+/// - **`Thread.start` / `Thread.join`** — `std::thread::spawn`
+///   (start happens-before the spawned body) and `JoinHandle::join`
+///   (body completion happens-before `join()` returning). The
+///   escaping object graph is `publish_deep`'d before spawn so the
+///   child only ever sees `SHARED` cells.
+/// - **Coroutine interceptor dispatch / resume** — coroutines run on
+///   a single cooperative thread; dispatch and resume are ordinary
+///   sequenced-before steps on that one instruction stream, so no
+///   cross-thread fence is needed for intra-dispatcher resumption.
 struct AdaptiveCell<T: ?Sized> {
     state: AtomicU8,
     flag: Cell<isize>,
-    lock: cell_sync::Mutex<()>,
+    lock: cell_sync::RwLock<()>,
     data: UnsafeCell<T>,
 }
 
@@ -89,7 +146,7 @@ impl<T> AdaptiveCell<T> {
         Self {
             state: AtomicU8::new(UNSHARED),
             flag: Cell::new(0),
-            lock: cell_sync::Mutex::new(()),
+            lock: cell_sync::RwLock::new(()),
             data: UnsafeCell::new(v),
         }
     }
@@ -127,18 +184,38 @@ impl<T: ?Sized> AdaptiveCell<T> {
         }
     }
 
-    /// Acquire the per-cell lock that serializes access once the cell
-    /// is `SHARED`. `std` `Mutex` can poison (recovered via
-    /// `into_inner`); loom's never does.
+    /// Acquire the per-cell RwLock for a *shared* borrow once the
+    /// cell is `SHARED`: a read guard, so concurrent readers run in
+    /// parallel. The non-loom path uses `read_recursive()` so a
+    /// thread that already holds a read guard on this cell (the
+    /// interpreter reading a list while iterating it) does not
+    /// self-deadlock against a queued writer. loom's `RwLock` has no
+    /// recursive read, but no loom scenario nests borrows on one
+    /// thread, so plain `read()` models the protocol exactly.
     #[inline(always)]
-    fn lock_shared(&self) -> cell_sync::MutexGuard<'_, ()> {
+    fn lock_shared_read(&self) -> cell_sync::RwLockReadGuard<'_, ()> {
         #[cfg(loom)]
         {
-            self.lock.lock().unwrap()
+            self.lock.read().unwrap()
         }
         #[cfg(not(loom))]
         {
-            self.lock.lock().unwrap_or_else(|e| e.into_inner())
+            self.lock.read_recursive()
+        }
+    }
+
+    /// Acquire the per-cell RwLock for an *exclusive* borrow once the
+    /// cell is `SHARED`: a write guard, mutually exclusive against
+    /// every reader and writer.
+    #[inline(always)]
+    fn lock_shared_write(&self) -> cell_sync::RwLockWriteGuard<'_, ()> {
+        #[cfg(loom)]
+        {
+            self.lock.write().unwrap()
+        }
+        #[cfg(not(loom))]
+        {
+            self.lock.write()
         }
     }
 }
@@ -185,8 +262,17 @@ impl<T: ?Sized> ObjRef<T> {
 
     fn try_borrow(&self) -> Option<ObjGuard<'_, T>> {
         let cell = &*self.0;
-        let _guard = (cell.state.load(Ordering::Acquire) == SHARED)
-            .then(|| cell.lock_shared());
+        if cell.state.load(Ordering::Acquire) == SHARED {
+            // SHARED path: the RwLock read guard is the discipline.
+            // Many shared borrows run concurrently; an exclusive
+            // `borrow_mut` blocks until they drain. `flag` is not
+            // consulted or mutated here — it is the UNSHARED-only
+            // RefCell counter.
+            let read = cell.lock_shared_read();
+            // SAFETY: a read guard is held for the returned guard's
+            // lifetime; no writer can be active concurrently.
+            return Some(ObjGuard { cell, _shared: Some(read) });
+        }
         let f = cell.flag.get();
         if f < 0 {
             return None;
@@ -194,23 +280,31 @@ impl<T: ?Sized> ObjRef<T> {
         cell.flag.set(f + 1);
         // SAFETY: flag was >= 0, so no mutable borrow is live; we
         // hand out a shared reference and the guard restores the
-        // count on drop. Shared cells additionally hold `lock`.
-        Some(ObjGuard { cell, _shared: _guard })
+        // count on drop.
+        Some(ObjGuard { cell, _shared: None })
     }
 
     /// Fallible mutable borrow (mirrors `RefCell::try_borrow_mut`).
     pub fn try_borrow_mut(&self) -> Result<ObjGuardMut<'_, T>, BorrowMutError> {
         let cell = &*self.0;
-        let _guard = (cell.state.load(Ordering::Acquire) == SHARED)
-            .then(|| cell.lock_shared());
+        if cell.state.load(Ordering::Acquire) == SHARED {
+            // SHARED path: the RwLock write guard is the discipline —
+            // exclusive against every reader and writer. It blocks
+            // (monitor-like) rather than failing if borrows are live
+            // on other threads; that is the intended behavior, not a
+            // `RefCell`-style panic. `flag` is untouched.
+            let write = cell.lock_shared_write();
+            // SAFETY: a write guard is held for the returned guard's
+            // lifetime; no other borrow can be active concurrently.
+            return Ok(ObjGuardMut { cell, _shared: Some(write) });
+        }
         if cell.flag.get() != 0 {
             return Err(BorrowMutError);
         }
         cell.flag.set(-1);
         // SAFETY: flag was 0, so no other borrow is live; the guard
-        // restores it on drop. Shared cells additionally hold
-        // `lock`, serializing cross-thread access.
-        Ok(ObjGuardMut { cell, _shared: _guard })
+        // restores it on drop.
+        Ok(ObjGuardMut { cell, _shared: None })
     }
 
     /// Transition the cell to the shared state with a full fence.
@@ -266,23 +360,31 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjRef<T> {
     }
 }
 
-/// Shared-borrow guard. Restores the borrow count on drop.
+/// Shared-borrow guard. On the UNSHARED path it restores the
+/// `RefCell` borrow count on drop; on the SHARED path it instead
+/// holds a RwLock read guard (`_shared`) for its lifetime and the
+/// lock — not `flag` — is the discipline.
 pub struct ObjGuard<'a, T: ?Sized> {
     cell: &'a AdaptiveCell<T>,
-    _shared: Option<cell_sync::MutexGuard<'a, ()>>,
+    _shared: Option<cell_sync::RwLockReadGuard<'a, ()>>,
 }
 impl<T: ?Sized> Deref for ObjGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY: a shared borrow is live (flag > 0). The pointer is
-        // valid for the cell's lifetime and the guard outlives this
-        // reference.
+        // SAFETY: a shared borrow is live (UNSHARED: flag > 0;
+        // SHARED: a read guard is held). The pointer is valid for
+        // the cell's lifetime and the guard outlives this reference.
         self.cell.with_data_ptr(|p| unsafe { &*p })
     }
 }
 impl<T: ?Sized> Drop for ObjGuard<'_, T> {
     fn drop(&mut self) {
-        self.cell.flag.set(self.cell.flag.get() - 1);
+        // UNSHARED path only: SHARED borrows never touched `flag`,
+        // so they must not decrement it. The read guard in `_shared`
+        // is released by its own `Drop` after this.
+        if self._shared.is_none() {
+            self.cell.flag.set(self.cell.flag.get() - 1);
+        }
     }
 }
 impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjGuard<'_, T> {
@@ -296,27 +398,37 @@ impl<T: ?Sized + fmt::Display> fmt::Display for ObjGuard<'_, T> {
     }
 }
 
-/// Mutable-borrow guard. Restores the borrow flag on drop.
+/// Mutable-borrow guard. On the UNSHARED path it restores the
+/// `RefCell` borrow flag on drop; on the SHARED path it instead
+/// holds an exclusive RwLock write guard (`_shared`) for its
+/// lifetime.
 pub struct ObjGuardMut<'a, T: ?Sized> {
     cell: &'a AdaptiveCell<T>,
-    _shared: Option<cell_sync::MutexGuard<'a, ()>>,
+    _shared: Option<cell_sync::RwLockWriteGuard<'a, ()>>,
 }
 impl<T: ?Sized> Deref for ObjGuardMut<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY: an exclusive borrow is live (flag == -1).
+        // SAFETY: an exclusive borrow is live (UNSHARED: flag == -1;
+        // SHARED: an exclusive write guard is held).
         self.cell.with_data_ptr(|p| unsafe { &*p })
     }
 }
 impl<T: ?Sized> DerefMut for ObjGuardMut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: an exclusive borrow is live (flag == -1).
+        // SAFETY: an exclusive borrow is live (UNSHARED: flag == -1;
+        // SHARED: an exclusive write guard is held).
         self.cell.with_data_ptr_mut(|p| unsafe { &mut *p })
     }
 }
 impl<T: ?Sized> Drop for ObjGuardMut<'_, T> {
     fn drop(&mut self) {
-        self.cell.flag.set(0);
+        // UNSHARED path only: SHARED mutable borrows never set
+        // `flag` to -1, so they must not clear it. The write guard
+        // in `_shared` is released by its own `Drop` after this.
+        if self._shared.is_none() {
+            self.cell.flag.set(0);
+        }
     }
 }
 impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjGuardMut<'_, T> {
@@ -330,25 +442,23 @@ impl<T: ?Sized + fmt::Display> fmt::Display for ObjGuardMut<'_, T> {
     }
 }
 
-/// The single memory-model seam where a release/acquire pair would be
-/// emitted under a parallel backing.
+/// Named memory-model seam, retained as the explicit ordering site
+/// for `synchronized` enter/exit and `thread` start/join.
 ///
-/// Kotlin's memory model defines program behaviour only for race-free
-/// programs, and for those the observable result is whatever a
-/// sequentially consistent execution produces. KLIO interprets on one
-/// thread and serializes every action, so every execution is already
-/// sequentially consistent: monitor enter/exit, thread start, and
-/// thread join impose no ordering that the single instruction stream
-/// does not already guarantee. This function is therefore an
-/// intentional no-op.
-///
-/// It exists as a named site so the ordering points are real in the
-/// code rather than implicit. It is invoked conceptually at the
-/// memory-model boundaries — `synchronized` enter and exit, and
-/// `thread` start and `Thread.join`. When a future stage gives KLIO a
-/// truly parallel backing, this is the one place that grows real
-/// `Acquire`/`Release` fences (and where the `ObjRef` heap handle
-/// gains its publication barrier); call sites do not change.
+/// The concrete happens-before mechanism for every seam is now
+/// real and is stated normatively in the **fence matrix** on
+/// [`AdaptiveCell`] (shared-object access → the cell RwLock + the
+/// `state` `Release`/`Acquire` on [`ObjRef::publish`]; monitors → the
+/// process-wide reentrant monitor's `Mutex`/`Condvar`; `@Volatile` →
+/// subsumed by lock-mediated shared access; atomics → the underlying
+/// Rust atomic ops; `Thread.start`/`join` → `std::thread`
+/// spawn/join; coroutine dispatch/resume → the single cooperative
+/// thread). Each of those edges is established by its own primitive
+/// at its own site; this function does not itself emit a fence —
+/// publication ordering lives in [`ObjRef::publish`] /
+/// [`Value::publish_deep`], which the runtime invokes before an
+/// object graph escapes to a spawned thread. It is kept as a
+/// stable, named call site so the boundary is visible in the code.
 #[inline(always)]
 pub fn fence_and_publish() {}
 

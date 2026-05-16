@@ -67,6 +67,7 @@ const RUNNABLE: &[&str] = &[
     "mm8_thread_join",
     "mm9_coroutine_hb",
     "mm10_channel_flow",
+    "mm11_no_lost_tearing",
 ];
 
 // Every memory-model rule is now exercised through the pack-aware
@@ -94,7 +95,7 @@ fn conformance_gated() {
 }
 
 /// Every litmus file is accounted for in exactly one bucket, and
-/// every spec rule MM1..MM10 has a file. Guards against silently
+/// every spec rule MM1..MM11 has a file. Guards against silently
 /// orphaned or missing litmus programs.
 #[test]
 fn conformance_suite_is_complete() {
@@ -121,7 +122,7 @@ fn conformance_suite_is_complete() {
         "every conformance/*.kt must be in RUNNABLE or GATED exactly once"
     );
 
-    for n in 1..=10 {
+    for n in 1..=11 {
         let prefix = format!("mm{n}_");
         assert!(
             classified.iter().any(|s| s.starts_with(&prefix)),
