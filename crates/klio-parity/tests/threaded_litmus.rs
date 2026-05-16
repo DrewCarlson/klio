@@ -65,6 +65,9 @@ const RUNNABLE: &[&str] = &[
     "tl_thread_join",
     "tl_sync_counter",
     "tl_parallel_partition",
+    "tl_async_parallel",
+    "tl_withcontext_io",
+    "tl_dispatch_many",
 ];
 
 /// Guarantees that only become meaningful with real OS-thread

@@ -73,6 +73,69 @@ impl SharedClosures {
     }
 }
 
+/// Bounded concurrency gate for the parallel coroutine dispatchers.
+///
+/// `Dispatchers.Default`/`IO` realize parallelism by spawning a real
+/// OS thread per dispatched coroutine body (reusing the proven
+/// `spawn_os_thread` publication + cross-thread join machinery). A
+/// raw thread-per-coroutine would let 1000 `async`s create 1000 live
+/// threads; this counting semaphore caps how many dispatched bodies
+/// run *concurrently*. A worker thread is still spawned per job
+/// (cheap to create, parks immediately on the gate), but only `cap`
+/// of them execute their Kotlin body at once — the rest block on the
+/// `Condvar` until a permit frees. `Default`'s cap tracks
+/// `available_parallelism()` (CPU-bound); `IO`'s is a large fixed cap
+/// (blocking-offload, elastic in practice).
+struct DispatchGate {
+    inner: Mutex<usize>,
+    cv: std::sync::Condvar,
+}
+
+impl DispatchGate {
+    fn new(cap: usize) -> Self {
+        Self {
+            inner: Mutex::new(cap.max(1)),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+    /// Block until a permit is free, then take it.
+    fn acquire(&self) {
+        let mut avail = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        while *avail == 0 {
+            avail = self.cv.wait(avail).unwrap_or_else(|e| e.into_inner());
+        }
+        *avail -= 1;
+    }
+    /// Return a permit and wake one waiter.
+    fn release(&self) {
+        let mut avail = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        *avail += 1;
+        self.cv.notify_one();
+    }
+}
+
+/// Process-global Default-dispatcher gate, sized to the host's
+/// hardware parallelism. CPU-bound coroutine bodies dispatched on
+/// `Dispatchers.Default` contend for these permits so the machine
+/// runs at most ~one busy body per core.
+fn default_gate() -> &'static DispatchGate {
+    static GATE: std::sync::OnceLock<DispatchGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| {
+        let cap = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        DispatchGate::new(cap)
+    })
+}
+
+/// Process-global IO-dispatcher gate. `Dispatchers.IO` is for
+/// blocking offload, so its cap is large (an effectively-elastic
+/// pool) rather than CPU-bound.
+fn io_gate() -> &'static DispatchGate {
+    static GATE: std::sync::OnceLock<DispatchGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| DispatchGate::new(64))
+}
+
 /// One Vm instance executes a single program against the IR module
 /// produced by the front end.
 pub struct Vm {
@@ -6563,6 +6626,92 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             Some(e) => e.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false),
             None => false,
         }
+    }
+
+    /// Dispatch a coroutine body onto the parallel worker pool.
+    ///
+    /// Realised as a real OS thread per job (reusing the spawned-
+    /// thread publication + join machinery), but gated by a process-
+    /// global counting semaphore so concurrency is bounded:
+    /// `Dispatchers.Default` to the host core count, `Dispatchers.IO`
+    /// to a large elastic cap. The escaping graph is `publish_deep`'d
+    /// before the worker starts (the `ObjRef` `Send` happens-before);
+    /// the worker parks on the gate, runs the body once a permit is
+    /// free, then publishes its terminal value for the joiner.
+    fn dispatch_coroutine(
+        &mut self,
+        block: &klio_runtime::Value,
+        elastic: bool,
+        _out: &mut dyn Output,
+    ) -> Result<u64, klio_runtime::RuntimeError> {
+        block.publish_deep();
+        klio_runtime::publish_env_deep(&self.globals);
+        for def in self.classes.borrow().values() {
+            klio_runtime::Value::Class(Arc::clone(def)).publish_deep();
+        }
+        for v in self.class_default_outer.borrow().values() {
+            v.publish_deep();
+        }
+        self.classes.publish();
+        self.anon_methods.publish();
+        self.class_default_outer.publish();
+        klio_runtime::fence_and_publish(); // dispatch start
+
+        let seed = SendableVmSeed {
+            module: Arc::clone(&self.module),
+            globals: self.globals.clone(),
+            instance_id_counter: Arc::clone(&self.instance_id_counter),
+            classes: self.classes.clone(),
+            prog: Arc::clone(&self.prog),
+            anon_methods: self.anon_methods.clone(),
+            class_default_outer: self.class_default_outer.clone(),
+            closures: self.closures.clone(),
+            out_sink: self.out_sink.clone(),
+            threads: Arc::clone(&self.threads),
+        };
+        let block = block.clone();
+        let time_mode = coroutine_time_mode();
+        let id = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed);
+        let gate: &'static DispatchGate = if elastic { io_gate() } else { default_gate() };
+
+        let handle = std::thread::Builder::new()
+            .name(format!("klio-dispatch-{id}"))
+            .spawn(move || -> Result<(), klio_runtime::RuntimeError> {
+                // Bound concurrent bodies; the worker exists but only
+                // executes Kotlin once it holds a pool permit.
+                gate.acquire();
+                set_coroutine_time_mode(time_mode);
+                let mut vm = seed.materialize();
+                let r = vm.run_thread_block(&block);
+                klio_runtime::fence_and_publish(); // body completion → joiner
+                gate.release();
+                match r {
+                    Ok(v) => {
+                        v.publish_deep();
+                        Ok(())
+                    }
+                    Err(klio_runtime::RuntimeError::Return(v)) => {
+                        v.publish_deep();
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+            .map_err(|e| {
+                klio_runtime::RuntimeError::Type(format!(
+                    "failed to spawn dispatch worker: {e}"
+                ))
+            })?;
+
+        self.threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, ThreadEntry { handle: Some(handle) });
+        Ok(id)
+    }
+
+    fn join_dispatched(&mut self, id: u64) -> Result<(), klio_runtime::RuntimeError> {
+        self.join_os_thread(id)
     }
 }
 

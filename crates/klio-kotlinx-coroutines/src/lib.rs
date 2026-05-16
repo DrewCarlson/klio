@@ -70,6 +70,9 @@ klio_stdlib::host_bindings! {
         "kotlinx.coroutines.__kxco_schedulerEnqueue"   => scheduler_enqueue,
         "kotlinx.coroutines.__kxco_schedulerDrainCount" => scheduler_drain_count,
         "kotlinx.coroutines.__kxco_spawn"               => spawn_launch_block,
+        "kotlinx.coroutines.__kxco_dispatch"            => dispatch_coroutine,
+        "kotlinx.coroutines.__kxco_dispatchIo"          => dispatch_coroutine_io,
+        "kotlinx.coroutines.__kxco_joinDispatched"      => join_dispatched,
         "kotlinx.coroutines.__kxco_scheduleResume"      => schedule_resume,
         "kotlinx.coroutines.__kxco_newSlot"             => new_slot,
         "kotlinx.coroutines.__kxco_parkSlot"            => park_slot,
@@ -192,6 +195,51 @@ fn spawn_launch_block(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let scope = ctx.host.lookup_global("GlobalScope").unwrap_or(Value::Null);
     ctx.host.coroutine_launch(&lam, &scope, ctx.out)?;
+    Ok(Value::Unit)
+}
+
+/// `__kxco_dispatch { … }` — dispatch a coroutine body onto the
+/// real parallel worker pool (`Dispatchers.Default`). Returns an
+/// opaque job id the caller joins with `__kxco_joinDispatched`. The
+/// body, its captures, and any value it returns cross threads; the
+/// host `publish_deep`'s the escaping graph before the worker starts
+/// and again on completion (mirrors the spawned-thread boundary).
+fn dispatch_coroutine(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let Some(block) = ctx.args.first().cloned() else {
+        return Err(RuntimeError::Type(
+            "__kxco_dispatch: expected the coroutine block as the first arg".into(),
+        ));
+    };
+    let id = ctx.host.dispatch_coroutine(&block, false, ctx.out)?;
+    Ok(Value::Long(id as i64))
+}
+
+/// `__kxco_dispatchIo { … }` — same as `__kxco_dispatch` but routes
+/// to the elastic (`Dispatchers.IO`) pool for blocking offload.
+fn dispatch_coroutine_io(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let Some(block) = ctx.args.first().cloned() else {
+        return Err(RuntimeError::Type(
+            "__kxco_dispatchIo: expected the coroutine block as the first arg".into(),
+        ));
+    };
+    let id = ctx.host.dispatch_coroutine(&block, true, ctx.out)?;
+    Ok(Value::Long(id as i64))
+}
+
+/// `__kxco_joinDispatched(id)` — block the calling coroutine's
+/// thread until the dispatched job completes, establishing the
+/// completion → joiner happens-before edge.
+fn join_dispatched(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let id = match ctx.args.first() {
+        Some(Value::Long(l)) => *l,
+        Some(Value::Int(i)) => *i as i64,
+        _ => {
+            return Err(RuntimeError::Type(
+                "__kxco_joinDispatched: argument must be Long".into(),
+            ))
+        }
+    };
+    ctx.host.join_dispatched(id as u64)?;
     Ok(Value::Unit)
 }
 

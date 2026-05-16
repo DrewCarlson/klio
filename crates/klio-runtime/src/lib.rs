@@ -607,6 +607,30 @@ pub trait IntrinsicHost {
     fn os_thread_alive(&mut self, _id: u64) -> bool {
         false
     }
+
+    /// Dispatch a coroutine `block` onto a real worker thread for a
+    /// parallel dispatcher (`Dispatchers.Default` / `Dispatchers.IO`)
+    /// and return an opaque job id usable with [`join_dispatched`].
+    /// The escaping value graph is `publish_deep`'d before the worker
+    /// starts (same publication boundary as a spawned OS thread).
+    /// `elastic` requests the unbounded (`IO`) pool rather than the
+    /// CPU-bound (`Default`) pool. Default impl reuses
+    /// [`spawn_os_thread`].
+    fn dispatch_coroutine(
+        &mut self,
+        block: &Value,
+        _elastic: bool,
+        out: &mut dyn Output,
+    ) -> Result<u64, RuntimeError> {
+        self.spawn_os_thread(block, out)
+    }
+
+    /// Block the calling thread until the dispatched job completes,
+    /// establishing the completion → joiner happens-before edge.
+    /// Default impl reuses [`join_os_thread`].
+    fn join_dispatched(&mut self, id: u64) -> Result<(), RuntimeError> {
+        self.join_os_thread(id)
+    }
 }
 
 /// Cooperative scheduler the runtime exposes to anything called
