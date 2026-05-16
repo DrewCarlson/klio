@@ -4888,6 +4888,38 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Reflective `KSerializer` synthesis (the kotlinx-serialization
+        // compiler-plugin replacement). `T.serializer()` /
+        // `Companion.serializer()` on a `@Serializable` class with no
+        // hand-written or `with=` serializer reaches here only after
+        // every real dispatch (including a user-declared companion
+        // `serializer()`) has missed. When the kotlinx-serialization
+        // pack is loaded it registers a top-level
+        // `ReflectiveKSerializer` class; build one over the target
+        // class so the program gets a working serializer by
+        // reflecting the primary-constructor properties.
+        if name == "serializer"
+            && args.is_empty()
+            && matches!(
+                receiver,
+                klio_runtime::Value::Class(_)
+                    | klio_runtime::Value::BoundInnerClass { .. }
+            )
+        {
+            let factory = self
+                .classes
+                .borrow()
+                .get("ReflectiveKSerializer")
+                .cloned();
+            if let Some(def) = factory {
+                if let Some(class_id) = self.module.class_id(&def.name) {
+                    let ctor_args = [receiver.clone()];
+                    return <VmHost as klio_ir::eval::Host>::new_instance(
+                        self, class_id, &ctor_args,
+                    );
+                }
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()

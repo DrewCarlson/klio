@@ -28,6 +28,7 @@ klio-stdlib   = { workspace = true }
 klio-kotlinx-coroutines = { workspace = true }
 klio-kotlinx-atomicfu   = { workspace = true }
 klio-kotlinx-datetime   = { workspace = true }
+klio-kotlinx-serialization = { workspace = true }
 klio-kotlinx-io         = { workspace = true }
 
 [lints]

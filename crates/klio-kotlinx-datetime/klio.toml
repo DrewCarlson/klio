@@ -9,16 +9,26 @@ auto_bindings = true
 # from the in-pack git submodule. `include` curates exactly the files
 # klio can parse + resolve verbatim with no machinery it lacks: the
 # self-contained Month / DayOfWeek enums + factories and the public
-# exception types. Every other commonMain file is an `expect`
-# declaration whose `actual` lives in core/commonKotlin and pulls in
-# kotlinx-serialization (`@Serializable(with = ...)`), the
-# kotlinx.datetime.format parser-combinator DSL, the internal IANA
-# tz database + Tzfile binary reader, and stdlib `kotlin.time.Instant`
-# / `kotlin.time.Duration`; none of which klio has. Several of those
-# files also use syntax klio's parser does not yet accept (qualified
-# function-type receivers `A.B.() -> Unit`, qualified anonymous-object
-# supertypes, nested-type params in `(x: A.B)` position). They are
-# excluded and the consumer-facing surface is supplied by klioMain.
+# exception types.
+#
+# Every datetime value-type source file (LocalDate.kt, Instant.kt,
+# LocalDateTime.kt, LocalTime.kt, TimeZone.kt, DateTimePeriod.kt,
+# DateTimeUnit.kt, UtcOffset.kt, YearMonth.kt, Clock.kt) and every
+# `serializers/*.kt` file fails to *parse* under klio: they use syntax
+# klio's parser does not yet accept (qualified function-type receivers
+# `A.B.() -> Unit`, qualified anonymous-object supertypes, nested-type
+# params in `(x: A.B)` position). This is a pre-existing klio parser
+# limitation independent of kotlinx-serialization, so the value types
+# stay klio-supplied (klioMain cannot shrink until the parser grows
+# those forms). The serializers that *do* parse
+# (DateTimePeriod/DayOfWeek/Instant/TimeZone) still cannot *run*: they
+# need the format parser-combinator DSL, `kotlin.time.Instant`, the
+# excluded reified-generic serializer factories, or
+# `buildClassSerialDescriptor` (whose body hits a klio `vararg.toList`
+# interpreter gap). The pack now depends on kotlinx.serialization so
+# datetime value types are reflectively `@Serializable`-serializable
+# (see the serialization pack's reflective KSerializer); the
+# consumer-facing value-type surface is still supplied by klioMain.
 [[source]]
 root = "upstream/core/common/src"
 include = [
@@ -40,3 +50,6 @@ root = "klioMain"
 
 [[deps]]
 id = "stdlib"
+
+[[deps]]
+id = "kotlinx.serialization"

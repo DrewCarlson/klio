@@ -887,6 +887,7 @@ dependencies = [
  "klio-kotlinx-coroutines",
  "klio-kotlinx-datetime",
  "klio-kotlinx-io",
+ "klio-kotlinx-serialization",
  "klio-ktor-client",
  "klio-lexer",
  "klio-pack",
@@ -982,6 +983,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "klio-kotlinx-serialization"
+version = "0.1.0"
+dependencies = [
+ "klio-runtime",
+ "klio-stdlib",
+]
+
+[[package]]
 name = "klio-ktor-client"
 version = "0.1.0"
 dependencies = [
@@ -1027,6 +1036,7 @@ dependencies = [
  "klio-kotlinx-coroutines",
  "klio-kotlinx-datetime",
  "klio-kotlinx-io",
+ "klio-kotlinx-serialization",
  "klio-lexer",
  "klio-parser",
  "klio-resolver",

@@ -20,6 +20,7 @@ members = [
     "crates/klio-kotlinx-atomicfu",
     "crates/klio-kotlinx-datetime",
     "crates/klio-kotlinx-io",
+    "crates/klio-kotlinx-serialization",
     "crates/klio-ktor-client",
     "crates/klio-interp-ir",
     "crates/klio-cli",
@@ -54,6 +55,7 @@ klio-kotlinx-coroutines = { path = "crates/klio-kotlinx-coroutines" }
 klio-kotlinx-atomicfu   = { path = "crates/klio-kotlinx-atomicfu" }
 klio-kotlinx-datetime   = { path = "crates/klio-kotlinx-datetime" }
 klio-kotlinx-io         = { path = "crates/klio-kotlinx-io" }
+klio-kotlinx-serialization = { path = "crates/klio-kotlinx-serialization" }
 klio-ktor-client        = { path = "crates/klio-ktor-client" }
 klio-interp-ir   = { path = "crates/klio-interp-ir" }
 

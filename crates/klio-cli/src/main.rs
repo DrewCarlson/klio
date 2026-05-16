@@ -1146,6 +1146,7 @@ fn merged_host_bindings() -> klio_stdlib::HostBindings {
     merge_into(&mut out, klio_kotlinx_io::host_bindings());
     merge_into(&mut out, klio_kotlinx_datetime::host_bindings());
     merge_into(&mut out, klio_kotlinx_coroutines::host_bindings());
+    merge_into(&mut out, klio_kotlinx_serialization::host_bindings());
     // ktor-client is opt-in (pack must be installed to take effect)
     // but its host functions are always available in the registry so
     // the pack's bindings resolve when installed.
