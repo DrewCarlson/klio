@@ -393,7 +393,7 @@ pub trait IntrinsicHost {
 /// `Continuation` records itself with [`Scheduler::schedule_resume`].
 /// The interpreter pulls from these queues between rounds to
 /// interleave sibling coroutines.
-pub trait Scheduler {
+pub trait Scheduler: Send {
     /// Post a lambda to run as a freshly-launched task. The
     /// interpreter drives the body through the suspend state
     /// machine on the next drain pass.
