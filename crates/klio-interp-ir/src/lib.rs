@@ -1219,15 +1219,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if let Some(intrinsic) = self.installed_bindings.resolve(&func.fqn) {
                 return self.dispatch_intrinsic(intrinsic, args);
             }
-            // Fill missing positional args with Null so an
-            // implicit-`it` lambda invoked with zero args still
-            // initialises the param slot. Pack trailing vararg
-            // args into an Array when the target's last param is
-            // marked vararg.
-            let mut call_args: Vec<klio_runtime::Value> = Vec::with_capacity(info.n_params);
-            for i in 0..info.n_params {
-                call_args.push(args.get(i).cloned().unwrap_or(klio_runtime::Value::Null));
-            }
+            // Fill missing positional args from the target's
+            // registered default-arg thunks (an implicit-`it` lambda
+            // invoked with zero args still gets its slot as Null).
+            // Pack trailing vararg args into an Array when the
+            // target's last param is marked vararg.
+            let defaults =
+                self.func_defaults.get(&info.body_func).cloned();
+            let mut call_args = pad_args_with_defaults(
+                &module,
+                info.n_params,
+                args,
+                defaults.as_ref(),
+                self,
+            )?;
             if let Some(last) = func.params.last() {
                 if last.is_vararg && args.len() > info.n_params {
                     let mut packed: Vec<klio_runtime::Value> = Vec::new();
@@ -5288,6 +5293,52 @@ fn pack_vararg_args(
     args
 }
 
+/// Build the `n_params`-length argument vector for a closure call,
+/// filling positions past the provided args from the target's
+/// registered default-arg thunks (each binds the params before it),
+/// falling back to `Null` when a slot has no default. This mirrors
+/// the trailing-arg padding `Vm::call_func` does for top-level
+/// functions so a local `fun f(a, b = a + 1)` called `f(1)` yields
+/// `b == 2`.
+fn pad_args_with_defaults<H: klio_ir::eval::Host>(
+    module: &klio_ir::Module,
+    n_params: usize,
+    provided: &[klio_runtime::Value],
+    defaults: Option<&Vec<Option<klio_ir::FuncId>>>,
+    host: &mut H,
+) -> Result<Vec<klio_runtime::Value>, klio_ir::eval::EvalError> {
+    let mut call_args: Vec<klio_runtime::Value> = Vec::with_capacity(n_params);
+    for i in 0..n_params {
+        if i < provided.len() {
+            call_args.push(provided[i].clone());
+            continue;
+        }
+        let dfid = defaults.and_then(|d| d.get(i).copied().flatten());
+        if let Some(dfid) = dfid {
+            let dfunc = module
+                .funcs
+                .get(dfid.0 as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    klio_ir::eval::EvalError::Type(format!(
+                        "default-arg FuncId {} out of range",
+                        dfid.0
+                    ))
+                })?;
+            let v = klio_ir::eval::eval_with(
+                module,
+                &dfunc,
+                call_args.clone(),
+                host,
+            )?;
+            call_args.push(v);
+        } else {
+            call_args.push(klio_runtime::Value::Null);
+        }
+    }
+    Ok(call_args)
+}
+
 /// Structural value hash matching `Value::structural_eq`. Used by
 /// data-class auto `hashCode`. Mirrors klio-interp's helper.
 fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
@@ -5857,10 +5908,8 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     "closure body FuncId {} out of range",
                     info.body_func.0
                 )))?;
-            let mut call_args: Vec<klio_runtime::Value> = Vec::with_capacity(info.n_params);
-            for i in 0..info.n_params {
-                call_args.push(args.get(i).cloned().unwrap_or(klio_runtime::Value::Null));
-            }
+            let defaults =
+                self.func_defaults.get(&info.body_func).cloned();
             let capture_values: Vec<klio_runtime::Value> = info.captures.borrow().clone();
             let module = Rc::clone(&self.module);
             // Mutable-capture support: pre-define each captured name
@@ -5902,13 +5951,22 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     class_default_outer: Rc::clone(&self.class_default_outer),
                     closures: &mut *self.closures,
                 };
-                klio_ir::eval::eval_with_captures(
+                match pad_args_with_defaults(
                     &module,
-                    &func,
-                    call_args,
-                    capture_values,
+                    info.n_params,
+                    args,
+                    defaults.as_ref(),
                     &mut host,
-                )
+                ) {
+                    Ok(call_args) => klio_ir::eval::eval_with_captures(
+                        &module,
+                        &func,
+                        call_args,
+                        capture_values,
+                        &mut host,
+                    ),
+                    Err(e) => Err(e),
+                }
             };
             // Read back updated capture values into the closure's
             // captures cell so subsequent reads (and the outer

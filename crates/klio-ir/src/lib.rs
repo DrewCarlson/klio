@@ -546,6 +546,15 @@ pub struct ModuleRegistry {
     /// Body-property `(class, prop)` pairs declared with `by`.
     #[serde(default)]
     pub delegated_body_props: std::collections::HashSet<(String, String)>,
+    /// Per-local-function default-arg thunks. Keyed by the local
+    /// fn's lowered body `FuncId`; each slot holds the `FuncId` of a
+    /// 0-arg thunk producing that parameter's default (binding the
+    /// preceding params), or `None` for a required param. The Vm
+    /// folds these into its `func_defaults` table so closure calls
+    /// pad missing trailing args the same way top-level calls do.
+    #[serde(default)]
+    pub local_fn_defaults:
+        std::collections::HashMap<FuncId, Vec<Option<FuncId>>>,
 }
 
 impl Module {

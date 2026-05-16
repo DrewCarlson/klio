@@ -931,10 +931,14 @@ fn build_module_with_overrides(
                 for (idx, p) in f.params.iter().enumerate() {
                     if let Some(default_expr) = &p.default {
                         let bind_upto = (offset + idx).min(name_refs.len());
+                        let widened = klio_ir::lower::widen_numeric_literal(
+                            default_expr,
+                            &p.ty,
+                        );
                         let fid = klio_ir::lower::lower_expr_as_param_thunk(
                             &mut module,
                             &name_refs[..bind_upto],
-                            default_expr,
+                            widened.as_ref().unwrap_or(default_expr),
                             &format!("__default_{}_{}", f.name.name, p.name.name),
                         );
                         slots.push(Some(fid));
@@ -1655,6 +1659,16 @@ fn build_module_with_overrides(
     // at dispatch time. Build populates the same data as the loose
     // BuiltModule fields; the long-term plan is to drop those once
     // every dispatch site reads through `module.registry` directly.
+    // Local-function default thunks were recorded into the registry
+    // during body lowering. Fold them into `func_defaults` (keyed by
+    // the local fn's body FuncId) so the closure-call path pads
+    // missing trailing args exactly like top-level `call_func` does,
+    // and keep them on the registry so a serialized pack carries them.
+    let local_fn_defaults =
+        std::mem::take(&mut module.registry.local_fn_defaults);
+    for (fid, slots) in &local_fn_defaults {
+        func_defaults.entry(*fid).or_insert_with(|| slots.clone());
+    }
     module.registry = klio_ir::ModuleRegistry {
         object_names: object_names.clone(),
         companion_singletons: companion_singletons.clone(),
@@ -1662,6 +1676,7 @@ fn build_module_with_overrides(
         func_type_params: func_type_params.clone(),
         top_level_delegated_props: top_level_delegated_props.clone(),
         delegated_body_props: delegated_body_props.clone(),
+        local_fn_defaults,
     };
     BuiltModule {
         module: Rc::new(module),

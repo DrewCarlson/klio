@@ -85,6 +85,7 @@ cargo run -p klio-cli -- run examples/<name>.kt
 | `string_builder.kt`, `string_ordering.kt` | `StringBuilder`, string comparison.             |
 | `char_unicode.kt`          | `Char` and Unicode handling.                                   |
 | `numeric_fidelity.kt`      | Integer/float width and rounding fidelity.                     |
+| `numeric_literal_coercion.kt` | Unsuffixed integer literals taking a `Long` binding or parameter-default type, including recursive local `tailrec` accumulators. |
 | `regex.kt`                 | `Regex` basics.                                                |
 | `for_user_iterator.kt`     | `for` over a user-defined `iterator()`.                        |
 | `notnull_assertion.kt`     | The `!!` operator.                                             |

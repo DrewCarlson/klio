@@ -719,6 +719,37 @@ pub fn lower_binary_expr_as_thunk(
 /// Lower an arbitrary expression as an N-arg IR function. Used to
 /// lift parent-ctor argument expressions whose scope is the child
 /// class's primary-ctor params.
+/// An unsuffixed integer literal takes the type of the binding it
+/// initializes, so `val x: Long = 0` is `0L`. Without this the
+/// literal keeps its `Int` runtime representation and later
+/// arithmetic truncates (a `Long` accumulator seeded from `0`
+/// overflowing at 32 bits). Returns the `Long`-kinded literal when
+/// the target type is `Long`, else `None`. This is the only
+/// implicit literal widening Kotlin performs — an integer literal
+/// is *not* assignable to `Float`/`Double` (`val d: Double = 1` is
+/// a type error there), and `Byte`/`Short` slots promote to `Int`
+/// in arithmetic anyway, so neither needs a rewrite.
+pub fn widen_numeric_literal(
+    e: &Expr,
+    ty: &klio_ast::TypeRef,
+) -> Option<Expr> {
+    if ty.nullable || ty.name.name != "Long" {
+        return None;
+    }
+    match e {
+        Expr::IntLit {
+            value,
+            kind: klio_ast::IntLitKind::Int,
+            span,
+        } => Some(Expr::IntLit {
+            value: *value,
+            kind: klio_ast::IntLitKind::Long,
+            span: *span,
+        }),
+        _ => None,
+    }
+}
+
 pub fn lower_expr_as_param_thunk(
     module: &mut crate::Module,
     params: &[&str],
@@ -3231,6 +3262,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let outer_boxed = b.boxed_vars_snapshot();
             let (body_func, captured_names) = lower_lambda_body_capturing_kind(
                 b.module, &param_idents, &body_block, outer_names, false, &outer_boxed,
+                None,
             );
             let captures: Vec<Reg> = captured_names
                 .iter()
@@ -3344,7 +3376,7 @@ fn lower_lambda_body_capturing(
     outer: std::collections::HashSet<String>,
     outer_boxed: &std::collections::HashSet<String>,
 ) -> (crate::FuncId, Vec<String>) {
-    lower_lambda_body_capturing_kind(module, params, body, outer, true, outer_boxed)
+    lower_lambda_body_capturing_kind(module, params, body, outer, true, outer_boxed, None)
 }
 
 fn lower_lambda_body_capturing_kind(
@@ -3354,12 +3386,20 @@ fn lower_lambda_body_capturing_kind(
     outer: std::collections::HashSet<String>,
     is_lambda: bool,
     outer_boxed: &std::collections::HashSet<String>,
+    tailrec_self: Option<&str>,
 ) -> (crate::FuncId, Vec<String>) {
     let mut b = FuncBuilder::new(module);
     if is_lambda {
         b.set_outer_names(outer);
     } else {
         b.set_outer_names_without_lambda(outer);
+    }
+    // A local `tailrec fun` recurses by looping: its tail-position
+    // self-call lowers to a `TailJump` (params re-bound, entry block
+    // restarted) exactly like a top-level tailrec, so deep
+    // recursion runs in constant stack.
+    if let Some(name) = tailrec_self {
+        let _ = b.set_tailrec_self(name.to_string());
     }
     // Boxed vars: this lambda's own captured vars, plus any
     // enclosing-frame boxed var this body references (a captured
@@ -3793,7 +3833,13 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             // into a fresh register and bound in the current scope;
             // mutability is enforced by typeck, not the IR.
             let init = match &p.init {
-                Some(e) => lower_expr(b, e),
+                Some(e) => {
+                    let widened = p
+                        .ty
+                        .as_ref()
+                        .and_then(|ty| widen_numeric_literal(e, ty));
+                    lower_expr(b, widened.as_ref().unwrap_or(e))
+                }
                 None => b.emit_const(Const::Unit),
             };
             // Allocate a "home" register and Move the init value
@@ -3852,6 +3898,29 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                 None => None,
             };
             if let Some(body) = body_block {
+                // A local function that calls itself is desugared like
+                // `var name = null; name = { … name(…) … }`: a shared
+                // cell is created first so the body can capture it and
+                // the closure stores itself into it once built. This
+                // is the same boxed-self-reference path a recursive
+                // `lateinit var f = { … f(…) … }` already uses.
+                let mut self_refs = std::collections::HashSet::new();
+                for s in &body.stmts {
+                    collect_path_idents_stmt(s, &mut self_refs);
+                }
+                let is_recursive = self_refs.contains(&f.name.name);
+                let self_cell: Option<Reg> = if is_recursive {
+                    let null_v = b.emit_const(Const::Null);
+                    let home = b.alloc_reg();
+                    b.push(Inst::MakeCell { dst: home, src: null_v });
+                    b.set_mutable_home(&f.name.name, home);
+                    b.mark_mutable(&f.name.name);
+                    b.mark_boxed(&f.name.name);
+                    b.bind(f.name.name.clone(), home);
+                    Some(home)
+                } else {
+                    None
+                };
                 let outer_names: std::collections::HashSet<String> = b.visible_names();
                 let outer_boxed = b.boxed_vars_snapshot();
                 // A local *extension* function (`fun List<T>.mid() =
@@ -3867,12 +3936,16 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                         klio_ast::Ident { name: "this".to_string(), span: dummy_span },
                     );
                 }
-                let (body_func, captured_names) = lower_lambda_body_capturing(
+                let tailrec_self =
+                    if f.is_tailrec { Some(f.name.name.as_str()) } else { None };
+                let (body_func, captured_names) = lower_lambda_body_capturing_kind(
                     b.module,
                     &param_idents,
                     &body,
                     outer_names,
+                    true,
                     &outer_boxed,
+                    tailrec_self,
                 );
                 let captures: Vec<Reg> = captured_names
                     .iter()
@@ -3882,6 +3955,45 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     f.params.iter().map(|p| p.name.name.clone()).collect();
                 if is_ext {
                     param_names.insert(0, "this".to_string());
+                }
+                // Per-param defaults: lower each default expression as
+                // a thunk binding the lowered param prefix (so `b =
+                // a + 1` can read an earlier param) and register it
+                // under the body FuncId. The Vm pads missing trailing
+                // args from these the same way it does for top-level
+                // functions.
+                if f.params.iter().any(|p| p.default.is_some()) {
+                    let offset = usize::from(is_ext);
+                    let name_refs: Vec<&str> =
+                        param_names.iter().map(String::as_str).collect();
+                    let mut slots: Vec<Option<crate::FuncId>> =
+                        Vec::with_capacity(param_names.len());
+                    for _ in 0..offset {
+                        slots.push(None);
+                    }
+                    for (idx, p) in f.params.iter().enumerate() {
+                        if let Some(default_expr) = &p.default {
+                            let bind_upto = (offset + idx).min(name_refs.len());
+                            let widened =
+                                widen_numeric_literal(default_expr, &p.ty);
+                            let fid = lower_expr_as_param_thunk(
+                                b.module,
+                                &name_refs[..bind_upto],
+                                widened.as_ref().unwrap_or(default_expr),
+                                &format!(
+                                    "__default_local_{}_{}",
+                                    f.name.name, p.name.name
+                                ),
+                            );
+                            slots.push(Some(fid));
+                        } else {
+                            slots.push(None);
+                        }
+                    }
+                    b.module
+                        .registry
+                        .local_fn_defaults
+                        .insert(body_func, slots);
                 }
                 let dst = b.alloc_reg();
                 b.push(Inst::AstLambda {
@@ -3893,7 +4005,11 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     absorb_return: true,
                     body_func: Some(body_func),
                 });
-                b.bind(f.name.name.clone(), dst);
+                if let Some(home) = self_cell {
+                    b.push(Inst::CellSet { cell: home, value: dst });
+                } else {
+                    b.bind(f.name.name.clone(), dst);
+                }
                 b.mark_local_fn(&f.name.name);
             }
             None

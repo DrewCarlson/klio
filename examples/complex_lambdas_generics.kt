@@ -2,9 +2,6 @@
 // memoization via a captured map, a generic recursive Tree with
 // fold/map, and tail-recursive accumulation.
 
-tailrec fun sumTo(n: Int, acc: Long = 0): Long =
-    if (n == 0) acc else sumTo(n - 1, acc + n)
-
 fun <A, B, C> compose(f: (B) -> C, g: (A) -> B): (A) -> C = { a -> f(g(a)) }
 
 fun <A, B, C> curry(f: (A, B) -> C): (A) -> (B) -> C = { a -> { b -> f(a, b) } }
@@ -65,8 +62,11 @@ fun main() {
     val doubled = tree.map { it * 2 }.fold({ "$it" }, { a, b -> "($a $b)" })
     println("sum=$sum depth=$depth shape=$doubled")
 
-    // Tail-recursive accumulation, plus a fold producing a lambda
+    // Tail-recursive accumulation via a recursive local function
+    // with a defaulted accumulator, plus a fold producing a lambda
     // pipeline.
+    tailrec fun sumTo(n: Int, acc: Long = 0): Long =
+        if (n == 0) acc else sumTo(n - 1, acc + n)
     println(sumTo(1_000))
 
     val pipeline: (Int) -> Int = listOf<(Int) -> Int>(
