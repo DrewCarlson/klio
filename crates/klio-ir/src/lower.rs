@@ -2347,6 +2347,51 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     && b.module.class_id(&segments[0].name).is_none()
                     && b.module.func_id(&segments[0].name).is_none()
                 {
+                    // Inside a method / extension body `this` is a
+                    // bound param (not a capture). A bare primitive
+                    // conversion call — `toInt()` in `fun Byte.and(o)
+                    // = toInt() and o` — is a member call on the
+                    // receiver. The receiver is a primitive with no
+                    // class member table, and CallMemberOrGlobal only
+                    // sees a *captured* `this` (Null for a param), so
+                    // dispatch straight on the `this` reg. Limited to
+                    // the fixed set of stdlib conversion names, none
+                    // of which is ever a top-level function, so
+                    // ordinary global calls are unaffected.
+                    let is_primitive_conv = matches!(
+                        segments[0].name.as_str(),
+                        "toInt"
+                            | "toLong"
+                            | "toByte"
+                            | "toShort"
+                            | "toDouble"
+                            | "toFloat"
+                            | "toChar"
+                            | "toBoolean"
+                            | "toUInt"
+                            | "toULong"
+                            | "toUByte"
+                            | "toUShort"
+                    );
+                    if is_primitive_conv {
+                        if let Some(this_reg) = b.resolve("this") {
+                            let (args_start, count) = lower_arg_run(b, args);
+                            let arg_names = intern_arg_names(b.module, ast_arg_names);
+                            let dst = b.alloc_reg();
+                            let nm = b
+                                .module
+                                .intern_const(Const::String(segments[0].name.clone()));
+                            b.push(Inst::CallMember {
+                                dst,
+                                receiver: this_reg,
+                                name: nm,
+                                args: args_start,
+                                n_args: count,
+                                arg_names,
+                            });
+                            return dst;
+                        }
+                    }
                     let this_idx = b.record_capture("this");
                     let (args_start, count) = lower_arg_run(b, args);
                     let arg_names = intern_arg_names(b.module, ast_arg_names);
