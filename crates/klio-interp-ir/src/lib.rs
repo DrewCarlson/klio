@@ -3479,7 +3479,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let make_seq = |new_op: klio_runtime::SeqOp| -> klio_runtime::Value {
                 let mut ops = seq.ops.clone();
                 ops.push(new_op);
-                klio_runtime::Value::Sequence(Rc::new(klio_runtime::SequenceData {
+                klio_runtime::Value::Sequence(Arc::new(klio_runtime::SequenceData {
                     source: seq.source.clone(),
                     ops,
                 }))

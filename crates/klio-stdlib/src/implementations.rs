@@ -5135,7 +5135,7 @@ fn pair_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// Build an items-only Sequence from a `Vec`. Used by `asSequence`,
 /// `sequenceOf`, and `emptySequence`.
 fn make_sequence(items: Vec<Value>) -> Value {
-    Value::Sequence(Rc::new(klio_runtime::SequenceData {
+    Value::Sequence(Arc::new(klio_runtime::SequenceData {
         source: klio_runtime::SequenceSource::Items(Arc::new(items)),
         ops: Vec::new(),
     }))
@@ -5170,7 +5170,7 @@ fn seq_empty(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn seq_generate_sequence(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     use klio_runtime::{SequenceData, SequenceSource};
     match ctx.args {
-        [lam @ (Value::Lambda { .. } | Value::IrClosure { .. })] => Ok(Value::Sequence(Rc::new(SequenceData {
+        [lam @ (Value::Lambda { .. } | Value::IrClosure { .. })] => Ok(Value::Sequence(Arc::new(SequenceData {
             source: SequenceSource::Generate {
                 seed: None,
                 next: Box::new(lam.clone()),
@@ -5183,7 +5183,7 @@ fn seq_generate_sequence(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             } else {
                 Some(Box::new(seed.clone()))
             };
-            Ok(Value::Sequence(Rc::new(SequenceData {
+            Ok(Value::Sequence(Arc::new(SequenceData {
                 source: SequenceSource::Generate {
                     seed: seeded,
                     next: Box::new(lam.clone()),

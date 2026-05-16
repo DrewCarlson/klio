@@ -602,7 +602,7 @@ pub enum Value {
     /// pipeline ops. Terminal ops drive the pull, so unbounded generators
     /// (`generateSequence { … }`) only emit as many items as the terminal
     /// op consumes.
-    Sequence(Rc<SequenceData>),
+    Sequence(Arc<SequenceData>),
     /// `kotlin.collections.Iterator<T>` and its primitive specializations
     /// (`IntIterator`, `CharIterator`, …). Sequential cursor over a fixed
     /// vector; `prim` tags the typed-iterator variant so `is`-checks and
@@ -1094,7 +1094,7 @@ pub struct InstanceData {
 /// accidentally trample each other's storage on the same instance.
 pub struct NativeState {
     pub kind: &'static str,
-    pub data: Rc<RefCell<dyn std::any::Any>>,
+    pub data: Arc<Mutex<dyn std::any::Any + Send + Sync>>,
 }
 
 impl std::fmt::Debug for NativeState {
@@ -1360,21 +1360,22 @@ impl InstanceData {
     /// on first access. Panics when the instance already carries
     /// native state under a different `kind`, which indicates two
     /// host bindings are fighting over the same instance.
-    pub fn ensure_native_state<T: std::any::Any>(
+    pub fn ensure_native_state<T: std::any::Any + Send + Sync>(
         &mut self,
         kind: &'static str,
         init: impl FnOnce() -> T,
-    ) -> Rc<RefCell<dyn std::any::Any>> {
+    ) -> Arc<Mutex<dyn std::any::Any + Send + Sync>> {
         if let Some(ns) = &self.native_state {
             assert_eq!(
                 ns.kind, kind,
                 "native_state kind mismatch: instance carries `{}`, binding asked for `{}`",
                 ns.kind, kind,
             );
-            return Rc::clone(&ns.data);
+            return Arc::clone(&ns.data);
         }
-        let data: Rc<RefCell<dyn std::any::Any>> = Rc::new(RefCell::new(init()));
-        self.native_state = Some(NativeState { kind, data: Rc::clone(&data) });
+        let data: Arc<Mutex<dyn std::any::Any + Send + Sync>> =
+            Arc::new(Mutex::new(init()));
+        self.native_state = Some(NativeState { kind, data: Arc::clone(&data) });
         data
     }
 }
@@ -2588,6 +2589,19 @@ impl Env {
         }
     }
 }
+
+/// The whole point of the value-model migration: a `Value` (and the
+/// interpreter state reachable through it) can be sent and shared
+/// across OS threads. If a future change reintroduces an `Rc` /
+/// `RefCell` / non-`Send` payload anywhere in the graph, this fails
+/// to compile — the regression guard for the parallel backing.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Value>();
+    assert_send_sync::<ObjRef<Value>>();
+    assert_send_sync::<Env>();
+    assert_send_sync::<ClassDef>();
+};
 
 #[cfg(test)]
 mod tests {
