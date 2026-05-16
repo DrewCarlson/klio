@@ -33,7 +33,7 @@ pub struct Vm {
     /// expands to carry the full runtime shape this table shrinks
     /// and eventually goes away. Wrapped in RefCell so the Vm can
     /// register local classes encountered at runtime (Inst::RegisterClass).
-    classes: Rc<RefCell<std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>>>,
+    classes: Rc<RefCell<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>>,
     /// Body-property initialiser FuncIds. Invoked during instance
     /// allocation to populate fields for `val/var x: T = expr`
     /// declared in a class body (not primary-ctor params).
@@ -481,7 +481,7 @@ struct VmHost<'a> {
     scheduler: &'a mut dyn klio_runtime::Scheduler,
     out: &'a mut dyn Output,
     instance_id_counter: &'a mut u64,
-    classes: Rc<RefCell<std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>>>,
+    classes: Rc<RefCell<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>>,
     body_prop_inits:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_prop_getters:
@@ -961,7 +961,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 | "Char" | "String" | "Unit" | "Any" | "Nothing" | "UInt"
                 | "ULong" | "UShort" | "UByte" | "Number"
         ) {
-            let def = Rc::new(klio_runtime::ClassDef {
+            let def = Arc::new(klio_runtime::ClassDef {
                 name: name.to_string(),
                 fqn: format!("kotlin.{name}"),
                 annotation_names: Vec::new(),
@@ -979,19 +979,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 is_anonymous: false,
                 secondary_ctors: Vec::new(),
                 supertype_names: Vec::new(),
-                parent: RefCell::new(None),
-                interfaces: RefCell::new(Vec::new()),
+                parent: klio_runtime::ObjRef::new(None),
+                interfaces: klio_runtime::ObjRef::new(Vec::new()),
                 is_interface: false,
                 is_fun_interface: false,
                 parent_ctor_args: Vec::new(),
-                enum_entries: RefCell::new(Vec::new()),
-                companion: RefCell::new(None),
-                enclosing_class: RefCell::new(None),
-                nested_classes: RefCell::new(Vec::new()),
+                enum_entries: klio_runtime::ObjRef::new(Vec::new()),
+                companion: klio_runtime::ObjRef::new(None),
+                enclosing_class: klio_runtime::ObjRef::new(None),
+                nested_classes: klio_runtime::ObjRef::new(Vec::new()),
                 captured_env: klio_runtime::ObjRef::new(klio_runtime::Env::new()),
-                supertype_delegates: RefCell::new(Vec::new()),
-                delegate_forwarders: RefCell::new(Vec::new()),
-                object_singleton: RefCell::new(None),
+                supertype_delegates: klio_runtime::ObjRef::new(Vec::new()),
+                delegate_forwarders: klio_runtime::ObjRef::new(Vec::new()),
+                object_singleton: klio_runtime::ObjRef::new(None),
             });
             return Some(klio_runtime::Value::Class(def));
         }
@@ -1118,7 +1118,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 *self.instance_id_counter += 1;
                 let identity = *self.instance_id_counter;
                 let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
-                    class: Rc::clone(cls),
+                    class: Arc::clone(cls),
                     fields: vec![("__sam_target__".to_string(), args[0].clone())],
                     outer: None,
                     identity,
@@ -1165,7 +1165,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 .get(&cls.name)
                 .cloned();
             let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
-                class: Rc::clone(cls),
+                class: Arc::clone(cls),
                 fields,
                 outer: default_outer,
                 identity,
@@ -1550,7 +1550,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .borrow()
                         .values()
                         .filter(|c| c.supertype_names.iter().any(|n| n == &cls.name))
-                        .map(|c| klio_runtime::Value::Class(Rc::clone(c)))
+                        .map(|c| klio_runtime::Value::Class(Arc::clone(c)))
                         .collect();
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
@@ -1727,7 +1727,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // methods referencing companion members lower as
             // `this.X`, which lands here after the instance's own
             // fields miss.
-            let mut queue: Vec<Rc<klio_runtime::ClassDef>> =
+            let mut queue: Vec<Arc<klio_runtime::ClassDef>> =
                 vec![inst.borrow().class.clone()];
             let mut visited: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
@@ -1749,7 +1749,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     queue.push(p);
                 }
                 for ifc in c.interfaces.borrow().iter() {
-                    queue.push(Rc::clone(ifc));
+                    queue.push(Arc::clone(ifc));
                 }
             }
             // Outer-instance chain fallback: an inner-class method
@@ -2003,7 +2003,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 if !has_own && !is_own_member {
                     // Walk class chain (parents + interfaces) and
                     // probe each level's companion for the field.
-                    let mut queue: Vec<Rc<klio_runtime::ClassDef>> =
+                    let mut queue: Vec<Arc<klio_runtime::ClassDef>> =
                         vec![inst.borrow().class.clone()];
                     let mut visited: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
@@ -2027,7 +2027,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             queue.push(p);
                         }
                         for ifc in c.interfaces.borrow().iter() {
-                            queue.push(Rc::clone(ifc));
+                            queue.push(Arc::clone(ifc));
                         }
                     }
                     let outer = inst.borrow().outer.clone();
@@ -2057,7 +2057,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // inspect the runtime class.
         if name == "class" {
             if let klio_runtime::Value::Instance(inst) = receiver {
-                return Ok(klio_runtime::Value::Class(Rc::clone(&inst.borrow().class)));
+                return Ok(klio_runtime::Value::Class(Arc::clone(&inst.borrow().class)));
             }
             return Ok(receiver.clone());
         }
@@ -2067,7 +2067,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // fields drive the call_value path below.
         *self.instance_id_counter += 1;
         let identity = *self.instance_id_counter;
-        let synth_class = Rc::new(klio_runtime::ClassDef {
+        let synth_class = Arc::new(klio_runtime::ClassDef {
             name: format!("$bound_ref${name}"),
             fqn: format!("$bound_ref${name}"),
             annotation_names: Vec::new(),
@@ -2085,19 +2085,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             is_anonymous: true,
             secondary_ctors: Vec::new(),
             supertype_names: Vec::new(),
-            parent: RefCell::new(None),
-            interfaces: RefCell::new(Vec::new()),
+            parent: klio_runtime::ObjRef::new(None),
+            interfaces: klio_runtime::ObjRef::new(Vec::new()),
             is_interface: false,
             is_fun_interface: false,
             parent_ctor_args: Vec::new(),
-            enum_entries: RefCell::new(Vec::new()),
-            companion: RefCell::new(None),
-            enclosing_class: RefCell::new(None),
-            nested_classes: RefCell::new(Vec::new()),
+            enum_entries: klio_runtime::ObjRef::new(Vec::new()),
+            companion: klio_runtime::ObjRef::new(None),
+            enclosing_class: klio_runtime::ObjRef::new(None),
+            nested_classes: klio_runtime::ObjRef::new(Vec::new()),
             captured_env: klio_runtime::ObjRef::new(klio_runtime::Env::new()),
-            supertype_delegates: RefCell::new(Vec::new()),
-            delegate_forwarders: RefCell::new(Vec::new()),
-            object_singleton: RefCell::new(None),
+            supertype_delegates: klio_runtime::ObjRef::new(Vec::new()),
+            delegate_forwarders: klio_runtime::ObjRef::new(Vec::new()),
+            object_singleton: klio_runtime::ObjRef::new(None),
         });
         let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
             class: synth_class,
@@ -2151,7 +2151,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => None,
             })
             .collect();
-        let def = Rc::new(klio_runtime::ClassDef {
+        let def = Arc::new(klio_runtime::ClassDef {
             name: class.name.name.clone(),
             fqn: class.name.name.clone(),
             annotation_names: Vec::new(),
@@ -2173,19 +2173,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 .iter()
                 .map(|t| t.name.name.clone())
                 .collect(),
-            parent: RefCell::new(None),
-            interfaces: RefCell::new(Vec::new()),
+            parent: klio_runtime::ObjRef::new(None),
+            interfaces: klio_runtime::ObjRef::new(Vec::new()),
             is_interface: class.is_interface,
             is_fun_interface: class.is_fun_interface,
             parent_ctor_args: Vec::new(),
-            enum_entries: RefCell::new(Vec::new()),
-            companion: RefCell::new(None),
-            enclosing_class: RefCell::new(None),
-            nested_classes: RefCell::new(Vec::new()),
+            enum_entries: klio_runtime::ObjRef::new(Vec::new()),
+            companion: klio_runtime::ObjRef::new(None),
+            enclosing_class: klio_runtime::ObjRef::new(None),
+            nested_classes: klio_runtime::ObjRef::new(Vec::new()),
             captured_env: klio_runtime::ObjRef::new(klio_runtime::Env::new()),
-            supertype_delegates: RefCell::new(Vec::new()),
-            delegate_forwarders: RefCell::new(Vec::new()),
-            object_singleton: RefCell::new(None),
+            supertype_delegates: klio_runtime::ObjRef::new(Vec::new()),
+            delegate_forwarders: klio_runtime::ObjRef::new(Vec::new()),
+            object_singleton: klio_runtime::ObjRef::new(None),
         });
         self.classes
             .borrow_mut()
@@ -2457,7 +2457,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 .collect();
             let supertype_names: Vec<String> =
                 supertypes.iter().map(|t| t.name.name.clone()).collect();
-            let class_def = Rc::new(klio_runtime::ClassDef {
+            let class_def = Arc::new(klio_runtime::ClassDef {
                 name: format!("$anon${identity}"),
                 fqn: format!("$anon${identity}"),
                 annotation_names: Vec::new(),
@@ -2475,19 +2475,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 is_anonymous: true,
                 secondary_ctors: Vec::new(),
                 supertype_names,
-                parent: RefCell::new(None),
-                interfaces: RefCell::new(Vec::new()),
+                parent: klio_runtime::ObjRef::new(None),
+                interfaces: klio_runtime::ObjRef::new(Vec::new()),
                 is_interface: false,
                 is_fun_interface: false,
                 parent_ctor_args: Vec::new(),
-                enum_entries: RefCell::new(Vec::new()),
-                companion: RefCell::new(None),
-                enclosing_class: RefCell::new(None),
-                nested_classes: RefCell::new(Vec::new()),
+                enum_entries: klio_runtime::ObjRef::new(Vec::new()),
+                companion: klio_runtime::ObjRef::new(None),
+                enclosing_class: klio_runtime::ObjRef::new(None),
+                nested_classes: klio_runtime::ObjRef::new(Vec::new()),
                 captured_env: klio_runtime::ObjRef::new(klio_runtime::Env::new()),
-                supertype_delegates: RefCell::new(Vec::new()),
-                delegate_forwarders: RefCell::new(Vec::new()),
-                object_singleton: RefCell::new(None),
+                supertype_delegates: klio_runtime::ObjRef::new(Vec::new()),
+                delegate_forwarders: klio_runtime::ObjRef::new(Vec::new()),
+                object_singleton: klio_runtime::ObjRef::new(None),
             });
             // Initialise body-property fields with literal values
             // only — anonymous-object property inits with arbitrary
@@ -2637,8 +2637,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // and local-class scenarios. `this@Outer` from an Inner
         // method walks to the captured outer instance.
         if let klio_runtime::Value::Instance(inst) = receiver {
-            let mut cur: Option<Rc<klio_runtime::ClassDef>> =
-                Some(Rc::clone(&inst.borrow().class));
+            let mut cur: Option<Arc<klio_runtime::ClassDef>> =
+                Some(Arc::clone(&inst.borrow().class));
             while let Some(c) = cur {
                 if c.name == qualifier || c.fqn == qualifier {
                     return Ok(receiver.clone());
@@ -2849,8 +2849,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 "UnsupportedOperationException",
                 "Any",
             ];
-            let mut cur: Option<Rc<klio_runtime::ClassDef>> =
-                Some(Rc::clone(&inst.borrow().class));
+            let mut cur: Option<Arc<klio_runtime::ClassDef>> =
+                Some(Arc::clone(&inst.borrow().class));
             while let Some(c) = cur {
                 if c.name == ty.name || c.fqn == ty.name {
                     return true;
@@ -2866,7 +2866,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 // `class Robot : FormalGreeter` where
                 // `interface FormalGreeter : Greeter` matches both.
                 {
-                    let mut iq: std::collections::VecDeque<Rc<klio_runtime::ClassDef>> =
+                    let mut iq: std::collections::VecDeque<Arc<klio_runtime::ClassDef>> =
                         c.interfaces.borrow().iter().cloned().collect();
                     let mut iseen: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
@@ -2886,7 +2886,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             }
                         }
                         for sup in iface.interfaces.borrow().iter() {
-                            iq.push_back(Rc::clone(sup));
+                            iq.push_back(Arc::clone(sup));
                         }
                     }
                 }
@@ -4841,7 +4841,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 *self.instance_id_counter += 1;
                 let identity = *self.instance_id_counter;
                 let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
-                    class: Rc::clone(&class_def),
+                    class: Arc::clone(&class_def),
                     fields: vec![("__sam_target__".to_string(), args[0].clone())],
                     outer: None,
                     identity,
@@ -5239,11 +5239,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // subclass instance also picks up the parent's `var/val`
         // body properties. Each init thunk runs with
         // `[this, leaf-ctor-args...]`.
-        let mut chain_classes: Vec<Rc<klio_runtime::ClassDef>> = Vec::new();
+        let mut chain_classes: Vec<Arc<klio_runtime::ClassDef>> = Vec::new();
         {
-            let mut cur = Some(Rc::clone(&class_def));
+            let mut cur = Some(Arc::clone(&class_def));
             while let Some(c) = cur {
-                chain_classes.push(Rc::clone(&c));
+                chain_classes.push(Arc::clone(&c));
                 cur = c.parent.borrow().clone();
             }
         }
@@ -5548,7 +5548,7 @@ struct VmIntrinsicHost<'a> {
     module: Arc<klio_ir::Module>,
     closures: &'a mut Vec<ClosureInfo>,
     globals: klio_runtime::ObjRef<klio_runtime::Env>,
-    classes: Rc<RefCell<std::collections::HashMap<String, Rc<klio_runtime::ClassDef>>>>,
+    classes: Rc<RefCell<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>>,
     body_prop_inits:
         &'a std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_prop_getters:

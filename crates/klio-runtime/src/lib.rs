@@ -590,12 +590,12 @@ pub enum Value {
     /// A user-declared class. Calling it constructs an `Instance`. Holds the
     /// declaration plus the env it was declared in (for resolving names from
     /// method bodies, supertypes, etc.).
-    Class(Rc<ClassDef>),
+    Class(Arc<ClassDef>),
     /// An `inner class` bound to a specific outer-instance. Produced when
     /// the source navigates `outer.Inner` (or refers to `Inner` unqualified
     /// inside an outer-class method, where `this` is the outer instance).
     /// Calling it constructs an `Instance` with `InstanceData.outer = Some(outer)`.
-    BoundInnerClass { class: Rc<ClassDef>, outer: ObjRef<InstanceData> },
+    BoundInnerClass { class: Arc<ClassDef>, outer: ObjRef<InstanceData> },
     /// A live instance of a user-declared class.
     Instance(ObjRef<InstanceData>),
     /// `kotlin.sequences.Sequence<T>`. Lazy: a source plus a chain of
@@ -920,11 +920,11 @@ pub struct ClassDef {
     /// Resolved parent class for method-resolution chain walking. Single
     /// inheritance only — populated from the first non-interface supertype
     /// that resolves to a `Value::Class` at registration time.
-    pub parent: RefCell<Option<Rc<ClassDef>>>,
+    pub parent: ObjRef<Option<Arc<ClassDef>>>,
     /// Resolved interface supertypes (any number). Walked after `parent` for
     /// default-method lookup and `is`-check membership. Each entry is a
     /// `ClassDef` with `is_interface = true`.
-    pub interfaces: RefCell<Vec<Rc<ClassDef>>>,
+    pub interfaces: ObjRef<Vec<Arc<ClassDef>>>,
     /// `true` for a class declared with the `interface` keyword.
     pub is_interface: bool,
     /// `true` for a `fun interface` (a SAM interface eligible for lambda
@@ -951,24 +951,24 @@ pub struct ClassDef {
     /// Eagerly-constructed enum entries in source order. Each value is a
     /// `Value::Instance` whose class is either this `ClassDef` or a
     /// synthetic per-entry subclass when the entry declared an override
-    /// body. Populated after the enclosing `Rc<ClassDef>` exists so
-    /// entries can carry a `Rc<ClassDef>` back-reference.
-    pub enum_entries: RefCell<Vec<(String, Value)>>,
+    /// body. Populated after the enclosing `Arc<ClassDef>` exists so
+    /// entries can carry a `Arc<ClassDef>` back-reference.
+    pub enum_entries: ObjRef<Vec<(String, Value)>>,
     /// Companion object, if any. Stored as a class with `is_object: true`.
     /// Companion object instance. Interior mutability lets the
     /// interpreter defer construction until after the enclosing
     /// class is bound to the env, so `class Outer { companion {
     /// val X = Outer() } }` can resolve `Outer` during its
     /// companion's init. Construction sites set this once.
-    pub companion: RefCell<Option<ObjRef<InstanceData>>>,
+    pub companion: ObjRef<Option<ObjRef<InstanceData>>>,
     /// For a companion-object class (`is_object: true` built from a
     /// `companion object` declaration), this points back to the enclosing
     /// class. Lets the interpreter expose enum entries / `entries` inside
     /// the companion's own method bodies.
-    pub enclosing_class: RefCell<Option<Rc<ClassDef>>>,
+    pub enclosing_class: ObjRef<Option<Arc<ClassDef>>>,
     /// Nested classes by simple name (both plain nested and `inner` —
     /// `is_inner` lives on the nested class's own `ClassDef`).
-    pub nested_classes: RefCell<Vec<(String, Rc<ClassDef>)>>,
+    pub nested_classes: ObjRef<Vec<(String, Arc<ClassDef>)>>,
     /// Captured env in which the class was declared (for closure-like
     /// resolution in method bodies).
     pub captured_env: ObjRef<Env>,
@@ -978,17 +978,17 @@ pub struct ClassDef {
     /// is stored on the instance under `$$delegate$<idx>`. Resolved by
     /// the interpreter to forward calls to abstract methods that are not
     /// overridden in this class.
-    pub supertype_delegates: RefCell<Vec<SupertypeDelegate>>,
+    pub supertype_delegates: ObjRef<Vec<SupertypeDelegate>>,
     /// Synthesized forwarder methods built once the delegated interfaces
     /// are resolved (at parent-link time). Walked by `find_method_walk`
     /// after the class's own methods miss but before the parent chain.
-    pub delegate_forwarders: RefCell<Vec<MethodDef>>,
+    pub delegate_forwarders: ObjRef<Vec<MethodDef>>,
     /// Lazily-constructed singleton for `is_object` classes that are
     /// nested inside another classifier. Top-level objects materialize
     /// their singleton at file load and bind it in globals; nested
     /// objects (including ones inside sealed classes) need lazy
     /// construction the first time `Outer.NestedObj` is read.
-    pub object_singleton: RefCell<Option<ObjRef<InstanceData>>>,
+    pub object_singleton: ObjRef<Option<ObjRef<InstanceData>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -998,7 +998,7 @@ pub struct SupertypeDelegate {
     /// table for forwarder synthesis.
     pub interface_name: String,
     /// Resolved interface class, if it resolves at registration time.
-    pub interface: Option<Rc<ClassDef>>,
+    pub interface: Option<Arc<ClassDef>>,
     /// Delegate expression — evaluated in the primary-ctor parameter
     /// scope at construction.
     pub expr: Arc<klio_ast::Expr>,
@@ -1067,7 +1067,7 @@ pub struct PropertyDef {
 
 #[derive(Debug)]
 pub struct InstanceData {
-    pub class: Rc<ClassDef>,
+    pub class: Arc<ClassDef>,
     /// Field name → value. Insertion ordered (Vec keeps order for `toString`
     /// on data classes).
     pub fields: Vec<(String, Value)>,
@@ -1108,7 +1108,7 @@ impl ClassDef {
     /// return the first method matching `name`, paired with the class that
     /// declared it.
     #[must_use]
-    pub fn find_method(self: &Rc<Self>, name: &str) -> Option<(MethodDef, Rc<ClassDef>)> {
+    pub fn find_method(self: &Arc<Self>, name: &str) -> Option<(MethodDef, Arc<ClassDef>)> {
         let mut seen: Vec<*const ClassDef> = Vec::new();
         find_method_walk(self, name, &mut seen)
     }
@@ -1118,10 +1118,10 @@ impl ClassDef {
     /// used by operator dispatch to pick `plus(Bag)` over `plus(Int)` when
     /// the argument is a `Bag`. Falls back to the unspecific lookup.
     pub fn find_method_for_arg(
-        self: &Rc<Self>,
+        self: &Arc<Self>,
         name: &str,
         arg_type_name: Option<&str>,
-    ) -> Option<(MethodDef, Rc<ClassDef>)> {
+    ) -> Option<(MethodDef, Arc<ClassDef>)> {
         if let Some(arg) = arg_type_name {
             let mut seen: Vec<*const ClassDef> = Vec::new();
             if let Some(found) = find_method_for_arg_walk(self, name, arg, &mut seen) {
@@ -1134,14 +1134,14 @@ impl ClassDef {
     /// Walk the class chain searching for a body property declaration of the
     /// given name. Returns the property and the class that declared it.
     #[must_use]
-    pub fn find_body_property(self: &Rc<Self>, name: &str) -> Option<(PropertyDef, Rc<ClassDef>)> {
+    pub fn find_body_property(self: &Arc<Self>, name: &str) -> Option<(PropertyDef, Arc<ClassDef>)> {
         let mut seen: Vec<*const ClassDef> = Vec::new();
         find_body_property_walk(self, name, &mut seen)
     }
 
     /// Returns the list of declared interface supertypes (resolved).
     #[must_use]
-    pub fn interface_refs(&self) -> Vec<Rc<ClassDef>> {
+    pub fn interface_refs(&self) -> Vec<Arc<ClassDef>> {
         self.interfaces.borrow().clone()
     }
 
@@ -1151,7 +1151,7 @@ impl ClassDef {
     /// `Counter.inc()` default body that runs on a class implementing
     /// `Counter`).
     #[must_use]
-    pub fn all_companions(self: &Rc<Self>) -> Vec<ObjRef<InstanceData>> {
+    pub fn all_companions(self: &Arc<Self>) -> Vec<ObjRef<InstanceData>> {
         let mut out: Vec<ObjRef<InstanceData>> = Vec::new();
         let mut seen: Vec<*const ClassDef> = Vec::new();
         collect_companions_walk(self, &mut out, &mut seen);
@@ -1198,11 +1198,11 @@ impl ClassDef {
 }
 
 fn collect_companions_walk(
-    cls: &Rc<ClassDef>,
+    cls: &Arc<ClassDef>,
     out: &mut Vec<ObjRef<InstanceData>>,
     seen: &mut Vec<*const ClassDef>,
 ) {
-    let ptr = Rc::as_ptr(cls);
+    let ptr = Arc::as_ptr(cls);
     if seen.iter().any(|p| *p == ptr) || seen.len() > 128 {
         return;
     }
@@ -1226,12 +1226,12 @@ fn collect_companions_walk(
 }
 
 fn find_method_for_arg_walk(
-    cls: &Rc<ClassDef>,
+    cls: &Arc<ClassDef>,
     name: &str,
     arg_type_name: &str,
     seen: &mut Vec<*const ClassDef>,
-) -> Option<(MethodDef, Rc<ClassDef>)> {
-    let ptr = Rc::as_ptr(cls);
+) -> Option<(MethodDef, Arc<ClassDef>)> {
+    let ptr = Arc::as_ptr(cls);
     if seen.iter().any(|p| *p == ptr) || seen.len() > 128 {
         return None;
     }
@@ -1246,7 +1246,7 @@ fn find_method_for_arg_walk(
     if let Some(m) = cls.methods.iter().find(|m| {
         m.name == name && m.decl.body.is_some() && arg_matches(m)
     }) {
-        return Some((m.clone(), Rc::clone(cls)));
+        return Some((m.clone(), Arc::clone(cls)));
     }
     if let Some(parent) = cls.parent.borrow().clone() {
         if let Some(found) = find_method_for_arg_walk(&parent, name, arg_type_name, seen) {
@@ -1262,11 +1262,11 @@ fn find_method_for_arg_walk(
 }
 
 fn find_method_walk(
-    cls: &Rc<ClassDef>,
+    cls: &Arc<ClassDef>,
     name: &str,
     seen: &mut Vec<*const ClassDef>,
-) -> Option<(MethodDef, Rc<ClassDef>)> {
-    let ptr = Rc::as_ptr(cls);
+) -> Option<(MethodDef, Arc<ClassDef>)> {
+    let ptr = Arc::as_ptr(cls);
     if seen.iter().any(|p| *p == ptr) || seen.len() > 128 {
         return None;
     }
@@ -1281,14 +1281,14 @@ fn find_method_walk(
                     || m.delegate_field.is_some())
         })
     {
-        return Some((m.clone(), Rc::clone(cls)));
+        return Some((m.clone(), Arc::clone(cls)));
     }
     // Inheritance-delegation forwarders synthesized at parent-link
     // resolution time. Consulted before the parent chain so a delegated
     // member wins over a default body the same way an explicit override
     // would.
     if let Some(m) = cls.delegate_forwarders.borrow().iter().find(|m| m.name == name) {
-        return Some((m.clone(), Rc::clone(cls)));
+        return Some((m.clone(), Arc::clone(cls)));
     }
     // Walk the parent chain (concrete superclass) before interfaces — a
     // concrete-method inherited from a parent class wins over an interface
@@ -1306,23 +1306,23 @@ fn find_method_walk(
     // Fall back to an abstract declaration on the class itself — only useful
     // for error reporting at call time.
     if let Some(m) = cls.methods.iter().find(|m| m.name == name) {
-        return Some((m.clone(), Rc::clone(cls)));
+        return Some((m.clone(), Arc::clone(cls)));
     }
     None
 }
 
 fn find_body_property_walk(
-    cls: &Rc<ClassDef>,
+    cls: &Arc<ClassDef>,
     name: &str,
     seen: &mut Vec<*const ClassDef>,
-) -> Option<(PropertyDef, Rc<ClassDef>)> {
-    let ptr = Rc::as_ptr(cls);
+) -> Option<(PropertyDef, Arc<ClassDef>)> {
+    let ptr = Arc::as_ptr(cls);
     if seen.iter().any(|p| *p == ptr) || seen.len() > 128 {
         return None;
     }
     seen.push(ptr);
     if let Some(p) = cls.body_properties.iter().find(|p| p.name == name) {
-        return Some((p.clone(), Rc::clone(cls)));
+        return Some((p.clone(), Arc::clone(cls)));
     }
     if let Some(parent) = cls.parent.borrow().clone() {
         if let Some(found) = find_body_property_walk(&parent, name, seen) {
@@ -2593,8 +2593,8 @@ impl Env {
 mod tests {
     use super::*;
 
-    fn make_class(name: &str, is_data: bool, is_object: bool, is_enum: bool) -> Rc<ClassDef> {
-        Rc::new(ClassDef {
+    fn make_class(name: &str, is_data: bool, is_object: bool, is_enum: bool) -> Arc<ClassDef> {
+        Arc::new(ClassDef {
             name: name.to_string(),
             fqn: name.to_string(),
             annotation_names: Vec::new(),
@@ -2607,8 +2607,8 @@ mod tests {
             is_enum,
             is_sealed: false,
             supertype_names: Vec::new(),
-            parent: RefCell::new(None),
-            interfaces: RefCell::new(Vec::new()),
+            parent: ObjRef::new(None),
+            interfaces: ObjRef::new(Vec::new()),
             is_interface: false,
             is_fun_interface: false,
             parent_ctor_args: Vec::new(),
@@ -2617,14 +2617,14 @@ mod tests {
             is_inner: false,
             is_anonymous: false,
             secondary_ctors: Vec::new(),
-            enum_entries: RefCell::new(Vec::new()),
-            companion: RefCell::new(None),
-            enclosing_class: RefCell::new(None),
-            nested_classes: RefCell::new(Vec::new()),
+            enum_entries: ObjRef::new(Vec::new()),
+            companion: ObjRef::new(None),
+            enclosing_class: ObjRef::new(None),
+            nested_classes: ObjRef::new(Vec::new()),
             captured_env: ObjRef::new(Env::new()),
-            supertype_delegates: RefCell::new(Vec::new()),
-            delegate_forwarders: RefCell::new(Vec::new()),
-            object_singleton: RefCell::new(None),
+            supertype_delegates: ObjRef::new(Vec::new()),
+            delegate_forwarders: ObjRef::new(Vec::new()),
+            object_singleton: ObjRef::new(None),
         })
     }
 

@@ -12,10 +12,7 @@
 //! * Suspend state-machine lowering (W6)
 //! * Reflection metadata population (W8)
 
-use std::rc::Rc;
 use std::sync::Arc;
-
-use std::cell::RefCell;
 
 use klio_ast::{Decl, Expr, Ident, KotlinFile};
 use klio_runtime::{ClassDef, ClassParamDef, PropertyDef};
@@ -351,7 +348,7 @@ pub struct BuiltModule {
     /// grows to carry the full runtime shape (methods, supertypes,
     /// init blocks lowered as FuncIds) this table shrinks and
     /// eventually goes away.
-    pub classes: std::collections::HashMap<String, Rc<ClassDef>>,
+    pub classes: std::collections::HashMap<String, Arc<ClassDef>>,
     /// `(class name, property name) -> FuncId` for body properties
     /// with a literal-style initialiser (`val x: Int = 5`). The Vm
     /// invokes the FuncId during allocation to populate the field.
@@ -1106,7 +1103,7 @@ fn build_module_with_overrides(
     // (methods, init blocks, supertypes, secondary ctors, ...); for
     // now the Vm uses these for the instance-allocation shape.
     let globals_for_capture = klio_runtime::ObjRef::new(klio_runtime::Env::new());
-    let mut classes: std::collections::HashMap<String, Rc<ClassDef>> =
+    let mut classes: std::collections::HashMap<String, Arc<ClassDef>> =
         std::collections::HashMap::new();
     for d in decls {
         if let Decl::Class(c) = d {
@@ -1137,7 +1134,7 @@ fn build_module_with_overrides(
                 })
                 .collect();
             let is_object = object_names.iter().any(|n| n == &c.name.name);
-            let def = std::rc::Rc::new(ClassDef {
+            let def = std::sync::Arc::new(ClassDef {
                 name: c.name.name.clone(),
                 fqn: fqn_overrides
                     .get(&c.name.name)
@@ -1172,19 +1169,19 @@ fn build_module_with_overrides(
                     .iter()
                     .map(|t| t.name.name.clone())
                     .collect(),
-                parent: RefCell::new(None),
-                interfaces: RefCell::new(Vec::new()),
+                parent: klio_runtime::ObjRef::new(None),
+                interfaces: klio_runtime::ObjRef::new(Vec::new()),
                 is_interface: c.is_interface,
                 is_fun_interface: c.is_fun_interface,
                 parent_ctor_args: Vec::new(),
-                enum_entries: RefCell::new(Vec::new()),
-                companion: RefCell::new(None),
-                enclosing_class: RefCell::new(None),
-                nested_classes: RefCell::new(Vec::new()),
+                enum_entries: klio_runtime::ObjRef::new(Vec::new()),
+                companion: klio_runtime::ObjRef::new(None),
+                enclosing_class: klio_runtime::ObjRef::new(None),
+                nested_classes: klio_runtime::ObjRef::new(Vec::new()),
                 captured_env: globals_for_capture.clone(),
-                supertype_delegates: RefCell::new(Vec::new()),
-                delegate_forwarders: RefCell::new(Vec::new()),
-                object_singleton: RefCell::new(None),
+                supertype_delegates: klio_runtime::ObjRef::new(Vec::new()),
+                delegate_forwarders: klio_runtime::ObjRef::new(Vec::new()),
+                object_singleton: klio_runtime::ObjRef::new(None),
             });
             classes.insert(c.name.name.clone(), def);
         }
@@ -1222,7 +1219,7 @@ fn build_module_with_overrides(
                         klio_runtime::Value::new_int(ordinal as i64),
                     ));
                     let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
-                        class: std::rc::Rc::clone(&class_def),
+                        class: std::sync::Arc::clone(&class_def),
                         fields,
                         outer: None,
                         identity: id,
@@ -1306,15 +1303,15 @@ fn build_module_with_overrides(
     // hierarchy, qualified_this outer walks) follow the source-
     // declared chain. Single inheritance picks the first
     // non-interface supertype; the rest are added as interfaces.
-    let class_table_snapshot: std::collections::HashMap<String, Rc<ClassDef>> =
+    let class_table_snapshot: std::collections::HashMap<String, Arc<ClassDef>> =
         classes.clone();
     for (_, def) in &classes {
         for sup_name in &def.supertype_names {
             if let Some(sup_def) = class_table_snapshot.get(sup_name) {
                 if sup_def.is_interface {
-                    def.interfaces.borrow_mut().push(Rc::clone(sup_def));
+                    def.interfaces.borrow_mut().push(Arc::clone(sup_def));
                 } else if def.parent.borrow().is_none() {
-                    *def.parent.borrow_mut() = Some(Rc::clone(sup_def));
+                    *def.parent.borrow_mut() = Some(Arc::clone(sup_def));
                 }
             }
         }
