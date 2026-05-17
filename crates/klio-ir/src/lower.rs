@@ -1335,6 +1335,22 @@ fn lower_function_body_with_implicit_owner(
         is_vararg: p.is_vararg,
     }));
     func.params = params;
+    // An extension fn's synthetic receiver param (`this`) carries
+    // the declared receiver type, not the `Unit` placeholder, so
+    // runtime overload resolution can pick the right receiver
+    // overload (`fun Int.f()` vs `fun Long.f()`) instead of falling
+    // back to declaration order.
+    if let Some(rt) = &f.receiver_type {
+        if let Some(first) = func.params.first_mut() {
+            if first.name == "this" {
+                first.ty = crate::TypeRef {
+                    name: lowered_type_name(rt),
+                    nullable: rt.nullable,
+                    args: Vec::new(),
+                };
+            }
+        }
+    }
     func.is_suspend = f.is_suspend;
     func
 }
