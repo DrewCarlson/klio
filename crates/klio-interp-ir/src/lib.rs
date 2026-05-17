@@ -1155,6 +1155,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 body_properties: Vec::new(),
                 init_blocks: Vec::new(),
                 is_data: false,
+                is_value: false,
                 is_object: false,
                 is_enum: false,
                 is_sealed: false,
@@ -2280,6 +2281,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             body_properties: Vec::new(),
             init_blocks: Vec::new(),
             is_data: false,
+            is_value: false,
             is_object: false,
             is_enum: false,
             is_sealed: false,
@@ -2364,6 +2366,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             body_properties,
             init_blocks: Vec::new(),
             is_data: class.is_data,
+            is_value: class.is_value,
             is_object: false,
             is_enum: class.is_enum,
             is_sealed: class.is_sealed,
@@ -2669,6 +2672,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 body_properties,
                 init_blocks: Vec::new(),
                 is_data: false,
+                is_value: false,
                 is_object: false,
                 is_enum: false,
                 is_sealed: false,
@@ -4392,6 +4396,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // precedence (we check find_method first).
         if let klio_runtime::Value::Instance(inst) = receiver {
             let is_data = inst.borrow().class.is_data;
+            // A `value class` gets the same compiler-synthesised
+            // `equals`/`hashCode`/`toString` over its single backing
+            // property as a data class (but no `copy`).
+            let is_value = inst.borrow().class.is_value;
             let has_user_override = {
                 let start_name = inst.borrow().class.name.clone();
                 let mut queue: std::collections::VecDeque<String> =
@@ -4435,8 +4443,9 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 let i = inst.borrow();
                 return Ok(klio_runtime::Value::String(Arc::new(i.class.name.clone())));
             }
-            if is_data && !has_user_override && args.is_empty() {
-                if let Some(rest) = name.strip_prefix("component") {
+            if (is_data || is_value) && !has_user_override && args.is_empty() {
+                if is_data {
+                  if let Some(rest) = name.strip_prefix("component") {
                     if let Ok(n) = rest.parse::<usize>() {
                         if n >= 1 {
                             let i = inst.borrow();
@@ -4447,6 +4456,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             }
                         }
                     }
+                  }
                 }
                 if name == "toString" {
                     let i = inst.borrow();
@@ -4495,7 +4505,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 }
             }
-            if is_data && !has_user_override && args.len() == 1 && name == "equals" {
+            if (is_data || is_value) && !has_user_override && args.len() == 1 && name == "equals" {
                 let i = inst.borrow();
                 let class_fqn = i.class.fqn.clone();
                 let same = matches!(&args[0],

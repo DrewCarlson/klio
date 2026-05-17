@@ -1341,6 +1341,11 @@ pub struct ClassDef {
     pub body_properties: Vec<PropertyDef>,
     pub init_blocks: Vec<Arc<klio_ast::Block>>,
     pub is_data: bool,
+    /// `true` for a `value class` / `@JvmInline value class`. Like a
+    /// data class, the compiler synthesises `equals`/`hashCode`/
+    /// `toString` over the single backing property, so structural
+    /// equality and display follow the data-class path.
+    pub is_value: bool,
     pub is_object: bool,
     /// `true` for an `enum class`. The entry instances live on
     /// `enum_entries` of the same `ClassDef`.
@@ -2092,7 +2097,7 @@ impl fmt::Display for Value {
                 if inst.class.is_object {
                     return write!(f, "{}", inst.class.name);
                 }
-                if inst.class.is_data {
+                if inst.class.is_data || inst.class.is_value {
                     write!(f, "{}(", inst.class.name)?;
                     let mut first = true;
                     for p in &inst.class.primary_params {
@@ -2717,7 +2722,7 @@ impl Value {
                 if aa.class.fqn != bb.class.fqn {
                     return false;
                 }
-                if !aa.class.is_data {
+                if !aa.class.is_data && !aa.class.is_value {
                     return false;
                 }
                 for p in &aa.class.primary_params {
@@ -3833,6 +3838,7 @@ mod tests {
             body_properties: Vec::new(),
             init_blocks: Vec::new(),
             is_data,
+            is_value: false,
             is_object,
             is_enum,
             is_sealed: false,

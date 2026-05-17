@@ -1152,6 +1152,7 @@ fn build_module_with_overrides(
                 body_properties,
                 init_blocks: Vec::new(),
                 is_data: c.is_data,
+                is_value: c.is_value,
                 is_object,
                 is_enum: c.is_enum,
                 is_sealed: c.is_sealed,
