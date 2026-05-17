@@ -3,8 +3,36 @@ id = "kotlinx.coroutines"
 version = "1.11.0"
 abi = 1
 implicit_packages = []
-source_roots = ["shim"]
 auto_bindings = true
+
+# Upstream kotlinx-coroutines-core commonMain, consumed straight from
+# the in-pack git checkout. `include` curates the declarative API
+# contracts klio runs as-is:
+#  - CompletionHandler.common.kt : the `CompletionHandler` typealias
+#                                  ((Throwable?) -> Unit), zero deps.
+#  - Runnable.common.kt          : `expect fun interface Runnable`;
+#                                  klioMain supplies the matching
+#                                  `actual fun interface`.
+#
+# The remainder of upstream commonMain (JobSupport / AbstractCoroutine
+# / EventLoopImplBase / LockFreeTaskQueueCore / DispatchedTask /
+# ThreadSafeHeap and the atomicfu loop/CAS machinery) is a
+# multi-threaded-preemptive lock-free runtime; klio runs a
+# single-threaded cooperative scheduler, so the builder runtime
+# (runBlocking / launch / async / delay / Job / Deferred /
+# CoroutineScope / Dispatchers / Channel) is supplied bespoke by
+# klioMain over the host `__kxco_*` primitives instead.
+[[source]]
+root = "upstream/kotlinx-coroutines-core/common/src"
+include = [
+    "CompletionHandler.common.kt",
+    "Runnable.common.kt",
+]
+
+# klio-supplied platform layer: the bespoke cooperative runtime and
+# the `actual` for the curated upstream `Runnable` expect.
+[[source]]
+root = "klioMain"
 
 [[deps]]
 id = "stdlib"

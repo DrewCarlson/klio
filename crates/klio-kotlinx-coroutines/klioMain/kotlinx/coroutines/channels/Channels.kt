@@ -1,7 +1,7 @@
 // kotlinx.coroutines.channels — the channels subpackage. Upstream
-// places Channel and its companions here; the klio shim implements
-// them in kotlinx.coroutines, so this file re-exports that surface
-// so `import kotlinx.coroutines.channels.Channel` resolves while
+// places Channel and its companions here; klio implements them in
+// kotlinx.coroutines, so this file re-exports that surface so
+// `import kotlinx.coroutines.channels.Channel` resolves while
 // `import kotlinx.coroutines.*` keeps working too.
 
 package kotlinx.coroutines.channels

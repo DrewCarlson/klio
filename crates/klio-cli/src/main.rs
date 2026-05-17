@@ -1927,7 +1927,11 @@ mod source_selection_tests {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace = manifest_dir.parent().unwrap().parent().unwrap();
         let cases: &[(&str, &[&str], &[&str])] = &[
-            ("crates/klio-kotlinx-coroutines", &["shim"], &["shim/"]),
+            (
+                "crates/klio-kotlinx-coroutines",
+                &["upstream/kotlinx-coroutines-core/common/src", "klioMain"],
+                &["klioMain/"],
+            ),
             ("crates/klio-kotlinx-io", &["upstream", "klioMain"], &["upstream/Buffer.kt"]),
             ("crates/klio-kotlinx-datetime", &["klioMain"], &["klioMain/"]),
             ("crates/klio-kotlinx-atomicfu", &["klioMain"], &["klioMain/"]),

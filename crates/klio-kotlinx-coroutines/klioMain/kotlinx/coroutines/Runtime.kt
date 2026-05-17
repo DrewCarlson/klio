@@ -1,32 +1,32 @@
-// Klio shim for kotlinx.coroutines.
+// klio platform layer for kotlinx.coroutines.
 //
-// The klio interpreter implements the core suspend / runBlocking /
-// Continuation primitives (see crates/klio-interp/src/lib.rs:5068);
-// this shim adds the higher-level kotlinx.coroutines API surface
-// on top. klio runs single-threaded, so the runtime is built
-// around a cooperative scheduler: launch posts a task to a queue,
-// runBlocking drains the queue, suspension points yield control
-// back to the scheduler. Cancellation propagates through a shared
-// host-backed token; cancellable suspending calls observe it and
-// throw CancellationException.
+// The interpreter implements the core suspend / Continuation
+// primitives; this layer supplies the kotlinx.coroutines runtime on
+// top of them, written to klio's single-threaded cooperative model.
+// `launch` posts a task onto the enclosing `runBlocking`'s scheduler
+// queue, suspension points yield control back to the scheduler, and
+// cancellation propagates through a host-backed token observed by
+// cancellable suspending calls. The curated upstream commonMain files
+// (`CompletionHandler.common.kt`, `Runnable.common.kt`) carry the
+// declarative API contracts; the platform `actual`s and the builder
+// runtime live here.
 
 package kotlinx.coroutines
 
 import kotlin.coroutines.CoroutineContext
 
-// Concrete empty context. kotlin.coroutines.EmptyCoroutineContext
-// is a known type symbol but carries no runtime object; the
-// builders only need an inert default value, so the shim provides
-// its own and the API surface stays self-contained.
+// Concrete empty context. kotlin.coroutines.EmptyCoroutineContext is
+// a known type symbol but carries no runtime object; the builders
+// only need an inert default, so this layer provides its own.
 object EmptyCoroutineContext : CoroutineContext
 
-// --- internal native helpers (bound natively by the klio host) ----
+// --- host-bound native helpers (bound by the klio host crate) -----
 
 internal fun __kxco_delayMillis(millis: Long): Unit = Unit
 internal fun __kxco_currentTimeMillis(): Long = 0L
-// Cancellation tokens — opaque Long ids managed host-side. A token
-// id of 0 means "no cancellation"; everything non-zero is a live
-// token whose flag is observed via __kxco_tokenIsCancelled.
+// Cancellation tokens — opaque Long ids managed host-side. Id 0 means
+// "no cancellation"; non-zero is a live token whose flag is observed
+// via __kxco_tokenIsCancelled.
 internal fun __kxco_tokenCreate(): Long = 0L
 internal fun __kxco_tokenCancel(id: Long): Unit = Unit
 internal fun __kxco_tokenIsCancelled(id: Long): Boolean = false
@@ -34,20 +34,16 @@ internal fun __kxco_tokenIsCancelled(id: Long): Boolean = false
 internal fun __kxco_schedulerEnqueue(handle: Long): Unit = Unit
 internal fun __kxco_schedulerDrainCount(): Int = 0
 
-// Pack hook that posts a launch-block onto the enclosing
-// runBlocking's pending-launch queue. The pack lives in
-// klio-kotlinx-coroutines; the host pumps the queue after the
-// runBlocking body returns.
+// Posts a launch-block onto the enclosing runBlocking's pending queue;
+// the host pumps the queue after the runBlocking body returns.
 internal fun __kxco_spawn(block: () -> Unit): Unit = Unit
 internal fun __kxco_scheduleResume(cont: Any): Unit = Unit
 
-// Parallel dispatch primitives. `__kxco_dispatch` runs the block on
-// a real OS-thread worker pool (Dispatchers.Default) and returns an
-// opaque job id; `__kxco_dispatchIo` is the elastic IO pool variant;
+// Parallel dispatch primitives. `__kxco_dispatch` runs the block on a
+// real OS-thread worker pool (Dispatchers.Default) and returns an
+// opaque job id; `__kxco_dispatchIo` is the elastic IO variant;
 // `__kxco_joinDispatched` blocks the caller until that job finishes
-// (cross-thread happens-before). The body, its captures, and any
-// value it stores back cross threads — the host publishes the
-// escaping graph on dispatch and on completion.
+// (cross-thread happens-before).
 internal fun __kxco_dispatch(block: () -> Unit): Long = 0L
 internal fun __kxco_dispatchIo(block: () -> Unit): Long = 0L
 internal fun __kxco_joinDispatched(id: Long): Unit = Unit
@@ -55,19 +51,18 @@ internal fun __kxco_joinDispatched(id: Long): Unit = Unit
 // Slot rendezvous primitives. A slot is an opaque host-side id; a
 // coroutine parks indefinitely on it via __kxco_parkSlot and an
 // explicit event (job completion, channel handoff) wakes it via
-// __kxco_resumeSlot. Park always re-checks its guard in a loop so a
-// resume that races ahead of the park is harmless.
+// __kxco_resumeSlot. Park re-checks its guard in a loop so a resume
+// that races ahead of the park is harmless.
 internal fun __kxco_newSlot(): Long = 0L
 internal fun __kxco_parkSlot(slot: Long): Unit = Unit
 internal fun __kxco_resumeSlot(slot: Long): Unit = Unit
 
-// `runBlocking` bridges the non-suspending world into a coroutine:
-// it builds a fresh scope, runs the suspend block to completion on
-// the caller's stack, and drains any `launch`/resume work queued
-// during the block. The platform implementation is supplied by the
-// `klio-kotlinx-coroutines` host crate (the `actual` half); this
-// `expect` declaration carries the public signature so callers
-// type-check and the API surface lives entirely in this pack.
+// `runBlocking` bridges the non-suspending world into a coroutine: it
+// builds a fresh scope, runs the suspend block to completion on the
+// caller's stack, and drains any `launch`/resume work queued during
+// the block. The platform implementation is supplied by the
+// klio-kotlinx-coroutines host crate (the `actual` half); this
+// `expect` carries the public signature so callers type-check.
 expect fun <T> runBlocking(block: suspend CoroutineScope.() -> T): T
 
 class CancellationException(message: String) : Throwable(message)
@@ -88,7 +83,7 @@ class CompletableJob internal constructor() : Job {
     override val tokenId: Long = __kxco_tokenCreate()
     // 0 = cooperative (park on `slot`); >0 = dispatched onto a real
     // worker — `join()` blocks the calling thread on the OS-thread
-    // join (cross-thread happens-before) instead of cooperative park.
+    // join instead of cooperative park.
     internal var dispatchId: Long = 0L
 
     override val isActive: Boolean get() = _active && !_cancelled && !__kxco_tokenIsCancelled(tokenId)
@@ -104,14 +99,9 @@ class CompletableJob internal constructor() : Job {
 
     override suspend fun join() {
         if (dispatchId != 0L) {
-            // Dispatched body runs on a real worker thread; block
-            // this thread until it completes (establishes the
-            // completion → joiner happens-before).
             __kxco_joinDispatched(dispatchId)
             return
         }
-        // Park until the child runs to completion. The while
-        // re-check absorbs a resume that races ahead of the park.
         while (_active) __kxco_parkSlot(slot)
     }
 
@@ -127,10 +117,10 @@ class Deferred<T> internal constructor() : Job {
     private var _cancelled: Boolean = false
     private val slot: Long = __kxco_newSlot()
     override val tokenId: Long = __kxco_tokenCreate()
-    // 0 = cooperative; >0 = dispatched onto a real worker. The
-    // result is written by the worker thread; the host publishes it
-    // on completion and the OS-thread join below is the
-    // happens-before that makes the stored value visible here.
+    // 0 = cooperative; >0 = dispatched onto a real worker. The result
+    // is written by the worker; the host publishes it on completion
+    // and the OS-thread join is the happens-before that makes the
+    // stored value visible here.
     internal var dispatchId: Long = 0L
 
     override val isActive: Boolean get() = !_done && !_cancelled
@@ -184,16 +174,12 @@ fun CoroutineScope(context: CoroutineContext): CoroutineScope = CoroutineScopeIm
 
 // A CoroutineDispatcher is itself a CoroutineContext so the builders
 // accept `launch(Dispatchers.Default) { … }`. `parallelKind`
-// classifies how a body submitted to this dispatcher runs:
+// classifies how a submitted body runs:
 //   0 = cooperative single-thread (Main / Unconfined / unset) —
-//       UNCHANGED legacy behavior, interleaved by the runBlocking
-//       interceptor at suspension points.
-//   1 = Default — dispatched onto the real OS-thread worker pool
-//       (CPU-bound, bounded to host parallelism).
-//   2 = IO — dispatched onto the elastic OS-thread pool (blocking
-//       offload).
-// Kinds 1/2 give genuine multicore parallelism; the cooperative
-// path is never taken for them and is never altered by them.
+//       interleaved by the runBlocking interceptor at suspension
+//       points.
+//   1 = Default — dispatched onto the real OS-thread worker pool.
+//   2 = IO — dispatched onto the elastic OS-thread pool.
 abstract class CoroutineDispatcher : CoroutineContext {
     open val parallelKind: Int get() = 0
 }
@@ -210,19 +196,11 @@ object Dispatchers {
 }
 
 // Effective parallel kind of a builder `context` argument: only a
-// CoroutineDispatcher carries one; every other context (the default
-// EmptyCoroutineContext, a plain scope context) is cooperative (0).
+// CoroutineDispatcher carries one; every other context is
+// cooperative (0).
 internal fun __kxco_parallelKind(context: CoroutineContext): Int {
     return if (context is CoroutineDispatcher) context.parallelKind else 0
 }
-
-// klio is single-threaded but the launch/async builders post their
-// bodies through the cooperative scheduler. Without a real
-// continuation-state-machine in the IR yet, the body still runs to
-// completion on the calling stack — but cancellation tokens, Job
-// observability, and the scheduler queue are real and let callers
-// build patterns (e.g. polling cancellation, supervisor scopes)
-// that match upstream semantics.
 
 fun CoroutineScope.launch(
     context: CoroutineContext = EmptyCoroutineContext,
@@ -232,8 +210,6 @@ fun CoroutineScope.launch(
     val scope = this
     val kind = __kxco_parallelKind(context)
     if (kind != 0) {
-        // Dispatchers.Default / IO: run the body on a real worker
-        // thread. `job.join()` blocks on the OS-thread join.
         val id = if (kind == 2) {
             __kxco_dispatchIo {
                 if (!job.isCancelled) block(scope)
@@ -248,10 +224,6 @@ fun CoroutineScope.launch(
         job.dispatchId = id
         return job
     }
-    // Cooperative (Main / Unconfined / unset) — UNCHANGED. Hand the
-    // suspend block to the cooperative scheduler; it interleaves
-    // with siblings at every suspension point and is awaited before
-    // the enclosing runBlocking returns.
     __kxco_spawn {
         if (!job.isCancelled) {
             block(scope)
@@ -269,9 +241,6 @@ fun <T> CoroutineScope.async(
     val scope = this
     val kind = __kxco_parallelKind(context)
     if (kind != 0) {
-        // Dispatchers.Default / IO: run the body on a real worker
-        // thread. The result crosses threads — the host publishes
-        // it on completion and `await()` joins before reading it.
         val id = if (kind == 2) {
             __kxco_dispatchIo {
                 val r = block(scope)
@@ -286,9 +255,6 @@ fun <T> CoroutineScope.async(
         deferred.dispatchId = id
         return deferred
     }
-    // Cooperative — UNCHANGED. Spawn the body as a sibling
-    // coroutine; it interleaves at suspension points and resumes
-    // the awaiter on completion.
     __kxco_spawn {
         val r = block(scope)
         deferred.complete(r)
@@ -307,14 +273,12 @@ fun CoroutineScope.ensureActive() {
     if (!isActive) throw CancellationException("scope is no longer active")
 }
 
-// `withContext(Dispatchers.IO/Default) { … }` offloads the block
-// onto a real worker thread and suspends the caller until it
-// completes, returning its value (the blocking-offload headline).
-// Any other context (cooperative / unset) keeps the legacy inline
-// behavior: these run on the cooperative driver already (they are
-// `suspend` funs invoked from inside runBlocking), so the block
-// runs inline on the same driver — nesting a fresh runBlocking
-// here would re-enter and corrupt the scheduler.
+// `withContext(Dispatchers.IO/Default) { … }` offloads the block onto
+// a real worker thread and suspends the caller until it completes,
+// returning its value. Any other context keeps the inline behavior:
+// these run on the cooperative driver already (they are `suspend`
+// funs invoked from inside runBlocking), so the block runs inline on
+// the same driver.
 suspend fun <T> withContext(context: CoroutineContext, block: suspend CoroutineScope.() -> T): T {
     val kind = __kxco_parallelKind(context)
     if (kind != 0) {
@@ -355,9 +319,9 @@ interface ChannelIterator<T> {
 // Rendezvous (capacity 0/-1) and buffered channels. send suspends
 // until a receiver takes the item (or buffer space frees); receive
 // suspends until an item is available or the channel is closed and
-// drained. Waiters park on slots; the counterpart resumes the
-// oldest waiter. Park loops re-check their guard so a resume that
-// races ahead of the park is harmless.
+// drained. Waiters park on slots; the counterpart resumes the oldest
+// waiter. Park loops re-check their guard so a resume that races
+// ahead of the park is harmless.
 class Channel<T> internal constructor(private val capacity: Int = 0) {
     private val items: MutableList<T> = mutableListOf()
     private var closed: Boolean = false
@@ -380,8 +344,6 @@ class Channel<T> internal constructor(private val capacity: Int = 0) {
 
     suspend fun send(value: T) {
         if (closed) throw ClosedSendChannelException("Channel was closed")
-        // Park the sender until a receiver is waiting or there is
-        // buffer space. A pending receiver consumes directly.
         while (true) {
             if (closed) throw ClosedSendChannelException("Channel was closed")
             if (recvWaiters.isNotEmpty() || items.size < bufferLimit()) {
@@ -428,15 +390,10 @@ class Channel<T> internal constructor(private val capacity: Int = 0) {
 
     fun close() {
         closed = true
-        // Closing wakes every blocked receiver so they observe the
-        // close (and every sender so it throws).
         wakeAllReceivers()
         while (sendWaiters.isNotEmpty()) __kxco_resumeSlot(sendWaiters.removeAt(0))
     }
 
-    // Drain one element, suspending until available; returns false
-    // once the channel is closed and empty. The iterator drives
-    // `for (v in ch)` off this.
     internal suspend fun pull(): Boolean {
         while (true) {
             if (items.isNotEmpty()) {
