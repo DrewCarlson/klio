@@ -840,8 +840,25 @@ impl<'a> VmHost<'a> {
             // skip it when scoring against the caller's args.
             let params_skip = if f.params.first().map(|p| p.name == "this").unwrap_or(false) { 1 } else { 0 };
             let effective: &[klio_ir::Param] = &f.params[params_skip..];
-            if effective.len() != args.len() {
+            // Accept an exact-arity match, or a call that supplies
+            // fewer args when every unsupplied trailing parameter has
+            // a default (`fun make(s, adj: Long = 0)` called as
+            // `make(s)`). func_defaults is indexed by lowered-param
+            // position, so probe with the implicit-`this` offset.
+            if args.len() > effective.len() {
                 continue;
+            }
+            if args.len() < effective.len() {
+                let defaults = self.prog.func_defaults.get(&f.id);
+                let all_defaulted = (args.len()..effective.len()).all(|k| {
+                    defaults
+                        .and_then(|d| d.get(params_skip + k))
+                        .map(|slot| slot.is_some())
+                        .unwrap_or(false)
+                });
+                if !all_defaulted {
+                    continue;
+                }
             }
             let mut total: i32 = 0;
             let mut ok = true;
@@ -853,6 +870,11 @@ impl<'a> VmHost<'a> {
                         break;
                     }
                 }
+            }
+            // Prefer an exact-arity overload over one relying on
+            // defaulted trailing params, all else equal.
+            if ok && args.len() == effective.len() {
+                total += 5;
             }
             if ok && best.map(|(_, s)| total > s).unwrap_or(true) {
                 best = Some((i, total));
@@ -4712,12 +4734,28 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             Vec::with_capacity(args.len() + 1);
                         all_args.push(receiver.clone());
                         all_args.extend_from_slice(args);
-                        // A method/companion fn with a trailing
-                        // `vararg` needs its variadic tail collected
-                        // into an array (the implicit `this` is now
-                        // in `all_args`, so packing aligns).
-                        let all_args = pack_vararg_args(&f, all_args);
+                        // Fill omitted trailing params from the
+                        // method's recorded default-arg thunks, then
+                        // collect a trailing `vararg`. The implicit
+                        // `this` is already in `all_args`, so
+                        // positions align with the lowered param list.
                         let module = Arc::clone(&self.module);
+                        let defaults =
+                            self.prog.func_defaults.get(&f.id).cloned();
+                        let all_args = if defaults.is_some()
+                            && all_args.len() < f.params.len()
+                        {
+                            pad_args_with_defaults(
+                                &module,
+                                f.params.len(),
+                                &all_args,
+                                defaults.as_ref(),
+                                self,
+                            )?
+                        } else {
+                            all_args
+                        };
+                        let all_args = pack_vararg_args(&f, all_args);
                         return klio_ir::eval::eval_with(&module, &f, all_args, self);
                     }
                 }

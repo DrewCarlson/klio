@@ -1102,9 +1102,11 @@ pub fn lower_class_with_extras(
             if f.body.is_none() {
                 continue;
             }
-            let _ = lower_method(module, f, &c.name.name, &own_member_names);
-            let last_id = crate::FuncId((module.funcs.len() - 1) as u32);
-            methods.push(last_id);
+            // Use the method's own FuncId, not `funcs.len() - 1`:
+            // lowering a method also pushes its default-arg thunk
+            // funcs, so the last slot is no longer the method body.
+            let placed = lower_method(module, f, &c.name.name, &own_member_names);
+            methods.push(placed.id);
         }
     }
     let supertypes: Vec<crate::ClassId> = c
@@ -1235,6 +1237,43 @@ fn lower_function_body(
 /// `func_index` — method names live in the class's method table,
 /// not the top-level fn namespace, so a top-level Path-callee
 /// lookup must not surface a class method.
+/// Record a class method's per-parameter default-arg thunks under its
+/// body FuncId, so a call that omits trailing defaulted args
+/// (`A().g(5)` for `fun g(x, y = 10)`) gets them filled — the same
+/// padding top-level / local functions already get. Methods carry an
+/// implicit leading `this`, so default slots are offset by one.
+fn record_method_param_defaults(
+    module: &mut crate::Module,
+    f: &klio_ast::Function,
+    body_func: crate::FuncId,
+) {
+    if !f.params.iter().any(|p| p.default.is_some()) {
+        return;
+    }
+    let mut names: Vec<String> = Vec::with_capacity(f.params.len() + 1);
+    names.push("this".to_string());
+    names.extend(f.params.iter().map(|p| p.name.name.clone()));
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut slots: Vec<Option<crate::FuncId>> = Vec::with_capacity(names.len());
+    slots.push(None); // implicit `this`
+    for (idx, p) in f.params.iter().enumerate() {
+        if let Some(default_expr) = &p.default {
+            let bind_upto = (1 + idx).min(name_refs.len());
+            let widened = widen_numeric_literal(default_expr, &p.ty);
+            let fid = lower_expr_as_param_thunk(
+                module,
+                &name_refs[..bind_upto],
+                widened.as_ref().unwrap_or(default_expr),
+                &format!("__default_method_{}_{}", f.name.name, p.name.name),
+            );
+            slots.push(Some(fid));
+        } else {
+            slots.push(None);
+        }
+    }
+    module.registry.local_fn_defaults.insert(body_func, slots);
+}
+
 pub fn lower_method(
     module: &mut crate::Module,
     f: &klio_ast::Function,
@@ -1264,6 +1303,7 @@ pub fn lower_method(
         placed.id = id;
         module.funcs.push(placed.clone());
         module.func_index.push((f.name.name.clone(), id));
+        record_method_param_defaults(module, f, id);
         return placed;
     }
     let func = lower_function_body_with_implicit_owner(
@@ -1277,6 +1317,7 @@ pub fn lower_method(
     let mut placed = func;
     placed.id = id;
     module.funcs.push(placed.clone());
+    record_method_param_defaults(module, f, id);
     placed
 }
 
