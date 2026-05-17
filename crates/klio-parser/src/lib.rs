@@ -1697,7 +1697,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             TokenKind::Eq => {
                 self.bump();
                 self.skip_nl();
-                self.parse_expr().map(FunctionBody::Expr)
+                self.parse_expr_body().map(FunctionBody::Expr)
             }
             _ => None, // Function declaration without body (abstract / external).
         };
@@ -1767,7 +1767,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             TokenKind::Eq => {
                 self.bump();
                 self.skip_nl();
-                self.parse_expr().map(|e| Box::new(FunctionBody::Expr(e)))
+                self.parse_expr_body().map(|e| Box::new(FunctionBody::Expr(e)))
             }
             _ => None,
         };
@@ -2109,7 +2109,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             let body = if matches!(self.peek_kind(), TokenKind::Eq) {
                 self.bump();
                 self.skip_nl();
-                let e = self.parse_expr()?;
+                let e = self.parse_expr_body()?;
                 FunctionBody::Expr(e)
             } else if matches!(self.peek_kind(), TokenKind::LBrace) {
                 let b = self.parse_block()?;
@@ -2778,6 +2778,20 @@ impl<'src, 'tok> Parser<'src, 'tok> {
 
     pub fn parse_expr(&mut self) -> Option<Expr> {
         self.parse_disjunction()
+    }
+
+    /// Parse a function expression body (`fun f() = <expr>`). Kotlin
+    /// allows annotations on the body expression itself
+    /// (`= @Suppress("UNCHECKED_CAST") if (…) this as E else null`,
+    /// as in the stdlib `CoroutineContext.Element.get`). Annotations
+    /// are runtime no-ops here; consume and discard them before the
+    /// expression.
+    fn parse_expr_body(&mut self) -> Option<Expr> {
+        if self.peek_kind().is_at() {
+            let _ = self.parse_annotations();
+            self.skip_nl();
+        }
+        self.parse_expr()
     }
 
     fn parse_disjunction(&mut self) -> Option<Expr> {
