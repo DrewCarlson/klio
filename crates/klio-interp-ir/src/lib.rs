@@ -5034,6 +5034,49 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Companion fallback for an instance receiver: inside a
+        // class's own member body, a companion function/property is
+        // in scope unqualified (`fun plus(d) = of(x + d)` where
+        // `of` is on the companion). The bare call lowered as
+        // `this.of(...)`; the instance has no such member, so route
+        // to the class's companion singleton before failing.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let mut cur = Some(inst.borrow().class.name.clone());
+            let mut seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            while let Some(cname) = cur.take() {
+                if !seen.insert(cname.clone()) {
+                    break;
+                }
+                let comp_name = self
+                    .module
+                    .registry
+                    .companion_singletons
+                    .get(&cname)
+                    .cloned();
+                if let Some(comp_name) = comp_name {
+                    let singleton = self.globals.borrow().lookup(&comp_name);
+                    if let Some(singleton) = singleton {
+                        if matches!(
+                            singleton,
+                            klio_runtime::Value::Instance(_)
+                        ) {
+                            if let Ok(v) =
+                                self.call_member(&singleton, name, args)
+                            {
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
+                let next = self
+                    .classes
+                    .borrow()
+                    .get(&cname)
+                    .and_then(|d| d.supertype_names.first().cloned());
+                cur = next;
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()

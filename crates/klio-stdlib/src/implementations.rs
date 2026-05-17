@@ -593,6 +593,14 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Float.coerceIn", num_coerce_in),
     ("kotlin.Float.coerceAtLeast", num_coerce_at_least),
     ("kotlin.Float.coerceAtMost", num_coerce_at_most),
+    ("kotlin.Int.floorDiv", num_floor_div),
+    ("kotlin.Long.floorDiv", num_floor_div),
+    ("kotlin.Short.floorDiv", num_floor_div),
+    ("kotlin.Byte.floorDiv", num_floor_div),
+    ("kotlin.Int.mod", num_mod),
+    ("kotlin.Long.mod", num_mod),
+    ("kotlin.Short.mod", num_mod),
+    ("kotlin.Byte.mod", num_mod),
     ("kotlin.Int.toChar", int_to_char),
 
     // ----- Additional List ops -----
@@ -5919,6 +5927,68 @@ fn int_coerce_at_most(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// receivers (the Int forms have their own arms above). Composed from
 /// `num_extreme` so the result keeps the receiver's numeric kind and
 /// the same widening rules as `minOf`/`maxOf`.
+/// `Int`/`Long`/… `floorDiv` — integer division rounded toward
+/// negative infinity (Kotlin's `floorDiv`, distinct from `/` which
+/// truncates toward zero). Result widens to `Long` if either operand
+/// is `Long`, else `Int`.
+fn num_floor_div(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "floorDiv")?;
+    let (x, y) = (
+        a.as_i64()
+            .ok_or_else(|| RuntimeError::Type("floorDiv requires integers".into()))?,
+        b.as_i64()
+            .ok_or_else(|| RuntimeError::Type("floorDiv requires integers".into()))?,
+    );
+    if y == 0 {
+        return Err(RuntimeError::Thrown(Value::Exception {
+            fqn: std::sync::Arc::new("kotlin.ArithmeticException".to_string()),
+            message: Some(std::sync::Arc::new("/ by zero".to_string())),
+            cause: None,
+        }));
+    }
+    let mut q = x / y;
+    let r = x % y;
+    if r != 0 && ((r < 0) != (y < 0)) {
+        q -= 1;
+    }
+    let wide = matches!(a, Value::Long(_)) || matches!(b, Value::Long(_));
+    Ok(if wide {
+        Value::Long(q)
+    } else {
+        Value::new_int(q)
+    })
+}
+
+/// `Int`/`Long`/… `mod` — remainder whose sign follows the divisor
+/// (Kotlin's `mod`, distinct from `%` whose sign follows the
+/// dividend). Result widens to `Long` if either operand is `Long`.
+fn num_mod(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "mod")?;
+    let (x, y) = (
+        a.as_i64()
+            .ok_or_else(|| RuntimeError::Type("mod requires integers".into()))?,
+        b.as_i64()
+            .ok_or_else(|| RuntimeError::Type("mod requires integers".into()))?,
+    );
+    if y == 0 {
+        return Err(RuntimeError::Thrown(Value::Exception {
+            fqn: std::sync::Arc::new("kotlin.ArithmeticException".to_string()),
+            message: Some(std::sync::Arc::new("/ by zero".to_string())),
+            cause: None,
+        }));
+    }
+    let mut r = x % y;
+    if r != 0 && ((r < 0) != (y < 0)) {
+        r += y;
+    }
+    let wide = matches!(a, Value::Long(_)) || matches!(b, Value::Long(_));
+    Ok(if wide {
+        Value::Long(r)
+    } else {
+        Value::new_int(r)
+    })
+}
+
 fn num_coerce_in(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let recv = ctx
         .args
