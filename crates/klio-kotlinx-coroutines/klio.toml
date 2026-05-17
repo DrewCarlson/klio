@@ -27,6 +27,7 @@ root = "upstream/kotlinx-coroutines-core/common/src"
 include = [
     "Annotations.kt",
     "CompletionHandler.common.kt",
+    "CoroutineName.kt",
     "Debug.common.kt",
     "Runnable.common.kt",
 ]
