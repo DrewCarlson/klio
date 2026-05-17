@@ -1071,6 +1071,89 @@ fn collect_manifest_sources(pack_dir: &Path) -> Result<Vec<PathBuf>, String> {
 /// in-repo kotlinx packs (coroutines, atomicfu) loaded and their
 /// host bindings installed — the same shape the `klio` binary uses,
 /// but sourced from each pack's `klio.toml` manifest so it is
+/// Parse the embedded stdlib pack's curated `SOURCES` and return the
+/// subset whose declared packages are imported (directly or by prefix)
+/// somewhere in `existing`. All-or-nothing per the curated unit, the
+/// same gating the production binary's `load_embedded_stdlib_sources`
+/// applies, so the parity harness mirrors `klio run`.
+fn embedded_stdlib_sources(
+    existing: &[klio_ast::KotlinFile],
+    map: &mut SourceMap,
+) -> Vec<klio_ast::KotlinFile> {
+    use klio_pack::schema::decode;
+    use klio_pack::{section_names, PackReader};
+
+    let mut import_prefixes: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for f in existing {
+        for imp in &f.imports {
+            let p = imp
+                .path
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if !p.is_empty() {
+                import_prefixes.insert(p);
+            }
+        }
+    }
+
+    let bytes = klio_stdlib_pack::stdlib_pack_bytes();
+    let pack = match PackReader::from_bytes(bytes.into_owned()) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let payload = match pack.read_section(section_names::SOURCES) {
+        Ok(Some(p)) => p,
+        _ => return Vec::new(),
+    };
+    let bundle: klio_pack::schema::SourceBundle = match decode(&payload) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut parsed: Vec<(String, klio_ast::KotlinFile)> = Vec::new();
+    for sf in &bundle.files {
+        let text = String::from_utf8_lossy(&sf.bytes).into_owned();
+        let fid = map.add(std::path::Path::new(&sf.rel_path), text);
+        let src = map.get(fid).source.clone();
+        let lexed = Lexer::new(fid, &src).tokenize();
+        if lexed.diagnostics.has_errors() {
+            continue;
+        }
+        let (ast, diags) = KtParser::new(fid, &src, &lexed.tokens).parse_file();
+        if diags.has_errors() {
+            continue;
+        }
+        let pkg = ast
+            .package
+            .as_ref()
+            .map(|p| {
+                p.path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .unwrap_or_default();
+        parsed.push((pkg, ast));
+    }
+
+    let wanted = parsed.iter().any(|(pkg, _)| {
+        !pkg.is_empty()
+            && import_prefixes.iter().any(|imp| {
+                imp == pkg
+                    || imp.starts_with(&format!("{pkg}."))
+                    || pkg.starts_with(&format!("{imp}."))
+            })
+    });
+    if !wanted {
+        return Vec::new();
+    }
+    parsed.into_iter().map(|(_, ast)| ast).collect()
+}
+
 /// independent of `~/.klio/packs`. Used by the memory-model
 /// conformance suite.
 pub fn run_with_packs(file: &Path) -> Result<String, String> {
@@ -1130,6 +1213,28 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
     }
     let user_src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
     asts.push(parse(&mut map, file, user_src)?);
+
+    // Mirror the production binary: surface the embedded stdlib pack's
+    // curated `SOURCES` (the real `kotlin.coroutines` / `kotlin.time`
+    // commonMain + klio actuals) as runtime declarations, gated on the
+    // imports actually in play, so a pack consuming real upstream
+    // resolves `kotlin.coroutines.EmptyCoroutineContext` &c. against
+    // the stdlib layer instead of needing the kotlinx pack to redeclare
+    // it. Without this the harness diverges from `klio run`.
+    for ast in embedded_stdlib_sources(&asts, &mut map) {
+        if let Some(pkg) = &ast.package {
+            let path = pkg
+                .path
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if !path.is_empty() {
+                klio_stdlib::register_known_package(path);
+            }
+        }
+        asts.push(ast);
+    }
 
     let mut bindings = klio_stdlib::HostBindings::with_stdlib_defaults();
     for (sym, f) in klio_kotlinx_coroutines::host_bindings().entries() {

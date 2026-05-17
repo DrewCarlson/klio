@@ -1038,11 +1038,13 @@ dependencies = [
  "klio-kotlinx-io",
  "klio-kotlinx-serialization",
  "klio-lexer",
+ "klio-pack",
  "klio-parser",
  "klio-resolver",
  "klio-runtime",
  "klio-span",
  "klio-stdlib",
+ "klio-stdlib-pack",
  "klio-typeck",
 ]
 

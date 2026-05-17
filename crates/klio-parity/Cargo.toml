@@ -25,6 +25,8 @@ klio-runtime = { workspace = true }
 klio-resolver = { workspace = true }
 klio-typeck   = { workspace = true }
 klio-stdlib   = { workspace = true }
+klio-stdlib-pack = { workspace = true }
+klio-pack     = { workspace = true }
 klio-kotlinx-coroutines = { workspace = true }
 klio-kotlinx-atomicfu   = { workspace = true }
 klio-kotlinx-datetime   = { workspace = true }
