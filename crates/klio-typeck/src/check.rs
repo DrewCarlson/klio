@@ -3978,15 +3978,38 @@ impl<'r> Checker<'r> {
                 FunctionBody::Block(b) => {
                     let body_ty = self.check_block(b, Some(&declared_return));
                     // Block-body functions with a declared non-`Unit` /
-                    // non-`Nothing` return require every path to terminate
-                    // in `return` / `throw` / equivalent divergence. We
-                    // approximate the rule by checking that the block's
-                    // tail type diverges (`Nothing`) when the declared
-                    // return is value-bearing.
+                    // non-`Nothing` return require every path to
+                    // terminate in `return` / `throw` / divergence.
+                    // Defer to the CFG: if the normal-completion block
+                    // is unreachable (the body always throws, calls a
+                    // `Nothing`-returning function such as `error(..)`
+                    // or atomicfu's `loop`, or loops forever) no
+                    // `return` is required — Kotlin's post-control-
+                    // flow rule. `check_block` has now populated the
+                    // expression types the type-aware pass consults.
+                    let normal_exit_reachable = {
+                        let type_map: std::collections::HashMap<(u32, u32), Type> = self
+                            .types
+                            .iter()
+                            .map(|(s, t)| ((s.start, s.end), t.clone()))
+                            .collect();
+                        match self.lowerings.get(&f.span) {
+                            Some(low) => {
+                                let r = klio_cfa::analyses::reachable::analyse_with_types(
+                                    &low.cfg,
+                                    Some(&type_map),
+                                );
+                                low.cfg.exits.is_empty()
+                                    || low.cfg.exits.iter().any(|e| r.is_reachable(*e))
+                            }
+                            None => true,
+                        }
+                    };
                     if !f.is_abstract
                         && f.return_type.is_some()
                         && !matches!(declared_return, Type::Unit | Type::Nothing | Type::Unresolved)
                         && !matches!(body_ty, Type::Nothing)
+                        && normal_exit_reachable
                     {
                         let span = b.stmts.last().map(stmt_span).unwrap_or(f.name.span);
                         self.diagnostics.emit(
