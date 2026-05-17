@@ -65,23 +65,36 @@ pub struct Parser<'src, 'tok> {
 impl<'src, 'tok> Parser<'src, 'tok> {
     #[must_use]
     pub fn new(_file: FileId, src: &'src str, tokens: &'tok [Token]) -> Self {
-        // Depth of enclosing `(` / `[` for every token. The closing
-        // bracket itself reports the *outer* depth; tokens strictly
-        // between the brackets report depth > 0. `{` is intentionally
-        // ignored so block statements keep newline-as-separator.
+        // A newline is *soft* (an expression may wrap across it) only
+        // when the innermost still-open bracket is `(` or `[`. Inside
+        // a `{ … }` — a block, lambda, or `when` body — newlines stay
+        // significant (statement / when-entry separators) even when
+        // that `{}` is itself nested inside `(…)`, e.g.
+        // `f(when { a -> x \n b -> y })`. Tracked with a bracket
+        // stack so the *innermost* context wins; a counter that
+        // ignored `{` mis-softened newlines inside such nested blocks.
         let mut nl_soft = Vec::with_capacity(tokens.len());
-        let mut depth: u32 = 0;
+        let mut stack: Vec<u8> = Vec::new();
+        let soft = |s: &[u8]| matches!(s.last(), Some(b'(') | Some(b'['));
         for t in tokens {
             match t.kind {
-                TokenKind::RParen | TokenKind::RBracket => {
-                    depth = depth.saturating_sub(1);
-                    nl_soft.push(depth > 0);
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    stack.pop();
+                    nl_soft.push(soft(&stack));
                 }
-                TokenKind::LParen | TokenKind::LBracket => {
-                    nl_soft.push(depth > 0);
-                    depth += 1;
+                TokenKind::LParen => {
+                    nl_soft.push(soft(&stack));
+                    stack.push(b'(');
                 }
-                _ => nl_soft.push(depth > 0),
+                TokenKind::LBracket => {
+                    nl_soft.push(soft(&stack));
+                    stack.push(b'[');
+                }
+                TokenKind::LBrace => {
+                    nl_soft.push(soft(&stack));
+                    stack.push(b'{');
+                }
+                _ => nl_soft.push(soft(&stack)),
             }
         }
         Self {
