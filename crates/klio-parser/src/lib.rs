@@ -769,6 +769,50 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             Vec::new()
         };
         self.skip_nl();
+        // Optional primary-constructor annotations:
+        // `class Foo @Inject @Deprecated(...) internal constructor(...)`.
+        // Kotlin requires the `constructor` keyword when the primary
+        // constructor is annotated/modified, so only consume a leading
+        // `@…` run when it is actually followed by `[visibility]
+        // constructor` — otherwise the `@` belongs to the *next*
+        // top-level declaration (e.g. `annotation class A` then
+        // `@A fun f()`) and must be left untouched. klio treats
+        // primary-ctor annotations as runtime no-ops.
+        if self.peek_kind().is_at() {
+            let ann_save = self.pos;
+            while self.peek_kind().is_at() {
+                if self.parse_annotation_set().is_none() {
+                    break;
+                }
+                self.skip_nl();
+            }
+            // Skip an optional visibility ident, then require
+            // `constructor`.
+            let mut probe = self.pos;
+            let probe_is_vis = matches!(
+                self.tokens.get(probe).map(|t| &t.kind),
+                Some(TokenKind::Ident)
+            ) && {
+                let t = self.text(self.tokens[probe].span);
+                t == "public" || t == "private" || t == "protected" || t == "internal"
+            };
+            if probe_is_vis {
+                probe += 1;
+                while matches!(
+                    self.tokens.get(probe).map(|t| &t.kind),
+                    Some(TokenKind::Newline)
+                ) {
+                    probe += 1;
+                }
+            }
+            let is_primary_ctor = matches!(
+                self.tokens.get(probe).map(|t| &t.kind),
+                Some(TokenKind::Ident)
+            ) && self.text(self.tokens[probe].span) == "constructor";
+            if !is_primary_ctor {
+                self.pos = ann_save; // the `@` annotates the next decl
+            }
+        }
         // Optional primary-ctor visibility: `class Foo (private)? constructor(...)`.
         let mut primary_ctor_visibility: Option<Visibility> = None;
         let save = self.pos;
