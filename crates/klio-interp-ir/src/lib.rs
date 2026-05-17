@@ -3327,6 +3327,40 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         result
     }
 
+    fn call_named_overload(
+        &mut self,
+        module: &klio_ir::Module,
+        name: &str,
+        args: &[klio_runtime::Value],
+        arg_names: &[Option<String>],
+    ) -> Result<Option<klio_runtime::Value>, klio_ir::eval::EvalError> {
+        // Only intercept genuine overload sets: a single top-level
+        // function keeps the plain global-value path (which carries
+        // default-arg + vararg packing the IrClosure branch handles).
+        let mut first: Option<klio_ir::FuncId> = None;
+        let mut count = 0usize;
+        for (n, id) in &module.func_index {
+            if n == name {
+                count += 1;
+                if first.is_none() {
+                    first = Some(*id);
+                }
+            }
+        }
+        if count < 2 {
+            return Ok(None);
+        }
+        let func = first.expect("count >= 2 implies a first candidate");
+        let result = self.call_func_typed(
+            module,
+            func,
+            args.to_vec(),
+            arg_names,
+            &[],
+        )?;
+        Ok(Some(result))
+    }
+
     fn build_ast_lambda_with_flag_funcid(
         &mut self,
         params: &[String],

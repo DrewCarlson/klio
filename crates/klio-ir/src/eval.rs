@@ -340,6 +340,21 @@ pub trait Host {
     ) -> Result<Value, EvalError> {
         self.call_func_named(module, func, args, arg_names)
     }
+    /// Resolve a bare-name call against the top-level function table
+    /// with runtime-argument overload selection. Returns `Ok(None)`
+    /// when the name is not an overloaded top-level function (the
+    /// caller then falls back to the plain global-value path). Lets
+    /// `foo(x)` pick between `fun foo(Long)` / `fun foo(Double)` even
+    /// when the call site baked in a single global at lower time.
+    fn call_named_overload(
+        &mut self,
+        _module: &Module,
+        _name: &str,
+        _args: &[Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<Option<Value>, EvalError> {
+        Ok(None)
+    }
 }
 
 /// No-op host for unit tests and IR-shape exercises.
@@ -1028,12 +1043,21 @@ fn exec_inst(
             let result = match resolved {
                 Some(v) => v,
                 None => {
-                    let callee = host
-                        .lookup_global_throwing(&name_str)?
-                        .ok_or_else(|| EvalError::Unbound(
-                            format!("unresolved global `{name_str}`"),
-                        ))?;
-                    host.call_value_named(&callee, &arg_values, &names)?
+                    // Overloaded top-level function: select by runtime
+                    // arg types before falling back to the single
+                    // global value baked in at lower time.
+                    if let Some(v) = host.call_named_overload(
+                        frame.module, &name_str, &arg_values, &names,
+                    )? {
+                        v
+                    } else {
+                        let callee = host
+                            .lookup_global_throwing(&name_str)?
+                            .ok_or_else(|| EvalError::Unbound(
+                                format!("unresolved global `{name_str}`"),
+                            ))?;
+                        host.call_value_named(&callee, &arg_values, &names)?
+                    }
                 }
             };
             frame.write(*dst, result);

@@ -11023,6 +11023,28 @@ fn is_builtin_integer(t: &Type) -> bool {
     matches!(t, Type::Int | Type::Long | Type::Short | Type::Byte)
 }
 
+fn is_builtin_numeric(t: &Type) -> bool {
+    is_builtin_integer(t) || matches!(t, Type::Float | Type::Double)
+}
+
+/// Position in Kotlin's numeric widening tower (Byte ⊂ Short ⊂ Int ⊂
+/// Long ⊂ Float ⊂ Double). A *narrower* type is the more specific
+/// overload target for a given numeric argument, so a smaller rank is
+/// more specific. Used only for the mixed integer/floating
+/// specificity case; integer-vs-integer keeps `int_widen_rank`'s
+/// literal-widening preference untouched.
+fn num_tower_rank(t: &Type) -> u32 {
+    match t {
+        Type::Byte => 0,
+        Type::Short => 1,
+        Type::Int => 2,
+        Type::Long => 3,
+        Type::Float => 4,
+        Type::Double => 5,
+        _ => 0,
+    }
+}
+
 /// Class-aware subtype check used by the MSC pairwise test. Walks `sub`'s
 /// supertype chain in `classes` looking for `sup`. Returns true on a hit
 /// or on `sub == sup`. Anonymous / not-in-table classes fall through.
@@ -11070,6 +11092,16 @@ fn at_least_as_applicable(
             // narrower widening set (Int has the smallest set, Byte the
             // largest). F1 is at-least-as-applicable iff rank(X) <= rank(Y).
             if int_widen_rank(x) > int_widen_rank(y) {
+                return false;
+            }
+        } else if is_builtin_numeric(x) && is_builtin_numeric(y) {
+            // Mixed integer/floating (or floating/floating): the
+            // narrower numeric param is the more specific target, so
+            // `f(Long)` dominates `f(Double)` for an integer argument.
+            // Long is not a Kotlin subtype of Double, so without this
+            // both would land in the fitting set and report a bogus
+            // ambiguity.
+            if num_tower_rank(x) > num_tower_rank(y) {
                 return false;
             }
         } else if matches!(x, Type::Unresolved) && matches!(y, Type::Unresolved) {
