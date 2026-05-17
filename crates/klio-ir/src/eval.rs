@@ -769,6 +769,7 @@ fn inst_dst(inst: &Inst) -> Option<Reg> {
         | Inst::CallSuper { dst, .. }
         | Inst::CallMember { dst, .. }
         | Inst::CallMemberOrGlobal { dst, .. }
+        | Inst::CallValueOrMember { dst, .. }
         | Inst::NewInstance { dst, .. } => Some(*dst),
         _ => None,
     }
@@ -1113,6 +1114,52 @@ fn exec_inst(
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
             let result = host.call_member_named(&recv, &name_str, &arg_values, &names)?;
+            frame.write(*dst, result);
+        }
+        Inst::CallValueOrMember {
+            dst,
+            callee,
+            this_recv,
+            name,
+            args,
+            n_args,
+            arg_names,
+        } => {
+            let callee_v = frame.read(*callee);
+            let arg_values = read_arg_run(frame, *args, *n_args);
+            let names = resolve_arg_names(frame.module, arg_names);
+            let invocable = match &callee_v {
+                Value::Function { .. }
+                | Value::Lambda { .. }
+                | Value::Intrinsic { .. }
+                | Value::IrClosure { .. }
+                | Value::BoundMethod { .. }
+                | Value::BoundUserMethod { .. } => true,
+                Value::Instance(i) => {
+                    let cls = i.borrow().class.name.clone();
+                    frame
+                        .module
+                        .registry
+                        .hierarchy_methods
+                        .get(&cls)
+                        .map_or(false, |m| m.contains("invoke"))
+                }
+                _ => false,
+            };
+            let result = if invocable {
+                host.call_value_named(&callee_v, &arg_values, &names)?
+            } else {
+                let recv = frame.read(*this_recv);
+                let name_str = match &frame.module.consts[name.0 as usize] {
+                    Const::String(s) => s.clone(),
+                    _ => {
+                        return Err(EvalError::Type(
+                            "CallValueOrMember: name not a string const".into(),
+                        ))
+                    }
+                };
+                host.call_member_named(&recv, &name_str, &arg_values, &names)?
+            };
             frame.write(*dst, result);
         }
         Inst::NewInstance { dst, class, args, n_args, arg_names } => {

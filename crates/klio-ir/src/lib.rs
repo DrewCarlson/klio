@@ -179,6 +179,25 @@ pub enum Inst {
         #[serde(default)]
         arg_names: Vec<Option<ConstId>>,
     },
+    /// `name(args)` where `name` resolves to an in-scope value that
+    /// also names a member function of the enclosing class. Kotlin
+    /// keeps the function and property namespaces separate: a
+    /// non-invocable value (e.g. a `Boolean` parameter) falls to the
+    /// member function, while an invocable value (a function type, or
+    /// a type with `operator fun invoke`, in a closer scope) is
+    /// invoked directly. Invocability is only known at runtime, so
+    /// the choice is made here: invoke `callee` if invocable, else
+    /// dispatch `name` as a member on `this_recv`.
+    CallValueOrMember {
+        dst: Reg,
+        callee: Reg,
+        this_recv: Reg,
+        name: ConstId,
+        args: Reg,
+        n_args: u8,
+        #[serde(default)]
+        arg_names: Vec<Option<ConstId>>,
+    },
     /// Member call on a receiver. The evaluator resolves the
     /// method through the receiver's class table at runtime.
     CallMember {

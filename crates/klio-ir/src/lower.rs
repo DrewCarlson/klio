@@ -2426,20 +2426,34 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             && b.resolve("this").is_some()
                     };
                     if redirect_to_member {
-                        // `name(args)` where `name` is a hierarchy
-                        // member function shadowed in scope by a
-                        // same-named value/param: dispatch as an
-                        // implicit-receiver member call on `this`.
+                        // `name(args)` where `name` names both a
+                        // hierarchy member function and an in-scope
+                        // value. Kotlin's choice depends on whether
+                        // the value is invocable — known only at
+                        // runtime — so emit `CallValueOrMember`: the
+                        // value is invoked if invocable (a function
+                        // type / `operator fun invoke`, the closer
+                        // scope), otherwise the member function runs.
                         let this_reg = b.resolve("this").expect("this bound");
+                        let callee_reg =
+                            b.resolve(&segments[0].name).expect("shadowing value");
+                        let callee_reg = if b.is_boxed(&segments[0].name) {
+                            let c = b.alloc_reg();
+                            b.push(Inst::CellGet { dst: c, cell: callee_reg });
+                            c
+                        } else {
+                            callee_reg
+                        };
                         let (args_start, count) = lower_arg_run(b, args);
                         let arg_names = intern_arg_names(b.module, ast_arg_names);
                         let dst = b.alloc_reg();
                         let nm = b
                             .module
                             .intern_const(Const::String(segments[0].name.clone()));
-                        b.push(Inst::CallMember {
+                        b.push(Inst::CallValueOrMember {
                             dst,
-                            receiver: this_reg,
+                            callee: callee_reg,
+                            this_recv: this_reg,
                             name: nm,
                             args: args_start,
                             n_args: count,
