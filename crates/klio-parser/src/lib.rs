@@ -4135,11 +4135,14 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     }
                 }
                 // Tokens that wouldn't appear in a type list — bail out.
+                // `*` inside the angle brackets is a star projection
+                // (`Foo<List<*>>()`), not multiplication; only bail on
+                // it at depth 0 where it would be an arithmetic op.
+                TokenKind::Star if depth == 0 => return false,
                 TokenKind::Eq
                 | TokenKind::Semicolon
                 | TokenKind::Plus
                 | TokenKind::Minus
-                | TokenKind::Star
                 | TokenKind::Slash
                 | TokenKind::Percent
                 | TokenKind::EqEq
