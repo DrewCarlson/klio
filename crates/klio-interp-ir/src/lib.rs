@@ -5173,6 +5173,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return Ok(klio_runtime::Value::Bool(false));
             }
         }
+        // `kotlin.Unit` is the singleton `object Unit`; its `Any`
+        // methods are well-defined. Upstream `JobSupport`'s state
+        // machine compares state values with `==`, and a state slot
+        // can legitimately be `Unit`, so `Unit.equals(x)` must answer
+        // (`x === Unit`) rather than fail to resolve.
+        if matches!(receiver, klio_runtime::Value::Unit) {
+            match (name, args.len()) {
+                ("equals", 1) => {
+                    return Ok(klio_runtime::Value::Bool(matches!(
+                        args[0],
+                        klio_runtime::Value::Unit
+                    )));
+                }
+                ("hashCode", 0) => {
+                    return Ok(klio_runtime::Value::new_int(0));
+                }
+                ("toString", 0) => {
+                    return Ok(klio_runtime::Value::String(Arc::new(
+                        "kotlin.Unit".to_string(),
+                    )));
+                }
+                _ => {}
+            }
+        }
         // Stdlib member dispatch: probe the receiver's type FQN
         // for a `<typeFqn>.<name>` intrinsic, then for the common
         // package-extension fallbacks. For 0-arg call shapes the
