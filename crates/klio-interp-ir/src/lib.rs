@@ -2039,6 +2039,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             format!("{type_fqn}.{name}"),
             format!("kotlin.collections.{name}"),
             format!("kotlin.text.{name}"),
+            format!("kotlin.math.{name}"),
             format!("kotlin.{name}"),
         ];
         for probe in &probes {

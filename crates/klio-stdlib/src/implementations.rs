@@ -60,6 +60,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
 
     // ----- math (functions) -----
     ("kotlin.math.abs", math_abs),
+    ("kotlin.math.absoluteValue", math_abs),
     ("kotlin.math.ceil", math_ceil),
     ("kotlin.math.cos", math_cos),
     ("kotlin.math.exp", math_exp),
@@ -2484,8 +2485,10 @@ fn as_double(v: &Value, what: &str) -> Result<f64, RuntimeError> {
 fn math_abs(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     match ctx.args {
         [Value::Int(n)] => Ok(Value::Int(n.wrapping_abs())),
+        [Value::Long(n)] => Ok(Value::Long(n.wrapping_abs())),
         [Value::Double(n)] => Ok(Value::Double(n.abs())),
-        _ => Err(RuntimeError::Type("abs requires Int or Double".into())),
+        [Value::Float(n)] => Ok(Value::Float(n.abs())),
+        _ => Err(RuntimeError::Type("abs requires a number".into())),
     }
 }
 
@@ -2612,6 +2615,8 @@ fn math_sign(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = arg1(ctx, "sign")?;
     match v {
         Value::Int(n) => Ok(Value::Int(n.signum())),
+        Value::Long(n) => Ok(Value::Int(n.signum() as i32)),
+        Value::Float(n) => Ok(Value::Float(n.signum())),
         Value::Double(n) => Ok(Value::Double(n.signum())),
         other => Err(RuntimeError::Type(format!("sign requires a number, got {other:?}"))),
     }
