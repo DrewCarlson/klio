@@ -1315,7 +1315,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => {}
             }
         }
-        self.globals.borrow_mut().define(name, value);
+        // Assign through the scope chain so a write to an existing
+        // (top-level) binding from inside a child scope — a closure
+        // or the coroutine-driver env — mutates the real global
+        // instead of shadowing it with a transient local. Only a
+        // genuinely new name defines here.
+        if self
+            .globals
+            .borrow_mut()
+            .assign(name, value.clone())
+            .is_err()
+        {
+            self.globals.borrow_mut().define(name, value);
+        }
         Ok(())
     }
 
