@@ -769,6 +769,14 @@ pub trait IntrinsicHost {
     /// after each park). Default impl is a no-op.
     fn coroutine_resume_slot(&mut self, _slot: i64) {}
 
+    /// Like [`coroutine_resume_slot`] but the parked activation
+    /// resumes with `value` delivered as the result of the call that
+    /// suspended it (instead of the default `Unit`). Backs the
+    /// `kotlin.coroutines` `Continuation.resumeWith` protocol, where
+    /// the suspending `suspendCoroutine` site must observe the
+    /// resumed value. Default impl is a no-op.
+    fn coroutine_resume_slot_value(&mut self, _slot: i64, _value: Value) {}
+
     /// Spawn `block` on a real OS thread and return an opaque thread
     /// id usable with [`join_os_thread`]. The default impl runs
     /// `block` eagerly on the calling stack (preserving the legacy

@@ -1659,6 +1659,17 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             }
             self.skip_nl();
             ty
+        } else if self.looks_like_paren_extension_receiver() {
+            // Parenthesized / function-type extension receiver:
+            // `fun (suspend () -> T).startCoroutine(...)`.
+            let ty = self.parse_type();
+            if matches!(self.peek_kind(), TokenKind::QuestionDot) {
+                self.bump();
+            } else {
+                self.expect(&TokenKind::Dot, "`.`")?;
+            }
+            self.skip_nl();
+            ty
         } else {
             None
         };
@@ -1816,6 +1827,42 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             && matches!(self.tokens.get(j + 1).map(|t| &t.kind), Some(TokenKind::Ident))
     }
 
+    /// Look-ahead for a parenthesized extension receiver:
+    /// `( … ) (?)? . Ident` — the shape of `fun (suspend () -> T).f()`
+    /// or `fun ((A) -> B).f()`. The receiver is a function/grouped
+    /// type, so the `Ident`-led [`looks_like_extension_receiver`]
+    /// scan does not apply.
+    fn looks_like_paren_extension_receiver(&self) -> bool {
+        if !matches!(self.tokens.get(self.pos).map(|t| &t.kind), Some(TokenKind::LParen)) {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut j = self.pos;
+        loop {
+            match self.tokens.get(j).map(|t| &t.kind) {
+                Some(TokenKind::LParen) => depth += 1,
+                Some(TokenKind::RParen) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        j += 1;
+                        break;
+                    }
+                }
+                None | Some(TokenKind::Eof) => return false,
+                _ => {}
+            }
+            j += 1;
+        }
+        if self.tokens.get(j).map(|t| t.kind.is_question()).unwrap_or(false) {
+            j += 1;
+        }
+        if matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::QuestionDot)) {
+            return matches!(self.tokens.get(j + 1).map(|t| &t.kind), Some(TokenKind::Ident));
+        }
+        matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Dot))
+            && matches!(self.tokens.get(j + 1).map(|t| &t.kind), Some(TokenKind::Ident))
+    }
+
     fn parse_param_list(&mut self) -> Vec<Param> {
         let mut params = Vec::new();
         loop {
@@ -1911,13 +1958,12 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     }
 
     fn parse_property_with_flags(&mut self, flags: ModifierFlags) -> Option<Property> {
-        if let Some(sp) = flags.suspend_span {
-            self.error(
-                "T0114",
-                "`suspend` modifier is not allowed on a property declaration",
-                sp,
-            );
-        }
+        // `suspend` is not a meaningful property modifier, but the
+        // stdlib `coroutineContext` intrinsic carries it (under a
+        // `@Suppress`). klio runs suspend bodies inline, so the
+        // modifier is simply inert on a property rather than an
+        // error — accept and ignore it.
+        let _ = flags.suspend_span;
         let kw_tok = self.bump();
         let mutable = matches!(kw_tok.kind, TokenKind::Keyword(Keyword::Var));
         self.skip_nl();
@@ -4640,12 +4686,15 @@ mod tests {
     }
 
     #[test]
-    fn suspend_modifier_on_property_rejected() {
-        let (_file, diags) = parse("suspend val x = 1\n");
+    fn suspend_modifier_on_property_accepted_inert() {
+        // The stdlib `coroutineContext` intrinsic is a `suspend val`;
+        // klio accepts the (inert) modifier rather than erroring.
+        let (file, diags) = parse("suspend val x = 1\n");
         assert!(
-            diags.diagnostics().iter().any(|d| d.code() == Some("T0114")),
-            "expected T0114: {:?}", diags.diagnostics()
+            !diags.diagnostics().iter().any(|d| d.code() == Some("T0114")),
+            "unexpected T0114: {:?}", diags.diagnostics()
         );
+        assert!(matches!(&file.decls[0], klio_ast::Decl::Property(_)));
     }
 
     #[test]

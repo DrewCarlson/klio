@@ -4219,7 +4219,25 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 | klio_runtime::Value::Function { .. }
                 | klio_runtime::Value::Intrinsic { .. }
         ) {
-            if name != "invoke" {
+            // A user extension on a function type
+            // (`fun (() -> T).foo()`) lowers to a top-level fn whose
+            // first param is the receiver. When one named `name`
+            // exists, it must win over the SAM-invoke shortcut, which
+            // would otherwise just call the receiver and discard the
+            // intended dispatch. Defer to the extension-fn fallback.
+            let has_ext = self.module.func_index.iter().any(|(n, fid)| {
+                n == name
+                    && self
+                        .module
+                        .funcs
+                        .get(fid.0 as usize)
+                        .map(|f| {
+                            f.params.first().map(|p| p.name == "this").unwrap_or(false)
+                                && f.params.len() >= args.len() + 1
+                        })
+                        .unwrap_or(false)
+            });
+            if name != "invoke" && !has_ext {
                 if let Ok(v) = self.call_value(receiver, args) {
                     return Ok(v);
                 }
@@ -5332,6 +5350,29 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => {}
             }
         }
+        // Function-typed property invoked by name: `body()` where
+        // `body: () -> T` is a (constructor) property. No method
+        // `body` exists, so read the callable field and invoke it.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let field = inst
+                .borrow()
+                .fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone());
+            if let Some(v) = field {
+                if matches!(
+                    v,
+                    klio_runtime::Value::Lambda { .. }
+                        | klio_runtime::Value::IrClosure { .. }
+                        | klio_runtime::Value::Function { .. }
+                        | klio_runtime::Value::BoundMethod { .. }
+                        | klio_runtime::Value::Instance(_)
+                ) {
+                    return <Self as klio_ir::eval::Host>::call_value(self, &v, args);
+                }
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()
@@ -6345,6 +6386,11 @@ struct CooperativeInterceptor {
     /// explicit `__kxco_resumeSlot(slot)` moves the token into
     /// `ready` and clears the entry.
     slot_to_token: std::collections::HashMap<i64, u64>,
+    /// token → value the activation should observe as the result of
+    /// its suspending call when resumed (the `kotlin.coroutines`
+    /// `Continuation.resumeWith` payload). Absent ⇒ resume with the
+    /// default `Unit`.
+    token_resume_value: std::collections::HashMap<u64, klio_runtime::Value>,
 }
 
 impl CooperativeInterceptor {
@@ -6360,6 +6406,7 @@ impl CooperativeInterceptor {
             launched: Vec::new(),
             pending_slot: None,
             slot_to_token: std::collections::HashMap::new(),
+            token_resume_value: std::collections::HashMap::new(),
         }
     }
 
@@ -6420,6 +6467,24 @@ impl CooperativeInterceptor {
         } else {
             false
         }
+    }
+
+    /// Like [`resume_slot`] but records `value` so the resumed
+    /// activation observes it as its suspending call's result.
+    fn resume_slot_value(&mut self, slot: i64, value: klio_runtime::Value) -> bool {
+        if let Some(token) = self.slot_to_token.remove(&slot) {
+            self.token_resume_value.insert(token, value);
+            self.ready.push_back(token);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Take the pending resume value for `token`, if one was set by
+    /// [`resume_slot_value`].
+    fn take_resume_value(&mut self, token: u64) -> Option<klio_runtime::Value> {
+        self.token_resume_value.remove(&token)
     }
 
     /// Seam: take the child `launch` blocks queued this round.
@@ -6786,7 +6851,9 @@ impl<'a> VmIntrinsicHost<'a> {
                 let entry = with_top(|i| i.take_parked(tok));
                 if let Some((st, _)) = entry {
                     progressed = true;
-                    match self.resume_raw(st, klio_runtime::Value::Unit, out) {
+                    let resume_with = with_top(|i| i.take_resume_value(tok))
+                        .unwrap_or(klio_runtime::Value::Unit);
+                    match self.resume_raw(st, resume_with, out) {
                         Ok(v) => {
                             if Some(tok) == root_token {
                                 root_value = Some(v);
@@ -6875,6 +6942,17 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             let mut stk = s.borrow_mut();
             for interceptor in stk.iter_mut().rev() {
                 if interceptor.resume_slot(slot) {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn coroutine_resume_slot_value(&mut self, slot: i64, value: klio_runtime::Value) {
+        with_coro(|s| {
+            let mut stk = s.borrow_mut();
+            for interceptor in stk.iter_mut().rev() {
+                if interceptor.resume_slot_value(slot, value.clone()) {
                     break;
                 }
             }

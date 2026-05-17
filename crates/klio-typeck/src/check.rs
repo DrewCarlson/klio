@@ -4239,6 +4239,16 @@ impl<'r> Checker<'r> {
             let mut sigs_tmp: HashMap<String, MemberSig> = HashMap::new();
             self.inject_function_type_supertypes(c, &mut inherited, &mut sigs_tmp);
         }
+        // A supertype whose declaration is not visible to this
+        // type-check unit (e.g. an interface from the embedded stdlib
+        // like `kotlin.coroutines.Continuation`) may legitimately
+        // declare the overridden member. Don't false-positive
+        // "overrides nothing" when such an opaque supertype is
+        // present.
+        let has_opaque_supertype = c.supertypes.iter().any(|s| {
+            s.function.is_none()
+                && !self.classes.contains_key(&s.name.name)
+        });
         for m in &c.members {
             let (mname, mspan, mflags) = match m {
                 Decl::Function(f) => (
@@ -4301,7 +4311,10 @@ impl<'r> Checker<'r> {
                     }
                 }
                 None => {
-                    if mflags.is_override && !is_builtin_overridable(mname) {
+                    if mflags.is_override
+                        && !is_builtin_overridable(mname)
+                        && !has_opaque_supertype
+                    {
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 format!(

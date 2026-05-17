@@ -876,6 +876,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
 
     // ----- kotlin.coroutines intrinsics -----
     ("kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED", coroutine_suspended_sentinel),
+    ("kotlin.coroutines.__klio_co_newSlot", coro_new_slot),
+    ("kotlin.coroutines.__klio_co_park", coro_park),
+    ("kotlin.coroutines.__klio_co_resume", coro_resume),
 
     // ----- Regex -----
     ("kotlin.text.Regex", regex_ctor),
@@ -6870,6 +6873,52 @@ fn result_exception_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// any sentinel `x`.
 fn coroutine_suspended_sentinel(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::CoroutineSuspended)
+}
+
+thread_local! {
+    /// Monotonic rendezvous-slot counter for the `kotlin.coroutines`
+    /// language layer. Distinct from the kotlinx.coroutines pack's
+    /// own counter so the two suspension surfaces never alias.
+    static CO_NEXT_SLOT: std::cell::Cell<i64> = const { std::cell::Cell::new(1) };
+}
+
+/// `__klio_co_newSlot()` — a fresh slot id for a `suspendCoroutine`
+/// rendezvous.
+fn coro_new_slot(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let id = CO_NEXT_SLOT.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1));
+        v
+    });
+    Ok(Value::Long(id))
+}
+
+fn slot_arg(args: &[Value], who: &str) -> Result<i64, RuntimeError> {
+    match args.first() {
+        Some(Value::Long(l)) => Ok(*l),
+        Some(Value::Int(i)) => Ok(i64::from(*i)),
+        _ => Err(RuntimeError::Type(format!("{who}: slot must be Long"))),
+    }
+}
+
+/// `__klio_co_park(slot)` — record the current activation as waiting
+/// on `slot`, then suspend indefinitely. On resume the call yields
+/// the `Result` delivered by `__klio_co_resume`.
+fn coro_park(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let slot = slot_arg(ctx.args, "__klio_co_park")?;
+    ctx.host.coroutine_park_slot(slot);
+    Err(RuntimeError::Suspend(-1))
+}
+
+/// `__klio_co_resume(slot, ok, value)` — deliver a `Result` to the
+/// activation parked on `slot` and make it ready.
+fn coro_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let slot = slot_arg(ctx.args, "__klio_co_resume")?;
+    let ok = matches!(ctx.args.get(1), Some(Value::Bool(true)));
+    let payload = ctx.args.get(2).cloned().unwrap_or(Value::Null);
+    let result = Value::Result { ok, payload: Box::new(payload) };
+    ctx.host.coroutine_resume_slot_value(slot, result);
+    Ok(Value::Unit)
 }
 
 /// `Result.getOrThrow()` — the success value, or rethrow the

@@ -20,8 +20,10 @@ fn main() {
     // `actual` files and the upstream kotlin.time commonMain checkout;
     // re-pack when either changes.
     rerun_dir(&klio_stdlib_dir.join("kotlin-time"));
+    rerun_dir(&klio_stdlib_dir.join("kotlin-coroutines"));
     let ws_root = PathBuf::from(&manifest_dir).join("..").join("..");
     rerun_dir(&ws_root.join("kotlin").join("libraries").join("stdlib").join("src").join("kotlin").join("time"));
+    rerun_dir(&ws_root.join("kotlin").join("libraries").join("stdlib").join("src").join("kotlin").join("coroutines"));
 
     let bytes = klio_stdlib::build_stdlib_pack(true).expect("build stdlib pack");
     std::fs::write(&dest, &bytes).expect("write stdlib pack");

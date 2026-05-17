@@ -42,11 +42,19 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/time/Clocks.kt",
     "src/kotlin/time/Instant.kt",
     "src/kotlin/time/ExperimentalTime.kt",
+    "src/kotlin/coroutines/CoroutineContext.kt",
+    "src/kotlin/coroutines/CoroutineContextImpl.kt",
+    "src/kotlin/coroutines/ContinuationInterceptor.kt",
+    "src/kotlin/coroutines/Continuation.kt",
 ];
 
 /// klio-authored platform `actual` source files shipped in the same
 /// `SOURCES` section, paths relative to the `klio-stdlib` crate root.
-const KLIO_STDLIB_ACTUAL_FILES: &[&str] = &["kotlin-time/Actuals.kt"];
+const KLIO_STDLIB_ACTUAL_FILES: &[&str] = &[
+    "kotlin-time/Actuals.kt",
+    "kotlin-coroutines/Actuals.kt",
+    "kotlin-coroutines/Intrinsics.kt",
+];
 
 /// Locate the local upstream Kotlin checkout's `libraries/stdlib`
 /// directory (the same one the stdlib-gen miner and the parity harness
