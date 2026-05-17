@@ -1288,7 +1288,10 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     "private" => { visibility = Visibility::Private; self.bump(); self.skip_nl(); }
                     "protected" => { visibility = Visibility::Protected; self.bump(); self.skip_nl(); }
                     "internal" => { visibility = Visibility::Internal; self.bump(); self.skip_nl(); }
-                    "override" => { self.bump(); self.skip_nl(); }
+                    "override" | "final" | "open" | "abstract" | "lateinit" => {
+                        self.bump();
+                        self.skip_nl();
+                    }
                     _ => break,
                 }
             }
