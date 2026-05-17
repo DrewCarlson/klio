@@ -89,14 +89,19 @@ internal class KlioStartContinuation<T>(
         get() = completion.context
 
     public override fun resumeWith(result: Result<Unit>) {
-        // Call `body()` directly (no wrapping closure) so the
-        // enclosing `this` survives a suspension inside the body
-        // across the frame-snapshot resume.
-        val out: Result<T> = try {
-            Result.success(__klio_co_runRoot(body))
-        } catch (e: Throwable) {
-            Result.failure(e)
+        // Deliver the body's outcome to `completion` *inside* the
+        // driver root: a suspension inside `body()` parks the whole
+        // activation (including this pending completion delivery),
+        // and the later resume drives it to the real result.
+        val comp = completion
+        val b = body
+        __klio_co_runRoot {
+            val r: Result<T> = try {
+                Result.success(b())
+            } catch (e: Throwable) {
+                Result.failure(e)
+            }
+            comp.resumeWith(r)
         }
-        completion.resumeWith(out)
     }
 }

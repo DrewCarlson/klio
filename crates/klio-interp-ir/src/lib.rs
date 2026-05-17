@@ -6341,6 +6341,15 @@ pub enum TimeMode {
 thread_local! {
     static COROUTINE_TIME_MODE: std::cell::Cell<TimeMode> =
         const { std::cell::Cell::new(TimeMode::Wall) };
+
+    /// Coroutines that parked indefinitely inside a `startCoroutine`
+    /// driver and are awaiting an external `Continuation.resume`.
+    /// Keyed by rendezvous slot; the resume drives the saved state to
+    /// completion. Program-lifetime (the held continuation outlives
+    /// the driver that started it).
+    static PERSISTED_PARKED: std::cell::RefCell<
+        std::collections::HashMap<i64, klio_ir::eval::SuspendState>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Set the coroutine time mode for the current thread. The default
@@ -6491,6 +6500,36 @@ impl CooperativeInterceptor {
     /// [`resume_slot_value`].
     fn take_resume_value(&mut self, token: u64) -> Option<klio_runtime::Value> {
         self.token_resume_value.remove(&token)
+    }
+
+    /// Remove every indefinitely-parked activation still waiting on a
+    /// slot, returning `(slot, state)` pairs. Used by the
+    /// `startCoroutine` driver to hand a coroutine that parked
+    /// awaiting an external `resume` to program-lifetime storage so
+    /// it survives the driver's return.
+    fn drain_indefinite_parked(
+        &mut self,
+    ) -> Vec<(i64, klio_ir::eval::SuspendState)> {
+        let slots: Vec<(i64, u64)> = self
+            .slot_to_token
+            .iter()
+            .map(|(s, t)| (*s, *t))
+            .collect();
+        let mut out = Vec::new();
+        for (slot, token) in slots {
+            let is_indefinite = self
+                .parked
+                .get(&token)
+                .map(|(_, wake)| *wake == i64::MAX)
+                .unwrap_or(false);
+            if is_indefinite {
+                if let Some((state, _)) = self.parked.remove(&token) {
+                    self.slot_to_token.remove(&slot);
+                    out.push((slot, state));
+                }
+            }
+        }
+        out
     }
 
     /// Seam: take the child `launch` blocks queued this round.
@@ -6803,6 +6842,21 @@ impl<'a> VmIntrinsicHost<'a> {
         scope: &klio_runtime::Value,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        self.drive_root(block, scope, out, false)
+    }
+
+    /// `drive_run_blocking` with control over whether a coroutine
+    /// that parks indefinitely (awaiting an external resume) is
+    /// preserved into program-lifetime storage on driver exit
+    /// (`persist = true`, the `startCoroutine` boundary) or simply
+    /// abandoned (`persist = false`, `runBlocking`).
+    fn drive_root(
+        &mut self,
+        block: &klio_runtime::Value,
+        scope: &klio_runtime::Value,
+        out: &mut dyn Output,
+        persist: bool,
+    ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
         /// Run `f` against the active interceptor.
         fn with_top<R>(f: impl FnOnce(&mut CooperativeInterceptor) -> R) -> R {
             with_coro(|s| f(s.borrow_mut().last_mut().expect("no active runBlocking")))
@@ -6895,6 +6949,20 @@ impl<'a> VmIntrinsicHost<'a> {
                 break;
             }
         }
+        if persist {
+            // A coroutine that parked indefinitely is alive, waiting
+            // on a continuation held outside this driver. Preserve it
+            // so a later external `resume` can drive it to completion.
+            let saved = with_top(CooperativeInterceptor::drain_indefinite_parked);
+            if !saved.is_empty() {
+                PERSISTED_PARKED.with(|p| {
+                    let mut m = p.borrow_mut();
+                    for (slot, state) in saved {
+                        m.insert(slot, state);
+                    }
+                });
+            }
+        }
         with_coro(|s| {
             s.borrow_mut().pop();
         });
@@ -6917,7 +6985,39 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         block: &klio_runtime::Value,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
-        self.drive_run_blocking(block, &klio_runtime::Value::Unit, out)
+        self.drive_root(block, &klio_runtime::Value::Unit, out, true)
+    }
+
+    fn coroutine_resume_external(
+        &mut self,
+        slot: i64,
+        value: klio_runtime::Value,
+        out: &mut dyn Output,
+    ) {
+        // A live cooperative driver still holding this slot? Enqueue
+        // there — its drive loop runs the activation.
+        let in_driver = with_coro(|s| {
+            let mut stk = s.borrow_mut();
+            for interceptor in stk.iter_mut().rev() {
+                if interceptor.resume_slot_value(slot, value.clone()) {
+                    return true;
+                }
+            }
+            false
+        });
+        if in_driver {
+            return;
+        }
+        // Otherwise the coroutine parked inside a `startCoroutine`
+        // driver that already returned; its state was preserved.
+        // Drive it to completion (or its next suspension) now.
+        let saved = PERSISTED_PARKED.with(|p| p.borrow_mut().remove(&slot));
+        if let Some(state) = saved {
+            // `value` is already the `Result` built by
+            // `__klio_co_resume`; it is injected at the parked
+            // `__klio_co_park` call site.
+            let _ = self.resume_raw(state, value, out);
+        }
     }
 
     fn coroutine_launch(

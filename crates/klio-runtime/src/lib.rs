@@ -793,6 +793,21 @@ pub trait IntrinsicHost {
     /// resumed value. Default impl is a no-op.
     fn coroutine_resume_slot_value(&mut self, _slot: i64, _value: Value) {}
 
+    /// `Continuation.resumeWith` entry point: deliver `value` to the
+    /// activation parked on `slot`. If a live cooperative driver
+    /// holds it, just enqueue (the driver runs it); otherwise the
+    /// coroutine parked inside a since-returned `startCoroutine`
+    /// driver — drive its preserved state to completion here.
+    /// Default impl delegates to [`coroutine_resume_slot_value`].
+    fn coroutine_resume_external(
+        &mut self,
+        slot: i64,
+        value: Value,
+        _out: &mut dyn Output,
+    ) {
+        self.coroutine_resume_slot_value(slot, value);
+    }
+
     /// Spawn `block` on a real OS thread and return an opaque thread
     /// id usable with [`join_os_thread`]. The default impl runs
     /// `block` eagerly on the calling stack (preserving the legacy

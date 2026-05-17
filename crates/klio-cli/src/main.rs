@@ -1063,6 +1063,10 @@ fn load_embedded_stdlib_sources(
     for fqn in [
         "kotlin.time.__klio_time_systemMillis",
         "kotlin.time.__klio_time_monotonicNanos",
+        "kotlin.coroutines.__klio_co_newSlot",
+        "kotlin.coroutines.__klio_co_park",
+        "kotlin.coroutines.__klio_co_resume",
+        "kotlin.coroutines.__klio_co_runRoot",
     ] {
         if let Some(f) = merged.resolve(fqn) {
             out_bindings.register(fqn, f);

@@ -6918,7 +6918,7 @@ fn coro_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let ok = matches!(ctx.args.get(1), Some(Value::Bool(true)));
     let payload = ctx.args.get(2).cloned().unwrap_or(Value::Null);
     let result = Value::Result { ok, payload: Box::new(payload) };
-    ctx.host.coroutine_resume_slot_value(slot, result);
+    ctx.host.coroutine_resume_external(slot, result, ctx.out);
     Ok(Value::Unit)
 }
 
