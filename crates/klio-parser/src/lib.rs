@@ -3707,7 +3707,24 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         // `else` may follow on the next line.
         let save = self.pos;
         self.skip_nl();
-        let else_branch = if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Else)) {
+        // A following `else ->` is a `when`-arm else, not this `if`'s
+        // else branch — do not consume it (upstream kotlinx-coroutines
+        // `when { ... cond -> if (c) return X; else -> ... }`).
+        let else_is_when_arm = matches!(
+            self.peek_kind(),
+            TokenKind::Keyword(Keyword::Else)
+        ) && {
+            let mut j = self.pos + 1;
+            while matches!(
+                self.tokens.get(j).map(|t| &t.kind),
+                Some(TokenKind::Newline)
+            ) {
+                j += 1;
+            }
+            matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Arrow))
+        };
+        let else_branch = if !else_is_when_arm
+            && matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Else)) {
             self.bump();
             self.skip_nl();
             if matches!(self.peek_kind(), TokenKind::Semicolon) {
