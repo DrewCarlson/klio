@@ -584,6 +584,15 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Int.coerceIn", int_coerce_in),
     ("kotlin.Int.coerceAtLeast", int_coerce_at_least),
     ("kotlin.Int.coerceAtMost", int_coerce_at_most),
+    ("kotlin.Long.coerceIn", num_coerce_in),
+    ("kotlin.Long.coerceAtLeast", num_coerce_at_least),
+    ("kotlin.Long.coerceAtMost", num_coerce_at_most),
+    ("kotlin.Double.coerceIn", num_coerce_in),
+    ("kotlin.Double.coerceAtLeast", num_coerce_at_least),
+    ("kotlin.Double.coerceAtMost", num_coerce_at_most),
+    ("kotlin.Float.coerceIn", num_coerce_in),
+    ("kotlin.Float.coerceAtLeast", num_coerce_at_least),
+    ("kotlin.Float.coerceAtMost", num_coerce_at_most),
     ("kotlin.Int.toChar", int_to_char),
 
     // ----- Additional List ops -----
@@ -5904,6 +5913,59 @@ fn int_coerce_at_most(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Type("coerceAtMost requires an Int".into()));
     };
     Ok(Value::new_int(v.min(hi)))
+}
+
+/// `coerceIn` / `coerceAtLeast` / `coerceAtMost` for Long and Double
+/// receivers (the Int forms have their own arms above). Composed from
+/// `num_extreme` so the result keeps the receiver's numeric kind and
+/// the same widening rules as `minOf`/`maxOf`.
+fn num_coerce_in(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("coerceIn: missing receiver".into()))?;
+    match &ctx.args[1..] {
+        [Value::Range { start, end, .. }] => {
+            let lo = num_extreme(&[recv, Value::Long(*start)], false, "coerceIn")?;
+            num_extreme(&[lo, Value::Long(*end)], true, "coerceIn")
+        }
+        [min, max] => {
+            let lo = num_extreme(&[recv, min.clone()], false, "coerceIn")?;
+            num_extreme(&[lo, max.clone()], true, "coerceIn")
+        }
+        _ => Err(RuntimeError::Type(
+            "coerceIn requires (min, max) or a range".into(),
+        )),
+    }
+}
+
+fn num_coerce_at_least(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("coerceAtLeast: missing receiver".into()))?;
+    let min = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("coerceAtLeast requires a minimum".into()))?;
+    num_extreme(&[recv, min], false, "coerceAtLeast")
+}
+
+fn num_coerce_at_most(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("coerceAtMost: missing receiver".into()))?;
+    let max = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("coerceAtMost requires a maximum".into()))?;
+    num_extreme(&[recv, max], true, "coerceAtMost")
 }
 
 fn int_to_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
