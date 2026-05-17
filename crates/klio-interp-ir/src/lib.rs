@@ -966,6 +966,10 @@ impl<'a> VmHost<'a> {
 }
 
 impl<'a> klio_ir::eval::Host for VmHost<'a> {
+    fn enclosing_this(&self) -> Option<klio_runtime::Value> {
+        with_outer_this(|s| s.borrow().last().cloned())
+    }
+
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         let cached = self.globals.borrow().lookup(name);
         if self.module.registry.top_level_delegated_props.contains(name) {
@@ -2876,6 +2880,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // if the qualifier isn't a known class. The IR emits this
         // form for scope-fn lambdas + extension fns whose receiver
         // is already in `this`.
+        // Receiver-lambda case: `this@Outer` written inside
+        // `buildString { … }` (or another scope fn) in an `Outer`
+        // member. The lambda receiver displaced the enclosing
+        // instance; recover it from the enclosing-`this` stack and
+        // match the qualifier against its class chain.
+        let enclosing = with_outer_this(|s| s.borrow().last().cloned());
+        if let Some(klio_runtime::Value::Instance(o_inst)) = enclosing {
+            let mut cur: Option<Arc<klio_runtime::ClassDef>> =
+                Some(o_inst.borrow().class.clone());
+            while let Some(c) = cur {
+                if c.name == qualifier || c.fqn == qualifier {
+                    return Ok(klio_runtime::Value::Instance(o_inst.clone()));
+                }
+                cur = c.parent.borrow().clone();
+            }
+        }
         let known_class = self.classes.borrow().contains_key(qualifier);
         if !known_class && !matches!(receiver, klio_runtime::Value::Null) {
             return Ok(receiver.clone());
@@ -6097,6 +6117,15 @@ struct ExecState {
     /// builds the primary shell, so a `constructor() { … }` body
     /// that re-enters `new_instance` doesn't recurse forever.
     ctor_guard: RefCell<Vec<String>>,
+    /// Enclosing-`this` stack for receiver lambdas. A scope function
+    /// (`apply` / `with` / `buildString`) rebinds the lambda's
+    /// implicit `this` to its receiver, but Kotlin keeps the
+    /// lexically enclosing `this@Outer` reachable as an outer
+    /// implicit receiver. Each receiver-lambda invocation pushes the
+    /// instance it displaced; member / `this@Label` resolution falls
+    /// back to the top of this stack when the inner receiver lacks
+    /// the member.
+    outer_this: RefCell<Vec<klio_runtime::Value>>,
 }
 
 thread_local! {
@@ -6111,6 +6140,12 @@ fn with_coro<R>(f: impl FnOnce(&RefCell<Vec<CooperativeInterceptor>>) -> R) -> R
 /// Run `f` against this thread's constructor-shell recursion guard.
 fn with_ctor_guard<R>(f: impl FnOnce(&RefCell<Vec<String>>) -> R) -> R {
     EXEC.with(|e| f(&e.ctor_guard))
+}
+
+/// Run `f` against this thread's enclosing-`this` stack for receiver
+/// lambdas.
+fn with_outer_this<R>(f: impl FnOnce(&RefCell<Vec<klio_runtime::Value>>) -> R) -> R {
+    EXEC.with(|e| f(&e.outer_this))
 }
 
 impl<'a> VmIntrinsicHost<'a> {
@@ -6627,7 +6662,31 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 } else {
                     all.extend_from_slice(args);
                 }
+                // The receiver just displaced an enclosing-class
+                // `this` (e.g. `buildString { … }` written inside a
+                // member). Keep that instance reachable as an outer
+                // implicit receiver so bare members / `this@Outer`
+                // inside the lambda still resolve, matching Kotlin's
+                // nested-receiver rule.
+                let pushed_outer = matches!(
+                    &prior_this,
+                    Some(klio_runtime::Value::Instance(_))
+                ) && !matches!(
+                    (&prior_this, this),
+                    (Some(klio_runtime::Value::Instance(a)), klio_runtime::Value::Instance(b))
+                        if klio_runtime::ObjRef::ptr_eq(a, b)
+                );
+                if pushed_outer {
+                    if let Some(p) = &prior_this {
+                        with_outer_this(|s| s.borrow_mut().push(p.clone()));
+                    }
+                }
                 let result = self.invoke_callable(callable, &all, out);
+                if pushed_outer {
+                    with_outer_this(|s| {
+                        s.borrow_mut().pop();
+                    });
+                }
                 // Restore prior this so a closure reused with
                 // different receivers preserves the original
                 // captured value between uses.

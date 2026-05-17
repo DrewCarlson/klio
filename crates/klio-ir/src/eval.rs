@@ -355,6 +355,13 @@ pub trait Host {
     ) -> Result<Option<Value>, EvalError> {
         Ok(None)
     }
+    /// The lexically enclosing `this` displaced by a receiver lambda
+    /// (`apply` / `with` / `buildString` written inside a member).
+    /// Member resolution and `this@Label` consult it when the inner
+    /// receiver lacks the member. `None` outside a receiver lambda.
+    fn enclosing_this(&self) -> Option<Value> {
+        None
+    }
 }
 
 /// No-op host for unit tests and IR-shape exercises.
@@ -1040,6 +1047,21 @@ fn exec_inst(
                     resolved = Some(v);
                 }
             }
+            // Enclosing-receiver fallback: inside a receiver lambda
+            // (`buildString { … }` in a member) a bare call may be a
+            // member of the lexically enclosing `this@Outer` rather
+            // than the lambda receiver.
+            if resolved.is_none() {
+                if let Some(outer) = host.enclosing_this() {
+                    if !matches!(outer, Value::Null | Value::Unit) {
+                        if let Ok(v) = host.call_member_named(
+                            &outer, &name_str, &arg_values, &names,
+                        ) {
+                            resolved = Some(v);
+                        }
+                    }
+                }
+            }
             let result = match resolved {
                 Some(v) => v,
                 None => {
@@ -1200,6 +1222,20 @@ fn exec_inst(
                 if let Ok(v) = host.get_field(&this_val, &name_str) {
                     if !matches!(v, Value::Unit) {
                         resolved = Some(v);
+                    }
+                }
+            }
+            // Enclosing-receiver fallback: a bare property read inside
+            // a receiver lambda may name a member of the lexically
+            // enclosing `this@Outer`.
+            if resolved.is_none() {
+                if let Some(outer) = host.enclosing_this() {
+                    if !matches!(outer, Value::Null | Value::Unit) {
+                        if let Ok(v) = host.get_field(&outer, &name_str) {
+                            if !matches!(v, Value::Unit) {
+                                resolved = Some(v);
+                            }
+                        }
                     }
                 }
             }

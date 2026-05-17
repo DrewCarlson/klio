@@ -562,6 +562,21 @@ fn is_package_head(name: &str) -> bool {
     )
 }
 
+/// A genuine top-level package root. `is_package_head` treats *any*
+/// lowercase identifier as a package head, which is fine at
+/// statement scope (a bare `this`-bound method body blocks the FQN
+/// path via its own guard) but misfires inside a receiver lambda,
+/// where an unresolved lowercase name like `twin` is actually a
+/// member of the lexically enclosing `this@Outer`, not a package.
+/// Restrict the FQN-flattening call/read paths to these real roots
+/// when no local `this` is in scope but an enclosing one may be.
+fn is_pkg_root(name: &str) -> bool {
+    matches!(
+        name,
+        "kotlin" | "kotlinx" | "java" | "javax" | "io" | "org" | "com" | "net"
+    )
+}
+
 /// Flatten a `Member{receiver: Member{...,Path}}` chain into a
 /// dotted FQN like `kotlin.math.PI`. Returns `None` when the chain
 /// is not purely identifier segments (e.g. it has a Call, Index, or
@@ -1692,6 +1707,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // off a head LoadGlobal when the FQN doesn't resolve.
             if segments.len() >= 2
                 && is_package_head(&segments[0].name)
+                && (is_pkg_root(&segments[0].name) || !b.is_lambda_body())
                 && b.resolve(&segments[0].name).is_none()
                 && b.module.class_id(&segments[0].name).is_none()
             {
@@ -1710,9 +1726,20 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let head = if let Some(r) = b.resolve(&first.name) {
                 r
             } else {
+                // Unresolved head: route through `this` / the
+                // enclosing receiver before a bare global so a bare
+                // member of `this@Outer` (e.g. inside a receiver
+                // lambda) resolves instead of failing as a missing
+                // global. Falls back to the global when neither has
+                // it.
+                let this_idx = b.record_capture("this");
                 let dst = b.alloc_reg();
                 let n = b.module.intern_const(Const::String(first.name.clone()));
-                b.push(Inst::LoadGlobal { dst, name: n });
+                b.push(Inst::LoadFromThisOrGlobal {
+                    dst,
+                    this_idx,
+                    name: n,
+                });
                 dst
             };
             let mut cur = head;
@@ -2618,6 +2645,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     {
                         if tail != fqn
                             && is_package_head(head)
+                            && (is_pkg_root(head) || !b.is_lambda_body())
                             && b.resolve(head).is_none()
                             && !b.knows_outer(head)
                             && b.module.class_id(head).is_none()
@@ -2652,6 +2680,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 if let Some(fqn) = collect_dotted_fqn(callee) {
                     if let Some(head) = fqn.split('.').next() {
                         if is_package_head(head)
+                            && (is_pkg_root(head) || !b.is_lambda_body())
                             && b.resolve(head).is_none()
                             && !b.knows_outer(head)
                             && b.module.class_id(head).is_none()
