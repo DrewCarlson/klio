@@ -1528,9 +1528,36 @@ fn build_module_with_overrides(
     let mut top_level_props: Vec<(String, klio_ir::FuncId)> = Vec::new();
     let mut top_level_delegated_props: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // `const val` is a compile-time constant: its initializer is a
+    // constant expression with no dependency on runtime state, and it
+    // must be observable before any other top-level initializer runs
+    // (an earlier non-const initializer may construct a class whose
+    // body references a `const` declared later in source order). Drive
+    // every const initializer first, preserving relative declaration
+    // order so a const that references an earlier const still sees it.
+    let mut const_props: Vec<(String, klio_ir::FuncId)> = Vec::new();
+    for d in decls {
+        if let Decl::Property(p) = d {
+            if p.receiver_type.is_some() || !p.is_const {
+                continue;
+            }
+            if let Some(init) = &p.init {
+                let fid = klio_ir::lower::lower_expr_as_thunk(
+                    &mut module,
+                    init,
+                    &format!("__top_prop_init_{}", p.name.name),
+                );
+                const_props.push((p.name.name.clone(), fid));
+            }
+        }
+    }
+    top_level_props.extend(const_props);
     for d in decls {
         if let Decl::Property(p) = d {
             if p.receiver_type.is_some() {
+                continue;
+            }
+            if p.is_const {
                 continue;
             }
             if let Some(init) = &p.init {
