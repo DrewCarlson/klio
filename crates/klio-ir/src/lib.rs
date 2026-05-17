@@ -555,6 +555,12 @@ pub struct ModuleRegistry {
     #[serde(default)]
     pub local_fn_defaults:
         std::collections::HashMap<FuncId, Vec<Option<FuncId>>>,
+    /// `typealias Name = Target` → `Name` ↦ `Target`'s simple head
+    /// name. Lets a bare-name lookup of an alias resolve the aliased
+    /// class for constructor / companion / static access (the type
+    /// checker already unfolds aliases in type position).
+    #[serde(default)]
+    pub type_aliases: std::collections::HashMap<String, String>,
 }
 
 impl Module {

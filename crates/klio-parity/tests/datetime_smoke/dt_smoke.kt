@@ -8,7 +8,7 @@
 //> ld day=29 dow=THURSDAY doy=60
 //> rt=true
 //> ldt 2023-11-14T22:13:20 dow=TUESDAY t=22:13:20 sod=80000
-//> addP=2025-01-14T22:13:20
+//> addP=2023-12-16T22:13:20
 //> dow=WEDNESDAY iso=3
 //> m12=DECEMBER
 

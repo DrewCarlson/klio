@@ -8,7 +8,7 @@ import kotlinx.datetime.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
 import kotlinx.datetime.toInstant
-import kotlinx.datetime.Duration
+import kotlin.time.Duration.Companion.hours
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
 
@@ -45,8 +45,8 @@ fun ioSection() {
 fun datetimeSection() {
     println("== kotlinx.datetime ==")
     val pinned = Instant.fromEpochMilliseconds(1_700_000_000_000L)
-    println("pinned=$pinned")
-    val later = pinned + Duration.hours(2L)
+    println("pinned=${pinned.toEpochMilliseconds()}")
+    val later = pinned + 2.hours
     println("delta_min=${(later - pinned).inWholeMinutes}")
     val utc = TimeZone.of("UTC")
     val ldt = pinned.toLocalDateTime(utc)

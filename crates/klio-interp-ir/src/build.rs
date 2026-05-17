@@ -1700,6 +1700,27 @@ fn build_module_with_overrides(
     for (fid, slots) in &local_fn_defaults {
         func_defaults.entry(*fid).or_insert_with(|| slots.clone());
     }
+    // `typealias Name = Target` → Name ↦ Target's simple head name.
+    // The type checker unfolds aliases in type position; this lets a
+    // bare-name *value* lookup (`Alias.of(...)`, `Alias(...)`)
+    // resolve the aliased class at runtime.
+    let mut type_aliases: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for d in decls {
+        if let Decl::TypeAlias(ta) = d {
+            let target = ta
+                .target
+                .name
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&ta.target.name.name)
+                .to_string();
+            if !target.is_empty() && target != ta.name.name {
+                type_aliases.insert(ta.name.name.clone(), target);
+            }
+        }
+    }
     module.registry = klio_ir::ModuleRegistry {
         object_names: object_names.clone(),
         companion_singletons: companion_singletons.clone(),
@@ -1708,6 +1729,7 @@ fn build_module_with_overrides(
         top_level_delegated_props: top_level_delegated_props.clone(),
         delegated_body_props: delegated_body_props.clone(),
         local_fn_defaults,
+        type_aliases,
     };
     BuiltModule {
         module: Arc::new(module),

@@ -66,6 +66,13 @@ include = [
     "LocalTime.kt",
     "LocalDate.kt",
     "LocalDateTime.kt",
+    "DeprecatedInstant.kt",
+    "DeprecatedClock.kt",
+    "DateTimePeriod.kt",
+    "DateTimeUnit.kt",
+    "internal/math.kt",
+    "internal/dateCalculations.kt",
+    "internal/util.kt",
 ]
 
 # klio-supplied platform layer. The `actual class` bodies for the

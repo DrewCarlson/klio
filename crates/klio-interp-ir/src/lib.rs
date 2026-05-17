@@ -1231,6 +1231,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // `typealias Alias = Target` — resolve the alias to the
+        // aliased declaration for value/qualifier position
+        // (`Alias.of(...)`, `Alias(...)`). Follow chains with a
+        // cycle guard.
+        {
+            let mut cur = name.to_string();
+            let mut seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            while let Some(target) = self
+                .module
+                .registry
+                .type_aliases
+                .get(&cur)
+                .cloned()
+            {
+                if !seen.insert(cur.clone()) {
+                    break;
+                }
+                if let Some(v) = self.lookup_global(&target) {
+                    return Some(v);
+                }
+                cur = target;
+            }
+        }
         None
     }
 
@@ -1896,11 +1920,38 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     );
                 }
             }
-            if let Some(fid) = self.prog
-                .instance_prop_getters
-                .get(&(class_name.clone(), name.to_string()))
-                .copied()
-            {
+            // Probe the instance's class then its supertype chain:
+            // a property getter declared on a (sealed) base
+            // (`DateTimePeriod.months`) is invoked on a subclass
+            // instance (`DatePeriod`), so the
+            // `(declaring-class, prop)` key is an ancestor's.
+            let getter_fid = {
+                let mut found: Option<klio_ir::FuncId> = None;
+                let mut cur = Some(class_name.clone());
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                while let Some(cn) = cur.take() {
+                    if !seen.insert(cn.clone()) {
+                        break;
+                    }
+                    if let Some(fid) = self
+                        .prog
+                        .instance_prop_getters
+                        .get(&(cn.clone(), name.to_string()))
+                        .copied()
+                    {
+                        found = Some(fid);
+                        break;
+                    }
+                    cur = self
+                        .classes
+                        .borrow()
+                        .get(&cn)
+                        .and_then(|d| d.supertype_names.first().cloned());
+                }
+                found
+            };
+            if let Some(fid) = getter_fid {
                 let func = self
                     .module
                     .funcs
@@ -3396,10 +3447,59 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         positional_idx += 1;
                     }
                 }
+                // Fill omitted slots from the function's default-arg
+                // thunks (left-to-right, so a default may read an
+                // earlier param). A named call that skips a
+                // *non-trailing* defaulted param
+                // (`DateTimePeriod(months = 1, days = 2)` skipping
+                // `years`) must evaluate that default, not pass Null.
+                let n_params = params.len();
+                let defaults = self.prog.func_defaults.get(&func).cloned();
                 let mut reordered: Vec<klio_runtime::Value> =
-                    slots.into_iter().map(|s| s.unwrap_or(klio_runtime::Value::Null)).collect();
-                while matches!(reordered.last(), Some(klio_runtime::Value::Null)) {
-                    reordered.pop();
+                    Vec::with_capacity(n_params);
+                let mut truncated = false;
+                for (i, slot) in slots.into_iter().enumerate() {
+                    if let Some(v) = slot {
+                        reordered.push(v);
+                        continue;
+                    }
+                    let dfid = defaults
+                        .as_ref()
+                        .and_then(|d| d.get(i).copied().flatten());
+                    if let Some(dfid) = dfid {
+                        let dfunc = module
+                            .funcs
+                            .get(dfid.0 as usize)
+                            .cloned()
+                            .ok_or_else(|| {
+                                klio_ir::eval::EvalError::Type(format!(
+                                    "default-arg FuncId {} out of range",
+                                    dfid.0
+                                ))
+                            })?;
+                        let v = klio_ir::eval::eval_with(
+                            module,
+                            &dfunc,
+                            reordered.clone(),
+                            self,
+                        )?;
+                        reordered.push(v);
+                    } else {
+                        // No value and no default: a trailing
+                        // omitted param. Hand the prefix to
+                        // call_func, whose own default / vararg /
+                        // trailing-lambda padding finishes the job.
+                        truncated = true;
+                        break;
+                    }
+                }
+                if !truncated {
+                    while matches!(
+                        reordered.last(),
+                        Some(klio_runtime::Value::Null)
+                    ) {
+                        reordered.pop();
+                    }
                 }
                 return self.call_func(module, func, reordered);
             }
@@ -3953,15 +4053,41 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Companion forwarding for method calls: `Foo.parse("…")`
         // routes through the companion singleton's method.
         if let klio_runtime::Value::Class(cls) = receiver {
-            if let Some(comp_name) = self.module.registry.companion_singletons.get(&cls.name).cloned() {
+            // companion_singletons is keyed by simple name; an
+            // embedded-stdlib / pack class can present its fqn, so
+            // probe both the name and the fqn's simple tail.
+            let comp_name = self
+                .module
+                .registry
+                .companion_singletons
+                .get(&cls.name)
+                .or_else(|| {
+                    self.module
+                        .registry
+                        .companion_singletons
+                        .get(&cls.fqn)
+                })
+                .or_else(|| {
+                    cls.fqn.rsplit('.').next().and_then(|s| {
+                        self.module.registry.companion_singletons.get(s)
+                    })
+                })
+                .cloned();
+            if let Some(comp_name) = comp_name {
                 let singleton = self.globals.borrow().lookup(&comp_name);
                 if let Some(singleton) = singleton {
                     if matches!(singleton, klio_runtime::Value::Instance(_)) {
-                        // Try the companion instance first; on
-                        // unimplemented fall through so error sites
-                        // still see the class receiver.
-                        if let Ok(v) = self.call_member(&singleton, name, args) {
-                            return Ok(v);
+                        // Forward to the companion instance. Only an
+                        // "unimplemented" (i.e. the companion has no
+                        // such member) falls through so other error
+                        // sites still see the class receiver; a real
+                        // error from inside the companion method must
+                        // propagate, not be masked as
+                        // member-on-KClass.
+                        match self.call_member(&singleton, name, args) {
+                            Ok(v) => return Ok(v),
+                            Err(klio_ir::eval::EvalError::Unimplemented(_)) => {}
+                            Err(e) => return Err(e),
                         }
                     }
                 }

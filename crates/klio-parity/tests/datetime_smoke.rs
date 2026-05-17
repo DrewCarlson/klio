@@ -128,7 +128,7 @@ size_before=14
 int=42 long=1000000000000 str=kt
 empty=true
 == kotlinx.datetime ==
-pinned=2023-11-14T22:13:20Z
+pinned=1700000000000
 delta_min=120
 ldt=2023-11-14T22:13:20
 roundtrip=true

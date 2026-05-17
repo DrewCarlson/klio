@@ -1,31 +1,26 @@
 // klio platform layer for kotlinx-datetime.
 //
-// Upstream kotlinx-datetime 0.8.0 core commonMain declares every
-// value type (LocalDate/Time/DateTime, TimeZone, Clock,
-// DateTimePeriod, DateTimeUnit, plus the `kotlin.time.Instant`
-// extensions) only as `expect` / extensions over machinery klio
-// does not have (kotlinx-serialization runtime, the
-// kotlinx.datetime.format parser-combinator DSL, the internal IANA
-// tz database + Tzfile reader, stdlib `kotlin.time.Instant`). The
-// only commonMain files klio consumes verbatim are the self-
-// contained `Month` / `DayOfWeek` enums + factories and the public
-// exception types (see klio.toml `[[source]]`).
+// kotlinx-datetime 0.8.0 moved the moment-in-time type to the
+// stdlib: `kotlinx.datetime.Instant` / `Clock` are deprecated
+// typealiases to `kotlin.time.Instant` / `kotlin.time.Clock` (see
+// the consumed DeprecatedInstant.kt / DeprecatedClock.kt). Now that
+// klio runs real `kotlin.time`, the value types DateTimePeriod /
+// DateTimeUnit and the Month / DayOfWeek enums are all consumed
+// verbatim from the upstream submodule (see klio.toml `[[source]]`),
+// and the internal math helpers have klio actuals
+// (internal/MathActuals.kt).
 //
-// This file is the klio-supplied platform layer: the concrete value
-// types and operators the consumer needs, implemented in thin Kotlin
-// over the Rust host bindings in this crate (src/lib.rs) — system
-// clock, chrono-backed Instant<->LocalDateTime conversion, ISO
-// parse/format, calendar arithmetic. `Month` / `DayOfWeek` are NOT
-// declared here; `LocalDate.month` / `LocalDateTime.month` resolve to
-// the real upstream `Month` enum via upstream's own `Month(number)`
-// factory, so the consumed upstream code is on the live path.
-//
-// Limitation: TimeZone is backed by chrono-tz in the host (real IANA
-// rules for conversion), but the pure-Kotlin tz database, the format
-// DSL, and serialization are intentionally absent. Anything depending
-// on those is out of scope for this pack.
+// This file is the remaining klio-supplied platform layer: the
+// LocalDate / LocalTime / LocalDateTime `actual class`es, the
+// `TimeZone` value type, and the chrono-backed instant<->local
+// conversion + calendar-period arithmetic over the Rust host
+// bindings in this crate (src/lib.rs). The format-DSL parser
+// combinators, the pure-Kotlin IANA tz database, and serialization
+// remain intentionally out of scope.
 
 package kotlinx.datetime
+
+import kotlin.time.Instant
 
 // --- internal native helpers (bound natively by the klio host) ----
 
@@ -44,113 +39,24 @@ internal fun __kxdt_localToInstant(
     tz: String,
 ): LongArray = longArrayOf(0L, 0L)
 
-internal fun __kxdt_instantToString(epochSeconds: Long, nanos: Int): String = ""
-internal fun __kxdt_parseInstant(s: String): LongArray = longArrayOf(0L, 0L)
 internal fun __kxdt_validateTimeZone(id: String): Boolean = true
 
-// --- public API ---
+// Returns [epochSeconds, nanos] after applying the calendar period
+// in the given tz.
+internal fun __kxdt_addPeriod(
+    epochSeconds: Long,
+    nanos: Int,
+    years: Int,
+    months: Int,
+    days: Int,
+    hours: Int,
+    minutes: Int,
+    seconds: Int,
+    nanoAdjust: Long,
+    tz: String,
+): LongArray = longArrayOf(epochSeconds, nanos.toLong())
 
-class Instant internal constructor(
-    val epochSeconds: Long,
-    val nanosecondsOfSecond: Int,
-) : Comparable<Instant> {
-    fun toEpochMilliseconds(): Long =
-        epochSeconds * 1000L + (nanosecondsOfSecond / 1_000_000).toLong()
-
-    operator fun plus(duration: Duration): Instant {
-        val addedSec = duration.inWholeSeconds
-        val addedNano = duration.nanosPart
-        var s = epochSeconds + addedSec
-        var n = nanosecondsOfSecond + addedNano
-        if (n >= 1_000_000_000) { s += 1; n -= 1_000_000_000 }
-        if (n < 0) { s -= 1; n += 1_000_000_000 }
-        return Instant(s, n)
-    }
-
-    operator fun minus(duration: Duration): Instant = plus(Duration(-duration.inWholeSeconds, -duration.nanosPart))
-
-    operator fun minus(other: Instant): Duration {
-        var s = epochSeconds - other.epochSeconds
-        var n = nanosecondsOfSecond - other.nanosecondsOfSecond
-        if (n < 0) { s -= 1; n += 1_000_000_000 }
-        return Duration(s, n)
-    }
-
-    override fun compareTo(other: Instant): Int {
-        if (epochSeconds != other.epochSeconds) return if (epochSeconds < other.epochSeconds) -1 else 1
-        return nanosecondsOfSecond.compareTo(other.nanosecondsOfSecond)
-    }
-
-    override fun toString(): String = __kxdt_instantToString(epochSeconds, nanosecondsOfSecond)
-
-    override fun equals(other: Any?): Boolean {
-        if (other !is Instant) return false
-        return epochSeconds == other.epochSeconds && nanosecondsOfSecond == other.nanosecondsOfSecond
-    }
-
-    override fun hashCode(): Int = (epochSeconds.hashCode() * 31) + nanosecondsOfSecond
-
-    companion object {
-        fun fromEpochSeconds(epochSeconds: Long, nanosecondAdjustment: Int = 0): Instant {
-            var s = epochSeconds + (nanosecondAdjustment / 1_000_000_000).toLong()
-            var n = nanosecondAdjustment % 1_000_000_000
-            if (n < 0) { s -= 1; n += 1_000_000_000 }
-            return Instant(s, n)
-        }
-        fun fromEpochMilliseconds(epochMilliseconds: Long): Instant {
-            val s = epochMilliseconds / 1000L
-            var n = ((epochMilliseconds % 1000L) * 1_000_000L).toInt()
-            if (n < 0) return Instant(s - 1, n + 1_000_000_000)
-            return Instant(s, n)
-        }
-        fun parse(input: String): Instant {
-            val parts = __kxdt_parseInstant(input)
-            return Instant(parts[0], parts[1].toInt())
-        }
-    }
-}
-
-class Duration internal constructor(
-    val inWholeSeconds: Long,
-    val nanosPart: Int,
-) : Comparable<Duration> {
-    val inWholeMilliseconds: Long get() = inWholeSeconds * 1000L + (nanosPart / 1_000_000).toLong()
-    val inWholeMinutes: Long get() = inWholeSeconds / 60L
-    val inWholeHours: Long get() = inWholeSeconds / 3600L
-    val inWholeDays: Long get() = inWholeSeconds / 86_400L
-
-    operator fun plus(other: Duration): Duration {
-        var s = inWholeSeconds + other.inWholeSeconds
-        var n = nanosPart + other.nanosPart
-        if (n >= 1_000_000_000) { s += 1; n -= 1_000_000_000 }
-        if (n < 0) { s -= 1; n += 1_000_000_000 }
-        return Duration(s, n)
-    }
-    operator fun minus(other: Duration): Duration = plus(Duration(-other.inWholeSeconds, -other.nanosPart))
-    override fun compareTo(other: Duration): Int {
-        if (inWholeSeconds != other.inWholeSeconds) return if (inWholeSeconds < other.inWholeSeconds) -1 else 1
-        return nanosPart.compareTo(other.nanosPart)
-    }
-    override fun toString(): String = "${inWholeSeconds}s${nanosPart}n"
-
-    companion object {
-        fun seconds(value: Long): Duration = Duration(value, 0)
-        fun seconds(value: Int): Duration = Duration(value.toLong(), 0)
-        fun milliseconds(value: Long): Duration {
-            val s = value / 1000L
-            var n = ((value % 1000L) * 1_000_000L).toInt()
-            if (n < 0) return Duration(s - 1, n + 1_000_000_000)
-            return Duration(s, n)
-        }
-        fun milliseconds(value: Int): Duration = milliseconds(value.toLong())
-        fun minutes(value: Long): Duration = Duration(value * 60L, 0)
-        fun minutes(value: Int): Duration = minutes(value.toLong())
-        fun hours(value: Long): Duration = Duration(value * 3600L, 0)
-        fun hours(value: Int): Duration = hours(value.toLong())
-        fun days(value: Long): Duration = Duration(value * 86_400L, 0)
-        fun days(value: Int): Duration = days(value.toLong())
-    }
-}
+// --- LocalDate / LocalTime / LocalDateTime actuals ---------------
 
 // `actual` for upstream `expect class LocalDate` (LocalDate.kt).
 // format-DSL / LocalDateRange members are intentionally absent.
@@ -224,7 +130,6 @@ internal fun daysInMonth(year: Int, month: Int): Int = when (month) {
 }
 
 // `actual` for upstream `expect class LocalTime` (LocalTime.kt).
-// format-DSL members are intentionally absent.
 actual class LocalTime(
     val hour: Int,
     val minute: Int,
@@ -255,8 +160,7 @@ actual class LocalTime(
     override fun hashCode(): Int = (((hour * 60 + minute) * 60 + second) * 1_000_000_000) + nanosecond
 }
 
-// `actual` for upstream `expect class LocalDateTime`
-// (LocalDateTime.kt). format-DSL members are intentionally absent.
+// `actual` for upstream `expect class LocalDateTime` (LocalDateTime.kt).
 actual class LocalDateTime(
     val date: LocalDate,
     val time: LocalTime,
@@ -291,6 +195,12 @@ actual class LocalDateTime(
     override fun hashCode(): Int = date.hashCode() * 31 + time.hashCode()
 }
 
+// --- TimeZone ----------------------------------------------------
+//
+// klio-supplied (upstream's TimeZone.kt expect class pulls in
+// UtcOffset / FixedOffsetTimeZone / the format DSL, out of scope).
+// Conversion is chrono-backed in the host.
+
 class TimeZone internal constructor(val id: String) {
     override fun toString(): String = id
     override fun equals(other: Any?): Boolean = (other is TimeZone) && other.id == id
@@ -307,6 +217,12 @@ class TimeZone internal constructor(val id: String) {
     }
 }
 
+// --- instant <-> local conversion (over kotlin.time.Instant) -----
+//
+// Upstream declares these as `expect fun Instant.toLocalDateTime(tz)`
+// in TimeZone.kt (not consumed); klio supplies them directly over
+// the chrono host binding.
+
 fun Instant.toLocalDateTime(timeZone: TimeZone): LocalDateTime {
     val parts = __kxdt_instantToLocalParts(epochSeconds, nanosecondsOfSecond, timeZone.id)
     return LocalDateTime(parts[0].toInt(), parts[1].toInt(), parts[2].toInt(),
@@ -315,180 +231,29 @@ fun Instant.toLocalDateTime(timeZone: TimeZone): LocalDateTime {
 
 fun LocalDateTime.toInstant(timeZone: TimeZone): Instant {
     val r = __kxdt_localToInstant(year, monthNumber, dayOfMonth, hour, minute, second, nanosecond, timeZone.id)
-    return Instant(r[0], r[1].toInt())
+    return Instant.fromEpochSeconds(r[0], r[1])
 }
 
-interface Clock {
-    fun now(): Instant
-}
-
-object SystemClock : Clock {
-    override fun now(): Instant =
-        Instant.fromEpochMilliseconds(__kxdt_currentTimeMillis())
-            .let { Instant(it.epochSeconds, __kxdt_currentNanosOfSecond()) }
-}
-
-// ---------- DateTimePeriod ----------
-//
-// Calendar-aware delta. Used with Instant.plusPeriod(period, timeZone)
-// so month/day arithmetic respects DST and varying month lengths via
-// the host's chrono backend.
-
-class DateTimePeriod(
-    val years: Int = 0,
-    val months: Int = 0,
-    val days: Int = 0,
-    val hours: Int = 0,
-    val minutes: Int = 0,
-    val seconds: Int = 0,
-    val nanoseconds: Long = 0L,
-) {
-    val totalMonths: Int get() = years * 12 + months
-
-    override fun toString(): String {
-        val sb = StringBuilder("P")
-        if (years != 0) sb.append(years).append('Y')
-        if (months != 0) sb.append(months).append('M')
-        if (days != 0) sb.append(days).append('D')
-        val anyTime = hours != 0 || minutes != 0 || seconds != 0 || nanoseconds != 0L
-        if (anyTime) {
-            sb.append('T')
-            if (hours != 0) sb.append(hours).append('H')
-            if (minutes != 0) sb.append(minutes).append('M')
-            if (seconds != 0 || nanoseconds != 0L) {
-                sb.append(seconds)
-                if (nanoseconds != 0L) sb.append('.').append(nanoseconds.toString().padStart(9, '0'))
-                sb.append('S')
-            }
-        }
-        if (sb.length == 1) sb.append("0D")
-        return sb.toString()
-    }
-}
-
-// Native helper: returns [epochSeconds, nanos] after applying the
-// calendar period in the given tz.
-internal fun __kxdt_addPeriod(
-    epochSeconds: Long,
-    nanos: Int,
-    years: Int,
-    months: Int,
-    days: Int,
-    hours: Int,
-    minutes: Int,
-    seconds: Int,
-    nanoAdjust: Long,
-    tz: String,
-): LongArray = longArrayOf(epochSeconds, nanos.toLong())
-
-// Calendar-aware add. klio's overload resolver does not yet
-// disambiguate `Instant.plus(Duration)` (member) from
-// `Instant.plus(DateTimePeriod, TimeZone)` (extension) by signature,
-// so the extension lives under a distinct name. Functionally
-// equivalent to upstream's overloaded plus.
+// Calendar-aware period add. klio's overload resolver picks
+// `Instant.plus(Duration)` (kotlin.time member) vs this by signature
+// now, but the upstream `Instant.plus(DateTimePeriod, TimeZone)`
+// lives in Instant.kt (format/internal heavy, not consumed), so the
+// klio surface keeps the explicit name used by the test corpus.
 fun Instant.plusPeriod(period: DateTimePeriod, timeZone: TimeZone): Instant {
     val r = __kxdt_addPeriod(
         epochSeconds, nanosecondsOfSecond,
         period.years, period.months, period.days,
-        period.hours, period.minutes, period.seconds, period.nanoseconds,
+        period.hours, period.minutes, period.seconds, period.nanoseconds.toLong(),
         timeZone.id,
     )
-    return Instant(r[0], r[1].toInt())
+    return Instant.fromEpochSeconds(r[0], r[1])
 }
 
 fun Instant.minusPeriod(period: DateTimePeriod, timeZone: TimeZone): Instant = plusPeriod(
     DateTimePeriod(
         years = -period.years, months = -period.months, days = -period.days,
         hours = -period.hours, minutes = -period.minutes, seconds = -period.seconds,
-        nanoseconds = -period.nanoseconds,
+        nanoseconds = -period.nanoseconds.toLong(),
     ),
     timeZone,
 )
-
-// ---------- DateTimeUnit ----------
-//
-// Models units of date/time arithmetic. The sealed-class hierarchy
-// follows upstream kotlinx.datetime: DateBased for whole-day units
-// (Day/Week/Month/Year/etc.) and TimeBased for sub-day units
-// (Nanosecond/Microsecond/Millisecond/Second/Minute/Hour). The
-// klio surface plus host binding compose into Instant.plus(value,
-// unit, tz) — calendar-aware for date units, fixed-nanosecond for
-// time units.
-
-class TimeBased(val nanoseconds: Long) {
-    operator fun times(scalar: Int): TimeBased = TimeBased(nanoseconds * scalar.toLong())
-}
-class DateBased(val days: Int, val months: Int) {
-    operator fun times(scalar: Int): DateBased = DateBased(days * scalar, months * scalar)
-}
-
-object DateTimeUnit {
-    val NANOSECOND: TimeBased = TimeBased(1L)
-    val MICROSECOND: TimeBased = TimeBased(1_000L)
-    val MILLISECOND: TimeBased = TimeBased(1_000_000L)
-    val SECOND: TimeBased = TimeBased(1_000_000_000L)
-    val MINUTE: TimeBased = TimeBased(60L * 1_000_000_000L)
-    val HOUR: TimeBased = TimeBased(3_600L * 1_000_000_000L)
-    val DAY: DateBased = DateBased(1, 0)
-    val WEEK: DateBased = DateBased(7, 0)
-    val MONTH: DateBased = DateBased(0, 1)
-    val QUARTER: DateBased = DateBased(0, 3)
-    val YEAR: DateBased = DateBased(0, 12)
-}
-
-fun Instant.plusUnit(value: Long, unit: TimeBased): Instant {
-    val totalNanos = value * unit.nanoseconds
-    val nanoSec = totalNanos / 1_000_000_000L
-    val nanoRem = totalNanos % 1_000_000_000L
-    var s = epochSeconds + nanoSec
-    var n = nanosecondsOfSecond + nanoRem.toInt()
-    if (n >= 1_000_000_000) { s += 1; n -= 1_000_000_000 }
-    if (n < 0) { s -= 1; n += 1_000_000_000 }
-    return Instant(s, n)
-}
-
-fun Instant.plusDateUnit(value: Int, unit: DateBased, timeZone: TimeZone): Instant {
-    val r = __kxdt_addPeriod(
-        epochSeconds, nanosecondsOfSecond,
-        0, unit.months * value, unit.days * value,
-        0, 0, 0, 0L,
-        timeZone.id,
-    )
-    return Instant(r[0], r[1].toInt())
-}
-
-fun Instant.minusUnit(value: Long, unit: TimeBased): Instant = plusUnit(-value, unit)
-fun Instant.minusDateUnit(value: Int, unit: DateBased, timeZone: TimeZone): Instant =
-    plusDateUnit(-value, unit, timeZone)
-
-// ---------- Duration extension properties on Int/Long ----------
-//
-// kotlin.time-style fluent builders: `5.seconds`, `2L.hours`, etc.
-// These return kotlinx.datetime.Duration, matching the rest of this
-// layer. kotlin.time.Duration interop is deferred until stdlib
-// carries it as a first-class type.
-
-val Int.nanoseconds: Duration get() = Duration(0L, this)
-val Int.microseconds: Duration get() = Duration(0L, this * 1_000)
-val Int.milliseconds: Duration get() = Duration.milliseconds(this.toLong())
-val Int.seconds: Duration get() = Duration.seconds(this.toLong())
-val Int.minutes: Duration get() = Duration.minutes(this.toLong())
-val Int.hours: Duration get() = Duration.hours(this.toLong())
-val Int.days: Duration get() = Duration.days(this.toLong())
-
-val Long.nanoseconds: Duration
-    get() {
-        val s = this / 1_000_000_000L
-        val n = (this % 1_000_000_000L).toInt()
-        return if (n < 0) Duration(s - 1, n + 1_000_000_000) else Duration(s, n)
-    }
-val Long.microseconds: Duration
-    get() {
-        val ns = this * 1_000L
-        return ns.nanoseconds
-    }
-val Long.milliseconds: Duration get() = Duration.milliseconds(this)
-val Long.seconds: Duration get() = Duration.seconds(this)
-val Long.minutes: Duration get() = Duration.minutes(this)
-val Long.hours: Duration get() = Duration.hours(this)
-val Long.days: Duration get() = Duration.days(this)

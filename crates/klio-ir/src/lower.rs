@@ -2377,6 +2377,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // constructor. Only kicks in on the
                     // class+function name clash, so ordinary
                     // default/vararg calls are unaffected.
+                    // The factory function is applicable whenever it
+                    // can accept the supplied positional count —
+                    // fewer args than params is fine (trailing params
+                    // are defaulted, e.g. the all-default
+                    // `fun DateTimePeriod(years=0, months=0, …)`
+                    // factory beside `sealed class DateTimePeriod`).
+                    // Only treat the call as a constructor when the
+                    // function genuinely cannot take that many args.
                     let shadowed_by_class = b
                         .module
                         .class_id(&segments[0].name)
@@ -2385,7 +2393,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             .module
                             .func_id(&segments[0].name)
                             .and_then(|fid| b.module.funcs.get(fid.0 as usize))
-                            .map(|f| f.params.len() != args.len())
+                            .map(|f| {
+                                let last_vararg = f
+                                    .params
+                                    .last()
+                                    .map(|p| p.is_vararg)
+                                    .unwrap_or(false);
+                                !last_vararg && args.len() > f.params.len()
+                            })
                             .unwrap_or(false);
                     if let Some(func_id) =
                         b.module.func_id(&segments[0].name).filter(|_| !shadowed_by_class)

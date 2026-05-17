@@ -1098,23 +1098,35 @@ fn load_installed_packs(
             })
         })
         .collect();
-    // Consume the embedded stdlib pack's curated SOURCES (kotlin.time)
-    // before the pack-cache walk: it is statically linked, not
-    // installed in `~/.klio/packs`, so it must load even when no pack
-    // cache directory exists.
-    load_embedded_stdlib_sources(
-        &user_import_prefixes,
-        source_map,
-        &mut out_asts,
-        &mut out_bindings,
-    );
+    // The embedded stdlib's curated kotlin.time SOURCES are consumed
+    // *after* the pack-cache walk, so a loaded pack that itself
+    // imports kotlin.time (kotlinx-datetime 0.8.0's
+    // `kotlinx.datetime.Instant` is a typealias to
+    // `kotlin.time.Instant`) also triggers the load — gating on the
+    // user program's imports alone would miss it.
     let cache = match klio_cache_dir() {
         Ok(c) => c,
-        Err(_) => return (out_asts, out_bindings),
+        Err(_) => {
+            load_embedded_stdlib_sources(
+                &user_import_prefixes,
+                source_map,
+                &mut out_asts,
+                &mut out_bindings,
+            );
+            return (out_asts, out_bindings);
+        }
     };
     let entries = match std::fs::read_dir(&cache) {
         Ok(e) => e,
-        Err(_) => return (out_asts, out_bindings),
+        Err(_) => {
+            load_embedded_stdlib_sources(
+                &user_import_prefixes,
+                source_map,
+                &mut out_asts,
+                &mut out_bindings,
+            );
+            return (out_asts, out_bindings);
+        }
     };
     let merged = merged_host_bindings();
     for e in entries.flatten() {
@@ -1260,6 +1272,27 @@ fn load_installed_packs(
             }
         }
     }
+    // Re-derive the import set including the freshly-loaded pack
+    // ASTs so a pack that imports kotlin.time pulls in the embedded
+    // stdlib kotlin.time sources too.
+    let mut combined_prefixes = user_import_prefixes.clone();
+    for f in &out_asts {
+        for imp in &f.imports {
+            combined_prefixes.insert(
+                imp.path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            );
+        }
+    }
+    load_embedded_stdlib_sources(
+        &combined_prefixes,
+        source_map,
+        &mut out_asts,
+        &mut out_bindings,
+    );
     (out_asts, out_bindings)
 }
 
