@@ -347,6 +347,18 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.List.first", coll_list_first),
     ("kotlin.collections.List.get", coll_list_get),
     ("kotlin.collections.List.indexOf", coll_list_index_of),
+    ("kotlin.Array.isEmpty", array_is_empty),
+    ("kotlin.Array.isNotEmpty", array_is_not_empty),
+    ("kotlin.collections.Array.isEmpty", array_is_empty),
+    ("kotlin.collections.Array.isNotEmpty", array_is_not_empty),
+    ("kotlin.IntArray.isEmpty", array_is_empty),
+    ("kotlin.IntArray.isNotEmpty", array_is_not_empty),
+    ("kotlin.LongArray.isEmpty", array_is_empty),
+    ("kotlin.LongArray.isNotEmpty", array_is_not_empty),
+    ("kotlin.ByteArray.isEmpty", array_is_empty),
+    ("kotlin.ByteArray.isNotEmpty", array_is_not_empty),
+    ("kotlin.CharArray.isEmpty", array_is_empty),
+    ("kotlin.CharArray.isNotEmpty", array_is_not_empty),
     ("kotlin.collections.List.isEmpty", coll_list_is_empty),
     ("kotlin.collections.List.isNotEmpty", coll_list_is_not_empty),
     ("kotlin.collections.List.joinToString", coll_list_join_to_string),
@@ -1809,6 +1821,32 @@ fn map_get_or_put(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let new_v = host.invoke_callable(&block, &[], *out)?;
     entries_rc.borrow_mut().push((key, new_v.clone()));
     Ok(new_v)
+}
+
+/// `Array<T>.isEmpty()` / `isNotEmpty()` (and the primitive-array
+/// variants) — `size == 0`. Stdlib extensions, not member fns.
+fn array_len(recv: &Value) -> Option<usize> {
+    match recv {
+        Value::Array { items, .. } => Some(items.borrow().len()),
+        Value::List { items, .. } => Some(items.borrow().len()),
+        _ => None,
+    }
+}
+fn array_is_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let r = ctx
+        .args
+        .first()
+        .and_then(array_len)
+        .ok_or_else(|| RuntimeError::Type("isEmpty requires an array".into()))?;
+    Ok(Value::Bool(r == 0))
+}
+fn array_is_not_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let r = ctx
+        .args
+        .first()
+        .and_then(array_len)
+        .ok_or_else(|| RuntimeError::Type("isNotEmpty requires an array".into()))?;
+    Ok(Value::Bool(r != 0))
 }
 
 fn array_size_arg(v: &Value, what: &str) -> Result<i64, RuntimeError> {

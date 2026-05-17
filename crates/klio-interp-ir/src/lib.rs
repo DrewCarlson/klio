@@ -3521,6 +3521,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // the IR call site bakes in the first FuncId at lower time —
         // pick the best match here using the runtime arg types.
         let func = self.pick_overload(module, func, &args).unwrap_or(func);
+        // Incompatible-receiver guard (sound, narrow): a bare call
+        // baked to a top-level extension (`fun R.f`, param0
+        // == "this") whose declared receiver `R` is a *user / pack
+        // class* — never a builtin and never an interface/Any a
+        // builtin could satisfy — but whose actual receiver arg is a
+        // *builtin value* (String/StringBuilder/Int/Array/…) cannot
+        // be correct: a builtin value is never an instance of a user
+        // class. Without this, a kotlinx-io `ByteStringBuilder.append`
+        // selected for a `kotlin.text.StringBuilder` receiver
+        // self-recurses. Re-dispatch as a member call so the builtin
+        // member wins. Instance / Class receivers never trip this, so
+        // interface- and subtype-receiver extensions are unaffected.
+        if let Some(f) = module.funcs.get(func.0 as usize) {
+            if f.params.first().map(|p| p.name == "this").unwrap_or(false)
+                && !args.is_empty()
+                && ext_decl_recv_is_user_class(&f.params[0].ty.name)
+                && value_is_builtin(&args[0])
+            {
+                let fname = f.name.clone();
+                let recv = args[0].clone();
+                let rest = args[1..].to_vec();
+                return self.call_member(&recv, &fname, &rest);
+            }
+        }
         // Bind each call-site type-arg name to a synth
         // `Value::Class` global for the duration of the call so
         // reified type-param reads (`T::class`) resolve. We
@@ -5981,6 +6005,51 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
 /// the target function's last param is marked `vararg`. Leaves
 /// non-vararg signatures untouched. A single passed-in array slips
 /// through as-is to support `f(*arr)` call sites.
+/// True when an extension's declared receiver type name denotes a
+/// user / pack class — i.e. not a builtin, an open supertype a
+/// builtin satisfies (`Any`, `CharSequence`, `Comparable`, …), or a
+/// bare type parameter. Such a receiver can never be a builtin
+/// value, so the extension is definitively inapplicable to one.
+fn ext_decl_recv_is_user_class(ty_name: &str) -> bool {
+    let s = ty_name.rsplit('.').next().unwrap_or(ty_name);
+    if s.is_empty() {
+        return false;
+    }
+    if s.len() <= 2 && s.chars().all(|c| c.is_ascii_uppercase()) {
+        return false; // type parameter (T, R, E, K, V, …)
+    }
+    !matches!(
+        s,
+        "String" | "StringBuilder" | "CharSequence" | "Appendable"
+            | "Int" | "Long" | "Short" | "Byte" | "Double" | "Float"
+            | "Char" | "Boolean" | "Number" | "Array" | "List"
+            | "MutableList" | "Collection" | "Iterable" | "Map"
+            | "MutableMap" | "Set" | "MutableSet" | "Sequence"
+            | "Comparable" | "Any" | "Unit"
+    )
+}
+
+/// True for a builtin (non-`Instance`, non-`Class`) value — one that
+/// can never be an instance of a user-declared class.
+fn value_is_builtin(v: &klio_runtime::Value) -> bool {
+    matches!(
+        v,
+        klio_runtime::Value::String(_)
+            | klio_runtime::Value::StringBuilder(_)
+            | klio_runtime::Value::Int(_)
+            | klio_runtime::Value::Long(_)
+            | klio_runtime::Value::Short(_)
+            | klio_runtime::Value::Byte(_)
+            | klio_runtime::Value::Double(_)
+            | klio_runtime::Value::Float(_)
+            | klio_runtime::Value::Char(_)
+            | klio_runtime::Value::Bool(_)
+            | klio_runtime::Value::Array { .. }
+            | klio_runtime::Value::List { .. }
+            | klio_runtime::Value::Map { .. }
+    )
+}
+
 fn pack_vararg_args(
     func: &klio_ir::Func,
     args: Vec<klio_runtime::Value>,
