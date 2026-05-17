@@ -6255,6 +6255,7 @@ fn value_is_builtin(v: &klio_runtime::Value) -> bool {
             | klio_runtime::Value::Array { .. }
             | klio_runtime::Value::List { .. }
             | klio_runtime::Value::Map { .. }
+            | klio_runtime::Value::Result { .. }
     )
 }
 
