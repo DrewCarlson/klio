@@ -2679,6 +2679,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         let mut lhs = self.parse_conjunction()?;
         loop {
             self.skip_soft_nl();
+            // A wrapped line may begin with `||`; it cannot start a
+            // statement, so this is an unambiguous continuation.
+            if self.newline_then(&TokenKind::PipePipe) {
+                self.skip_nl();
+            }
             if !matches!(self.peek_kind(), TokenKind::PipePipe) {
                 break;
             }
@@ -2695,6 +2700,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         let mut lhs = self.parse_equality()?;
         loop {
             self.skip_soft_nl();
+            // A wrapped line may begin with `&&` (an unambiguous
+            // continuation — it cannot start a statement).
+            if self.newline_then(&TokenKind::AmpAmp) {
+                self.skip_nl();
+            }
             if !matches!(self.peek_kind(), TokenKind::AmpAmp) {
                 break;
             }
