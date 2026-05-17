@@ -8350,12 +8350,18 @@ impl<'r> Checker<'r> {
             "sequence" | "iterator" if args.len() == 1 => {
                 let mut elem = Type::Nothing;
                 if let Expr::Lambda { params, body, .. } = &args[0] {
+                    // The `sequence { }` / `iterator { }` block has a
+                    // `suspend SequenceScope<T>.() -> Unit` type, so
+                    // `yield` / `yieldAll` (suspend funcs) inside it
+                    // are in a suspending context.
+                    self.suspend_context_stack.push(true);
                     self.check_lambda_in_place(
                         params,
                         body,
                         None,
                         Some((Type::Unresolved, None)),
                     );
+                    self.suspend_context_stack.pop();
                     elem = self.collect_builder_call_arg_type(body, "yield", 0);
                 }
                 if matches!(elem, Type::Nothing | Type::Unresolved) {
@@ -8645,9 +8651,17 @@ impl<'r> Checker<'r> {
         };
         self.push_frame();
         // Spec §18.1: a lambda assigned to a `suspend (…) -> R` slot
-        // becomes a suspending lambda. Push the bit so calls inside the
-        // body can target suspending functions.
-        self.suspend_context_stack.push(is_suspend);
+        // becomes a suspending lambda. A lambda passed to an `inline`
+        // function (`let`/`run`/`forEach`/`map`/… and the `sequence`/
+        // `iterator` builders) is inlined into the caller, so it also
+        // inherits the enclosing suspending bit — e.g. `sequence { …
+        // list.forEach { yield(it) } }`. Inheriting is Kotlin-correct
+        // for inline lambdas and only lenient for the rare
+        // non-inline case (klio favours not false-positiving on the
+        // consumed upstream, which is itself valid Kotlin).
+        let enclosing_suspend =
+            self.suspend_context_stack.last().copied().unwrap_or(false);
+        self.suspend_context_stack.push(is_suspend || enclosing_suspend);
         // Spec §14.3.2 step 3: pick zero vs one phantom `it` based on the
         // expected callable shape. The parser preemptively pushes a synthetic
         // `it` for any zero-`->` lambda body, so when the expected callable

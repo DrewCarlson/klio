@@ -35,6 +35,18 @@ suspend fun boom(): Int = suspendCoroutineUninterceptedOrReturn {
     throw IllegalStateException("kaboom")
 }
 
+suspend fun inc(x: Int): Int = suspendCoroutineUninterceptedOrReturn { x + 1 }
+
+// A suspend call inside an inline-function lambda (`forEach`/`let`)
+// nested in a suspend context is allowed — the inline lambda
+// inherits the enclosing suspending bit.
+suspend fun sumUp(): Int {
+    var t = 0
+    listOf(1, 2, 3).forEach { t += inc(it) }
+    listOf(10).let { it.forEach { v -> t += inc(v) } }
+    return t
+}
+
 fun main() {
     val ctx: CoroutineContext = EmptyCoroutineContext
     //> EmptyCoroutineContext
@@ -57,4 +69,7 @@ fun main() {
     // A thrown exception propagates to the completion.
     //> err=kaboom
     ::boom.startCoroutine(Sink<Int>())
+    // Suspend calls inside nested inline-fn lambdas are allowed.
+    //> ok=20
+    ::sumUp.startCoroutine(Sink<Int>())
 }
