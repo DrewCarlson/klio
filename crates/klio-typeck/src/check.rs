@@ -3223,7 +3223,8 @@ impl<'r> Checker<'r> {
                             return_class,
                         });
                 } else {
-                    self.fns.entry(f.name.name.clone()).or_default().push(sig);
+                    let nm = f.name.name.clone();
+                    self.push_fn_sig(&nm, sig, f.is_expect || f.is_actual);
                     self.fn_visibility
                         .entry(f.name.name.clone())
                         .or_default()
@@ -3339,6 +3340,30 @@ impl<'r> Checker<'r> {
             bounds.push(v);
         }
         (names, bounds)
+    }
+
+    /// Register a top-level function signature under `name`. An
+    /// `expect`/`actual` pair (or the same declaration visible from
+    /// two curated source roots, as with the upstream packs) is one
+    /// logical function, not an overload set: when the function is
+    /// `expect`/`actual` and an identical parameter signature is
+    /// already registered, skip the duplicate so overload resolution
+    /// does not see a spurious `(T), (T)` ambiguity. Ordinary
+    /// overloads (distinct parameter types) and genuine
+    /// same-signature clashes between non-expect/actual declarations
+    /// are unaffected.
+    fn push_fn_sig(&mut self, name: &str, sig: FnSig, expect_or_actual: bool) {
+        let entry = self.fns.entry(name.to_string()).or_default();
+        if expect_or_actual {
+            let key = describe_params(&sig.params);
+            if entry
+                .iter()
+                .any(|e| e.params.len() == sig.params.len() && describe_params(&e.params) == key)
+            {
+                return;
+            }
+        }
+        entry.push(sig);
     }
 
     fn signature_of(&self, f: &Function) -> FnSig {
@@ -5497,7 +5522,8 @@ impl<'r> Checker<'r> {
                     f.name.name.clone(),
                     Binding { ty: fn_ty, mutable: false, decl_span: Some(f.name.span), class_name: None, decl_type_name: None },
                 );
-                self.fns.entry(f.name.name.clone()).or_default().push(sig);
+                let nm = f.name.name.clone();
+                self.push_fn_sig(&nm, sig, f.is_expect || f.is_actual);
                 self.check_function(f);
             }
             Decl::Class(c) => {
@@ -12251,6 +12277,26 @@ mod tests {
         let _ = tc;
         assert!(codes(&tc2).contains(&codes::TYPE_OVERLOAD_RESOLUTION_AMBIGUITY),
             "{:?}", tc2.diagnostics.diagnostics());
+    }
+
+    #[test]
+    fn expect_actual_pair_is_not_ambiguous() {
+        // An `expect`/`actual` pair with an identical signature is one
+        // logical function, not an overload set — resolving a call to
+        // it must not report T0091 (regression: upstream
+        // kotlinx.atomicfu `atomic(...)` was flagged `(T), (T)`).
+        let tc = check_src(
+            r#"
+            expect fun mk(x: Int): Int
+            actual fun mk(x: Int): Int = x
+            fun main() { val _r: Int = mk(1) }
+            "#,
+        );
+        assert!(
+            !codes(&tc).contains(&codes::TYPE_OVERLOAD_RESOLUTION_AMBIGUITY),
+            "expect/actual pair must not be ambiguous: {:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
