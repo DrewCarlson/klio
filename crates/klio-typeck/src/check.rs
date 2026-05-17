@@ -4704,6 +4704,9 @@ impl<'r> Checker<'r> {
             // Secondary-ctor flow may assign properties along its own path;
             // be conservative and skip the post-init check to avoid false
             // positives until that flow is modeled.
+        } else if c.is_expect {
+            // An `expect class` declares members without bodies or
+            // initializers; the matching `actual` supplies them.
         } else {
             for (name, span, _mutable, _decl_span) in &uninitialized_properties {
                 let cfg_says_unassigned = self
