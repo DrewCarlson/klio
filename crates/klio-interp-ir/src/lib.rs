@@ -1621,18 +1621,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 }
             }
+            // Nested singleton object: `Outer.Monotonic` /
+            // `Sealed.Subclass` is a synthesised object singleton
+            // published as a global. Its instance must win over the
+            // synthesised class def so `Outer.Obj.member` reaches the
+            // singleton rather than a bare KClass.
+            if let Some(v) = self.globals.borrow().lookup(name) {
+                if matches!(v, klio_runtime::Value::Instance(_)) {
+                    return Ok(v);
+                }
+            }
             // Nested-class access on a class receiver: `Outer.Inner`
             // and `Sealed.Variant` resolve through the module's
             // global class table.
             if let Some(def) = self.classes.borrow().get(name).cloned() {
                 return Ok(klio_runtime::Value::Class(def));
-            }
-            // Nested singleton object: `Sealed.Subclass` may be a
-            // synthesised object singleton stored as a global.
-            if let Some(v) = self.globals.borrow().lookup(name) {
-                if matches!(v, klio_runtime::Value::Instance(_)) {
-                    return Ok(v);
-                }
             }
             let _ = cls;
         }
