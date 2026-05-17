@@ -5898,10 +5898,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let cls_def = self.classes.borrow().get(cls_name).cloned();
             if let Some(cls_def) = cls_def {
                 for (param, value) in cls_def.primary_params.iter().zip(cls_args.iter()) {
-                    if param.property.is_some() {
-                        fields.retain(|(n, _)| n != &param.name);
-                        fields.push((param.name.clone(), value.clone()));
-                    }
+                    // Capture every primary-constructor parameter as a
+                    // field, not only `val`/`var` ones: Kotlin retains
+                    // any plain ctor parameter referenced from a
+                    // member into a synthetic field, so methods that
+                    // read it must find it on the instance.
+                    fields.retain(|(n, _)| n != &param.name);
+                    fields.push((param.name.clone(), value.clone()));
                 }
             }
         }

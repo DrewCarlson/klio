@@ -985,8 +985,12 @@ fn neg_value_equality_distinct() {
 
 #[test]
 fn neg_method_reads_nonproperty_ctor_param() {
+    // `class C(p: Int) { fun get() = p }` is valid Kotlin: a plain
+    // primary-constructor parameter referenced from a member is
+    // captured by the compiler into a synthetic field (kotlinc
+    // compiles and runs this). klio must not flag T0075 here.
     assert!(
-        type_codes_for("neg_method_reads_nonproperty_ctor_param.kt")
+        !type_codes_for("neg_method_reads_nonproperty_ctor_param.kt")
             .iter()
             .any(|c| c == "T0075")
     );
