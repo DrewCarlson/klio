@@ -56,6 +56,14 @@ pub trait Host {
     ) -> Result<Value, EvalError> {
         self.call_member(receiver, name, args)
     }
+    /// Whether `receiver`'s class (transitively over supertypes)
+    /// declares a member function `name`. Lets the evaluator honor
+    /// Kotlin's rule that an explicit-receiver call `recv.name(args)`
+    /// is a member call whenever the member exists, and only falls to
+    /// a same-named local extension/lambda when it does not.
+    fn host_has_member(&mut self, _receiver: &Value, _name: &str) -> bool {
+        false
+    }
     /// Construct an instance of a class referenced by ID. The
     /// implementation looks up the corresponding ClassDef and
     /// invokes the primary constructor with the supplied args.
@@ -770,6 +778,7 @@ fn inst_dst(inst: &Inst) -> Option<Reg> {
         | Inst::CallMember { dst, .. }
         | Inst::CallMemberOrGlobal { dst, .. }
         | Inst::CallValueOrMember { dst, .. }
+        | Inst::CallMemberOrValue { dst, .. }
         | Inst::NewInstance { dst, .. } => Some(*dst),
         _ => None,
     }
@@ -1114,6 +1123,37 @@ fn exec_inst(
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
             let result = host.call_member_named(&recv, &name_str, &arg_values, &names)?;
+            frame.write(*dst, result);
+        }
+        Inst::CallMemberOrValue {
+            dst,
+            receiver,
+            name,
+            fallback,
+            args,
+            n_args,
+            arg_names,
+        } => {
+            let recv = frame.read(*receiver);
+            let user_args = read_arg_run(frame, *args, *n_args);
+            let names = resolve_arg_names(frame.module, arg_names);
+            let name_str = match &frame.module.consts[name.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => {
+                    return Err(EvalError::Type(
+                        "CallMemberOrValue: name not a string const".into(),
+                    ))
+                }
+            };
+            let result = if host.host_has_member(&recv, &name_str) {
+                host.call_member_named(&recv, &name_str, &user_args, &names)?
+            } else {
+                let fb = frame.read(*fallback);
+                let mut all: Vec<Value> = Vec::with_capacity(1 + user_args.len());
+                all.push(recv);
+                all.extend(user_args);
+                host.call_value_named(&fb, &all, &[])?
+            };
             frame.write(*dst, result);
         }
         Inst::CallValueOrMember {

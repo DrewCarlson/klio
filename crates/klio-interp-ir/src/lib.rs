@@ -5474,6 +5474,47 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         )))
     }
 
+    fn host_has_member(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+    ) -> bool {
+        let klio_runtime::Value::Instance(inst) = receiver else {
+            return false;
+        };
+        let cls = inst.borrow().class.name.clone();
+        if self
+            .module
+            .registry
+            .hierarchy_methods
+            .get(&cls)
+            .map_or(false, |m| m.contains(name))
+        {
+            return true;
+        }
+        // Fall back to the runtime ClassDef parent chain for classes
+        // that predate the registry's hierarchy map (e.g. embedded
+        // stdlib): a method `name` anywhere up the chain counts.
+        let mut cur = self.classes.borrow().get(&cls).cloned();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(def) = cur {
+            if !seen.insert(def.name.clone()) {
+                break;
+            }
+            let has = def.methods.iter().any(|m| {
+                m.name == name || m.name.rsplit('.').next() == Some(name)
+            });
+            if has {
+                return true;
+            }
+            cur = def
+                .supertype_names
+                .first()
+                .and_then(|p| self.classes.borrow().get(p).cloned());
+        }
+        false
+    }
+
     fn call_member_named(
         &mut self,
         receiver: &klio_runtime::Value,

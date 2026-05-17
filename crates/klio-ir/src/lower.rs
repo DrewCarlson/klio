@@ -3013,30 +3013,29 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         && b.resolve(&name.name).is_some();
                     if local_callable {
                         let local_reg = b.resolve(&name.name).unwrap();
-                        // Evaluate receiver + args into temp regs
-                        // first, then lay them out in a fresh
-                        // contiguous run (arg evaluation can itself
-                        // allocate regs, so the run must be built
-                        // after).
+                        // `recv.name(args)` where `name` is also a
+                        // callable local/param. Kotlin dispatches the
+                        // member when `recv`'s type has it, and only
+                        // the local (a local extension fn, or a
+                        // `T.() -> R` param invoked as `recv.block()`)
+                        // when it does not. That needs the receiver's
+                        // runtime type, so emit CallMemberOrValue: the
+                        // member wins if present, else the local is
+                        // invoked with `recv` prepended.
                         let recv = lower_expr(b, receiver);
-                        let mut vals: Vec<Reg> = Vec::with_capacity(args.len() + 1);
-                        vals.push(recv);
-                        for a in args {
-                            vals.push(lower_expr(b, a));
-                        }
-                        let args_start = b.alloc_reg();
-                        b.push(Inst::Move { dst: args_start, src: vals[0] });
-                        for v in &vals[1..] {
-                            let slot = b.alloc_reg();
-                            b.push(Inst::Move { dst: slot, src: *v });
-                        }
+                        let (args_start, count) = lower_arg_run(b, args);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let nm =
+                            b.module.intern_const(Const::String(name.name.clone()));
                         let dst = b.alloc_reg();
-                        b.push(Inst::CallValue {
+                        b.push(Inst::CallMemberOrValue {
                             dst,
-                            callee: local_reg,
+                            receiver: recv,
+                            name: nm,
+                            fallback: local_reg,
                             args: args_start,
-                            n_args: vals.len() as u8,
-                            arg_names: Vec::new(),
+                            n_args: count,
+                            arg_names,
                         });
                         return dst;
                     }

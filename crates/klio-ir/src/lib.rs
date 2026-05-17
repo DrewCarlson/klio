@@ -198,6 +198,24 @@ pub enum Inst {
         #[serde(default)]
         arg_names: Vec<Option<ConstId>>,
     },
+    /// Explicit-receiver call `recv.name(args)` where `name` is also
+    /// a callable local/param in scope. Kotlin resolves this to the
+    /// member when `recv`'s type has it, and only to the local
+    /// (a local extension function, or a `T.() -> R` parameter
+    /// invoked as `recv.block()`) when it does not. The member-vs-
+    /// local choice needs the receiver's runtime type, so it is made
+    /// here: if `recv` has member `name`, dispatch the member with
+    /// `args`; otherwise invoke `fallback` with `recv` prepended.
+    CallMemberOrValue {
+        dst: Reg,
+        receiver: Reg,
+        name: ConstId,
+        fallback: Reg,
+        args: Reg,
+        n_args: u8,
+        #[serde(default)]
+        arg_names: Vec<Option<ConstId>>,
+    },
     /// Member call on a receiver. The evaluator resolves the
     /// method through the receiver's class table at runtime.
     CallMember {
