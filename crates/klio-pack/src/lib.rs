@@ -71,6 +71,8 @@ pub enum PackError {
         found: u32,
         supported: u32,
     },
+    #[error("{0}")]
+    Io(String),
 }
 
 #[cfg(test)]

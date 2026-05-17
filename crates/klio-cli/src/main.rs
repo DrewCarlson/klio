@@ -957,6 +957,119 @@ fn write_pack(out: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// `host_symbol` keys resolve against this merged table, so a
 /// `kotlinx.atomicfu.AtomicInt.compareAndSet` binding wins exactly
 /// when the user has the matching pack loaded.
+/// Consume the **embedded** stdlib pack's `SOURCES` section (the
+/// curated upstream commonMain + klio actuals — today `kotlin.time`).
+///
+/// The embedded stdlib pack's `SYMBOLS` / `BINDINGS` are already
+/// statically linked into the interpreter (the cache loop deliberately
+/// skips any on-disk `stdlib*` pack so they are not double-loaded);
+/// those sections are intentionally NOT touched here. This step only
+/// parses the Kotlin `SOURCES` and pushes the resulting ASTs into the
+/// module + registers their packages, so a program importing a package
+/// these sources provide resolves against real upstream Kotlin.
+///
+/// Gated on the user's imports: the curated set is loaded only when a
+/// user import matches one of the packages those sources declare
+/// (prefix match — `import kotlin.time.*` /
+/// `import kotlin.time.Duration` both trigger `kotlin.time`). Programs
+/// that never import such a package pay nothing and see no change to
+/// the statically-linked stdlib surface.
+fn load_embedded_stdlib_sources(
+    user_import_prefixes: &std::collections::HashSet<String>,
+    source_map: &mut SourceMap,
+    out_asts: &mut Vec<klio_ast::KotlinFile>,
+    out_bindings: &mut klio_stdlib::HostBindings,
+) {
+    use klio_pack::schema::decode;
+    use klio_pack::{section_names, PackReader};
+
+    let bytes = klio_stdlib_pack::stdlib_pack_bytes();
+    let pack = match PackReader::from_bytes(bytes.into_owned()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let payload = match pack.read_section(section_names::SOURCES) {
+        Ok(Some(p)) => p,
+        _ => return,
+    };
+    let bundle: klio_pack::schema::SourceBundle = match decode(&payload) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    if bundle.files.is_empty() {
+        return;
+    }
+
+    // Parse each source once, recording its package header. The
+    // curated set is an interdependent unit (Duration <-> DurationUnit
+    // <-> TimeSource <-> the klio actuals), so it is all-or-nothing:
+    // load every file iff some user import matches any package the set
+    // declares.
+    let mut parsed: Vec<(String, klio_ast::KotlinFile)> = Vec::with_capacity(bundle.files.len());
+    for sf in &bundle.files {
+        let text = String::from_utf8_lossy(&sf.bytes).into_owned();
+        let fid = source_map.add(&sf.rel_path, text);
+        let src = source_map.get(fid).source.clone();
+        let lexed = klio_lexer::Lexer::new(fid, &src).tokenize();
+        if lexed.diagnostics.has_errors() {
+            continue;
+        }
+        let (ast, diags) = klio_parser::Parser::new(fid, &src, &lexed.tokens).parse_file();
+        if diags.has_errors() {
+            continue;
+        }
+        let pkg = ast
+            .package
+            .as_ref()
+            .map(|p| {
+                p.path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .unwrap_or_default();
+        parsed.push((pkg, ast));
+    }
+
+    let wanted = parsed.iter().any(|(pkg, _)| {
+        !pkg.is_empty()
+            && user_import_prefixes.iter().any(|imp| {
+                imp == pkg
+                    || imp.starts_with(&format!("{pkg}."))
+                    || pkg.starts_with(&format!("{imp}."))
+            })
+    });
+    if !wanted {
+        return;
+    }
+
+    for (pkg, ast) in parsed {
+        if !pkg.is_empty() {
+            klio_stdlib::register_known_package(pkg);
+        }
+        out_asts.push(ast);
+    }
+
+    // The curated sources' klio `actual`s call a couple of `internal`
+    // platform helpers (`kotlin.time.__klio_time_systemMillis` /
+    // `__klio_time_monotonicNanos`) whose Kotlin bodies are inert
+    // stubs. Register their Rust host bindings into the installed
+    // overlay so they shadow the stub bodies at dispatch — exactly the
+    // mechanism a kotlinx pack's BINDINGS use for its `__kxdt_*`
+    // helpers. These come from the statically-linked stdlib defaults;
+    // we do NOT re-load the embedded pack's SYMBOLS/BINDINGS sections.
+    let merged = merged_host_bindings();
+    for fqn in [
+        "kotlin.time.__klio_time_systemMillis",
+        "kotlin.time.__klio_time_monotonicNanos",
+    ] {
+        if let Some(f) = merged.resolve(fqn) {
+            out_bindings.register(fqn, f);
+        }
+    }
+}
+
 /// Walk the local pack cache, parse each pack's AST bundle, and
 /// build a `HostBindings` populated with the Rust-side bindings each
 /// pack declares. The caller prepends `pack_asts` to the user's AST
@@ -973,15 +1086,6 @@ fn load_installed_packs(
     use klio_pack::{section_names, PackReader};
     let mut out_asts: Vec<klio_ast::KotlinFile> = Vec::new();
     let mut out_bindings = klio_stdlib::HostBindings::new();
-    let cache = match klio_cache_dir() {
-        Ok(c) => c,
-        Err(_) => return (out_asts, out_bindings),
-    };
-    let entries = match std::fs::read_dir(&cache) {
-        Ok(e) => e,
-        Err(_) => return (out_asts, out_bindings),
-    };
-    let merged = merged_host_bindings();
     let user_import_prefixes: std::collections::HashSet<String> = user_asts
         .iter()
         .flat_map(|f| {
@@ -994,6 +1098,25 @@ fn load_installed_packs(
             })
         })
         .collect();
+    // Consume the embedded stdlib pack's curated SOURCES (kotlin.time)
+    // before the pack-cache walk: it is statically linked, not
+    // installed in `~/.klio/packs`, so it must load even when no pack
+    // cache directory exists.
+    load_embedded_stdlib_sources(
+        &user_import_prefixes,
+        source_map,
+        &mut out_asts,
+        &mut out_bindings,
+    );
+    let cache = match klio_cache_dir() {
+        Ok(c) => c,
+        Err(_) => return (out_asts, out_bindings),
+    };
+    let entries = match std::fs::read_dir(&cache) {
+        Ok(e) => e,
+        Err(_) => return (out_asts, out_bindings),
+    };
+    let merged = merged_host_bindings();
     for e in entries.flatten() {
         let p = e.path();
         if p.extension().map(|x| x != "klio-pack").unwrap_or(true) {

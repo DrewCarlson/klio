@@ -5457,6 +5457,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 inst.borrow_mut().outer = Some(default_outer);
             }
         }
+        // Publish object / companion singletons into globals *before*
+        // their body-property initialisers and init blocks run, so a
+        // companion whose initialiser (transitively) references the
+        // companion's own members resolves to the in-progress
+        // instance instead of failing forwarding. This mirrors JVM
+        // `<clinit>` semantics, where the (companion) class is loaded
+        // and self-referenceable while its static initialiser runs —
+        // e.g. upstream `kotlin.time.Duration.Companion`'s `INFINITE`
+        // / `NEG_INFINITE` / `INVALID` go through top-level
+        // `durationOf*` helpers that call `Duration.fromRawValue`.
+        if class_def.is_object {
+            self.globals
+                .borrow_mut()
+                .define(&class_def.name, inst_value.clone());
+        }
         // Evaluate class-delegation expressions (`: I by g`) and
         // store the resulting delegate values on the instance
         // under `__delegate__<superName>` so call_member can

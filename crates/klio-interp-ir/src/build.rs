@@ -1564,8 +1564,40 @@ fn build_module_with_overrides(
         (String, String),
         klio_ir::FuncId,
     > = std::collections::HashMap::new();
+    // Gather every extension property (`val T.name …`): top-level
+    // declarations *and* those declared inside a companion / nested
+    // object. Companion-scoped extension properties imported via
+    // `import Outer.Companion.name` are used exactly like top-level
+    // ones (`5.seconds`) — upstream `kotlin.time.Duration.Companion`
+    // declares all the `Int/Long/Double.seconds/minutes/…` builders
+    // this way — so they lower to the same receiver-keyed thunk.
+    let mut ext_prop_decls: Vec<&klio_ast::Property> = Vec::new();
     for d in decls {
-        if let Decl::Property(p) = d {
+        match d {
+            Decl::Property(p) if p.receiver_type.is_some() => ext_prop_decls.push(p),
+            Decl::Class(c) => {
+                for m in &c.members {
+                    if let Decl::Property(p) = m {
+                        if p.receiver_type.is_some() {
+                            ext_prop_decls.push(p);
+                        }
+                    }
+                }
+            }
+            Decl::Object(o) => {
+                for m in &o.members {
+                    if let Decl::Property(p) = m {
+                        if p.receiver_type.is_some() {
+                            ext_prop_decls.push(p);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for p in ext_prop_decls {
+        {
             if let Some(recv) = &p.receiver_type {
                 if let Some(getter) = &p.getter {
                     let empty_members = std::collections::HashSet::new();

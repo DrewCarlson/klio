@@ -6,13 +6,109 @@
 //! only; the AST / resolved / typeck sections are reserved for the
 //! interpreted-stdlib path that follows after the MVP.
 
+use std::path::{Path, PathBuf};
+
 use klio_pack::schema::{
-    encode, Binding, BindingKind, BindingManifest, ModifierBits, PackManifest, Purity, SourceLoc,
-    SymbolIndex, SymbolKind, SymbolRecord,
+    encode, Binding, BindingKind, BindingManifest, ModifierBits, PackManifest, Purity, SourceBundle,
+    SourceFile, SourceLoc, SymbolIndex, SymbolKind, SymbolRecord,
 };
 use klio_pack::{section_names, Compression, PackError, PackWriter};
 
 use crate::{generated, implementation, param_names, IMPLICITLY_IMPORTED_PACKAGES};
+
+/// Curated set of upstream stdlib commonMain `.kt` files the embedded
+/// stdlib pack ships verbatim as a `SOURCES` section, so the
+/// interpreter consumes the real upstream Kotlin instead of (or
+/// alongside) the mined Rust surface.
+///
+/// This is the general, include-list-driven mechanism: each entry is a
+/// path **relative to `kotlin/libraries/stdlib`** in the local upstream
+/// Kotlin checkout. The list is intentionally scoped to `kotlin.time`
+/// for now; growing the consumed-from-source surface later is a matter
+/// of appending entries here (plus authoring any matching `actual`s).
+///
+/// The platform `actual`s for the `internal expect` declarations in
+/// these files (and the one `public expect enum class DurationUnit`)
+/// are supplied by [`KLIO_STDLIB_ACTUAL_FILES`], authored under
+/// `crates/klio-stdlib/`.
+const CURATED_UPSTREAM_SOURCES: &[&str] = &[
+    "src/kotlin/time/Duration.kt",
+    "src/kotlin/time/DurationUnit.kt",
+    "src/kotlin/time/longSaturatedMath.kt",
+    "src/kotlin/time/measureTime.kt",
+    "src/kotlin/time/TimeSource.kt",
+    "src/kotlin/time/TimeSources.kt",
+    "src/kotlin/time/Clock.kt",
+    "src/kotlin/time/Clocks.kt",
+    "src/kotlin/time/Instant.kt",
+    "src/kotlin/time/ExperimentalTime.kt",
+];
+
+/// klio-authored platform `actual` source files shipped in the same
+/// `SOURCES` section, paths relative to the `klio-stdlib` crate root.
+const KLIO_STDLIB_ACTUAL_FILES: &[&str] = &["kotlin-time/Actuals.kt"];
+
+/// Locate the local upstream Kotlin checkout's `libraries/stdlib`
+/// directory (the same one the stdlib-gen miner and the parity harness
+/// depend on). The workspace root is two levels up from the
+/// `klio-stdlib` crate dir.
+fn upstream_stdlib_root() -> Result<PathBuf, PackError> {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ws_root = crate_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| PackError::Io("cannot locate workspace root from klio-stdlib".into()))?;
+    let root = ws_root.join("kotlin").join("libraries").join("stdlib");
+    if !root.is_dir() {
+        return Err(PackError::Io(format!(
+            "upstream Kotlin checkout missing: expected stdlib sources at {} \
+             (the curated stdlib SOURCES path and the parity harness both \
+             require the local `kotlin/` checkout)",
+            root.display()
+        )));
+    }
+    Ok(root)
+}
+
+/// Read the curated upstream commonMain files plus the klio-authored
+/// `actual` files into a [`SourceBundle`]. Fails hard (matching the
+/// parity harness's hard dependency on the checkout) when an expected
+/// file is absent.
+fn build_curated_sources() -> Result<SourceBundle, PackError> {
+    let upstream = upstream_stdlib_root()?;
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<SourceFile> = Vec::new();
+
+    for rel in CURATED_UPSTREAM_SOURCES {
+        let abs = upstream.join(rel);
+        let bytes = std::fs::read(&abs).map_err(|e| {
+            PackError::Io(format!(
+                "curated stdlib source {} unreadable: {e}",
+                abs.display()
+            ))
+        })?;
+        files.push(SourceFile {
+            rel_path: format!("stdlib/kotlin/libraries/stdlib/{rel}"),
+            bytes,
+        });
+    }
+
+    for rel in KLIO_STDLIB_ACTUAL_FILES {
+        let abs = crate_dir.join(rel);
+        let bytes = std::fs::read(&abs).map_err(|e| {
+            PackError::Io(format!(
+                "klio stdlib actual source {} unreadable: {e}",
+                abs.display()
+            ))
+        })?;
+        files.push(SourceFile {
+            rel_path: format!("stdlib/klio/{rel}"),
+            bytes,
+        });
+    }
+
+    Ok(SourceBundle { files })
+}
 
 /// Build a deterministic pack for the in-process Kotlin standard
 /// library. When `compress_symbols` is true the symbol index section
@@ -62,6 +158,13 @@ pub fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, PackError> {
     bindings.sort_by(|a, b| a.fqn.cmp(&b.fqn));
     let binding_bytes = encode(&BindingManifest { bindings })?;
 
+    // Curated upstream commonMain + klio actuals, shipped so the loader
+    // can parse + register them when a program imports a package these
+    // sources provide (today: `kotlin.time`). The mined SYMBOLS /
+    // BINDINGS sections above are still what gets statically linked;
+    // this SOURCES section carries the Kotlin the interpreter parses.
+    let sources_bytes = encode(&build_curated_sources()?)?;
+
     let mut writer = PackWriter::new();
     writer.add_raw(section_names::MANIFEST, manifest_bytes);
     writer.add_section(
@@ -70,6 +173,7 @@ pub fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, PackError> {
         if compress_symbols { Compression::Zstd } else { Compression::None },
     );
     writer.add_raw(section_names::BINDINGS, binding_bytes);
+    writer.add_section(section_names::SOURCES, sources_bytes, Compression::Zstd);
     writer.finish()
 }
 
