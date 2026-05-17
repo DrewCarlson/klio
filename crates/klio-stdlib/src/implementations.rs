@@ -867,6 +867,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Result.onFailure", result_on_failure),
     ("kotlin.Result.isSuccess", result_is_success),
     ("kotlin.Result.isFailure", result_is_failure),
+    ("kotlin.Result.getOrThrow", result_get_or_throw),
     ("kotlin.Result.getOrNull", result_get_or_null),
     ("kotlin.Result.exceptionOrNull", result_exception_or_null),
     ("kotlin.Result.getOrDefault", result_get_or_default),
@@ -6857,6 +6858,17 @@ fn result_get_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn result_exception_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (ok, payload) = recv_result(ctx.args, "Result.exceptionOrNull")?;
     if ok { Ok(Value::Null) } else { Ok(payload.clone()) }
+}
+
+/// `Result.getOrThrow()` — the success value, or rethrow the
+/// captured failure. Core to `Continuation.resumeWith`.
+fn result_get_or_throw(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (ok, payload) = recv_result(ctx.args, "Result.getOrThrow")?;
+    if ok {
+        Ok(payload.clone())
+    } else {
+        Err(RuntimeError::Thrown(payload.clone()))
+    }
 }
 
 fn result_get_or_else(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
