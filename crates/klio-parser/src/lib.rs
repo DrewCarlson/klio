@@ -813,41 +813,44 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 self.pos = ann_save; // the `@` annotates the next decl
             }
         }
-        // Optional primary-ctor visibility: `class Foo (private)? constructor(...)`.
+        // Optional explicit primary constructor:
+        // `class Foo [visibility] [actual|expect]* constructor(...)`.
+        // Scan a run of soft-keyword constructor modifiers (in any
+        // order) that must terminate in `constructor`; commit only
+        // then. `actual`/`expect` are runtime-inert here (klio's
+        // expect/actual is name-keyed), visibility is recorded.
         let mut primary_ctor_visibility: Option<Visibility> = None;
-        let save = self.pos;
-        let mut peek_vis: Option<Visibility> = None;
-        if matches!(self.peek_kind(), TokenKind::Ident) {
-            let txt = self.text(self.current_span());
-            peek_vis = match txt {
-                "public" => Some(Visibility::Public),
-                "private" => Some(Visibility::Private),
-                "protected" => Some(Visibility::Protected),
-                "internal" => Some(Visibility::Internal),
-                _ => None,
-            };
-        }
-        if peek_vis.is_some() {
-            // Only commit if the next non-newline token is `constructor`.
+        {
             let saved = self.pos;
-            self.bump();
-            self.skip_nl();
-            if matches!(self.peek_kind(), TokenKind::Ident)
-                && self.text(self.current_span()) == "constructor"
-            {
-                primary_ctor_visibility = peek_vis;
-                self.bump(); // constructor
+            let mut vis: Option<Visibility> = None;
+            let mut consumed_modifier = false;
+            loop {
+                if !matches!(self.peek_kind(), TokenKind::Ident) {
+                    break;
+                }
+                match self.text(self.current_span()) {
+                    "public" => vis = Some(Visibility::Public),
+                    "private" => vis = Some(Visibility::Private),
+                    "protected" => vis = Some(Visibility::Protected),
+                    "internal" => vis = Some(Visibility::Internal),
+                    "actual" | "expect" => {}
+                    _ => break,
+                }
+                self.bump();
                 self.skip_nl();
-            } else {
+                consumed_modifier = true;
+            }
+            let at_ctor = matches!(self.peek_kind(), TokenKind::Ident)
+                && self.text(self.current_span()) == "constructor";
+            if at_ctor {
+                primary_ctor_visibility = vis;
+                self.bump(); // `constructor`
+                self.skip_nl();
+            } else if consumed_modifier {
+                // The run was not a constructor header — restore.
                 self.pos = saved;
             }
-        } else if matches!(self.peek_kind(), TokenKind::Ident)
-            && self.text(self.current_span()) == "constructor"
-        {
-            self.bump();
-            self.skip_nl();
         }
-        let _ = save;
         let primary_params = if matches!(self.peek_kind(), TokenKind::LParen) {
             self.bump();
             let params = self.parse_class_param_list();
@@ -1288,7 +1291,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     "private" => { visibility = Visibility::Private; self.bump(); self.skip_nl(); }
                     "protected" => { visibility = Visibility::Protected; self.bump(); self.skip_nl(); }
                     "internal" => { visibility = Visibility::Internal; self.bump(); self.skip_nl(); }
-                    "override" | "final" | "open" | "abstract" | "lateinit" => {
+                    "override" | "final" | "open" | "abstract" | "lateinit"
+                    | "actual" | "expect" => {
                         self.bump();
                         self.skip_nl();
                     }
