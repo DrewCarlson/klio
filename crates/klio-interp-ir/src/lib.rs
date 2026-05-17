@@ -2090,6 +2090,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return Ok(v);
             }
         }
+        // Bare top-level `const val` / `val` referenced inside an
+        // extension-fn body lowers as `this.<name>` (the receiver is
+        // a bound param). When the receiver has no such field the
+        // name is really the top-level binding — resolve it as a
+        // global before failing.
+        if let Some(v) = self.globals.borrow().lookup(name) {
+            return Ok(v);
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::get_field `{name}` on `{}`",
             receiver.type_fqn()
