@@ -2252,6 +2252,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let Some(v) = self.globals.borrow().lookup(name) {
             return Ok(v);
         }
+        // Also resolve stdlib const-style globals (e.g. an imported
+        // `COROUTINE_SUSPENDED`) through the full global path, which
+        // probes package surfaces and auto-invokes a 0-arg constant.
+        if let Some(v) = <Self as klio_ir::eval::Host>::lookup_global(self, name) {
+            return Ok(v);
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::get_field `{name}` on `{}`",
             receiver.type_fqn()
