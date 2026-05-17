@@ -2772,10 +2772,32 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         Some(lhs)
     }
 
+    /// True when, skipping any newlines from the cursor, the next
+    /// significant token is `kind`. Used so a line that *starts* with
+    /// a binary continuation operator (e.g. `?:`) joins the previous
+    /// expression rather than ending it.
+    fn newline_then(&self, kind: &TokenKind) -> bool {
+        if !matches!(self.peek_kind(), TokenKind::Newline) {
+            return false;
+        }
+        let mut i = self.pos;
+        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+            i += 1;
+        }
+        self.tokens.get(i).map(|t| &t.kind) == Some(kind)
+    }
+
     fn parse_elvis(&mut self) -> Option<Expr> {
         let mut lhs = self.parse_infix_fn()?;
         loop {
             self.skip_soft_nl();
+            // A line beginning with `?:` continues the expression
+            // (Kotlin allows the elvis operator to lead a wrapped
+            // line); `?:` can never start a statement, so this is
+            // unambiguous.
+            if self.newline_then(&TokenKind::QuestionColon) {
+                self.skip_nl();
+            }
             if !matches!(self.peek_kind(), TokenKind::QuestionColon) {
                 break;
             }
