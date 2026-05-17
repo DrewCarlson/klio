@@ -46,6 +46,13 @@ pub struct Parser<'src, 'tok> {
     /// supertype-list entry of the form `: I by expr`, so the class body's
     /// opening brace isn't swallowed as `expr { … }`.
     suppress_trailing_lambda: bool,
+    /// When `true`, `parse_simple_type` does NOT fold trailing
+    /// `.Ident` segments into a qualified type path. Set while
+    /// parsing an extension / anonymous-function *receiver* type,
+    /// where the trailing `.name` is the function name (the
+    /// receiver-fold loop separates the qualifier itself). Keeps
+    /// qualified type refs working everywhere else.
+    suppress_qualified_path: bool,
     /// Per-token flag: `true` when the token sits inside an unclosed
     /// `(` or `[` (not `{`). Kotlin treats newlines as soft inside
     /// round/square brackets — an expression may break before or
@@ -83,6 +90,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             pos: 0,
             diagnostics: DiagnosticSink::new(),
             suppress_trailing_lambda: false,
+            suppress_qualified_path: false,
             nl_soft,
         }
     }
@@ -1544,7 +1552,10 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         // `Ident (?)? . Ident` so the regular non-extension path can
         // continue using `parse_ident` for the function name.
         let receiver_type = if self.looks_like_extension_receiver() {
+            let saved_sqp = self.suppress_qualified_path;
+            self.suppress_qualified_path = true;
             let mut ty = self.parse_type();
+            self.suppress_qualified_path = saved_sqp;
             // Fold additional `.Ident` segments into the receiver type
             // for qualified extension receivers like `Foo.Companion.bar()`
             // — keep the final `.Ident` as the function name itself.
@@ -1854,7 +1865,10 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         let mutable = matches!(kw_tok.kind, TokenKind::Keyword(Keyword::Var));
         self.skip_nl();
         let receiver_type = if self.looks_like_extension_receiver() {
+            let saved_sqp = self.suppress_qualified_path;
+            self.suppress_qualified_path = true;
             let mut ty = self.parse_type();
+            self.suppress_qualified_path = saved_sqp;
             if matches!(self.peek_kind(), TokenKind::QuestionDot) {
                 if let Some(ref mut t) = ty {
                     t.nullable = true;
@@ -2152,17 +2166,40 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     /// NOT consume a trailing `?` — that's the caller's job so function-type
     /// nullability composes correctly.
     fn parse_simple_type(&mut self) -> Option<TypeRef> {
-        let name = self.parse_ident("type")?;
-        let type_args = if matches!(self.peek_kind(), TokenKind::Lt) {
+        let first = self.parse_ident("type")?;
+        let mut name = first.clone();
+        let mut type_args = if matches!(self.peek_kind(), TokenKind::Lt) {
             self.parse_type_args()
         } else {
             Vec::new()
         };
+        // Qualified / nested type path: `A.B.C` (each segment may carry
+        // its own type arguments, e.g. `Outer<T>.Inner`). klio resolves
+        // types by simple name against imports + known packages, so the
+        // path collapses to its last segment (the package / outer-class
+        // qualifier is the namespace the resolver already keys on).
+        // Stop before `.(` — that is a receiver-function type
+        // (`A.B.() -> R`), consumed by `parse_type`.
+        while !self.suppress_qualified_path
+            && matches!(self.peek_kind(), TokenKind::Dot)
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident)
+            )
+        {
+            self.bump(); // '.'
+            name = self.parse_ident("type")?;
+            type_args = if matches!(self.peek_kind(), TokenKind::Lt) {
+                self.parse_type_args()
+            } else {
+                Vec::new()
+            };
+        }
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         Some(TypeRef {
             name: name.clone(),
             nullable: false,
-            span: name.span.join(end),
+            span: first.span.join(end),
             type_args,
             function: None,
             definitely_non_null: false,
