@@ -1639,10 +1639,39 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         return Ok(s);
                     }
                 }
-                if let Some(singleton) = self.globals.borrow().lookup(&comp_name) {
+                let singleton = self.globals.borrow().lookup(&comp_name);
+                if let Some(singleton) = singleton {
                     if let klio_runtime::Value::Instance(inst) = &singleton {
                         if let Some(v) = inst.borrow().get(name) {
                             return Ok(v);
+                        }
+                        // No plain backing field — the companion
+                        // member may be a `val` with a custom getter
+                        // (`val DISTANT_PAST get() = …`). Run that
+                        // getter directly against the companion
+                        // singleton (mirrors the instance getter
+                        // path; no recursion through get_field).
+                        let comp_cls = inst.borrow().class.name.clone();
+                        let getter = self
+                            .prog
+                            .instance_prop_getters
+                            .get(&(comp_cls, name.to_string()))
+                            .copied();
+                        if let Some(fid) = getter {
+                            if let Some(func) = self
+                                .module
+                                .funcs
+                                .get(fid.0 as usize)
+                                .cloned()
+                            {
+                                let module = Arc::clone(&self.module);
+                                return klio_ir::eval::eval_with(
+                                    &module,
+                                    &func,
+                                    vec![singleton.clone()],
+                                    self,
+                                );
+                            }
                         }
                     }
                 }
@@ -2110,6 +2139,56 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let simple = def.name.rsplit('.').next().unwrap_or(&def.name);
             if let Some(v) = klio_stdlib::primitive_companion_const(simple, name) {
                 return Ok(v);
+            }
+        }
+        // Companion fallback for an instance receiver: a companion
+        // `val` (incl. one with a custom getter) is in scope
+        // unqualified inside the class's own member bodies
+        // (`fun useMin() = MIN`). The bare read lowered as
+        // `this.MIN`; the instance has no such field, so route to
+        // the class's companion singleton (walking supertypes).
+        // Skip when the receiver is itself a companion singleton —
+        // resolving a sibling from inside the companion goes through
+        // the normal field/getter path; re-forwarding here would
+        // recurse into the same instance.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let is_companion_recv =
+                inst.borrow().class.name.contains("$Companion$");
+            let mut cur = if is_companion_recv {
+                None
+            } else {
+                Some(inst.borrow().class.name.clone())
+            };
+            let mut seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            while let Some(cname) = cur.take() {
+                if !seen.insert(cname.clone()) {
+                    break;
+                }
+                let comp_name = self
+                    .module
+                    .registry
+                    .companion_singletons
+                    .get(&cname)
+                    .cloned();
+                if let Some(comp_name) = comp_name {
+                    let singleton = self.globals.borrow().lookup(&comp_name);
+                    if let Some(singleton @ klio_runtime::Value::Instance(_)) =
+                        singleton
+                    {
+                        if let Ok(v) = self.get_field(&singleton, name) {
+                            if !matches!(v, klio_runtime::Value::Unit) {
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
+                let next = self
+                    .classes
+                    .borrow()
+                    .get(&cname)
+                    .and_then(|d| d.supertype_names.first().cloned());
+                cur = next;
             }
         }
         // Bare top-level `const val` / `val` referenced inside an
