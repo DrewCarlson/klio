@@ -1241,6 +1241,31 @@ pub fn lower_method(
     owner_class: &str,
     own_members: &std::collections::HashSet<String>,
 ) -> crate::Func {
+    // A member extension function (`class C { fun R.f(p) { … } }`)
+    // binds its *extension* receiver as `this`, exactly like a
+    // top-level extension fn — the body's bare members resolve on
+    // `R`, not on `C`. (The `C` dispatch receiver / `this@C` is not
+    // bound here; member extensions whose body only uses the
+    // extension receiver — the common case — work, which is what
+    // the stdlib's `Duration.appendFractional`-style helpers need.)
+    // It is also registered in `func_index` so a bare call resolves
+    // through the same extension-call lowering top-level extensions
+    // use (the receiver is prepended as the implicit `this`).
+    if f.receiver_type.is_some() {
+        let func = lower_function_body_with_implicit_owner(
+            module,
+            f,
+            &["this"],
+            None,
+            Some(own_members),
+        );
+        let id = crate::FuncId(module.funcs.len() as u32);
+        let mut placed = func;
+        placed.id = id;
+        module.funcs.push(placed.clone());
+        module.func_index.push((f.name.name.clone(), id));
+        return placed;
+    }
     let func = lower_function_body_with_implicit_owner(
         module,
         f,
