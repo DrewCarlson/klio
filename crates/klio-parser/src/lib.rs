@@ -3399,6 +3399,43 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 let tok = self.bump();
                 Some(Expr::CharLit { value: c, span: tok.span })
             }
+            // Collection-literal `[a, b, ...]`. Kotlin permits this
+            // only as an annotation argument
+            // (`@Foo(imports = ["a", "b"])`); klio accepts it as a
+            // `listOf(...)` expression — annotation arguments are
+            // runtime-inert, so the representation only needs to
+            // parse and carry the elements.
+            TokenKind::LBracket => {
+                let lb = self.bump();
+                self.skip_nl();
+                let mut elems = Vec::new();
+                while !matches!(self.peek_kind(), TokenKind::RBracket | TokenKind::Eof) {
+                    let Some(e) = self.parse_expr() else { break };
+                    elems.push(e);
+                    self.skip_nl();
+                    if matches!(self.peek_kind(), TokenKind::Comma) {
+                        self.bump();
+                        self.skip_nl();
+                    } else {
+                        break;
+                    }
+                }
+                let rb = self.expect(&TokenKind::RBracket, "`]`")?;
+                let span = lb.span.join(rb.span);
+                let n = elems.len();
+                let callee = Expr::Path {
+                    segments: vec![Ident { name: "listOf".into(), span: lb.span }],
+                    span: lb.span,
+                };
+                Some(Expr::Call {
+                    callee: Box::new(callee),
+                    args: elems,
+                    arg_names: vec![None; n],
+                    type_args: Vec::new(),
+                    is_infix: false,
+                    span,
+                })
+            }
             TokenKind::StringQuote { .. } => self.parse_string_template(),
             TokenKind::Ident => {
                 if let Some(label_expr) = self.try_parse_label_binding() {
