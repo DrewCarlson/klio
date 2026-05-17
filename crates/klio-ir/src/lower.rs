@@ -3406,11 +3406,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // back to the captured `this` slot — populated by the
             // dispatcher when the lambda is called with a
             // this-binding (scope fns like `apply` / `with`).
+            // Note: when `this` resolves through a capture (a scope-fn
+            // / receiver lambda body), we deliberately do NOT bind it
+            // as a local. Binding poisoned later bare-member reads:
+            // they would resolve `this` to the captured lambda
+            // receiver and emit a raw GetField with no
+            // enclosing-receiver fallback, so `this@Outer` followed by
+            // a bare enclosing member failed. Leaving `this` unbound
+            // keeps subsequent bare names on the this-or-global probe,
+            // which tries the lambda receiver, then the enclosing
+            // `this@Outer`, then globals — Kotlin's nested-receiver
+            // order. Re-emitting LoadCapture per `this` is cheap.
             let this_reg = b.resolve("this").or_else(|| {
                 let idx = b.record_capture("this");
                 let dst = b.alloc_reg();
                 b.push(Inst::LoadCapture { dst, idx });
-                b.bind("this".to_string(), dst);
                 Some(dst)
             });
             if let Some(this_reg) = this_reg {
