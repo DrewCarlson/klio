@@ -2313,6 +2313,18 @@ impl<'a> Checker<'a> {
                                 return true;
                             }
                         }
+                        // Builtin primitive companion constants
+                        // (`Long.MAX_VALUE`, `Int.MIN_VALUE`,
+                        // `Double.POSITIVE_INFINITY`, `*.SIZE_BITS`,
+                        // …) are compile-time constants.
+                        if matches!(
+                            segments[0].name.as_str(),
+                            "Int" | "Long" | "Short" | "Byte" | "Double" | "Float"
+                                | "Char" | "Boolean" | "UInt" | "ULong" | "UShort"
+                                | "UByte"
+                        ) {
+                            return true;
+                        }
                     }
                 }
                 self.is_const_initializer(receiver) && self.is_const_ref(&name.name)
@@ -2339,6 +2351,30 @@ impl<'a> Checker<'a> {
                         | BinOp::Or
                 ) && self.is_const_initializer(lhs)
                     && self.is_const_initializer(rhs)
+            }
+            // Integer bitwise/shift infix functions are compile-time
+            // constant in Kotlin (`const val M = 1 shl 30`,
+            // `Long.MAX_VALUE / MS`): they parse as an infix call
+            // `a shl b` or a member call `a.shl(b)`.
+            Expr::Call { callee, args, is_infix, .. } => {
+                const CONST_INFIX: &[&str] =
+                    &["shl", "shr", "ushr", "and", "or", "xor", "inv"];
+                match callee.as_ref() {
+                    Expr::Path { segments, .. }
+                        if *is_infix
+                            && segments.len() == 1
+                            && CONST_INFIX.contains(&segments[0].name.as_str()) =>
+                    {
+                        args.iter().all(|a| self.is_const_initializer(a))
+                    }
+                    Expr::Member { receiver, name, safe: false, .. }
+                        if CONST_INFIX.contains(&name.name.as_str()) =>
+                    {
+                        self.is_const_initializer(receiver)
+                            && args.iter().all(|a| self.is_const_initializer(a))
+                    }
+                    _ => false,
+                }
             }
             _ => false,
         }
