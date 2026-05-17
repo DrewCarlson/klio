@@ -1514,7 +1514,13 @@ impl<'a> Checker<'a> {
                 let need_setter = p.mutable;
                 let missing_getter = p.getter.is_none();
                 let missing_setter = need_setter && p.setter.is_none();
-                if (missing_getter || missing_setter) && p.init.is_none() && p.delegate.is_none() {
+                // An `expect` extension property is a declaration
+                // with no body; its accessors come from the `actual`.
+                if (missing_getter || missing_setter)
+                    && p.init.is_none()
+                    && p.delegate.is_none()
+                    && !p.is_expect
+                {
                     let what = if missing_getter && missing_setter {
                         "explicit getter and setter"
                     } else if missing_getter {

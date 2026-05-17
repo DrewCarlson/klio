@@ -1967,6 +1967,14 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         let kw_tok = self.bump();
         let mutable = matches!(kw_tok.kind, TokenKind::Keyword(Keyword::Var));
         self.skip_nl();
+        // Type parameters on an extension property:
+        // `var <T> Box<T>.value: T`. klio erases generics, so the
+        // list is parsed and discarded — `T` resolves structurally
+        // in the receiver / type / accessors.
+        if matches!(self.peek_kind(), TokenKind::Lt) {
+            let _ = self.parse_type_params(true);
+            self.skip_nl();
+        }
         let receiver_type = if self.looks_like_extension_receiver() {
             let saved_sqp = self.suppress_qualified_path;
             self.suppress_qualified_path = true;
