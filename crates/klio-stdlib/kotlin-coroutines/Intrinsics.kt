@@ -88,11 +88,14 @@ internal class KlioStartContinuation<T>(
         get() = completion.context
 
     public override fun resumeWith(result: Result<Unit>) {
-        val out = runCatching { body() }
-        if (out.isSuccess) {
-            completion.resumeWith(Result.success(out.getOrThrow()))
-        } else {
-            completion.resumeWith(Result.failure(out.exceptionOrNull()!!))
+        // Call `body()` directly (no wrapping closure) so the
+        // enclosing `this` survives a suspension inside the body
+        // across the frame-snapshot resume.
+        val out: Result<T> = try {
+            Result.success(body())
+        } catch (e: Throwable) {
+            Result.failure(e)
         }
+        completion.resumeWith(out)
     }
 }

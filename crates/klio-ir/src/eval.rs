@@ -883,14 +883,16 @@ fn exec_inst(
                 frame.write(*dst, result);
                 return Ok(());
             }
-            // COROUTINE_SUSPENDED is a methodless singleton: any
-            // equality against it is identity, never a user
-            // `equals` dispatch (it has no member surface).
+            // COROUTINE_SUSPENDED and Result have no user `equals`
+            // surface: any equality against them is structural /
+            // identity, never a `call_member("equals")` dispatch.
             if matches!(
                 *op,
                 BinOp::Eq | BinOp::NotEq | BinOp::BoxedEq | BinOp::BoxedNotEq
             ) && (matches!(l, Value::CoroutineSuspended)
-                || matches!(r, Value::CoroutineSuspended))
+                || matches!(r, Value::CoroutineSuspended)
+                || matches!(l, Value::Result { .. })
+                || matches!(r, Value::Result { .. }))
             {
                 let eq = Value::structural_eq(&l, &r);
                 let b = if matches!(*op, BinOp::NotEq | BinOp::BoxedNotEq) {
