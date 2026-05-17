@@ -568,6 +568,35 @@ pub fn build_module(file: &KotlinFile) -> BuiltModule {
     )
 }
 
+/// Collect the member names (property-params, body properties, member
+/// functions) declared by `start` and every supertype reachable from
+/// it among the module's class declarations. Used so a class body's
+/// bare references — and call-position name resolution — see inherited
+/// members, not just the class's own, matching Kotlin's separate
+/// function/property namespaces (a `name(args)` call resolves to an
+/// inherited member function even when a same-named value is in scope).
+fn collect_hierarchy_method_names(
+    start: &str,
+    by_name: &std::collections::HashMap<String, &klio_ast::Class>,
+    out: &mut std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    if !seen.insert(start.to_string()) {
+        return;
+    }
+    let Some(c) = by_name.get(start) else {
+        return;
+    };
+    for m in &c.members {
+        if let Decl::Function(f) = m {
+            out.insert(f.name.name.clone());
+        }
+    }
+    for st in &c.supertypes {
+        collect_hierarchy_method_names(&st.name.name, by_name, out, seen);
+    }
+}
+
 fn build_module_with_overrides(
     file: &KotlinFile,
     fqn_overrides: &std::collections::HashMap<String, String>,
@@ -783,6 +812,30 @@ fn build_module_with_overrides(
             file_classes.insert(c.name.name.clone(), c);
         }
     }
+    // Per-class transitive member-function-name set, so the lowerer
+    // can resolve a call-position `name(args)` to a hierarchy member
+    // function even when a same-named value/param shadows it.
+    let hierarchy_methods: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = file_classes
+        .keys()
+        .map(|cname| {
+            let mut methods = std::collections::HashSet::new();
+            let mut seen = std::collections::HashSet::new();
+            collect_hierarchy_method_names(
+                cname,
+                &file_classes,
+                &mut methods,
+                &mut seen,
+            );
+            (cname.clone(), methods)
+        })
+        .collect();
+    // Visible to `FuncBuilder` during the body-lowering passes below
+    // (the registry is otherwise only assembled at the end of this
+    // function, too late for lowering to consult).
+    module.registry.hierarchy_methods = hierarchy_methods.clone();
     // Pre-register every class name so `class_id` resolves
     // regardless of declaration order: a method body may reference a
     // class declared later in the module (kotlinx-io's `Buffer`
@@ -1757,6 +1810,7 @@ fn build_module_with_overrides(
         delegated_body_props: delegated_body_props.clone(),
         local_fn_defaults,
         type_aliases,
+        hierarchy_methods,
     };
     BuiltModule {
         module: Arc::new(module),

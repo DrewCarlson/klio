@@ -543,6 +543,14 @@ pub struct ModuleRegistry {
     /// `getValue` / `setValue` methods.
     #[serde(default)]
     pub top_level_delegated_props: std::collections::HashSet<String>,
+    /// Class simple name → the set of member *function* names it
+    /// declares or inherits (transitively over supertypes). Lets the
+    /// lowerer honor Kotlin's separate function/property namespaces:
+    /// in call position `name(args)` binds to a hierarchy member
+    /// function even when a same-named value/param is in scope.
+    #[serde(default)]
+    pub hierarchy_methods:
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Body-property `(class, prop)` pairs declared with `by`.
     #[serde(default)]
     pub delegated_body_props: std::collections::HashSet<(String, String)>,

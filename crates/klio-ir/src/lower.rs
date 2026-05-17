@@ -2395,6 +2395,58 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // kotlinx.coroutines' suspend `yield()`.
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
+                    // Kotlin keeps the function and property namespaces
+                    // separate: in call position `name(args)` resolves
+                    // to a member function of the enclosing class (own
+                    // or inherited) even when a same-named value/param
+                    // is in scope (`init { if (flag) flag(x) }` where
+                    // `flag` is both a ctor param and a method). Only a
+                    // genuine local function shadows; a same-named
+                    // member function outranks the value, so skip the
+                    // value-invocation path and fall through to member
+                    // dispatch. A bare param that is *not* a hierarchy
+                    // member (kotlinx-io's `yield: (Char)->Unit`
+                    // parameter) still invokes the value.
+                    let redirect_to_member = {
+                        let n = &segments[0].name;
+                        let is_hierarchy_method = b
+                            .owner_class()
+                            .and_then(|oc| {
+                                b.module.registry.hierarchy_methods.get(oc)
+                            })
+                            .map_or(false, |s| s.contains(n));
+                        // Only intervene when a value/param actually
+                        // shadows the method name — otherwise the
+                        // normal member/function dispatch below is
+                        // already correct and must not be rerouted.
+                        is_hierarchy_method
+                            && b.resolve(n).is_some()
+                            && !b.is_local_fn(n)
+                            && !b.is_local_ext_fn(n)
+                            && b.resolve("this").is_some()
+                    };
+                    if redirect_to_member {
+                        // `name(args)` where `name` is a hierarchy
+                        // member function shadowed in scope by a
+                        // same-named value/param: dispatch as an
+                        // implicit-receiver member call on `this`.
+                        let this_reg = b.resolve("this").expect("this bound");
+                        let (args_start, count) = lower_arg_run(b, args);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let dst = b.alloc_reg();
+                        let nm = b
+                            .module
+                            .intern_const(Const::String(segments[0].name.clone()));
+                        b.push(Inst::CallMember {
+                            dst,
+                            receiver: this_reg,
+                            name: nm,
+                            args: args_start,
+                            n_args: count,
+                            arg_names,
+                        });
+                        return dst;
+                    }
                     if let Some(reg) = b.resolve(&segments[0].name) {
                         // A boxed `var` (captured + reassigned, e.g. a
                         // recursive `lateinit var f = { … f(…) … }`)
