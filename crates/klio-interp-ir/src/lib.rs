@@ -4077,16 +4077,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 let singleton = self.globals.borrow().lookup(&comp_name);
                 if let Some(singleton) = singleton {
                     if matches!(singleton, klio_runtime::Value::Instance(_)) {
-                        // Forward to the companion instance. Only an
-                        // "unimplemented" (i.e. the companion has no
-                        // such member) falls through so other error
-                        // sites still see the class receiver; a real
-                        // error from inside the companion method must
-                        // propagate, not be masked as
+                        // Forward to the companion instance. Only the
+                        // specific "this exact member is not on the
+                        // companion" Unimplemented falls through (so
+                        // other resolution can try); any *other*
+                        // error — including an Unimplemented from
+                        // deeper inside the companion method's body —
+                        // propagates rather than being masked as
                         // member-on-KClass.
+                        let no_such = format!("`{name}` on");
                         match self.call_member(&singleton, name, args) {
                             Ok(v) => return Ok(v),
-                            Err(klio_ir::eval::EvalError::Unimplemented(_)) => {}
+                            Err(klio_ir::eval::EvalError::Unimplemented(m))
+                                if m.contains("Vm::call_member")
+                                    && m.contains(&no_such) => {}
                             Err(e) => return Err(e),
                         }
                     }

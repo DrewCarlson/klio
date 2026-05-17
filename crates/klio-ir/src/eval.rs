@@ -1532,6 +1532,27 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
     match (op, l, r) {
         (BinOp::Add, Int(a), Int(b)) => Ok(Int(a.wrapping_add(*b))),
         (BinOp::Sub, Int(a), Int(b)) => Ok(Int(a.wrapping_sub(*b))),
+        // Kotlin Char arithmetic: `Char - Char` → Int (code-point
+        // distance); `Char + Int` / `Char - Int` → Char.
+        (BinOp::Sub, Value::Char(a), Value::Char(b)) => {
+            Ok(Int(*a as i32 - *b as i32))
+        }
+        (BinOp::Add, Value::Char(a), Int(b)) => {
+            let cp = (*a as i64).wrapping_add(*b as i64);
+            Ok(Value::Char(char::from_u32(cp as u32).unwrap_or('\u{0}')))
+        }
+        (BinOp::Sub, Value::Char(a), Int(b)) => {
+            let cp = (*a as i64).wrapping_sub(*b as i64);
+            Ok(Value::Char(char::from_u32(cp as u32).unwrap_or('\u{0}')))
+        }
+        (BinOp::Add, Value::Char(a), Long(b)) => {
+            let cp = (*a as i64).wrapping_add(*b);
+            Ok(Value::Char(char::from_u32(cp as u32).unwrap_or('\u{0}')))
+        }
+        (BinOp::Sub, Value::Char(a), Long(b)) => {
+            let cp = (*a as i64).wrapping_sub(*b);
+            Ok(Value::Char(char::from_u32(cp as u32).unwrap_or('\u{0}')))
+        }
         (BinOp::Mul, Int(a), Int(b)) => Ok(Int(a.wrapping_mul(*b))),
         // (Int Div/Mod handled below, after Long, with ArithmeticException throw.)
         (BinOp::Add, Long(a), Long(b)) => Ok(Long(a.wrapping_add(*b))),

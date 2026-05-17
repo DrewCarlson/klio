@@ -103,6 +103,11 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String.replace", string_replace),
     ("kotlin.String.reversed", string_reversed),
     ("kotlin.String.startsWith", string_starts_with),
+    ("kotlin.String.regionMatches", string_region_matches),
+    ("kotlin.CharSequence.regionMatches", string_region_matches),
+    ("kotlin.String.skipWhile", string_skip_while),
+    ("kotlin.text.skipWhile", string_skip_while),
+    ("kotlin.CharSequence.skipWhile", string_skip_while),
     ("kotlin.String.substring", string_substring),
     ("kotlin.String.chunked", string_chunked),
     ("kotlin.String.split", string_split),
@@ -593,6 +598,14 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Float.coerceIn", num_coerce_in),
     ("kotlin.Float.coerceAtLeast", num_coerce_at_least),
     ("kotlin.Float.coerceAtMost", num_coerce_at_most),
+    ("kotlin.Int.countLeadingZeroBits", num_count_leading_zero_bits),
+    ("kotlin.Long.countLeadingZeroBits", num_count_leading_zero_bits),
+    ("kotlin.Short.countLeadingZeroBits", num_count_leading_zero_bits),
+    ("kotlin.Byte.countLeadingZeroBits", num_count_leading_zero_bits),
+    ("kotlin.Int.countTrailingZeroBits", num_count_trailing_zero_bits),
+    ("kotlin.Long.countTrailingZeroBits", num_count_trailing_zero_bits),
+    ("kotlin.Int.countOneBits", num_count_one_bits),
+    ("kotlin.Long.countOneBits", num_count_one_bits),
     ("kotlin.Int.floorDiv", num_floor_div),
     ("kotlin.Long.floorDiv", num_floor_div),
     ("kotlin.Short.floorDiv", num_floor_div),
@@ -966,6 +979,9 @@ const PARAM_NAMES: &[(&str, &[&str])] = &[
     ("kotlin.String.contains", &["other", "ignoreCase"]),
     ("kotlin.String.startsWith", &["prefix", "ignoreCase"]),
     ("kotlin.String.endsWith", &["suffix", "ignoreCase"]),
+    ("kotlin.String.regionMatches", &[
+        "thisOffset", "other", "otherOffset", "length", "ignoreCase",
+    ]),
     ("kotlin.String.toInt", &["radix"]),
     ("kotlin.String.toIntOrNull", &["radix"]),
     ("kotlin.Int.toString", &["radix"]),
@@ -2785,6 +2801,88 @@ fn string_starts_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         "startsWith",
     )?;
     Ok(Value::Bool(s.starts_with(&prefix)))
+}
+
+/// `String.regionMatches(thisOffset, other, otherOffset, length,
+/// ignoreCase = false)` — true when the `length`-char regions match.
+/// Out-of-range offsets/lengths yield `false` (Kotlin semantics).
+fn string_region_matches(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.regionMatches")?;
+    let this_off = ctx
+        .args
+        .get(1)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RuntimeError::Type("regionMatches: thisOffset".into()))?;
+    let other = arg_as_string(
+        ctx.args
+            .get(2)
+            .ok_or_else(|| RuntimeError::Arity("regionMatches: other".into()))?,
+        "regionMatches",
+    )?;
+    let other_off = ctx
+        .args
+        .get(3)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RuntimeError::Type("regionMatches: otherOffset".into()))?;
+    let length = ctx
+        .args
+        .get(4)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RuntimeError::Type("regionMatches: length".into()))?;
+    let ignore_case = matches!(ctx.args.get(5), Some(Value::Bool(true)));
+    let sc: Vec<char> = s.chars().collect();
+    let oc: Vec<char> = other.chars().collect();
+    if length < 0
+        || this_off < 0
+        || other_off < 0
+        || this_off + length > sc.len() as i64
+        || other_off + length > oc.len() as i64
+    {
+        return Ok(Value::Bool(false));
+    }
+    for i in 0..length as usize {
+        let a = sc[this_off as usize + i];
+        let b = oc[other_off as usize + i];
+        let eq = if ignore_case {
+            a.eq_ignore_ascii_case(&b)
+                || a.to_lowercase().eq(b.to_lowercase())
+        } else {
+            a == b
+        };
+        if !eq {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+/// `internal inline fun String.skipWhile(startIndex, predicate)` —
+/// kotlin.text helper used by Duration's parser. Returns the first
+/// index >= startIndex whose char fails `predicate` (or `length`).
+fn string_skip_while(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.skipWhile")?;
+    let start = ctx
+        .args
+        .get(1)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RuntimeError::Type("skipWhile: startIndex".into()))?;
+    let block = ctx
+        .args
+        .get(2)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("skipWhile: predicate".into()))?;
+    let chars: Vec<char> = s.chars().collect();
+    let CallCtx { out, host, .. } = ctx;
+    let mut i = if start < 0 { 0i64 } else { start };
+    while (i as usize) < chars.len() {
+        let c = Value::Char(chars[i as usize]);
+        let keep = host.invoke_callable(&block, std::slice::from_ref(&c), *out)?;
+        if !matches!(keep, Value::Bool(true)) {
+            break;
+        }
+        i += 1;
+    }
+    Ok(Value::new_int(i))
 }
 
 fn string_ends_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5931,6 +6029,67 @@ fn int_coerce_at_most(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// negative infinity (Kotlin's `floorDiv`, distinct from `/` which
 /// truncates toward zero). Result widens to `Long` if either operand
 /// is `Long`, else `Int`.
+/// `Int`/`Long`.countLeadingZeroBits() — leading zeros in the
+/// two's-complement bit pattern (32 / 64 wide). Result is Int.
+fn num_count_leading_zero_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Arity("countLeadingZeroBits".into()))?;
+    let n = match recv {
+        Value::Long(v) => (*v as u64).leading_zeros() as i32,
+        Value::Int(v) => (*v as u32).leading_zeros() as i32,
+        Value::Short(v) => (*v as u16).leading_zeros() as i32,
+        Value::Byte(v) => (*v as u8).leading_zeros() as i32,
+        other => {
+            return Err(RuntimeError::Type(format!(
+                "countLeadingZeroBits requires an integer, got {other:?}"
+            )))
+        }
+    };
+    Ok(Value::new_int(n as i64))
+}
+
+/// `Int`/`Long`.countTrailingZeroBits().
+fn num_count_trailing_zero_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Arity("countTrailingZeroBits".into()))?;
+    let n = match recv {
+        Value::Long(v) => (*v as u64).trailing_zeros() as i32,
+        Value::Int(v) => (*v as u32).trailing_zeros() as i32,
+        Value::Short(v) => (*v as u16).trailing_zeros().min(16) as i32,
+        Value::Byte(v) => (*v as u8).trailing_zeros().min(8) as i32,
+        other => {
+            return Err(RuntimeError::Type(format!(
+                "countTrailingZeroBits requires an integer, got {other:?}"
+            )))
+        }
+    };
+    Ok(Value::new_int(n as i64))
+}
+
+/// `Int`/`Long`.countOneBits() (population count).
+fn num_count_one_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Arity("countOneBits".into()))?;
+    let n = match recv {
+        Value::Long(v) => (*v as u64).count_ones() as i32,
+        Value::Int(v) => (*v as u32).count_ones() as i32,
+        Value::Short(v) => (*v as u16).count_ones() as i32,
+        Value::Byte(v) => (*v as u8).count_ones() as i32,
+        other => {
+            return Err(RuntimeError::Type(format!(
+                "countOneBits requires an integer, got {other:?}"
+            )))
+        }
+    };
+    Ok(Value::new_int(n as i64))
+}
+
 fn num_floor_div(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (a, b) = arg2(ctx, "floorDiv")?;
     let (x, y) = (
