@@ -6,29 +6,56 @@ implicit_packages = []
 auto_bindings = true
 
 # Upstream kotlinx-datetime 0.8.0 core commonMain, consumed straight
-# from the in-pack git submodule. `include` curates exactly the files
-# klio can parse + resolve verbatim with no machinery it lacks: the
-# self-contained Month / DayOfWeek enums + factories and the public
-# exception types.
+# from the in-pack git submodule. `include` curates the files klio can
+# parse + run: the self-contained Month / DayOfWeek enums + factories,
+# the public exception types, and the LocalDate / LocalTime /
+# LocalDateTime value types. The value-type files declare `expect
+# class` + non-expect arithmetic/extension helpers; klioMain supplies
+# the matching `actual class` (the `actual` keyword on the class drives
+# klio's expect/actual supersession). The format-DSL members on those
+# classes (`parse(CharSequence, DateTimeFormat)`, `Format { ... }`,
+# `Formats.ISO`) are intentionally left without an actual: they are
+# never reached at runtime, and klio tolerates unresolved references in
+# uninvoked code paths.
 #
-# Every datetime value-type source file (LocalDate.kt, Instant.kt,
-# LocalDateTime.kt, LocalTime.kt, TimeZone.kt, DateTimePeriod.kt,
-# DateTimeUnit.kt, UtcOffset.kt, YearMonth.kt, Clock.kt) and every
-# `serializers/*.kt` file fails to *parse* under klio: they use syntax
-# klio's parser does not yet accept (qualified function-type receivers
-# `A.B.() -> Unit`, qualified anonymous-object supertypes, nested-type
-# params in `(x: A.B)` position). This is a pre-existing klio parser
-# limitation independent of kotlinx-serialization, so the value types
-# stay klio-supplied (klioMain cannot shrink until the parser grows
-# those forms). The serializers that *do* parse
-# (DateTimePeriod/DayOfWeek/Instant/TimeZone) still cannot *run*: they
-# need the format parser-combinator DSL, `kotlin.time.Instant`, the
-# excluded reified-generic serializer factories, or
-# `buildClassSerialDescriptor` (whose body hits a klio `vararg.toList`
-# interpreter gap). The pack now depends on kotlinx.serialization so
-# datetime value types are reflectively `@Serializable`-serializable
-# (see the serialization pack's reflective KSerializer); the
-# consumer-facing value-type surface is still supplied by klioMain.
+# Still klio-supplied (excluded), with the exact per-file blocker:
+#  - Instant.kt    : `import kotlin.time.Instant` — datetime 0.8.0
+#                     moved Instant to the kotlin stdlib; the file is
+#                     all extensions on `kotlin.time.Instant` and its
+#                     bodies use `kotlin.time.Duration` builders
+#                     (`.seconds`/`.nanoseconds`). klio has no
+#                     kotlin.time. (Instant supplied by klioMain.)
+#  - Clock.kt      : `import kotlin.time.Clock` / `kotlin.time.Instant`
+#                     / `kotlin.time.isDistantFuture` /
+#                     `kotlin.time.Duration.Companion.seconds`.
+#  - DateTimePeriod.kt : `import kotlin.time.Duration` + uses it.
+#  - DateTimeUnit.kt   : non-expect class member `public val duration:
+#                     Duration` (kotlin.time.Duration) +
+#                     `import kotlin.time.Duration.Companion.nanoseconds`.
+#  - TimeZone.kt   : `expect open class TimeZone` with member
+#                     extension funcs `Instant.toLocalDateTime()` /
+#                     `LocalDateTime.toInstant()`, companion `UTC:
+#                     FixedOffsetTimeZone`, `serializer():
+#                     KSerializer<TimeZone>`; non-expect
+#                     `Instant.offsetIn` needs `UtcOffset` +
+#                     `FixedOffsetTimeZone` (the typealias `ZoneOffset
+#                     = FixedOffsetTimeZone`). Consuming it would be a
+#                     net-add of UtcOffset/FixedOffsetTimeZone actuals
+#                     (no klioMain shrink) and pulls kotlin.time.Instant
+#                     semantics; left supplied.
+#  - UtcOffset.kt / YearMonth.kt : `expect class` + format DSL +
+#                     serializers; not in klioMain and not exercised —
+#                     consuming is a pure net-add with no run path.
+#  - LocalDateRange.kt / LocalIsoWeekDate.kt / serializers/*.kt :
+#                     depend on `kotlinx.datetime.internal.*`, the
+#                     format parser-combinator DSL, or
+#                     reified-generic serializer factories klio lacks.
+#
+# A `kotlin.time` shim (Duration/Instant/Clock) is the single blocker
+# for Instant/Clock/DateTimePeriod/DateTimeUnit; it is a large
+# subsystem and intentionally not built here. The pack depends on
+# kotlinx.serialization so datetime value types stay reflectively
+# `@Serializable`-serializable.
 [[source]]
 root = "upstream/core/common/src"
 include = [
@@ -36,15 +63,20 @@ include = [
     "DayOfWeek.kt",
     "Exceptions.kt",
     "OverloadMarker.kt",
+    "LocalTime.kt",
+    "LocalDate.kt",
+    "LocalDateTime.kt",
 ]
 
-# klio-supplied platform layer. Declares the value types and operators
-# (Instant, LocalDate/Time/DateTime, TimeZone, Duration, Clock,
-# DateTimePeriod, DateTimeUnit, conversions) that upstream commonMain
-# only declares as `expect`. Bodies are thin Kotlin over the Rust host
-# bindings in src/lib.rs (system clock, chrono-backed tz conversion,
-# ISO parse/format, calendar arithmetic). Month / DayOfWeek are NOT
-# redeclared here; they come from the real upstream files above.
+# klio-supplied platform layer. The `actual class` bodies for the
+# upstream `expect class` LocalDate / LocalTime / LocalDateTime, plus
+# the still-supplied Instant / TimeZone / Duration / Clock /
+# DateTimePeriod / DateTimeUnit and the conversion extensions. Bodies
+# are thin Kotlin over the Rust host bindings in src/lib.rs (system
+# clock, chrono-backed tz conversion, ISO parse/format, calendar
+# arithmetic) plus standard proleptic-Gregorian day arithmetic for the
+# LocalDate epoch/day-of-week/day-of-year accessors. Month / DayOfWeek
+# are NOT redeclared here; they come from the upstream files above.
 [[source]]
 root = "klioMain"
 

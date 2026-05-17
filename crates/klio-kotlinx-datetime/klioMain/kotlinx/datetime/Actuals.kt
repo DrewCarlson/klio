@@ -152,37 +152,91 @@ class Duration internal constructor(
     }
 }
 
-class LocalDate(val year: Int, val monthNumber: Int, val dayOfMonth: Int) : Comparable<LocalDate> {
-    // Bridges to the real upstream `Month` enum (consumed verbatim
-    // from core/common/src/Month.kt) via upstream's own `Month(number)`
-    // factory, so the consumed upstream code is exercised on the live
-    // value-type path.
+// `actual` for upstream `expect class LocalDate` (LocalDate.kt).
+// format-DSL / LocalDateRange members are intentionally absent.
+actual class LocalDate(
+    val year: Int,
+    val monthNumber: Int,
+    val day: Int,
+) : Comparable<LocalDate> {
+    constructor(year: Int, month: Month, day: Int) : this(year, month.number, day)
+
     val month: Month get() = Month(monthNumber)
+    val dayOfMonth: Int get() = day
+
+    fun toEpochDays(): Long {
+        val y = year.toLong()
+        val m = monthNumber.toLong()
+        var total = 365L * y
+        if (y >= 0) {
+            total += (y + 3) / 4 - (y + 99) / 100 + (y + 399) / 400
+        } else {
+            total -= y / -4 - y / -100 + y / -400
+        }
+        total += (367 * m - 362) / 12
+        total += (day - 1).toLong()
+        if (m > 2) {
+            total -= 1
+            if (!isLeapYear(year)) total -= 1
+        }
+        return total - 719528L
+    }
+
+    val dayOfWeek: DayOfWeek
+        get() {
+            val dow0 = ((toEpochDays() + 3) % 7 + 7) % 7
+            return DayOfWeek((dow0 + 1).toInt())
+        }
+
+    val dayOfYear: Int
+        get() {
+            var d = day
+            var mm = 1
+            while (mm < monthNumber) {
+                d += daysInMonth(year, mm)
+                mm += 1
+            }
+            return d
+        }
 
     override fun compareTo(other: LocalDate): Int {
         if (year != other.year) return year.compareTo(other.year)
         if (monthNumber != other.monthNumber) return monthNumber.compareTo(other.monthNumber)
-        return dayOfMonth.compareTo(other.dayOfMonth)
+        return day.compareTo(other.day)
     }
     override fun toString(): String =
-        "${year.toString().padStart(4, '0')}-${monthNumber.toString().padStart(2, '0')}-${dayOfMonth.toString().padStart(2, '0')}"
+        "${year.toString().padStart(4, '0')}-${monthNumber.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}"
 
     override fun equals(other: Any?): Boolean {
         if (other !is LocalDate) return false
-        return year == other.year && monthNumber == other.monthNumber && dayOfMonth == other.dayOfMonth
+        return year == other.year && monthNumber == other.monthNumber && day == other.day
     }
-    override fun hashCode(): Int = year * 10000 + monthNumber * 100 + dayOfMonth
-
-    companion object {
-        fun parse(input: String): LocalDate {
-            val parts = input.split('-')
-            return LocalDate(parts[0].toInt(), parts[1].toInt(), parts[2].toInt())
-        }
-    }
+    override fun hashCode(): Int = year * 10000 + monthNumber * 100 + day
 }
 
-class LocalTime(val hour: Int, val minute: Int, val second: Int, val nanosecond: Int) : Comparable<LocalTime> {
-    override fun compareTo(other: LocalTime): Int {
+internal fun isLeapYear(year: Int): Boolean =
+    (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0)
+
+internal fun daysInMonth(year: Int, month: Int): Int = when (month) {
+    1, 3, 5, 7, 8, 10, 12 -> 31
+    4, 6, 9, 11 -> 30
+    else -> if (isLeapYear(year)) 29 else 28
+}
+
+// `actual` for upstream `expect class LocalTime` (LocalTime.kt).
+// format-DSL members are intentionally absent.
+actual class LocalTime(
+    val hour: Int,
+    val minute: Int,
+    val second: Int = 0,
+    val nanosecond: Int = 0,
+) : Comparable<LocalTime> {
+    fun toSecondOfDay(): Int = (hour * 60 + minute) * 60 + second
+    fun toMillisecondOfDay(): Int = toSecondOfDay() * 1_000 + nanosecond / 1_000_000
+    fun toNanosecondOfDay(): Long =
+        toSecondOfDay().toLong() * 1_000_000_000L + nanosecond.toLong()
+
+    override operator fun compareTo(other: LocalTime): Int {
         if (hour != other.hour) return hour.compareTo(other.hour)
         if (minute != other.minute) return minute.compareTo(other.minute)
         if (second != other.second) return second.compareTo(other.second)
@@ -201,14 +255,24 @@ class LocalTime(val hour: Int, val minute: Int, val second: Int, val nanosecond:
     override fun hashCode(): Int = (((hour * 60 + minute) * 60 + second) * 1_000_000_000) + nanosecond
 }
 
-class LocalDateTime(val date: LocalDate, val time: LocalTime) : Comparable<LocalDateTime> {
-    constructor(year: Int, monthNumber: Int, dayOfMonth: Int, hour: Int, minute: Int, second: Int, nanosecond: Int)
-        : this(LocalDate(year, monthNumber, dayOfMonth), LocalTime(hour, minute, second, nanosecond))
+// `actual` for upstream `expect class LocalDateTime`
+// (LocalDateTime.kt). format-DSL members are intentionally absent.
+actual class LocalDateTime(
+    val date: LocalDate,
+    val time: LocalTime,
+) : Comparable<LocalDateTime> {
+    constructor(year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int = 0, nanosecond: Int = 0)
+        : this(LocalDate(year, month, day), LocalTime(hour, minute, second, nanosecond))
+    constructor(year: Int, month: Month, day: Int, hour: Int, minute: Int, second: Int = 0, nanosecond: Int = 0)
+        : this(LocalDate(year, month.number, day), LocalTime(hour, minute, second, nanosecond))
 
     val year: Int get() = date.year
     val monthNumber: Int get() = date.monthNumber
     val month: Month get() = date.month
-    val dayOfMonth: Int get() = date.dayOfMonth
+    val day: Int get() = date.day
+    val dayOfMonth: Int get() = date.day
+    val dayOfWeek: DayOfWeek get() = date.dayOfWeek
+    val dayOfYear: Int get() = date.dayOfYear
     val hour: Int get() = time.hour
     val minute: Int get() = time.minute
     val second: Int get() = time.second
