@@ -3096,6 +3096,15 @@ impl<'a> Checker<'a> {
         variance: klio_ast::Variance,
         f: &Function,
     ) {
+        // A member that declares its own type parameter of the same
+        // name shadows the class parameter inside its signature, so
+        // the class's variance does not constrain it
+        // (`class C<in T> { fun <T> get(): T }` — the method `T` is a
+        // fresh invariant param; upstream
+        // CancellableContinuationImpl.getSuccessfulResult).
+        if f.type_params.iter().any(|tp| tp.name.name == param) {
+            return;
+        }
         // For `out T`: T must not appear in input positions.
         // For `in T`: T must not appear in output positions.
         match variance {
