@@ -5970,7 +5970,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Body properties: walk each class in the parent chain so a
         // subclass instance also picks up the parent's `var/val`
         // body properties. Each init thunk runs with
-        // `[this, leaf-ctor-args...]`.
+        // `[this, that-class's-own-ctor-args...]` — a parent's
+        // initializer references the parent's primary-ctor params,
+        // which are the super-constructor call's evaluated arguments,
+        // not the leaf subclass's args (the two differ whenever the
+        // subclass adds or reorders params).
+        let chain_args_by_class: std::collections::HashMap<String, Vec<klio_runtime::Value>> =
+            chain.iter().cloned().collect();
         let mut chain_classes: Vec<Arc<klio_runtime::ClassDef>> = Vec::new();
         {
             let mut cur = Some(Arc::clone(&class_def));
@@ -6000,9 +6006,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         ))
                     })?;
                 let module = Arc::clone(&self.module);
-                let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(1 + args.len());
+                let cls_args: &[klio_runtime::Value] = chain_args_by_class
+                    .get(&cls.name)
+                    .map_or(args, |v| v.as_slice());
+                let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(1 + cls_args.len());
                 all.push(inst_value.clone());
-                all.extend_from_slice(args);
+                all.extend_from_slice(cls_args);
                 let mut v = klio_ir::eval::eval_with(&module, &func, all, self)?;
                 if self.module.registry
                     .delegated_body_props
