@@ -28,6 +28,11 @@ pub mod build;
 /// needs no synchronization.
 pub struct ProgramImage {
     module: Arc<klio_ir::Module>,
+    /// Top-level property name → 0-arg initializer FuncId. Mirrors
+    /// `Vm::top_level_props` so a `VmHost` can drive a property's
+    /// initializer on demand when it is read before the in-order
+    /// startup pass reaches it.
+    top_level_prop_inits: std::collections::HashMap<String, klio_ir::FuncId>,
     body_prop_inits:
         std::collections::HashMap<(String, String), klio_ir::FuncId>,
     instance_prop_getters:
@@ -282,6 +287,7 @@ impl Vm {
             closures: SharedClosures::new(),
             prog: Arc::new(ProgramImage {
                 module,
+                top_level_prop_inits: std::collections::HashMap::new(),
                 body_prop_inits: std::collections::HashMap::new(),
                 instance_prop_getters: std::collections::HashMap::new(),
                 instance_prop_setters: std::collections::HashMap::new(),
@@ -321,6 +327,11 @@ impl Vm {
         vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
         vm.prog = Arc::new(ProgramImage {
             module: built.module,
+            top_level_prop_inits: vm
+                .top_level_props
+                .iter()
+                .cloned()
+                .collect(),
             body_prop_inits: built.body_prop_inits,
             instance_prop_getters: built.instance_prop_getters,
             instance_prop_setters: built.instance_prop_setters,
@@ -688,6 +699,59 @@ struct VmHost<'a> {
 }
 
 impl<'a> VmHost<'a> {
+    /// Drive a top-level property's initializer on demand when it is
+    /// read before the in-order startup pass has reached it (an
+    /// earlier top-level initializer constructs a class whose body
+    /// reads a property declared later). Returns the value (also
+    /// cached into `globals` so the later startup pass and subsequent
+    /// reads are consistent), or `None` if `name` is not a top-level
+    /// property. A thread-local guard breaks initializer cycles: a
+    /// re-entrant read returns `None`, matching the JVM static-field
+    /// zero/null default rather than recursing.
+    fn ensure_top_level_inited(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<klio_runtime::Value>, klio_ir::eval::EvalError> {
+        thread_local! {
+            static IN_PROGRESS: std::cell::RefCell<std::collections::HashSet<String>> =
+                std::cell::RefCell::new(std::collections::HashSet::new());
+        }
+        if let Some(v) = self.globals.borrow().lookup(name) {
+            return Ok(Some(v));
+        }
+        let Some(fid) = self.prog.top_level_prop_inits.get(name).copied() else {
+            return Ok(None);
+        };
+        let already = IN_PROGRESS.with(|s| !s.borrow_mut().insert(name.to_string()));
+        if already {
+            return Ok(None);
+        }
+        struct Guard(String);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                IN_PROGRESS.with(|s| {
+                    s.borrow_mut().remove(&self.0);
+                });
+            }
+        }
+        let _guard = Guard(name.to_string());
+        let func = self
+            .module
+            .funcs
+            .get(fid.0 as usize)
+            .cloned()
+            .ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "top-level prop init FuncId {} out of range",
+                    fid.0
+                ))
+            })?;
+        let module = Arc::clone(&self.module);
+        let v = klio_ir::eval::eval_with(&module, &func, Vec::new(), self)?;
+        self.globals.borrow_mut().define(name, v.clone());
+        Ok(Some(v))
+    }
+
     /// Join the spawned OS thread `id`, propagating a thrown
     /// Throwable as a `RuntimeError`. Idempotent: a second join (or
     /// an unknown id) is a no-op since the happens-before edge was
@@ -2268,6 +2332,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // `COROUTINE_SUSPENDED`) through the full global path, which
         // probes package surfaces and auto-invokes a 0-arg constant.
         if let Some(v) = <Self as klio_ir::eval::Host>::lookup_global(self, name) {
+            return Ok(v);
+        }
+        // A top-level property read before its initializer has run in
+        // startup order — e.g. an earlier top-level initializer
+        // constructs a class whose body reads a property declared
+        // later in the file. On the JVM the static field would read
+        // its zero/null default here; klio instead drives the
+        // referenced property's initializer on demand (with a
+        // re-entrancy guard so a genuine init cycle degrades to the
+        // default rather than recursing) and caches the result, so
+        // subsequent reads — and the eventual in-order startup pass —
+        // observe the same value.
+        if let Some(v) = self.ensure_top_level_inited(name)? {
             return Ok(v);
         }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
