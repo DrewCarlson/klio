@@ -742,6 +742,22 @@ pub trait IntrinsicHost {
         self.invoke_callable_with_this(block, &[], scope, out)
     }
 
+    /// Run `block` (a `() -> T`) as the root of a cooperative
+    /// coroutine and drive the scheduler to quiescence, then return
+    /// its terminal value. Backs the `kotlin.coroutines`
+    /// `startCoroutine` boundary: a suspension inside the started
+    /// coroutine parks in the driver and any continuation resumed
+    /// while draining runs, instead of the suspension propagating to
+    /// a non-coroutine caller. Default impl invokes `block` directly
+    /// (no scheduling).
+    fn coroutine_run_root(
+        &mut self,
+        block: &Value,
+        out: &mut dyn Output,
+    ) -> Result<Value, RuntimeError> {
+        self.invoke_callable(block, &[], out)
+    }
+
     /// Spawn `block` as a child coroutine of the active
     /// `runBlocking`/coroutineScope. It interleaves with siblings at
     /// suspension points and is awaited before the root completes.

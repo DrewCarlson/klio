@@ -879,6 +879,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.coroutines.__klio_co_newSlot", coro_new_slot),
     ("kotlin.coroutines.__klio_co_park", coro_park),
     ("kotlin.coroutines.__klio_co_resume", coro_resume),
+    ("kotlin.coroutines.__klio_co_runRoot", coro_run_root),
 
     // ----- Regex -----
     ("kotlin.text.Regex", regex_ctor),
@@ -6919,6 +6920,20 @@ fn coro_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let result = Value::Result { ok, payload: Box::new(payload) };
     ctx.host.coroutine_resume_slot_value(slot, result);
     Ok(Value::Unit)
+}
+
+/// `__klio_co_runRoot(block)` — drive `block` as a cooperative
+/// coroutine root to quiescence, returning its terminal value.
+fn coro_run_root(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let block = match ctx.args.first() {
+        Some(v) => v.clone(),
+        None => {
+            return Err(RuntimeError::Type(
+                "__klio_co_runRoot: missing block".into(),
+            ))
+        }
+    };
+    ctx.host.coroutine_run_root(&block, ctx.out)
 }
 
 /// `Result.getOrThrow()` — the success value, or rethrow the

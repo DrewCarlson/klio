@@ -10,6 +10,7 @@ import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.KlioContinuation
 import kotlin.coroutines.__klio_co_newSlot
 import kotlin.coroutines.__klio_co_park
+import kotlin.coroutines.__klio_co_runRoot
 
 // Obtains the current continuation and either suspends or returns a
 // value immediately. klio model: hand the block a slot-backed
@@ -92,7 +93,7 @@ internal class KlioStartContinuation<T>(
         // enclosing `this` survives a suspension inside the body
         // across the frame-snapshot resume.
         val out: Result<T> = try {
-            Result.success(body())
+            Result.success(__klio_co_runRoot(body))
         } catch (e: Throwable) {
             Result.failure(e)
         }

@@ -37,6 +37,11 @@ internal fun __klio_co_park(slot: Long): Result<Any?> = Result.success(null)
 internal fun __klio_co_resume(slot: Long, ok: Boolean, value: Any?) {
 }
 
+// Drive `block` as a cooperative coroutine root to quiescence and
+// return its terminal value (the start-coroutine driver boundary).
+@PublishedApi
+internal fun <T> __klio_co_runRoot(block: () -> T): T = block()
+
 // --- the continuation klio hands to a suspendCoroutine block -------
 
 @PublishedApi

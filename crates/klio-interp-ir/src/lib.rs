@@ -6906,6 +6906,14 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         self.drive_run_blocking(block, scope, out)
     }
 
+    fn coroutine_run_root(
+        &mut self,
+        block: &klio_runtime::Value,
+        out: &mut dyn Output,
+    ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        self.drive_run_blocking(block, &klio_runtime::Value::Unit, out)
+    }
+
     fn coroutine_launch(
         &mut self,
         block: &klio_runtime::Value,
