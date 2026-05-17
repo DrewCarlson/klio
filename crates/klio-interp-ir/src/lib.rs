@@ -1081,7 +1081,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Probe stdlib by FQN for known package surfaces. Covers
         // bare references to `IntArray`, `compareBy`, `buildList`,
         // `naturalOrder`, `PI`, etc. that aren't in IMPLICIT_ALIASES.
-        let direct_probes: [String; 8] = [
+        let direct_probes: [String; 10] = [
             name.to_string(),
             format!("kotlin.{name}"),
             format!("kotlin.collections.{name}"),
@@ -1090,6 +1090,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             format!("kotlin.math.{name}"),
             format!("kotlin.comparisons.{name}"),
             format!("kotlin.concurrent.{name}"),
+            format!("kotlin.coroutines.{name}"),
+            format!("kotlin.coroutines.intrinsics.{name}"),
         ];
         // Loaded packs register their FQNs in `installed_bindings`.
         // For a bare-name reference, scan the overlay for a key that
@@ -5308,6 +5310,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     .get(&cname)
                     .and_then(|d| d.supertype_names.first().cloned());
                 cur = next;
+            }
+        }
+        // The COROUTINE_SUSPENDED singleton has a fixed member
+        // surface: it stringifies to its own name and equality is
+        // identity against the sole instance.
+        if matches!(receiver, klio_runtime::Value::CoroutineSuspended) {
+            match name {
+                "toString" => {
+                    return Ok(klio_runtime::Value::String(Arc::new(
+                        "COROUTINE_SUSPENDED".to_string(),
+                    )))
+                }
+                "hashCode" => return Ok(klio_runtime::Value::Int(0)),
+                "equals" => {
+                    return Ok(klio_runtime::Value::Bool(matches!(
+                        args.first(),
+                        Some(klio_runtime::Value::CoroutineSuspended)
+                    )))
+                }
+                _ => {}
             }
         }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(

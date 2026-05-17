@@ -883,6 +883,24 @@ fn exec_inst(
                 frame.write(*dst, result);
                 return Ok(());
             }
+            // COROUTINE_SUSPENDED is a methodless singleton: any
+            // equality against it is identity, never a user
+            // `equals` dispatch (it has no member surface).
+            if matches!(
+                *op,
+                BinOp::Eq | BinOp::NotEq | BinOp::BoxedEq | BinOp::BoxedNotEq
+            ) && (matches!(l, Value::CoroutineSuspended)
+                || matches!(r, Value::CoroutineSuspended))
+            {
+                let eq = Value::structural_eq(&l, &r);
+                let b = if matches!(*op, BinOp::NotEq | BinOp::BoxedNotEq) {
+                    !eq
+                } else {
+                    eq
+                };
+                frame.write(*dst, Value::Bool(b));
+                return Ok(());
+            }
             if let Some(method) = operator_method(*op) {
                 if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
                     let result = host.call_member(&l, method, std::slice::from_ref(&r))?;

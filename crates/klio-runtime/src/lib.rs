@@ -915,12 +915,12 @@ impl Scheduler for InProcessScheduler {
 #[derive(Clone)]
 pub enum Value {
     Unit,
-    /// Spec §18.2 sentinel `kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED`.
-    /// Returned from a suspending call site when the underlying
-    /// state machine elected to pause; the carried frame is the
-    /// continuation entry point that, when resumed, will drive
-    /// execution forward.
-    CoroutineSuspended(ObjRef<SuspendFrame>),
+    /// The `kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED`
+    /// singleton. A `suspendCoroutineUninterceptedOrReturn` block
+    /// returns this to signal it parked instead of producing a
+    /// value. There is exactly one logical instance, so every
+    /// `CoroutineSuspended` compares referentially equal.
+    CoroutineSuspended,
     Int(i32),
     Long(i64),
     Short(i16),
@@ -1863,7 +1863,7 @@ impl fmt::Debug for Value {
         match self {
             Self::Cell(c) => write!(f, "Cell({:?})", c.borrow()),
             Self::Unit => write!(f, "Unit"),
-            Self::CoroutineSuspended(_) => write!(f, "CoroutineSuspended"),
+            Self::CoroutineSuspended => write!(f, "CoroutineSuspended"),
             Self::Int(v) => write!(f, "Int({v})"),
             Self::Long(v) => write!(f, "Long({v})"),
             Self::Short(v) => write!(f, "Short({v})"),
@@ -1950,7 +1950,7 @@ impl fmt::Display for Value {
         match self {
             Self::Cell(c) => write!(f, "{}", c.borrow()),
             Self::Unit => write!(f, "kotlin.Unit"),
-            Self::CoroutineSuspended(_) => write!(f, "COROUTINE_SUSPENDED"),
+            Self::CoroutineSuspended => write!(f, "COROUTINE_SUSPENDED"),
             Self::Int(v) => write!(f, "{v}"),
             Self::Long(v) => write!(f, "{v}"),
             Self::Short(v) => write!(f, "{v}"),
@@ -2340,7 +2340,7 @@ impl Value {
             // never reaches a user-visible type query.
             Self::Cell(_) => "kotlin.Any",
             Self::Unit => "kotlin.Unit",
-            Self::CoroutineSuspended(_) => "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED",
+            Self::CoroutineSuspended => "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED",
             Self::Int(_) => "kotlin.Int",
             Self::Long(_) => "kotlin.Long",
             Self::Short(_) => "kotlin.Short",
@@ -2447,7 +2447,7 @@ impl Value {
     pub fn is_runtime_type(&self, name: &str) -> bool {
         match self {
             Value::Cell(c) => c.borrow().is_runtime_type(name),
-            Value::CoroutineSuspended(_) => false,
+            Value::CoroutineSuspended => false,
             Value::Int(_) => matches!(name, "Int" | "Number" | "Any" | "Comparable"),
             Value::Long(_) => matches!(name, "Long" | "Number" | "Any" | "Comparable"),
             Value::Short(_) => matches!(name, "Short" | "Number" | "Any" | "Comparable"),
@@ -2672,6 +2672,7 @@ impl Value {
             (Char(x), Char(y)) => x == y,
             (Null, Null) => true,
             (Unit, Unit) => true,
+            (CoroutineSuspended, CoroutineSuspended) => true,
             (
                 Range { start: a1, end: a2, step: s1, kind: k1 },
                 Range { start: b1, end: b2, step: s2, kind: k2 },
@@ -3265,37 +3266,6 @@ fn publish_instance(inst: &InstanceData, seen: &mut std::collections::HashSet<us
     }
 }
 
-fn publish_suspend_frame(frame: &SuspendFrame, seen: &mut std::collections::HashSet<usize>) {
-    if mark_cell(&frame.env, seen) {
-        publish_env(&frame.env.borrow(), seen);
-    }
-    for (_, v) in &frame.locals {
-        publish_value(v, seen);
-    }
-    match &frame.caller {
-        Some(SuspendCallerCont::Frame(f)) => {
-            if mark_cell(f, seen) {
-                publish_suspend_frame(&f.borrow(), seen);
-            }
-        }
-        Some(SuspendCallerCont::HostSlot(slot)) => {
-            if mark_cell(slot, seen) {
-                if let Some(res) = slot.borrow().as_ref() {
-                    match res {
-                        Ok(v) | Err(v) => publish_value(v, seen),
-                    }
-                }
-            }
-        }
-        None => {}
-    }
-    if let Some(pr) = frame.paused_resume.borrow().as_ref() {
-        match pr {
-            PausedResume::Resumed(v) | PausedResume::Failed(v) => publish_value(v, seen),
-        }
-    }
-}
-
 fn publish_delegate(kind: &DelegateKind, seen: &mut std::collections::HashSet<usize>) {
     match kind {
         DelegateKind::Lazy { producer, cached } => {
@@ -3406,11 +3376,7 @@ fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
                 publish_env(&env.borrow(), seen);
             }
         }
-        Value::CoroutineSuspended(frame) => {
-            if mark_cell(frame, seen) {
-                publish_suspend_frame(&frame.borrow(), seen);
-            }
-        }
+        Value::CoroutineSuspended => {}
 
         Value::Pair(a, b) => {
             publish_value(a, seen);
@@ -3599,37 +3565,6 @@ fn gc_mark_instance(inst: &InstanceData, seen: &mut std::collections::HashSet<us
 }
 
 #[cfg(feature = "gc")]
-fn gc_mark_suspend_frame(frame: &SuspendFrame, seen: &mut std::collections::HashSet<usize>) {
-    if gc_mark_cell(&frame.env, seen) {
-        gc_mark_env(&frame.env.borrow(), seen);
-    }
-    for (_, v) in &frame.locals {
-        gc_mark_value(v, seen);
-    }
-    match &frame.caller {
-        Some(SuspendCallerCont::Frame(f)) => {
-            if gc_mark_cell(f, seen) {
-                gc_mark_suspend_frame(&f.borrow(), seen);
-            }
-        }
-        Some(SuspendCallerCont::HostSlot(slot)) => {
-            if gc_mark_cell(slot, seen) {
-                if let Some(res) = slot.borrow().as_ref() {
-                    match res {
-                        Ok(v) | Err(v) => gc_mark_value(v, seen),
-                    }
-                }
-            }
-        }
-        None => {}
-    }
-    if let Some(pr) = frame.paused_resume.borrow().as_ref() {
-        match pr {
-            PausedResume::Resumed(v) | PausedResume::Failed(v) => gc_mark_value(v, seen),
-        }
-    }
-}
-
 #[cfg(feature = "gc")]
 fn gc_mark_delegate(kind: &DelegateKind, seen: &mut std::collections::HashSet<usize>) {
     match kind {
@@ -3740,11 +3675,7 @@ fn gc_mark_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
                 gc_mark_env(&env.borrow(), seen);
             }
         }
-        Value::CoroutineSuspended(frame) => {
-            if gc_mark_cell(frame, seen) {
-                gc_mark_suspend_frame(&frame.borrow(), seen);
-            }
-        }
+        Value::CoroutineSuspended => {}
 
         Value::Pair(a, b) => {
             gc_mark_value(a, seen);

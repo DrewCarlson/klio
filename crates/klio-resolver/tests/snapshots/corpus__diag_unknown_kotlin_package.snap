@@ -21,6 +21,7 @@ expression: "import kotlin.bogus.Thing\n\nfun main() {\n    println(\"hi\")\n}\n
   [14] Builtin sequence @builtin
   [15] Builtin iterator @builtin
   [16] TopLevelFunction main @31..35
+  [17] Builtin Thing @builtin
 
 # uses
   @44..51 -> [0] println (Builtin)

@@ -174,6 +174,7 @@ pub fn resolve_module(files: &[KotlinFile]) -> Resolution {
         let file_scope = r.push_scope(Some(module_scope), ScopeKind::File);
         for imp in &file.imports {
             r.check_import(imp);
+            r.bind_import_leaf(file_scope, imp);
         }
         for decl in &file.decls {
             r.resolve_decl(file_scope, decl, /*is_top_level=*/ true);
@@ -237,6 +238,12 @@ impl Resolver {
         // Forward-declare every top-level decl so order doesn't matter.
         for decl in &file.decls {
             self.declare_top_level(file_scope, decl);
+        }
+
+        // Imported names are in scope at use sites; bind any leaf a
+        // declaration didn't already claim.
+        for imp in &file.imports {
+            self.bind_import_leaf(file_scope, imp);
         }
 
         for decl in &file.decls {
@@ -972,6 +979,26 @@ impl Resolver {
         let id = SymbolId(self.symbols.len() as u32);
         self.symbols.push(Symbol { id, name, kind, decl_span, nullable: None });
         id
+    }
+
+    /// Bind the leaf of a non-wildcard import (or its `as` alias) so
+    /// use sites of an explicitly imported stdlib value resolve. Only
+    /// fills a name that nothing else already binds, so a same-named
+    /// local/top-level declaration always wins.
+    fn bind_import_leaf(&mut self, scope: ScopeId, imp: &ImportDecl) {
+        if imp.wildcard || imp.path.is_empty() {
+            return;
+        }
+        let leaf = imp
+            .alias
+            .as_ref()
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| imp.path.last().unwrap().name.clone());
+        if self.lookup(scope, &leaf).is_some() {
+            return;
+        }
+        let sym = self.add_symbol(leaf.clone(), SymbolKind::Builtin, None);
+        self.scopes[scope.0 as usize].bindings.insert(leaf, sym);
     }
 }
 

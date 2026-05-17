@@ -874,6 +874,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Result.getOrElse", result_get_or_else),
     ("kotlin.Result.toString", result_to_string),
 
+    // ----- kotlin.coroutines intrinsics -----
+    ("kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED", coroutine_suspended_sentinel),
+
     // ----- Regex -----
     ("kotlin.text.Regex", regex_ctor),
     ("kotlin.text.Regex.pattern", regex_pattern),
@@ -6858,6 +6861,15 @@ fn result_get_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn result_exception_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (ok, payload) = recv_result(ctx.args, "Result.exceptionOrNull")?;
     if ok { Ok(Value::Null) } else { Ok(payload.clone()) }
+}
+
+/// `kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED` — the
+/// singleton a `suspendCoroutineUninterceptedOrReturn` block
+/// returns to signal it parked rather than producing a value.
+/// One logical instance, so `x === COROUTINE_SUSPENDED` holds for
+/// any sentinel `x`.
+fn coroutine_suspended_sentinel(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::CoroutineSuspended)
 }
 
 /// `Result.getOrThrow()` — the success value, or rethrow the
