@@ -83,6 +83,9 @@ pub struct FuncBuilder<'a> {
     /// be a local extension fn) — but a local `val`/`var` of the
     /// same name must NOT hijack member-call syntax.
     local_fns: std::collections::HashSet<String>,
+    /// Subset of `local_fns` declared as extensions (`fun R.f(...)`);
+    /// a bare call must prepend the implicit receiver as `this`.
+    local_ext_fns: std::collections::HashSet<String>,
     is_lambda_body: bool,
     is_inline: bool,
     /// True while lowering a default-argument thunk. A default
@@ -128,6 +131,7 @@ impl<'a> FuncBuilder<'a> {
             tailrec_self: None,
             param_names: std::collections::HashSet::new(),
             local_fns: std::collections::HashSet::new(),
+            local_ext_fns: std::collections::HashSet::new(),
             is_lambda_body: false,
             is_inline: false,
             is_param_thunk: false,
@@ -321,6 +325,12 @@ impl<'a> FuncBuilder<'a> {
     }
     pub fn is_local_fn(&self, name: &str) -> bool {
         self.local_fns.contains(name)
+    }
+    pub fn mark_local_ext_fn(&mut self, name: &str) {
+        self.local_ext_fns.insert(name.to_string());
+    }
+    pub fn is_local_ext_fn(&self, name: &str) -> bool {
+        self.local_ext_fns.contains(name)
     }
     pub fn mark_param(&mut self, name: &str) {
         self.param_names.insert(name.to_string());

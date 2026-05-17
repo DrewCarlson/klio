@@ -2189,7 +2189,25 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         type_args,
                     });
                 } else {
-                    let callee_r = lower_expr(b, callee);
+                    // Not a user module fn. A bound local of this
+                    // name is the callable (a local lambda var);
+                    // otherwise it is a global / scope-fn intrinsic
+                    // (`run`, `let`, …) — resolve it as a global
+                    // directly. `lower_expr` would prepend an
+                    // implicit `this.` inside a method body, turning
+                    // `run { … }` into `this.run` and invoking the
+                    // receiver instance.
+                    let callee_r = if b.resolve(&segments[0].name).is_some()
+                    {
+                        lower_expr(b, callee)
+                    } else {
+                        let r = b.alloc_reg();
+                        let n = b.module.intern_const(Const::String(
+                            segments[0].name.clone(),
+                        ));
+                        b.push(Inst::LoadGlobal { dst: r, name: n });
+                        r
+                    };
                     b.push(Inst::CallValue {
                         dst,
                         callee: callee_r,
@@ -2349,6 +2367,51 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         } else {
                             reg
                         };
+                        // A bare call to a *local extension* function
+                        // (`fun Appendable.two(x)` declared in this
+                        // scope, called `two(n)`) takes the enclosing
+                        // implicit receiver as its first `this` param;
+                        // prepend it so the user args don't slot into
+                        // the receiver position.
+                        if b.is_local_ext_fn(&segments[0].name) {
+                            let this_reg = b.resolve("this").or_else(|| {
+                                if b.knows_outer("this") || b.is_lambda_body() {
+                                    let idx = b.record_capture("this");
+                                    let d = b.alloc_reg();
+                                    b.push(Inst::LoadCapture { dst: d, idx });
+                                    Some(d)
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(this_reg) = this_reg {
+                                let recv = b.alloc_reg();
+                                b.push(Inst::Move { dst: recv, src: this_reg });
+                                let mut vals: Vec<Reg> =
+                                    Vec::with_capacity(args.len() + 1);
+                                vals.push(recv);
+                                for a in args {
+                                    vals.push(lower_expr(b, a));
+                                }
+                                let args_start = b.alloc_reg();
+                                b.push(Inst::Move { dst: args_start, src: vals[0] });
+                                for v in &vals[1..] {
+                                    let slot = b.alloc_reg();
+                                    b.push(Inst::Move { dst: slot, src: *v });
+                                }
+                                let arg_names =
+                                    intern_arg_names(b.module, ast_arg_names);
+                                let dst = b.alloc_reg();
+                                b.push(Inst::CallValue {
+                                    dst,
+                                    callee: callee_reg,
+                                    args: args_start,
+                                    n_args: (vals.len()) as u8,
+                                    arg_names,
+                                });
+                                return dst;
+                            }
+                        }
                         let (args_start, count) = lower_arg_run(b, args);
                         let arg_names = intern_arg_names(b.module, ast_arg_names);
                         let dst = b.alloc_reg();
@@ -4196,6 +4259,9 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     b.bind(f.name.name.clone(), dst);
                 }
                 b.mark_local_fn(&f.name.name);
+                if is_ext {
+                    b.mark_local_ext_fn(&f.name.name);
+                }
             }
             None
         }
