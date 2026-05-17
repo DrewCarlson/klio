@@ -65,8 +65,6 @@ internal fun __kxco_resumeSlot(slot: Long): Unit = Unit
 // `expect` carries the public signature so callers type-check.
 expect fun <T> runBlocking(block: suspend CoroutineScope.() -> T): T
 
-class CancellationException(message: String) : Throwable(message)
-
 interface Job {
     val isActive: Boolean
     val isCompleted: Boolean
