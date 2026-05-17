@@ -2583,6 +2583,12 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 // No declaration matched — roll back so unrelated modifiers
                 // (annotations on expressions, etc.) don't get swallowed.
                 self.pos = save;
+                // A statement may carry leading annotations (`@Suppress(...)`
+                // before a `return`/expression statement). They are runtime
+                // no-ops here; consume and discard so the expression parser
+                // sees the statement itself.
+                let _ = self.parse_annotations();
+                self.skip_nl();
                 self.parse_expr_or_assign_stmt()
             }
         }
