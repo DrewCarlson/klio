@@ -3219,6 +3219,54 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     let span = expr.span().join(rbr.span);
                     expr = Expr::Index { receiver: Box::new(expr), args, span };
                 }
+                // Labeled trailing lambda: `call lbl@ { ... }`. The
+                // label binds the lambda (for `return@lbl`); upstream
+                // kotlinx-coroutines uses this pervasively
+                // (`suspendCoroutineUninterceptedOrReturn sc@ { ... }`).
+                TokenKind::Ident
+                    if !self.suppress_trailing_lambda
+                        && is_trailing_lambda_callable(&expr)
+                        && matches!(
+                            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                            Some(TokenKind::AtNoWs | TokenKind::AtPostWs)
+                        )
+                        && matches!(
+                            self.tokens.get(self.pos + 2).map(|t| &t.kind),
+                            Some(TokenKind::LBrace)
+                        ) =>
+                {
+                    let name_span = self.current_span();
+                    let label = Ident { name: self.ident_name(name_span), span: name_span };
+                    self.bump(); // label ident
+                    self.bump(); // `@`
+                    let lam = self.parse_trailing_lambda()?;
+                    let lspan = label.span.join(lam.span());
+                    let lam = Expr::Labeled {
+                        label,
+                        expr: Box::new(lam),
+                        span: lspan,
+                    };
+                    let span = expr.span().join(lspan);
+                    let extra_type_args = std::mem::take(&mut pending_type_args);
+                    expr = match expr {
+                        Expr::Call { callee, mut args, mut arg_names, mut type_args, is_infix, .. } => {
+                            args.push(lam);
+                            arg_names.push(None);
+                            if type_args.is_empty() {
+                                type_args = extra_type_args;
+                            }
+                            Expr::Call { callee, args, arg_names, type_args, is_infix, span }
+                        }
+                        other => Expr::Call {
+                            callee: Box::new(other),
+                            args: vec![lam],
+                            arg_names: vec![None],
+                            type_args: extra_type_args,
+                            is_infix: false,
+                            span,
+                        },
+                    };
+                }
                 TokenKind::LBrace
                     if is_trailing_lambda_callable(&expr) && !self.suppress_trailing_lambda =>
                 {
