@@ -4381,8 +4381,15 @@ impl<'r> Checker<'r> {
                     // Member exists in a parent.
                     if mflags.is_override {
                         // Parent must be open / abstract for the override
-                        // to be legitimate.
-                        if !(parent_flags.is_open || parent_flags.is_abstract) {
+                        // to be legitimate. Suppressed when an opaque
+                        // (unresolved, e.g. embedded-stdlib / cross-file
+                        // pack) supertype is present: the member may be
+                        // declared there as an implicitly-open interface
+                        // member (upstream `Deferred.await`), which this
+                        // unit cannot see.
+                        if !(parent_flags.is_open || parent_flags.is_abstract)
+                            && !has_opaque_supertype
+                        {
                             self.diagnostics.emit(
                                 Diagnostic::error(
                                     format!(
