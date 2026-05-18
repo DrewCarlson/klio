@@ -1203,6 +1203,36 @@ fn exec_inst(
                     }
                 }
             }
+            // Inner-class outer-chain fallback: a bare call inside an
+            // `inner class` method may target an enclosing-class
+            // member. The enclosing instance is the receiver's
+            // captured `outer` link (not the receiver-lambda
+            // `enclosing_this` stack), so walk it.
+            if resolved.is_none() {
+                let mut cur = match &this_val {
+                    Value::Instance(i) => i.borrow().outer.clone(),
+                    _ => None,
+                };
+                while let Some(o) = cur {
+                    if matches!(o, Value::Null | Value::Unit) {
+                        break;
+                    }
+                    match host.call_member_named(
+                        &o, &name_str, &arg_values, &names,
+                    ) {
+                        Ok(v) => {
+                            resolved = Some(v);
+                            break;
+                        }
+                        Err(e @ EvalError::Suspended(_)) => return Err(e),
+                        Err(_) => {}
+                    }
+                    cur = match &o {
+                        Value::Instance(i) => i.borrow().outer.clone(),
+                        _ => None,
+                    };
+                }
+            }
             let result = match resolved {
                 Some(v) => v,
                 None => {

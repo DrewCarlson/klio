@@ -2562,6 +2562,36 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Inner-class outer-chain fallback: a bare member property
+        // read inside an `inner class` method may name a field of an
+        // enclosing-class instance, reachable via the receiver's
+        // captured `outer` link.
+        if let Some(v) = with_outer_chain_guard(|active| {
+            if !active {
+                return None;
+            }
+            let mut cur = match receiver {
+                klio_runtime::Value::Instance(i) => i.borrow().outer.clone(),
+                _ => None,
+            };
+            while let Some(o) = cur {
+                if matches!(o, klio_runtime::Value::Null | klio_runtime::Value::Unit) {
+                    break;
+                }
+                if let Ok(v) = self.get_field(&o, name) {
+                    if !matches!(v, klio_runtime::Value::Unit) {
+                        return Some(v);
+                    }
+                }
+                cur = match &o {
+                    klio_runtime::Value::Instance(i) => i.borrow().outer.clone(),
+                    _ => None,
+                };
+            }
+            None
+        }) {
+            return Ok(v);
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::get_field `{name}` on `{}`",
             receiver.type_fqn()
@@ -5761,6 +5791,39 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // Inner-class outer-chain fallback: a bare call inside an
+        // `inner class` method may target an enclosing-class member,
+        // reachable through the receiver's captured `outer` link
+        // rather than the receiver-lambda `enclosing_this` stack.
+        if let Some(hit) = with_outer_chain_guard(|active| {
+            if !active {
+                return None;
+            }
+            let mut cur = match receiver {
+                klio_runtime::Value::Instance(i) => i.borrow().outer.clone(),
+                _ => None,
+            };
+            while let Some(o) = cur {
+                if matches!(o, klio_runtime::Value::Null | klio_runtime::Value::Unit) {
+                    break;
+                }
+                match self.call_member(&o, name, args) {
+                    Ok(v) => return Some(Ok(v)),
+                    // Only "method not found here" continues the walk;
+                    // a real throw / suspension from the resolved
+                    // enclosing method must propagate.
+                    Err(klio_ir::eval::EvalError::Unimplemented(_)) => {}
+                    Err(e) => return Some(Err(e)),
+                }
+                cur = match &o {
+                    klio_runtime::Value::Instance(i) => i.borrow().outer.clone(),
+                    _ => None,
+                };
+            }
+            None
+        }) {
+            return hit;
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()
@@ -7134,6 +7197,28 @@ struct ExecState {
 
 thread_local! {
     static EXEC: ExecState = ExecState::default();
+    /// Re-entrancy guard for the inner-class outer-chain dispatch
+    /// fallback. The walk invokes `call_member` / `get_field` on each
+    /// enclosing instance, which themselves run the same fallback;
+    /// without this guard a self-referential `outer` link (or a deep
+    /// chain re-walked at every level) recurses without bound.
+    static OUTER_CHAIN_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the outer-chain fallback guard held; `f` receives
+/// `false` when the guard was already held (caller must skip the
+/// fallback to avoid unbounded re-entrancy).
+fn with_outer_chain_guard<R>(f: impl FnOnce(bool) -> R) -> R {
+    let was = OUTER_CHAIN_ACTIVE.with(|c| {
+        let prev = c.get();
+        c.set(true);
+        prev
+    });
+    let r = f(!was);
+    if !was {
+        OUTER_CHAIN_ACTIVE.with(|c| c.set(false));
+    }
+    r
 }
 
 /// Run `f` against this thread's coroutine interceptor stack.
