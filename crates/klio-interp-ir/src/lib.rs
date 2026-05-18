@@ -877,21 +877,29 @@ impl<'a> VmHost<'a> {
         // overload declared on a supertype (`f(s: Segment)`) is picked
         // for a subclass argument (`ChannelSegment`).
         if let klio_runtime::Value::Instance(_) = arg {
-            let mut queue: std::collections::VecDeque<String> =
+            // Distance-weighted subtype match: a parameter type that
+            // is *closer* in the receiver's hierarchy outranks a more
+            // distant ancestor, so `x.ensureActive()` on a value that
+            // is both a `Job` and (transitively) a `CoroutineContext`
+            // binds `Job.ensureActive` rather than the more general
+            // `CoroutineContext.ensureActive` (which would recurse).
+            let mut queue: std::collections::VecDeque<(String, i32)> =
                 std::collections::VecDeque::new();
             let mut seen: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            queue.push_back(v_ty.to_string());
-            while let Some(cur) = queue.pop_front() {
+            queue.push_back((v_ty.to_string(), 0));
+            while let Some((cur, depth)) = queue.pop_front() {
                 if !seen.insert(cur.clone()) {
                     continue;
                 }
                 if cur == nm {
-                    return Some(60);
+                    // Direct match 60; each hierarchy step costs 1,
+                    // floored well above generic(5)/Unit(1).
+                    return Some(60 - depth.min(50));
                 }
                 if let Some(def) = self.classes.borrow().get(&cur).cloned() {
                     for sup in &def.supertype_names {
-                        queue.push_back(sup.clone());
+                        queue.push_back((sup.clone(), depth + 1));
                     }
                 }
             }
