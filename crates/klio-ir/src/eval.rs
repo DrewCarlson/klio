@@ -1171,10 +1171,17 @@ fn exec_inst(
                 .map_or(false, |c| c.is_uppercase());
             let mut resolved: Option<Value> = None;
             if !is_ctor_name && !matches!(this_val, Value::Null | Value::Unit) {
-                if let Ok(v) = host.call_member_named(
+                match host.call_member_named(
                     &this_val, &name_str, &arg_values, &names,
                 ) {
-                    resolved = Some(v);
+                    Ok(v) => resolved = Some(v),
+                    // A suspension is not a "member not found": the
+                    // target *was* dispatched and parked. Propagate it
+                    // so the cooperative driver resumes the activation,
+                    // instead of swallowing it and misreporting the
+                    // name as an unresolved global.
+                    Err(e @ EvalError::Suspended(_)) => return Err(e),
+                    Err(_) => {}
                 }
             }
             // Enclosing-receiver fallback: inside a receiver lambda
@@ -1184,10 +1191,14 @@ fn exec_inst(
             if resolved.is_none() {
                 if let Some(outer) = host.enclosing_this() {
                     if !matches!(outer, Value::Null | Value::Unit) {
-                        if let Ok(v) = host.call_member_named(
+                        match host.call_member_named(
                             &outer, &name_str, &arg_values, &names,
                         ) {
-                            resolved = Some(v);
+                            Ok(v) => resolved = Some(v),
+                            Err(e @ EvalError::Suspended(_)) => {
+                                return Err(e)
+                            }
+                            Err(_) => {}
                         }
                     }
                 }

@@ -874,6 +874,31 @@ impl<'a> VmHost<'a> {
             }
             return Some(15);
         }
+        // Subtype: an instance argument whose class transitively
+        // extends / implements the parameter's nominal type matches
+        // (below an exact-name match, above generic/Unit), so an
+        // overload declared on a supertype (`f(s: Segment)`) is picked
+        // for a subclass argument (`ChannelSegment`).
+        if let klio_runtime::Value::Instance(_) = arg {
+            let mut queue: std::collections::VecDeque<String> =
+                std::collections::VecDeque::new();
+            let mut seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            queue.push_back(v_ty.to_string());
+            while let Some(cur) = queue.pop_front() {
+                if !seen.insert(cur.clone()) {
+                    continue;
+                }
+                if cur == nm {
+                    return Some(60);
+                }
+                if let Some(def) = self.classes.borrow().get(&cur).cloned() {
+                    for sup in &def.supertype_names {
+                        queue.push_back(sup.clone());
+                    }
+                }
+            }
+        }
         // Generic single-letter type-parameter — accept any.
         if nm.len() <= 2 && nm.chars().all(|c| c.is_ascii_uppercase()) {
             return Some(5);
