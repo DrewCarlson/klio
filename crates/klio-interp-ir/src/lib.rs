@@ -5397,6 +5397,16 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // each name maps back to a klio_ir::Class via the
             // module's class_index.
             let class_name = inst.borrow().class.name.clone();
+            // The receiver's own class is resolved by its
+            // fully-qualified name: two packages may declare the same
+            // simple name (`kotlinx.io.Segment` vs the abstract
+            // `kotlinx.coroutines.internal.Segment`); a bare-name
+            // lookup would bind the first IR class and lose this
+            // class's members (`Segment.writeInt`). Supertype levels
+            // keep the simple-name walk (their names are recorded
+            // simple).
+            let recv_fqn = inst.borrow().class.fqn.clone();
+            let mut first = true;
             let mut queue: std::collections::VecDeque<String> =
                 std::collections::VecDeque::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -5405,12 +5415,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 if !seen.insert(cur_name.clone()) {
                     continue;
                 }
-                let ir_class = self
-                    .module
-                    .classes
-                    .iter()
-                    .find(|c| c.name == cur_name)
-                    .cloned();
+                let by_fqn = if first {
+                    self.module
+                        .class_id_by_fqn(&recv_fqn)
+                        .and_then(|cid| self.module.classes.get(cid.0 as usize))
+                        .cloned()
+                } else {
+                    None
+                };
+                first = false;
+                let ir_class = by_fqn.or_else(|| {
+                    self.module
+                        .classes
+                        .iter()
+                        .find(|c| c.name == cur_name)
+                        .cloned()
+                });
                 if let Some(ir_class) = ir_class {
                     // Gather every method named `name` so we can pick
                     // an overload by scoring runtime arg types.

@@ -1021,6 +1021,33 @@ pub fn lower_class_with_file(
     lower_class_with_extras(module, c, file_classes, &std::collections::HashSet::new())
 }
 
+/// Like [`lower_class_with_extras`] but stamps the IR class with a
+/// caller-supplied package-qualified FQN. Two packages may declare
+/// the same simple class name; a distinct FQN lets `add_class` keep
+/// them as separate definitions instead of collapsing one onto the
+/// other.
+pub fn lower_class_with_extras_fqn(
+    module: &mut crate::Module,
+    c: &klio_ast::Class,
+    file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
+    extra_members: &std::collections::HashSet<String>,
+    class_fqn: &str,
+) -> crate::ClassId {
+    LOWER_CLASS_FQN.with(|f| *f.borrow_mut() = Some(class_fqn.to_string()));
+    let id = lower_class_with_extras(module, c, file_classes, extra_members);
+    LOWER_CLASS_FQN.with(|f| *f.borrow_mut() = None);
+    id
+}
+
+thread_local! {
+    /// Package-qualified FQN for the class currently being lowered by
+    /// `lower_class_with_extras_fqn`. Read once where the IR `Class`
+    /// shell is created. A thread-local keeps the existing public
+    /// signatures (and their other callers/tests) unchanged.
+    static LOWER_CLASS_FQN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Same as `lower_class_with_file` but mixes an additional set of
 /// member names into the class's `own_members`. Used when a nested
 /// class is lifted to top level: the outer's property + method
@@ -1046,10 +1073,13 @@ pub fn lower_class_with_extras(
         .collect();
     // Register the class shell first so the class name resolves
     // inside its own method bodies (`class Foo { fun copy() = Foo(...) }`).
+    let class_fqn = LOWER_CLASS_FQN
+        .with(|f| f.borrow().clone())
+        .unwrap_or_else(|| c.name.name.clone());
     let class_id = module.add_class(crate::Class {
         id: crate::ClassId(0),
         name: c.name.name.clone(),
-        fqn: c.name.name.clone(),
+        fqn: class_fqn,
         primary_params,
         methods: Vec::new(),
         init_block: None,

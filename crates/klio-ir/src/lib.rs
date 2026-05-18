@@ -654,15 +654,52 @@ impl Module {
     /// to that id stay valid.
     pub fn add_class(&mut self, mut class: Class) -> ClassId {
         if let Some(&(_, id)) = self.class_index.iter().find(|(n, _)| n == &class.name) {
-            class.id = id;
-            self.classes[id.0 as usize] = class;
-            return id;
+            let existing = &self.classes[id.0 as usize];
+            let is_stub = existing.fqn == existing.name
+                && existing.methods.is_empty()
+                && existing.primary_params.is_empty()
+                && existing.supertypes.is_empty()
+                && existing.init_block.is_none();
+            // A reserved-stub fill, or the same class re-lowered
+            // (identical FQN), overwrites in place so forward
+            // references keep their id. A *different* fully-qualified
+            // name sharing the simple name is a genuinely distinct
+            // class from another package
+            // (`kotlinx.coroutines.internal.Segment` vs
+            // `kotlinx.io.Segment`): give it its own ClassId so its
+            // methods are not collapsed onto the sibling. The
+            // simple-name index keeps its first entry, so `class_id`
+            // and the reserve/forward-reference machinery are
+            // unchanged; the distinct class is reachable via
+            // `class_id_by_fqn`.
+            if is_stub || existing.fqn == class.fqn || class.fqn == class.name {
+                class.id = id;
+                self.classes[id.0 as usize] = class;
+                return id;
+            }
         }
         let id = ClassId(self.classes.len() as u32);
         class.id = id;
         self.class_index.push((class.name.clone(), id));
         self.classes.push(class);
         id
+    }
+
+    /// Resolve a class by its fully-qualified name. Distinguishes
+    /// same-simple-name classes from different packages that
+    /// [`add_class`](Self::add_class) keeps as separate definitions.
+    #[must_use]
+    pub fn class_id_by_fqn(&self, fqn: &str) -> Option<ClassId> {
+        // Only resolve when the FQN is unambiguous. A residual
+        // collision (e.g. a synthesized class that fell back to a
+        // bare name) must not silently bind the wrong class — callers
+        // then keep their existing simple-name resolution.
+        let mut it = self.classes.iter().filter(|c| c.fqn == fqn);
+        let first = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        Some(first.id)
     }
 
     /// Pre-register a class name so `class_id` resolves it before its

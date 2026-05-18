@@ -555,8 +555,18 @@ fn collect_class_fqns(
         if !pkg.is_empty() {
             out.insert(c.span, format!("{}.{}", pkg, c.name.name));
         }
+        // Recurse with the enclosing class appended so nested
+        // declarations get proper `pkg.Outer.Inner` FQNs. A flat
+        // `pkg` would give every package's `companion object` the
+        // same `pkg.Companion`, making FQNs non-unique and
+        // mis-resolving FQN-keyed lookups.
+        let inner_pkg = if pkg.is_empty() {
+            c.name.name.clone()
+        } else {
+            format!("{}.{}", pkg, c.name.name)
+        };
         for m in &c.members {
-            collect_class_fqns(m, pkg, out);
+            collect_class_fqns(m, &inner_pkg, out);
         }
     }
     if let Decl::Object(o) = d {
@@ -915,11 +925,19 @@ fn build_module_with_overrides(
         if let Decl::Class(c) = d {
             let empty = std::collections::HashSet::new();
             let extras = nested_outer_members.get(&c.name.name).unwrap_or(&empty);
-            let _ = klio_ir::lower::lower_class_with_extras(
+            let cfqn = fqn_overrides.get(&c.span).cloned().unwrap_or_else(|| {
+                if package_prefix.is_empty() {
+                    c.name.name.clone()
+                } else {
+                    format!("{}.{}", package_prefix, c.name.name)
+                }
+            });
+            let _ = klio_ir::lower::lower_class_with_extras_fqn(
                 &mut module,
                 c,
                 &file_classes,
                 extras,
+                &cfqn,
             );
         }
     }
