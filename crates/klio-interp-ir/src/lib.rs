@@ -1614,6 +1614,27 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // A bare class/interface name used as a value resolves to its
+        // companion object (Kotlin). Lowering emits this sentinel read
+        // on the loaded class; yield the companion singleton when the
+        // class declares one, else the receiver unchanged (no
+        // companion / `object` singleton — left as-is).
+        if name == "<class-companion-or-self>" {
+            if let klio_runtime::Value::Class(cls) = receiver {
+                if let Some(comp_name) = self
+                    .module
+                    .registry
+                    .companion_singletons
+                    .get(&cls.name)
+                    .cloned()
+                {
+                    if let Some(s) = self.globals.borrow().lookup(&comp_name) {
+                        return Ok(s);
+                    }
+                }
+            }
+            return Ok(receiver.clone());
+        }
         // Backing-field bypass: getter / setter bodies that reference
         // `field` lower into a member read on this synthetic name.
         // Route straight to the raw instance slot to break recursion.

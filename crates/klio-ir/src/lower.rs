@@ -1425,6 +1425,31 @@ fn lower_function_body_with_implicit_owner(
 /// register holding the result. Statements that do not produce a
 /// value (assignments, declarations) return a synthetic `Unit`
 /// register so downstream code stays uniform.
+/// Lower an expression that appears as the *receiver / qualifier
+/// head* of a member access or call (`recv.member`, `recv.m()`,
+/// `recv::ref`, `recv.x = v`). A bare single-segment class/interface
+/// name here is a *qualifier* — it must stay the `Value::Class` so
+/// nested-class (`Outer.Inner`) and companion-member forwarding work
+/// — unlike the same Path in value position, which resolves to the
+/// companion object. Everything else defers to `lower_expr`.
+pub fn lower_receiver(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
+    if let Expr::Path { segments, .. } = expr {
+        if segments.len() == 1 {
+            let n = &segments[0].name;
+            if b.resolve(n).is_none()
+                && !b.knows_outer(n)
+                && b.module.class_id(n).is_some()
+            {
+                let dst = b.alloc_reg();
+                let nm = b.module.intern_const(Const::String(n.clone()));
+                b.push(Inst::LoadGlobal { dst, name: nm });
+                return dst;
+            }
+        }
+    }
+    lower_expr(b, expr)
+}
+
 pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
     match expr {
         Expr::IntLit { value, kind, .. } => {
@@ -1608,12 +1633,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         }
                     }
                     Expr::Member { receiver, name, safe: false, .. } => {
-                        let recv = lower_expr(b, receiver);
+                        let recv = lower_receiver(b, receiver);
                         let field = b.module.intern_const(Const::String(name.name.clone()));
                         b.push(Inst::SetField { receiver: recv, field, value: dst });
                     }
                     Expr::Index { receiver, args: idx_args, .. } => {
-                        let recv = lower_expr(b, receiver);
+                        let recv = lower_receiver(b, receiver);
                         let n_keys = idx_args.len();
                         let key_start = b.alloc_reg();
                         let mut key_slots: Vec<Reg> = vec![key_start];
@@ -1772,11 +1797,26 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // miss. The class value flows into get_field /
                 // call_member which forward to the companion.
                 if b.module.class_id(&segments[0].name).is_some() {
-                    let dst = b.alloc_reg();
+                    let cls = b.alloc_reg();
                     let n = b
                         .module
                         .intern_const(Const::String(segments[0].name.clone()));
-                    b.push(Inst::LoadGlobal { dst, name: n });
+                    b.push(Inst::LoadGlobal { dst: cls, name: n });
+                    // A bare class/interface name in *value* position
+                    // (Kotlin: only well-formed when it declares a
+                    // companion) is the companion object, not the
+                    // class. Qualifier heads (`Foo.member`, `Foo(..)`,
+                    // `Foo::class`) lower their receiver via
+                    // `lower_receiver` / NewInstance / ClassLiteral and
+                    // never reach here. The sentinel read yields the
+                    // companion when one exists, else the class value
+                    // unchanged (objects / no-companion classes are
+                    // untouched).
+                    let dst = b.alloc_reg();
+                    let sentinel = b.module.intern_const(Const::String(
+                        "<class-companion-or-self>".to_string(),
+                    ));
+                    b.push(Inst::GetField { dst, receiver: cls, field: sentinel });
                     return dst;
                 }
                 // A bare builtin type name used as a qualifier
@@ -1973,7 +2013,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         Expr::Member { receiver, name, safe, .. } if *safe => {
             // `recv?.x` — null-guard: if recv is null, the whole
             // expression is null; otherwise read the field.
-            let recv = lower_expr(b, receiver);
+            let recv = lower_receiver(b, receiver);
             let null_r = b.emit_const(Const::Null);
             let is_null = b.alloc_reg();
             b.push(Inst::BinOp { dst: is_null, op: BinOp::Eq, lhs: recv, rhs: null_r });
@@ -2021,7 +2061,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                 }
             }
-            let recv = lower_expr(b, receiver);
+            let recv = lower_receiver(b, receiver);
             let dst = b.alloc_reg();
             let field = b.module.intern_const(Const::String(name.name.clone()));
             b.push(Inst::GetField { dst, receiver: recv, field });
@@ -2031,7 +2071,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // `r[a, b, ...]` → r.get(a, b, ...). Evaluator's
             // CallMember + host.call_member route dispatches to
             // Value::Map / List / Array / user classes uniformly.
-            let recv = lower_expr(b, receiver);
+            let recv = lower_receiver(b, receiver);
             let (args_start, count) = lower_arg_run(b, args);
             let dst = b.alloc_reg();
             let nm = b.module.intern_const(Const::String("get".into()));
@@ -2061,7 +2101,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let Expr::Member { receiver, name, .. } = callee.as_ref() else {
                 unreachable!()
             };
-            let recv = lower_expr(b, receiver);
+            let recv = lower_receiver(b, receiver);
             let null_r = b.emit_const(Const::Null);
             let is_null = b.alloc_reg();
             b.push(Inst::BinOp { dst: is_null, op: BinOp::Eq, lhs: recv, rhs: null_r });
@@ -2145,7 +2185,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // lambda so the env's mutations are synced back to
             // the caller's regs after the call returns.
             let Expr::Member { receiver, name, .. } = callee.as_ref() else { unreachable!() };
-            let recv = lower_expr(b, receiver);
+            let recv = lower_receiver(b, receiver);
             // Lower args individually so we can remember each
             // lambda's reg for writeback.
             let mut arg_regs: Vec<Reg> = Vec::with_capacity(args.len());
@@ -3075,7 +3115,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         // runtime type, so emit CallMemberOrValue: the
                         // member wins if present, else the local is
                         // invoked with `recv` prepended.
-                        let recv = lower_expr(b, receiver);
+                        let recv = lower_receiver(b, receiver);
                         let (args_start, count) = lower_arg_run(b, args);
                         let arg_names = intern_arg_names(b.module, ast_arg_names);
                         let nm =
@@ -3134,7 +3174,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             }
                         }
                     }
-                    let recv = lower_expr(b, receiver);
+                    let recv = lower_receiver(b, receiver);
                     let (args_start, count) = lower_arg_run(b, args);
                     let arg_names = intern_arg_names(b.module, ast_arg_names);
                     let dst = b.alloc_reg();
@@ -3417,7 +3457,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // the generic "evaluate inner once, write back via
                 // Path / Member" path.
                 if let Expr::Index { receiver, args: idx_args, .. } = inner.as_ref() {
-                    let recv = lower_expr(b, receiver);
+                    let recv = lower_receiver(b, receiver);
                     let n_keys = idx_args.len();
                     let key_start = b.alloc_reg();
                     let mut key_slots: Vec<Reg> = vec![key_start];
@@ -3505,13 +3545,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         // `obj.field++` — write the incremented value
                         // back through the same SetField path the
                         // host's set_field uses for class setters.
-                        let recv = lower_expr(b, receiver);
+                        let recv = lower_receiver(b, receiver);
                         let field = b.module.intern_const(Const::String(name.name.clone()));
                         b.push(Inst::SetField { receiver: recv, field, value: new });
                     }
                     Expr::Index { receiver, args: idx_args, .. } => {
                         // `xs[i]++` — read above, write back via .set(i, new).
-                        let recv = lower_expr(b, receiver);
+                        let recv = lower_receiver(b, receiver);
                         let n_keys = idx_args.len();
                         let key_start = b.alloc_reg();
                         let mut key_slots: Vec<Reg> = vec![key_start];
@@ -3608,7 +3648,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.push(Inst::LoadGlobal { dst, name: nm });
                 return dst;
             }
-            let recv = lower_expr(b, receiver);
+            let recv = lower_receiver(b, receiver);
             let dst = b.alloc_reg();
             let nm = b.module.intern_const(Const::String(name.name.clone()));
             b.push(Inst::MemberRef { dst, receiver: recv, name: nm });
@@ -4638,7 +4678,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     }
                 }
                 Expr::Member { receiver, name, .. } => {
-                    let recv = lower_expr(b, receiver);
+                    let recv = lower_receiver(b, receiver);
                     let field = b.module.intern_const(Const::String(name.name.clone()));
                     b.push(Inst::SetField { receiver: recv, field, value: combined });
                 }
@@ -4647,7 +4687,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     // map / mutable-list assignment dispatches
                     // through the same call_member path that
                     // handles built-in collection mutation.
-                    let recv = lower_expr(b, receiver);
+                    let recv = lower_receiver(b, receiver);
                     // Reserve a contiguous run of slots for keys +
                     // value BEFORE lowering the key expressions,
                     // since lowering each key may allocate auxiliary
