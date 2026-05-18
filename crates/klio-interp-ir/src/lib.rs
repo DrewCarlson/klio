@@ -1137,6 +1137,55 @@ impl<'a> VmHost<'a> {
             other => klio_ir::eval::EvalError::Type(format!("{other}")),
         })
     }
+
+    /// Resolve the user extension/top-level fn an unqualified
+    /// `recv.name(args)` would dispatch to — identical candidate
+    /// selection to the `call_member` extension-fn fallback (arity
+    /// filter, unique-exact-arity, then receiver/arg type scoring).
+    /// Shared so the named-argument path picks the *same* overload
+    /// the positional path does.
+    fn resolve_ext_overload(
+        &self,
+        name: &str,
+        receiver: &klio_runtime::Value,
+        args: &[klio_runtime::Value],
+    ) -> Option<klio_ir::FuncId> {
+        let want = args.len() + 1;
+        let candidates: Vec<(klio_ir::FuncId, klio_ir::Func)> = self
+            .module
+            .func_index
+            .iter()
+            .filter(|(n, _)| n == name)
+            .filter_map(|(_, fid)| {
+                self.module.funcs.get(fid.0 as usize).cloned().map(|f| (*fid, f))
+            })
+            .filter(|(_fid, f)| !f.params.is_empty() && f.params.len() >= want)
+            .collect();
+        if candidates.len() <= 1 {
+            return candidates.into_iter().next().map(|(fid, _)| fid);
+        }
+        let mut exact = candidates.iter().filter(|(_, f)| f.params.len() == want);
+        if let (Some(only), None) = (exact.next(), exact.next()) {
+            return Some(only.0);
+        }
+        let mut best: Option<(klio_ir::FuncId, i32)> = None;
+        for (fid, f) in candidates {
+            let mut score =
+                self.overload_score_arg(&f.params[0].ty, receiver).unwrap_or(-1);
+            for (i, a) in args.iter().enumerate() {
+                if let Some(p) = f.params.get(i + 1) {
+                    score += self.overload_score_arg(&p.ty, a).unwrap_or(-1);
+                }
+            }
+            if f.params.len() == want {
+                score += 5;
+            }
+            if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+                best = Some((fid, score));
+            }
+        }
+        best.map(|(fid, _)| fid)
+    }
 }
 
 impl<'a> klio_ir::eval::Host for VmHost<'a> {
@@ -5824,6 +5873,27 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                     break;
                 }
+            }
+        }
+        // User extension / member fn with named args: route through
+        // `call_func_named` so names slot by the resolved function's
+        // own parameter list and omitted (incl. *leading* defaulted)
+        // params are filled — `recv.f(h = x)` for
+        // `fun R.f(flag: Boolean = true, h: H)` must bind `h`, not
+        // shift `x` into `flag`. Without this the fall-through dropped
+        // `arg_names` and bound positionally.
+        if arg_names.iter().any(|n| n.is_some()) {
+            if let Some(fid) = self.resolve_ext_overload(name, receiver, args) {
+                let module = Arc::clone(&self.module);
+                let mut all: Vec<klio_runtime::Value> =
+                    Vec::with_capacity(args.len() + 1);
+                all.push(receiver.clone());
+                all.extend_from_slice(args);
+                let mut names: Vec<Option<String>> =
+                    Vec::with_capacity(arg_names.len() + 1);
+                names.push(None); // implicit `this` receiver slot
+                names.extend(arg_names.iter().cloned());
+                return self.call_func_named(&module, fid, all, &names);
             }
         }
         self.call_member(receiver, name, args)
