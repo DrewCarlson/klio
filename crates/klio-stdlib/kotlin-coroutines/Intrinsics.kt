@@ -51,7 +51,7 @@ public fun <R, T> (suspend R.() -> T).createCoroutineUnintercepted(
     completion: Continuation<T>
 ): Continuation<Unit> {
     val block = this
-    return KlioStartContinuation(completion) { receiver.block() }
+    return KlioStartContinuation(completion) { block(receiver) }
 }
 
 public fun <T> (suspend () -> T).startCoroutineUninterceptedOrReturn(
@@ -66,7 +66,7 @@ public fun <R, T> (suspend R.() -> T).startCoroutineUninterceptedOrReturn(
     completion: Continuation<T>
 ): Any? {
     val block = this
-    return startBlock(completion) { receiver.block() }
+    return startBlock(completion) { block(receiver) }
 }
 
 internal fun <T> startBlock(completion: Continuation<T>, body: () -> T): Any? {

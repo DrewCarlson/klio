@@ -3194,6 +3194,32 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 }
             }
+            // `super.<prop>` (a property read, lowered as a 0-arg
+            // CallSuper): no method named `name` on this class — look
+            // for its property getter. Walking from the parent skips
+            // the overriding subclass's getter, so `override val x
+            // get() = super.x` reads the base getter instead of
+            // recursing into itself.
+            if args.is_empty() {
+                if let Some(fid) = self
+                    .prog
+                    .instance_prop_getters
+                    .get(&(cname.clone(), name.to_string()))
+                    .copied()
+                {
+                    if let Some(func) =
+                        self.module.funcs.get(fid.0 as usize).cloned()
+                    {
+                        let module = Arc::clone(&self.module);
+                        return klio_ir::eval::eval_with(
+                            &module,
+                            &func,
+                            vec![receiver.clone()],
+                            self,
+                        );
+                    }
+                }
+            }
             // Step to the next non-interface supertype.
             let next: Option<String> = self
                 .classes
@@ -3201,6 +3227,16 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 .get(&cname)
                 .and_then(|d| d.supertype_names.first().cloned());
             current = next;
+        }
+        // `super.<prop>` where the base property has no custom getter
+        // (a stored val/var): read the backing field off the receiver
+        // instance directly rather than failing.
+        if args.is_empty() {
+            if let klio_runtime::Value::Instance(inst) = receiver {
+                if let Some(v) = inst.borrow().get(name) {
+                    return Ok(v);
+                }
+            }
         }
         Err(klio_ir::eval::EvalError::Type(format!(
             "super.{name}: no matching method up the supertype chain from `{owner_class}`"
@@ -5396,8 +5432,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 })
                 .filter(|(_fid, f)| !f.params.is_empty() && f.params.len() >= want)
                 .collect();
+            let unique_exact: Option<(klio_ir::FuncId, klio_ir::Func)> = {
+                // Kotlin disambiguates same-named extensions by
+                // applicable arity first. When exactly one candidate's
+                // declared arity equals the supplied (receiver + args)
+                // count it is the unique applicable overload — pick it
+                // before type-scoring, which otherwise mis-ranks a
+                // `suspend ()->T` receiver (its lowered arity includes
+                // the continuation) as `Function1` and selects the
+                // wrong receiver-form `startCoroutine` /
+                // `createCoroutineUnintercepted`.
+                let mut it = candidates.iter().filter(|(_, f)| f.params.len() == want);
+                match (it.next(), it.next()) {
+                    (Some(only), None) => Some(only.clone()),
+                    _ => None,
+                }
+            };
             let chosen = if candidates.len() <= 1 {
                 candidates.into_iter().next()
+            } else if unique_exact.is_some() {
+                unique_exact
             } else {
                 // Score the receiver (param 0) *and* every value
                 // argument against the declared parameter types, so

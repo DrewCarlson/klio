@@ -2038,6 +2038,41 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             dst
         }
         Expr::Member { receiver, name, .. } => {
+            // `super.<prop>` is a property read on the superclass —
+            // dispatch its getter via the parent chain (a 0-arg
+            // `CallSuper`), never `this.<prop>` (which would re-enter
+            // an overriding getter, e.g. `override val isActive get()
+            // = super.isActive`, and recurse forever). Mirrors the
+            // `super.method(...)` CallSuper path.
+            if let Expr::Super { qualifier, label, .. } = receiver.as_ref() {
+                if let Some(this_reg) = b.resolve("this") {
+                    if let Some(owner) = b.owner_class().map(|s| s.to_string()) {
+                        let dst = b.alloc_reg();
+                        let nm = b.module.intern_const(Const::String(name.name.clone()));
+                        let oc = b.module.intern_const(Const::String(owner));
+                        let qual_const = qualifier
+                            .as_ref()
+                            .map(|t| b.module.intern_const(Const::String(t.name.name.clone())))
+                            .or_else(|| {
+                                label.as_ref().map(|id| {
+                                    b.module.intern_const(Const::String(id.name.clone()))
+                                })
+                            });
+                        let args_start = b.alloc_reg();
+                        b.push(Inst::CallSuper {
+                            dst,
+                            receiver: this_reg,
+                            owner_class: oc,
+                            qualifier: qual_const,
+                            name: nm,
+                            args: args_start,
+                            n_args: 0,
+                            arg_names: Vec::new(),
+                        });
+                        return dst;
+                    }
+                }
+            }
             // Flatten chains like `kotlin.math.PI` into a single FQN
             // lookup against the host when the head is an unresolved
             // identifier (i.e. not a local). Stdlib package roots
@@ -2046,6 +2081,16 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             if let Some(fqn) = collect_dotted_fqn(expr) {
                 if let Some(head) = fqn.split('.').next() {
                     if is_package_head(head)
+                        // Only a genuine package root (`kotlin`,
+                        // `kotlinx`, …) flattens inside a lambda body:
+                        // there `this` is a captured outer (not
+                        // locally resolvable), so an arbitrary
+                        // lowercase head like a member field
+                        // (`resumeMode.isCancellableMode`) must NOT be
+                        // mistaken for an FQN — it is a `this.<field>`
+                        // access then an extension-property read.
+                        // Mirrors the call-site guards below.
+                        && (is_pkg_root(head) || !b.is_lambda_body())
                         && b.resolve(head).is_none()
                         && !b.knows_outer(head)
                         && b.module.class_id(head).is_none()
@@ -2756,6 +2801,74 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                     arg_names = names;
                                 }
                                 let type_args = intern_type_args(b.module, ast_type_args);
+                                // Kotlin: at an unqualified call inside a
+                                // receiver scope, a member of the
+                                // (possibly smart-cast) implicit receiver
+                                // outranks a same-named top-level
+                                // extension. Route through `call_member`
+                                // on `this` so the full precedence applies
+                                // — receiver member (incl. a runtime
+                                // subtype's, e.g. `DispatchedContinuation`
+                                // when the static type is `Continuation`),
+                                // then the builtin/stdlib intrinsic (so a
+                                // `kotlin.Result` receiver hits Result's
+                                // own `getOrElse`, not an unrelated
+                                // `Bag.getOrElse` extension), then the
+                                // best-by-receiver extension-fn fallback.
+                                // A direct `Call` to one resolved
+                                // `func_id` bypassed all of that and
+                                // could recurse (`resumeCancellableWith`)
+                                // or mis-bind on a builtin receiver. The
+                                // defaulted-middle-param trailing-lambda
+                                // arg-name synthesis is extension-fn
+                                // specific, so keep the direct `Call`
+                                // there.
+                                let synth_names_needed = !target_params
+                                    .is_empty()
+                                    && user_arg_count >= 1
+                                    && (1 + user_arg_count)
+                                        < target_params.len()
+                                    && ast_arg_names
+                                        .iter()
+                                        .all(|n| n.is_none());
+                                if !synth_names_needed {
+                                    // Kotlin: a member of the
+                                    // (smart-cast) implicit receiver
+                                    // outranks a same-named top-level
+                                    // extension. Route through
+                                    // `call_member` on `this` so the
+                                    // full precedence applies —
+                                    // receiver member (incl. a runtime
+                                    // subtype's), then builtin/stdlib
+                                    // intrinsic, then the
+                                    // best-by-receiver extension-fn
+                                    // fallback. A direct `Call` to one
+                                    // by-name `func_id` bypassed this
+                                    // (recursed for
+                                    // `resumeCancellableWith`,
+                                    // mis-bound on `Result`).
+                                    let (uargs_start, ucount) =
+                                        lower_arg_run(b, args);
+                                    let uarg_names = intern_arg_names(
+                                        b.module,
+                                        ast_arg_names,
+                                    );
+                                    let nmc = b.module.intern_const(
+                                        Const::String(
+                                            segments[0].name.clone(),
+                                        ),
+                                    );
+                                    let dst = b.alloc_reg();
+                                    b.push(Inst::CallMember {
+                                        dst,
+                                        receiver: this_reg,
+                                        name: nmc,
+                                        args: uargs_start,
+                                        n_args: ucount,
+                                        arg_names: uarg_names,
+                                    });
+                                    return dst;
+                                }
                                 let dst = b.alloc_reg();
                                 let _ = this_reg;
                                 b.push(Inst::Call {
