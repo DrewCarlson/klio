@@ -3858,7 +3858,12 @@ fn build_exception(ctx: &CallCtx<'_>, fqn: &str) -> Result<Value, RuntimeError> 
             };
             let cause = match c {
                 Value::Null => None,
-                Value::Exception { .. } => Some(Box::new(c.clone())),
+                // A builtin exception is `Value::Exception`; a user /
+                // pack exception subclass is a `Value::Instance` of a
+                // Throwable-derived class. Both are valid causes.
+                Value::Exception { .. } | Value::Instance(_) => {
+                    Some(Box::new(c.clone()))
+                }
                 _ => return Err(RuntimeError::Type(
                     "Throwable cause must be a Throwable or null".into(),
                 )),
