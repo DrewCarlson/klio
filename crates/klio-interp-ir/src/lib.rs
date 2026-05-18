@@ -2045,11 +2045,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     f.rsplit('.').next().unwrap_or(f).to_string()
                 }
             };
-            if let Some(fid) = self
-                .prog.extension_props
-                .get(&(recv_simple, name.to_string()))
+            // An extension property declared on `Any`
+            // (`internal val Any.classSimpleName`) applies to every
+            // receiver. Probe the receiver's own class first, then
+            // fall back to an `Any` extension property.
+            let ext_fid = self
+                .prog
+                .extension_props
+                .get(&(recv_simple.clone(), name.to_string()))
                 .copied()
-            {
+                .or_else(|| {
+                    self.prog
+                        .extension_props
+                        .get(&("Any".to_string(), name.to_string()))
+                        .copied()
+                });
+            if let Some(fid) = ext_fid {
                 let func = self.module.funcs.get(fid.0 as usize).cloned().ok_or_else(|| {
                     klio_ir::eval::EvalError::Type(format!(
                         "extension prop FuncId {} out of range",
@@ -5721,8 +5732,43 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 // `Byte.and(Long)` for `byte and 0xffL`). An exact
                 // declared arity is also preferred over a
                 // defaulted-tail match.
-                let mut best: Option<((klio_ir::FuncId, klio_ir::Func), i32)> = None;
-                for (fid, f) in candidates {
+                // Candidate receiver-type names, for Kotlin's
+                // "most-specific receiver" tie-break: when scores tie,
+                // prefer the candidate whose receiver type is a
+                // (transitive) subtype of the most *other* candidates'
+                // receiver types. `Job` is a subtype of the candidate
+                // `CoroutineContext`; the sibling `CoroutineScope` is
+                // not — so `x.ensureActive()` binds `Job.ensureActive`
+                // rather than the recursive `CoroutineContext` /
+                // `CoroutineScope` variants.
+                let recv_tys: Vec<String> = candidates
+                    .iter()
+                    .map(|(_, f)| f.params[0].ty.name.clone())
+                    .collect();
+                let is_subtype = |a: &str, b: &str| -> bool {
+                    if a == b {
+                        return false;
+                    }
+                    let mut q = vec![a.to_string()];
+                    let mut seen = std::collections::HashSet::new();
+                    while let Some(c) = q.pop() {
+                        if !seen.insert(c.clone()) {
+                            continue;
+                        }
+                        if c == b {
+                            return true;
+                        }
+                        if let Some(d) = self.classes.borrow().get(&c).cloned() {
+                            for s in &d.supertype_names {
+                                q.push(s.clone());
+                            }
+                        }
+                    }
+                    false
+                };
+                let mut best: Option<((klio_ir::FuncId, klio_ir::Func), (i32, i32))> =
+                    None;
+                for (idx, (fid, f)) in candidates.into_iter().enumerate() {
                     let mut score = self
                         .overload_score_arg(&f.params[0].ty, receiver)
                         .unwrap_or(-1);
@@ -5734,8 +5780,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     if f.params.len() == want {
                         score += 5;
                     }
-                    if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
-                        best = Some(((fid, f), score));
+                    let spec = recv_tys
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, t)| *j != idx && is_subtype(&recv_tys[idx], t))
+                        .count() as i32;
+                    let key = (score, spec);
+                    if best.as_ref().map(|(_, k)| key > *k).unwrap_or(true) {
+                        best = Some(((fid, f), key));
                     }
                 }
                 best.map(|(c, _)| c)
