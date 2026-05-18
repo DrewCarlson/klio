@@ -7382,6 +7382,31 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         block: &klio_runtime::Value,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        // Already inside a cooperative driver (e.g. a child started by
+        // `launch` while a `runBlocking` loop is running): join the
+        // enclosing interceptor rather than spinning an isolated root.
+        // The block runs on the shared virtual clock; if it suspends,
+        // its activation is parked on the active interceptor and the
+        // start completes normally (the enclosing driver loop resumes
+        // it when its slot/timer is due), so concurrently-launched
+        // children interleave by deadline instead of launch order.
+        let nested = with_coro(|s| !s.borrow().is_empty());
+        if nested {
+            return match self.eval_closure_raw(block, &[], None, out) {
+                Ok(v) => Ok(v),
+                Err(klio_ir::eval::EvalError::Suspended(st)) => {
+                    self.park(*st);
+                    Ok(klio_runtime::Value::Unit)
+                }
+                Err(klio_ir::eval::EvalError::Throw(v)) => {
+                    Err(klio_runtime::RuntimeError::Thrown(v))
+                }
+                Err(klio_ir::eval::EvalError::NonLocalReturn(v)) => {
+                    Err(klio_runtime::RuntimeError::Return(v))
+                }
+                Err(e) => Err(klio_runtime::RuntimeError::Type(format!("{e}"))),
+            };
+        }
         self.drive_root(block, &klio_runtime::Value::Unit, out, true)
     }
 
