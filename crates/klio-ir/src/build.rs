@@ -94,6 +94,15 @@ pub struct FuncBuilder<'a> {
     /// that isn't a known member must resolve as a global/this probe
     /// rather than a hard `this.<name>` field read.
     is_param_thunk: bool,
+    /// Inline-expansion state. `inline_return` is a stack of
+    /// (result reg, join block): a `return` inside an inlined body
+    /// assigns the result and jumps to the join (the inline call's
+    /// value). `inline_stack` guards recursive inline. `inline_lambda_subst`
+    /// maps a lambda parameter name to the argument lambda AST for
+    /// the current inline frame so `param(args)` splices in place.
+    inline_return: Vec<(Reg, BlockId)>,
+    inline_stack: Vec<String>,
+    inline_lambda_subst: Vec<std::collections::HashMap<String, klio_ast::Expr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +144,50 @@ impl<'a> FuncBuilder<'a> {
             is_lambda_body: false,
             is_inline: false,
             is_param_thunk: false,
+            inline_return: Vec::new(),
+            inline_stack: Vec::new(),
+            inline_lambda_subst: Vec::new(),
         }
+    }
+
+    pub fn inline_active_return(&self) -> Option<(Reg, BlockId)> {
+        self.inline_return.last().copied()
+    }
+    pub fn push_inline_return(&mut self, r: Reg, join: BlockId) {
+        self.inline_return.push((r, join));
+    }
+    pub fn pop_inline_return(&mut self) {
+        self.inline_return.pop();
+    }
+    pub fn take_inline_return(&mut self) -> Vec<(Reg, BlockId)> {
+        std::mem::take(&mut self.inline_return)
+    }
+    pub fn restore_inline_return(&mut self, saved: Vec<(Reg, BlockId)>) {
+        self.inline_return = saved;
+    }
+    pub fn inline_in_progress(&self, name: &str) -> bool {
+        self.inline_stack.iter().any(|n| n == name)
+    }
+    pub fn push_inline_name(&mut self, name: String) {
+        self.inline_stack.push(name);
+    }
+    pub fn pop_inline_name(&mut self) {
+        self.inline_stack.pop();
+    }
+    pub fn push_inline_lambda_frame(
+        &mut self,
+        m: std::collections::HashMap<String, klio_ast::Expr>,
+    ) {
+        self.inline_lambda_subst.push(m);
+    }
+    pub fn pop_inline_lambda_frame(&mut self) {
+        self.inline_lambda_subst.pop();
+    }
+    /// Only the innermost inline frame's lambda params are in scope.
+    pub fn inline_lambda_for(&self, name: &str) -> Option<klio_ast::Expr> {
+        self.inline_lambda_subst
+            .last()
+            .and_then(|m| m.get(name).cloned())
     }
 
     pub fn mark_any_typed(&mut self, name: &str) {

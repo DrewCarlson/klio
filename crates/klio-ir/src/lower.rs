@@ -13,6 +13,55 @@ use klio_ast::{BinOp as AstBinOp, Block as AstBlock, Expr, Stmt, UnOp as AstUnOp
 use crate::build::FuncBuilder;
 use crate::{BinOp, BlockId, Const, Inst, Reg, Terminator, UnOp};
 
+thread_local! {
+    /// `suspend inline fun` ASTs by simple name, set by the build
+    /// driver before body lowering. A `suspend inline` builder's
+    /// `suspendCoroutineUninterceptedOrReturn` must capture the
+    /// *caller's* continuation — only correct when the body is truly
+    /// inlined. (Non-suspend inline fns keep the normal call path and
+    /// klio's existing `is_inline`-frame non-local-return mechanism,
+    /// so the inline blast radius stays minimal.)
+    static INLINE_FN_ASTS: std::cell::RefCell<
+        std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Install the suspend-inline-fn AST table for the current build.
+pub fn set_inline_fn_asts(
+    m: std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>>,
+) {
+    INLINE_FN_ASTS.with(|c| *c.borrow_mut() = m);
+}
+
+fn inline_fn_ast(name: &str) -> Option<std::rc::Rc<klio_ast::Function>> {
+    INLINE_FN_ASTS.with(|c| c.borrow().get(name).cloned())
+}
+
+thread_local! {
+    /// Hard ceiling on combined inline nesting (fn-body + lambda-arg
+    /// splices), so transitive expansion cannot recurse without
+    /// bound; past it, callers fall back to a normal call.
+    static INLINE_EXPAND_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+const INLINE_EXPAND_MAX: u32 = 8;
+
+fn inline_expand_enter() -> bool {
+    INLINE_EXPAND_DEPTH.with(|c| {
+        let d = c.get();
+        if d >= INLINE_EXPAND_MAX {
+            false
+        } else {
+            c.set(d + 1);
+            true
+        }
+    })
+}
+
+fn inline_expand_leave() {
+    INLINE_EXPAND_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+}
+
 /// Bind function parameters into the current scope. Each param is
 /// loaded into a fresh register via `Inst::LoadParam` so subsequent
 /// `Path { name }` reads route through the same register.
@@ -2495,6 +2544,30 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             dst
         }
         Expr::Call { callee, args, arg_names: ast_arg_names, type_args: ast_type_args, is_infix, .. } => {
+            // Inline expansion (suspend-inline only). A bare `Path`
+            // callee that names a lambda parameter of the enclosing
+            // inline frame is spliced; one that names a registered
+            // `suspend inline fun` is expanded so its
+            // `suspendCoroutineUninterceptedOrReturn` captures the
+            // caller's continuation. Any unsafe shape falls back to a
+            // normal call via `None`.
+            if !*is_infix {
+                if let Expr::Path { segments, .. } = callee.as_ref() {
+                    if segments.len() == 1 {
+                        let nm = &segments[0].name;
+                        if let Some(lam) = b.inline_lambda_for(nm) {
+                            return splice_inline_lambda(b, &lam, args);
+                        }
+                        if inline_fn_ast(nm).is_some() {
+                            if let Some(r) = try_inline_call(
+                                b, nm, args, ast_arg_names, None,
+                            ) {
+                                return r;
+                            }
+                        }
+                    }
+                }
+            }
             // Infix call `a fn b` lowers as `a.fn(b)` — the
             // dispatch site is a member call on the receiver
             // even when `fn` is a top-level extension.
@@ -3378,6 +3451,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 Some(e) => Some(lower_expr(b, e)),
                 None => None,
             };
+            // An unlabeled `return` inside an inlined body returns
+            // from that inline fn — which, inlined, is the call's
+            // value. Spliced lambda-arg bodies clear the inline-return
+            // target, so their non-local `return` falls through to
+            // the caller path below (Kotlin non-local semantics).
+            if label.is_none() {
+                if let Some((res, join)) = b.inline_active_return() {
+                    if let Some(rr) = r {
+                        b.push(Inst::Move { dst: res, src: rr });
+                    }
+                    b.terminate(Terminator::Goto(join));
+                    let dead = b.alloc_block();
+                    b.switch_to(dead);
+                    return b.emit_const(Const::Unit);
+                }
+            }
             if b.is_lambda_body() && label.is_none() {
                 b.terminate(Terminator::NonLocalReturn(r));
             } else {
@@ -4409,6 +4498,135 @@ fn or_chain(b: &mut FuncBuilder<'_>, mk: impl FnOnce(&mut FuncBuilder<'_>) -> Ve
         acc = dst;
     }
     acc
+}
+
+/// Splice an `inline fun` argument lambda where the inlined body
+/// invokes the corresponding lambda parameter. The lambda body
+/// lowers in the caller's `FuncBuilder` (a call-site closure), so a
+/// non-local `return` targets the caller; the inline-return target
+/// is cleared and the inline frame's lambda map hidden meanwhile.
+fn splice_inline_lambda(
+    b: &mut FuncBuilder<'_>,
+    lam: &Expr,
+    arg_exprs: &[Expr],
+) -> Reg {
+    let Expr::Lambda { params, body, .. } = lam else {
+        return lower_expr(b, lam);
+    };
+    let arg_regs: Vec<Reg> = arg_exprs.iter().map(|a| lower_expr(b, a)).collect();
+    let counted = inline_expand_enter();
+    b.push_scope();
+    if params.is_empty() {
+        if let Some(r) = arg_regs.first() {
+            b.bind("it".to_string(), *r);
+        }
+    } else {
+        for (p, r) in params.iter().zip(arg_regs.iter()) {
+            b.bind(p.name.clone(), *r);
+        }
+    }
+    b.push_inline_lambda_frame(std::collections::HashMap::new());
+    let saved = b.take_inline_return();
+    let v = lower_block(b, body);
+    b.restore_inline_return(saved);
+    b.pop_inline_lambda_frame();
+    b.pop_scope();
+    if counted {
+        inline_expand_leave();
+    }
+    v
+}
+
+/// Expand a call to a `suspend inline fun` by splicing its body into
+/// the caller (so `suspendCoroutineUninterceptedOrReturn` captures
+/// the caller's continuation). `None` falls back to a normal call
+/// for any shape not safely inlinable.
+fn try_inline_call(
+    b: &mut FuncBuilder<'_>,
+    fname: &str,
+    args: &[Expr],
+    arg_names: &[Option<String>],
+    this_arg: Option<&Expr>,
+) -> Option<Reg> {
+    let f = inline_fn_ast(fname)?;
+    if b.inline_in_progress(fname) {
+        return None;
+    }
+    let body = f.body.as_ref()?;
+    let mut ordered: Vec<Option<Expr>> = vec![None; f.params.len()];
+    let mut next_pos = 0usize;
+    for (i, a) in args.iter().enumerate() {
+        match arg_names.get(i).and_then(|n| n.clone()) {
+            Some(nm) => {
+                let idx = f.params.iter().position(|p| p.name.name == nm)?;
+                ordered[idx] = Some(a.clone());
+            }
+            None => {
+                while next_pos < ordered.len() && ordered[next_pos].is_some() {
+                    next_pos += 1;
+                }
+                if next_pos >= ordered.len() {
+                    return None;
+                }
+                ordered[next_pos] = Some(a.clone());
+                next_pos += 1;
+            }
+        }
+    }
+    for (i, slot) in ordered.iter_mut().enumerate() {
+        if slot.is_none() {
+            slot.clone_from(&f.params[i].default);
+            if slot.is_none() {
+                return None;
+            }
+        }
+    }
+    if !inline_expand_enter() {
+        return None;
+    }
+    b.push_inline_name(fname.to_string());
+    b.push_scope();
+    let mut lambda_map: std::collections::HashMap<String, Expr> =
+        std::collections::HashMap::new();
+    for (p, a) in f.params.iter().zip(ordered.iter()) {
+        let a = a.as_ref().expect("filled above");
+        // Always bind the param to a real lowered value so uses of
+        // the parameter *as a value* (passed on, stored, member
+        // call) resolve. For a lambda argument additionally record
+        // it for invocation splicing: a direct `param(args)` call in
+        // the inlined body is spliced (non-local return / inline
+        // semantics) and beats the value binding.
+        let r = lower_expr(b, a);
+        b.bind(p.name.name.clone(), r);
+        if matches!(a, Expr::Lambda { .. }) {
+            lambda_map.insert(p.name.name.clone(), a.clone());
+        }
+    }
+    b.push_inline_lambda_frame(lambda_map);
+    if f.receiver_type.is_some() {
+        if let Some(recv) = this_arg {
+            let rr = lower_expr(b, recv);
+            b.bind("this".to_string(), rr);
+        }
+    }
+    let result = b.alloc_reg();
+    let unit0 = b.emit_const(Const::Unit);
+    b.push(Inst::Move { dst: result, src: unit0 });
+    let join = b.alloc_block();
+    b.push_inline_return(result, join);
+    let body_val = match body {
+        klio_ast::FunctionBody::Expr(e) => lower_expr(b, e),
+        klio_ast::FunctionBody::Block(blk) => lower_block(b, blk),
+    };
+    b.push(Inst::Move { dst: result, src: body_val });
+    b.terminate(Terminator::Goto(join));
+    b.switch_to(join);
+    b.pop_inline_return();
+    b.pop_inline_lambda_frame();
+    b.pop_scope();
+    b.pop_inline_name();
+    inline_expand_leave();
+    Some(result)
 }
 
 fn lower_block(b: &mut FuncBuilder<'_>, block: &AstBlock) -> Reg {

@@ -837,6 +837,46 @@ fn build_module_with_overrides(
     // (the registry is otherwise only assembled at the end of this
     // function, too late for lowering to consult).
     module.registry.hierarchy_methods = hierarchy_methods.clone();
+    // Make every `suspend inline fun` body (top-level or nested)
+    // available to the lowerer by simple name so a call site can
+    // splice it in — required for correct continuation capture.
+    {
+        fn collect_inline(
+            d: &Decl,
+            out: &mut std::collections::HashMap<
+                String,
+                std::rc::Rc<klio_ast::Function>,
+            >,
+        ) {
+            match d {
+                Decl::Function(f) => {
+                    if f.is_inline && f.is_suspend && f.body.is_some() {
+                        out.entry(f.name.name.clone())
+                            .or_insert_with(|| std::rc::Rc::new(f.clone()));
+                    }
+                }
+                Decl::Class(c) => {
+                    for m in &c.members {
+                        collect_inline(m, out);
+                    }
+                }
+                Decl::Object(o) => {
+                    for m in &o.members {
+                        collect_inline(m, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut inline_fns: std::collections::HashMap<
+            String,
+            std::rc::Rc<klio_ast::Function>,
+        > = std::collections::HashMap::new();
+        for d in &file.decls {
+            collect_inline(d, &mut inline_fns);
+        }
+        klio_ir::lower::set_inline_fn_asts(inline_fns);
+    }
     // Non-wildcard imports, keyed by the name they bind (alias or
     // last segment), so the lowerer can rewrite a bare reference to
     // an imported (possibly named-) companion member into the
