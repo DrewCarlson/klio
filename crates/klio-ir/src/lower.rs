@@ -4484,9 +4484,20 @@ fn lower_when(
         b.terminate(Terminator::Goto(join));
         b.switch_to(next_blk);
     }
-    // No matching branch and no `else` arm: throw
-    // `NoWhenBranchMatchedException`.
-    emit_no_when_throw(b);
+    // No matching branch and no `else` arm. A *subjectless* `when {}`
+    // without `else` is a valid non-exhaustive Kotlin statement: on
+    // no match it simply falls through (yielding Unit), it does NOT
+    // throw. (A subjectless `when` expression without `else` is a
+    // compile error, so this is only reached in statement position.)
+    // A *subject* `when (x)` without `else` is the exhaustive
+    // sealed/enum form; keep the runtime safety throw there.
+    if subject.is_some() {
+        emit_no_when_throw(b);
+    } else {
+        let u = b.emit_const(Const::Unit);
+        b.push(Inst::Move { dst: result, src: u });
+        b.terminate(Terminator::Goto(join));
+    }
     b.switch_to(join);
     result
 }
