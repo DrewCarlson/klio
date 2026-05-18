@@ -306,7 +306,14 @@ fn atomic_ref_cas(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let cur = inst.borrow().get("value").unwrap_or(Value::Null);
     let expected = ctx.args.get(1).cloned().unwrap_or(Value::Null);
     let update = ctx.args.get(2).cloned().unwrap_or(Value::Null);
-    if Value::structural_eq(&cur, &expected) {
+    // atomicfu `compareAndSet` is a CAS: it compares by *referential
+    // identity* for reference types (and by value for primitives /
+    // null), exactly like Kotlin `===`. The lock-free channel /
+    // coroutine algorithms swap on sentinel-object identity (e.g.
+    // `_closeCause.compareAndSet(NO_CLOSE_CAUSE, cause)`); structural
+    // equality mis-CASes distinct-but-equal objects and corrupts
+    // that state.
+    if Value::reference_eq(&cur, &expected) {
         inst.borrow_mut().define("value", update);
         Ok(Value::Bool(true))
     } else {
