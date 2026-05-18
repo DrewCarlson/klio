@@ -837,9 +837,10 @@ fn build_module_with_overrides(
     // (the registry is otherwise only assembled at the end of this
     // function, too late for lowering to consult).
     module.registry.hierarchy_methods = hierarchy_methods.clone();
-    // Make every `suspend inline fun` body (top-level or nested)
-    // available to the lowerer by simple name so a call site can
-    // splice it in — required for correct continuation capture.
+    // Make every `inline fun` body (top-level or nested) available to
+    // the lowerer by simple name. The lowerer only expands a suspend
+    // builder (continuation capture) or an inline call whose lambda
+    // arg does a non-local return; the rest keep the normal path.
     {
         fn collect_inline(
             d: &Decl,
@@ -850,7 +851,7 @@ fn build_module_with_overrides(
         ) {
             match d {
                 Decl::Function(f) => {
-                    if f.is_inline && f.is_suspend && f.body.is_some() {
+                    if f.is_inline && f.body.is_some() {
                         out.entry(f.name.name.clone())
                             .or_insert_with(|| std::rc::Rc::new(f.clone()));
                     }

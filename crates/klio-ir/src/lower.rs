@@ -2558,11 +2558,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         if let Some(lam) = b.inline_lambda_for(nm) {
                             return splice_inline_lambda(b, &lam, args);
                         }
-                        if inline_fn_ast(nm).is_some() {
-                            if let Some(r) = try_inline_call(
-                                b, nm, args, ast_arg_names, None,
-                            ) {
-                                return r;
+                        if let Some(f) = inline_fn_ast(nm) {
+                            // Inline a suspending builder (continuation
+                            // capture) or any inline fn called with a
+                            // lambda that does a non-local `return`
+                            // (must target the caller). Other inline
+                            // calls keep the normal path so the inline
+                            // graph cannot expand combinatorially.
+                            let needs_inline = f.is_suspend
+                                || arg_lambda_has_nonlocal_return(args);
+                            if needs_inline {
+                                if let Some(r) = try_inline_call(
+                                    b, nm, args, ast_arg_names, None,
+                                ) {
+                                    return r;
+                                }
                             }
                         }
                     }
@@ -3462,6 +3472,19 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         b.push(Inst::Move { dst: res, src: rr });
                     }
                     b.terminate(Terminator::Goto(join));
+                    let dead = b.alloc_block();
+                    b.switch_to(dead);
+                    return b.emit_const(Const::Unit);
+                }
+            }
+            // `return@<inlineFnName>` inside a spliced inline-argument
+            // lambda is a local return from that lambda invocation.
+            if let Some(lbl) = label.as_ref() {
+                if let Some((res, end)) = b.inline_lambda_ret_for(&lbl.name) {
+                    if let Some(rr) = r {
+                        b.push(Inst::Move { dst: res, src: rr });
+                    }
+                    b.terminate(Terminator::Goto(end));
                     let dead = b.alloc_block();
                     b.switch_to(dead);
                     return b.emit_const(Const::Unit);
@@ -4500,6 +4523,85 @@ fn or_chain(b: &mut FuncBuilder<'_>, mk: impl FnOnce(&mut FuncBuilder<'_>) -> Ve
     acc
 }
 
+/// Does any argument that is a lambda literal contain a non-local
+/// `return` in its own body (not descending into nested lambdas /
+/// local functions, whose returns are their own)? A bare/labeled
+/// `return` in a lambda is only legal when the lambda is passed to
+/// an `inline fun`, and it must target the enclosing function — so
+/// such a call *requires* true inline expansion. Calls whose lambda
+/// args have no non-local return do not, which keeps the channel
+/// inline graph from expanding combinatorially.
+fn arg_lambda_has_nonlocal_return(args: &[Expr]) -> bool {
+    fn scan_stmts(stmts: &[Stmt]) -> bool {
+        stmts.iter().any(|s| match s {
+            Stmt::Expr(e) => scan(e),
+            Stmt::Assign { target, value, .. } => scan(target) || scan(value),
+            Stmt::DestructuringDecl { init, .. } => scan(init),
+            Stmt::Decl(klio_ast::Decl::Property(p)) => {
+                p.init.as_ref().map(scan).unwrap_or(false)
+            }
+            _ => false,
+        })
+    }
+    fn scan(e: &Expr) -> bool {
+        match e {
+            Expr::Return { .. } => true,
+            // A nested lambda / anon-fun / object literal owns its
+            // own returns — do not descend.
+            Expr::Lambda { .. }
+            | Expr::AnonFun { .. }
+            | Expr::ObjectExpr { .. } => false,
+            Expr::Member { receiver, .. }
+            | Expr::Unary { expr: receiver, .. }
+            | Expr::Postfix { expr: receiver, .. }
+            | Expr::Spread { expr: receiver, .. }
+            | Expr::Throw { value: receiver, .. }
+            | Expr::Labeled { expr: receiver, .. }
+            | Expr::As { expr: receiver, .. }
+            | Expr::IsCheck { expr: receiver, .. }
+            | Expr::MemberRef { receiver, .. } => scan(receiver),
+            Expr::Call { callee, args, .. } => {
+                scan(callee) || args.iter().any(scan)
+            }
+            Expr::Index { receiver, args, .. } => {
+                scan(receiver) || args.iter().any(scan)
+            }
+            Expr::Binary { lhs, rhs, .. } => scan(lhs) || scan(rhs),
+            Expr::If { cond, then_branch, else_branch, .. } => {
+                scan(cond)
+                    || scan(then_branch)
+                    || else_branch.as_ref().map(|e| scan(e)).unwrap_or(false)
+            }
+            Expr::While { cond, body, .. } => scan(cond) || scan(body),
+            Expr::DoWhile { body, cond, .. } => {
+                body.as_ref().map(|b| scan(b)).unwrap_or(false) || scan(cond)
+            }
+            Expr::For { iter, body, .. } => scan(iter) || scan(body),
+            Expr::Block(b) => scan_stmts(&b.stmts),
+            Expr::When { subject, branches, .. } => {
+                subject.as_ref().map(|s| scan(s)).unwrap_or(false)
+                    || branches.iter().any(|br| scan(&br.body))
+            }
+            Expr::Try { body, catches, finally, .. } => {
+                scan_stmts(&body.stmts)
+                    || catches.iter().any(|c| scan_stmts(&c.body.stmts))
+                    || finally
+                        .as_ref()
+                        .map(|fb| scan_stmts(&fb.stmts))
+                        .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    args.iter().any(|a| {
+        if let Expr::Lambda { body, .. } = a {
+            scan_stmts(&body.stmts)
+        } else {
+            false
+        }
+    })
+}
+
 /// Splice an `inline fun` argument lambda where the inlined body
 /// invokes the corresponding lambda parameter. The lambda body
 /// lowers in the caller's `FuncBuilder` (a call-site closure), so a
@@ -4527,14 +4629,34 @@ fn splice_inline_lambda(
     }
     b.push_inline_lambda_frame(std::collections::HashMap::new());
     let saved = b.take_inline_return();
+    // `return@<inlineFnName>` inside this lambda is a *local* return
+    // from the lambda invocation (Kotlin: the implicit label is the
+    // inline fn it was passed to). Route it to this splice's result.
+    let result = b.alloc_reg();
+    let unit0 = b.emit_const(Const::Unit);
+    b.push(Inst::Move {
+        dst: result,
+        src: unit0,
+    });
+    let end = b.alloc_block();
+    let label = b.current_inline_fn();
+    if let Some(lbl) = &label {
+        b.push_inline_lambda_ret(lbl.clone(), result, end);
+    }
     let v = lower_block(b, body);
+    b.push(Inst::Move { dst: result, src: v });
+    b.terminate(Terminator::Goto(end));
+    b.switch_to(end);
+    if label.is_some() {
+        b.pop_inline_lambda_ret();
+    }
     b.restore_inline_return(saved);
     b.pop_inline_lambda_frame();
     b.pop_scope();
     if counted {
         inline_expand_leave();
     }
-    v
+    result
 }
 
 /// Expand a call to a `suspend inline fun` by splicing its body into

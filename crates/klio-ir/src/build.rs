@@ -103,6 +103,11 @@ pub struct FuncBuilder<'a> {
     inline_return: Vec<(Reg, BlockId)>,
     inline_stack: Vec<String>,
     inline_lambda_subst: Vec<std::collections::HashMap<String, klio_ast::Expr>>,
+    /// Labeled-return targets for spliced inline-argument lambdas:
+    /// `return@<inlineFnName>` inside such a lambda is a *local*
+    /// return from the lambda invocation (its value), not a return
+    /// of the caller. (label, result reg, end block).
+    inline_lambda_ret: Vec<(String, Reg, BlockId)>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +152,25 @@ impl<'a> FuncBuilder<'a> {
             inline_return: Vec::new(),
             inline_stack: Vec::new(),
             inline_lambda_subst: Vec::new(),
+            inline_lambda_ret: Vec::new(),
         }
+    }
+
+    pub fn current_inline_fn(&self) -> Option<String> {
+        self.inline_stack.last().cloned()
+    }
+    pub fn push_inline_lambda_ret(&mut self, label: String, r: Reg, end: BlockId) {
+        self.inline_lambda_ret.push((label, r, end));
+    }
+    pub fn pop_inline_lambda_ret(&mut self) {
+        self.inline_lambda_ret.pop();
+    }
+    pub fn inline_lambda_ret_for(&self, label: &str) -> Option<(Reg, BlockId)> {
+        self.inline_lambda_ret
+            .iter()
+            .rev()
+            .find(|(l, _, _)| l == label)
+            .map(|(_, r, e)| (*r, *e))
     }
 
     pub fn inline_active_return(&self) -> Option<(Reg, BlockId)> {
