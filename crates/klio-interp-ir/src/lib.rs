@@ -887,6 +887,70 @@ impl<'a> VmHost<'a> {
         None
     }
 
+    /// Conservative "this argument provably is not that parameter
+    /// type" test, usable from `&self`. Returns `true` only on a
+    /// *definite* mismatch: a non-null `Value::Instance` whose own
+    /// class is known and whose full supertype closure does **not**
+    /// contain the parameter's (concrete user class/interface) name.
+    /// Anything uncertain — `Any`/generic/`Unit`/`Function*`/builtin
+    /// or collection param types, non-instance or unknown-class args,
+    /// `null`, nullable params — returns `false` (not a mismatch), so
+    /// valid subtype / interface / generic calls are never rejected.
+    fn arg_definitely_not_param_type(
+        &self,
+        param_ty: &klio_ir::TypeRef,
+        arg: &klio_runtime::Value,
+    ) -> bool {
+        let pn = param_ty.name.as_str();
+        if matches!(pn, "Any" | "Unit") || param_ty.nullable {
+            return false;
+        }
+        // Generic single/double uppercase type parameter, or a
+        // function type — never a definite mismatch here.
+        if pn.starts_with("Function")
+            || (pn.len() <= 2 && pn.chars().all(|c| c.is_ascii_uppercase()))
+        {
+            return false;
+        }
+        // Only adjudicate when the parameter names a known user
+        // class/interface; builtins/primitives/collections are scored
+        // elsewhere and must not be rejected here.
+        if self.classes.borrow().get(pn).is_none() {
+            return false;
+        }
+        let klio_runtime::Value::Instance(inst) = arg else {
+            // Non-instance values (primitives, lambdas, collections,
+            // null, …) are not adjudicated conservatively.
+            return false;
+        };
+        let start = inst.borrow().class.name.clone();
+        // The arg's own class must be known so its supertype closure
+        // is complete; otherwise we cannot be definite.
+        if self.classes.borrow().get(&start).is_none() {
+            return false;
+        }
+        let mut queue: std::collections::VecDeque<String> =
+            std::collections::VecDeque::new();
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        queue.push_back(start);
+        while let Some(cur) = queue.pop_front() {
+            if cur == pn {
+                return false; // arg IS-A param type — compatible
+            }
+            if !seen.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(def) = self.classes.borrow().get(&cur).cloned() {
+                for sup in &def.supertype_names {
+                    queue.push_back(sup.clone());
+                }
+            }
+        }
+        // Closure exhausted without reaching the parameter type.
+        true
+    }
+
     fn pick_method_overload(
         &self,
         candidates: &[klio_ir::Func],
@@ -896,6 +960,30 @@ impl<'a> VmHost<'a> {
             return None;
         }
         if candidates.len() == 1 {
+            // Even a lone same-named member must be *applicable*: a
+            // definite argument-type mismatch (e.g. the deprecated
+            // `CoroutineDispatcher.plus(CoroutineDispatcher)` reached
+            // for a `CoroutineName` argument) must fall through so the
+            // hierarchy walk continues to the real target
+            // (`CoroutineContext.plus(CoroutineContext)`), instead of
+            // dispatching a non-applicable narrowing overload.
+            let f = &candidates[0];
+            let params_skip = if f
+                .params
+                .first()
+                .map(|p| p.name == "this")
+                .unwrap_or(false)
+            {
+                1
+            } else {
+                0
+            };
+            let effective = &f.params[params_skip..];
+            for (p, a) in effective.iter().zip(args.iter()) {
+                if self.arg_definitely_not_param_type(&p.ty, a) {
+                    return None;
+                }
+            }
             return Some(candidates[0].clone());
         }
         let mut best: Option<(usize, i32)> = None;
