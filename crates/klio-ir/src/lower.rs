@@ -1306,12 +1306,16 @@ pub fn lower_method(
     own_members: &std::collections::HashSet<String>,
 ) -> crate::Func {
     // A member extension function (`class C { fun R.f(p) { … } }`)
-    // binds its *extension* receiver as `this`, exactly like a
-    // top-level extension fn — the body's bare members resolve on
-    // `R`, not on `C`. (The `C` dispatch receiver / `this@C` is not
-    // bound here; member extensions whose body only uses the
-    // extension receiver — the common case — work, which is what
-    // the stdlib's `Duration.appendFractional`-style helpers need.)
+    // binds its *extension* receiver as `this`, like a top-level
+    // extension fn. A bare member reference in its body may be a
+    // member of the extension receiver `R` *or* of the enclosing
+    // class `C` (`this@C`). Passing `C`'s `own_members` here would
+    // force every such reference into a `this.member` access on the
+    // *extension* receiver, so `C` members fail. Pass no own-members
+    // instead: bare references then lower through the dynamic
+    // `this` → enclosing-`this` → global probe, which tries `R`,
+    // then the lexically enclosing `C` instance (kept reachable by
+    // the caller via the enclosing-`this` stack), then a global.
     // It is also registered in `func_index` so a bare call resolves
     // through the same extension-call lowering top-level extensions
     // use (the receiver is prepended as the implicit `this`).
@@ -1321,7 +1325,7 @@ pub fn lower_method(
             f,
             &["this"],
             None,
-            Some(own_members),
+            None,
         );
         let id = crate::FuncId(module.funcs.len() as u32);
         let mut placed = func;

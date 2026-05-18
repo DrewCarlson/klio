@@ -1193,6 +1193,16 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         with_outer_this(|s| s.borrow().last().cloned())
     }
 
+    fn push_access_enclosing(&self, v: &klio_runtime::Value) {
+        with_outer_this(|s| s.borrow_mut().push(v.clone()));
+    }
+
+    fn pop_access_enclosing(&self) {
+        with_outer_this(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         let cached = self.globals.borrow().lookup(name);
         if self.module.registry.top_level_delegated_props.contains(name) {
@@ -5894,6 +5904,57 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 names.push(None); // implicit `this` receiver slot
                 names.extend(arg_names.iter().cloned());
                 return self.call_func_named(&module, fid, all, &names);
+            }
+            // An instance method called with named / omitted arguments:
+            // resolve it by walking the receiver's class hierarchy and
+            // route through `call_func_named` so names slot by the
+            // method's own parameter list and defaulted params fill.
+            // The positional `call_member` / overload scorer below
+            // can't match a reordered or short named-arg call.
+            if let klio_runtime::Value::Instance(inst) = receiver {
+                let start = inst.borrow().class.name.clone();
+                let mut queue: std::collections::VecDeque<String> =
+                    std::collections::VecDeque::new();
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                queue.push_back(start);
+                let mut method_fid: Option<klio_ir::FuncId> = None;
+                while let Some(cur) = queue.pop_front() {
+                    if !seen.insert(cur.clone()) {
+                        continue;
+                    }
+                    if let Some(ir_class) =
+                        self.module.classes.iter().find(|c| c.name == cur)
+                    {
+                        if let Some(fid) = ir_class.methods.iter().find(|fid| {
+                            self.module
+                                .funcs
+                                .get(fid.0 as usize)
+                                .map(|f| f.name == name)
+                                .unwrap_or(false)
+                        }) {
+                            method_fid = Some(*fid);
+                            break;
+                        }
+                    }
+                    if let Some(def) = self.classes.borrow().get(&cur).cloned() {
+                        for sup in &def.supertype_names {
+                            queue.push_back(sup.clone());
+                        }
+                    }
+                }
+                if let Some(fid) = method_fid {
+                    let module = Arc::clone(&self.module);
+                    let mut all: Vec<klio_runtime::Value> =
+                        Vec::with_capacity(args.len() + 1);
+                    all.push(receiver.clone());
+                    all.extend_from_slice(args);
+                    let mut names: Vec<Option<String>> =
+                        Vec::with_capacity(arg_names.len() + 1);
+                    names.push(None); // implicit `this` receiver slot
+                    names.extend(arg_names.iter().cloned());
+                    return self.call_func_named(&module, fid, all, &names);
+                }
             }
         }
         self.call_member(receiver, name, args)

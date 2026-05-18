@@ -370,6 +370,15 @@ pub trait Host {
     fn enclosing_this(&self) -> Option<Value> {
         None
     }
+    /// Make `v` reachable as the lexically enclosing `this` for the
+    /// duration of a member access whose receiver displaces it — the
+    /// same nested-receiver rule receiver lambdas use, extended to a
+    /// `recv.member` access so a member extension property/function
+    /// accessor (whose body calls enclosing-class members) resolves
+    /// them against the class instance the access was written in.
+    /// Default: no-op (non-Vm Hosts have no enclosing-this stack).
+    fn push_access_enclosing(&self, _v: &Value) {}
+    fn pop_access_enclosing(&self) {}
 }
 
 /// No-op host for unit tests and IR-shape exercises.
@@ -969,7 +978,32 @@ fn exec_inst(
                 Const::String(s) => s.clone(),
                 _ => return Err(EvalError::Type("GetField: name not a string const".into())),
             };
-            let v = host.get_field(&r, &name)?;
+            // The executing function's receiver (`this`, param 0 of a
+            // method / extension) is the instance this access was
+            // lexically written in. Keep it reachable as the enclosing
+            // `this` while the field/property is resolved, so a member
+            // extension property accessor whose body calls enclosing-
+            // class members resolves them against that instance rather
+            // than the extension receiver. Only an Instance distinct
+            // from the receiver is pushed (matches the receiver-lambda
+            // nested-`this` rule); other cases are unaffected.
+            let pushed_enclosing = match frame.params.first() {
+                Some(p @ Value::Instance(pi)) => {
+                    let same = matches!(&r, Value::Instance(ri) if klio_runtime::ObjRef::ptr_eq(pi, ri));
+                    if same {
+                        false
+                    } else {
+                        host.push_access_enclosing(p);
+                        true
+                    }
+                }
+                _ => false,
+            };
+            let got = host.get_field(&r, &name);
+            if pushed_enclosing {
+                host.pop_access_enclosing();
+            }
+            let v = got?;
             frame.write(*dst, v);
         }
         Inst::SetField { receiver, field, value } => {
@@ -991,7 +1025,51 @@ fn exec_inst(
                     _ => String::new(),
                 })
                 .collect();
-            let result = host.call_func_typed(frame.module, *func, arg_values, &names, &ta)?;
+            // Invoking an extension / member-extension function (its
+            // first param is the `this` receiver) from inside a method:
+            // keep the caller's instance `this` reachable as the
+            // enclosing receiver so the callee's body can resolve bare
+            // enclosing-class members (the same nested-`this` rule used
+            // for receiver lambdas and member-extension property
+            // accessors). Only fires when the caller's `this` is an
+            // Instance distinct from the extension receiver.
+            let callee_is_ext = frame
+                .module
+                .funcs
+                .get(func.0 as usize)
+                .and_then(|f| f.params.first())
+                .map(|p| p.name == "this")
+                .unwrap_or(false);
+            let pushed_enclosing = if callee_is_ext {
+                let caller_this = frame
+                    .func
+                    .params
+                    .iter()
+                    .position(|p| p.name == "this")
+                    .and_then(|i| frame.params.get(i));
+                match caller_this {
+                    Some(p @ Value::Instance(pi)) => {
+                        let same = matches!(
+                            arg_values.first(),
+                            Some(Value::Instance(ri)) if klio_runtime::ObjRef::ptr_eq(pi, ri)
+                        );
+                        if same {
+                            false
+                        } else {
+                            host.push_access_enclosing(p);
+                            true
+                        }
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            let res = host.call_func_typed(frame.module, *func, arg_values, &names, &ta);
+            if pushed_enclosing {
+                host.pop_access_enclosing();
+            }
+            let result = res?;
             frame.write(*dst, result);
         }
         Inst::CallValue { dst, callee, args, n_args, arg_names } => {
@@ -1132,7 +1210,30 @@ fn exec_inst(
             };
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
-            let result = host.call_member_named(&recv, &name_str, &arg_values, &names)?;
+            // Keep the caller's instance `this` reachable as the
+            // enclosing receiver while a `recv.member(...)` call runs,
+            // so a member-extension function/property whose body calls
+            // bare enclosing-class members resolves them (same nested-
+            // `this` rule as receiver lambdas). Only an Instance `this`
+            // distinct from the receiver is pushed; ordinary method
+            // bodies never consult the enclosing-this fallback.
+            let pushed_enclosing = match frame.params.first() {
+                Some(p @ Value::Instance(pi)) => {
+                    let same = matches!(&recv, Value::Instance(ri) if klio_runtime::ObjRef::ptr_eq(pi, ri));
+                    if same {
+                        false
+                    } else {
+                        host.push_access_enclosing(p);
+                        true
+                    }
+                }
+                _ => false,
+            };
+            let res = host.call_member_named(&recv, &name_str, &arg_values, &names);
+            if pushed_enclosing {
+                host.pop_access_enclosing();
+            }
+            let result = res?;
             frame.write(*dst, result);
         }
         Inst::CallMemberOrValue {
