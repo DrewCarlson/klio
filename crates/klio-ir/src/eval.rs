@@ -1157,8 +1157,20 @@ fn exec_inst(
                     }
                 }
             }
+            // A bare callee whose name starts uppercase is a
+            // constructor / type (`UnsupportedOperationException(msg)`,
+            // `Foo(...)`), never an instance member (Kotlin members are
+            // lowerCamelCase). Dispatching it as `this.<Name>(...)`
+            // prepends the receiver and a 1-arg exception constructor
+            // is misread as `(message, cause)`. Skip the member probe
+            // for such names and let the constructor / global path
+            // (below) build it with the real arguments.
+            let is_ctor_name = name_str
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_uppercase());
             let mut resolved: Option<Value> = None;
-            if !matches!(this_val, Value::Null | Value::Unit) {
+            if !is_ctor_name && !matches!(this_val, Value::Null | Value::Unit) {
                 if let Ok(v) = host.call_member_named(
                     &this_val, &name_str, &arg_values, &names,
                 ) {
