@@ -1830,6 +1830,27 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Suspend-implicit `kotlin.coroutines.coroutineContext`
+        // intrinsic: it is the *running* coroutine's context, not a
+        // member of whatever `this` a suspend member carries. klio
+        // lowers a bare `coroutineContext` as a field read; redirect
+        // it to the active coroutine scope's context. The scope's own
+        // `coroutineContext` getter (receiver == the active scope)
+        // resolves normally — no redirect, no recursion.
+        if name == "coroutineContext" {
+            if let Some(scope) = active_coro_scope() {
+                let same = matches!(
+                    (&scope, receiver),
+                    (
+                        klio_runtime::Value::Instance(a),
+                        klio_runtime::Value::Instance(b)
+                    ) if klio_runtime::ObjRef::ptr_eq(a, b)
+                );
+                if !same {
+                    return self.get_field(&scope, "coroutineContext");
+                }
+            }
+        }
         // A bare class/interface name used as a value resolves to its
         // companion object (Kotlin). Lowering emits this sentinel read
         // on the loaded class; yield the companion singleton when the
@@ -7421,6 +7442,16 @@ thread_local! {
     /// terminating while still allowing the one legitimate hop.
     static FIELD_RESOLVE_STACK: std::cell::RefCell<Vec<(usize, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Stack of the active coroutine's `CoroutineScope` value (the
+    /// `runBlocking` / driven-root scope). The suspend-implicit
+    /// `kotlin.coroutines.coroutineContext` intrinsic is the
+    /// *running* coroutine's context, not a member of whatever `this`
+    /// a suspend member happens to have (`JobSupport.join()` reads it
+    /// to check the caller's cancellation). klio has no native
+    /// intrinsic, so a bare `coroutineContext` read is redirected to
+    /// the active scope's context via this stack.
+    static ACTIVE_CORO_SCOPE: std::cell::RefCell<Vec<klio_runtime::Value>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Top-level property initializers currently executing — breaks
     /// initializer cycles (a re-entrant on-demand drive returns the
     /// placeholder rather than recursing).
@@ -7512,6 +7543,35 @@ fn with_field_outer_guard<R>(f: impl FnOnce(bool) -> R) -> R {
 /// Run `f` against this thread's coroutine interceptor stack.
 fn with_coro<R>(f: impl FnOnce(&RefCell<Vec<CooperativeInterceptor>>) -> R) -> R {
     EXEC.with(|e| f(&e.coro))
+}
+
+/// The active coroutine scope (top of the driver stack), if any.
+fn active_coro_scope() -> Option<klio_runtime::Value> {
+    ACTIVE_CORO_SCOPE.with(|s| s.borrow().last().cloned())
+}
+
+/// RAII guard: pushes the driven coroutine's scope for the lifetime
+/// of a `drive_root` activation so the `coroutineContext` intrinsic
+/// resolves to it.
+struct ActiveScopeGuard(bool);
+impl ActiveScopeGuard {
+    fn enter(scope: &klio_runtime::Value) -> Self {
+        if matches!(scope, klio_runtime::Value::Instance(_)) {
+            ACTIVE_CORO_SCOPE.with(|s| s.borrow_mut().push(scope.clone()));
+            ActiveScopeGuard(true)
+        } else {
+            ActiveScopeGuard(false)
+        }
+    }
+}
+impl Drop for ActiveScopeGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            ACTIVE_CORO_SCOPE.with(|s| {
+                s.borrow_mut().pop();
+            });
+        }
+    }
 }
 
 /// Run `f` against this thread's constructor-shell recursion guard.
@@ -7740,6 +7800,7 @@ impl<'a> VmIntrinsicHost<'a> {
             with_coro(|s| f(s.borrow_mut().last_mut().expect("no active runBlocking")))
         }
         with_coro(|s| s.borrow_mut().push(CooperativeInterceptor::new()));
+        let _active_scope = ActiveScopeGuard::enter(scope);
         let map_err = |e: klio_ir::eval::EvalError| -> klio_runtime::RuntimeError {
             match e {
                 klio_ir::eval::EvalError::Throw(v) => klio_runtime::RuntimeError::Thrown(v),
