@@ -603,6 +603,16 @@ pub struct ModuleRegistry {
     #[serde(default)]
     pub local_fn_defaults:
         std::collections::HashMap<FuncId, Vec<Option<FuncId>>>,
+    /// Default-arg thunks for *bodyless* (abstract / interface)
+    /// member declarations, keyed by `(class simple name, method
+    /// name)`. The body is skipped during lowering, but Kotlin lets a
+    /// concrete `override` (which may not repeat the default) inherit
+    /// the supertype declaration's default. The build pass folds
+    /// these onto the overriding member's `func_defaults` so an
+    /// omitted argument fills the inherited default instead of `Unit`.
+    #[serde(default)]
+    pub abstract_member_defaults:
+        std::collections::HashMap<(String, String), Vec<Option<FuncId>>>,
     /// `typealias Name = Target` → `Name` ↦ `Target`'s simple head
     /// name. Lets a bare-name lookup of an alias resolve the aliased
     /// class for constructor / companion / static access (the type

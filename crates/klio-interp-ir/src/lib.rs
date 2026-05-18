@@ -2351,6 +2351,24 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         if let Some(v) = outer_inst.borrow().get(name) {
                             return Ok(v);
                         }
+                        // Kotlin: an inner class accessing an enclosing
+                        // instance's property goes through that
+                        // property's accessor. A getter-only outer
+                        // property (`BufferedChannel.closeCause`) has no
+                        // raw field, so resolve it via the outer's
+                        // getter — bounded by the identity+name guard so
+                        // mutually-forwarding instances cannot loop.
+                        let oid =
+                            klio_runtime::ObjRef::as_ptr(outer_inst) as usize;
+                        if let Some(Ok(v)) = with_field_resolve_pair(
+                            oid,
+                            name,
+                            || self.get_field(&o, name),
+                        ) {
+                            if !matches!(v, klio_runtime::Value::Unit) {
+                                return Ok(v);
+                            }
+                        }
                         cur_outer = outer_inst.borrow().outer.clone();
                     }
                     klio_runtime::Value::Class(cls) => {
@@ -2555,7 +2573,15 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     if klio_runtime::ObjRef::ptr_eq(a, b)
             );
             if !same && !matches!(outer, klio_runtime::Value::Null | klio_runtime::Value::Unit) {
-                if let Ok(v) = self.get_field(&outer, name) {
+                let oid = match &outer {
+                    klio_runtime::Value::Instance(i) => {
+                        klio_runtime::ObjRef::as_ptr(i) as usize
+                    }
+                    _ => 0,
+                };
+                if let Some(Ok(v)) = with_field_resolve_pair(oid, name, || {
+                    self.get_field(&outer, name)
+                }) {
                     if !matches!(v, klio_runtime::Value::Unit) {
                         return Ok(v);
                     }
@@ -7210,6 +7236,49 @@ thread_local! {
     /// unbounded recursion (gate hang), so this is the correct middle.
     static CALL_OUTER_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FIELD_OUTER_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Re-entrancy stack of `(receiver-identity, name)` pairs whose
+    /// `get_field` resolution is in progress along the heuristic
+    /// outer-instance / enclosing-`this` fallbacks. An inner class
+    /// reading an enclosing instance's getter-only property
+    /// (`BufferedChannelIterator` reading `BufferedChannel.closeCause`)
+    /// must reach the outer's *getter* via a recursive `get_field` on
+    /// the outer — but the same `(outer, name)` pair must never be
+    /// re-resolved through these fallbacks while already on the stack,
+    /// or two instances that each forward the name to the other loop
+    /// forever. Keying on identity+name makes the fallbacks provably
+    /// terminating while still allowing the one legitimate hop.
+    static FIELD_RESOLVE_STACK: std::cell::RefCell<Vec<(usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` only if `(id, name)` is not already being resolved through
+/// the `get_field` heuristic fallbacks; pushes/pops the pair so the
+/// recursion is bounded by the distinct instances on the stack.
+fn with_field_resolve_pair<R>(
+    id: usize,
+    name: &str,
+    f: impl FnOnce() -> R,
+) -> Option<R> {
+    let key = (id, name.to_string());
+    let entered = FIELD_RESOLVE_STACK.with(|s| {
+        if s.borrow().iter().any(|k| k == &key) {
+            false
+        } else {
+            s.borrow_mut().push(key.clone());
+            true
+        }
+    });
+    if !entered {
+        return None;
+    }
+    let r = f();
+    FIELD_RESOLVE_STACK.with(|s| {
+        let mut v = s.borrow_mut();
+        if let Some(pos) = v.iter().rposition(|k| k == &key) {
+            v.remove(pos);
+        }
+    });
+    Some(r)
 }
 
 fn with_call_outer_guard<R>(f: impl FnOnce(bool) -> R) -> R {

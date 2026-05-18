@@ -1871,6 +1871,118 @@ fn build_module_with_overrides(
     for (fid, slots) in &local_fn_defaults {
         func_defaults.entry(*fid).or_insert_with(|| slots.clone());
     }
+    // Inherited default arguments: Kotlin forbids an `override` from
+    // repeating a default value, but a call that omits the argument
+    // still uses the default declared on the overridden supertype
+    // member (`SendChannel.close(cause: Throwable? = null)` reached
+    // through `BufferedChannel.close(cause)`). The override's own
+    // FuncId therefore has no thunk for that parameter; without this
+    // the Vm pads the gap with `Unit`, so `_closeCause` is set to
+    // `Unit` and the `as Throwable?` cast in the `closeCause` getter
+    // throws. Propagate each supertype member's default-thunk slots
+    // onto the overriding member (matched by name + lowered arity, so
+    // the `this`-offset slot layout already lines up), leaving any
+    // slot the override itself defines untouched.
+    {
+        let abstract_defaults = module.registry.abstract_member_defaults.clone();
+        let by_id: std::collections::HashMap<u32, usize> = module
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id.0, i))
+            .collect();
+        let mut inherited: Vec<(klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>)> =
+            Vec::new();
+        for c in &module.classes {
+            // Transitive supertype closure.
+            let mut anc: Vec<usize> = Vec::new();
+            let mut queue: Vec<klio_ir::ClassId> = c.supertypes.clone();
+            let mut seen: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
+            while let Some(sid) = queue.pop() {
+                if !seen.insert(sid.0) {
+                    continue;
+                }
+                if let Some(&idx) = by_id.get(&sid.0) {
+                    anc.push(idx);
+                    queue.extend(module.classes[idx].supertypes.iter().copied());
+                }
+            }
+            for &m in &c.methods {
+                let (mname, marity) = match module.funcs.get(m.0 as usize) {
+                    Some(f) => (f.name.clone(), f.params.len()),
+                    None => continue,
+                };
+                let mut merged: Option<Vec<Option<klio_ir::FuncId>>> =
+                    func_defaults.get(&m).cloned();
+                for &ai in &anc {
+                    for &am in &module.classes[ai].methods {
+                        if am.0 == m.0 {
+                            continue;
+                        }
+                        let base = match module.funcs.get(am.0 as usize) {
+                            Some(f)
+                                if f.name == mname
+                                    && f.params.len() == marity =>
+                            {
+                                am
+                            }
+                            _ => continue,
+                        };
+                        let Some(bslots) = func_defaults.get(&base) else {
+                            continue;
+                        };
+                        let cur = merged.get_or_insert_with(|| {
+                            vec![None; bslots.len()]
+                        });
+                        if cur.len() < bslots.len() {
+                            cur.resize(bslots.len(), None);
+                        }
+                        for (i, bs) in bslots.iter().enumerate() {
+                            if cur[i].is_none() {
+                                cur[i] = *bs;
+                            }
+                        }
+                    }
+                }
+                // Bodyless (abstract / interface) supertype
+                // declarations contribute no FuncId, so consult the
+                // separately-stashed `(class, method)` default table.
+                for &ai in anc.iter().chain(std::iter::once(
+                    &by_id[&c.id.0],
+                )) {
+                    let cn = &module.classes[ai].name;
+                    let cn_simple =
+                        cn.rsplit('.').next().unwrap_or(cn).to_string();
+                    let bslots = abstract_defaults
+                        .get(&(cn.clone(), mname.clone()))
+                        .or_else(|| {
+                            abstract_defaults
+                                .get(&(cn_simple, mname.clone()))
+                        });
+                    let Some(bslots) = bslots else { continue };
+                    let cur = merged
+                        .get_or_insert_with(|| vec![None; bslots.len()]);
+                    if cur.len() < bslots.len() {
+                        cur.resize(bslots.len(), None);
+                    }
+                    for (i, bs) in bslots.iter().enumerate() {
+                        if cur[i].is_none() {
+                            cur[i] = *bs;
+                        }
+                    }
+                }
+                if let Some(slots) = merged {
+                    if func_defaults.get(&m) != Some(&slots) {
+                        inherited.push((m, slots));
+                    }
+                }
+            }
+        }
+        for (fid, slots) in inherited {
+            func_defaults.insert(fid, slots);
+        }
+    }
     // `typealias Name = Target` → Name ↦ Target's simple head name.
     // The type checker unfolds aliases in type position; this lets a
     // bare-name *value* lookup (`Alias.of(...)`, `Alias(...)`)
@@ -1893,6 +2005,8 @@ fn build_module_with_overrides(
         }
     }
     let import_aliases = std::mem::take(&mut module.registry.import_aliases);
+    let abstract_member_defaults =
+        std::mem::take(&mut module.registry.abstract_member_defaults);
     module.registry = klio_ir::ModuleRegistry {
         object_names: object_names.clone(),
         companion_singletons: companion_singletons.clone(),
@@ -1904,6 +2018,7 @@ fn build_module_with_overrides(
         type_aliases,
         hierarchy_methods,
         import_aliases,
+        abstract_member_defaults,
     };
     BuiltModule {
         module: Arc::new(module),
