@@ -893,6 +893,16 @@ fn exec_inst(
                 frame.write(*dst, result);
                 return Ok(());
             }
+            // Referential identity (`===` / `!==`): pure pointer
+            // identity, never a user `equals` dispatch — so a
+            // `this === other` guard inside an `equals` / `plus`
+            // override (e.g. `CombinedContext`) does not recurse.
+            if matches!(*op, BinOp::IdentEq | BinOp::IdentNeq) {
+                let same = Value::reference_eq(&l, &r);
+                let b = if matches!(*op, BinOp::IdentNeq) { !same } else { same };
+                frame.write(*dst, Value::Bool(b));
+                return Ok(());
+            }
             // COROUTINE_SUSPENDED and Result have no user `equals`
             // surface: any equality against them is structural /
             // identity, never a `call_member("equals")` dispatch.

@@ -771,9 +771,34 @@ pub fn lower_expr_as_param_thunk(
     expr: &Expr,
     name: &str,
 ) -> crate::FuncId {
+    lower_expr_as_param_thunk_scoped(module, params, expr, name, None, None)
+}
+
+/// Like [`lower_expr_as_param_thunk`] but additionally puts the
+/// enclosing class's name and own-member set in scope. A
+/// superclass-constructor delegation argument
+/// (`class C : Base(Companion.x)`) runs with the companion already
+/// initialized but no instance `this`, so a bare name that is the
+/// class's companion object — or one of its members — must resolve
+/// against the companion, not be misread as an unrelated global
+/// class of the same name.
+pub fn lower_expr_as_param_thunk_scoped(
+    module: &mut crate::Module,
+    params: &[&str],
+    expr: &Expr,
+    name: &str,
+    owner_class: Option<&str>,
+    own_members: Option<&std::collections::HashSet<String>>,
+) -> crate::FuncId {
     let mut b = FuncBuilder::new(module);
     bind_params(&mut b, params);
     b.set_param_thunk(true);
+    if let Some(owner) = owner_class {
+        let _ = b.set_owner_class(owner.to_string());
+    }
+    if let Some(set) = own_members {
+        let _ = b.set_own_members(set.clone());
+    }
     let v = lower_expr(&mut b, expr);
     b.terminate(Terminator::Return(Some(v)));
     let func = b.finish(name, name, crate::TypeRef::unit());
@@ -1708,6 +1733,34 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             field: nm,
                         });
                         return dst;
+                    }
+                    // A superclass-constructor delegation argument
+                    // thunk runs with the companion initialized but
+                    // no `this`. A bare own-member name there is a
+                    // companion access: load the enclosing class and
+                    // read the member off it (get_field forwards a
+                    // Class receiver to its companion singleton). This
+                    // must beat the global-class step below so an
+                    // unrelated interface/class of the same name (e.g.
+                    // a `companion object Key` vs `CoroutineContext.Key`)
+                    // does not shadow the class's own companion.
+                    if b.is_param_thunk() {
+                        if let Some(owner) = b.owner_class().map(str::to_string) {
+                            let cls = b.alloc_reg();
+                            let on =
+                                b.module.intern_const(Const::String(owner));
+                            b.push(Inst::LoadGlobal { dst: cls, name: on });
+                            let dst = b.alloc_reg();
+                            let nm = b.module.intern_const(Const::String(
+                                segments[0].name.clone(),
+                            ));
+                            b.push(Inst::GetField {
+                                dst,
+                                receiver: cls,
+                                field: nm,
+                            });
+                            return dst;
+                        }
                     }
                 }
                 // A bare name that is a known class is a class
@@ -4685,8 +4738,10 @@ fn ast_binop(op: AstBinOp) -> BinOp {
         AstBinOp::Mul => BinOp::Mul,
         AstBinOp::Div => BinOp::Div,
         AstBinOp::Rem => BinOp::Mod,
-        AstBinOp::Eq | AstBinOp::IdentEq => BinOp::Eq,
-        AstBinOp::Neq | AstBinOp::IdentNeq => BinOp::NotEq,
+        AstBinOp::Eq => BinOp::Eq,
+        AstBinOp::Neq => BinOp::NotEq,
+        AstBinOp::IdentEq => BinOp::IdentEq,
+        AstBinOp::IdentNeq => BinOp::IdentNeq,
         AstBinOp::Lt => BinOp::Less,
         AstBinOp::Le => BinOp::LessEq,
         AstBinOp::Gt => BinOp::Greater,

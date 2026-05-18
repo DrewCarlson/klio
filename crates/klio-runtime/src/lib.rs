@@ -2777,6 +2777,30 @@ impl Value {
             _ => false,
         }
     }
+
+    /// Kotlin referential identity (`===` / `!==`). Heap-backed
+    /// reference values compare by backing-cell pointer; a class /
+    /// object reference compares by identity; value-like primitives
+    /// (where the Kotlin compiler forbids `===`, or it coincides with
+    /// `==`) fall back to structural equality. Crucially this never
+    /// dispatches a user `equals`, so a `this === other` guard inside
+    /// an `equals` / `plus` override cannot recurse into itself.
+    #[must_use]
+    pub fn reference_eq(a: &Value, b: &Value) -> bool {
+        use Value::*;
+        match (a, b) {
+            (Instance(x), Instance(y)) => ObjRef::ptr_eq(x, y),
+            (Cell(x), Cell(y)) => ObjRef::ptr_eq(x, y),
+            (List { items: x, .. }, List { items: y, .. })
+            | (Set { items: x, .. }, Set { items: y, .. }) => ObjRef::ptr_eq(x, y),
+            (Map { entries: x, .. }, Map { entries: y, .. }) => ObjRef::ptr_eq(x, y),
+            (Array { items: x, .. }, Array { items: y, .. }) => ObjRef::ptr_eq(x, y),
+            // Distinct heap-reference variants are never identical to
+            // a value of an unrelated variant.
+            (Instance(_), _) | (_, Instance(_)) => false,
+            _ => Value::structural_eq(a, b),
+        }
+    }
 }
 
 #[derive(Debug, Error)]

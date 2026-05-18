@@ -1388,13 +1388,44 @@ fn build_module_with_overrides(
                         .collect();
                     let param_refs: Vec<&str> =
                         param_names.iter().map(|s| s.as_str()).collect();
+                    // Companion object (by its own name) and its
+                    // members are in scope for a superclass-ctor
+                    // delegation argument (the companion is
+                    // initialized before the subclass ctor runs).
+                    let mut own: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for m in &c.members {
+                        if let Decl::Class(inner) = m {
+                            if inner.is_companion {
+                                own.insert(inner.name.name.clone());
+                                for cm in &inner.members {
+                                    match cm {
+                                        Decl::Function(f) => {
+                                            own.insert(f.name.name.clone());
+                                        }
+                                        Decl::Property(p) => {
+                                            own.insert(p.name.name.clone());
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                for p in &inner.primary_params {
+                                    if p.property.is_some() {
+                                        own.insert(p.name.name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let mut fids: Vec<klio_ir::FuncId> = Vec::with_capacity(parent_args.len());
                     for (idx, e) in parent_args.iter().enumerate() {
-                        let fid = klio_ir::lower::lower_expr_as_param_thunk(
+                        let fid = klio_ir::lower::lower_expr_as_param_thunk_scoped(
                             &mut module,
                             &param_refs,
                             e,
                             &format!("__parent_ctor_arg_{}_{idx}", c.name.name),
+                            Some(c.name.name.as_str()),
+                            Some(&own),
                         );
                         fids.push(fid);
                     }

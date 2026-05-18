@@ -390,6 +390,9 @@ pub enum BinOp {
     /// a statically-Any-typed path. Uses bitwise comparison for
     /// `Double` / `Float` so NaN == NaN and +0.0 != -0.0.
     BoxedEq, BoxedNotEq,
+    /// Referential identity (`===` / `!==`). Compares heap values by
+    /// backing-cell pointer and never dispatches a user `equals`.
+    IdentEq, IdentNeq,
     And, Or, Xor, Shl, Shr, UShr,
     RangeTo, RangeUntil, DownTo,
     Elvis,
