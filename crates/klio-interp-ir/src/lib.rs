@@ -492,6 +492,7 @@ impl Vm {
                 .cloned()
                 .ok_or(VmError::InvalidMain)?;
             let v = {
+                let _tl = TlInitGuard::enter();
                 let mut host = self.make_host(out);
                 let mut v = klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
                     .map_err(VmError::from)?;
@@ -712,10 +713,6 @@ impl<'a> VmHost<'a> {
         &mut self,
         name: &str,
     ) -> Result<Option<klio_runtime::Value>, klio_ir::eval::EvalError> {
-        thread_local! {
-            static IN_PROGRESS: std::cell::RefCell<std::collections::HashSet<String>> =
-                std::cell::RefCell::new(std::collections::HashSet::new());
-        }
         if let Some(v) = self.globals.borrow().lookup(name) {
             return Ok(Some(v));
         }
@@ -1079,10 +1076,33 @@ impl<'a> VmHost<'a> {
         let mut best: Option<(klio_ir::FuncId, i32)> = None;
         for cand in &candidates {
             let f = module.funcs.get(cand.0 as usize)?;
-            if f.params.len() != args.len() {
+            // Default-argument-aware applicability: a call may supply
+            // fewer arguments than the function has parameters when
+            // every omitted trailing parameter carries a default
+            // (`systemProp(name, 32)` binding the 4-param
+            // `(String, Int, Int = 1, Int = MAX): Int` overload). An
+            // exact-arity match is preferred (no default penalty) so a
+            // dedicated N-arg overload still outranks a defaulted one.
+            if f.params.len() < args.len() {
                 continue;
             }
-            let mut total: i32 = 0;
+            if f.params.len() > args.len() {
+                let defaults = self.prog.func_defaults.get(cand);
+                let all_defaulted = (args.len()..f.params.len()).all(|i| {
+                    defaults
+                        .and_then(|d| d.get(i))
+                        .map(|slot| slot.is_some())
+                        .unwrap_or(false)
+                });
+                if !all_defaulted {
+                    continue;
+                }
+            }
+            let mut total: i32 = if f.params.len() == args.len() {
+                0
+            } else {
+                -1
+            };
             let mut ok = true;
             for (p, a) in f.params.iter().zip(args.iter()) {
                 match self.overload_score_arg(&p.ty, a) {
@@ -1230,6 +1250,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
 
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         let cached = self.globals.borrow().lookup(name);
+        // Forward reference to a top-level property whose own
+        // initializer has not run yet (it is declared after the
+        // initializer currently executing). The slot is still its
+        // pre-init `Null` placeholder; drive the initializer on demand
+        // so the real value — not `Null` — is observed (a cycle
+        // degrades to the placeholder via the re-entrancy guard).
+        if in_top_level_init()
+            && matches!(&cached, None | Some(klio_runtime::Value::Null))
+            && self.prog.top_level_prop_inits.contains_key(name)
+        {
+            if let Ok(Some(v)) = self.ensure_top_level_inited(name) {
+                if !matches!(v, klio_runtime::Value::Null) {
+                    return Some(v);
+                }
+            }
+        }
         if self.module.registry.top_level_delegated_props.contains(name) {
             if let Some(v) = cached.clone() {
                 if matches!(v, klio_runtime::Value::Instance(_)) {
@@ -7249,7 +7285,37 @@ thread_local! {
     /// terminating while still allowing the one legitimate hop.
     static FIELD_RESOLVE_STACK: std::cell::RefCell<Vec<(usize, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Top-level property initializers currently executing — breaks
+    /// initializer cycles (a re-entrant on-demand drive returns the
+    /// placeholder rather than recursing).
+    static IN_PROGRESS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Nesting depth of top-level property initializers currently on
+    /// the stack. The forward-reference on-demand drive only applies
+    /// while a top-level initializer is running — at ordinary runtime
+    /// a not-yet-resolved name must keep its existing resolution path
+    /// (driving it early there changes execution order and context,
+    /// e.g. resolving `MAX_MILLIS` against a live `this`).
+    static TL_INIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
+
+fn in_top_level_init() -> bool {
+    TL_INIT_DEPTH.with(|c| c.get() > 0)
+}
+
+struct TlInitGuard;
+impl TlInitGuard {
+    fn enter() -> Self {
+        TL_INIT_DEPTH.with(|c| c.set(c.get() + 1));
+        TlInitGuard
+    }
+}
+impl Drop for TlInitGuard {
+    fn drop(&mut self) {
+        TL_INIT_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
 
 /// Run `f` only if `(id, name)` is not already being resolved through
 /// the `get_field` heuristic fallbacks; pushes/pops the pair so the
