@@ -1192,6 +1192,35 @@ fn build_module_with_overrides(
                         if let Some(fid) = fid {
                             instance_prop_getters
                                 .insert((c.name.name.clone(), p.name.name.clone()), fid);
+                            // Also key by the class's package-qualified
+                            // FQN. Two packages may declare the same
+                            // simple class name where only one has a
+                            // getter for this property
+                            // (`kotlinx.io.Segment.next` is a plain
+                            // field; the abstract
+                            // `kotlinx.coroutines.internal.Segment`
+                            // exposes a `next` getter). The FQN key
+                            // lets the lookup bind the getter to the
+                            // class that actually declares it.
+                            let cfqn = fqn_overrides
+                                .get(&c.span)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    if package_prefix.is_empty() {
+                                        c.name.name.clone()
+                                    } else {
+                                        format!(
+                                            "{}.{}",
+                                            package_prefix, c.name.name
+                                        )
+                                    }
+                                });
+                            if cfqn != c.name.name {
+                                instance_prop_getters.insert(
+                                    (cfqn, p.name.name.clone()),
+                                    fid,
+                                );
+                            }
                         }
                     }
                     if let Some(setter) = &p.setter {

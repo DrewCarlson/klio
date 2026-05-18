@@ -2232,29 +2232,64 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // (`DateTimePeriod.months`) is invoked on a subclass
             // instance (`DatePeriod`), so the
             // `(declaring-class, prop)` key is an ancestor's.
+            let recv_fqn = inst.borrow().class.fqn.clone();
             let getter_fid = {
                 let mut found: Option<klio_ir::FuncId> = None;
-                let mut cur = Some(class_name.clone());
-                let mut seen: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                while let Some(cn) = cur.take() {
-                    if !seen.insert(cn.clone()) {
-                        break;
-                    }
-                    if let Some(fid) = self
+                // The receiver's own class is resolved by its
+                // package-qualified FQN: the simple-name getter table
+                // collides across packages (`kotlinx.io.Segment.next`
+                // is a plain field; the abstract
+                // `kotlinx.coroutines.internal.Segment` has a `next`
+                // getter). When the class is package-qualified, only
+                // its FQN-keyed entry may bind the getter for its own
+                // properties; a miss means this class has no such
+                // getter (use the raw field) rather than borrowing a
+                // same-simple-name sibling's. Supertype levels keep
+                // the simple-name walk (their names are recorded
+                // simple and are package-local).
+                let own_is_qualified = recv_fqn != class_name;
+                if own_is_qualified {
+                    found = self
                         .prog
                         .instance_prop_getters
-                        .get(&(cn.clone(), name.to_string()))
-                        .copied()
-                    {
-                        found = Some(fid);
-                        break;
+                        .get(&(recv_fqn.clone(), name.to_string()))
+                        .copied();
+                }
+                if found.is_none() {
+                    let mut cur = if own_is_qualified {
+                        // Skip the colliding own-class simple-name
+                        // probe and continue from *this instance's*
+                        // supertypes — `self.classes` is simple-name
+                        // keyed, so looking the own class up there
+                        // would return a same-name sibling from
+                        // another package and walk its hierarchy
+                        // (`kotlinx.coroutines.internal.Segment :
+                        // ConcurrentLinkedListNode`).
+                        inst.borrow().class.supertype_names.first().cloned()
+                    } else {
+                        Some(class_name.clone())
+                    };
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    while let Some(cn) = cur.take() {
+                        if !seen.insert(cn.clone()) {
+                            break;
+                        }
+                        if let Some(fid) = self
+                            .prog
+                            .instance_prop_getters
+                            .get(&(cn.clone(), name.to_string()))
+                            .copied()
+                        {
+                            found = Some(fid);
+                            break;
+                        }
+                        cur = self
+                            .classes
+                            .borrow()
+                            .get(&cn)
+                            .and_then(|d| d.supertype_names.first().cloned());
                     }
-                    cur = self
-                        .classes
-                        .borrow()
-                        .get(&cn)
-                        .and_then(|d| d.supertype_names.first().cloned());
                 }
                 found
             };
