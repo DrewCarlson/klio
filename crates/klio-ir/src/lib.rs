@@ -609,6 +609,14 @@ pub struct ModuleRegistry {
     /// checker already unfolds aliases in type position).
     #[serde(default)]
     pub type_aliases: std::collections::HashMap<String, String>,
+    /// Non-wildcard import leaf → the import's full segment path.
+    /// Lets the lowerer resolve a bare reference to an imported
+    /// member of a (possibly named) companion object — e.g. `import
+    /// a.b.C.Factory.RENDEZVOUS` then bare `RENDEZVOUS` — by
+    /// rewriting it to the qualified `C.…` access the IR can lower,
+    /// since the lowering pass otherwise carries no import context.
+    #[serde(default)]
+    pub import_aliases: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Module {

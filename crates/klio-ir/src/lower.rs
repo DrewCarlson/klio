@@ -1850,6 +1850,40 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // the receiver, so a bare name there must take the
                 // this-or-global probe (resolving top-level objects
                 // like `EmptyCoroutineContext`) instead.
+                // An imported member of a (possibly named) companion
+                // object — `import a.b.C.Factory.RENDEZVOUS` then a
+                // bare `RENDEZVOUS` — has no import context in the IR,
+                // so rewrite it to the qualified `C.RENDEZVOUS`
+                // companion access (companion name is optional in
+                // Kotlin) and lower that. Only fires when the import
+                // path names a class the module actually declares, so
+                // a coincidental same-named local/global is untouched.
+                if b.resolve(&segments[0].name).is_none() {
+                    if let Some(rewrite) = b
+                        .module
+                        .registry
+                        .import_aliases
+                        .get(&segments[0].name)
+                        .and_then(|segs| {
+                            let cls_idx = segs
+                                .iter()
+                                .rposition(|s| b.module.class_id(s).is_some())?;
+                            (cls_idx + 1 < segs.len()).then(|| {
+                                (segs[cls_idx].clone(), segs[segs.len() - 1].clone())
+                            })
+                        })
+                    {
+                        let sp = segments[0].span;
+                        let qualified = Expr::Path {
+                            segments: vec![
+                                klio_ast::Ident { name: rewrite.0, span: sp },
+                                klio_ast::Ident { name: rewrite.1, span: sp },
+                            ],
+                            span: sp,
+                        };
+                        return lower_expr(b, &qualified);
+                    }
+                }
                 if !b.is_param_thunk() {
                 if let Some(this_reg) = b.resolve("this") {
                     let dst = b.alloc_reg();

@@ -536,6 +536,7 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
             }
         }
         combined.decls.extend(f.decls.iter().cloned());
+        combined.imports.extend(f.imports.iter().cloned());
     }
     build_module_with_overrides(&combined, &fqn_overrides, &func_fqn_overrides)
 }
@@ -836,6 +837,24 @@ fn build_module_with_overrides(
     // (the registry is otherwise only assembled at the end of this
     // function, too late for lowering to consult).
     module.registry.hierarchy_methods = hierarchy_methods.clone();
+    // Non-wildcard imports, keyed by the name they bind (alias or
+    // last segment), so the lowerer can rewrite a bare reference to
+    // an imported (possibly named-) companion member into the
+    // qualified `Class.…` access it can lower. Set here, before the
+    // body passes, since the registry is otherwise only finalised at
+    // the end of this function.
+    for imp in &file.imports {
+        if imp.wildcard || imp.path.is_empty() {
+            continue;
+        }
+        let segs: Vec<String> = imp.path.iter().map(|i| i.name.clone()).collect();
+        let leaf = imp
+            .alias
+            .as_ref()
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| segs.last().unwrap().clone());
+        module.registry.import_aliases.entry(leaf).or_insert(segs);
+    }
     // Pre-register every class name so `class_id` resolves
     // regardless of declaration order: a method body may reference a
     // class declared later in the module (kotlinx-io's `Buffer`
@@ -1832,6 +1851,7 @@ fn build_module_with_overrides(
             }
         }
     }
+    let import_aliases = std::mem::take(&mut module.registry.import_aliases);
     module.registry = klio_ir::ModuleRegistry {
         object_names: object_names.clone(),
         companion_singletons: companion_singletons.clone(),
@@ -1842,6 +1862,7 @@ fn build_module_with_overrides(
         local_fn_defaults,
         type_aliases,
         hierarchy_methods,
+        import_aliases,
     };
     BuiltModule {
         module: Arc::new(module),

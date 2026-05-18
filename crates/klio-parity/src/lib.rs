@@ -1193,7 +1193,54 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
 
     let mut map = SourceMap::new();
     let mut asts: Vec<klio_ast::KotlinFile> = Vec::new();
+
+    // Parse the user program first so pack loading can be gated on the
+    // imports actually in play, exactly as the production binary's
+    // pack loader is. Without the gate every conformance program would
+    // compile the full upstream kotlinx-coroutines commonMain,
+    // diverging from `klio run` (and overflowing on programs that
+    // never touch coroutines).
+    let user_src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
+    let user_ast = parse(&mut map, file, user_src)?;
+    let mut user_import_prefixes: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for imp in &user_ast.imports {
+        let p = imp
+            .path
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        if !p.is_empty() {
+            user_import_prefixes.insert(p);
+        }
+    }
+    fn manifest_library_id(pack_dir: &Path) -> Option<String> {
+        let toml = std::fs::read_to_string(pack_dir.join("klio.toml")).ok()?;
+        for line in toml.lines() {
+            let l = line.split('#').next().unwrap_or("").trim();
+            if let Some(rest) = l.strip_prefix("id") {
+                let v = rest.trim_start_matches([' ', '=']).trim().trim_matches('"');
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        None
+    }
+    let imports_coroutines = user_import_prefixes
+        .iter()
+        .any(|imp| imp == "kotlinx.coroutines" || imp.starts_with("kotlinx.coroutines."));
     for pack_dir in &pack_dirs {
+        let lib_id = manifest_library_id(pack_dir).unwrap_or_default();
+        let wanted = user_import_prefixes.iter().any(|imp| {
+            imp == &lib_id
+                || imp.starts_with(&format!("{lib_id}."))
+                || lib_id.starts_with(&format!("{imp}."))
+        }) || (lib_id == "kotlinx.atomicfu" && imports_coroutines);
+        if !wanted {
+            continue;
+        }
         for src_path in collect_manifest_sources(pack_dir)? {
             let text = std::fs::read_to_string(&src_path).map_err(|e| e.to_string())?;
             let ast = parse(&mut map, &src_path, text)?;
@@ -1211,8 +1258,7 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
             asts.push(ast);
         }
     }
-    let user_src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
-    asts.push(parse(&mut map, file, user_src)?);
+    asts.push(user_ast);
 
     // Mirror the production binary: surface the embedded stdlib pack's
     // curated `SOURCES` (the real `kotlin.coroutines` / `kotlin.time`
