@@ -2540,6 +2540,28 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let Some(v) = self.ensure_top_level_inited(name)? {
             return Ok(v);
         }
+        // Enclosing-receiver fallback: a bare member property read
+        // (`onUndeliveredElement?.…`) inside a member-extension /
+        // receiver-lambda body whose `this` is the inner receiver may
+        // name a member of the lexically enclosing class instance.
+        // Mirrors the call-side this/enclosing/global probe so a plain
+        // `Inst::GetField` resolves the same enclosing member a bare
+        // call would. Guard against re-probing the same receiver.
+        let enclosing = with_outer_this(|s| s.borrow().last().cloned());
+        if let Some(outer) = enclosing {
+            let same = matches!(
+                (&outer, receiver),
+                (klio_runtime::Value::Instance(a), klio_runtime::Value::Instance(b))
+                    if klio_runtime::ObjRef::ptr_eq(a, b)
+            );
+            if !same && !matches!(outer, klio_runtime::Value::Null | klio_runtime::Value::Unit) {
+                if let Ok(v) = self.get_field(&outer, name) {
+                    if !matches!(v, klio_runtime::Value::Unit) {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::get_field `{name}` on `{}`",
             receiver.type_fqn()
