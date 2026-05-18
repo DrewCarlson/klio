@@ -6143,12 +6143,33 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 class.0
             ))
         })?;
-        let class_def = self.classes.borrow().get(&ir_class.name).cloned().ok_or_else(|| {
+        let mut class_def = self.classes.borrow().get(&ir_class.name).cloned().ok_or_else(|| {
             klio_ir::eval::EvalError::Unimplemented(format!(
                 "Vm::new_instance: no runtime ClassDef registered for `{}`",
                 ir_class.name
             ))
         })?;
+        // A constructor's target is never abstract. Resolving to an
+        // abstract class here is a simple-name collision artifact: the
+        // public concrete `kotlinx.io.Segment` is shadowed in the
+        // simple-name table by the abstract
+        // `kotlinx.coroutines.internal.Segment`. Redirect to the
+        // same-simple-name sibling whose definition is concrete,
+        // reachable via the additive FQN-keyed entries.
+        if class_def.is_abstract {
+            let want = ir_class.name.clone();
+            let concrete = {
+                let g = self.classes.borrow();
+                g.values()
+                    .find(|d| {
+                        d.name == want && !d.is_abstract && !d.is_interface
+                    })
+                    .cloned()
+            };
+            if let Some(d) = concrete {
+                class_def = d;
+            }
+        }
         if class_def.is_abstract {
             return Err(klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
                 fqn: std::sync::Arc::new("kotlin.InstantiationError".to_string()),

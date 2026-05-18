@@ -510,7 +510,12 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
     // build pass would otherwise emit bare-name FQNs and pack
     // bindings keyed by `kotlinx.atomicfu.AtomicInt.<method>`
     // wouldn't resolve at dispatch.
-    let mut fqn_overrides: std::collections::HashMap<String, String> =
+    // Keyed by each class declaration's span (unique per declaration)
+    // rather than its simple name: two packs may declare the same
+    // simple name in different packages (`kotlinx.coroutines.internal
+    // .Segment` vs `kotlinx.io.Segment`), and a name-keyed map would
+    // collapse them to a single (last-writer) FQN.
+    let mut fqn_overrides: std::collections::HashMap<klio_span::Span, String> =
         std::collections::HashMap::new();
     let mut func_fqn_overrides: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -544,11 +549,11 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
 fn collect_class_fqns(
     d: &Decl,
     pkg: &str,
-    out: &mut std::collections::HashMap<String, String>,
+    out: &mut std::collections::HashMap<klio_span::Span, String>,
 ) {
     if let Decl::Class(c) = d {
         if !pkg.is_empty() {
-            out.insert(c.name.name.clone(), format!("{}.{}", pkg, c.name.name));
+            out.insert(c.span, format!("{}.{}", pkg, c.name.name));
         }
         for m in &c.members {
             collect_class_fqns(m, pkg, out);
@@ -556,7 +561,7 @@ fn collect_class_fqns(
     }
     if let Decl::Object(o) = d {
         if !pkg.is_empty() {
-            out.insert(o.name.name.clone(), format!("{}.{}", pkg, o.name.name));
+            out.insert(o.span, format!("{}.{}", pkg, o.name.name));
         }
     }
 }
@@ -600,7 +605,7 @@ fn collect_hierarchy_method_names(
 
 fn build_module_with_overrides(
     file: &KotlinFile,
-    fqn_overrides: &std::collections::HashMap<String, String>,
+    fqn_overrides: &std::collections::HashMap<klio_span::Span, String>,
     func_fqn_overrides: &std::collections::HashMap<String, String>,
 ) -> BuiltModule {
     let mut module = klio_ir::Module::default();
@@ -1250,7 +1255,7 @@ fn build_module_with_overrides(
             let def = std::sync::Arc::new(ClassDef {
                 name: c.name.name.clone(),
                 fqn: fqn_overrides
-                    .get(&c.name.name)
+                    .get(&c.span)
                     .cloned()
                     .unwrap_or_else(|| {
                         if package_prefix.is_empty() {
@@ -1297,6 +1302,18 @@ fn build_module_with_overrides(
                 delegate_forwarders: klio_runtime::ObjRef::new(Vec::new()),
                 object_singleton: klio_runtime::ObjRef::new(None),
             });
+            // Additionally key by the fully-qualified name. The
+            // primary table is simple-name keyed, so two packs
+            // declaring the same simple name (the `internal`
+            // `kotlinx.coroutines.internal.Segment` vs the `public`
+            // `kotlinx.io.Segment`) collapse to a single entry — a
+            // constructor resolving to the abstract one then cannot
+            // reach the concrete sibling. The FQN entries are additive
+            // (distinct keys) so existing simple-name lookups are
+            // unaffected while both definitions stay reachable.
+            if !def.fqn.is_empty() && def.fqn != c.name.name {
+                classes.insert(def.fqn.clone(), std::sync::Arc::clone(&def));
+            }
             classes.insert(c.name.name.clone(), def);
         }
     }
