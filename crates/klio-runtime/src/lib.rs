@@ -2795,6 +2795,21 @@ impl Value {
             | (Set { items: x, .. }, Set { items: y, .. }) => ObjRef::ptr_eq(x, y),
             (Map { entries: x, .. }, Map { entries: y, .. }) => ObjRef::ptr_eq(x, y),
             (Array { items: x, .. }, Array { items: y, .. }) => ObjRef::ptr_eq(x, y),
+            // Stdlib intrinsics are process singletons: identity is
+            // by fully-qualified name (`x === COROUTINE_SUSPENDED`,
+            // `x === Unit`-like sentinels). `structural_eq` has no
+            // intrinsic arm, so without this an `outcome ===
+            // COROUTINE_SUSPENDED` guard never fires and the sentinel
+            // leaks as a value.
+            (Intrinsic { fqn: a, .. }, Intrinsic { fqn: b, .. }) => a == b,
+            // The dedicated `CoroutineSuspended` variant and the
+            // `COROUTINE_SUSPENDED` intrinsic are the same logical
+            // singleton regardless of which representation a path
+            // produced.
+            (CoroutineSuspended, Intrinsic { fqn, .. })
+            | (Intrinsic { fqn, .. }, CoroutineSuspended) => {
+                *fqn == "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED"
+            }
             // Distinct heap-reference variants are never identical to
             // a value of an unrelated variant.
             (Instance(_), _) | (_, Instance(_)) => false,
