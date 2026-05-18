@@ -2566,7 +2566,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // read inside an `inner class` method may name a field of an
         // enclosing-class instance, reachable via the receiver's
         // captured `outer` link.
-        if let Some(v) = with_outer_chain_guard(|active| {
+        if let Some(v) = with_field_outer_guard(|active| {
             if !active {
                 return None;
             }
@@ -5795,7 +5795,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // `inner class` method may target an enclosing-class member,
         // reachable through the receiver's captured `outer` link
         // rather than the receiver-lambda `enclosing_this` stack.
-        if let Some(hit) = with_outer_chain_guard(|active| {
+        if let Some(hit) = with_call_outer_guard(|active| {
             if !active {
                 return None;
             }
@@ -7197,26 +7197,43 @@ struct ExecState {
 
 thread_local! {
     static EXEC: ExecState = ExecState::default();
-    /// Re-entrancy guard for the inner-class outer-chain dispatch
-    /// fallback. The walk invokes `call_member` / `get_field` on each
-    /// enclosing instance, which themselves run the same fallback;
-    /// without this guard a self-referential `outer` link (or a deep
-    /// chain re-walked at every level) recurses without bound.
-    static OUTER_CHAIN_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Separate re-entrancy booleans for the inner-class outer-chain
+    /// dispatch fallback — one for the call-side (`call_member`) walk,
+    /// one for the field-side (`get_field`) walk. Each prevents *its
+    /// own* unbounded re-entrancy (a self-referential `outer` link /
+    /// deep re-walk), exactly like a single boolean would. Keeping
+    /// them independent avoids the over-suppression a *shared* guard
+    /// caused: a field-side outer-chain legitimately reached from
+    /// within a call-side outer-chain (the `closeCause` getter read
+    /// from an inner-class method invoked via the call fallback) must
+    /// still run. A shared depth counter instead re-allowed the
+    /// unbounded recursion (gate hang), so this is the correct middle.
+    static CALL_OUTER_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FIELD_OUTER_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Run `f` with the outer-chain fallback guard held; `f` receives
-/// `false` when the guard was already held (caller must skip the
-/// fallback to avoid unbounded re-entrancy).
-fn with_outer_chain_guard<R>(f: impl FnOnce(bool) -> R) -> R {
-    let was = OUTER_CHAIN_ACTIVE.with(|c| {
-        let prev = c.get();
+fn with_call_outer_guard<R>(f: impl FnOnce(bool) -> R) -> R {
+    let was = CALL_OUTER_ACTIVE.with(|c| {
+        let p = c.get();
         c.set(true);
-        prev
+        p
     });
     let r = f(!was);
     if !was {
-        OUTER_CHAIN_ACTIVE.with(|c| c.set(false));
+        CALL_OUTER_ACTIVE.with(|c| c.set(false));
+    }
+    r
+}
+
+fn with_field_outer_guard<R>(f: impl FnOnce(bool) -> R) -> R {
+    let was = FIELD_OUTER_ACTIVE.with(|c| {
+        let p = c.get();
+        c.set(true);
+        p
+    });
+    let r = f(!was);
+    if !was {
+        FIELD_OUTER_ACTIVE.with(|c| c.set(false));
     }
     r
 }
