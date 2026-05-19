@@ -7102,6 +7102,35 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
         }
         if effective_args.len() != n_primary {
+            // Kotlin allows a top-level factory function with the same
+            // name as a class (`fun TimeoutCancellationException(time,
+            // delay, coroutine, name)` beside the 2-arg class). When
+            // the call's arity doesn't fit any constructor but a
+            // same-named module function does, that factory is the
+            // resolution — dispatch it instead of failing. (Lower-time
+            // can't always pick it: forward-reference stubs hide the
+            // real arity.)
+            let module = Arc::clone(&self.module);
+            let factory = module
+                .func_index
+                .iter()
+                .filter(|(n, _)| *n == class_def.name)
+                .filter_map(|(_, fid)| {
+                    module.funcs.get(fid.0 as usize).map(|f| (*fid, f))
+                })
+                .find(|(_, f)| {
+                    !f.blocks.is_empty()
+                        && (f.params.len() == effective_args.len()
+                            || f
+                                .params
+                                .last()
+                                .map(|p| p.is_vararg)
+                                .unwrap_or(false))
+                })
+                .map(|(fid, _)| fid);
+            if let Some(fid) = factory {
+                return self.call_func(&module, fid, effective_args.clone());
+            }
             return Err(klio_ir::eval::EvalError::Arity(format!(
                 "{}() expects {n_primary} args, got {}",
                 class_def.name,
