@@ -5678,6 +5678,66 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .filter(|f| f.name == name)
                         .collect();
                     if let Some(f) = self.pick_method_overload(&candidates, args) {
+                        // Under a member-only probe, a member that
+                        // only matches by SAM-converting a lambda
+                        // argument to a `fun interface` parameter is
+                        // NOT the resolution Kotlin wants — a
+                        // same-named extension whose parameter is the
+                        // exact function type is more specific
+                        // (`flow.collect { … }` binds
+                        // `Flow<T>.collect(action)`, not the
+                        // `collect(collector: FlowCollector)` member).
+                        // Decline so the probe continues / the
+                        // extension fallback resolves it; otherwise
+                        // the raw lambda is passed where a
+                        // FlowCollector is expected and emissions are
+                        // silently dropped.
+                        if member_only {
+                            let skip = f
+                                .params
+                                .first()
+                                .map(|p| p.name == "this")
+                                .unwrap_or(false)
+                                as usize;
+                            let sam_lambda = f.params[skip..]
+                                .iter()
+                                .zip(args.iter())
+                                .any(|(p, a)| {
+                                    let callable = matches!(
+                                        a,
+                                        klio_runtime::Value::Lambda { .. }
+                                          | klio_runtime::Value::IrClosure { .. }
+                                          | klio_runtime::Value::Function { .. }
+                                          | klio_runtime::Value::BoundMethod { .. }
+                                    );
+                                    let pn = p.ty.name.as_str();
+                                    let fn_ty = pn.starts_with("Function")
+                                        || (pn.len() <= 2
+                                            && pn.chars().all(|c| {
+                                                c.is_ascii_uppercase()
+                                            }));
+                                    // A lambda can only bind a
+                                    // non-function-typed parameter via
+                                    // SAM conversion; an exact
+                                    // function-typed extension is more
+                                    // specific. (klio's
+                                    // `is_fun_interface` is unreliable
+                                    // for pack interfaces, so don't
+                                    // gate on it.)
+                                    callable && !fn_ty
+                                });
+                            if sam_lambda {
+                                return Err(
+                                    klio_ir::eval::EvalError::Unimplemented(
+                                        format!(
+                                            "Vm::call_member `{name}` \
+                                             (member-only: SAM-lambda \
+                                             member deferred to extension)"
+                                        ),
+                                    ),
+                                );
+                            }
+                        }
                         let mut all_args: Vec<klio_runtime::Value> =
                             Vec::with_capacity(args.len() + 1);
                         all_args.push(receiver.clone());
