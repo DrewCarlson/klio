@@ -70,14 +70,16 @@ public fun <R, T> (suspend R.() -> T).startCoroutineUninterceptedOrReturn(
 }
 
 internal fun <T> startBlock(completion: Continuation<T>, body: () -> T): Any? {
-    return try {
-        val r = body()
-        completion.resumeWith(Result.success(r))
-        r
-    } catch (e: Throwable) {
-        completion.resumeWith(Result.failure(e))
-        COROUTINE_SUSPENDED
-    }
+    // `startCoroutineUninterceptedOrReturn` semantics: run the
+    // coroutine in the current activation and return its result
+    // directly. The completion is NOT resumed here on synchronous
+    // completion — the caller (e.g. `startUndispatched`) inspects the
+    // returned value and drives the completion itself; resuming here
+    // too would double-complete the Job. A synchronous throw
+    // propagates so the caller can wrap it; a real suspension parks
+    // cooperatively inside `body()` and the eventual resume routes
+    // through the continuation klio captured at the suspension point.
+    return body()
 }
 
 @PublishedApi

@@ -2209,6 +2209,41 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 .get(&(recv_simple.clone(), name.to_string()))
                 .copied()
                 .or_else(|| {
+                    // An extension property declared on a supertype
+                    // (`val CoroutineContext.coroutineName`) applies to
+                    // a receiver whose concrete class is a subtype
+                    // (`CombinedContext`, `EmptyCoroutineContext`, a
+                    // context element …). Walk the receiver's runtime
+                    // supertype chain before the `Any` fallback.
+                    if let klio_runtime::Value::Instance(i) = receiver {
+                        let mut queue: std::collections::VecDeque<String> =
+                            i.borrow().class.supertype_names.iter().cloned().collect();
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        while let Some(sup) = queue.pop_front() {
+                            if !seen.insert(sup.clone()) {
+                                continue;
+                            }
+                            if let Some(fid) = self
+                                .prog
+                                .extension_props
+                                .get(&(sup.clone(), name.to_string()))
+                                .copied()
+                            {
+                                return Some(fid);
+                            }
+                            if let Some(def) =
+                                self.classes.borrow().get(&sup).cloned()
+                            {
+                                for s in &def.supertype_names {
+                                    queue.push_back(s.clone());
+                                }
+                            }
+                        }
+                    }
+                    None
+                })
+                .or_else(|| {
                     self.prog
                         .extension_props
                         .get(&("Any".to_string(), name.to_string()))
@@ -4115,7 +4150,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             if let Some(f) = module.funcs.get(func.0 as usize) {
                 let params = &f.params;
                 let mut slots: Vec<Option<klio_runtime::Value>> = vec![None; params.len()];
-                let mut positional_idx = 0usize;
+                // Bind named arguments first so a following positional
+                // argument fills the next slot that is *not* already
+                // bound by name. Kotlin allows a positional argument
+                // after a named one (`f(named = x, pos1, pos2)`) and
+                // assigns the positionals to the remaining parameters
+                // in declaration order — a single rolling index would
+                // instead overwrite the named slot and shift every
+                // later argument (dropping the last one).
                 for (i, a) in args.iter().enumerate() {
                     if let Some(Some(arg_name)) = arg_names.get(i) {
                         if let Some(pos) =
@@ -4123,12 +4165,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         {
                             slots[pos] = Some(a.clone());
                         }
-                    } else {
-                        if positional_idx < params.len() {
-                            slots[positional_idx] = Some(a.clone());
-                        }
+                    }
+                }
+                let mut positional_idx = 0usize;
+                for (i, a) in args.iter().enumerate() {
+                    if matches!(arg_names.get(i), Some(Some(_))) {
+                        continue;
+                    }
+                    while positional_idx < params.len()
+                        && slots[positional_idx].is_some()
+                    {
                         positional_idx += 1;
                     }
+                    if positional_idx < params.len() {
+                        slots[positional_idx] = Some(a.clone());
+                    }
+                    positional_idx += 1;
                 }
                 // Fill omitted slots from the function's default-arg
                 // thunks (left-to-right, so a default may read an
@@ -5253,6 +5305,18 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::Bool(has));
                 }
                 _ => {}
+            }
+        }
+        // `Collection<T>.toTypedArray()` — used by upstream
+        // `Collection<Deferred<T>>.awaitAll()`
+        // (`AwaitAll(toTypedArray()).await()`).
+        if let klio_runtime::Value::List { items, .. } = receiver {
+            if name == "toTypedArray" && args.is_empty() {
+                let v: Vec<klio_runtime::Value> = items.borrow().clone();
+                return Ok(klio_runtime::Value::Array {
+                    items: klio_runtime::ObjRef::new(v),
+                    prim: None,
+                });
             }
         }
         // Generic Array → List conversion + a couple of frequently

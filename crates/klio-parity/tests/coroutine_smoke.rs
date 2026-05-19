@@ -37,6 +37,7 @@ const SMOKE: &[&str] = &[
     "cs4_suspend_seq",
     "cs5_flow_builder",
     "cs6_flow_operators",
+    "cs7_scope_builders",
 ];
 
 #[test]
