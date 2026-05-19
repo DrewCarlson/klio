@@ -5589,6 +5589,59 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .filter(|f| f.name == name)
                         .collect();
                     if let Some(f) = self.pick_method_overload(&candidates, args) {
+                        // Kotlin: a lambda argument binds an exact
+                        // function-typed parameter in preference to
+                        // SAM-converting it to a `fun interface`
+                        // member parameter. `flow.collect { … }` has
+                        // both a `collect(collector: FlowCollector)`
+                        // member (FlowCollector is a `fun interface`,
+                        // so the lambda SAM-binds) and a
+                        // `Flow<T>.collect(action: (T)->Unit)`
+                        // extension; the extension is more specific.
+                        // When the member match is SAM-only and an
+                        // applicable same-named extension exists,
+                        // defer to the extension fallback below.
+                        let sam_only = {
+                            let skip = f
+                                .params
+                                .first()
+                                .map(|p| p.name == "this")
+                                .unwrap_or(false)
+                                as usize;
+                            f.params[skip..]
+                                .iter()
+                                .zip(args.iter())
+                                .any(|(p, a)| {
+                                    let callable = matches!(
+                                        a,
+                                        klio_runtime::Value::Lambda { .. }
+                                            | klio_runtime::Value::IrClosure { .. }
+                                            | klio_runtime::Value::Function { .. }
+                                            | klio_runtime::Value::BoundMethod { .. }
+                                    );
+                                    let pn = p.ty.name.as_str();
+                                    let fn_ty = pn.starts_with("Function")
+                                        || (pn.len() <= 2
+                                            && pn.chars().all(|c| {
+                                                c.is_ascii_uppercase()
+                                            }));
+                                    callable
+                                        && !fn_ty
+                                        && self
+                                            .classes
+                                            .borrow()
+                                            .get(pn)
+                                            .map(|c| c.is_fun_interface)
+                                            .unwrap_or(false)
+                                })
+                        };
+                        if sam_only
+                            && self
+                                .resolve_ext_overload(name, receiver, args)
+                                .is_some()
+                        {
+                            break;
+                        }
                         let mut all_args: Vec<klio_runtime::Value> =
                             Vec::with_capacity(args.len() + 1);
                         all_args.push(receiver.clone());
