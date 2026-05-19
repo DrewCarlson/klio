@@ -1915,10 +1915,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     let idx = b.record_capture(&segments[0].name);
                     let cell = b.alloc_reg();
                     b.push(Inst::LoadCapture { dst: cell, idx });
-                    // Bind the capture name to the freshly-loaded
-                    // reg so subsequent Path reads hit the local
-                    // path instead of re-emitting LoadCapture.
-                    b.bind(segments[0].name.clone(), cell);
+                    // Do NOT cache the loaded reg under the capture
+                    // name: a later reference in a sibling branch
+                    // would reuse a reg whose defining `LoadCapture`
+                    // is in a non-dominating block (its value would be
+                    // the uninitialized `Unit`). `LoadCapture` reads
+                    // the frame-global captures vector, so re-emitting
+                    // it at every use is always correct and cheap.
                     if b.is_boxed(&segments[0].name) {
                         let dst = b.alloc_reg();
                         b.push(Inst::CellGet { dst, cell });

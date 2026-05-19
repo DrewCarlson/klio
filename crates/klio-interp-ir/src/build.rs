@@ -613,6 +613,44 @@ fn collect_hierarchy_method_names(
     }
 }
 
+/// Like [`collect_hierarchy_method_names`] but also gathers property
+/// and property-parameter names across the hierarchy. Used to seed an
+/// init block's bare-name set so an inherited member referenced
+/// without an explicit receiver (e.g. `initParentJob(parent)` from a
+/// subclass `init`) lowers as `this.<name>` rather than a global.
+fn collect_hierarchy_member_names(
+    start: &str,
+    by_name: &std::collections::HashMap<String, &klio_ast::Class>,
+    out: &mut std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    if !seen.insert(start.to_string()) {
+        return;
+    }
+    let Some(c) = by_name.get(start) else {
+        return;
+    };
+    for p in &c.primary_params {
+        if p.property.is_some() {
+            out.insert(p.name.name.clone());
+        }
+    }
+    for m in &c.members {
+        match m {
+            Decl::Function(f) => {
+                out.insert(f.name.name.clone());
+            }
+            Decl::Property(p) => {
+                out.insert(p.name.name.clone());
+            }
+            _ => {}
+        }
+    }
+    for st in &c.supertypes {
+        collect_hierarchy_member_names(&st.name.name, by_name, out, seen);
+    }
+}
+
 fn build_module_with_overrides(
     file: &KotlinFile,
     fqn_overrides: &std::collections::HashMap<klio_span::Span, String>,
@@ -1582,6 +1620,21 @@ fn build_module_with_overrides(
                 }
                 if let Decl::Function(f) = m {
                     own_members.insert(f.name.name.clone());
+                }
+            }
+            // Inherited members are reachable without an explicit
+            // receiver from an init block too (`initParentJob(parent)`
+            // in a `JobSupport` subclass `init`).
+            {
+                let mut seen_sup: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for st in &c.supertypes {
+                    collect_hierarchy_member_names(
+                        &st.name.name,
+                        &file_classes,
+                        &mut own_members,
+                        &mut seen_sup,
+                    );
                 }
             }
             // Primary ctor params are visible inside init blocks
