@@ -1208,7 +1208,16 @@ fn exec_inst(
             // scoping has it shadow any same-named member, so skip the
             // implicit-receiver member probe and member dispatch and
             // bind the captured callable via the global path below.
-            let shadow_capture = host.is_shadowing_capture(&name_str);
+            // But a genuine member of the implicit receiver still wins
+            // over an *over-captured* scoped global: anon-object
+            // capture sets are built from the whole visible scope, so
+            // a name like `emit` can land in the capture layer even
+            // though the real binding is the receiver's member
+            // (`SafeCollector.emit`). Only shadow when the receiver
+            // does not actually carry the member.
+            let shadow_capture = host.is_shadowing_capture(&name_str)
+                && !(!matches!(this_val, Value::Null | Value::Unit)
+                    && host.host_has_member(&this_val, &name_str));
             // Implicit-receiver search, Kotlin order: a *member* of
             // the lambda's own `this` or of any lexically enclosing
             // `this@…` outranks a same-named top-level extension.
@@ -1311,7 +1320,29 @@ fn exec_inst(
                         _ => None,
                     };
                 }
-            }            let result = match resolved {
+            }
+            // The receiver is known to carry this member but none of
+            // the probes above bound it (a pack actual class such as
+            // `SafeCollector` whose method is registered via the
+            // hierarchy map rather than the IR class table). Dispatch
+            // the member rather than fall through to the global path —
+            // an unqualified `emit` inside a Flow operator's receiver
+            // lambda is the collector's member, and the global path
+            // would mis-bind it to a captured closure and recurse.
+            if resolved.is_none()
+                && !is_ctor_name
+                && !matches!(this_val, Value::Null | Value::Unit)
+                && host.host_has_member(&this_val, &name_str)
+            {
+                match host.call_member_named(
+                    &this_val, &name_str, &arg_values, &names,
+                ) {
+                    Ok(v) => resolved = Some(v),
+                    Err(e @ EvalError::Suspended(_)) => return Err(e),
+                    Err(_) => {}
+                }
+            }
+            let result = match resolved {
                 Some(v) => v,
                 None => {
                     // Overloaded top-level function: select by runtime

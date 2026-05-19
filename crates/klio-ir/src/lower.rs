@@ -2959,19 +2959,17 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         && b.resolve(name0).is_none()
                         && b.module.func_id(name0).is_some();
                     if shadowed_by_local {
+                        // Bind the lexically-enclosing `flow { }`
+                        // collector as the receiver so a captured
+                        // receiver-function lambda (Flow `map`'s
+                        // `{ v -> emit(transform(v)) }`) targets the
+                        // right downstream collector. A non-receiver
+                        // value lambda (`{ it * 10 }`) ignores the
+                        // bound receiver — `invoke_callable_with_this`
+                        // only delivers it through a `this` capture or
+                        // a zero-param positional, never displacing a
+                        // declared value parameter.
                         let callee_r = resolve_capture(b, name0);
-                        // The captured callable may be a receiver
-                        // function (`FlowCollector<R>.(T) -> Unit`,
-                        // e.g. Flow `map`'s `{ v -> emit(transform(v)) }`
-                        // passed as `transform`'s `crossinline`
-                        // parameter). Kotlin binds its receiver to the
-                        // implicit receiver of the calling scope — the
-                        // lexically enclosing `flow { }` collector. Bind
-                        // that enclosing `this` so the body's `emit`
-                        // targets the correct downstream stage instead
-                        // of re-entering the source collector. Binding
-                        // `this` for a non-receiver lambda is harmless
-                        // (its body ignores `this`; args are unchanged).
                         let this_reg = if b.knows_outer("this")
                             || b.is_lambda_body()
                         {

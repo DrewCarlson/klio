@@ -5283,6 +5283,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         enum_class: None,
                     });
                 }
+                ("toTypedArray", 0) => {
+                    let v: Vec<klio_runtime::Value> = items.borrow().clone();
+                    return Ok(klio_runtime::Value::Array {
+                        items: klio_runtime::ObjRef::new(v),
+                        prim: None,
+                    });
+                }
                 ("toSet", 0) => {
                     let v: Vec<klio_runtime::Value> = items.borrow().clone();
                     return Ok(klio_runtime::Value::Set {
@@ -8659,7 +8666,17 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 let has_this_capture =
                     info.capture_names.iter().any(|n| n == "this");
                 let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(info.n_params);
-                if info.n_params >= 1 && !has_this_capture {
+                // Deliver the receiver as the leading positional only
+                // when there is an unfilled leading slot for it
+                // (`{ it.foo() }`-style receiver lambda invoked with
+                // fewer args than params). When the caller already
+                // supplies a value for every declared parameter, the
+                // lambda is an ordinary value function (`{ it * 10 }`)
+                // and the receiver must not displace its parameter.
+                if info.n_params >= 1
+                    && !has_this_capture
+                    && args.len() < info.n_params
+                {
                     all.push(this.clone());
                     for a in args.iter() {
                         all.push(a.clone());
