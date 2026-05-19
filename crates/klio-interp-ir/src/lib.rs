@@ -3359,6 +3359,16 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 }
             }
+            // Names the object closes over reach its method bodies as
+            // runtime-injected scoped globals; make them visible to
+            // method lowering so a `recv.name()` whose `name` is one
+            // of them (e.g. `c.block()` where `block` is an enclosing
+            // inline fn's crossinline param) dispatches as
+            // CallMemberOrValue instead of mis-SAM-dispatching the
+            // receiver's abstract method.
+            let anon_cap_set: std::collections::HashSet<String> =
+                captured_names.iter().cloned().collect();
+            klio_ir::lower::set_lower_anon_captures(Some(anon_cap_set));
             for m in members {
                 if let klio_ast::Decl::Function(f) = m {
                     if f.body.is_none() {
@@ -3388,6 +3398,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     );
                 }
             }
+            klio_ir::lower::set_lower_anon_captures(None);
             let body_properties: Vec<klio_runtime::PropertyDef> = members
                 .iter()
                 .filter_map(|m| match m {

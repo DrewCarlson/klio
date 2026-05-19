@@ -1048,6 +1048,34 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    /// Names captured by the anonymous object whose method is being
+    /// lowered (`object : Flow { collect(c) { c.block() } }` where
+    /// `block` is an enclosing inline fn's crossinline param). These
+    /// reach the method body as runtime-injected scoped globals, so a
+    /// `recv.name()` whose `name` is one of them must dispatch as
+    /// CallMemberOrValue with a `LoadGlobal(name)` fallback (the
+    /// receiver's member wins if present, else the captured callable
+    /// is invoked with the receiver bound). A thread-local keeps
+    /// `lower_method`'s public signature (and its other callers)
+    /// unchanged.
+    static LOWER_ANON_CAPTURES: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set (or clear) the anon-object captured-name set consulted while
+/// lowering that object's method bodies.
+pub fn set_lower_anon_captures(
+    names: Option<std::collections::HashSet<String>>,
+) {
+    LOWER_ANON_CAPTURES.with(|c| *c.borrow_mut() = names);
+}
+
+fn is_lower_anon_capture(name: &str) -> bool {
+    LOWER_ANON_CAPTURES
+        .with(|c| c.borrow().as_ref().map(|s| s.contains(name)).unwrap_or(false))
+}
+
 /// Same as `lower_class_with_file` but mixes an additional set of
 /// member names into the class's `own_members`. Used when a nested
 /// class is lifted to top level: the outer's property + method
@@ -3445,15 +3473,32 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // local param/fn. CallMemberOrValue still tries
                     // the receiver's member first, so a captured
                     // non-callable can't hijack a real member call.
+                    let anon_cap = is_lower_anon_capture(&name.name)
+                        && b.resolve(&name.name).is_none()
+                        && !b.is_local_fn(&name.name)
+                        && !b.is_param(&name.name)
+                        && !b.knows_outer(&name.name);
                     let local_callable = b.is_local_fn(&name.name)
                         || b.is_param(&name.name)
-                        || b.knows_outer(&name.name);
+                        || b.knows_outer(&name.name)
+                        || anon_cap;
                     if local_callable {
-                        // Capture the name on demand (a callable
-                        // closed over by this lambda may not have been
-                        // referenced — hence captured — yet at this
-                        // point).
-                        let local_reg = resolve_capture(b, &name.name);
+                        // For an anon-object method, a captured name
+                        // reaches the body as a runtime-injected scoped
+                        // global — load it as a global. Otherwise
+                        // capture the name on demand (a callable closed
+                        // over by this lambda may not have been
+                        // referenced — hence captured — yet here).
+                        let local_reg = if anon_cap {
+                            let r = b.alloc_reg();
+                            let n = b.module.intern_const(Const::String(
+                                name.name.clone(),
+                            ));
+                            b.push(Inst::LoadGlobal { dst: r, name: n });
+                            r
+                        } else {
+                            resolve_capture(b, &name.name)
+                        };
                         // `recv.name(args)` where `name` is also a
                         // callable local/param. Kotlin dispatches the
                         // member when `recv`'s type has it, and only
