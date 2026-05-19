@@ -1313,10 +1313,14 @@ fn exec_inst(
                 host.call_member_named(&recv, &name_str, &user_args, &names)?
             } else {
                 let fb = frame.read(*fallback);
-                let mut all: Vec<Value> = Vec::with_capacity(1 + user_args.len());
-                all.push(recv);
-                all.extend(user_args);
-                host.call_value_named(&fb, &all, &[])?
+                // Invoke with `recv` bound as the callable's receiver.
+                // For a lowered extension fn (param 0 is `this`) this
+                // prepends `recv`; for a receiver lambda that captured
+                // `this` (`Sink.(Int) -> Unit` written `{ v -> … }`)
+                // the receiver is delivered through the capture and
+                // the declared params stay the value params — so a
+                // blind `recv`-prepend would bind `v` to the receiver.
+                host.call_value_with_this(&fb, &recv, &user_args, &names)?
             };
             frame.write(*dst, result);
         }

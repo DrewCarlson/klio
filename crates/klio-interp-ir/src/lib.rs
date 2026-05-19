@@ -1874,6 +1874,54 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         self.call_value(callee, args)
     }
 
+    fn call_value_with_this(
+        &mut self,
+        callee: &klio_runtime::Value,
+        this_value: &klio_runtime::Value,
+        args: &[klio_runtime::Value],
+        _arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        use klio_runtime::IntrinsicHost as _;
+        let mut sink = self.out_sink.clone();
+        let r = {
+            let mut intrinsic = VmIntrinsicHost {
+                scheduler: &mut *self.scheduler,
+                module: Arc::clone(&self.module),
+                closures: self.closures.clone(),
+                globals: self.globals.clone(),
+                classes: self.classes.clone(),
+                prog: Arc::clone(&self.prog),
+                anon_methods: self.anon_methods.clone(),
+                class_default_outer: self.class_default_outer.clone(),
+                instance_id_counter: Arc::clone(&self.instance_id_counter),
+                out_sink: self.out_sink.clone(),
+                threads: Arc::clone(&self.threads),
+            };
+            intrinsic.invoke_callable_with_this(
+                callee, args, this_value, &mut sink,
+            )
+        };
+        r.map_err(|e| match e {
+            klio_runtime::RuntimeError::Thrown(v) => {
+                klio_ir::eval::EvalError::Throw(v)
+            }
+            klio_runtime::RuntimeError::Return(v) => {
+                klio_ir::eval::EvalError::NonLocalReturn(v)
+            }
+            klio_runtime::RuntimeError::Suspend(wake) => {
+                klio_ir::eval::EvalError::Suspended(Box::new(
+                    klio_ir::eval::SuspendState {
+                        token: 0,
+                        frames: Vec::new(),
+                        wake_in_millis: wake,
+                        pending_resume_reg: None,
+                    },
+                ))
+            }
+            other => klio_ir::eval::EvalError::Type(format!("{other}")),
+        })
+    }
+
     fn get_field(
         &mut self,
         receiver: &klio_runtime::Value,
@@ -8401,8 +8449,19 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                         cap[idx] = this.clone();
                     }
                 }
+                // The receiver reaches a receiver lambda one of two
+                // ways. If the body captured `this` (it uses bare
+                // members / `this`), the override above already
+                // delivered the receiver through that capture slot —
+                // the declared params are the *value* params, so pass
+                // only `args` (a `Sink.(Int) -> Unit` written
+                // `{ v -> … }` has one param `v`, not the receiver).
+                // Without a `this` capture the receiver is the lambda's
+                // sole positional (`{ it.foo() }`-style), so prepend it.
+                let has_this_capture =
+                    info.capture_names.iter().any(|n| n == "this");
                 let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(info.n_params);
-                if info.n_params >= 1 {
+                if info.n_params >= 1 && !has_this_capture {
                     all.push(this.clone());
                     for a in args.iter() {
                         all.push(a.clone());
