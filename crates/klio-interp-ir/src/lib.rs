@@ -1140,7 +1140,8 @@ impl<'a> VmHost<'a> {
             // `(String, Int, Int = 1, Int = MAX): Int` overload). An
             // exact-arity match is preferred (no default penalty) so a
             // dedicated N-arg overload still outranks a defaulted one.
-            if f.params.len() < args.len() {
+            let last_vararg = f.params.last().map(|p| p.is_vararg).unwrap_or(false);
+            if f.params.len() < args.len() && !last_vararg {
                 continue;
             }
             if f.params.len() > args.len() {

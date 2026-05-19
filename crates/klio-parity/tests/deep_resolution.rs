@@ -218,9 +218,7 @@ fun main() {
 
 // 11. Overloaded function with vararg and non-vararg variants; call
 //     site disambiguation.
-//     Tracked: task #34 (vararg overload not selected with n>1 args).
 #[test]
-#[ignore = "tracked as task #34"]
 fn overload_vararg_vs_specific() {
     let src = r#"
 fun pick(x: Int): String = "single:$x"
