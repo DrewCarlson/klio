@@ -1457,6 +1457,30 @@ fn exec_inst(
             let v = frame.read(*value);
             host.store_global(&name_str, v)?;
         }
+        Inst::StoreToThisOrGlobal { this_idx, name, value } => {
+            let name_str = match &frame.module.consts[name.0 as usize] {
+                Const::String(s) => s.clone(),
+                _ => return Err(EvalError::Type(
+                    "StoreToThisOrGlobal: name not a string const".into(),
+                )),
+            };
+            let v = frame.read(*value);
+            let this_val = frame
+                .captures
+                .get(*this_idx as usize)
+                .cloned()
+                .unwrap_or(Value::Null);
+            // Bound-receiver property write inside a receiver lambda
+            // (`Sink.(Int) -> Unit` doing `sum = 99`). When `this` is
+            // a real instance carrying the member, set it there;
+            // otherwise the name is a genuine top-level binding —
+            // route to globals (matches the read side).
+            if matches!(this_val, Value::Instance(_)) {
+                host.set_field(&this_val, &name_str, v)?;
+            } else {
+                host.store_global(&name_str, v)?;
+            }
+        }
         Inst::LoadGlobal { dst, name } => {
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),

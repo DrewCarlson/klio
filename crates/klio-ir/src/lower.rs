@@ -5286,6 +5286,27 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                         let _ = b.record_capture(&segments[0].name);
                         let n = b.module.intern_const(Const::String(segments[0].name.clone()));
                         b.push(Inst::StoreGlobal { name: n, value: combined });
+                    } else if b.is_lambda_body() {
+                        // Unqualified write inside a lambda body whose
+                        // name is not a local/param/captured-outer/
+                        // own-member. By Kotlin scoping it is either a
+                        // property of the lambda's bound receiver
+                        // (`Sink.(Int) -> Unit` doing `sum = 99`) or a
+                        // genuine top-level binding. Decide at runtime,
+                        // symmetric to the read side's
+                        // LoadFromThisOrGlobal: capture `this` on
+                        // demand so a receiver-binding invoke populates
+                        // the slot, then StoreToThisOrGlobal sets the
+                        // receiver's member when present, else globals.
+                        let this_idx = b.record_capture("this");
+                        let name_c = b.module.intern_const(Const::String(
+                            segments[0].name.clone(),
+                        ));
+                        b.push(Inst::StoreToThisOrGlobal {
+                            this_idx,
+                            name: name_c,
+                            value: combined,
+                        });
                     } else {
                         // Top-level binding: route through StoreGlobal so
                         // the tree-walker setter / delegate fires.

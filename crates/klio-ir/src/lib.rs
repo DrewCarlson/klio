@@ -294,6 +294,13 @@ pub enum Inst {
     /// field/method named `name`, read it; otherwise fall back to
     /// LoadGlobal(name).
     LoadFromThisOrGlobal { dst: Reg, this_idx: u16, name: ConstId },
+    /// Symmetric write counterpart of `LoadFromThisOrGlobal`.
+    /// runtime: if `this_idx`'s captured value is an instance with a
+    /// member named `name`, `SetField` it; otherwise fall back to
+    /// `StoreGlobal(name)`. Lets an unqualified write inside a
+    /// receiver lambda reach the bound receiver's property while a
+    /// genuine top-level binding still routes to globals.
+    StoreToThisOrGlobal { this_idx: u16, name: ConstId, value: Reg },
     /// Call a bare-name function inside a lambda body that may be
     /// invoked with a this-receiver. If the captured this is an
     /// instance with a method named `name`, dispatch as a member
