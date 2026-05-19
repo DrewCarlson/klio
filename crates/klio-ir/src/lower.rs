@@ -548,7 +548,19 @@ fn collect_var_decls(stmts: &[Stmt], out: &mut std::collections::HashSet<String>
     }
     for s in stmts {
         match s {
-            Stmt::Decl(klio_ast::Decl::Property(p)) if p.mutable => {
+            // A `var`, or a deferred-init plain `val` (no initializer /
+            // delegate / accessor). A deferred `val` assigned later
+            // inside a nested lambda (`val x: T; run { x = … }`, as in
+            // JobSupport's `synchronized(state) { wasCancelling = … }`)
+            // needs the same Ref-boxing as a captured `var` so the
+            // lambda's write is visible after the call returns.
+            Stmt::Decl(klio_ast::Decl::Property(p))
+                if p.mutable
+                    || (p.init.is_none()
+                        && p.delegate.is_none()
+                        && p.getter.is_none()
+                        && p.setter.is_none()) =>
+            {
                 out.insert(p.name.name.clone());
             }
             Stmt::DestructuringDecl { mutable: true, names, .. } => {
