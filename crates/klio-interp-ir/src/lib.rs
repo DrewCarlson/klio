@@ -1251,7 +1251,10 @@ impl<'a> VmHost<'a> {
         name: &str,
         receiver: &klio_runtime::Value,
         args: &[klio_runtime::Value],
+        arg_names: &[Option<String>],
     ) -> Option<klio_ir::FuncId> {
+        // params[0] is the synthesized extension/dispatch receiver
+        // (`this`); user args map onto params[1..].
         let want = args.len() + 1;
         let candidates: Vec<(klio_ir::FuncId, klio_ir::Func)> = self
             .module
@@ -1261,22 +1264,140 @@ impl<'a> VmHost<'a> {
             .filter_map(|(_, fid)| {
                 self.module.funcs.get(fid.0 as usize).cloned().map(|f| (*fid, f))
             })
-            .filter(|(_fid, f)| !f.params.is_empty() && f.params.len() >= want)
+            .filter(|(_fid, f)| !f.params.is_empty())
             .collect();
         if candidates.len() <= 1 {
             return candidates.into_iter().next().map(|(fid, _)| fid);
         }
-        let mut exact = candidates.iter().filter(|(_, f)| f.params.len() == want);
-        if let (Some(only), None) = (exact.next(), exact.next()) {
-            return Some(only.0);
+        let has_names = arg_names.iter().any(|n| n.is_some());
+        // Default-/named-arg-aware applicability + scoring. A
+        // candidate is viable only if every user parameter
+        // (params[1..]) that is left unbound after slotting the
+        // positional and named args has a default. Without this a
+        // named-only call like `recv.f(h = x)` mis-bound to an
+        // overload missing a required parameter (and slotted args by
+        // raw position, yielding `Unit` fills) — e.g. picking
+        // `f(b: Boolean, h)` over the applicable
+        // `f(invokeImmediately: Boolean = true, h)`.
+        let mut best: Option<(klio_ir::FuncId, i64)> = None;
+        for (fid, f) in &candidates {
+            let np = f.params.len();
+            if np < 1 {
+                continue;
+            }
+            let upar = np - 1; // user-facing params (excl. `this`)
+            let mut filled = vec![false; upar];
+            let mut score: i64 =
+                self.overload_score_arg(&f.params[0].ty, receiver)
+                    .unwrap_or(-2) as i64;
+            let mut viable = true;
+            // Named args bind by parameter name.
+            for (i, an) in arg_names.iter().enumerate() {
+                if let Some(nm) = an {
+                    match f.params[1..]
+                        .iter()
+                        .position(|p| &p.name == nm)
+                    {
+                        Some(slot) => {
+                            filled[slot] = true;
+                            if let Some(a) = args.get(i) {
+                                score += self
+                                    .overload_score_arg(
+                                        &f.params[slot + 1].ty,
+                                        a,
+                                    )
+                                    .unwrap_or(-2)
+                                    as i64;
+                            }
+                        }
+                        None => {
+                            viable = false; // unknown named arg
+                            break;
+                        }
+                    }
+                }
+            }
+            if !viable {
+                continue;
+            }
+            // Positional args fill the next unfilled user slot.
+            let mut next = 0usize;
+            for (i, an) in arg_names.iter().enumerate() {
+                if an.is_some() {
+                    continue;
+                }
+                while next < upar && filled[next] {
+                    next += 1;
+                }
+                if next >= upar {
+                    viable = false; // too many positional args
+                    break;
+                }
+                filled[next] = true;
+                if let Some(a) = args.get(i) {
+                    score += self
+                        .overload_score_arg(
+                            &f.params[next + 1].ty,
+                            a,
+                        )
+                        .unwrap_or(-2) as i64;
+                }
+                next += 1;
+            }
+            if !viable {
+                continue;
+            }
+            // Every unfilled user param must carry a default.
+            let defaults = self.prog.func_defaults.get(fid);
+            for (slot, done) in filled.iter().enumerate() {
+                if !*done {
+                    let has_default = defaults
+                        .and_then(|d| d.get(slot + 1))
+                        .map(|s| s.is_some())
+                        .unwrap_or(false);
+                    if !has_default {
+                        viable = false;
+                        break;
+                    }
+                }
+            }
+            if !viable {
+                continue;
+            }
+            // Prefer exact arity and (slightly) name-supplied calls.
+            if np == want {
+                score += 5;
+            }
+            if has_names {
+                score += 1;
+            }
+            if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+                best = Some((*fid, score));
+            }
+        }
+        if let Some((fid, _)) = best {
+            return Some(fid);
+        }
+        // No viable candidate under the strict rule — fall back to
+        // the old arity-permissive pick so non-named / legacy call
+        // shapes keep resolving exactly as before.
+        let arity: Vec<(klio_ir::FuncId, klio_ir::Func)> = candidates
+            .into_iter()
+            .filter(|(_, f)| f.params.len() >= want)
+            .collect();
+        if arity.len() == 1 {
+            return Some(arity[0].0);
         }
         let mut best: Option<(klio_ir::FuncId, i32)> = None;
-        for (fid, f) in candidates {
-            let mut score =
-                self.overload_score_arg(&f.params[0].ty, receiver).unwrap_or(-1);
+        for (fid, f) in arity {
+            let mut score = self
+                .overload_score_arg(&f.params[0].ty, receiver)
+                .unwrap_or(-1);
             for (i, a) in args.iter().enumerate() {
                 if let Some(p) = f.params.get(i + 1) {
-                    score += self.overload_score_arg(&p.ty, a).unwrap_or(-1);
+                    score += self
+                        .overload_score_arg(&p.ty, a)
+                        .unwrap_or(-1);
                 }
             }
             if f.params.len() == want {
@@ -3748,6 +3869,77 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // The chain bottomed out at a builtin (`Any` / `Throwable`),
+        // which declares no IR method. Supply the inherited
+        // `Any`/`Throwable` semantics so `override fun toString() =
+        // "${super.toString()} …"` works through the exception
+        // hierarchy.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            match (name, args.len()) {
+                ("toString", 0) => {
+                    let i = inst.borrow();
+                    let is_throwable = {
+                        let classes = self.classes.borrow();
+                        let mut stack: Vec<String> =
+                            vec![i.class.name.clone()];
+                        let mut seen = std::collections::HashSet::new();
+                        let mut found = false;
+                        while let Some(cn) = stack.pop() {
+                            if !seen.insert(cn.clone()) {
+                                continue;
+                            }
+                            if matches!(
+                                cn.as_str(),
+                                "Throwable"
+                                    | "Exception"
+                                    | "RuntimeException"
+                                    | "Error"
+                                    | "CancellationException"
+                            ) {
+                                found = true;
+                                break;
+                            }
+                            if let Some(d) = classes.get(&cn) {
+                                stack.extend(
+                                    d.supertype_names.iter().cloned(),
+                                );
+                            }
+                        }
+                        found
+                    };
+                    if is_throwable {
+                        let msg = match i.get("message") {
+                            Some(klio_runtime::Value::String(s)) => {
+                                Some((*s).clone())
+                            }
+                            _ => None,
+                        };
+                        let s = match msg {
+                            Some(m) => format!("{}: {m}", i.class.fqn),
+                            None => i.class.fqn.clone(),
+                        };
+                        return Ok(klio_runtime::Value::String(Arc::new(s)));
+                    }
+                    return Ok(klio_runtime::Value::String(Arc::new(
+                        format!("{}@{:x}", i.class.fqn, i.identity),
+                    )));
+                }
+                ("hashCode", 0) => {
+                    return Ok(klio_runtime::Value::new_int(
+                        inst.borrow().identity as i64,
+                    ));
+                }
+                ("equals", 1) => {
+                    let same = matches!(
+                        &args[0],
+                        klio_runtime::Value::Instance(o)
+                            if klio_runtime::ObjRef::ptr_eq(inst, o)
+                    );
+                    return Ok(klio_runtime::Value::Bool(same));
+                }
+                _ => {}
+            }
+        }
         Err(klio_ir::eval::EvalError::Type(format!(
             "super.{name}: no matching method up the supertype chain from `{owner_class}`"
         )))
@@ -6064,6 +6256,45 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 format!("kotlin.{name}"),
             ]
         };
+        // A pack-defined exception class (`CompletionHandlerException`,
+        // `JobCancellationException`, …) is a `Value::Instance` whose
+        // `type_fqn()` is its own class, so the `kotlin.Throwable.*`
+        // intrinsics (`message`, `cause`, `addSuppressed`,
+        // `suppressedExceptions`, …) are never probed. When the
+        // receiver's supertype chain reaches the Throwable family,
+        // probe `kotlin.Throwable.<name>` too so those resolve.
+        let mut probes = probes;
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let is_throwable = {
+                let classes = self.classes.borrow();
+                let mut stack = vec![inst.borrow().class.name.clone()];
+                let mut seen = std::collections::HashSet::new();
+                let mut found = false;
+                while let Some(cn) = stack.pop() {
+                    if !seen.insert(cn.clone()) {
+                        continue;
+                    }
+                    if matches!(
+                        cn.as_str(),
+                        "Throwable"
+                            | "Exception"
+                            | "RuntimeException"
+                            | "Error"
+                            | "CancellationException"
+                    ) {
+                        found = true;
+                        break;
+                    }
+                    if let Some(d) = classes.get(&cn) {
+                        stack.extend(d.supertype_names.iter().cloned());
+                    }
+                }
+                found
+            };
+            if is_throwable {
+                probes.push(format!("kotlin.Throwable.{name}"));
+            }
+        }
         // A top-level stdlib function (`listOf`, `mutableListOf`,
         // `minOf`, `println`, …) is never a member or extension of an
         // arbitrary receiver. Skip the speculative receiver-prepend
@@ -6785,7 +7016,9 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // shift `x` into `flag`. Without this the fall-through dropped
         // `arg_names` and bound positionally.
         if arg_names.iter().any(|n| n.is_some()) {
-            if let Some(fid) = self.resolve_ext_overload(name, receiver, args) {
+            if let Some(fid) =
+                self.resolve_ext_overload(name, receiver, args, arg_names)
+            {
                 let module = Arc::clone(&self.module);
                 let mut all: Vec<klio_runtime::Value> =
                     Vec::with_capacity(args.len() + 1);
@@ -6822,7 +7055,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             self.module
                                 .funcs
                                 .get(fid.0 as usize)
-                                .map(|f| f.name == name)
+                                // Tolerate a package/class-qualified
+                                // lowered name (`Cls.method`) as well as
+                                // the bare `method` — same matching
+                                // `host_has_member` uses, so a member it
+                                // reports present is actually
+                                // dispatchable (a pack class such as
+                                // `CancellableContinuationImpl` whose
+                                // private methods lower with a qualified
+                                // name).
+                                .map(|f| {
+                                    f.name == name
+                                        || f.name.rsplit('.').next()
+                                            == Some(name)
+                                })
                                 .unwrap_or(false)
                         }) {
                             method_fid = Some(*fid);
@@ -6849,7 +7095,77 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
-        self.call_member(receiver, name, args)
+        // Positional / no-named-args instance call. Run normal
+        // dispatch FIRST so klio's stdlib-intrinsic shadowing wins —
+        // e.g. the native `kotlinx.atomicfu.AtomicRef.compareAndSet`
+        // must beat the pack's IR fallback-stub body (which returns a
+        // constant `false`, making `_state.loop { … compareAndSet …
+        // }` spin forever). Only if `call_member` yields klio's
+        // "no such member" sentinel (`Unimplemented`) do we walk the
+        // class hierarchy in `module.classes` for a pack method that
+        // lowers with a class-qualified func name (e.g.
+        // `CancellableContinuationImpl.detachChildIfNonReusable`,
+        // reached bare from inside the atomicfu `loop {}` closure) —
+        // which `host_has_member` reports present but `call_member`
+        // cannot dispatch.
+        let primary = self.call_member(receiver, name, args);
+        if !matches!(
+            primary,
+            Err(klio_ir::eval::EvalError::Unimplemented(_))
+        ) {
+            return primary;
+        }
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let start = inst.borrow().class.name.clone();
+            let mut queue: std::collections::VecDeque<String> =
+                std::collections::VecDeque::new();
+            let mut seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            queue.push_back(start);
+            let mut method_fid: Option<klio_ir::FuncId> = None;
+            while let Some(cur) = queue.pop_front() {
+                if !seen.insert(cur.clone()) {
+                    continue;
+                }
+                if let Some(ir_class) =
+                    self.module.classes.iter().find(|c| c.name == cur)
+                {
+                    if let Some(fid) = ir_class.methods.iter().find(|fid| {
+                        self.module
+                            .funcs
+                            .get(fid.0 as usize)
+                            .map(|f| {
+                                f.name == name
+                                    || f.name.rsplit('.').next()
+                                        == Some(name)
+                            })
+                            .unwrap_or(false)
+                    }) {
+                        method_fid = Some(*fid);
+                        break;
+                    }
+                }
+                if let Some(def) =
+                    self.classes.borrow().get(&cur).cloned()
+                {
+                    for sup in &def.supertype_names {
+                        queue.push_back(sup.clone());
+                    }
+                }
+            }
+            if let Some(fid) = method_fid {
+                let module = Arc::clone(&self.module);
+                let mut all: Vec<klio_runtime::Value> =
+                    Vec::with_capacity(args.len() + 1);
+                all.push(receiver.clone());
+                all.extend_from_slice(args);
+                let mut names: Vec<Option<String>> =
+                    vec![None; all.len()];
+                names.truncate(all.len());
+                return self.call_func_named(&module, fid, all, &names);
+            }
+        }
+        primary
     }
 
     fn new_instance(

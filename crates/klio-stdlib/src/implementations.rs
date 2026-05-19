@@ -310,6 +310,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Throwable.message", throwable_message),
     ("kotlin.Throwable.cause", throwable_cause),
     ("kotlin.Throwable.toString", throwable_to_string),
+    ("kotlin.Throwable.addSuppressed", throwable_add_suppressed),
+    ("kotlin.Throwable.getSuppressed", throwable_suppressed),
+    ("kotlin.Throwable.suppressedExceptions", throwable_suppressed),
 
     // ----- Collection constructors -----
     ("kotlin.Pair", coll_pair_ctor),
@@ -3943,6 +3946,19 @@ fn throwable_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Type("toString requires a Throwable receiver".into()));
     };
     Ok(Value::String(Arc::new(format!("{v}"))))
+}
+
+/// `Throwable.addSuppressed(other)` — klio is single-threaded and
+/// does not surface suppressed-exception chains in diagnostics, so
+/// this records nothing. Accepts any throwable-shaped receiver.
+fn throwable_add_suppressed(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Unit)
+}
+
+/// `Throwable.suppressedExceptions` / `getSuppressed()` — always
+/// empty (see [`throwable_add_suppressed`]).
+fn throwable_suppressed(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(make_list(Vec::new(), false))
 }
 
 fn throwable_cause(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

@@ -4624,18 +4624,22 @@ fn lower_when(
     if let Some(subj) = subject_r {
         if let Some(arms) = collect_switch_arms(b, branches) {
             let (cases, default_blk, body_block_for_branch) = arms;
-            // When the source has no `else`, route the default edge
-            // to a fresh block that throws NoWhenBranchMatchedException
-            // rather than falling through to the join.
+            // No `else`: route the default edge to a block that
+            // yields `Unit` and falls through to the join — never
+            // throw. (Statement `when`s are non-exhaustive in Kotlin;
+            // exhaustive expression `when`s are compiler-guaranteed so
+            // the default is unreachable in well-formed code.)
             let default = match default_blk {
                 Some(blk) => blk,
                 None => {
-                    let throw_blk = b.alloc_block();
+                    let dflt = b.alloc_block();
                     let saved = b.cur;
-                    b.switch_to(throw_blk);
-                    emit_no_when_throw(b);
+                    b.switch_to(dflt);
+                    let u = b.emit_const(Const::Unit);
+                    b.push(Inst::Move { dst: result, src: u });
+                    b.terminate(Terminator::Goto(join));
                     b.switch_to(saved);
-                    throw_blk
+                    dflt
                 }
             };
             b.terminate(Terminator::Switch { reg: subj, arms: cases, default });
@@ -4762,40 +4766,22 @@ fn lower_when(
         b.terminate(Terminator::Goto(join));
         b.switch_to(next_blk);
     }
-    // No matching branch and no `else` arm. A *subjectless* `when {}`
-    // without `else` is a valid non-exhaustive Kotlin statement: on
-    // no match it simply falls through (yielding Unit), it does NOT
-    // throw. (A subjectless `when` expression without `else` is a
-    // compile error, so this is only reached in statement position.)
-    // A *subject* `when (x)` without `else` is the exhaustive
-    // sealed/enum form; keep the runtime safety throw there.
-    if subject.is_some() {
-        emit_no_when_throw(b);
-    } else {
-        let u = b.emit_const(Const::Unit);
-        b.push(Inst::Move { dst: result, src: u });
-        b.terminate(Terminator::Goto(join));
-    }
+    // No matching branch and no `else` arm — fall through yielding
+    // `Unit`, never throw. A subject `when (x)` *statement* without
+    // `else` (e.g. `when (state) { is CancelHandler -> …; is
+    // Segment<*> -> … }` in `CancellableContinuationImpl.cancel`) is
+    // valid non-exhaustive Kotlin and must NOT throw on no match. A
+    // subject `when` *expression* without `else` is only valid when
+    // the compiler proved it exhaustive (sealed/enum), so a no-match
+    // is unreachable in a well-formed program; falling through to
+    // `Unit` is a safe defensive default and avoids crashing valid
+    // statement-position `when`s that `lower_when` cannot distinguish
+    // (it is always invoked through `lower_expr`).
+    let u = b.emit_const(Const::Unit);
+    b.push(Inst::Move { dst: result, src: u });
+    b.terminate(Terminator::Goto(join));
     b.switch_to(join);
     result
-}
-
-fn emit_no_when_throw(b: &mut FuncBuilder<'_>) {
-    let class_name = b
-        .module
-        .intern_const(Const::String("NoWhenBranchMatchedException".into()));
-    let ctor = b.alloc_reg();
-    b.push(Inst::LoadGlobal { dst: ctor, name: class_name });
-    let args_start = b.alloc_reg();
-    let exc = b.alloc_reg();
-    b.push(Inst::CallValue {
-        dst: exc,
-        callee: ctor,
-        args: args_start,
-        n_args: 0,
-        arg_names: Vec::new(),
-    });
-    b.terminate(Terminator::Throw(exc));
 }
 
 fn or_chain(b: &mut FuncBuilder<'_>, mk: impl FnOnce(&mut FuncBuilder<'_>) -> Vec<Reg>) -> Reg {
@@ -4916,8 +4902,22 @@ fn splice_inline_lambda(
             b.bind(p.name.clone(), *r);
         }
     }
+    // The lambda being spliced was written in the body of the inline
+    // fn whose splice owns this snapshot. An unlabeled `return`
+    // inside it is a non-local return that, in Kotlin, returns from
+    // the function lexically containing the inline call the lambda
+    // was passed to — i.e. that owner splice. Expose the owner's
+    // `inline_return` (not the full current stack, which also holds
+    // *inner* inline-fn splices like `loopOnState` that the lambda's
+    // `return` must pass through) so the unlabeled `return` localizes
+    // to the owner splice via `inline_active_return()` rather than
+    // falling to the heuristic `NonLocalReturn` unwind.
+    let owner_ret = b.inline_lambda_owner_return();
     b.push_inline_lambda_frame(std::collections::HashMap::new());
     let saved = b.take_inline_return();
+    if let Some(o) = owner_ret {
+        b.restore_inline_return(o);
+    }
     // `return@<inlineFnName>` inside this lambda is a *local* return
     // from the lambda invocation (Kotlin: the implicit label is the
     // inline fn it was passed to). Route it to this splice's result.

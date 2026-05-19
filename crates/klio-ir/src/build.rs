@@ -102,7 +102,17 @@ pub struct FuncBuilder<'a> {
     /// the current inline frame so `param(args)` splices in place.
     inline_return: Vec<(Reg, BlockId)>,
     inline_stack: Vec<String>,
-    inline_lambda_subst: Vec<std::collections::HashMap<String, klio_ast::Expr>>,
+    /// Per inline-fn-splice frame: the lambda-param substitution map
+    /// *and* a snapshot of `inline_return` as it was when this frame
+    /// was pushed. A lambda taken from this frame was written in the
+    /// body of the inline fn whose splice owns that snapshot, so an
+    /// unlabeled `return` inside the spliced lambda must localize to
+    /// that owner splice (restore the snapshot), not fall through to
+    /// the heuristic non-local-return unwind.
+    inline_lambda_subst: Vec<(
+        std::collections::HashMap<String, klio_ast::Expr>,
+        Vec<(Reg, BlockId)>,
+    )>,
     /// Labeled-return targets for spliced inline-argument lambdas:
     /// `return@<inlineFnName>` inside such a lambda is a *local*
     /// return from the lambda invocation (its value), not a return
@@ -201,7 +211,8 @@ impl<'a> FuncBuilder<'a> {
         &mut self,
         m: std::collections::HashMap<String, klio_ast::Expr>,
     ) {
-        self.inline_lambda_subst.push(m);
+        let snap = self.inline_return.clone();
+        self.inline_lambda_subst.push((m, snap));
     }
     pub fn pop_inline_lambda_frame(&mut self) {
         self.inline_lambda_subst.pop();
@@ -210,7 +221,15 @@ impl<'a> FuncBuilder<'a> {
     pub fn inline_lambda_for(&self, name: &str) -> Option<klio_ast::Expr> {
         self.inline_lambda_subst
             .last()
-            .and_then(|m| m.get(name).cloned())
+            .and_then(|(m, _)| m.get(name).cloned())
+    }
+    /// The `inline_return` snapshot captured when the innermost
+    /// inline-lambda frame was pushed — the owner splice's localize
+    /// target for an unlabeled `return` in a lambda from that frame.
+    pub fn inline_lambda_owner_return(
+        &self,
+    ) -> Option<Vec<(Reg, BlockId)>> {
+        self.inline_lambda_subst.last().map(|(_, s)| s.clone())
     }
 
     pub fn mark_any_typed(&mut self, name: &str) {

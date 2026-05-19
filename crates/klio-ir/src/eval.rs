@@ -1256,6 +1256,15 @@ fn exec_inst(
                 .next()
                 .map_or(false, |c| c.is_uppercase());
             let mut resolved: Option<Value> = None;
+            // A probe that *found* the member but whose body failed
+            // (any error that is not the `Unimplemented`
+            // "no-such-member" sentinel) is recorded here. Probing
+            // continues across the remaining receivers — a later one
+            // may legitimately resolve — but if nothing resolves this
+            // genuine failure is surfaced instead of the misleading
+            // `unresolved global` diagnostic that would otherwise
+            // mask it.
+            let mut first_real_err: Option<EvalError> = None;
             // A bare `name` bound to a captured callable in the
             // innermost scoped-global layer (an anon-object method's
             // capture env) is a closed-over parameter/local: Kotlin
@@ -1304,7 +1313,18 @@ fn exec_inst(
                         Err(e @ EvalError::Suspended(_)) => {
                             return Err(e)
                         }
-                        Err(_) => {}
+                        // `Unimplemented` is klio's "no such member"
+                        // sentinel — keep probing the next receiver.
+                        // A different error means the member *was*
+                        // found and its body failed: record it (so it
+                        // can be surfaced if nothing resolves) but
+                        // keep probing — a later receiver may bind.
+                        Err(EvalError::Unimplemented(_)) => {}
+                        Err(e) => {
+                            if first_real_err.is_none() {
+                                first_real_err = Some(e);
+                            }
+                        }
                     }
                 }
             }
@@ -1323,7 +1343,12 @@ fn exec_inst(
                     // instead of swallowing it and misreporting the
                     // name as an unresolved global.
                     Err(e @ EvalError::Suspended(_)) => return Err(e),
-                    Err(_) => {}
+                    Err(EvalError::Unimplemented(_)) => {}
+                    Err(e) => {
+                        if first_real_err.is_none() {
+                            first_real_err = Some(e);
+                        }
+                    }
                 }
             }
             // Enclosing-receiver fallback: inside a receiver lambda
@@ -1340,7 +1365,12 @@ fn exec_inst(
                             Err(e @ EvalError::Suspended(_)) => {
                                 return Err(e)
                             }
-                            Err(_) => {}
+                            Err(EvalError::Unimplemented(_)) => {}
+                            Err(e) => {
+                                if first_real_err.is_none() {
+                                    first_real_err = Some(e);
+                                }
+                            }
                         }
                     }
                 }
@@ -1367,7 +1397,12 @@ fn exec_inst(
                             break;
                         }
                         Err(e @ EvalError::Suspended(_)) => return Err(e),
-                        Err(_) => {}
+                        Err(EvalError::Unimplemented(_)) => {}
+                        Err(e) => {
+                            if first_real_err.is_none() {
+                                first_real_err = Some(e);
+                            }
+                        }
                     }
                     cur = match &o {
                         Value::Instance(i) => i.borrow().outer.clone(),
@@ -1393,7 +1428,12 @@ fn exec_inst(
                 ) {
                     Ok(v) => resolved = Some(v),
                     Err(e @ EvalError::Suspended(_)) => return Err(e),
-                    Err(_) => {}
+                    Err(EvalError::Unimplemented(_)) => {}
+                    Err(e) => {
+                        if first_real_err.is_none() {
+                            first_real_err = Some(e);
+                        }
+                    }
                 }
             }
             let result = match resolved {
@@ -1407,12 +1447,81 @@ fn exec_inst(
                     )? {
                         v
                     } else {
-                        let callee = host
-                            .lookup_global_throwing(&name_str)?
-                            .ok_or_else(|| EvalError::Unbound(
-                                format!("unresolved global `{name_str}`"),
-                            ))?;
-                        host.call_value_named(&callee, &arg_values, &names)?
+                        match host.lookup_global_throwing(&name_str)? {
+                            Some(callee) => host.call_value_named(
+                                &callee, &arg_values, &names,
+                            )?,
+                            None => {
+                                // Last resort: a bare call that is a
+                                // member of the frame's own `this`
+                                // (`this` is a bound param, not a
+                                // capture, in a method/extension body —
+                                // e.g. `detachChildIfNonReusable()` in
+                                // `CancellableContinuationImpl
+                                // .parentCancelled`). Dispatch it on
+                                // that receiver before giving up.
+                                // The frame's bound `this` param
+                                // (method/extension body) or, when the
+                                // bare call is inside a lambda (e.g.
+                                // the atomicfu `_state.loop { … }`
+                                // closure in `cancel`), the lexically
+                                // enclosing receiver.
+                                let own_this = frame
+                                    .func
+                                    .params
+                                    .iter()
+                                    .position(|p| p.name == "this")
+                                    .and_then(|i| frame.params.get(i))
+                                    .cloned()
+                                    .filter(|v| {
+                                        matches!(v, Value::Instance(_))
+                                    })
+                                    .or_else(|| {
+                                        host.enclosing_this_chain()
+                                            .into_iter()
+                                            .find(|v| {
+                                                matches!(
+                                                    v,
+                                                    Value::Instance(_)
+                                                ) && host.host_has_member(
+                                                    v, &name_str,
+                                                )
+                                            })
+                                    });
+                                if let Some(t @ Value::Instance(_)) =
+                                    own_this
+                                {
+                                    match host.call_member_named(
+                                        &t, &name_str, &arg_values,
+                                        &names,
+                                    ) {
+                                        Ok(v) => v,
+                                        Err(
+                                            e @ EvalError::Suspended(_),
+                                        ) => return Err(e),
+                                        Err(_) => {
+                                            return Err(first_real_err
+                                                .unwrap_or(
+                                                EvalError::Unbound(
+                                                    format!("unresolved global `{name_str}`"),
+                                                ),
+                                            ))
+                                        }
+                                    }
+                                } else {
+                                    // Nothing resolved this name. If a
+                                    // probe found the member but its
+                                    // body failed, surface that real
+                                    // error instead of the misleading
+                                    // `unresolved global`.
+                                    return Err(first_real_err.unwrap_or(
+                                        EvalError::Unbound(format!(
+                                            "unresolved global `{name_str}`"
+                                        )),
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             };

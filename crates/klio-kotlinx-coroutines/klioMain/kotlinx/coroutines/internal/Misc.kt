@@ -7,8 +7,8 @@ package kotlinx.coroutines.internal
 import kotlinx.coroutines.*
 import kotlin.coroutines.*
 
-internal actual val platformExceptionHandlers: Collection<CoroutineExceptionHandler>
-    get() = emptyList()
+internal actual val platformExceptionHandlers: Collection<CoroutineExceptionHandler> =
+    emptyList()
 
 internal actual fun ensurePlatformExceptionHandlerLoaded(callback: CoroutineExceptionHandler) {
 }
@@ -17,9 +17,13 @@ internal actual fun propagateExceptionFinalResort(exception: Throwable) {
     throw exception
 }
 
+// klio is single-threaded; the diagnostic context string is
+// non-essential. Stringifying an arbitrary CoroutineContext here
+// (`context.toString()`) is also a hazard — folding its elements can
+// re-enter coroutine machinery — so keep a fixed message.
 internal actual class DiagnosticCoroutineContextException actual constructor(
     context: CoroutineContext
-) : RuntimeException(context.toString())
+) : RuntimeException("CoroutineContext")
 
 @Target(
     AnnotationTarget.FUNCTION,
