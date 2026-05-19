@@ -556,6 +556,7 @@ impl<'a> FuncBuilder<'a> {
         is_tailrec: self.tailrec_self.is_some(),
         is_lambda: false,
         is_inline: self.is_inline,
+        capture_order: self.capture_order.clone(),
         }
     }
 }

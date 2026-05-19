@@ -1316,6 +1316,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         r
     }
 
+    fn is_shadowing_capture(&self, name: &str) -> bool {
+        let g = self.globals.borrow();
+        if !g.has_parent() {
+            return false;
+        }
+        matches!(
+            g.lookup_local(name),
+            Some(
+                klio_runtime::Value::Lambda { .. }
+                    | klio_runtime::Value::IrClosure { .. }
+                    | klio_runtime::Value::Function { .. }
+            )
+        )
+    }
+
     fn push_access_enclosing(&self, v: &klio_runtime::Value) {
         with_outer_this(|s| s.borrow_mut().push(v.clone()));
     }
@@ -5637,7 +5652,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                     self.globals = scoped;
                 }
-                let result = klio_ir::eval::eval_with(&module_rc, &func, all, self);
+                // Lexical capture vector aligned to the method's
+                // `LoadCapture` index order. Each name resolves to the
+                // value snapshotted at object construction (the
+                // receiver for `this`); a captured closure then carries
+                // its own captures positionally and cannot collapse
+                // onto a same-named capture of an enclosing anon
+                // method through ambient globals.
+                let cap_vec: Vec<klio_runtime::Value> = func
+                    .capture_order
+                    .iter()
+                    .map(|n| {
+                        if n == "this" {
+                            return receiver.clone();
+                        }
+                        captures
+                            .iter()
+                            .find(|(cn, _)| cn == n)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(klio_runtime::Value::Null)
+                    })
+                    .collect();
+                let result = klio_ir::eval::eval_with_captures(
+                    &module_rc, &func, all, cap_vec, self,
+                );
                 self.globals = prev;
                 return result;
             }

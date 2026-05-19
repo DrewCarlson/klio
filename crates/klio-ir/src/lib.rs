@@ -492,6 +492,14 @@ pub struct Func {
     /// being caught here.
     #[serde(default)]
     pub is_inline: bool,
+    /// Capture-name list in `LoadCapture` index order. Non-empty for
+    /// anon-object method bodies that close over outer names — the
+    /// dispatch site materialises the capture-value vector in this
+    /// order so `Inst::LoadCapture` reads the right snapshot per
+    /// instance (rather than re-resolving bare names through ambient
+    /// globals, which collides across nested same-named captures).
+    #[serde(default)]
+    pub capture_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

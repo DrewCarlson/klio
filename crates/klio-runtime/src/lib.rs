@@ -3106,6 +3106,13 @@ impl Env {
         self.vars.get(name).cloned()
     }
 
+    /// True when this env is a child scope (has a parent). The base
+    /// module-globals env has no parent; a layered capture scope does.
+    #[must_use]
+    pub fn has_parent(&self) -> bool {
+        self.parent.is_some()
+    }
+
     /// Resolve `name` ignoring any binding that lives in `stop_at` (compared
     /// by `Rc::ptr_eq`). Used by the interpreter to ask "would this lookup
     /// have come from the implicit prelude?" — pass the prelude env in

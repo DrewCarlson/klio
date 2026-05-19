@@ -402,6 +402,15 @@ pub trait Host {
     /// Default: no-op (non-Vm Hosts have no enclosing-this stack).
     fn push_access_enclosing(&self, _v: &Value) {}
     fn pop_access_enclosing(&self) {}
+    /// True when `name` is bound, in the innermost scoped-global layer
+    /// (an anon-object method's capture env), to a callable value. A
+    /// captured callable is a closed-over parameter/local, which in
+    /// Kotlin shadows a same-named member — the bare call must invoke
+    /// it rather than be probed as a member of an implicit receiver.
+    /// Default: false (no scoped-capture layer).
+    fn is_shadowing_capture(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 /// No-op host for unit tests and IR-shape exercises.
@@ -1193,6 +1202,13 @@ fn exec_inst(
                 .next()
                 .map_or(false, |c| c.is_uppercase());
             let mut resolved: Option<Value> = None;
+            // A bare `name` bound to a captured callable in the
+            // innermost scoped-global layer (an anon-object method's
+            // capture env) is a closed-over parameter/local: Kotlin
+            // scoping has it shadow any same-named member, so skip the
+            // implicit-receiver member probe and member dispatch and
+            // bind the captured callable via the global path below.
+            let shadow_capture = host.is_shadowing_capture(&name_str);
             // Implicit-receiver search, Kotlin order: a *member* of
             // the lambda's own `this` or of any lexically enclosing
             // `this@…` outranks a same-named top-level extension.
@@ -1205,7 +1221,7 @@ fn exec_inst(
             // collector. Extensions still resolve normally below when
             // no receiver in the chain has the member (so `isEmpty`
             // / `withData` etc. are unaffected).
-            if !is_ctor_name {
+            if !is_ctor_name && !shadow_capture {
                 let mut chain: Vec<Value> = Vec::new();
                 if !matches!(this_val, Value::Null | Value::Unit) {
                     chain.push(this_val.clone());
@@ -1231,6 +1247,7 @@ fn exec_inst(
             }
             if resolved.is_none()
                 && !is_ctor_name
+                && !shadow_capture
                 && !matches!(this_val, Value::Null | Value::Unit)
             {
                 match host.call_member_named(
@@ -1250,7 +1267,7 @@ fn exec_inst(
             // (`buildString { … }` in a member) a bare call may be a
             // member of the lexically enclosing `this@Outer` rather
             // than the lambda receiver.
-            if resolved.is_none() {
+            if resolved.is_none() && !shadow_capture {
                 if let Some(outer) = host.enclosing_this() {
                     if !matches!(outer, Value::Null | Value::Unit) {
                         match host.call_member_named(
@@ -1270,7 +1287,7 @@ fn exec_inst(
             // member. The enclosing instance is the receiver's
             // captured `outer` link (not the receiver-lambda
             // `enclosing_this` stack), so walk it.
-            if resolved.is_none() {
+            if resolved.is_none() && !shadow_capture {
                 let mut cur = match &this_val {
                     Value::Instance(i) => i.borrow().outer.clone(),
                     _ => None,
@@ -1294,8 +1311,7 @@ fn exec_inst(
                         _ => None,
                     };
                 }
-            }
-            let result = match resolved {
+            }            let result = match resolved {
                 Some(v) => v,
                 None => {
                     // Overloaded top-level function: select by runtime

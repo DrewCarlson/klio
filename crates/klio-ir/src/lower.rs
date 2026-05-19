@@ -2933,6 +2933,76 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                 !last_vararg && args.len() > f.params.len()
                             })
                             .unwrap_or(false);
+                    // A bound local / parameter / captured outer of
+                    // this name shadows a same-named top-level function
+                    // (Kotlin scoping). e.g. a Flow operator's
+                    // `crossinline transform` parameter shadows the
+                    // top-level `Flow.transform` operator: a bare
+                    // `transform(v)` inside the operator's lambda must
+                    // invoke the parameter, not recurse into the
+                    // operator. Route it through the captured value.
+                    // Only the captured-outer gap: a name captured
+                    // from an enclosing scope but not locally bound.
+                    // Bound locals already route correctly through the
+                    // resolved-callee path below, and forcing those
+                    // through `CallValue` mis-invokes a non-callable
+                    // local of the same name as a top-level fn.
+                    // Fire only on a genuine shadowing conflict: the
+                    // name is a captured outer *and* also a registered
+                    // top-level function. Without the top-level fn the
+                    // existing capture/global handling is already
+                    // correct (ordinary captured local funs/lambdas
+                    // like a recursive `fib`); intercepting those
+                    // mis-invokes a not-yet-initialised capture.
+                    let name0 = &segments[0].name;
+                    let shadowed_by_local = b.knows_outer(name0)
+                        && b.resolve(name0).is_none()
+                        && b.module.func_id(name0).is_some();
+                    if shadowed_by_local {
+                        let callee_r = resolve_capture(b, name0);
+                        // The captured callable may be a receiver
+                        // function (`FlowCollector<R>.(T) -> Unit`,
+                        // e.g. Flow `map`'s `{ v -> emit(transform(v)) }`
+                        // passed as `transform`'s `crossinline`
+                        // parameter). Kotlin binds its receiver to the
+                        // implicit receiver of the calling scope — the
+                        // lexically enclosing `flow { }` collector. Bind
+                        // that enclosing `this` so the body's `emit`
+                        // targets the correct downstream stage instead
+                        // of re-entering the source collector. Binding
+                        // `this` for a non-receiver lambda is harmless
+                        // (its body ignores `this`; args are unchanged).
+                        let this_reg = if b.knows_outer("this")
+                            || b.is_lambda_body()
+                        {
+                            Some(resolve_capture(b, "this"))
+                        } else {
+                            b.resolve("this")
+                        };
+                        let (args_start, count) = lower_arg_run(b, args);
+                        let arg_names =
+                            intern_arg_names(b.module, ast_arg_names);
+                        let dst = b.alloc_reg();
+                        if let Some(recv) = this_reg {
+                            b.push(Inst::CallValueWithThis {
+                                dst,
+                                callee: callee_r,
+                                receiver: recv,
+                                args: args_start,
+                                n_args: count,
+                                arg_names,
+                            });
+                        } else {
+                            b.push(Inst::CallValue {
+                                dst,
+                                callee: callee_r,
+                                args: args_start,
+                                n_args: count,
+                                arg_names,
+                            });
+                        }
+                        return dst;
+                    }
                     if let Some(func_id) =
                         b.module.func_id(&segments[0].name).filter(|_| !shadowed_by_class)
                     {
@@ -3265,6 +3335,29 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // the fixed set of stdlib conversion names, none
                     // of which is ever a top-level function, so
                     // ordinary global calls are unaffected.
+                    // A bare call to a name the enclosing anon object
+                    // closes over invokes that lexically-captured
+                    // value. Read it via `LoadCapture` (this instance's
+                    // snapshot) and `CallValue` so a captured closure
+                    // keeps its own captures and cannot recurse onto a
+                    // same-named capture of an enclosing anon method.
+                    if is_lower_anon_capture(&segments[0].name) {
+                        let idx = b.record_capture(&segments[0].name);
+                        let callee_r = b.alloc_reg();
+                        b.push(Inst::LoadCapture { dst: callee_r, idx });
+                        let (args_start, count) = lower_arg_run(b, args);
+                        let arg_names =
+                            intern_arg_names(b.module, ast_arg_names);
+                        let dst = b.alloc_reg();
+                        b.push(Inst::CallValue {
+                            dst,
+                            callee: callee_r,
+                            args: args_start,
+                            n_args: count,
+                            arg_names,
+                        });
+                        return dst;
+                    }
                     let is_primitive_conv = matches!(
                         segments[0].name.as_str(),
                         "toInt"
@@ -3483,18 +3576,17 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         || b.knows_outer(&name.name)
                         || anon_cap;
                     if local_callable {
-                        // For an anon-object method, a captured name
-                        // reaches the body as a runtime-injected scoped
-                        // global — load it as a global. Otherwise
-                        // capture the name on demand (a callable closed
-                        // over by this lambda may not have been
-                        // referenced — hence captured — yet here).
+                        // For an anon-object method a captured name
+                        // reaches the body as a lexical capture: record
+                        // it and emit `LoadCapture` so it reads this
+                        // instance's snapshot (a captured closure keeps
+                        // its own captures and cannot collide with a
+                        // same-named capture of an enclosing anon
+                        // method). Otherwise capture on demand.
                         let local_reg = if anon_cap {
+                            let idx = b.record_capture(&name.name);
                             let r = b.alloc_reg();
-                            let n = b.module.intern_const(Const::String(
-                                name.name.clone(),
-                            ));
-                            b.push(Inst::LoadGlobal { dst: r, name: n });
+                            b.push(Inst::LoadCapture { dst: r, idx });
                             r
                         } else {
                             resolve_capture(b, &name.name)
