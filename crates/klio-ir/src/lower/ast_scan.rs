@@ -263,6 +263,20 @@ pub(super) fn names_referenced_in_lambdas(
                     scan_expr(e, out);
                 }
             }
+            Stmt::Decl(klio_ast::Decl::Function(f)) => {
+                if let Some(fb) = &f.body {
+                    match fb {
+                        klio_ast::FunctionBody::Block(blk) => {
+                            for s in &blk.stmts {
+                                collect_path_idents_stmt(s, out);
+                            }
+                        }
+                        klio_ast::FunctionBody::Expr(e) => {
+                            collect_path_idents(e, out);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }

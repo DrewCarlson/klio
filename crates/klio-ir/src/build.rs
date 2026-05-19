@@ -87,6 +87,7 @@ pub struct FuncBuilder<'a> {
     /// a bare call must prepend the implicit receiver as `this`.
     local_ext_fns: std::collections::HashSet<String>,
     is_lambda_body: bool,
+    is_named_local_fn: bool,
     is_inline: bool,
     /// True while lowering a default-argument thunk. A default
     /// expression executes in the declaring function's scope, not as
@@ -157,6 +158,7 @@ impl<'a> FuncBuilder<'a> {
             local_fns: std::collections::HashSet::new(),
             local_ext_fns: std::collections::HashSet::new(),
             is_lambda_body: false,
+            is_named_local_fn: false,
             is_inline: false,
             is_param_thunk: false,
             inline_return: Vec::new(),
@@ -301,6 +303,19 @@ impl<'a> FuncBuilder<'a> {
 
     pub fn is_lambda_body(&self) -> bool {
         self.is_lambda_body
+    }
+
+    pub fn set_outer_names_named_local_fn(
+        &mut self,
+        names: std::collections::HashSet<String>,
+    ) {
+        self.outer_names = names;
+        self.is_lambda_body = true;
+        self.is_named_local_fn = true;
+    }
+
+    pub fn is_named_local_fn(&self) -> bool {
+        self.is_named_local_fn
     }
 
     /// Record a capture reference encountered during lowering.

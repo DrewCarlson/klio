@@ -3350,7 +3350,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // a local return from the lambda invocation.
                     b.terminate(Terminator::Return(r));
                 }
-            } else if b.is_lambda_body() {
+            } else if b.is_lambda_body() && !b.is_named_local_fn() {
                 b.terminate(Terminator::NonLocalReturn(r));
             } else {
                 b.terminate(Terminator::Return(r));
@@ -3956,8 +3956,25 @@ fn lower_lambda_body_capturing_kind(
     outer_boxed: &std::collections::HashSet<String>,
     tailrec_self: Option<&str>,
 ) -> (crate::FuncId, Vec<String>) {
+    lower_lambda_body_capturing_kind_with(
+        module, params, body, outer, is_lambda, outer_boxed, tailrec_self, false,
+    )
+}
+
+fn lower_lambda_body_capturing_kind_with(
+    module: &mut crate::Module,
+    params: &[klio_ast::Ident],
+    body: &klio_ast::Block,
+    outer: std::collections::HashSet<String>,
+    is_lambda: bool,
+    outer_boxed: &std::collections::HashSet<String>,
+    tailrec_self: Option<&str>,
+    is_named_local_fn: bool,
+) -> (crate::FuncId, Vec<String>) {
     let mut b = FuncBuilder::new(module);
-    if is_lambda {
+    if is_named_local_fn {
+        b.set_outer_names_named_local_fn(outer);
+    } else if is_lambda {
         b.set_outer_names(outer);
     } else {
         b.set_outer_names_without_lambda(outer);
@@ -4842,7 +4859,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                 }
                 let tailrec_self =
                     if f.is_tailrec { Some(f.name.name.as_str()) } else { None };
-                let (body_func, captured_names) = lower_lambda_body_capturing_kind(
+                let (body_func, captured_names) = lower_lambda_body_capturing_kind_with(
                     b.module,
                     &param_idents,
                     &body,
@@ -4850,6 +4867,7 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                     true,
                     &outer_boxed,
                     tailrec_self,
+                    true,
                 );
                 let captures: Vec<Reg> = captured_names
                     .iter()
