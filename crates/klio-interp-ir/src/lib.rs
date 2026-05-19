@@ -2207,11 +2207,49 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
             let _ = cls;
         }
+        // A member property (its getter) outranks a same-named
+        // extension property (Kotlin resolution). Without this, a
+        // receiver smart-cast inside an extension getter
+        // (`val Incomplete.isCancelling get() = this is Finishing &&
+        // isCancelling`, where `Finishing` has its own member
+        // `isCancelling`) re-dispatches the extension property on
+        // itself and recurses forever. Skip the extension lookup when
+        // the receiver's class hierarchy declares a member getter for
+        // this name.
+        let member_getter_shadows = if let klio_runtime::Value::Instance(i) =
+            receiver
+        {
+            let mut cur = Some(i.borrow().class.name.clone());
+            let mut seen: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut found = false;
+            while let Some(cn) = cur.take() {
+                if !seen.insert(cn.clone()) {
+                    break;
+                }
+                if self
+                    .prog
+                    .instance_prop_getters
+                    .contains_key(&(cn.clone(), name.to_string()))
+                {
+                    found = true;
+                    break;
+                }
+                cur = self
+                    .classes
+                    .borrow()
+                    .get(&cn)
+                    .and_then(|d| d.supertype_names.first().cloned());
+            }
+            found
+        } else {
+            false
+        };
         // Top-level extension property: `val T.name get() = ...`
         // — keyed by (receiver simple type, prop name). Falls
         // through to the standard lookup chain when the user
         // didn't declare an extension property for this combo.
-        {
+        if !member_getter_shadows {
             let recv_simple: String = match receiver {
                 klio_runtime::Value::Instance(i) => i.borrow().class.name.clone(),
                 other => {
