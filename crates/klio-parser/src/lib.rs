@@ -1760,7 +1760,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             None
         };
         self.expect(&TokenKind::LParen, "`(`")?;
-        let params = self.parse_param_list();
+        let params = self.parse_param_list_with(true);
         self.expect(&TokenKind::RParen, "`)`")?;
         let return_ty = if matches!(self.peek_kind(), TokenKind::Colon) {
             self.bump();
@@ -1879,6 +1879,14 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     }
 
     fn parse_param_list(&mut self) -> Vec<Param> {
+        self.parse_param_list_with(false)
+    }
+
+    /// Same as `parse_param_list`, but with `allow_no_type` the
+    /// param's type annotation is optional — used for anonymous
+    /// function expressions (`fun(n) = …`) where the function-type
+    /// context supplies the param type.
+    fn parse_param_list_with(&mut self, allow_no_type: bool) -> Vec<Param> {
         let mut params = Vec::new();
         loop {
             self.skip_nl();
@@ -1922,16 +1930,39 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 break;
             };
             let start = name.span;
-            self.expect(&TokenKind::Colon, "`:`");
-            let ty = self.parse_type().unwrap_or_else(|| TypeRef {
-                name: Ident { name: "Any".into(), span: name.span },
-                nullable: true,
-                span: name.span,
-                type_args: Vec::new(),
-                function: None,
-                definitely_non_null: false,
-                annotations: Vec::new(),
-            });
+            let has_colon = matches!(self.peek_kind(), TokenKind::Colon);
+            if has_colon {
+                self.bump();
+            } else if !allow_no_type {
+                // Required type annotation missing — produce the
+                // standard "expected `:`" diagnostic. Anon-fn params
+                // legally omit the annotation; the caller passes
+                // `allow_no_type = true` for that context.
+                self.expect(&TokenKind::Colon, "`:`");
+            }
+            let ty = if has_colon || !allow_no_type {
+                self.parse_type().unwrap_or_else(|| TypeRef {
+                    name: Ident { name: "Any".into(), span: name.span },
+                    nullable: true,
+                    span: name.span,
+                    type_args: Vec::new(),
+                    function: None,
+                    definitely_non_null: false,
+                    annotations: Vec::new(),
+                })
+            } else {
+                // No colon and the caller allows it: synthesise an
+                // `Any?` placeholder without trying to parse a type.
+                TypeRef {
+                    name: Ident { name: "Any".into(), span: name.span },
+                    nullable: true,
+                    span: name.span,
+                    type_args: Vec::new(),
+                    function: None,
+                    definitely_non_null: false,
+                    annotations: Vec::new(),
+                }
+            };
             let mut default = None;
             if matches!(self.peek_kind(), TokenKind::Eq) {
                 self.bump();

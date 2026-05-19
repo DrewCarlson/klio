@@ -133,7 +133,7 @@ fun main() {
 //    can use `return` without a label for local return. Tracked as
 //    task #31 (parser feature).
 #[test]
-#[ignore = "task #31: parser does not yet accept `fun(args): T { body }` anonymous-function literal"]
+
 fn anonymous_function_local_return() {
     let src = r#"
 fun pickFirstEven(xs: List<Int>): Int? {
