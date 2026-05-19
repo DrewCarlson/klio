@@ -947,8 +947,25 @@ pub fn lower_accessor_expr(
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
     placed.id = id;
+    placed.params = accessor_params(params);
     module.funcs.push(placed);
     id
+}
+
+/// Record the accessor's bound parameters (the extension receiver
+/// `this`) as `Func.params` so the eval `this`-parameter fallback can
+/// recover the receiver — `FuncBuilder::finish` clears the list.
+fn accessor_params(params: &[&str]) -> Vec<crate::Param> {
+    params
+        .iter()
+        .map(|n| crate::Param {
+            name: (*n).to_string(),
+            ty: crate::TypeRef::unit(),
+            default: None,
+            is_property: false,
+            is_vararg: false,
+        })
+        .collect()
 }
 
 /// Variant of `lower_accessor_expr` for block-body accessors. The

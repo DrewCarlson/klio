@@ -6032,7 +6032,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // probe for these so a bare call inside a receiver-typed
         // lambda (e.g. `runBlocking { listOf(1, 2) }`) resolves to
         // the top-level function instead of `receiver.listOf(...)`.
-        if !klio_stdlib::is_toplevel_function(name) {
+        // A real member declared anywhere in the receiver's class
+        // hierarchy (including interface supertypes) outranks a
+        // same-named stdlib builtin op. Without this a user/pack
+        // `operator fun get` (e.g. `CoroutineContext.get`, a custom
+        // container) mis-routes to the collection `Map.get`/`List.get`
+        // when called bare on an extension receiver. Stdlib
+        // *extensions* are not class members, so `host_has_member`
+        // stays false for them and the probe still fires.
+        let member_shadows_stdlib = matches!(
+            receiver,
+            klio_runtime::Value::Instance(_)
+        ) && self.host_has_member(receiver, name);
+        if !member_shadows_stdlib
+            && !klio_stdlib::is_toplevel_function(name)
+        {
             for probe in &probes {
                 if let Some(func) = self.lookup_intrinsic(probe) {
                     let mut all_args: Vec<klio_runtime::Value> =
