@@ -77,7 +77,7 @@ fun main() {
 //    body that names an enclosing-class member is currently mis-
 //    resolved to a top-level intrinsic (`kotlin.to`).
 #[test]
-#[ignore = "task #32: anon-object body must consult enclosing-`this` before globals"]
+
 fn custom_iterator_drives_for_loop() {
     let src = r#"
 class Down(val from: Int, val to: Int) {

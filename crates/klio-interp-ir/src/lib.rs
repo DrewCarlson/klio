@@ -3609,6 +3609,31 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 }
             }
+            // Enclosing-class members are reachable from an anon-
+            // object method body via the captured outer `this`. Add
+            // them to `own_members` so bare identifiers lower as
+            // `GetField(this, …)`; the runtime's outer-chain walk in
+            // `get_field` then resolves them on the captured outer
+            // instance. Without this, a name that happens to match a
+            // top-level intrinsic (e.g. `to` matches `kotlin.to`)
+            // falls through to a `LoadGlobal` of the intrinsic.
+            for (n, v) in &capture_pairs {
+                if n == "this" {
+                    if let klio_runtime::Value::Instance(outer_inst) = v {
+                        let cls = outer_inst.borrow().class.clone();
+                        for p in &cls.primary_params {
+                            own_members.insert(p.name.clone());
+                        }
+                        for p in &cls.body_properties {
+                            own_members.insert(p.name.clone());
+                        }
+                        for me in cls.methods.iter() {
+                            own_members.insert(me.name.clone());
+                        }
+                    }
+                    break;
+                }
+            }
             // Names the object closes over reach its method bodies as
             // runtime-injected scoped globals; make them visible to
             // method lowering so a `recv.name()` whose `name` is one
@@ -3700,20 +3725,54 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 delegate_forwarders: klio_runtime::ObjRef::new(Vec::new()),
                 object_singleton: klio_runtime::ObjRef::new(None),
             });
-            // Initialise body-property fields with literal values
-            // only — anonymous-object property inits with arbitrary
-            // expressions would need a thunk lowered at lower-time,
-            // which the build pass already does for top-level
-            // classes; extending it to anonymous expressions lands
-            // when the IR grows an anon-class shape.
+            // Initialise body-property fields. Literal values via
+            // `simple_literal`; a bare-name reference to one of the
+            // captured outer names (e.g. `var cur = from` in
+            // `object : Iterator<Int> { var cur = from … }` inside
+            // a method of a `class Down(val from: Int, val to: Int)`)
+            // is resolved against the captured env. Arbitrary
+            // expressions still fall back to `Null` — a fuller
+            // solution would lower the init as a thunk, but the
+            // single-capture-Path case covers most realistic shapes.
             let mut fields: Vec<(String, klio_runtime::Value)> = Vec::new();
             for p in &class_def.body_properties {
                 if let Some(init) = &p.init {
-                    if let Some(v) = simple_literal(init) {
-                        fields.push((p.name.clone(), v));
+                    let v = if let Some(v) = simple_literal(init) {
+                        v
+                    } else if let klio_ast::Expr::Path { segments, .. } = init.as_ref() {
+                        if segments.len() == 1 {
+                            let nm = &segments[0].name;
+                            // First: captured-by-name (a local/param of
+                            // the enclosing scope).
+                            let direct = capture_pairs
+                                .iter()
+                                .find(|(n, _)| n == nm)
+                                .map(|(_, v)| v.clone());
+                            // Then: an enclosing-class member reached
+                            // through the captured outer `this`. The
+                            // runtime `get_field` walks the outer chain
+                            // for arbitrary later reads, but the body-
+                            // property init runs before the instance
+                            // exists, so the lookup happens here.
+                            direct
+                                .or_else(|| {
+                                    let outer_inst = capture_pairs
+                                        .iter()
+                                        .find(|(n, _)| n == "this")
+                                        .and_then(|(_, v)| match v {
+                                            klio_runtime::Value::Instance(i) => Some(i.clone()),
+                                            _ => None,
+                                        });
+                                    outer_inst.and_then(|i| i.borrow().get(nm))
+                                })
+                                .unwrap_or(klio_runtime::Value::Null)
+                        } else {
+                            klio_runtime::Value::Null
+                        }
                     } else {
-                        fields.push((p.name.clone(), klio_runtime::Value::Null));
-                    }
+                        klio_runtime::Value::Null
+                    };
+                    fields.push((p.name.clone(), v));
                 } else {
                     fields.push((p.name.clone(), klio_runtime::Value::Null));
                 }
@@ -3742,10 +3801,18 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 }
             }
+            // Wire the captured outer `this` (if any) as the anon
+            // instance's `outer`, so the runtime's outer-chain walk
+            // can resolve enclosing-class member references emitted
+            // as `GetField(this, …)` against the right instance.
+            let outer = capture_pairs
+                .iter()
+                .find(|(n, _)| n == "this")
+                .map(|(_, v)| v.clone());
             let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                 class: class_def,
                 fields,
-                outer: None,
+                outer,
                 identity,
                 native_state: None,
             });
