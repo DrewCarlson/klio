@@ -6571,25 +6571,32 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         {
             return true;
         }
-        // Fall back to the runtime ClassDef parent chain for classes
-        // that predate the registry's hierarchy map (e.g. embedded
-        // stdlib): a method `name` anywhere up the chain counts.
-        let mut cur = self.classes.borrow().get(&cls).cloned();
+        // Fall back to the runtime ClassDef chain for classes that
+        // predate the registry's hierarchy map (e.g. embedded
+        // stdlib). Walk the *whole* supertype graph (every parent and
+        // interface, breadth-first), not just the first parent — a
+        // pack interface-declared `operator fun get` / `emit` lives on
+        // an interface supertype, and missing it makes a real member
+        // fall through to a same-named stdlib builtin.
+        let mut queue: std::collections::VecDeque<String> =
+            std::collections::VecDeque::new();
+        queue.push_back(cls);
         let mut seen = std::collections::HashSet::new();
-        while let Some(def) = cur {
-            if !seen.insert(def.name.clone()) {
-                break;
+        while let Some(cur_name) = queue.pop_front() {
+            if !seen.insert(cur_name.clone()) {
+                continue;
             }
-            let has = def.methods.iter().any(|m| {
-                m.name == name || m.name.rsplit('.').next() == Some(name)
-            });
-            if has {
-                return true;
+            if let Some(def) = self.classes.borrow().get(&cur_name).cloned() {
+                let has = def.methods.iter().any(|m| {
+                    m.name == name || m.name.rsplit('.').next() == Some(name)
+                });
+                if has {
+                    return true;
+                }
+                for sup in &def.supertype_names {
+                    queue.push_back(sup.clone());
+                }
             }
-            cur = def
-                .supertype_names
-                .first()
-                .and_then(|p| self.classes.borrow().get(p).cloned());
         }
         false
     }
