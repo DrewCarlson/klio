@@ -4853,6 +4853,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             let target = inst.borrow().get("__sam_target__");
             if let Some(target) = target {
+                // A SAM wrapper invokes its lambda for *any* method
+                // name. Under a member-only probe that is not a real
+                // member of the named call (`c.collect(…)` on a SAM
+                // `FlowCollector` whose method is `emit`), so report
+                // not-found and let the probe continue its
+                // implicit-receiver search. Non-probe resolution still
+                // SAM-dispatches normally.
+                if member_only {
+                    return Err(klio_ir::eval::EvalError::Unimplemented(
+                        format!(
+                            "Vm::call_member `{name}` (member-only: \
+                             SAM dispatch is not a member)"
+                        ),
+                    ));
+                }
                 return self.call_value(&target, args);
             }
         }
