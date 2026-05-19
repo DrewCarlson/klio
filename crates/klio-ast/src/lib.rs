@@ -309,9 +309,17 @@ pub struct Class {
     /// become member properties on the instance.
     pub primary_params: Vec<ClassParam>,
     /// `init { … }` blocks in declaration order. Executed during
-    /// construction after primary params bind but before body property
-    /// initializers in source order is enforced by `members` ordering.
+    /// construction interleaved with body-property initializers per
+    /// `init_block_positions`, matching Kotlin's source-order rule.
     pub init_blocks: Vec<Block>,
+    /// Position of each entry in [`init_blocks`] in the original
+    /// declaration order, measured as "the number of `members` already
+    /// seen at the point the init block was parsed". So an init block
+    /// with position `N` runs **before** `members[N]`'s property
+    /// initializer (and after any earlier-positioned members and init
+    /// blocks). Same length as `init_blocks`.
+    #[serde(default)]
+    pub init_block_positions: Vec<usize>,
     /// Parsed but otherwise unused: supertype names from `class Foo : Bar()`.
     pub supertypes: Vec<TypeRef>,
     /// For each entry in `supertypes`, the constructor argument list at the

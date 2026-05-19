@@ -1387,6 +1387,11 @@ pub struct ClassDef {
     /// construction.
     pub body_properties: Vec<PropertyDef>,
     pub init_blocks: Vec<Arc<klio_ast::Block>>,
+    /// For each entry in `init_blocks`, the index of `body_properties`
+    /// it runs BEFORE — matching Kotlin's source-order rule that an
+    /// `init { … }` block interleaves with body-property initializers
+    /// in declaration order. Same length as `init_blocks`.
+    pub init_block_property_positions: Vec<usize>,
     pub is_data: bool,
     /// `true` for a `value class` / `@JvmInline value class`. Like a
     /// data class, the compiler synthesises `equals`/`hashCode`/
@@ -3861,6 +3866,7 @@ mod tests {
             methods: Vec::new(),
             body_properties: Vec::new(),
             init_blocks: Vec::new(),
+            init_block_property_positions: Vec::new(),
             is_data,
             is_value: false,
             is_object,

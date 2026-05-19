@@ -313,6 +313,7 @@ fn synthesize_class_from_object(o: &klio_ast::ObjectDecl) -> klio_ast::Class {
         where_bounds: Vec::new(),
         primary_params: Vec::new(),
         init_blocks: Vec::new(),
+        init_block_positions: Vec::new(),
         supertypes: o.supertypes.clone(),
         supertype_args: o.supertype_args.clone(),
         supertype_delegates: o.supertypes.iter().map(|_| None).collect(),
@@ -1355,6 +1356,22 @@ fn build_module_with_overrides(
                 methods: Vec::new(),
                 body_properties,
                 init_blocks: Vec::new(),
+                // Translate each init block's source position from
+                // "members index" to "body_properties index" — the
+                // count of `Decl::Property` entries in `members[0..P]`.
+                // The runtime construction loop uses this to interleave
+                // init blocks with property initializers in declaration
+                // order, matching Kotlin.
+                init_block_property_positions: c
+                    .init_block_positions
+                    .iter()
+                    .map(|&p| {
+                        c.members[..p.min(c.members.len())]
+                            .iter()
+                            .filter(|d| matches!(d, Decl::Property(_)))
+                            .count()
+                    })
+                    .collect(),
                 is_data: c.is_data,
                 is_value: c.is_value,
                 is_object,

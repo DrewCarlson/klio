@@ -1668,6 +1668,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 methods: Vec::new(),
                 body_properties: Vec::new(),
                 init_blocks: Vec::new(),
+            init_block_property_positions: Vec::new(),
                 is_data: false,
                 is_value: false,
                 is_object: false,
@@ -3273,6 +3274,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             methods: Vec::new(),
             body_properties: Vec::new(),
             init_blocks: Vec::new(),
+            init_block_property_positions: Vec::new(),
             is_data: false,
             is_value: false,
             is_object: false,
@@ -3358,6 +3360,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             methods: Vec::new(),
             body_properties,
             init_blocks: Vec::new(),
+            init_block_property_positions: Vec::new(),
             is_data: class.is_data,
             is_value: class.is_value,
             is_object: false,
@@ -3700,6 +3703,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 methods: Vec::new(),
                 body_properties,
                 init_blocks: Vec::new(),
+            init_block_property_positions: Vec::new(),
                 is_data: false,
                 is_value: false,
                 is_object: false,
@@ -7755,9 +7759,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
         }
         // Bottom-up so parent fields exist before child fields can
-        // override the same name.
+        // override the same name. Within each class, init blocks
+        // interleave with body-property initializers in declaration
+        // order (Kotlin's source-order rule).
         for cls in chain_classes.iter().rev() {
-        for p in &cls.body_properties {
+        for (prop_idx, p) in cls.body_properties.iter().enumerate() {
+            // Run any init blocks declared before this property.
+            self.run_init_blocks_at(
+                cls,
+                prop_idx,
+                &inst_value,
+                &chain_args_by_class,
+                args,
+            )?;
             if let Some(fid) = self.prog
                 .body_prop_inits
                 .get(&(cls.name.clone(), p.name.clone()))
@@ -7837,26 +7851,70 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
-        }
-        // Run init blocks bottom-up across the parent chain so a
-        // parent's init runs before its child's. Each init block
-        // takes `this` as its sole param.
-        for (cls_name, cls_args) in chain.iter().rev() {
-            if let Some(fids) = self.prog.init_blocks.get(cls_name).cloned() {
-                for fid in fids {
-                    let func = self.module.funcs.get(fid.0 as usize).cloned();
-                    if let Some(f) = func {
-                        let module = Arc::clone(&self.module);
-                        let mut all: Vec<klio_runtime::Value> =
-                            Vec::with_capacity(1 + cls_args.len());
-                        all.push(inst_value.clone());
-                        all.extend(cls_args.iter().cloned());
-                        klio_ir::eval::eval_with(&module, &f, all, self)?;
-                    }
-                }
-            }
+        // After all body-property initializers, run any trailing
+        // init blocks (those declared after the last property).
+        self.run_init_blocks_at(
+            cls,
+            cls.body_properties.len(),
+            &inst_value,
+            &chain_args_by_class,
+            args,
+        )?;
         }
         Ok(inst_value)
+    }
+}
+
+impl<'a> VmHost<'a> {
+    /// Run the class's `init { … }` blocks whose source position
+    /// equals `before_prop_idx` (i.e. those declared between
+    /// `body_properties[before_prop_idx-1]` and
+    /// `body_properties[before_prop_idx]`, or trailing if
+    /// `before_prop_idx == body_properties.len()`). Each block takes
+    /// `this` plus the class's primary-ctor args.
+    fn run_init_blocks_at(
+        &mut self,
+        cls: &Arc<klio_runtime::ClassDef>,
+        before_prop_idx: usize,
+        inst_value: &klio_runtime::Value,
+        chain_args_by_class: &std::collections::HashMap<String, Vec<klio_runtime::Value>>,
+        fallback_args: &[klio_runtime::Value],
+    ) -> Result<(), klio_ir::eval::EvalError> {
+        let Some(fids) = self.prog.init_blocks.get(&cls.name).cloned() else {
+            return Ok(());
+        };
+        let cls_args: Vec<klio_runtime::Value> = chain_args_by_class
+            .get(&cls.name)
+            .cloned()
+            .unwrap_or_else(|| fallback_args.to_vec());
+        for (i, fid) in fids.iter().enumerate() {
+            let pos = cls
+                .init_block_property_positions
+                .get(i)
+                .copied()
+                .unwrap_or(usize::MAX);
+            // `usize::MAX` means no recorded position (runtime-synth
+            // class that bypassed the build pass) — flush such blocks
+            // at the trailing position so legacy classes keep their
+            // prior all-end ordering.
+            let effective = if pos == usize::MAX {
+                cls.body_properties.len()
+            } else {
+                pos
+            };
+            if effective != before_prop_idx {
+                continue;
+            }
+            if let Some(f) = self.module.funcs.get(fid.0 as usize).cloned() {
+                let module = Arc::clone(&self.module);
+                let mut all: Vec<klio_runtime::Value> =
+                    Vec::with_capacity(1 + cls_args.len());
+                all.push(inst_value.clone());
+                all.extend(cls_args.iter().cloned());
+                klio_ir::eval::eval_with(&module, &f, all, self)?;
+            }
+        }
+        Ok(())
     }
 }
 

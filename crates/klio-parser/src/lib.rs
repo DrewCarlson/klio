@@ -862,13 +862,14 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         let (supertypes, supertype_args, supertype_delegates) =
             self.parse_optional_supertypes_full();
         let where_bounds = self.parse_where_clause();
-        let (members, init_blocks, enum_entries, secondary_ctors) = if is_enum {
-            let (m, i, e) = self.parse_enum_class_body();
-            (m, i, e, Vec::new())
-        } else {
-            let (m, i, s) = self.parse_class_body();
-            (m, i, Vec::new(), s)
-        };
+        let (members, init_blocks, init_block_positions, enum_entries, secondary_ctors) =
+            if is_enum {
+                let (m, i, p, e) = self.parse_enum_class_body();
+                (m, i, p, e, Vec::new())
+            } else {
+                let (m, i, p, s) = self.parse_class_body();
+                (m, i, p, Vec::new(), s)
+            };
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         Some(Class {
             name,
@@ -877,6 +878,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             primary_params,
             primary_ctor_visibility,
             init_blocks,
+            init_block_positions,
             supertypes,
             supertype_args,
             supertype_delegates,
@@ -906,16 +908,19 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     /// Parse an enum class body: optional entry list (comma-separated, with
     /// optional `(...)` ctor args and optional `{...}` per-entry body),
     /// optional `;` then regular class-body members.
-    fn parse_enum_class_body(&mut self) -> (Vec<Decl>, Vec<Block>, Vec<EnumEntry>) {
+    fn parse_enum_class_body(
+        &mut self,
+    ) -> (Vec<Decl>, Vec<Block>, Vec<usize>, Vec<EnumEntry>) {
         // Helper: enum-class body content (after the optional `;`) shares the
         // member-parsing shape of a regular class body, minus secondary
         // constructors.
         let mut members = Vec::new();
         let mut init_blocks = Vec::new();
+        let mut init_block_positions: Vec<usize> = Vec::new();
         let mut entries = Vec::new();
         self.skip_nl();
         if !matches!(self.peek_kind(), TokenKind::LBrace) {
-            return (members, init_blocks, entries);
+            return (members, init_blocks, init_block_positions, entries);
         }
         self.bump();
         // Parse entries until `;`, `}`, or EOF.
@@ -953,7 +958,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             let mut body_members = Vec::new();
             self.skip_nl();
             if matches!(self.peek_kind(), TokenKind::LBrace) {
-                let (m, _i, _s) = self.parse_class_body();
+                let (m, _i, _p, _s) = self.parse_class_body();
                 body_members = m;
             }
             let end = self.tokens[self.pos.saturating_sub(1)].span;
@@ -986,6 +991,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     self.bump();
                     self.skip_nl();
                     if let Some(b) = self.parse_block() {
+                        init_block_positions.push(members.len());
                         init_blocks.push(b);
                     }
                     continue;
@@ -998,7 +1004,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             }
         }
         self.expect(&TokenKind::RBrace, "`}`");
-        (members, init_blocks, entries)
+        (members, init_blocks, init_block_positions, entries)
     }
 
     fn parse_companion_object_as_class(
@@ -1015,7 +1021,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         };
         let (supertypes, supertype_args, supertype_delegates) =
             self.parse_optional_supertypes_full();
-        let (members, init_blocks, _sec) = self.parse_class_body();
+        let (members, init_blocks, init_block_positions, _sec) = self.parse_class_body();
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         Some(Class {
             name,
@@ -1023,6 +1029,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             where_bounds: Vec::new(),
             primary_params: Vec::new(),
             init_blocks,
+            init_block_positions,
             supertypes,
             supertype_args,
             supertype_delegates,
@@ -1058,7 +1065,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         let kw = self.bump(); // `object`
         let name = self.parse_ident("object name")?;
         let (supertypes, supertype_args) = self.parse_optional_supertypes();
-        let (members, _init, _sec) = self.parse_class_body();
+        let (members, _init, _ipos, _sec) = self.parse_class_body();
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         Some(ObjectDecl {
             name,
@@ -1148,17 +1155,16 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         (types, args_list, delegates)
     }
 
-    fn parse_class_body(&mut self) -> (Vec<Decl>, Vec<Block>, Vec<SecondaryCtor>) {
+    fn parse_class_body(&mut self) -> (Vec<Decl>, Vec<Block>, Vec<usize>, Vec<SecondaryCtor>) {
         let mut members = Vec::new();
         let mut init_blocks = Vec::new();
+        let mut init_block_positions: Vec<usize> = Vec::new();
         let mut secondary_ctors = Vec::new();
         let save = self.pos;
         self.skip_nl();
         if !matches!(self.peek_kind(), TokenKind::LBrace) {
-            // Body absent — preserve any newlines for the enclosing
-            // statement-separator check.
             self.pos = save;
-            return (members, init_blocks, secondary_ctors);
+            return (members, init_blocks, init_block_positions, secondary_ctors);
         }
         self.bump();
         loop {
@@ -1166,14 +1172,16 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             if matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
                 break;
             }
-            // `init { … }` blocks — detected before modifier scanning so the
-            // soft `init` ident isn't accidentally consumed.
             if matches!(self.peek_kind(), TokenKind::Ident)
                 && self.text(self.current_span()) == "init"
             {
                 self.bump();
                 self.skip_nl();
                 if let Some(b) = self.parse_block() {
+                    // Record the init block's position as the number of
+                    // members already seen — runs before the next member
+                    // (and after earlier ones).
+                    init_block_positions.push(members.len());
                     init_blocks.push(b);
                 }
                 continue;
@@ -1208,7 +1216,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             }
         }
         self.expect(&TokenKind::RBrace, "`}`");
-        (members, init_blocks, secondary_ctors)
+        (members, init_blocks, init_block_positions, secondary_ctors)
     }
 
     fn parse_secondary_ctor(
@@ -3519,7 +3527,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 let kw = self.bump();
                 let (supertypes, supertype_args, supertype_delegates) =
                     self.parse_optional_supertypes_full();
-                let (members, _init, _sec) = self.parse_class_body();
+                let (members, _init, _ipos, _sec) = self.parse_class_body();
                 let end = self.tokens[self.pos.saturating_sub(1)].span;
                 Some(Expr::ObjectExpr {
                     supertypes,

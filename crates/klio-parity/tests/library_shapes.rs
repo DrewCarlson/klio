@@ -87,7 +87,7 @@ fun main() {
 //    Tracked as task #33: klio runs all property inits before init
 //    blocks instead of interleaving in declaration order.
 #[test]
-#[ignore = "task #33: class init blocks + property inits must run in declaration order"]
+
 fn init_block_order() {
     let src = r#"
 class Loud(val tag: String) {
