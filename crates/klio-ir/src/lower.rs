@@ -3055,6 +3055,34 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                         ),
                                     );
                                     let dst = b.alloc_reg();
+                                    // In a receiver-lambda body the
+                                    // implicit `this` is a capture that
+                                    // a `this`-binding invoke may have
+                                    // displaced (e.g. `flow { forEach {
+                                    // emit(it) } }` inside
+                                    // `List.asFlow()`: `this` is the
+                                    // FlowCollector, but `forEach`
+                                    // targets the enclosing `this@asFlow`
+                                    // receiver). CallMemberOrGlobal adds
+                                    // the enclosing-`this` and global /
+                                    // extension fallbacks that plain
+                                    // CallMember lacks, so the call
+                                    // resolves against the lexically
+                                    // enclosing receiver when the lambda
+                                    // receiver has no such member.
+                                    if b.is_lambda_body() {
+                                        let this_idx =
+                                            b.record_capture("this");
+                                        b.push(Inst::CallMemberOrGlobal {
+                                            dst,
+                                            this_idx,
+                                            name: nmc,
+                                            args: uargs_start,
+                                            n_args: ucount,
+                                            arg_names: uarg_names,
+                                        });
+                                        return dst;
+                                    }
                                     b.push(Inst::CallMember {
                                         dst,
                                         receiver: this_reg,

@@ -904,6 +904,55 @@ impl<'a> VmHost<'a> {
                 }
             }
         }
+        // Builtin runtime types satisfy their nominal supertypes
+        // (`List`/`MutableList` → `Collection`/`Iterable`, a range →
+        // `Iterable`/`ClosedRange`, …). Without this a `Value::List`
+        // (not a `Value::Instance`, so the subtype walk above is
+        // skipped) scored equally against every same-named extension
+        // receiver, so `list.asFlow()` could bind `(() -> T).asFlow`
+        // instead of `Iterable<T>.asFlow`. Rank a builtin-supertype
+        // match below an exact name but above a callable / generic.
+        let builtin_supers: &[&str] = match v_ty {
+            "List" => &[
+                "Collection", "Iterable", "MutableList",
+                "MutableCollection", "MutableIterable",
+            ],
+            "MutableList" => &[
+                "List", "Collection", "Iterable", "MutableCollection",
+                "MutableIterable",
+            ],
+            "Set" => &[
+                "Collection", "Iterable", "MutableSet",
+                "MutableCollection", "MutableIterable",
+            ],
+            "MutableSet" => &[
+                "Set", "Collection", "Iterable", "MutableCollection",
+                "MutableIterable",
+            ],
+            "Map" => &["MutableMap"],
+            "MutableMap" => &["Map"],
+            "IntRange" => &[
+                "IntProgression", "ClosedRange", "Iterable",
+                "OpenEndRange",
+            ],
+            "LongRange" => &[
+                "LongProgression", "ClosedRange", "Iterable",
+                "OpenEndRange",
+            ],
+            "CharRange" => &[
+                "CharProgression", "ClosedRange", "Iterable",
+                "OpenEndRange",
+            ],
+            "IntProgression" | "LongProgression" | "CharProgression" => {
+                &["Iterable"]
+            }
+            "String" => &["CharSequence", "Comparable"],
+            _ => &[],
+        };
+        let nm_simple = nm.rsplit('.').next().unwrap_or(nm);
+        if builtin_supers.contains(&nm) || builtin_supers.contains(&nm_simple) {
+            return Some(55);
+        }
         // Generic single-letter type-parameter — accept any.
         if nm.len() <= 2 && nm.chars().all(|c| c.is_ascii_uppercase()) {
             return Some(5);
