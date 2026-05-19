@@ -1295,6 +1295,27 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         with_outer_this(|s| s.borrow().last().cloned())
     }
 
+    fn enclosing_this_chain(&self) -> Vec<klio_runtime::Value> {
+        with_outer_this(|s| s.borrow().iter().rev().cloned().collect())
+    }
+
+    fn call_member_only(
+        &mut self,
+        receiver: &klio_runtime::Value,
+        name: &str,
+        args: &[klio_runtime::Value],
+        arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let prev = MEMBER_ONLY_PROBE.with(|c| {
+            let p = c.get();
+            c.set(true);
+            p
+        });
+        let r = self.call_member_named(receiver, name, args, arg_names);
+        MEMBER_ONLY_PROBE.with(|c| c.set(prev));
+        r
+    }
+
     fn push_access_enclosing(&self, v: &klio_runtime::Value) {
         with_outer_this(|s| s.borrow_mut().push(v.clone()));
     }
@@ -4323,6 +4344,15 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Member-only probe applies to *this* resolution only — once a
+        // member is found and its body runs, nested calls resolve
+        // normally. Capture and clear the flag here so it never leaks
+        // into a dispatched member's execution.
+        let member_only = MEMBER_ONLY_PROBE.with(|c| {
+            let p = c.get();
+            c.set(false);
+            p
+        });
         // Built-in delegate protocol: `delegate.getValue(thisRef,
         // prop)` / `setValue(thisRef, prop, v)` for a `by lazy { }`,
         // `Delegates.observable`, `notNull()`, etc. The delegated
@@ -5945,6 +5975,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
                 best.map(|(c, _)| c)
             };
+            if chosen.is_some() && member_only {
+                // Member-only probe: the receiver-member walk did not
+                // resolve `name`; a top-level extension is not a
+                // member, so report not-found so the caller continues
+                // its implicit-receiver search.
+                return Err(klio_ir::eval::EvalError::Unimplemented(
+                    format!(
+                        "Vm::call_member `{name}` (member-only probe)"
+                    ),
+                ));
+            }
             if let Some((fid, _func)) = chosen {
                 // Runaway-recursion guard, scoped to the top-level
                 // extension dispatch only. Re-entering this block for
@@ -7406,6 +7447,21 @@ pub enum TimeMode {
 }
 
 thread_local! {
+    /// When set, `call_member` resolves only a real member of the
+    /// receiver (the instance / IR-class / anon-object method walk)
+    /// and returns not-found instead of falling back to a top-level
+    /// extension, a SAM `__sam_target__` dispatch, or a global. Used
+    /// by CallMemberOrGlobal to probe each implicit receiver (the
+    /// lambda's own `this`, then the lexically enclosing `this@…`
+    /// chain) for a *member* before any extension is considered —
+    /// Kotlin's rule that a member of an implicit receiver outranks
+    /// a same-named extension. This is what makes bare `collect`
+    /// inside upstream `transform`'s `flow { collect { … } }` bind
+    /// the enclosing source flow's `collect` member rather than the
+    /// `Flow<T>.collect` extension on the inner `flow{}` collector.
+    static MEMBER_ONLY_PROBE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     static COROUTINE_TIME_MODE: std::cell::Cell<TimeMode> =
         const { std::cell::Cell::new(TimeMode::Wall) };
 

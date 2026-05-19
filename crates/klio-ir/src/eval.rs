@@ -370,6 +370,29 @@ pub trait Host {
     fn enclosing_this(&self) -> Option<Value> {
         None
     }
+    /// The full lexically-enclosing-`this` chain, innermost first.
+    /// Nested receiver lambdas mean the intended `this@Outer` may be
+    /// deeper than the immediate enclosing. Default: the single
+    /// `enclosing_this()`.
+    fn enclosing_this_chain(&self) -> Vec<Value> {
+        self.enclosing_this().into_iter().collect()
+    }
+    /// Resolve `name` as a *member* of `receiver` only — the
+    /// instance / class / anon-object method walk — without falling
+    /// back to a top-level extension, SAM dispatch, or a global.
+    /// Returns `Err` when `receiver` has no such member. Used to give
+    /// a member of any implicit receiver precedence over a same-named
+    /// extension (Kotlin resolution order). Default: the normal
+    /// member call.
+    fn call_member_only(
+        &mut self,
+        receiver: &Value,
+        name: &str,
+        args: &[Value],
+        arg_names: &[Option<String>],
+    ) -> Result<Value, EvalError> {
+        self.call_member_named(receiver, name, args, arg_names)
+    }
     /// Make `v` reachable as the lexically enclosing `this` for the
     /// duration of a member access whose receiver displaces it — the
     /// same nested-receiver rule receiver lambdas use, extended to a
@@ -1170,7 +1193,46 @@ fn exec_inst(
                 .next()
                 .map_or(false, |c| c.is_uppercase());
             let mut resolved: Option<Value> = None;
-            if !is_ctor_name && !matches!(this_val, Value::Null | Value::Unit) {
+            // Implicit-receiver search, Kotlin order: a *member* of
+            // the lambda's own `this` or of any lexically enclosing
+            // `this@…` outranks a same-named top-level extension.
+            // Probe each receiver for a member only (no extension /
+            // SAM / global) before the general resolution below — so
+            // bare `collect` inside upstream `transform`'s
+            // `flow { collect { … } }` binds the enclosing source
+            // flow's `collect` member instead of the
+            // `Flow<T>.collect` extension on the inner `flow{}`
+            // collector. Extensions still resolve normally below when
+            // no receiver in the chain has the member (so `isEmpty`
+            // / `withData` etc. are unaffected).
+            if !is_ctor_name {
+                let mut chain: Vec<Value> = Vec::new();
+                if !matches!(this_val, Value::Null | Value::Unit) {
+                    chain.push(this_val.clone());
+                }
+                chain.extend(host.enclosing_this_chain());
+                for recv in chain {
+                    if matches!(recv, Value::Null | Value::Unit) {
+                        continue;
+                    }
+                    match host.call_member_only(
+                        &recv, &name_str, &arg_values, &names,
+                    ) {
+                        Ok(v) => {
+                            resolved = Some(v);
+                            break;
+                        }
+                        Err(e @ EvalError::Suspended(_)) => {
+                            return Err(e)
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            if resolved.is_none()
+                && !is_ctor_name
+                && !matches!(this_val, Value::Null | Value::Unit)
+            {
                 match host.call_member_named(
                     &this_val, &name_str, &arg_values, &names,
                 ) {
