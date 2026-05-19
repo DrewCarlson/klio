@@ -35,6 +35,7 @@ const SMOKE: &[&str] = &[
     "cs2_async_await",
     "cs3_many_launch",
     "cs4_suspend_seq",
+    "cs5_flow_builder",
 ];
 
 #[test]
