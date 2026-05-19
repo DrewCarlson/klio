@@ -28,6 +28,24 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
             continuation.resumeWith(Result.success(Unit))
         }
     }
+
+    // `withTimeout` schedules the timeout through this. The default
+    // `Delay.invokeOnTimeout` recurses into `DefaultDelay` (== this),
+    // so it must be overridden: run `block` after `timeMillis` of
+    // virtual time on the same cooperative pump, unless the returned
+    // handle is disposed first (the timed body completed in time).
+    override fun invokeOnTimeout(
+        timeMillis: Long,
+        block: Runnable,
+        context: CoroutineContext
+    ): DisposableHandle {
+        val cancelled = booleanArrayOf(false)
+        __kxco_spawn {
+            __kxco_delayMillis(timeMillis)
+            if (!cancelled[0]) block.run()
+        }
+        return DisposableHandle { cancelled[0] = true }
+    }
 }
 
 // klio runs one cooperative scheduler per `runBlocking`, so every

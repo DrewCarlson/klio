@@ -2002,6 +2002,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         return Ok(s);
                     }
                 }
+                // A bare `object` name in value position is the
+                // singleton, not the class/`KClass`. The singleton
+                // registers itself as a global on first construction;
+                // if a top-level property initializer (`val d = O`)
+                // reaches it before that, materialize it now so the
+                // value is the instance, order-independent.
+                if cls.is_object {
+                    if let Some(s) = self.globals.borrow().lookup(&cls.name) {
+                        return Ok(s);
+                    }
+                    let cid = self
+                        .module
+                        .class_index
+                        .iter()
+                        .find(|(n, _)| *n == cls.name)
+                        .map(|(_, id)| *id);
+                    if let Some(cid) = cid {
+                        return self.new_instance(cid, &[]);
+                    }
+                }
             }
             return Ok(receiver.clone());
         }

@@ -32,3 +32,9 @@ internal actual fun Continuation<*>.toDebugString(): String = toString()
 
 internal actual val CoroutineContext.coroutineName: String?
     get() = this[CoroutineName]?.name
+
+// klio's single cooperative dispatcher also serves as the default
+// `Delay`: `withTimeout` / `delay` on a context without an explicit
+// dispatcher resolve here, scheduling resumption on the same pump.
+@Suppress("PropertyName")
+internal actual val DefaultDelay: Delay = KlioDispatcher
