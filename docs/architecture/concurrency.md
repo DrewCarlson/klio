@@ -1,13 +1,18 @@
 # Concurrency
 
-klio executes Kotlin concurrency on one interpreter thread.
-Coroutines run on a cooperative scheduler; `Thread`,
-`synchronized`, `@Volatile`, and atomics have faithful Kotlin
-semantics because a single serialized interpreter is trivially
-sequentially consistent. The value model
-(`klio_runtime::Value`, built on `Rc<RefCell<…>>`) is not
-thread-safe, so all of this is by construction, not by locking —
-and it costs the single-threaded path nothing.
+klio runs Kotlin concurrency on real OS threads. `Thread.start` /
+`join` spawn and join genuine `std::thread`s, and
+`Dispatchers.Default` / `IO` dispatch coroutine bodies onto a real
+worker pool, so CPU-bound work runs in parallel. Coroutines within
+one `runBlocking` still interleave cooperatively on their driver
+thread. `Thread`, `synchronized`, `@Volatile`, and atomics have
+faithful Kotlin semantics; the value model
+(`klio_runtime::Value`, backed by `ObjRef = Arc<AdaptiveCell>`) is
+`Send`/`Sync` and the publication protocol is loom-verified
+race-free. The adaptive cell keeps the single-threaded path at
+`RefCell` speed: borrow tracking is a non-atomic `Cell` until a
+reference is published across threads, at which point that cell —
+and only that cell — promotes to a reader/writer lock.
 
 Three ideas structure the design.
 
@@ -80,21 +85,23 @@ program for each, is in [memory-model.md](memory-model.md).
 
 ### One primitive, many clients
 
-Every happens-before edge is established by exactly one runtime
-operation, `klio_runtime::fence_and_publish`, conceptually invoked
-at a closed set of seams: monitor enter/exit, volatile access,
-atomic op, thread start/join, the interceptor's dispatch/resume,
-and channel send/receive. There is no other way to create an edge.
-
-Under the serialized interpreter the operation is a no-op:
-interpretation is already a single total order, so sequential
-consistency holds for free. It is the single, documented place a
-parallel value-model backing would insert real acquire/release/SC
-fences and reference publication. The invariant that keeps the two
-layers consistent: core suspend never invokes it; the interceptor
-does, through the same operation `synchronized` and `@Volatile`
-use — so the model is obeyed identically whether code uses raw
-`suspend` or all of `kotlinx.coroutines`.
+Every happens-before edge is established at a closed set of seams:
+monitor enter/exit, volatile access, atomic op, thread start/join,
+the interceptor's dispatch/resume, and channel send/receive.
+`klio_runtime::fence_and_publish` is the stable, named call site
+that marks these boundaries in the code; the concrete edge for each
+seam is real and is stated normatively in the fence matrix on
+`AdaptiveCell` (shared-object access → the per-cell RwLock plus the
+`state` `Release`/`Acquire` on `ObjRef::publish`; monitors → the
+process-wide reentrant monitor; `@Volatile` → subsumed by
+lock-mediated shared access; atomics → the underlying Rust atomic
+ops; `Thread.start`/`join` → `std::thread` spawn/join, with the
+escaping object graph `publish_deep`'d before spawn). The invariant
+that keeps the two layers consistent: core suspend never creates an
+edge; the interceptor and the publication path do — so the model is
+obeyed identically whether code uses raw `suspend` or all of
+`kotlinx.coroutines`. The protocol is exhaustively model-checked
+under `loom` (`crates/klio-runtime/tests/objref_loom.rs`).
 
 ### Front end and runtime responsibilities
 
@@ -112,11 +119,13 @@ use — so the model is obeyed identically whether code uses raw
 
 All shared Kotlin heap state — collections, instances, `Cell`,
 `StringBuilder`, iterator state, delegates — is reached through one
-newtype, `klio_runtime::ObjRef<T>`, today wrapping
-`Rc<RefCell<T>>`. Call sites never name `Rc` / `RefCell`; they use
-`borrow` / `borrow_mut` / `clone` / `ptr_eq`. The backing
-representation is therefore a single-type change, not a
-codebase-wide one.
+newtype, `klio_runtime::ObjRef<T>`, backed by
+`Arc<AdaptiveCell<T>>`. Call sites never name the backing; they use
+`borrow` / `borrow_mut` / `clone` / `ptr_eq`. Because every
+shared-object access funnels through this one type, the adaptive
+publication protocol — and any future backing change, such as the
+optional `--features gc` tracing collector — is localized to one
+type and the publication seam, not a codebase-wide concern.
 
 Per-thread interpreter state lives in one `ExecState` (the
 cooperative interceptor stack and the constructor-shell guard),
@@ -128,17 +137,55 @@ boundary by design and is already `Mutex`-guarded.
 
 ## Parallelism
 
-True multicore execution is not required for correctness — the
-serialized interpreter already provides faithful semantics for the
-whole memory model and for `Thread` / coroutines, at no
-single-thread cost. Where it is wanted, it is a value-model
-question, not a semantics question: it requires making `Value`
-shareable across OS threads by replacing the backing of `ObjRef`
-with either escape-aware atomic reference counting (thread-local
-objects stay at `Rc` speed; published objects promote) or a
-concurrent collector. Because every shared-object access already
-goes through `ObjRef`, that change is localized to one type and
-the published-state seam, and is validated against the litmus suite
-in [memory-model.md](memory-model.md) plus a fixed single-thread
-benchmark set (`crates/klio-bench`) that the common case must not
-regress.
+True multicore execution is implemented. `Value` is shareable
+across OS threads: `ObjRef`'s `Arc<AdaptiveCell>` backing is
+escape-aware atomic reference counting — a cell stays at `RefCell`
+speed (non-atomic `Cell` borrow tracking) while it is reachable
+from only its creating thread, and promotes to a reader/writer lock
+the moment a reference is published across threads via
+`publish_deep` at an escape seam. `Thread.start` / `join` spawn and
+join real `std::thread`s; `Dispatchers.Default` / `IO` dispatch
+coroutine bodies onto a real worker pool for genuine CPU-bound
+parallelism. The single cooperative driver per `runBlocking` is
+retained for intra-scope coroutine interleaving.
+
+This is validated by three gates:
+
+- **Loom** — `crates/klio-runtime/tests/objref_loom.rs` exhaustively
+  model-checks the UNSHARED→SHARED publication protocol
+  (cross-thread borrow after publish, two post-publish writers,
+  reader/writer no-torn-read) under
+  `RUSTFLAGS="--cfg loom"`.
+- **Threaded litmus** — `crates/klio-parity/tests/threaded_litmus/`
+  exercises real-thread guarantees end to end (mutual exclusion,
+  safe publication, no lost update, parallel partition, parallel
+  `async`, `withContext(IO)`, many-dispatch), each asserting exact
+  stdout, plus a real-OS-thread stress suite
+  (`objref_threads.rs`).
+- **Single-thread benchmark** — the fixed `crates/klio-bench`
+  corpus, diffable against a baseline (`klio-bench --diff`), guards
+  the common path against regression; the adaptive cell's UNSHARED
+  fast path keeps it at the pre-parallel cost.
+
+The normative litmus statements live in
+[memory-model.md](memory-model.md). An optional stop-the-world
+tracing collector backing exists behind `--features gc` for
+workloads that prefer tracing reclamation to reference counting;
+the production backing is the adaptive `Arc` cell.
+
+## Status & known gaps
+
+`launch`, `delay`, `join`, real-thread dispatch, and the memory
+model are working and gated. **`job.cancel()` and `withTimeout` /
+`withTimeoutOrNull` are not yet end-to-end.** The blocker is a
+per-activation coroutine-context model: the running coroutine's
+`CoroutineContext` must travel with the activation rather than in a
+single shared interceptor slot, so a child's `delay`
+`CancellableContinuationImpl` registers with the correct `Job` and
+the root is not wrongly cancelled. The full inventory, root-cause
+analysis, and the ordered plan — including the inline/crossinline
+and script-vs-pack-unification prerequisites this depends on — are
+in [../development/stabilization-plan.md](../development/stabilization-plan.md).
+Do not add library-type-specific branches to `klio-ir` /
+`klio-interp-ir` to work around these; fix the general mechanism per
+that plan.

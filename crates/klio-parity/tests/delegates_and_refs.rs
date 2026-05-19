@@ -35,7 +35,7 @@ fn assert_klio(name: &str, src: &str, expected: &str) {
 //    LOCAL `val x by D` mis-lowers (binds `x` to Unit instead of
 //    routing reads through `getValue`).
 #[test]
-#[ignore = "task #30: local property delegation"]
+
 fn by_lazy_captures_enclosing_local() {
     let src = r#"
 fun build(seed: Int): String {

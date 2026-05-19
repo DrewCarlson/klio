@@ -4696,15 +4696,47 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             // `val x = expr` / `var x = expr`. The init is lowered
             // into a fresh register and bound in the current scope;
             // mutability is enforced by typeck, not the IR.
-            let init = match &p.init {
-                Some(e) => {
-                    let widened = p
-                        .ty
-                        .as_ref()
-                        .and_then(|ty| widen_numeric_literal(e, ty));
-                    lower_expr(b, widened.as_ref().unwrap_or(e))
+            let init = if let Some(de) = &p.delegate {
+                // `val x by D` — lower the delegate, then invoke its
+                // `getValue(null, ::x)` once at decl time. For a
+                // `lazy { producer }` this drives the producer; for
+                // any custom delegate the dispatched method runs.
+                // Each subsequent path read of `x` returns the bound
+                // value, so this is eager-once semantics (sufficient
+                // for `val`-style use; a `var x by D` mutating
+                // delegate would need a true read-through dispatch
+                // and is tracked separately).
+                let delegate = lower_expr(b, de);
+                let null_arg = b.emit_const(Const::Null);
+                let prop_ref = b.alloc_reg();
+                let pname = b.module.intern_const(Const::String(p.name.name.clone()));
+                b.push(Inst::PropertyRef { dst: prop_ref, name: pname });
+                let args_start = b.alloc_reg();
+                b.push(Inst::Move { dst: args_start, src: null_arg });
+                let _slot2 = b.alloc_reg();
+                b.push(Inst::Move { dst: Reg(args_start.0 + 1), src: prop_ref });
+                let dst = b.alloc_reg();
+                let name_c = b.module.intern_const(Const::String("getValue".to_string()));
+                b.push(Inst::CallMember {
+                    dst,
+                    receiver: delegate,
+                    name: name_c,
+                    args: args_start,
+                    n_args: 2,
+                    arg_names: Vec::new(),
+                });
+                dst
+            } else {
+                match &p.init {
+                    Some(e) => {
+                        let widened = p
+                            .ty
+                            .as_ref()
+                            .and_then(|ty| widen_numeric_literal(e, ty));
+                        lower_expr(b, widened.as_ref().unwrap_or(e))
+                    }
+                    None => b.emit_const(Const::Unit),
                 }
-                None => b.emit_const(Const::Unit),
             };
             // Allocate a "home" register and Move the init value
             // into it for `var`, or for `val` declared without an
