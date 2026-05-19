@@ -3989,17 +3989,25 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // member. The lambda receiver displaced the enclosing
         // instance; recover it from the enclosing-`this` stack and
         // match the qualifier against its class chain.
-        let enclosing = with_outer_this(|s| s.borrow().last().cloned());
-        if let Some(klio_runtime::Value::Instance(o_inst)) = &enclosing {
-            let mut cur: Option<Arc<klio_runtime::ClassDef>> =
-                Some(o_inst.borrow().class.clone());
-            while let Some(c) = cur {
-                if c.name == qualifier || c.fqn == qualifier {
-                    return Ok(klio_runtime::Value::Instance(o_inst.clone()));
+        // Walk the FULL enclosing-this chain (innermost first), not
+        // just the top: nested scope-fn / receiver lambdas each
+        // displace `this` and push a new entry, so the qualifier may
+        // match an older entry deeper in the stack.
+        let enclosing_chain: Vec<klio_runtime::Value> =
+            with_outer_this(|s| s.borrow().iter().rev().cloned().collect());
+        for encl_v in &enclosing_chain {
+            if let klio_runtime::Value::Instance(o_inst) = encl_v {
+                let mut cur: Option<Arc<klio_runtime::ClassDef>> =
+                    Some(o_inst.borrow().class.clone());
+                while let Some(c) = cur {
+                    if c.name == qualifier || c.fqn == qualifier {
+                        return Ok(klio_runtime::Value::Instance(o_inst.clone()));
+                    }
+                    cur = c.parent.borrow().clone();
                 }
-                cur = c.parent.borrow().clone();
             }
         }
+        let enclosing = enclosing_chain.into_iter().next();
         let known_class = self.classes.borrow().contains_key(qualifier);
         if !known_class && !matches!(receiver, klio_runtime::Value::Null) {
             // `this@<fn-label>` — the qualifier is an extension/fn

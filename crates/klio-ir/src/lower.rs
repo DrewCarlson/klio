@@ -3771,12 +3771,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     return b.emit_const(Const::Unit);
                 }
             }
-            if b.is_lambda_body() && label.is_none() {
+            if let Some(lbl) = label.as_ref() {
+                if b.current_inline_fn().is_some() {
+                    // Inside a spliced inline body: a plain `Return`
+                    // would exit the caller's whole function, not the
+                    // labeled frame. `LabeledReturn` walks until the
+                    // function whose name matches `lbl` catches it.
+                    b.terminate(Terminator::LabeledReturn(lbl.name.clone(), r));
+                } else {
+                    // Non-spliced closure body: `return@label` here is
+                    // a local return from the lambda invocation.
+                    b.terminate(Terminator::Return(r));
+                }
+            } else if b.is_lambda_body() {
                 b.terminate(Terminator::NonLocalReturn(r));
             } else {
                 b.terminate(Terminator::Return(r));
             }
-            let _ = label;
             // The post-return path is unreachable; allocate a fresh
             // block so caller code that emits anything after sees a
             // distinct cursor.

@@ -569,9 +569,16 @@ pub fn eval_with_captures(
     host: &mut dyn Host,
 ) -> Result<Value, EvalError> {
     let mut try_stack: Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)> = Vec::new();
+    let func_name = func.name.clone();
     let mut frame = Frame::new_with_captures(module, func, args, captures);
     let cur = func.entry;
-    run_frame(module, &mut frame, &mut try_stack, cur, 0, host)
+    match run_frame(module, &mut frame, &mut try_stack, cur, 0, host) {
+        // A labeled return whose target is this function exits it as
+        // a normal return. Other labels propagate further outward
+        // until the matching frame catches them.
+        Err(EvalError::LabeledReturn(label, v)) if label == func_name => Ok(v),
+        other => other,
+    }
 }
 
 /// Resume a parked coroutine. `resume_value` is written into the
@@ -785,6 +792,13 @@ fn run_frame_inner<'a>(
                     return Err(EvalError::NonLocalReturn(v));
                 }
                 return Ok(v);
+            }
+            Terminator::LabeledReturn(label, r) => {
+                let v = r.map(|r| frame.read(r)).unwrap_or(Value::Unit);
+                if frame.func.name == *label {
+                    return Ok(v);
+                }
+                return Err(EvalError::LabeledReturn(label.clone(), v));
             }
             Terminator::Throw(r) => {
                 let exc = frame.read(r);

@@ -435,6 +435,14 @@ pub enum Terminator {
     /// up through enclosing lambda frames until a non-lambda fn
     /// catches it and converts it into a normal return value.
     NonLocalReturn(Option<Reg>),
+    /// `return@label` — return the value from the function whose
+    /// name matches `label`. Propagates as `EvalError::LabeledReturn`
+    /// through enclosing frames until the labeled frame catches it.
+    /// Necessary because an inline-fn splice runs in its caller's
+    /// frame, so a labeled return targeting the caller cannot be a
+    /// plain `Return` (which would exit the splice's lexical frame,
+    /// not the labeled one).
+    LabeledReturn(String, Option<Reg>),
 }
 
 /// Catch handler frame attached to a try-body block. When a Throw
