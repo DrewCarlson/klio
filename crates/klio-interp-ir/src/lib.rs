@@ -3561,7 +3561,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // instance; recover it from the enclosing-`this` stack and
         // match the qualifier against its class chain.
         let enclosing = with_outer_this(|s| s.borrow().last().cloned());
-        if let Some(klio_runtime::Value::Instance(o_inst)) = enclosing {
+        if let Some(klio_runtime::Value::Instance(o_inst)) = &enclosing {
             let mut cur: Option<Arc<klio_runtime::ClassDef>> =
                 Some(o_inst.borrow().class.clone());
             while let Some(c) = cur {
@@ -3573,6 +3573,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         let known_class = self.classes.borrow().contains_key(qualifier);
         if !known_class && !matches!(receiver, klio_runtime::Value::Null) {
+            // `this@<fn-label>` — the qualifier is an extension/fn
+            // label, not a class. Inside a receiver lambda whose own
+            // `this` displaced the enclosing extension receiver
+            // (`IntRange.asFlow() = flow { forEach { emit(it) } }`:
+            // `this@asFlow` is the range, not the FlowCollector), the
+            // displaced receiver is the top of the enclosing-`this`
+            // stack. Prefer it over the lambda receiver when distinct.
+            if let Some(encl) = enclosing {
+                let same = match (&encl, receiver) {
+                    (
+                        klio_runtime::Value::Instance(a),
+                        klio_runtime::Value::Instance(b),
+                    ) => klio_runtime::ObjRef::ptr_eq(a, b),
+                    _ => false,
+                };
+                if !same
+                    && !matches!(
+                        encl,
+                        klio_runtime::Value::Null | klio_runtime::Value::Unit
+                    )
+                {
+                    return Ok(encl);
+                }
+            }
             return Ok(receiver.clone());
         }
         Err(klio_ir::eval::EvalError::Type(format!(
@@ -5989,6 +6013,83 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             }
         }
+        // `recv.member(...)` where `member` is not a member of the
+        // receiver's type but is a function-typed property of the
+        // lexically enclosing `this` — an extension-function-typed
+        // member invoked with an explicit receiver. (Upstream
+        // `SafeFlow.collectSafely(collector)` does `collector.block()`
+        // where `block: suspend FlowCollector<T>.() -> Unit` is a
+        // field of the enclosing `SafeFlow`.) Invoke the callable
+        // with the receiver as its extension-receiver argument.
+        if let Some(klio_runtime::Value::Instance(encl)) = self.enclosing_this() {
+            let cand = encl
+                .borrow()
+                .fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone());
+            if let Some(v) = cand {
+                if matches!(
+                    v,
+                    klio_runtime::Value::Lambda { .. }
+                        | klio_runtime::Value::IrClosure { .. }
+                        | klio_runtime::Value::Function { .. }
+                        | klio_runtime::Value::BoundMethod { .. }
+                ) {
+                    // Bind the explicit receiver as the callable's
+                    // implicit `this` so the body's bare member calls
+                    // (e.g. `emit(value)` inside a `flow { … }` block)
+                    // resolve against the receiver via its `this`
+                    // capture slot.
+                    use klio_runtime::IntrinsicHost as _;
+                    let mut sink = self.out_sink.clone();
+                    let r = {
+                        let mut intrinsic = VmIntrinsicHost {
+                            scheduler: &mut *self.scheduler,
+                            module: Arc::clone(&self.module),
+                            closures: self.closures.clone(),
+                            globals: self.globals.clone(),
+                            classes: self.classes.clone(),
+                            prog: Arc::clone(&self.prog),
+                            anon_methods: self.anon_methods.clone(),
+                            class_default_outer: self
+                                .class_default_outer
+                                .clone(),
+                            instance_id_counter: Arc::clone(
+                                &self.instance_id_counter,
+                            ),
+                            out_sink: self.out_sink.clone(),
+                            threads: Arc::clone(&self.threads),
+                        };
+                        intrinsic.invoke_callable_with_this(
+                            &v, args, receiver, &mut sink,
+                        )
+                    };
+                    return r
+                        .map_err(|e| match e {
+                            klio_runtime::RuntimeError::Thrown(tv) => {
+                                klio_ir::eval::EvalError::Throw(tv)
+                            }
+                            klio_runtime::RuntimeError::Return(rv) => {
+                                klio_ir::eval::EvalError::NonLocalReturn(rv)
+                            }
+                            klio_runtime::RuntimeError::Suspend(wake) => {
+                                klio_ir::eval::EvalError::Suspended(Box::new(
+                                    klio_ir::eval::SuspendState {
+                                        token: 0,
+                                        frames: Vec::new(),
+                                        wake_in_millis: wake,
+                                        pending_resume_reg: None,
+                                    },
+                                ))
+                            }
+                            other => klio_ir::eval::EvalError::Type(format!(
+                                "{other}"
+                            )),
+                        });
+                }
+            }
+        }
         // Inner-class outer-chain fallback: a bare call inside an
         // `inner class` method may target an enclosing-class member,
         // reachable through the receiver's captured `outer` link
@@ -8213,14 +8314,25 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 // implicit receiver so bare members / `this@Outer`
                 // inside the lambda still resolve, matching Kotlin's
                 // nested-receiver rule.
-                let pushed_outer = matches!(
-                    &prior_this,
-                    Some(klio_runtime::Value::Instance(_))
-                ) && !matches!(
-                    (&prior_this, this),
-                    (Some(klio_runtime::Value::Instance(a)), klio_runtime::Value::Instance(b))
-                        if klio_runtime::ObjRef::ptr_eq(a, b)
-                );
+                // Keep any distinct prior `this` (not only an
+                // Instance) reachable as an outer implicit receiver:
+                // an extension-receiver lambda such as
+                // `IntRange.asFlow() = flow { forEach { emit(it) } }`
+                // captures the range as its `this`, which the new
+                // collector receiver displaces — `forEach` must still
+                // resolve against the range via the enclosing
+                // fallback.
+                let pushed_outer = match &prior_this {
+                    None
+                    | Some(klio_runtime::Value::Null)
+                    | Some(klio_runtime::Value::Unit) => false,
+                    Some(klio_runtime::Value::Instance(a)) => !matches!(
+                        this,
+                        klio_runtime::Value::Instance(b)
+                            if klio_runtime::ObjRef::ptr_eq(a, b)
+                    ),
+                    Some(_) => true,
+                };
                 if pushed_outer {
                     if let Some(p) = &prior_this {
                         with_outer_this(|s| s.borrow_mut().push(p.clone()));
