@@ -5068,6 +5068,63 @@ fn try_inline_call(
 
 fn lower_block(b: &mut FuncBuilder<'_>, block: &AstBlock) -> Reg {
     b.push_scope();
+    // Hoist only the local fn names that an *earlier-declared* local
+    // fn in this same block references — that is the strict subset of
+    // names that require a shared cell so mutually-recursive sibling
+    // fns can resolve a forward reference. Hoisting more names changes
+    // the binding of unrelated locals from a direct value to a boxed
+    // cell, which then interacts with member-/extension-dispatch in
+    // ways that regress unrelated programs (a local-fn-by-value direct
+    // bind is what code without forward references is built on).
+    let local_fn_decls: Vec<(usize, &klio_ast::Function)> = block
+        .stmts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            if let Stmt::Decl(klio_ast::Decl::Function(f)) = s {
+                Some((i, f))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (k_idx, _) in local_fn_decls.iter().enumerate() {
+        let (k_pos, k_fn) = local_fn_decls[k_idx];
+        let mut needs_hoist = false;
+        for (i_pos, i_fn) in &local_fn_decls {
+            if *i_pos >= k_pos {
+                break;
+            }
+            // Only an EARLIER local fn referencing `k_fn` justifies a
+            // pre-hoist; later references already see `k_fn` bound.
+            if let Some(body) = i_fn.body.as_ref() {
+                let mut refs = std::collections::HashSet::new();
+                match body {
+                    klio_ast::FunctionBody::Block(blk) => {
+                        for s in &blk.stmts {
+                            collect_path_idents_stmt(s, &mut refs);
+                        }
+                    }
+                    klio_ast::FunctionBody::Expr(e) => {
+                        collect_path_idents(e, &mut refs);
+                    }
+                }
+                if refs.contains(&k_fn.name.name) {
+                    needs_hoist = true;
+                    break;
+                }
+            }
+        }
+        if needs_hoist && b.mutable_home(&k_fn.name.name).is_none() {
+            let null_v = b.emit_const(Const::Null);
+            let home = b.alloc_reg();
+            b.push(Inst::MakeCell { dst: home, src: null_v });
+            b.set_mutable_home(&k_fn.name.name, home);
+            b.mark_mutable(&k_fn.name.name);
+            b.mark_boxed(&k_fn.name.name);
+            b.bind(k_fn.name.name.clone(), home);
+        }
+    }
     let mut last: Option<Reg> = None;
     for stmt in &block.stmts {
         last = lower_stmt(b, stmt);
@@ -5160,8 +5217,16 @@ fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
                 for s in &body.stmts {
                     collect_path_idents_stmt(s, &mut self_refs);
                 }
-                let is_recursive = self_refs.contains(&f.name.name);
-                let self_cell: Option<Reg> = if is_recursive {
+                // Pre-hoisted by `lower_block`: every local fn declared
+                // at the block level already has a shared cell so
+                // siblings can capture each other. Reuse it. Falls back
+                // to the per-fn self-cell path for any local fn lowered
+                // outside `lower_block`'s pre-pass.
+                let self_cell: Option<Reg> = if let Some(home) =
+                    b.mutable_home(&f.name.name)
+                {
+                    Some(home)
+                } else if self_refs.contains(&f.name.name) {
                     let null_v = b.emit_const(Const::Null);
                     let home = b.alloc_reg();
                     b.push(Inst::MakeCell { dst: home, src: null_v });
