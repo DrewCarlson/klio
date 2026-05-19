@@ -3712,6 +3712,18 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         // lambda reading only applies in true expression position
         // (`val f = { … }`), which `parse_primary` handles.
         if matches!(self.peek_kind(), TokenKind::LBrace) {
+            // A `{ params -> body }` shape at branch position is a
+            // lambda literal (the branch evaluates to a function
+            // value); a `{` without a top-level `->` is the body
+            // block.
+            let next = self.pos + 1;
+            let save_pos = self.pos;
+            self.pos = next;
+            let has_header = self.lambda_has_header();
+            self.pos = save_pos;
+            if has_header {
+                return self.parse_lambda_literal();
+            }
             return self.parse_block().map(Expr::Block);
         }
         let save = self.pos;

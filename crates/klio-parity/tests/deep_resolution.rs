@@ -232,9 +232,7 @@ fun main() {
 
 // 12. Sealed-class polymorphic `when` returning a lambda; lambdas
 //     close over arm-local values, executed after.
-//     Tracked: task #37 (parser gap on lambda arm in when branch).
 #[test]
-#[ignore = "tracked as task #37"]
 fn when_returns_lambda_capturing_arm() {
     let src = r#"
 sealed class Op {
