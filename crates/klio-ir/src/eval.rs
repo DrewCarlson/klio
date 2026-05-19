@@ -590,6 +590,7 @@ pub fn resume_continuation(
     // then feed its return value to the next-outer frame, and so on.
     let mut frames: std::collections::VecDeque<FrameSnapshot> =
         state.frames.into();
+    let mut first = true;
     while let Some(snap) = frames.pop_front() {
         let func = &module.funcs[snap.func.0 as usize];
         let mut frame = Frame::new_with_captures(
@@ -599,11 +600,38 @@ pub fn resume_continuation(
             snap.captures.clone(),
         );
         frame.regs = snap.regs.clone();
-        if let Some(r) = snap.resume_reg {
-            frame.write(r, carry.clone());
+        // Kotlin `Continuation.resumeWith(Result.failure(e))` means
+        // "resume by throwing `e` at the suspension point". Only the
+        // innermost (suspending) frame sees the raw failure Result;
+        // route it as a throw there instead of delivering it as the
+        // suspending call's value, so a cancellation preempts a
+        // parked `delay`/acquire rather than letting it complete.
+        let resume_throw = if first {
+            match &carry {
+                Value::Result { ok: false, payload } => {
+                    Some((**payload).clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        first = false;
+        if resume_throw.is_none() {
+            if let Some(r) = snap.resume_reg {
+                frame.write(r, carry.clone());
+            }
         }
         let mut try_stack = snap.try_stack.clone();
-        match run_frame(module, &mut frame, &mut try_stack, snap.block, snap.inst_idx, host) {
+        match run_frame_inner(
+            module,
+            &mut frame,
+            &mut try_stack,
+            snap.block,
+            snap.inst_idx,
+            resume_throw,
+            host,
+        ) {
             Ok(v) => {
                 carry = v;
             }
@@ -631,6 +659,24 @@ fn run_frame<'a>(
     mut resume_idx: usize,
     host: &mut dyn Host,
 ) -> Result<Value, EvalError> {
+    run_frame_inner(module, frame, try_stack, cur, resume_idx, None, host)
+}
+
+/// `resume_throw`: when a continuation is resumed with
+/// `Result.failure(e)` (Kotlin's `resumeWith(failure)` =
+/// "resume by throwing at the suspension point"), the exception is
+/// routed through this frame's restored try-stack instead of being
+/// delivered as the suspending call's value. This makes a
+/// cancellation actually preempt a parked `delay` / acquire.
+fn run_frame_inner<'a>(
+    module: &'a Module,
+    frame: &mut Frame<'a>,
+    try_stack: &mut Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)>,
+    mut cur: BlockId,
+    mut resume_idx: usize,
+    mut resume_throw: Option<Value>,
+    host: &mut dyn Host,
+) -> Result<Value, EvalError> {
     loop {
         // Push any catch / finally metadata attached to this block.
         let (insts, term, catches, finally) = {
@@ -646,7 +692,15 @@ fn run_frame<'a>(
             try_stack.push((cur, catches, finally));
         }
         let mut thrown: Option<Value> = None;
-        let start_idx = std::mem::take(&mut resume_idx);
+        let mut start_idx = std::mem::take(&mut resume_idx);
+        if let Some(exc) = resume_throw.take() {
+            // Resumed with an exception: skip the remaining
+            // instructions of the suspending block and route the
+            // throw through the restored try-stack exactly as a
+            // mid-block throw would.
+            thrown = Some(exc);
+            start_idx = insts.len();
+        }
         for (idx, inst) in insts.iter().enumerate() {
             if idx < start_idx {
                 continue;

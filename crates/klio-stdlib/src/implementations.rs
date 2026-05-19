@@ -878,6 +878,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // ----- kotlin.coroutines intrinsics -----
     ("kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED", coroutine_suspended_sentinel),
     ("kotlin.coroutines.__klio_co_newSlot", coro_new_slot),
+    ("kotlin.coroutines.__klio_co_armSlot", coro_arm_slot),
+    ("kotlin.coroutines.__klio_co_disarmSlot", coro_disarm_slot),
     ("kotlin.coroutines.__klio_co_park", coro_park),
     ("kotlin.coroutines.__klio_co_resume", coro_resume),
     ("kotlin.coroutines.__klio_co_runRoot", coro_run_root),
@@ -6918,6 +6920,23 @@ fn coro_park(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let slot = slot_arg(ctx.args, "__klio_co_park")?;
     ctx.host.coroutine_park_slot(slot);
     Err(RuntimeError::Suspend(-1))
+}
+
+/// `__klio_co_armSlot(slot)` — bind the next suspension (even a
+/// timed one) to `slot` without suspending now, so a suspend inside
+/// a `suspendCoroutineUninterceptedOrReturn` block stays reachable
+/// via the continuation's slot for preemptive cancellation.
+fn coro_arm_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let slot = slot_arg(ctx.args, "__klio_co_armSlot")?;
+    ctx.host.coroutine_arm_slot(slot);
+    Ok(Value::Unit)
+}
+
+/// `__klio_co_disarmSlot()` — cancel a pending arm (the block
+/// returned a value without suspending).
+fn coro_disarm_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    ctx.host.coroutine_disarm_slot();
+    Ok(Value::Unit)
 }
 
 /// `__klio_co_resume(slot, ok, value)` — deliver a `Result` to the

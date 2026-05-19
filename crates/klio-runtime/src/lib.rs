@@ -778,6 +778,14 @@ pub trait IntrinsicHost {
     /// no-op (no cooperative driver).
     fn coroutine_park_slot(&mut self, _slot: i64) {}
 
+    /// Arm `slot` so the next parked activation (even a timed one) is
+    /// bound to it, without itself suspending. Default no-op.
+    fn coroutine_arm_slot(&mut self, _slot: i64) {}
+
+    /// Clear a previously-armed slot (block returned without
+    /// suspending). Default no-op.
+    fn coroutine_disarm_slot(&mut self) {}
+
     /// Make the coroutine waiting on `slot` ready, if any is parked.
     /// Searches the interceptor stack top-down so a nested scope can
     /// resume a waiter parked by an outer one. No-op if nothing is

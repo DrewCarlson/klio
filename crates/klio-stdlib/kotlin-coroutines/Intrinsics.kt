@@ -9,6 +9,8 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.KlioContinuation
 import kotlin.coroutines.__klio_co_newSlot
+import kotlin.coroutines.__klio_co_armSlot
+import kotlin.coroutines.__klio_co_disarmSlot
 import kotlin.coroutines.__klio_co_park
 import kotlin.coroutines.__klio_co_runRoot
 
@@ -20,11 +22,19 @@ import kotlin.coroutines.__klio_co_runRoot
 public fun <T> suspendCoroutineUninterceptedOrReturn(block: (Continuation<T>) -> Any?): T {
     val slot = __klio_co_newSlot()
     val cont = KlioContinuation<T>(slot, EmptyCoroutineContext)
+    // Arm the slot before running the block: a suspension inside it
+    // (e.g. a `delay` within `withTimeout`) is then bound to this
+    // continuation's slot, so a cancellation can resume it early by
+    // throwing instead of waiting out the timer.
+    __klio_co_armSlot(slot)
     val outcome = block(cont)
     @Suppress("UNCHECKED_CAST")
     return if (outcome === COROUTINE_SUSPENDED) {
         __klio_co_park(slot).getOrThrow() as T
     } else {
+        // Completed synchronously — drop the arm so it cannot bind a
+        // later unrelated suspension.
+        __klio_co_disarmSlot()
         outcome as T
     }
 }

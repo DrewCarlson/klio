@@ -28,6 +28,16 @@ import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 @PublishedApi
 internal fun __klio_co_newSlot(): Long = 0L
 
+// Bind the next suspension (even a timed `delay`) to `slot` without
+// suspending now, so a suspend inside a
+// `suspendCoroutineUninterceptedOrReturn` block stays reachable via
+// the continuation's slot for preemptive cancellation.
+@PublishedApi
+internal fun __klio_co_armSlot(slot: Long) {}
+
+@PublishedApi
+internal fun __klio_co_disarmSlot() {}
+
 // Parks the current activation indefinitely on `slot`; on resume the
 // call yields the Result delivered by __klio_co_resume.
 @PublishedApi

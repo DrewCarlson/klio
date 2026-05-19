@@ -7872,10 +7872,15 @@ impl CooperativeInterceptor {
         if state.wake_in_millis == 0 {
             self.ready.push_back(token);
         }
-        if state.wake_in_millis < 0 {
-            if let Some(slot) = self.pending_slot.take() {
-                self.slot_to_token.insert(slot, token);
-            }
+        // Bind an armed slot to *any* parked activation, not only
+        // indefinite parks. `suspendCoroutineUninterceptedOrReturn`
+        // arms its slot before running its block; if the block
+        // suspends on a *timed* `delay` (e.g. inside `withTimeout`),
+        // the activation must stay reachable through the slot so a
+        // later cancellation can resume it early with the exception
+        // instead of waiting out the timer.
+        if let Some(slot) = self.pending_slot.take() {
+            self.slot_to_token.insert(slot, token);
         }
         self.parked.insert(token, (state, wake_at));
         token
@@ -7885,6 +7890,10 @@ impl CooperativeInterceptor {
     /// activation is waiting on (set by `__kxco_parkSlot`).
     fn set_pending_slot(&mut self, slot: i64) {
         self.pending_slot = Some(slot);
+    }
+
+    fn clear_pending_slot(&mut self) {
+        self.pending_slot = None;
     }
 
     /// Seam: if a token is waiting on `slot`, move it into the ready
@@ -8639,6 +8648,22 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         with_coro(|s| {
             if let Some(top) = s.borrow_mut().last_mut() {
                 top.set_pending_slot(slot);
+            }
+        });
+    }
+
+    fn coroutine_arm_slot(&mut self, slot: i64) {
+        with_coro(|s| {
+            if let Some(top) = s.borrow_mut().last_mut() {
+                top.set_pending_slot(slot);
+            }
+        });
+    }
+
+    fn coroutine_disarm_slot(&mut self) {
+        with_coro(|s| {
+            if let Some(top) = s.borrow_mut().last_mut() {
+                top.clear_pending_slot();
             }
         });
     }
