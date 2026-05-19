@@ -1452,6 +1452,8 @@ fn record_method_param_defaults(
     module: &mut crate::Module,
     f: &klio_ast::Function,
     body_func: crate::FuncId,
+    owner_class: Option<&str>,
+    own_members: Option<&std::collections::HashSet<String>>,
 ) {
     if !f.params.iter().any(|p| p.default.is_some()) {
         return;
@@ -1466,11 +1468,18 @@ fn record_method_param_defaults(
         if let Some(default_expr) = &p.default {
             let bind_upto = (1 + idx).min(name_refs.len());
             let widened = widen_numeric_literal(default_expr, &p.ty);
-            let fid = lower_expr_as_param_thunk(
+            // Pass the owner class + own-member set so a default
+            // expression that references an enclosing-class member
+            // (`fun mix(a, b=a*2, c=base+b)` where `base` is a class
+            // member) routes the bare name through `this.<member>`
+            // instead of an unresolved global lookup.
+            let fid = lower_expr_as_param_thunk_scoped(
                 module,
                 &name_refs[..bind_upto],
                 widened.as_ref().unwrap_or(default_expr),
                 &format!("__default_method_{}_{}", f.name.name, p.name.name),
+                owner_class,
+                own_members,
             );
             slots.push(Some(fid));
         } else {
@@ -1513,7 +1522,10 @@ pub fn lower_method(
         placed.id = id;
         module.funcs.push(placed.clone());
         module.func_index.push((f.name.name.clone(), id));
-        record_method_param_defaults(module, f, id);
+        // Extension member: no enclosing-class own-members in scope
+        // (the receiver is `this`, not the declaring class), so the
+        // thunk runs with no owner_class context.
+        record_method_param_defaults(module, f, id, None, None);
         return placed;
     }
     let func = lower_function_body_with_implicit_owner(
@@ -1527,7 +1539,7 @@ pub fn lower_method(
     let mut placed = func;
     placed.id = id;
     module.funcs.push(placed.clone());
-    record_method_param_defaults(module, f, id);
+    record_method_param_defaults(module, f, id, Some(owner_class), Some(own_members));
     placed
 }
 
