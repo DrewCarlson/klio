@@ -3438,11 +3438,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // `recv.name()` — a local `val`/`var` of the same
                     // name must NOT hijack a stdlib/member call
                     // (`val sorted = …; xs.sorted()` is the member).
-                    let local_callable = (b.is_local_fn(&name.name)
-                        || b.is_param(&name.name))
-                        && b.resolve(&name.name).is_some();
+                    // A captured outer name that holds a callable
+                    // (e.g. a `Sink.(Int) -> Unit` parameter closed
+                    // over by a returned lambda, invoked as
+                    // `sink.g(v)`) shadows a member exactly like a
+                    // local param/fn. CallMemberOrValue still tries
+                    // the receiver's member first, so a captured
+                    // non-callable can't hijack a real member call.
+                    let local_callable = b.is_local_fn(&name.name)
+                        || b.is_param(&name.name)
+                        || b.knows_outer(&name.name);
                     if local_callable {
-                        let local_reg = b.resolve(&name.name).unwrap();
+                        // Capture the name on demand (a callable
+                        // closed over by this lambda may not have been
+                        // referenced — hence captured — yet at this
+                        // point).
+                        let local_reg = resolve_capture(b, &name.name);
                         // `recv.name(args)` where `name` is also a
                         // callable local/param. Kotlin dispatches the
                         // member when `recv`'s type has it, and only
