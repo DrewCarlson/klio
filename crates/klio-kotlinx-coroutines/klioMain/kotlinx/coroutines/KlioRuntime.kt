@@ -39,12 +39,12 @@ internal object KlioDispatcher : CoroutineDispatcher(), Delay {
         block: Runnable,
         context: CoroutineContext
     ): DisposableHandle {
-        val cancelled = booleanArrayOf(false)
+        val gate = TimeoutGate(block)
         __kxco_spawn {
             __kxco_delayMillis(timeMillis)
-            if (!cancelled[0]) block.run()
+            gate.fire()
         }
-        return DisposableHandle { cancelled[0] = true }
+        return gate
     }
 }
 
@@ -73,4 +73,19 @@ public actual object Dispatchers {
     // `Dispatchers.IO` for blocking offload. Under the cooperative
     // scheduler it is the same dispatcher as the rest.
     public val IO: CoroutineDispatcher get() = KlioDispatcher
+}
+
+// Carries the timeout `block` and its cancelled state as instance
+// members (not a lambda-captured local, which klio does not yet
+// close over correctly inside an object-method's nested lambda). The
+// scheduled spawn captures the gate instance and calls `fire()`;
+// `withTimeout` disposes it when the body completes in time.
+private class TimeoutGate(private val block: Runnable) : DisposableHandle {
+    private var cancelled = false
+    fun fire() {
+        if (!cancelled) block.run()
+    }
+    override fun dispose() {
+        cancelled = true
+    }
 }
