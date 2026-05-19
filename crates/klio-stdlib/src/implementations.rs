@@ -89,10 +89,13 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String.endsWith", string_ends_with),
     ("kotlin.String.get", string_get),
     ("kotlin.String.indexOf", string_index_of),
+    ("kotlin.String.ifBlank", string_if_blank),
+    ("kotlin.String.ifEmpty", string_if_empty),
     ("kotlin.String.isBlank", string_is_blank),
     ("kotlin.String.isEmpty", string_is_empty),
     ("kotlin.String.isNotBlank", string_is_not_blank),
     ("kotlin.String.isNotEmpty", string_is_not_empty),
+    ("kotlin.String.toString", string_to_string),
     ("kotlin.String.lastIndexOf", string_last_index_of),
     ("kotlin.String.length", string_length),
     ("kotlin.String.lowercase", string_lowercase),
@@ -2773,6 +2776,38 @@ fn string_is_not_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn string_is_blank(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.isBlank")?;
     Ok(Value::Bool(s.chars().all(char::is_whitespace)))
+}
+
+/// `CharSequence.ifEmpty(default)` — the receiver when non-empty,
+/// else the result of invoking `default`. Common in DSL/text code.
+fn string_if_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.ifEmpty")?.clone();
+    if !s.is_empty() {
+        return Ok(Value::String(s));
+    }
+    let default = ctx.args.get(1).cloned().ok_or_else(|| {
+        RuntimeError::Type("String.ifEmpty: missing default block".into())
+    })?;
+    ctx.host.invoke_callable(&default, &[], ctx.out)
+}
+
+/// `CharSequence.ifBlank(default)` — the receiver when non-blank,
+/// else the result of invoking `default`.
+fn string_if_blank(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.ifBlank")?.clone();
+    if !s.chars().all(char::is_whitespace) {
+        return Ok(Value::String(s));
+    }
+    let default = ctx.args.get(1).cloned().ok_or_else(|| {
+        RuntimeError::Type("String.ifBlank: missing default block".into())
+    })?;
+    ctx.host.invoke_callable(&default, &[], ctx.out)
+}
+
+/// `String.toString()` — the receiver itself.
+fn string_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.toString")?.clone();
+    Ok(Value::String(s))
 }
 
 fn string_is_not_blank(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
