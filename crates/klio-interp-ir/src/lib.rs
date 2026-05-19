@@ -5946,14 +5946,85 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 best.map(|(c, _)| c)
             };
             if let Some((fid, _func)) = chosen {
-                let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
-                all.push(receiver.clone());
-                all.extend_from_slice(args);
-                // call_func pads defaulted params, packs varargs and
-                // honours a pack-installed binding that shadows a
-                // bodyless `expect` extension.
-                let module = Arc::clone(&self.module);
-                return self.call_func(&module, fid, all);
+                // Runaway-recursion guard, scoped to the top-level
+                // extension dispatch only. Re-entering this block for
+                // the same (name, receiver-instance) is legitimate at
+                // bounded depth (e.g. a coroutine `dispatchResume`
+                // chain), but *unbounded* same-key re-entry is the
+                // pathological extension self-rebind — upstream
+                // `transform`'s bare `collect` mis-binds the
+                // `Flow<T>.collect` extension on the `flow{}` block's
+                // SafeCollector, whose body re-calls `collect` on the
+                // same SafeCollector forever. Allow a generous depth,
+                // then decline so CallMemberOrGlobal continues to the
+                // lexically enclosing receiver (the source flow's
+                // `collect` member). Legitimate recursive *member*
+                // methods dispatch through the IR method walk above,
+                // not here, so they are unaffected entirely.
+                const MAX_SAME_KEY_DEPTH: u32 = 48;
+                struct ExtGuard(Option<(String, u64)>);
+                impl Drop for ExtGuard {
+                    fn drop(&mut self) {
+                        if let Some(k) = self.0.take() {
+                            EXT_CHOSEN_DEPTH.with(|s| {
+                                let mut m = s.borrow_mut();
+                                if let Some(d) = m.get_mut(&k) {
+                                    *d -= 1;
+                                    if *d == 0 {
+                                        m.remove(&k);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                thread_local! {
+                    static EXT_CHOSEN_DEPTH: std::cell::RefCell<
+                        std::collections::HashMap<(String, u64), u32>,
+                    > = std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    );
+                }
+                let guard = if let klio_runtime::Value::Instance(inst) =
+                    receiver
+                {
+                    let key =
+                        (name.to_string(), inst.borrow().identity);
+                    let depth = EXT_CHOSEN_DEPTH.with(|s| {
+                        let mut m = s.borrow_mut();
+                        let d = m.entry(key.clone()).or_insert(0);
+                        *d += 1;
+                        *d
+                    });
+                    if depth > MAX_SAME_KEY_DEPTH {
+                        // Unbounded self-rebind: undo and decline.
+                        EXT_CHOSEN_DEPTH.with(|s| {
+                            let mut m = s.borrow_mut();
+                            if let Some(d) = m.get_mut(&key) {
+                                *d -= 1;
+                                if *d == 0 {
+                                    m.remove(&key);
+                                }
+                            }
+                        });
+                        None
+                    } else {
+                        Some(ExtGuard(Some(key)))
+                    }
+                } else {
+                    Some(ExtGuard(None))
+                };
+                if let Some(_g) = guard {
+                    let mut all: Vec<klio_runtime::Value> =
+                        Vec::with_capacity(args.len() + 1);
+                    all.push(receiver.clone());
+                    all.extend_from_slice(args);
+                    // call_func pads defaulted params, packs varargs
+                    // and honours a pack-installed binding that
+                    // shadows a bodyless `expect` extension.
+                    let module = Arc::clone(&self.module);
+                    return self.call_func(&module, fid, all);
+                }
             }
         }
         // Class-delegation forwarding: when the receiver instance
