@@ -4818,34 +4818,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             )));
         }
         // SAM-instance dispatch: a synthetic `FunInterface { … }`
-        // wrapper carries its lambda under `__sam_target__`.
-        // Dispatch the stored callable only for the interface's
-        // single abstract method (or a bare functional `invoke`).
-        // A call to any *other* name (e.g. `collector.collect(…)` on
-        // a `FlowCollector` whose abstract method is `emit`) must
-        // fall through so the enclosing-receiver / global resolution
-        // continues, instead of mis-invoking the SAM body.
+        // wrapper carries its lambda under `__sam_target__`. Any
+        // method call on the receiver invokes the stored callable.
         if let klio_runtime::Value::Instance(inst) = receiver {
             let target = inst.borrow().get("__sam_target__");
             if let Some(target) = target {
-                // The interface's member-name set (transitive),
-                // including the abstract method that an interface
-                // does not record in `ClassDef.methods`. A call to a
-                // name outside this set (and not a bare functional
-                // `invoke`) is not the SAM method — fall through so
-                // enclosing-receiver / global resolution continues.
-                let cls_name = inst.borrow().class.name.clone();
-                let known = self
-                    .module
-                    .registry
-                    .hierarchy_methods
-                    .get(&cls_name)
-                    .cloned();
-                let is_sam_call = name == "invoke"
-                    || known.as_ref().map_or(true, |s| s.contains(name));
-                if is_sam_call {
-                    return self.call_value(&target, args);
-                }
+                return self.call_value(&target, args);
             }
         }
         // Bound method/property-reference dispatch: a `recv::member`
