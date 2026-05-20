@@ -323,6 +323,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.emptyMap", coll_empty_map),
     ("kotlin.collections.emptySet", coll_empty_set),
     ("kotlin.collections.listOf", coll_list_of),
+    ("kotlin.collections.listOfNotNull", coll_list_of_not_null),
     ("kotlin.arrayOf", coll_array_of),
     ("kotlin.arrayOfNulls", coll_array_of_nulls),
     ("kotlin.intArrayOf", coll_int_array_of),
@@ -4183,6 +4184,15 @@ fn coll_to_infix(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn coll_list_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_list(ctx.args.to_vec(), false))
+}
+fn coll_list_of_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items: Vec<Value> = ctx
+        .args
+        .iter()
+        .filter(|v| !matches!(v, Value::Null))
+        .cloned()
+        .collect();
+    Ok(make_list(items, false))
 }
 fn coll_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {
