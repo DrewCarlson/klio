@@ -840,6 +840,20 @@ pub trait IntrinsicHost {
     /// `catch (e: TimeoutCancellationException)` arm fires.
     fn coroutine_cancel_timed_parks_with(&mut self, _cause: Option<Value>) {}
 
+    /// Drive the active cooperative interceptor's queues (launched
+    /// children and parked timers) until idle. Used by
+    /// `coroutineScope` / `supervisorScope` to enforce the
+    /// structured-concurrency wait-for-children contract for the
+    /// non-suspending body case (a scope body whose final expression
+    /// only queues launches, e.g. fire-and-forget event dispatch).
+    /// Default impl is a no-op.
+    fn coroutine_drain_to_idle(
+        &mut self,
+        _out: &mut dyn Output,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     /// `Continuation.resumeWith` entry point: deliver `value` to the
     /// activation parked on `slot`. If a live cooperative driver
     /// holds it, just enqueue (the driver runs it); otherwise the

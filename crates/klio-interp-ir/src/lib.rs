@@ -9870,6 +9870,105 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         });
     }
 
+    fn coroutine_drain_to_idle(
+        &mut self,
+        out: &mut dyn Output,
+    ) -> Result<(), klio_runtime::RuntimeError> {
+        // Pump the active interceptor's queue: start launches,
+        // resume ready tokens, advance virtual time. Stop when no
+        // progress remains. CancellationException is swallowed for
+        // child tokens (same shape as drive_root's per-token arm).
+        loop {
+            let launched: Vec<klio_runtime::Value> = with_coro(|s| {
+                s.borrow_mut()
+                    .last_mut()
+                    .map(|i| i.drain_launched())
+                    .unwrap_or_default()
+            });
+            let mut progressed = !launched.is_empty();
+            let scope = active_coro_scope().unwrap_or(klio_runtime::Value::Unit);
+            for child in launched {
+                match self.eval_closure_raw(&child, &[], Some(&scope), out) {
+                    Ok(_) => {}
+                    Err(klio_ir::eval::EvalError::Suspended(st)) => {
+                        self.park(*st);
+                    }
+                    Err(klio_ir::eval::EvalError::Throw(v))
+                        if is_cancellation_exception(&v) => {}
+                    Err(e) => {
+                        return Err(match e {
+                            klio_ir::eval::EvalError::Throw(v) => {
+                                klio_runtime::RuntimeError::Thrown(v)
+                            }
+                            klio_ir::eval::EvalError::NonLocalReturn(v) => {
+                                klio_runtime::RuntimeError::Return(v)
+                            }
+                            other => klio_runtime::RuntimeError::Type(format!(
+                                "{other}"
+                            )),
+                        });
+                    }
+                }
+            }
+            let next_ready = with_coro(|s| {
+                s.borrow_mut()
+                    .last_mut()
+                    .and_then(|i| i.next_ready())
+            });
+            if let Some(tok) = next_ready {
+                let entry = with_coro(|s| {
+                    s.borrow_mut()
+                        .last_mut()
+                        .and_then(|i| i.take_parked(tok))
+                });
+                if let Some((st, _)) = entry {
+                    progressed = true;
+                    let resume_with = with_coro(|s| {
+                        s.borrow_mut()
+                            .last_mut()
+                            .and_then(|i| i.take_resume_value(tok))
+                    })
+                    .unwrap_or(klio_runtime::Value::Unit);
+                    match self.resume_raw(st, resume_with, out) {
+                        Ok(_) => {}
+                        Err(klio_ir::eval::EvalError::Suspended(st2)) => {
+                            self.park(*st2);
+                        }
+                        Err(klio_ir::eval::EvalError::Throw(v))
+                            if is_cancellation_exception(&v) => {}
+                        Err(e) => {
+                            return Err(match e {
+                                klio_ir::eval::EvalError::Throw(v) => {
+                                    klio_runtime::RuntimeError::Thrown(v)
+                                }
+                                klio_ir::eval::EvalError::NonLocalReturn(v) => {
+                                    klio_runtime::RuntimeError::Return(v)
+                                }
+                                other => klio_runtime::RuntimeError::Type(
+                                    format!("{other}"),
+                                ),
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+            let advanced = with_coro(|s| {
+                s.borrow_mut()
+                    .last_mut()
+                    .map(|i| i.advance_time())
+                    .unwrap_or(false)
+            });
+            if advanced {
+                continue;
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn coroutine_cancel_timed_parks_with(
         &mut self,
         cause: Option<klio_runtime::Value>,

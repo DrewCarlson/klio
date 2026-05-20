@@ -652,6 +652,7 @@ fn closed_send_exc() -> Value {
     }
 }
 
+#[allow(dead_code)]
 fn next_slot() -> i64 {
     with_reg(|r| {
         let s = r.next_slot;
