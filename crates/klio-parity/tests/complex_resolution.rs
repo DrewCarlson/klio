@@ -268,3 +268,16 @@ fun main() {
 "#;
     assert_klio("join_user_tostring", src, "<1>,<2>,<3>\n<1>|<2>|<3>\n");
 }
+
+#[test]
+fn set_first_last_join_to_string() {
+    let src = r#"
+fun main() {
+    val s = setOf("a", "b", "c")
+    println(s.first())
+    println(s.last())
+    println(s.joinToString("|"))
+}
+"#;
+    assert_klio("set_first_last_join", src, "a\nc\na|b|c\n");
+}

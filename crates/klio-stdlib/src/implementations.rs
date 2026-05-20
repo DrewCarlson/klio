@@ -362,6 +362,15 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // ----- List / Set members -----
     ("kotlin.collections.List.contains", coll_list_contains),
     ("kotlin.collections.List.first", coll_list_first),
+    ("kotlin.collections.Set.first", coll_iter_first),
+    ("kotlin.collections.MutableSet.first", coll_iter_first),
+    ("kotlin.collections.Iterable.first", coll_iter_first),
+    ("kotlin.collections.Set.firstOrNull", coll_iter_first_or_null),
+    ("kotlin.collections.MutableSet.firstOrNull", coll_iter_first_or_null),
+    ("kotlin.collections.Iterable.firstOrNull", coll_iter_first_or_null),
+    ("kotlin.collections.Iterable.last", coll_iter_last),
+    ("kotlin.collections.Set.last", coll_iter_last),
+    ("kotlin.collections.MutableSet.last", coll_iter_last),
     ("kotlin.collections.List.get", coll_list_get),
     ("kotlin.collections.List.indexOf", coll_list_index_of),
     ("kotlin.collections.List.indexOfFirst", coll_iter_index_of_first),
@@ -430,6 +439,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.List.isEmpty", coll_list_is_empty),
     ("kotlin.collections.List.isNotEmpty", coll_list_is_not_empty),
     ("kotlin.collections.List.joinToString", coll_list_join_to_string),
+    ("kotlin.collections.Set.joinToString", coll_list_join_to_string),
+    ("kotlin.collections.MutableSet.joinToString", coll_list_join_to_string),
+    ("kotlin.collections.Iterable.joinToString", coll_list_join_to_string),
+    ("kotlin.collections.Collection.joinToString", coll_list_join_to_string),
     ("kotlin.collections.List.last", coll_list_last),
     ("kotlin.collections.List.average", coll_list_average),
     ("kotlin.collections.List.chunked", coll_list_chunked),
@@ -1462,6 +1475,27 @@ fn coll_iter_min_of_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
     }
     Ok(best.unwrap_or(Value::Null))
+}
+
+fn coll_iter_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "first")?;
+    items
+        .into_iter()
+        .next()
+        .ok_or_else(|| RuntimeError::Type("first on empty collection".into()))
+}
+
+fn coll_iter_first_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "firstOrNull")?;
+    Ok(items.into_iter().next().unwrap_or(Value::Null))
+}
+
+fn coll_iter_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "last")?;
+    items
+        .into_iter()
+        .last()
+        .ok_or_else(|| RuntimeError::Type("last on empty collection".into()))
 }
 
 fn coll_iter_take_while(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -4675,7 +4709,12 @@ fn coll_list_last_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::new_int(pos.map(|p| p as i64).unwrap_or(-1)))
 }
 fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let it = recv_list_items(ctx.args, "List.joinToString")?;
+    let items: Vec<Value> = match ctx.args.first() {
+        Some(v) => iterable_items(v, "joinToString")?,
+        None => return Err(RuntimeError::Arity(
+            "joinToString expects an iterable receiver".into(),
+        )),
+    };
     // Detect a trailing callable: a lambda/closure appearing as
     // the last positional arg slots into `transform`, leaving the
     // earlier args as separator/prefix/postfix/limit/truncated.
@@ -4708,7 +4747,6 @@ fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(v) => v.as_i64().unwrap_or(-1),
     };
     let truncated = opt_str(&effective, 4, "...");
-    let items: Vec<Value> = it.borrow().clone();
     let n = items.len();
     let take = if limit < 0 { n } else { (limit as usize).min(n) };
     let mut out = String::new();
