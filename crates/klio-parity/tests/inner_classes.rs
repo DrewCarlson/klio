@@ -120,3 +120,39 @@ fun main() {
 "#;
     assert_klio("sealed_tree", src, "6\n");
 }
+
+#[test]
+fn inner_class_calls_outer_member_extension() {
+    let src = r#"
+class Calc {
+    val base = 10
+    fun Int.boost(): Int = this * base
+    inner class Inner {
+        fun work(): String = (1..3).map { it.boost() }.joinToString(",")
+    }
+}
+fun main() {
+    println(Calc().Inner().work())
+}
+"#;
+    assert_klio("inner_outer_ext", src, "10,20,30\n");
+}
+
+#[test]
+fn inner_class_calls_outer_member_extension_on_string() {
+    let src = r#"
+class Wrap {
+    val sep = "::"
+    fun String.adorn(): String = "[$this$sep$this]"
+    inner class Builder {
+        fun render(xs: List<String>): String =
+            xs.joinToString(",") { it.adorn() }
+    }
+}
+fun main() {
+    println(Wrap().Builder().render(listOf("a", "b")))
+}
+"#;
+    assert_klio("inner_outer_ext_str", src,
+        "[a::a],[b::b]\n");
+}

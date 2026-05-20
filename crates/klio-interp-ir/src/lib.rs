@@ -6534,20 +6534,30 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 let chain = self.enclosing_this_chain();
                 let mut set: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
-                for v in &chain {
-                    if let klio_runtime::Value::Instance(inst) = v {
-                        let b = inst.borrow();
-                        set.insert(b.class.name.clone());
-                        if !b.class.fqn.is_empty() && b.class.fqn != b.class.name {
-                            set.insert(b.class.fqn.clone());
+                let mut add_class_and_supers = |cls: &Arc<klio_runtime::ClassDef>,
+                                                set: &mut std::collections::HashSet<String>| {
+                    set.insert(cls.name.clone());
+                    if !cls.fqn.is_empty() && cls.fqn != cls.name {
+                        set.insert(cls.fqn.clone());
+                    }
+                    let mut cur = cls.parent.borrow().clone();
+                    while let Some(p) = cur {
+                        set.insert(p.name.clone());
+                        if !p.fqn.is_empty() && p.fqn != p.name {
+                            set.insert(p.fqn.clone());
                         }
-                        let mut cur = b.class.parent.borrow().clone();
-                        while let Some(p) = cur {
-                            set.insert(p.name.clone());
-                            if !p.fqn.is_empty() && p.fqn != p.name {
-                                set.insert(p.fqn.clone());
-                            }
-                            cur = p.parent.borrow().clone();
+                        cur = p.parent.borrow().clone();
+                    }
+                };
+                for v in &chain {
+                    let mut cursor: Option<klio_runtime::Value> = Some(v.clone());
+                    while let Some(cv) = cursor {
+                        if let klio_runtime::Value::Instance(inst) = &cv {
+                            let b = inst.borrow();
+                            add_class_and_supers(&b.class, &mut set);
+                            cursor = b.outer.clone();
+                        } else {
+                            break;
                         }
                     }
                 }
@@ -6647,13 +6657,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let chain = self.enclosing_this_chain();
                     let mut v: Vec<String> = Vec::new();
                     for value in &chain {
-                        if let klio_runtime::Value::Instance(inst) = value {
-                            let b = inst.borrow();
-                            v.push(b.class.name.clone());
-                            let mut cur = b.class.parent.borrow().clone();
-                            while let Some(p) = cur {
-                                v.push(p.name.clone());
-                                cur = p.parent.borrow().clone();
+                        let mut cursor: Option<klio_runtime::Value> = Some(value.clone());
+                        while let Some(cv) = cursor {
+                            if let klio_runtime::Value::Instance(inst) = &cv {
+                                let b = inst.borrow();
+                                v.push(b.class.name.clone());
+                                let mut cur = b.class.parent.borrow().clone();
+                                while let Some(p) = cur {
+                                    v.push(p.name.clone());
+                                    cur = p.parent.borrow().clone();
+                                }
+                                cursor = b.outer.clone();
+                            } else {
+                                break;
                             }
                         }
                     }
