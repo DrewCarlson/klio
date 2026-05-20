@@ -1112,6 +1112,14 @@ pub fn lower_method_with_private(
         placed.id = id;
         module.funcs.push(placed.clone());
         module.func_index.push((f.name.name.clone(), id));
+        // Tag this member-extension with its declaring class so the
+        // runtime extension-fallback dispatch can filter it out at
+        // call sites whose enclosing class chain doesn't include
+        // the declaring class.
+        module
+            .registry
+            .member_ext_owner_class
+            .insert(id, owner_class.to_string());
         // Extension member: no enclosing-class own-members in scope
         // (the receiver is `this`, not the declaring class), so the
         // thunk runs with no owner_class context.

@@ -2132,6 +2132,8 @@ fn build_module_with_overrides(
     let import_aliases = std::mem::take(&mut module.registry.import_aliases);
     let abstract_member_defaults =
         std::mem::take(&mut module.registry.abstract_member_defaults);
+    let member_ext_owner_class =
+        std::mem::take(&mut module.registry.member_ext_owner_class);
     module.registry = klio_ir::ModuleRegistry {
         object_names: object_names.clone(),
         companion_singletons: companion_singletons.clone(),
@@ -2144,6 +2146,7 @@ fn build_module_with_overrides(
         hierarchy_methods,
         import_aliases,
         abstract_member_defaults,
+        member_ext_owner_class,
     };
     BuiltModule {
         module: Arc::new(module),

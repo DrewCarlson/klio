@@ -617,6 +617,16 @@ pub struct ModuleRegistry {
     /// Body-property `(class, prop)` pairs declared with `by`.
     #[serde(default)]
     pub delegated_body_props: std::collections::HashSet<(String, String)>,
+    /// `FuncId` → declaring-class simple name for *member extension
+    /// functions* (`class C { fun R.f(...) { … } }`). A member
+    /// extension is registered in the global `func_index` so the
+    /// extension-fallback dispatch can find it, but its visibility
+    /// is restricted to call sites whose enclosing class chain
+    /// includes the declaring class — at any other call site the
+    /// dispatcher must skip it. Empty for top-level extensions.
+    #[serde(default)]
+    pub member_ext_owner_class:
+        std::collections::HashMap<FuncId, String>,
     /// Per-local-function default-arg thunks. Keyed by the local
     /// fn's lowered body `FuncId`; each slot holds the `FuncId` of a
     /// 0-arg thunk producing that parameter's default (binding the
