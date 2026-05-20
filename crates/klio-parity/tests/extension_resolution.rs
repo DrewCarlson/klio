@@ -214,3 +214,67 @@ fun main() {
     assert_klio("inline_dsl_nested", src,
         "<root>A<inner>BC</inner>D</root>\n");
 }
+
+#[test]
+fn inline_non_local_return_through_nested_blocks() {
+    let src = r#"
+inline fun trace(label: String, block: () -> Unit) {
+    println(">$label")
+    block()
+    println("<$label")
+}
+fun outer(): String {
+    val sb = StringBuilder()
+    trace("a") {
+        sb.append("a1;")
+        trace("b") {
+            sb.append("b1;")
+            for (i in 1..3) {
+                if (i == 2) return sb.toString() + "early"
+                sb.append("i=$i;")
+            }
+        }
+        sb.append("a2;")
+    }
+    return sb.toString() + "end"
+}
+fun main() { println(outer()) }
+"#;
+    assert_klio("inline_nonlocal_return", src,
+        ">a\n>b\na1;b1;i=1;early\n");
+}
+
+#[test]
+fn crossinline_lambda_used_after_return() {
+    let src = r#"
+inline fun <T> withRetry(n: Int, crossinline factory: () -> T, validate: (T) -> Boolean): T? {
+    for (i in 1..n) {
+        val v = factory()
+        if (validate(v)) return v
+    }
+    return null
+}
+fun main() {
+    var counter = 0
+    val v = withRetry(5, factory = { counter++; counter }) { it > 3 }
+    println("v=$v,tries=$counter")
+}
+"#;
+    assert_klio("crossinline_retry", src, "v=4,tries=4\n");
+}
+
+#[test]
+fn flatMapTo_inline_extension_against_user_list() {
+    let src = r#"
+inline fun <T, R> List<T>.flatMapTo(out: MutableList<R>, transform: (T) -> List<R>): MutableList<R> {
+    for (x in this) out.addAll(transform(x))
+    return out
+}
+fun main() {
+    val out = mutableListOf<Int>()
+    listOf("ab", "cde").flatMapTo(out) { s -> s.map { it.code } }
+    println(out)
+}
+"#;
+    assert_klio("flat_map_to_inline", src, "[97, 98, 99, 100, 101]\n");
+}
