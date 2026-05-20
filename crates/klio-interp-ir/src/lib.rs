@@ -7181,6 +7181,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 if has {
                     return true;
                 }
+                if def.primary_params.iter().any(|p| p.name == name) {
+                    return true;
+                }
+                if def.body_properties.iter().any(|p| p.name == name) {
+                    return true;
+                }
                 for sup in &def.supertype_names {
                     queue.push_back(sup.clone());
                 }

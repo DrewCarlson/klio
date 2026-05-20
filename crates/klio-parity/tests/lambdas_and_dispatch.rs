@@ -162,3 +162,50 @@ fun main() {
 "#;
     assert_klio("apply_chain", src, "a,b,c\n");
 }
+
+#[test]
+fn apply_lambda_writes_member_property() {
+    let src = r#"
+class Counter {
+    var n = 0
+    fun bump() { apply { n += 1 } }
+}
+fun main() {
+    val c = Counter()
+    c.bump(); c.bump(); c.bump()
+    println(c.n)
+}
+"#;
+    assert_klio("apply_writes_member", src, "3\n");
+}
+
+#[test]
+fn operator_inc_via_apply_returns_modified_self() {
+    let src = r#"
+class Counter {
+    var n = 0
+    operator fun inc(): Counter = apply { n += 1 }
+    operator fun dec(): Counter = apply { n -= 1 }
+}
+fun main() {
+    var c = Counter()
+    c++; c++; c++; c--
+    println(c.n)
+}
+"#;
+    assert_klio("operator_inc_apply", src, "2\n");
+}
+
+#[test]
+fn iterable_max_of_or_null_with_transform() {
+    let src = r#"
+data class Item(val name: String, val price: Int)
+fun main() {
+    val items = listOf(Item("a", 3), Item("b", 7), Item("c", 2))
+    println(items.maxOfOrNull { it.price })
+    println(items.minOfOrNull { it.price })
+    println(emptyList<Int>().maxOfOrNull { it * 2 })
+}
+"#;
+    assert_klio("max_of_or_null", src, "7\n2\nnull\n");
+}

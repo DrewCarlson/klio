@@ -819,6 +819,14 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableSet.sumOf", coll_iter_sum_of),
     ("kotlin.collections.Map.sumOf", coll_iter_sum_of),
     ("kotlin.collections.MutableMap.sumOf", coll_iter_sum_of),
+    ("kotlin.collections.List.maxOfOrNull", coll_iter_max_of_or_null),
+    ("kotlin.collections.MutableList.maxOfOrNull", coll_iter_max_of_or_null),
+    ("kotlin.collections.Set.maxOfOrNull", coll_iter_max_of_or_null),
+    ("kotlin.collections.Iterable.maxOfOrNull", coll_iter_max_of_or_null),
+    ("kotlin.collections.List.minOfOrNull", coll_iter_min_of_or_null),
+    ("kotlin.collections.MutableList.minOfOrNull", coll_iter_min_of_or_null),
+    ("kotlin.collections.Set.minOfOrNull", coll_iter_min_of_or_null),
+    ("kotlin.collections.Iterable.minOfOrNull", coll_iter_min_of_or_null),
     ("kotlin.collections.List.takeWhile", coll_iter_take_while),
     ("kotlin.collections.MutableList.takeWhile", coll_iter_take_while),
     ("kotlin.collections.Set.takeWhile", coll_iter_take_while),
@@ -1392,6 +1400,54 @@ fn coll_iter_sum_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(d) => Value::Double(d),
         None => Value::new_int(acc_int.unwrap_or(0)),
     })
+}
+
+fn coll_iter_max_of_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity(
+            "maxOfOrNull expects (receiver, block)".into(),
+        ));
+    }
+    let items = iterable_items(&ctx.args[0], "maxOfOrNull")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut best: Option<Value> = None;
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        match &best {
+            None => best = Some(r),
+            Some(b) => {
+                if compare_values(&r, b)? == std::cmp::Ordering::Greater {
+                    best = Some(r);
+                }
+            }
+        }
+    }
+    Ok(best.unwrap_or(Value::Null))
+}
+
+fn coll_iter_min_of_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity(
+            "minOfOrNull expects (receiver, block)".into(),
+        ));
+    }
+    let items = iterable_items(&ctx.args[0], "minOfOrNull")?;
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut best: Option<Value> = None;
+    for v in items {
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        match &best {
+            None => best = Some(r),
+            Some(b) => {
+                if compare_values(&r, b)? == std::cmp::Ordering::Less {
+                    best = Some(r);
+                }
+            }
+        }
+    }
+    Ok(best.unwrap_or(Value::Null))
 }
 
 fn coll_iter_take_while(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
