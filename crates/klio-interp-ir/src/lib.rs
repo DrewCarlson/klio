@@ -6635,7 +6635,45 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                     false
                 };
-                let mut best: Option<((klio_ir::FuncId, klio_ir::Func), (i32, i32))> =
+                // Member-extension override tie-break: when multiple
+                // candidates name the same member-ext (a subclass
+                // overrides a base's `fun R.f`), prefer the candidate
+                // whose owner class is closest to the *innermost*
+                // enclosing-`this` instance — that's the runtime
+                // subclass override. Top-level extensions (no owner)
+                // get a neutral rank so they are picked only when
+                // no member-extension candidate scores higher overall.
+                let chain_class_order: Vec<String> = {
+                    let chain = self.enclosing_this_chain();
+                    let mut v: Vec<String> = Vec::new();
+                    for value in &chain {
+                        if let klio_runtime::Value::Instance(inst) = value {
+                            let b = inst.borrow();
+                            v.push(b.class.name.clone());
+                            let mut cur = b.class.parent.borrow().clone();
+                            while let Some(p) = cur {
+                                v.push(p.name.clone());
+                                cur = p.parent.borrow().clone();
+                            }
+                        }
+                    }
+                    v
+                };
+                let owner_rank_for = |fid: klio_ir::FuncId| -> i32 {
+                    if let Some(owner) =
+                        self.module.registry.member_ext_owner_class.get(&fid)
+                    {
+                        if let Some(pos) =
+                            chain_class_order.iter().position(|c| c == owner)
+                        {
+                            // Closer to the innermost `this` = higher rank.
+                            return (chain_class_order.len() as i32) - (pos as i32);
+                        }
+                        return 0;
+                    }
+                    0
+                };
+                let mut best: Option<((klio_ir::FuncId, klio_ir::Func), (i32, i32, i32))> =
                     None;
                 for (idx, (fid, f)) in candidates.into_iter().enumerate() {
                     let mut score = self
@@ -6654,7 +6692,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .enumerate()
                         .filter(|(j, t)| *j != idx && is_subtype(&recv_tys[idx], t))
                         .count() as i32;
-                    let key = (score, spec);
+                    let owner_rank = owner_rank_for(fid);
+                    let key = (score, owner_rank, spec);
                     if best.as_ref().map(|(_, k)| key > *k).unwrap_or(true) {
                         best = Some(((fid, f), key));
                     }

@@ -31,9 +31,7 @@ fn assert_klio(name: &str, src: &str, expected: &str) {
 
 // 1. Extension declared in subclass overrides extension declared in
 //    base, dispatched off the implicit receiver of a lambda body.
-//    Tracked: task #35 (member-extension override not virtual-dispatched).
 #[test]
-#[ignore = "tracked as task #35"]
 fn member_extension_override_in_lambda() {
     let src = r#"
 open class Base {
