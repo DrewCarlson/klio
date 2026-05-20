@@ -88,7 +88,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #57"]
 fn property_initializer_runs_once() {
     let src = r#"
 var initCount = 0

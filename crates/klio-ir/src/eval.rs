@@ -1875,11 +1875,16 @@ fn exec_inst(
                 .cloned()
                 .unwrap_or(Value::Null);
             // Bound-receiver property write inside a receiver lambda
-            // (`Sink.(Int) -> Unit` doing `sum = 99`). When `this` is
-            // a real instance carrying the member, set it there;
-            // otherwise the name is a genuine top-level binding —
-            // route to globals (matches the read side).
-            if matches!(this_val, Value::Instance(_)) {
+            // (`Sink.(Int) -> Unit` doing `sum = 99`). Only treat the
+            // assign as a receiver-member write when the receiver
+            // actually carries that name — otherwise the assign is a
+            // genuine top-level binding. Routing to `set_field` on
+            // an Instance that doesn't declare the name would create
+            // a phantom field while leaving the actual top-level
+            // global unmodified.
+            let route_to_member = matches!(this_val, Value::Instance(_))
+                && host.host_has_member(&this_val, &name_str);
+            if route_to_member {
                 host.set_field(&this_val, &name_str, v)?;
             } else {
                 host.store_global(&name_str, v)?;
