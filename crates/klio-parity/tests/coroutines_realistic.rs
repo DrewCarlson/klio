@@ -155,3 +155,35 @@ fun main() = runBlocking {
 "#;
     assert_klio("channel", src, "7,8\n");
 }
+
+#[test]
+fn with_timeout_or_null_returns_value_within_budget_and_null_on_expiry() {
+    let src = r#"
+import kotlinx.coroutines.*
+fun main() = runBlocking {
+    val r = withTimeoutOrNull(100) { delay(5); "done" }
+    val r2 = withTimeoutOrNull(5) { delay(50); "done2" }
+    println("$r,$r2")
+}
+"#;
+    assert_klio("with_timeout_or_null", src, "done,null\n");
+}
+
+#[test]
+fn cancel_during_delay_throws_cancellation_exception_into_body() {
+    let src = r#"
+import kotlinx.coroutines.*
+fun main() = runBlocking {
+    val sb = StringBuilder()
+    val j = launch {
+        try { delay(1000); sb.append("normal;") }
+        catch (e: CancellationException) { sb.append("c;") }
+        finally { sb.append("f;") }
+    }
+    delay(10); j.cancel(); j.join()
+    sb.append("done")
+    println(sb)
+}
+"#;
+    assert_klio("cancel_in_delay_catch_finally", src, "c;f;done\n");
+}

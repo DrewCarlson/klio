@@ -9326,6 +9326,24 @@ fn with_coro<R>(f: impl FnOnce(&RefCell<Vec<CooperativeInterceptor>>) -> R) -> R
 }
 
 /// The active coroutine scope (top of the driver stack), if any.
+/// True when `v` is a `Value::Exception` whose `fqn` names a
+/// `CancellationException` (including the timeout variant). Used to
+/// swallow cooperative-cancel throws that bubble out of launched
+/// child activations whose Job was cancelled.
+fn is_cancellation_exception(v: &klio_runtime::Value) -> bool {
+    if let klio_runtime::Value::Exception { fqn, .. } = v {
+        let s: &str = fqn;
+        return s.ends_with("CancellationException")
+            || s.ends_with("TimeoutCancellationException");
+    }
+    if let klio_runtime::Value::Instance(inst) = v {
+        let name = inst.borrow().class.name.clone();
+        return name.ends_with("CancellationException")
+            || name.ends_with("TimeoutCancellationException");
+    }
+    false
+}
+
 fn active_coro_scope() -> Option<klio_runtime::Value> {
     ACTIVE_CORO_SCOPE.with(|s| s.borrow().last().cloned())
 }
@@ -9651,6 +9669,19 @@ impl<'a> VmIntrinsicHost<'a> {
                                 // Root re-suspended — track its new token.
                                 root_token = Some(new_tok);
                             }
+                        }
+                        Err(klio_ir::eval::EvalError::Throw(v))
+                            if Some(tok) != root_token
+                                && is_cancellation_exception(&v) =>
+                        {
+                            // Child launched activation observed a
+                            // CancellationException from Job.cancel /
+                            // withTimeout's cooperative cancel — swallow
+                            // it the same way a real Kotlin runtime
+                            // does for launched coroutines whose Job
+                            // was cancelled. The root keeps its throw
+                            // semantics so user-visible exceptions
+                            // still propagate from runBlocking.
                         }
                         Err(e) => {
                             with_coro(|s| {
