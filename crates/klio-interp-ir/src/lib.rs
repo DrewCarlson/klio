@@ -7248,6 +7248,56 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         primary
     }
 
+    fn new_instance_named(
+        &mut self,
+        class: klio_ir::ClassId,
+        args: &[klio_runtime::Value],
+        arg_names: &[Option<String>],
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        if arg_names.iter().all(|n| n.is_none()) {
+            return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
+        }
+        let ir_class = self.module.classes.get(class.0 as usize).ok_or_else(|| {
+            klio_ir::eval::EvalError::Type(format!(
+                "Vm::new_instance_named: ClassId {} not found",
+                class.0
+            ))
+        })?;
+        let params = &ir_class.primary_params;
+        let mut reordered: Vec<Option<klio_runtime::Value>> = vec![None; params.len()];
+        let mut next_pos = 0usize;
+        for (i, v) in args.iter().enumerate() {
+            match arg_names.get(i).and_then(|n| n.clone()) {
+                Some(nm) => {
+                    let Some(idx) = params.iter().position(|p| p.name == nm) else {
+                        // Named arg doesn't match any primary param —
+                        // a secondary constructor or runtime ClassDef
+                        // owns the binding. Fall back to positional.
+                        return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
+                    };
+                    reordered[idx] = Some(v.clone());
+                }
+                None => {
+                    while next_pos < reordered.len() && reordered[next_pos].is_some() {
+                        next_pos += 1;
+                    }
+                    if next_pos >= reordered.len() {
+                        return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
+                    }
+                    reordered[next_pos] = Some(v.clone());
+                    next_pos += 1;
+                }
+            }
+        }
+        // Fill missing slots with Null; defaults are applied inside
+        // new_instance based on the runtime ClassDef metadata.
+        let final_args: Vec<klio_runtime::Value> = reordered
+            .into_iter()
+            .map(|s| s.unwrap_or(klio_runtime::Value::Null))
+            .collect();
+        <Self as klio_ir::eval::Host>::new_instance(self, class, &final_args)
+    }
+
     fn new_instance(
         &mut self,
         class: klio_ir::ClassId,

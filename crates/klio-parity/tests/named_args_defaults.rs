@@ -114,7 +114,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #50"]
 fn constructor_default_chained() {
     let src = r#"
 class Cfg(val host: String = "localhost", val port: Int = 8080, val tls: Boolean = false) {
