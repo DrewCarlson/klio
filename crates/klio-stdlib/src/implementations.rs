@@ -360,6 +360,15 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Array.isNotEmpty", array_is_not_empty),
     ("kotlin.IntArray.isEmpty", array_is_empty),
     ("kotlin.IntArray.isNotEmpty", array_is_not_empty),
+    ("kotlin.Array.joinToString", coll_array_join_to_string),
+    ("kotlin.IntArray.joinToString", coll_array_join_to_string),
+    ("kotlin.LongArray.joinToString", coll_array_join_to_string),
+    ("kotlin.DoubleArray.joinToString", coll_array_join_to_string),
+    ("kotlin.FloatArray.joinToString", coll_array_join_to_string),
+    ("kotlin.ShortArray.joinToString", coll_array_join_to_string),
+    ("kotlin.ByteArray.joinToString", coll_array_join_to_string),
+    ("kotlin.CharArray.joinToString", coll_array_join_to_string),
+    ("kotlin.BooleanArray.joinToString", coll_array_join_to_string),
     ("kotlin.LongArray.isEmpty", array_is_empty),
     ("kotlin.LongArray.isNotEmpty", array_is_not_empty),
     ("kotlin.ByteArray.isEmpty", array_is_empty),
@@ -1145,6 +1154,7 @@ fn scope_take_unless(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn iterable_items(v: &Value, what: &str) -> Result<Vec<Value>, RuntimeError> {
     match v {
         Value::List { items, .. } | Value::Set { items, .. } => Ok(items.borrow().clone()),
+        Value::Array { items, .. } => Ok(items.borrow().clone()),
         Value::Map { entries, .. } => Ok(entries
             .borrow()
             .iter()
@@ -4466,6 +4476,67 @@ fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     out.push_str(&postfix);
     Ok(Value::String(Arc::new(out)))
 }
+fn coll_array_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    // Reuses the List join logic on the array's items vector. An
+    // array argument carries its items in the same `RefCell<Vec<Value>>`
+    // as a List, so the implementation works untouched once we route
+    // the receiver through `iterable_items`.
+    let recv = ctx.args.first().ok_or_else(|| {
+        RuntimeError::Type("Array.joinToString requires a receiver".into())
+    })?;
+    let items = iterable_items(recv, "Array.joinToString")?;
+    let mut effective: Vec<Value> = ctx.args[1..].to_vec();
+    let mut transform_slot: Option<Value> = None;
+    if let Some(last) = effective.last() {
+        if matches!(last, Value::IrClosure { .. } | Value::Lambda { .. }) {
+            transform_slot = effective.pop();
+        }
+    }
+    fn opt_str<'a>(args: &'a [Value], idx: usize, default: &'a str) -> String {
+        match args.get(idx) {
+            None | Some(Value::Null) => default.to_string(),
+            Some(Value::String(s)) => (**s).clone(),
+            Some(other) => format!("{other}"),
+        }
+    }
+    let sep = opt_str(&effective, 0, ", ");
+    let prefix = opt_str(&effective, 1, "");
+    let postfix = opt_str(&effective, 2, "");
+    let limit: i64 = match effective.get(3) {
+        None | Some(Value::Null) => -1,
+        Some(v) => v.as_i64().unwrap_or(-1),
+    };
+    let truncated = opt_str(&effective, 4, "...");
+    let n = items.len();
+    let take = if limit < 0 { n } else { (limit as usize).min(n) };
+    let mut out = String::new();
+    out.push_str(&prefix);
+    let CallCtx { out: writer, host, .. } = ctx;
+    for (i, v) in items.iter().enumerate().take(take) {
+        if i > 0 {
+            out.push_str(&sep);
+        }
+        let piece = if let Some(t) = &transform_slot {
+            let r = host.invoke_callable(t, std::slice::from_ref(v), *writer)?;
+            match r {
+                Value::String(s) => (*s).clone(),
+                other => format!("{other}"),
+            }
+        } else {
+            format!("{v}")
+        };
+        out.push_str(&piece);
+    }
+    if limit >= 0 && n > take {
+        if take > 0 {
+            out.push_str(&sep);
+        }
+        out.push_str(&truncated);
+    }
+    out.push_str(&postfix);
+    Ok(Value::String(Arc::new(out)))
+}
+
 fn coll_list_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = ctx.args.first().ok_or_else(|| RuntimeError::Type("List.toString requires a receiver".into()))?;
     Ok(Value::String(Arc::new(format!("{v}"))))

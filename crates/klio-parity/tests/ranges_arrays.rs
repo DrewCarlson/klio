@@ -20,7 +20,6 @@ fn assert_klio(name: &str, src: &str, expected: &str) {
 }
 
 #[test]
-#[ignore = "tracked as task #54"]
 fn intArray_init_pattern() {
     let src = r#"
 fun main() {
