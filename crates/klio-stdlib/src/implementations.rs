@@ -802,6 +802,13 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Set.sortedWith", coll_iter_sorted_with),
     ("kotlin.collections.MutableSet.sortedWith", coll_iter_sorted_with),
     ("kotlin.collections.List.sortedByDescending", coll_iter_sorted_by_desc),
+    ("kotlin.collections.List.maxByOrNull", coll_iter_max_by_or_null),
+    ("kotlin.collections.List.minByOrNull", coll_iter_min_by_or_null),
+    ("kotlin.collections.MutableList.maxByOrNull", coll_iter_max_by_or_null),
+    ("kotlin.collections.MutableList.minByOrNull", coll_iter_min_by_or_null),
+    ("kotlin.collections.Iterable.maxByOrNull", coll_iter_max_by_or_null),
+    ("kotlin.collections.Iterable.minByOrNull", coll_iter_min_by_or_null),
+    ("kotlin.collections.MutableList.sort", coll_mut_list_sort),
     ("kotlin.collections.MutableList.sortedByDescending", coll_iter_sorted_by_desc),
     ("kotlin.collections.Set.sortedByDescending", coll_iter_sorted_by_desc),
     ("kotlin.collections.MutableSet.sortedByDescending", coll_iter_sorted_by_desc),
@@ -1537,6 +1544,69 @@ fn coll_iter_sorted_by_impl(ctx: &mut CallCtx, descending: bool, what: &str) -> 
 
 fn coll_iter_sorted_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     coll_iter_sorted_by_impl(ctx, false, "sortedBy")
+}
+
+fn coll_iter_max_min_by_impl(
+    ctx: &mut CallCtx,
+    descending: bool,
+    what: &str,
+) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity(format!("{what} expects (receiver, block)")));
+    }
+    let items = iterable_items(&ctx.args[0], what)?;
+    if items.is_empty() {
+        return Ok(Value::Null);
+    }
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut best_key = host.invoke_callable(&block, std::slice::from_ref(&items[0]), *out)?;
+    let mut best = items[0].clone();
+    for v in items.iter().skip(1) {
+        let key = host.invoke_callable(&block, std::slice::from_ref(v), *out)?;
+        let ord = compare_values(&key, &best_key)?;
+        let take = if descending {
+            ord == std::cmp::Ordering::Less
+        } else {
+            ord == std::cmp::Ordering::Greater
+        };
+        if take {
+            best_key = key;
+            best = v.clone();
+        }
+    }
+    Ok(best)
+}
+
+fn coll_iter_max_by_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    coll_iter_max_min_by_impl(ctx, false, "maxByOrNull")
+}
+
+fn coll_iter_min_by_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    coll_iter_max_min_by_impl(ctx, true, "minByOrNull")
+}
+
+fn coll_mut_list_sort(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let it = recv_list_items(ctx.args, "MutableList.sort")?;
+    let mut copy: Vec<Value> = it.borrow().clone();
+    let mut err: Option<RuntimeError> = None;
+    copy.sort_by(|a, b| {
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match compare_values(a, b) {
+            Ok(o) => o,
+            Err(e) => {
+                err = Some(e);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    *it.borrow_mut() = copy;
+    Ok(Value::Unit)
 }
 
 fn coll_iter_sorted_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
