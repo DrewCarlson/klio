@@ -186,3 +186,43 @@ fun main() = runBlocking {
 "#;
     assert_klio("cancel_in_delay_catch_finally", src, "c;f;done\n");
 }
+
+#[test]
+fn channel_for_loop_iterates_via_iterator() {
+    let src = r#"
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.*
+fun main() = runBlocking {
+    val ch = Channel<Int>()
+    launch {
+        for (i in 1..3) ch.send(i)
+        ch.close()
+    }
+    val sb = StringBuilder()
+    for (v in ch) sb.append("$v;")
+    println(sb)
+}
+"#;
+    assert_klio("channel_for_loop", src, "1;2;3;\n");
+}
+
+#[test]
+fn channel_buffered_send_receive_pairs() {
+    let src = r#"
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.*
+fun main() = runBlocking {
+    val ch = Channel<String>(2)
+    launch {
+        ch.send("a")
+        ch.send("b")
+        ch.send("c")
+        ch.close()
+    }
+    val sb = StringBuilder()
+    for (v in ch) sb.append(v)
+    println(sb)
+}
+"#;
+    assert_klio("channel_buffered", src, "abc\n");
+}
