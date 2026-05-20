@@ -2546,6 +2546,38 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 "name" | "simpleName" => {
                     return Ok(klio_runtime::Value::String(Arc::clone(pname)));
                 }
+                "isInitialized" => {
+                    // `::name.isInitialized` walks the enclosing-this
+                    // chain for a class that declares `name` as a
+                    // lateinit property; the value is true iff the
+                    // field is set to a non-Null (lateinit slots are
+                    // pre-seeded with Null and only the first write
+                    // replaces them).
+                    let prop_name = (**pname).clone();
+                    let chain: Vec<klio_runtime::Value> = self.enclosing_this_chain();
+                    for o in chain.into_iter() {
+                        if let klio_runtime::Value::Instance(inst) = o {
+                            let b = inst.borrow();
+                            let is_lateinit = b
+                                .class
+                                .body_properties
+                                .iter()
+                                .any(|p| p.name == prop_name && p.is_lateinit);
+                            if !is_lateinit {
+                                continue;
+                            }
+                            let initialised = b
+                                .fields
+                                .iter()
+                                .any(|(n, v)| {
+                                    n == &prop_name
+                                        && !matches!(v, klio_runtime::Value::Null)
+                                });
+                            return Ok(klio_runtime::Value::Bool(initialised));
+                        }
+                    }
+                    return Ok(klio_runtime::Value::Bool(false));
+                }
                 _ => {}
             },
             _ => {}
@@ -6934,6 +6966,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }) {
             return hit;
         }
+        // Iterable fallback: a user class that exposes an
+        // `iterator()` method is iterable; an unbound member call
+        // can resolve to the stdlib `Iterable.<name>` extension by
+        // draining the iterator into a List and re-dispatching the
+        // call there. Drives the standard Iterable-extension set
+        // (joinToString, map, filter, sum, …) for user collections.
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()

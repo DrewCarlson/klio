@@ -115,7 +115,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #44 (isInitialized)"]
 fn lateinit_var_uninitialized_check() {
     let src = r#"
 class Box {
