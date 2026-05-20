@@ -6550,7 +6550,61 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             receiver,
             klio_runtime::Value::Instance(_)
         ) && self.host_has_member(receiver, name);
+        // A visible member-extension on the receiver type declared in
+        // the enclosing-class chain outranks the stdlib type-name
+        // probe — without this, `operator fun Int.unaryPlus()` in a
+        // class would lose to `kotlin.Int.unaryPlus` when invoked
+        // bare inside the class's body. Cheap scan over the registry
+        // of member-extension owners for one whose owner is in scope.
+        let user_member_ext_shadows = {
+            let chain = self.enclosing_this_chain();
+            let mut owners: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for v in &chain {
+                let mut cur: Option<klio_runtime::Value> = Some(v.clone());
+                while let Some(cv) = cur {
+                    if let klio_runtime::Value::Instance(inst) = &cv {
+                        let b = inst.borrow();
+                        owners.insert(b.class.name.clone());
+                        owners.insert(b.class.fqn.clone());
+                        let mut p = b.class.parent.borrow().clone();
+                        while let Some(pp) = p {
+                            owners.insert(pp.name.clone());
+                            owners.insert(pp.fqn.clone());
+                            p = pp.parent.borrow().clone();
+                        }
+                        cur = b.outer.clone();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            let want = args.len() + 1;
+            let mut found = false;
+            for (fname, fid) in self.module.func_index.iter() {
+                if fname != name {
+                    continue;
+                }
+                let owner_ok = self
+                    .module
+                    .registry
+                    .member_ext_owner_class
+                    .get(fid)
+                    .map_or(false, |o| owners.contains(o));
+                if !owner_ok {
+                    continue;
+                }
+                if let Some(f) = self.module.funcs.get(fid.0 as usize) {
+                    if !f.params.is_empty() && f.params.len() >= want {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            found
+        };
         if !member_shadows_stdlib
+            && !user_member_ext_shadows
             && !klio_stdlib::is_toplevel_function(name)
         {
             for probe in &probes {

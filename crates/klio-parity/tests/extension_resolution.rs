@@ -278,3 +278,21 @@ fun main() {
 "#;
     assert_klio("flat_map_to_inline", src, "[97, 98, 99, 100, 101]\n");
 }
+
+#[test]
+fn member_extension_unary_operator_on_primitive() {
+    let src = r#"
+class Builder(val items: MutableList<Int> = mutableListOf()) {
+    operator fun Int.unaryPlus() { items.add(this) }
+    fun work() { +1; +2; +3 }
+    fun render(): String = items.joinToString(",")
+}
+fun main() {
+    val b = Builder()
+    b.work()
+    println(b.render())
+}
+"#;
+    assert_klio("member_ext_unary_primitive", src, "1,2,3\n");
+}
+

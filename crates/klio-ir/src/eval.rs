@@ -1115,19 +1115,46 @@ fn exec_inst(
         }
         Inst::UnOp { dst, op, operand } => {
             let v = frame.read(*operand);
-            // User-class operator dispatch for unary +/-/inc/dec.
+            let method = match op {
+                UnOp::Neg => "unaryMinus",
+                UnOp::Plus => "unaryPlus",
+                UnOp::Inc => "inc",
+                UnOp::Dec => "dec",
+            };
+            // User-class operator dispatch for unary +/-/inc/dec on
+            // an Instance always wins.
             if matches!(v, Value::Instance(_)) {
-                let method = match op {
-                    UnOp::Neg => Some("unaryMinus"),
-                    UnOp::Plus => Some("unaryPlus"),
-                    UnOp::Inc => Some("inc"),
-                    UnOp::Dec => Some("dec"),
-                };
-                if let Some(m) = method {
-                    let result = host.call_member(&v, m, &[])?;
+                let result = host.call_member(&v, method, &[])?;
+                frame.write(*dst, result);
+                return Ok(());
+            }
+            // Member-extension operator on a primitive receiver
+            // (`operator fun Int.unaryPlus()` inside a class). The
+            // calling frame's `this` carries the enclosing class —
+            // surface it as enclosing-this so the extension-fallback
+            // visibility filter accepts the member-ext owner, mirroring
+            // the `CallMember` dispatch path. Built-in unary ops on
+            // primitives are still reached if no user member-ext is
+            // visible (call_member returns Unimplemented and we fall
+            // through to apply_unop).
+            let pushed_enclosing = match frame.params.first() {
+                Some(p @ Value::Instance(_)) => {
+                    host.push_access_enclosing(p);
+                    true
+                }
+                _ => false,
+            };
+            let extension_result = host.call_member(&v, method, &[]);
+            if pushed_enclosing {
+                host.pop_access_enclosing();
+            }
+            match extension_result {
+                Ok(result) => {
                     frame.write(*dst, result);
                     return Ok(());
                 }
+                Err(EvalError::Unimplemented(_)) => {}
+                Err(e) => return Err(e),
             }
             let out = apply_unop(*op, &v)?;
             frame.write(*dst, out);
