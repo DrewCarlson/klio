@@ -723,6 +723,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Map.filter", coll_iter_filter),
     ("kotlin.collections.MutableMap.filter", coll_iter_filter),
     ("kotlin.collections.List.filterNot", coll_iter_filter_not),
+    ("kotlin.collections.List.filterNotNull", coll_iter_filter_not_null),
+    ("kotlin.collections.MutableList.filterNotNull", coll_iter_filter_not_null),
+    ("kotlin.collections.Iterable.filterNotNull", coll_iter_filter_not_null),
+    ("kotlin.Array.filterNotNull", coll_iter_filter_not_null),
     ("kotlin.collections.MutableList.filterNot", coll_iter_filter_not),
     ("kotlin.collections.Set.filterNot", coll_iter_filter_not),
     ("kotlin.collections.MutableSet.filterNot", coll_iter_filter_not),
@@ -1210,6 +1214,15 @@ fn coll_iter_filter(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             result.push(v);
         }
     }
+    Ok(make_list(result, false))
+}
+
+fn coll_iter_filter_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "filterNotNull")?;
+    let result: Vec<Value> = items
+        .into_iter()
+        .filter(|v| !matches!(v, Value::Null))
+        .collect();
     Ok(make_list(result, false))
 }
 
