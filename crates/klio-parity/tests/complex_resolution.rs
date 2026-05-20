@@ -234,3 +234,37 @@ fun main() {
         "A(x,7)|B(y,k)|Z(z)\n",
     );
 }
+
+#[test]
+fn comparable_user_type_sorted_and_min_max() {
+    let src = r#"
+class Coord(val x: Int, val y: Int) : Comparable<Coord> {
+    override fun compareTo(other: Coord): Int =
+        if (x != other.x) x - other.x else y - other.y
+    override fun toString(): String = "($x,$y)"
+}
+fun main() {
+    val cs = listOf(Coord(3,1), Coord(1,2), Coord(3,0), Coord(2,5)).sorted()
+    println(cs.joinToString(","))
+    println(cs.min())
+    println(cs.max())
+}
+"#;
+    assert_klio("comparable_sort", src,
+        "(1,2),(2,5),(3,0),(3,1)\n(1,2)\n(3,1)\n");
+}
+
+#[test]
+fn join_to_string_invokes_user_to_string_on_elements() {
+    let src = r#"
+class Tag(val v: Int) {
+    override fun toString(): String = "<$v>"
+}
+fun main() {
+    val xs = listOf(Tag(1), Tag(2), Tag(3))
+    println(xs.joinToString(","))
+    println(xs.joinToString("|"))
+}
+"#;
+    assert_klio("join_user_tostring", src, "<1>,<2>,<3>\n<1>|<2>|<3>\n");
+}

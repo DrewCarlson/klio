@@ -4724,6 +4724,14 @@ fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
                 Value::String(s) => (*s).clone(),
                 other => format!("{other}"),
             }
+        } else if matches!(v, Value::Instance(_)) {
+            // Honour a user-declared `override fun toString()` on an
+            // Instance receiver — the structural Display path would
+            // otherwise print `ClassName@<id>`.
+            match host.invoke_method(v, "toString", &[], *writer) {
+                Some(Ok(Value::String(s))) => (*s).clone(),
+                _ => format!("{v}"),
+            }
         } else {
             format!("{v}")
         };
@@ -5324,8 +5332,60 @@ pub fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, Runtim
 fn coll_list_sorted(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.sorted")?;
     let mut copy: Vec<Value> = it.borrow().clone();
-    // Stable sort by natural order. Returns the first comparison error if any.
+    // For Instance items, defer to a user-declared
+    // `override fun compareTo(...)` via the host. Build a parallel
+    // scores array of pairwise comparisons up-front to keep
+    // sort_by's closure side-effect-free.
+    let needs_host = copy
+        .iter()
+        .any(|v| matches!(v, Value::Instance(_)));
     let mut err: Option<RuntimeError> = None;
+    if needs_host {
+        let CallCtx { out, host, .. } = ctx;
+        let mut indexed: Vec<(usize, Value)> =
+            copy.iter().cloned().enumerate().collect();
+        indexed.sort_by(|(ia, a), (ib, b)| {
+            if err.is_some() {
+                return ia.cmp(ib);
+            }
+            let ord = if matches!(a, Value::Instance(_)) {
+                match host.invoke_method(a, "compareTo", std::slice::from_ref(b), *out) {
+                    Some(Ok(Value::Int(n))) => i32_to_ordering(n as i32),
+                    Some(Err(e)) => {
+                        err = Some(e);
+                        std::cmp::Ordering::Equal
+                    }
+                    _ => match compare_values(a, b) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            err = Some(e);
+                            std::cmp::Ordering::Equal
+                        }
+                    },
+                }
+            } else {
+                match compare_values(a, b) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        err = Some(e);
+                        std::cmp::Ordering::Equal
+                    }
+                }
+            };
+            if ord != std::cmp::Ordering::Equal {
+                ord
+            } else {
+                ia.cmp(ib)
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        return Ok(make_list(
+            indexed.into_iter().map(|(_, v)| v).collect(),
+            false,
+        ));
+    }
     copy.sort_by(|a, b| {
         if err.is_some() {
             return std::cmp::Ordering::Equal;
@@ -5342,6 +5402,16 @@ fn coll_list_sorted(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(e);
     }
     Ok(make_list(copy, false))
+}
+
+fn i32_to_ordering(n: i32) -> std::cmp::Ordering {
+    if n < 0 {
+        std::cmp::Ordering::Less
+    } else if n > 0 {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Equal
+    }
 }
 
 fn coll_list_sorted_descending(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5426,13 +5496,15 @@ fn coll_list_average(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn coll_list_max_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.maxOrNull")?;
-    let borrow = it.borrow();
-    if borrow.is_empty() {
+    let items: Vec<Value> = it.borrow().clone();
+    if items.is_empty() {
         return Ok(Value::Null);
     }
-    let mut best = borrow[0].clone();
-    for v in borrow.iter().skip(1) {
-        if compare_values(v, &best)? == std::cmp::Ordering::Greater {
+    let mut best = items[0].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for v in items.iter().skip(1) {
+        let ord = compare_host_aware(v, &best, host, *out)?;
+        if ord == std::cmp::Ordering::Greater {
             best = v.clone();
         }
     }
@@ -5441,17 +5513,35 @@ fn coll_list_max_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn coll_list_min_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.minOrNull")?;
-    let borrow = it.borrow();
-    if borrow.is_empty() {
+    let items: Vec<Value> = it.borrow().clone();
+    if items.is_empty() {
         return Ok(Value::Null);
     }
-    let mut best = borrow[0].clone();
-    for v in borrow.iter().skip(1) {
-        if compare_values(v, &best)? == std::cmp::Ordering::Less {
+    let mut best = items[0].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for v in items.iter().skip(1) {
+        let ord = compare_host_aware(v, &best, host, *out)?;
+        if ord == std::cmp::Ordering::Less {
             best = v.clone();
         }
     }
     Ok(best)
+}
+
+fn compare_host_aware(
+    a: &Value,
+    b: &Value,
+    host: &mut &mut dyn klio_runtime::IntrinsicHost,
+    out: &mut dyn klio_runtime::Output,
+) -> Result<std::cmp::Ordering, RuntimeError> {
+    if matches!(a, Value::Instance(_)) {
+        if let Some(Ok(Value::Int(n))) =
+            host.invoke_method(a, "compareTo", std::slice::from_ref(b), out)
+        {
+            return Ok(i32_to_ordering(n as i32));
+        }
+    }
+    compare_values(a, b)
 }
 
 fn coll_list_to_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
