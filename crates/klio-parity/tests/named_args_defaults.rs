@@ -44,7 +44,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #51"]
 fn vararg_with_named_after() {
     let src = r#"
 fun build(first: String, vararg items: Int, last: String = "end"): String =

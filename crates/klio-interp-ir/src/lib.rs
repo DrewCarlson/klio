@@ -4492,7 +4492,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         }
                     }
                 }
+                // Vararg-aware positional walk: positional args that
+                // land on the vararg slot (and every subsequent
+                // positional before a named slot shows up) accumulate
+                // into a single Array in that slot. A named arg
+                // already-bound elsewhere does not affect the
+                // accumulation.
+                let vararg_pos: Option<usize> =
+                    params.iter().position(|p| p.is_vararg);
                 let mut positional_idx = 0usize;
+                let mut vararg_acc: Vec<klio_runtime::Value> = Vec::new();
+                let mut hit_vararg = false;
                 for (i, a) in args.iter().enumerate() {
                     if matches!(arg_names.get(i), Some(Some(_))) {
                         continue;
@@ -4502,10 +4512,42 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     {
                         positional_idx += 1;
                     }
+                    if Some(positional_idx) == vararg_pos {
+                        if matches!(a, klio_runtime::Value::Array { .. })
+                            && vararg_acc.is_empty()
+                        {
+                            // Spread case: a single Array argument at
+                            // the vararg position is passed through
+                            // untouched the same way pack_vararg_args
+                            // handles `f(*arr)`.
+                            slots[positional_idx] = Some(a.clone());
+                            positional_idx += 1;
+                            continue;
+                        }
+                        vararg_acc.push(a.clone());
+                        hit_vararg = true;
+                        continue;
+                    }
                     if positional_idx < params.len() {
                         slots[positional_idx] = Some(a.clone());
                     }
                     positional_idx += 1;
+                }
+                if let Some(vp) = vararg_pos {
+                    if hit_vararg {
+                        slots[vp] = Some(klio_runtime::Value::Array {
+                            items: klio_runtime::ObjRef::new(vararg_acc),
+                            prim: None,
+                        });
+                    } else if slots[vp].is_none() {
+                        // No positional landed on the vararg slot —
+                        // bind an empty array so the callee sees a
+                        // zero-length vararg rather than padding-Null.
+                        slots[vp] = Some(klio_runtime::Value::Array {
+                            items: klio_runtime::ObjRef::new(Vec::new()),
+                            prim: None,
+                        });
+                    }
                 }
                 // Fill omitted slots from the function's default-arg
                 // thunks (left-to-right, so a default may read an
