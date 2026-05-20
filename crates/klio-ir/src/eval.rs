@@ -684,6 +684,7 @@ fn run_frame_inner<'a>(
     mut resume_throw: Option<Value>,
     host: &mut dyn Host,
 ) -> Result<Value, EvalError> {
+    let mut pending_rethrow: Option<(BlockId, Value)> = None;
     loop {
         // Push any catch / finally metadata attached to this block.
         let (insts, term, catches, finally) = {
@@ -767,6 +768,7 @@ fn run_frame_inner<'a>(
                     routed = true;
                     break;
                 } else if let Some(fin) = hfinally {
+                    pending_rethrow = Some((fin, exc.clone()));
                     cur = fin;
                     routed = true;
                     break;
@@ -776,6 +778,54 @@ fn run_frame_inner<'a>(
                 return Err(EvalError::Throw(exc));
             }
             continue;
+        }
+        // Finally re-throw: if we entered the current block as a
+        // finally on the uncaught-throw path, and the block exits
+        // via a plain Goto (no `return` / `throw` swallowed the
+        // pending exception), re-raise the saved exception through
+        // the enclosing try-stack just like a fresh throw.
+        if let Some((fin, _)) = &pending_rethrow {
+            if *fin == cur && matches!(term, Terminator::Goto(_)) {
+                let (_, exc) = pending_rethrow.take().unwrap();
+                let mut routed = false;
+                while let Some((_blk, hcatches, hfinally)) = try_stack.pop() {
+                    if let Some(h) = hcatches.iter().find(|h| host.instance_of(
+                        &exc,
+                        &TypeRef {
+                            name: h.type_name.clone(),
+                            nullable: false,
+                            args: Vec::new(),
+                        },
+                    )) {
+                        frame.write(h.exception_reg, exc.clone());
+                        cur = h.handler;
+                        routed = true;
+                        break;
+                    } else if let Some(fin2) = hfinally {
+                        pending_rethrow = Some((fin2, exc.clone()));
+                        cur = fin2;
+                        routed = true;
+                        break;
+                    }
+                }
+                if !routed {
+                    return Err(EvalError::Throw(exc));
+                }
+                continue;
+            }
+            // A `return` / `throw` inside finally clears the pending
+            // re-throw (Kotlin: finally's exit replaces the original).
+            if *fin == cur
+                && matches!(
+                    term,
+                    Terminator::Return(_)
+                        | Terminator::NonLocalReturn(_)
+                        | Terminator::LabeledReturn(_, _)
+                        | Terminator::Throw(_)
+                )
+            {
+                pending_rethrow = None;
+            }
         }
         match term {
             Terminator::Goto(next) => cur = next,
@@ -820,10 +870,11 @@ fn run_frame_inner<'a>(
                         break;
                     } else if let Some(fin) = hfinally {
                         // No matching catch on this frame — run
-                        // finally then re-throw by re-installing
-                        // it as the next terminator path. For the
-                        // simple model, we route to finally then
-                        // propagate by returning Throw afterwards.
+                        // finally, then re-throw the original
+                        // exception when finally exits normally
+                        // (Goto). A `return` / `throw` inside
+                        // finally clears the pending re-throw.
+                        pending_rethrow = Some((fin, exc.clone()));
                         cur = fin;
                         routed = true;
                         break;
