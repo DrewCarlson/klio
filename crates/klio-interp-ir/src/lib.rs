@@ -6523,6 +6523,36 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // Accept an extension whose declared arity is >= the
             // supplied (receiver + args) count when every trailing
             // unsupplied parameter has a default.
+            // Member-extension visibility filter: a `class C { fun
+            // R.f(...) { … } }` is registered in `func_index` for
+            // dispatch but its visibility is restricted to call
+            // sites whose enclosing-class chain includes `C`. Build
+            // the set of class names reachable through the current
+            // call's enclosing-`this` chain so the candidate filter
+            // can drop member-extensions whose owner isn't visible.
+            let visible_owners: std::collections::HashSet<String> = {
+                let chain = self.enclosing_this_chain();
+                let mut set: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for v in &chain {
+                    if let klio_runtime::Value::Instance(inst) = v {
+                        let b = inst.borrow();
+                        set.insert(b.class.name.clone());
+                        if !b.class.fqn.is_empty() && b.class.fqn != b.class.name {
+                            set.insert(b.class.fqn.clone());
+                        }
+                        let mut cur = b.class.parent.borrow().clone();
+                        while let Some(p) = cur {
+                            set.insert(p.name.clone());
+                            if !p.fqn.is_empty() && p.fqn != p.name {
+                                set.insert(p.fqn.clone());
+                            }
+                            cur = p.parent.borrow().clone();
+                        }
+                    }
+                }
+                set
+            };
             let candidates: Vec<(klio_ir::FuncId, klio_ir::Func)> = self
                 .module
                 .func_index
@@ -6536,6 +6566,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .map(|f| (*fid, f))
                 })
                 .filter(|(_fid, f)| !f.params.is_empty() && f.params.len() >= want)
+                .filter(|(fid, _)| {
+                    match self.module.registry.member_ext_owner_class.get(fid) {
+                        None => true, // top-level extension: always visible
+                        Some(owner) => visible_owners.contains(owner),
+                    }
+                })
                 .collect();
             let unique_exact: Option<(klio_ir::FuncId, klio_ir::Func)> = {
                 // Kotlin disambiguates same-named extensions by

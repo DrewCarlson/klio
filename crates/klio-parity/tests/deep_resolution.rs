@@ -158,9 +158,7 @@ fun main() {
 
 // 8. Top-level extension on String vs member-extension on String
 //    inside a class: member wins when receiver call is in class scope.
-//    Tracked: task #36 (member-extension leaks into top-level scope).
 #[test]
-#[ignore = "tracked as task #36"]
 fn member_ext_wins_over_top_level() {
     let src = r#"
 fun String.label(): String = "TOP:$this"
