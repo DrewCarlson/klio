@@ -451,6 +451,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Set.subtract", coll_set_subtract),
     ("kotlin.collections.Set.toString", coll_set_to_string),
     ("kotlin.collections.Set.union", coll_set_union),
+    ("kotlin.collections.Set.sorted", coll_set_sorted),
+    ("kotlin.collections.Set.sortedDescending", coll_set_sorted_descending),
     ("kotlin.collections.MutableSet.add", coll_mut_set_add),
     ("kotlin.collections.MutableSet.clear", coll_mut_set_clear),
     ("kotlin.collections.MutableSet.contains", coll_set_contains),
@@ -5343,6 +5345,36 @@ fn coll_set_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     Ok(Value::Bool(it.borrow().iter().any(|v| Value::structural_eq(v, needle))))
 }
+fn coll_set_sorted(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let it = recv_set_items(ctx.args, "Set.sorted")?;
+    let mut copy: Vec<Value> = it.borrow().clone();
+    let mut err: Option<RuntimeError> = None;
+    copy.sort_by(|a, b| {
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match compare_values(a, b) {
+            Ok(o) => o,
+            Err(e) => {
+                err = Some(e);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(make_list(copy, false))
+}
+
+fn coll_set_sorted_descending(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let v = coll_set_sorted(ctx)?;
+    let Value::List { items, .. } = v else { unreachable!() };
+    let mut out: Vec<Value> = items.borrow().clone();
+    out.reverse();
+    Ok(make_list(out, false))
+}
+
 fn coll_set_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = ctx.args.first().ok_or_else(|| RuntimeError::Type("Set.toString requires a receiver".into()))?;
     Ok(Value::String(Arc::new(format!("{v}"))))
