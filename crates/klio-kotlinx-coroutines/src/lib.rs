@@ -69,10 +69,6 @@ struct CoroutineRegistry {
     next_token: i64,
     /// Opaque scheduler-handle FIFO.
     sched_queue: Vec<i64>,
-    /// Monotonic slot-id counter. A slot is an opaque rendezvous
-    /// point: a coroutine parks indefinitely on it and an explicit
-    /// event (job completion, channel item) resumes it.
-    next_slot: i64,
     /// klio-native channel registry keyed on the synthesised
     /// channel `Instance.identity`. Lets the channel send/receive
     /// bindings find their state from any entry-point without
@@ -86,7 +82,6 @@ impl CoroutineRegistry {
             cancelled_tokens: HashSet::new(),
             next_token: 1,
             sched_queue: Vec::new(),
-            next_slot: 1,
             channels: HashMap::new(),
         }
     }
@@ -113,6 +108,7 @@ klio_stdlib::host_bindings! {
         "kotlinx.coroutines.__kxco_schedulerDrainCount" => scheduler_drain_count,
         "kotlinx.coroutines.__kxco_spawn"               => spawn_launch_block,
         "kotlinx.coroutines.__kxco_dispatch"            => dispatch_coroutine,
+        "kotlinx.coroutines.internal.synchronizedImpl"  => synchronized_impl,
         "kotlinx.coroutines.__kxco_dispatchIo"          => dispatch_coroutine_io,
         "kotlinx.coroutines.__kxco_joinDispatched"      => join_dispatched,
         "kotlinx.coroutines.__kxco_scheduleResume"      => schedule_resume,
@@ -251,8 +247,7 @@ fn channel_send(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             }
             ChannelSendDispatch::Buffered => ChannelSendOutcome::Buffered,
             ChannelSendDispatch::ParkSender => {
-                let slot = r.next_slot;
-                r.next_slot = r.next_slot.wrapping_add(1);
+                let slot = alloc_kxco_slot();
                 if let Some(state) = r.channels.get_mut(&id) {
                     state.send_waiters.push_back((slot, value.clone()));
                 }
@@ -365,8 +360,7 @@ fn channel_receive(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         if closed {
             return Err(RuntimeError::Thrown(closed_receive_exc()));
         }
-        let slot = r.next_slot;
-        r.next_slot = r.next_slot.wrapping_add(1);
+        let slot = alloc_kxco_slot();
         if let Some(state) = r.channels.get_mut(&id) {
             state.receive_waiters.push_back(slot);
         }
@@ -577,14 +571,13 @@ fn channel_iter_has_next(
             return Ok(Value::Bool(false));
         }
     }
-    let slot = with_reg(|r| {
-        let s = r.next_slot;
-        r.next_slot = r.next_slot.wrapping_add(1);
+    let s = alloc_kxco_slot();
+    with_reg(|r| {
         if let Some(state) = r.channels.get_mut(&ch_id) {
             state.receive_iter_waiters.push_back((s, iter_inst.clone()));
         }
-        s
     });
+    let slot = s;
     ctx.host.coroutine_arm_slot(slot);
     Err(RuntimeError::Suspend(-1))
 }
@@ -652,14 +645,6 @@ fn closed_send_exc() -> Value {
     }
 }
 
-#[allow(dead_code)]
-fn next_slot() -> i64 {
-    with_reg(|r| {
-        let s = r.next_slot;
-        r.next_slot = r.next_slot.wrapping_add(1);
-        s
-    })
-}
 
 fn job_cancel(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // args[0] is the Job receiver. args[1], if present, is the
@@ -784,6 +769,16 @@ fn scheduler_enqueue(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// scheduler so the enclosing `runBlocking` pump can drive it on
 /// the next drain pass. Launches no longer run inline on the
 /// calling stack.
+/// `kotlinx.coroutines.internal.synchronizedImpl(lock, block)` —
+/// delegates straight to the `kotlin.synchronized` host binding so
+/// kxco internal locks (LimitedDispatcher, ThreadSafeHeap, …) and
+/// any user `synchronized(lock) { … }` call that the inline-fn-AST
+/// table routes through `kotlinx.coroutines.internal.synchronized`
+/// observe the same per-object monitor as `kotlin.synchronized`.
+fn synchronized_impl(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    klio_stdlib::implementations::concurrent_synchronized(ctx)
+}
+
 fn spawn_launch_block(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(lam) = ctx.args.first().cloned() else {
         return Err(RuntimeError::Type(

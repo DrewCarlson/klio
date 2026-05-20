@@ -2542,7 +2542,7 @@ fn monitor_for(key: usize) -> Arc<(std::sync::Mutex<MonitorState>, std::sync::Co
 /// runs with the monitor held; it is released (even on a thrown
 /// exception) before returning. `fence_and_publish` marks the
 /// monitor enter and exit boundaries.
-fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+pub fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let lock = ctx.args.first().cloned().unwrap_or(Value::Unit);
     let block = ctx
         .args
