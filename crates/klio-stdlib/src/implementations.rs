@@ -39,6 +39,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.text.buildString", builders_build_string),
     ("kotlin.lazy", lazy_lazy),
     ("kotlin.lazyOf", lazy_lazy_of),
+    ("kotlin.io.use", io_use),
+    ("kotlin.AutoCloseable.use", io_use),
+    ("java.io.Closeable.use", io_use),
 
     // ----- threads / monitors (serialized-interpreter semantics) -----
     ("kotlin.synchronized", concurrent_synchronized),
@@ -1182,6 +1185,17 @@ fn scope_also(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let CallCtx { out, host, .. } = ctx;
     host.invoke_callable(&block, std::slice::from_ref(&recv), *out)?;
     Ok(recv)
+}
+
+fn io_use(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (recv, block) = split_receiver_and_block(ctx)?;
+    let CallCtx { out, host, .. } = ctx;
+    let res = host.invoke_callable(&block, std::slice::from_ref(&recv), *out);
+    // Invoke close() unconditionally. invoke_method returns None when
+    // the host doesn't expose the dispatcher (script harnesses), in
+    // which case the close call is a no-op.
+    let _ = host.invoke_method(&recv, "close", &[], *out);
+    res
 }
 
 fn scope_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

@@ -128,3 +128,19 @@ fun main() {
 "#;
     assert_klio("either", src, "ok:5,err:zero,ok:2\n");
 }
+
+#[test]
+fn auto_closeable_use_block_invokes_close() {
+    let src = r#"
+class Resource(val name: String) : AutoCloseable {
+    var closed = false
+    override fun close() { closed = true }
+}
+fun main() {
+    val r = Resource("A")
+    val n = r.use { it.name.length }
+    println("n=$n,closed=${r.closed}")
+}
+"#;
+    assert_klio("autoclose_use", src, "n=1,closed=true\n");
+}

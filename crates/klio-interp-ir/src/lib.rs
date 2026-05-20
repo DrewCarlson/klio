@@ -4933,6 +4933,24 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return self.dispatch_intrinsic(func, &all_args);
                 }
             }
+            // Built-in Any/AutoCloseable extension probes for a user
+            // Instance receiver. `kotlin.io.use` / `kotlin.AutoCloseable.use`
+            // are bound on the stdlib side; let the call site reach
+            // them by name when the user class hasn't shadowed them.
+            let any_probes = [
+                format!("kotlin.io.{name}"),
+                format!("kotlin.AutoCloseable.{name}"),
+                format!("kotlin.Any.{name}"),
+            ];
+            for p in &any_probes {
+                if let Some(func) = self.lookup_intrinsic(p) {
+                    let mut all_args: Vec<klio_runtime::Value> =
+                        Vec::with_capacity(args.len() + 1);
+                    all_args.push(receiver.clone());
+                    all_args.extend_from_slice(args);
+                    return self.dispatch_intrinsic(func, &all_args);
+                }
+            }
         }
         // `Delegates.notNull` / `Delegates.observable` /
         // `Delegates.vetoable` — synthesise the proper
