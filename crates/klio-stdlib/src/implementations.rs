@@ -362,6 +362,15 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.IntArray.isNotEmpty", array_is_not_empty),
     ("kotlin.IntArray.sum", array_sum_int),
     ("kotlin.Array.withIndex", coll_array_with_index),
+    ("kotlin.Array.sliceArray", array_slice_impl),
+    ("kotlin.IntArray.sliceArray", array_slice_impl),
+    ("kotlin.LongArray.sliceArray", array_slice_impl),
+    ("kotlin.DoubleArray.sliceArray", array_slice_impl),
+    ("kotlin.FloatArray.sliceArray", array_slice_impl),
+    ("kotlin.ShortArray.sliceArray", array_slice_impl),
+    ("kotlin.ByteArray.sliceArray", array_slice_impl),
+    ("kotlin.CharArray.sliceArray", array_slice_impl),
+    ("kotlin.BooleanArray.sliceArray", array_slice_impl),
     ("kotlin.IntArray.withIndex", coll_array_with_index),
     ("kotlin.LongArray.withIndex", coll_array_with_index),
     ("kotlin.DoubleArray.withIndex", coll_array_with_index),
@@ -5526,6 +5535,35 @@ fn coll_set_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     Ok(Value::Bool(it.borrow().iter().any(|v| Value::structural_eq(v, needle))))
 }
+fn array_slice_impl(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().ok_or_else(|| {
+        RuntimeError::Type("sliceArray requires a receiver".into())
+    })?;
+    let (items, prim) = match recv {
+        Value::Array { items, prim } => (items.clone(), prim.clone()),
+        _ => return Err(RuntimeError::Type(
+            "sliceArray requires an array receiver".into()
+        )),
+    };
+    let arg = ctx.args.get(1).ok_or_else(|| {
+        RuntimeError::Arity("sliceArray expects (receiver, range)".into())
+    })?;
+    let (start, end) = match arg {
+        Value::Range { start, end, step: _, kind: _ } => (*start as usize, *end as usize),
+        _ => return Err(RuntimeError::Type(
+            "sliceArray expects an IntRange argument".into()
+        )),
+    };
+    let src = items.borrow();
+    let lo = start.min(src.len());
+    let hi = (end + 1).min(src.len());
+    let slice: Vec<Value> = if lo <= hi { src[lo..hi].to_vec() } else { Vec::new() };
+    Ok(Value::Array {
+        items: klio_runtime::ObjRef::new(slice),
+        prim,
+    })
+}
+
 fn array_sum_impl(ctx: &mut CallCtx, what: &str) -> Result<Value, RuntimeError> {
     let items = iterable_items(
         ctx.args.first().ok_or_else(|| RuntimeError::Type(format!("{what} requires a receiver")))?,

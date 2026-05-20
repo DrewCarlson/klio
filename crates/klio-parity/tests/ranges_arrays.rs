@@ -80,7 +80,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #54"]
 fn array_copy_and_slice() {
     let src = r#"
 fun main() {
@@ -93,7 +92,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #54"]
 fn arrayOfNulls_works() {
     let src = r#"
 fun main() {
