@@ -226,3 +226,15 @@ fun main() {
     assert_klio("operator_invoke_value", src,
         "note:hello\nnote:a,note:b\nnote:c,note:d\n");
 }
+
+#[test]
+fn unbound_class_method_reference_invoked_as_value() {
+    let src = r#"
+fun main() {
+    val f: (String, String) -> String = String::plus
+    println(f("a", "b"))
+    println(listOf("hi", "yo").map(String::uppercase).joinToString(","))
+}
+"#;
+    assert_klio("unbound_method_ref", src, "ab\nHI,YO\n");
+}

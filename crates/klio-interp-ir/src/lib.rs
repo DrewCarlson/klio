@@ -1848,9 +1848,29 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let klio_runtime::Value::Intrinsic { func, .. } = callee {
             return self.dispatch_intrinsic(*func, args);
         }
-        // `instance()` — invoke an instance via its `operator fun
-        // invoke(...)` method.
-        if matches!(callee, klio_runtime::Value::Instance(_)) {
+        // `instance()` — bound-member-reference invocation
+        // (`recv::method`, `String::plus`) wins over `operator fun
+        // invoke`. A `$bound_ref$` synth carries `__bound_receiver__`
+        // and `__bound_name__`; dispatch through them so an unbound
+        // class-method ref consumes its first arg as the receiver.
+        if let klio_runtime::Value::Instance(inst) = callee {
+            let snap = inst.borrow();
+            let recv = snap.get("__bound_receiver__");
+            let name_v = snap.get("__bound_name__");
+            drop(snap);
+            if let (Some(recv), Some(klio_runtime::Value::String(name))) =
+                (recv, name_v)
+            {
+                if matches!(&recv, klio_runtime::Value::Class(_))
+                    && !args.is_empty()
+                {
+                    let first = args[0].clone();
+                    let rest: Vec<klio_runtime::Value> =
+                        args[1..].to_vec();
+                    return self.call_member(&first, &name, &rest);
+                }
+                return self.call_member(&recv, &name, args);
+            }
             return self.call_member(callee, "invoke", args);
         }
         // Constructor-like call on a user class value
