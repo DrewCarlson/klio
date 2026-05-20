@@ -15,6 +15,19 @@ thread_local! {
         std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 
+    /// Simple names that a default-imported host binding owns (e.g.
+    /// `kotlin.synchronized`, `kotlin.arrayOf`). Any inline fn that
+    /// happens to share a simple name with one of these — including
+    /// pack-declared inline fns living in `kotlinx.coroutines.internal`
+    /// — must NOT shadow Kotlin's default-import resolution at a bare
+    /// call site. The lowerer skips inline expansion for these names
+    /// so the call falls through to the normal call path, where FQN
+    /// dispatch finds the `kotlin.<name>` binding. Set by the build
+    /// driver, which has visibility into both the inline AST table
+    /// and the host-binding registry.
+    static SHADOWED_INLINE_NAMES: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
     /// Hard ceiling on combined inline nesting (fn-body + lambda-arg
     /// splices) so transitive expansion cannot recurse without
     /// bound; past it, callers fall back to a normal call.
@@ -30,7 +43,20 @@ pub fn set_inline_fn_asts(
     INLINE_FN_ASTS.with(|c| *c.borrow_mut() = m);
 }
 
+/// Install the set of simple names owned by default-imported host
+/// bindings. Inline expansion is skipped for these names so the call
+/// site dispatches through the binding (matches Kotlin's default-import
+/// precedence over a same-simple-name declaration in a non-default
+/// package, e.g. `kotlinx.coroutines.internal.synchronized`).
+pub fn set_shadowed_inline_names(names: std::collections::HashSet<String>) {
+    SHADOWED_INLINE_NAMES.with(|c| *c.borrow_mut() = names);
+}
+
 pub(super) fn inline_fn_ast(name: &str) -> Option<std::rc::Rc<klio_ast::Function>> {
+    let shadowed = SHADOWED_INLINE_NAMES.with(|c| c.borrow().contains(name));
+    if shadowed {
+        return None;
+    }
     INLINE_FN_ASTS.with(|c| c.borrow().get(name).cloned())
 }
 

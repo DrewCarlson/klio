@@ -929,6 +929,35 @@ fn build_module_with_overrides(
             collect_inline(d, &mut inline_fns);
         }
         klio_ir::lower::set_inline_fn_asts(inline_fns);
+
+        // Default-import host bindings shadow any same-simple-name
+        // inline fn declared in a non-default package. A bare call
+        // like `synchronized(lock) { … }` resolves to
+        // `kotlin.synchronized` via the default `kotlin.*` import,
+        // not to `kotlinx.coroutines.internal.synchronized` (whose
+        // package isn't reachable through any user import). Without
+        // this, klio's simple-name-keyed inline-AST table would
+        // hijack the call and splice in kxco's body, bypassing
+        // the host monitor binding.
+        let mut shadowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for fqn in klio_stdlib::implementations::all_fqns() {
+            // Split on the LAST `.`: everything before is the
+            // declaring scope (package or type), everything after is
+            // the simple name we'd see at a call site. A binding's
+            // simple name only shadows an inline fn when the
+            // declaring scope is one of the spec's implicitly
+            // imported packages (i.e. resolvable from a bare call).
+            // Member bindings like `String.toInt` don't shadow,
+            // because reaching them requires a receiver.
+            if let Some(dot) = fqn.rfind('.') {
+                let scope = &fqn[..dot];
+                let simple = &fqn[dot + 1..];
+                if klio_stdlib::is_implicitly_imported_package(scope) {
+                    shadowed.insert(simple.to_string());
+                }
+            }
+        }
+        klio_ir::lower::set_shadowed_inline_names(shadowed);
     }
     // Non-wildcard imports, keyed by the name they bind (alias or
     // last segment), so the lowerer can rewrite a bare reference to

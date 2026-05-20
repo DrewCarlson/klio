@@ -40,7 +40,7 @@ use lambda_body::{
     lower_lambda_body_capturing_kind_with, resolve_capture,
 };
 use when_expr::lower_when;
-pub use inline_state::set_inline_fn_asts;
+pub use inline_state::{set_inline_fn_asts, set_shadowed_inline_names};
 pub use literals::widen_numeric_literal;
 use literals::{is_package_head, is_pkg_root};
 

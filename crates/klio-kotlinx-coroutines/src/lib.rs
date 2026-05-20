@@ -770,11 +770,12 @@ fn scheduler_enqueue(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// the next drain pass. Launches no longer run inline on the
 /// calling stack.
 /// `kotlinx.coroutines.internal.synchronizedImpl(lock, block)` —
-/// delegates straight to the `kotlin.synchronized` host binding so
-/// kxco internal locks (LimitedDispatcher, ThreadSafeHeap, …) and
-/// any user `synchronized(lock) { … }` call that the inline-fn-AST
-/// table routes through `kotlinx.coroutines.internal.synchronized`
-/// observe the same per-object monitor as `kotlin.synchronized`.
+/// klio's platform actual for the kxco internal monitor primitive.
+/// Routes through the same per-object monitor as
+/// `kotlin.synchronized` so atomicfu locks, kxco internals
+/// (`LimitedDispatcher`, `ThreadSafeHeap`, …), and any user
+/// `synchronized(lock) { … }` call that the resolver lowered to
+/// kxco's `synchronized` inline body all share one mutex.
 fn synchronized_impl(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     klio_stdlib::implementations::concurrent_synchronized(ctx)
 }
