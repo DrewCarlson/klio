@@ -299,3 +299,36 @@ fun main() {
 "#;
     assert_klio("primary_default_factory", src, "110\n");
 }
+
+#[test]
+fn array_deque_supports_bfs_queue_operations() {
+    let src = r#"
+fun bfs(start: Int, edges: Map<Int, List<Int>>): List<Int> {
+    val q = ArrayDeque<Int>()
+    val seen = mutableSetOf<Int>()
+    val out = mutableListOf<Int>()
+    q.addLast(start)
+    seen.add(start)
+    while (q.isNotEmpty()) {
+        val cur = q.removeFirst()
+        out.add(cur)
+        for (n in edges[cur] ?: emptyList()) {
+            if (seen.add(n)) q.addLast(n)
+        }
+    }
+    return out
+}
+fun main() {
+    val es = mapOf(
+        1 to listOf(2, 3),
+        2 to listOf(4),
+        3 to listOf(4, 5),
+        4 to listOf(6),
+        5 to listOf(6),
+        6 to emptyList(),
+    )
+    println(bfs(1, es).joinToString(","))
+}
+"#;
+    assert_klio("array_deque_bfs", src, "1,2,3,4,5,6\n");
+}

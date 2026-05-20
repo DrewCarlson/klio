@@ -354,6 +354,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.setOf", coll_set_of),
     ("kotlin.to", coll_to_infix),
     ("kotlin.collections.ArrayList", coll_array_list_ctor),
+    ("kotlin.collections.ArrayDeque", coll_array_list_ctor),
     ("kotlin.collections.HashMap", coll_hash_map_ctor),
     ("kotlin.collections.HashSet", coll_hash_set_ctor),
     ("kotlin.collections.LinkedHashMap", coll_hash_map_ctor),
@@ -499,6 +500,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.minus", coll_list_minus),
     ("kotlin.collections.MutableList.plus", coll_list_plus),
     ("kotlin.collections.MutableList.removeAt", coll_mut_list_remove_at),
+    ("kotlin.collections.MutableList.addFirst", coll_mut_list_add_first),
+    ("kotlin.collections.MutableList.addLast", coll_mut_list_add),
+    ("kotlin.collections.MutableList.removeFirst", coll_mut_list_remove_first),
+    ("kotlin.collections.MutableList.removeLast", coll_mut_list_remove_last),
     ("kotlin.collections.MutableList.reversed", coll_list_reversed),
     ("kotlin.collections.MutableList.size", coll_list_size),
     ("kotlin.collections.MutableList.slice", coll_list_slice),
@@ -4891,6 +4896,38 @@ fn coll_mut_list_add(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     Err(RuntimeError::Arity("add requires an argument".into()))
 }
+fn coll_mut_list_add_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let it = recv_list_items(ctx.args, "MutableList.addFirst")?;
+    let Some(v) = ctx.args.get(1) else {
+        return Err(RuntimeError::Arity("addFirst requires an argument".into()));
+    };
+    it.borrow_mut().insert(0, v.clone());
+    Ok(Value::Unit)
+}
+
+fn coll_mut_list_remove_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let it = recv_list_items(ctx.args, "MutableList.removeFirst")?;
+    let mut b = it.borrow_mut();
+    if b.is_empty() {
+        return Err(RuntimeError::Thrown(Value::Exception {
+            fqn: Arc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Arc::new("ArrayDeque is empty.".into())),
+            cause: None,
+        }));
+    }
+    Ok(b.remove(0))
+}
+
+fn coll_mut_list_remove_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let it = recv_list_items(ctx.args, "MutableList.removeLast")?;
+    let mut b = it.borrow_mut();
+    b.pop().ok_or_else(|| RuntimeError::Thrown(Value::Exception {
+        fqn: Arc::new("kotlin.NoSuchElementException".into()),
+        message: Some(Arc::new("ArrayDeque is empty.".into())),
+        cause: None,
+    }))
+}
+
 fn coll_mut_list_remove_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "MutableList.removeAt")?;
     let Some(Value::Int(i)) = ctx.args.get(1) else {

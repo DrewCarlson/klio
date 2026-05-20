@@ -75,6 +75,7 @@ pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
     ("setOf", "kotlin.collections.setOf"),
     ("to", "kotlin.to"),
     ("ArrayList", "kotlin.collections.ArrayList"),
+    ("ArrayDeque", "kotlin.collections.ArrayDeque"),
     ("HashMap", "kotlin.collections.HashMap"),
     ("HashSet", "kotlin.collections.HashSet"),
     ("LinkedHashMap", "kotlin.collections.LinkedHashMap"),
