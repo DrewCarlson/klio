@@ -80,7 +80,54 @@ klio_stdlib::host_bindings! {
         "kotlinx.coroutines.runBlocking"                => run_blocking,
         "kotlinx.coroutines.delay"                      => delay_top_level,
         "kotlinx.coroutines.yield"                      => yield_now,
+        "kotlinx.coroutines.JobSupport.cancel"          => job_cancel,
+        "kotlinx.coroutines.Job.cancel"                 => job_cancel,
+        "kotlinx.coroutines.AbstractCoroutine.cancel"   => job_cancel,
+        "kotlinx.coroutines.StandaloneCoroutine.cancel" => job_cancel,
+        "kotlinx.coroutines.LazyStandaloneCoroutine.cancel" => job_cancel,
+        "kotlinx.coroutines.DeferredCoroutine.cancel"   => job_cancel,
+        "kotlinx.coroutines.LazyDeferredCoroutine.cancel" => job_cancel,
+        "kotlinx.coroutines.JobImpl.cancel"             => job_cancel,
+        "kotlinx.coroutines.SupervisorJobImpl.cancel"   => job_cancel,
+        "kotlinx.coroutines.ScopeCoroutine.cancel"      => job_cancel,
+        "kotlinx.coroutines.SupervisorCoroutine.cancel" => job_cancel,
+        "kotlinx.coroutines.TimeoutCoroutine.cancel"    => job_cancel,
+        "kotlinx.coroutines.CompletableJob.cancel"      => job_cancel,
+        "kotlinx.coroutines.Deferred.cancel"            => job_cancel,
+        "kotlinx.coroutines.CompletableDeferred.cancel" => job_cancel,
+        "kotlinx.coroutines.CompletableDeferredImpl.cancel" => job_cancel,
+        "kotlinx.coroutines.ReceiveChannel.cancel"      => job_cancel,
+        "kotlinx.coroutines.JobSupport.cancelImpl"      => job_cancel,
+        "kotlinx.coroutines.JobSupport.cancelCoroutine" => job_cancel,
+        "kotlinx.coroutines.TimeoutCoroutine.cancelCoroutine" => job_cancel,
+        "kotlinx.coroutines.AbstractCoroutine.cancelCoroutine" => job_cancel,
+        "kotlinx.coroutines.StandaloneCoroutine.cancelCoroutine" => job_cancel,
+        "kotlinx.coroutines.ScopeCoroutine.cancelCoroutine" => job_cancel,
     }
+}
+
+/// Job.cancel(...) — wake every parked timed activation (delay /
+/// withTimeout suspension) with a CancellationException so user
+/// `try { … } catch (e: CancellationException)` arms fire and
+/// `withTimeoutOrNull` observes the timeout. Indefinite parks
+/// (job-join, channel rendezvous) aren't touched.
+fn job_cancel(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    // args[0] is the Job receiver. args[1], if present, is the
+    // CancellationException cause supplied by the caller (e.g.
+    // `TimeoutCoroutine.run` calls `cancelCoroutine(TimeoutCancellationException(...))`).
+    // Surface that exception to the parked activations so a catch
+    // arm typed on the cause's concrete class (TimeoutCancellationException
+    // for withTimeoutOrNull) fires correctly.
+    let cause = ctx
+        .args
+        .iter()
+        .skip(1)
+        .find_map(|v| match v {
+            Value::Exception { .. } | Value::Instance(_) => Some(v.clone()),
+            _ => None,
+        });
+    ctx.host.coroutine_cancel_timed_parks_with(cause);
+    Ok(Value::Bool(true))
 }
 
 /// `yield()` — cooperative reschedule: park with a zero-ms wakeup

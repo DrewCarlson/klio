@@ -5019,10 +5019,35 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let cls_fqn = snap.class.fqn.clone();
             let cls_name = snap.class.name.clone();
             drop(snap);
-            let probes = [
+            let mut probes: Vec<String> = vec![
                 format!("{cls_fqn}.{name}"),
                 format!("{cls_name}.{name}"),
             ];
+            // Walk the supertype chain so a binding registered on a
+            // base class (e.g. `kotlinx.coroutines.JobSupport.cancel`)
+            // matches dispatch on a private subclass instance the
+            // pack synthesised (`StandaloneCoroutine`, `TimeoutCoroutine`).
+            {
+                let mut queue: std::collections::VecDeque<String> =
+                    std::collections::VecDeque::new();
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                queue.push_back(cls_name.clone());
+                queue.push_back(cls_fqn.clone());
+                while let Some(cur) = queue.pop_front() {
+                    if !seen.insert(cur.clone()) {
+                        continue;
+                    }
+                    if let Some(def) =
+                        self.classes.borrow().get(&cur).cloned()
+                    {
+                        for sup in &def.supertype_names {
+                            probes.push(format!("{sup}.{name}"));
+                            queue.push_back(sup.clone());
+                        }
+                    }
+                }
+            }
             for p in &probes {
                 if let Some(func) = self.prog.installed_bindings.resolve(p) {
                     let mut all_args: Vec<klio_runtime::Value> =
@@ -9066,6 +9091,30 @@ impl CooperativeInterceptor {
         self.parked.remove(&token)
     }
 
+    /// Wake every parked activation whose wake-at is a finite
+    /// virtual-time deadline (i.e. parked on a `delay`/`withTimeout`).
+    /// Each is removed from `parked`, its resume value is set to the
+    /// supplied `failure` (a `Value::Result { ok: false, … }` that
+    /// the resume path in `klio_ir::eval` routes as a throw at the
+    /// suspension point), and the token is queued ready. Indefinite
+    /// parks (wake_at == i64::MAX) such as join/await/channel-receive
+    /// are not touched.
+    fn cancel_timed_parks(&mut self, failure: klio_runtime::Value) {
+        let due: Vec<u64> = self
+            .parked
+            .iter()
+            .filter(|(_, (_, w))| *w != i64::MAX)
+            .map(|(k, _)| *k)
+            .collect();
+        for tok in due {
+            if let Some(entry) = self.parked.get_mut(&tok) {
+                entry.1 = 0;
+            }
+            self.token_resume_value.insert(tok, failure.clone());
+            self.ready.push_back(tok);
+        }
+    }
+
     /// Seam: nothing ready — advance the clock to the soonest timer
     /// and arm every activation due then. Under `Virtual` the clock
     /// jumps instantly; under `Wall` the thread sleeps until the
@@ -9786,6 +9835,29 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 if interceptor.resume_slot_value(slot, value.clone()) {
                     break;
                 }
+            }
+        });
+    }
+
+    fn coroutine_cancel_timed_parks_with(
+        &mut self,
+        cause: Option<klio_runtime::Value>,
+    ) {
+        let exc = cause.unwrap_or_else(|| klio_runtime::Value::Exception {
+            fqn: Arc::new(
+                "kotlin.coroutines.cancellation.CancellationException".into(),
+            ),
+            message: Some(Arc::new("StandaloneCoroutine was cancelled".into())),
+            cause: None,
+        });
+        let failure = klio_runtime::Value::Result {
+            ok: false,
+            payload: Box::new(exc),
+        };
+        with_coro(|s| {
+            let mut stk = s.borrow_mut();
+            if let Some(interceptor) = stk.last_mut() {
+                interceptor.cancel_timed_parks(failure);
             }
         });
     }

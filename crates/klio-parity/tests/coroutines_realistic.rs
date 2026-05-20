@@ -51,7 +51,6 @@ fun main() = runBlocking {
 }
 
 #[test]
-#[ignore = "tracked as task #47"]
 fn cancellation_propagates_to_children() {
     let src = r#"
 import kotlinx.coroutines.*

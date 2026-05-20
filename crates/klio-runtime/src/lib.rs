@@ -801,6 +801,24 @@ pub trait IntrinsicHost {
     /// resumed value. Default impl is a no-op.
     fn coroutine_resume_slot_value(&mut self, _slot: i64, _value: Value) {}
 
+    /// Cancel every parked timed-wait activation (a `delay()` /
+    /// `withTimeout` continuation) in the active interceptor: wake
+    /// each with `Result.failure(CancellationException)` so the
+    /// suspended call resumes by throwing instead of returning.
+    /// Indefinite parks (job joins, channel rendezvous) are not
+    /// touched. Default impl is a no-op.
+    fn coroutine_cancel_timed_parks(&mut self) {
+        self.coroutine_cancel_timed_parks_with(None);
+    }
+
+    /// Variant of [`coroutine_cancel_timed_parks`] that lets the
+    /// caller supply the exception each woken activation observes;
+    /// `None` defaults to a `CancellationException`. `cancelCoroutine`
+    /// in upstream Kotlin reaches this with a
+    /// `TimeoutCancellationException` cause so `withTimeoutOrNull`'s
+    /// `catch (e: TimeoutCancellationException)` arm fires.
+    fn coroutine_cancel_timed_parks_with(&mut self, _cause: Option<Value>) {}
+
     /// `Continuation.resumeWith` entry point: deliver `value` to the
     /// activation parked on `slot`. If a live cooperative driver
     /// holds it, just enqueue (the driver runs it); otherwise the
