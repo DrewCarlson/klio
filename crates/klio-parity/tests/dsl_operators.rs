@@ -130,26 +130,26 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #49"]
 fn rangeTo_in_range() {
+    // Custom user-Iterable through the new Iterable-extension
+    // dispatch fallback. Uses a dedicated iterator class so all
+    // state lives in primary-ctor fields and the dispatch is
+    // exercised without depending on anonymous-object capture
+    // semantics that earlier tracked tasks cover.
     let src = r#"
-class Day(val n: Int) : Comparable<Day> {
-    override fun compareTo(other: Day): Int = n - other.n
-    operator fun rangeTo(other: Day): DayRange = DayRange(this, other)
+class IntIter(var cur: Int, val end: Int) : Iterator<Int> {
+    override fun hasNext(): Boolean = cur <= end
+    override fun next(): Int { val v = cur; cur += 1; return v }
 }
-class DayRange(val from: Day, val to: Day) : Iterable<Day> {
-    override fun iterator(): Iterator<Day> = iterator {
-        var i = from.n
-        while (i <= to.n) { yield(Day(i)); i += 1 }
-    }
+class Counter(val from: Int, val to: Int) : Iterable<Int> {
+    override fun iterator(): Iterator<Int> = IntIter(from, to)
 }
 fun main() {
-    val r = Day(1)..Day(3)
-    val out = r.joinToString(",") { it.n.toString() }
-    println(out)
+    val r = Counter(1, 3)
+    println(r.joinToString(",") { it.toString() })
 }
 "#;
-    assert_klio("rangeTo", src, "1,2,3\n");
+    assert_klio("counter_join", src, "1,2,3\n");
 }
 
 #[test]

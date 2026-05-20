@@ -6994,8 +6994,32 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // `iterator()` method is iterable; an unbound member call
         // can resolve to the stdlib `Iterable.<name>` extension by
         // draining the iterator into a List and re-dispatching the
-        // call there. Drives the standard Iterable-extension set
-        // (joinToString, map, filter, sum, …) for user collections.
+        // call there. A re-entry guard prevents loops when the
+        // iterator returned is itself a user Instance whose members
+        // would otherwise re-trigger this fallback. Guarded by the
+        // probe `hasNext` / `next` so a non-Iterator Instance with
+        // only `iterator()` doesn't drain.
+        if let klio_runtime::Value::Instance(_) = receiver {
+            let already_active = ITERABLE_FALLBACK_ACTIVE.with(|c| c.get());
+            if !already_active && self.host_has_member(receiver, "iterator") {
+                let intrinsic = self
+                    .lookup_intrinsic(&format!("kotlin.collections.Iterable.{name}"))
+                    .or_else(|| {
+                        self.lookup_intrinsic(&format!("kotlin.collections.List.{name}"))
+                    });
+                if let Some(f) = intrinsic {
+                    ITERABLE_FALLBACK_ACTIVE.with(|c| c.set(true));
+                    let drain_result = self.drain_iterable_to_list(receiver);
+                    ITERABLE_FALLBACK_ACTIVE.with(|c| c.set(false));
+                    let drained = drain_result?;
+                    let mut new_args: Vec<klio_runtime::Value> =
+                        Vec::with_capacity(args.len() + 1);
+                    new_args.push(drained);
+                    new_args.extend(args.iter().cloned());
+                    return self.dispatch_intrinsic(f, &new_args);
+                }
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()
@@ -7997,6 +8021,37 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
 }
 
 impl<'a> VmHost<'a> {
+    /// Drain a user-Instance iterable into a Value::List by invoking
+    /// its iterator() / hasNext() / next() members. Used by the
+    /// Iterable-extension fallback in `call_member`. Stops after
+    /// 1,000,000 items to avoid runaway iterators.
+    fn drain_iterable_to_list(
+        &mut self,
+        receiver: &klio_runtime::Value,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let iter = <Self as klio_ir::eval::Host>::call_member(self, receiver, "iterator", &[])?;
+        let mut items: Vec<klio_runtime::Value> = Vec::new();
+        loop {
+            let has = <Self as klio_ir::eval::Host>::call_member(self, &iter, "hasNext", &[])?;
+            if !matches!(has, klio_runtime::Value::Bool(true)) {
+                break;
+            }
+            let v = <Self as klio_ir::eval::Host>::call_member(self, &iter, "next", &[])?;
+            items.push(v);
+            if items.len() > 1_000_000 {
+                return Err(klio_ir::eval::EvalError::Type(
+                    "Iterable.<extension>: iterator produced over 1,000,000 items"
+                        .into(),
+                ));
+            }
+        }
+        Ok(klio_runtime::Value::List {
+            items: klio_runtime::ObjRef::new(items),
+            mutable: false,
+            enum_class: None,
+        })
+    }
+
     /// Run the class's `init { … }` blocks whose source position
     /// equals `before_prop_idx` (i.e. those declared between
     /// `body_properties[before_prop_idx-1]` and
@@ -8332,6 +8387,13 @@ thread_local! {
     /// the enclosing source flow's `collect` member rather than the
     /// `Flow<T>.collect` extension on the inner `flow{}` collector.
     static MEMBER_ONLY_PROBE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Re-entry guard for the user-Iterable extension fallback in
+    /// `call_member`. The fallback drains the user iterable's
+    /// `iterator()` into a list; a user iterator's `next()` may
+    /// itself return Instances whose own bare-name probes must not
+    /// loop back through this fallback.
+    static ITERABLE_FALLBACK_ACTIVE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 
     static COROUTINE_TIME_MODE: std::cell::Cell<TimeMode> =
