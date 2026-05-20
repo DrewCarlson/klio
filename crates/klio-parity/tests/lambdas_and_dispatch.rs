@@ -238,3 +238,28 @@ fun main() {
 "#;
     assert_klio("unbound_method_ref", src, "ab\nHI,YO\n");
 }
+
+#[test]
+fn lambda_value_remove_compares_by_identity() {
+    let src = r#"
+class Stream<T> {
+    val subs = mutableListOf<(T) -> Unit>()
+    fun subscribe(h: (T) -> Unit): () -> Unit {
+        subs.add(h)
+        return { subs.remove(h) }
+    }
+    fun emit(v: T) { for (s in subs.toList()) s(v) }
+}
+fun main() {
+    val s = Stream<Int>()
+    val log = mutableListOf<String>()
+    val unsubA = s.subscribe { log.add("a:$it") }
+    s.subscribe { log.add("b:$it") }
+    s.emit(1)
+    unsubA()
+    s.emit(2)
+    println(log.joinToString(","))
+}
+"#;
+    assert_klio("lambda_identity_remove", src, "a:1,b:1,b:2\n");
+}

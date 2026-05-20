@@ -2766,6 +2766,23 @@ impl Value {
                 o1 == o2 && Value::structural_eq(p1, p2)
             }
             (Class(a), Class(b)) => a.fqn == b.fqn,
+            // Function values compare by identity. Two distinct
+            // closures created by the same source position are still
+            // separate values; the JVM-equivalent semantic is
+            // reference equality, which gives `List.remove(handler)`
+            // a way to drop the exact callable that subscribe()
+            // returned.
+            (Lambda { body: a, env: ea, .. }, Lambda { body: b, env: eb, .. }) => {
+                Arc::ptr_eq(a, b) && ObjRef::ptr_eq(ea, eb)
+            }
+            (
+                IrClosure { id: a, captures: ca },
+                IrClosure { id: b, captures: cb },
+            ) => a == b && Arc::ptr_eq(ca, cb),
+            (
+                BoundMethod { fqn: fa, receiver: ra, .. },
+                BoundMethod { fqn: fb, receiver: rb, .. },
+            ) => fa == fb && Value::structural_eq(ra, rb),
             (Instance(a), Instance(b)) => {
                 if ObjRef::ptr_eq(a, b) {
                     return true;
