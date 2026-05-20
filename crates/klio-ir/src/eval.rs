@@ -598,6 +598,7 @@ pub fn resume_continuation(
     let mut frames: std::collections::VecDeque<FrameSnapshot> =
         state.frames.into();
     let mut first = true;
+    let mut pending_throw_from_inner: Option<Value> = None;
     while let Some(snap) = frames.pop_front() {
         let func = &module.funcs[snap.func.0 as usize];
         let mut frame = Frame::new_with_captures(
@@ -613,7 +614,12 @@ pub fn resume_continuation(
         // route it as a throw there instead of delivering it as the
         // suspending call's value, so a cancellation preempts a
         // parked `delay`/acquire rather than letting it complete.
-        let resume_throw = if first {
+        let resume_throw = if let Some(exc) = pending_throw_from_inner.take() {
+            // An inner frame finished with an uncaught throw — route
+            // it through this frame's restored try-stack so an
+            // enclosing `try { suspendingCall() } catch (e)` fires.
+            Some(exc)
+        } else if first {
             match &carry {
                 Value::Result { ok: false, payload } => {
                     Some((**payload).clone())
@@ -648,6 +654,16 @@ pub fn resume_continuation(
                 // still-pending outer frames sit after them.
                 inner.frames.extend(frames.into_iter());
                 return Err(EvalError::Suspended(inner));
+            }
+            Err(EvalError::Throw(exc)) => {
+                // Route the throw through the next-outer frame's
+                // restored try-stack: a `try { suspendingCall() }
+                // catch (e) { … }` should see exceptions raised
+                // after the parked call resumes.
+                if frames.is_empty() {
+                    return Err(EvalError::Throw(exc));
+                }
+                pending_throw_from_inner = Some(exc);
             }
             Err(e) => return Err(e),
         }

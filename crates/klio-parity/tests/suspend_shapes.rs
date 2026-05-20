@@ -57,7 +57,6 @@ fun main() = runBlocking {
 }
 
 #[test]
-#[ignore = "tracked as task #55"]
 fn suspend_with_try_catch() {
     let src = r#"
 import kotlinx.coroutines.*
