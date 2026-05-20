@@ -79,12 +79,17 @@ const PENDING: &[(&str, &str)] = &[
     // ("tl_safe_publication",   "needs real thread spawn"),
 ];
 
-#[test]
-fn threaded_litmus_runnable() {
-    for stem in RUNNABLE {
-        check(stem);
-    }
-}
+// Each litmus stem is its own `#[test]` so cargo runs them in
+// parallel — the previous single test serialised 8 heavy
+// `run_with_packs` invocations.
+#[test] fn tl_smoke()                { check("tl_smoke"); }
+#[test] fn tl_thread_join()          { check("tl_thread_join"); }
+#[test] fn tl_sync_counter()         { check("tl_sync_counter"); }
+#[test] fn tl_parallel_partition()   { check("tl_parallel_partition"); }
+#[test] fn tl_async_parallel()       { check("tl_async_parallel"); }
+#[test] fn tl_withcontext_io()       { check("tl_withcontext_io"); }
+#[test] fn tl_dispatch_many()        { check("tl_dispatch_many"); }
+#[test] fn tl_thread_sleep()         { check("tl_thread_sleep"); }
 
 #[test]
 #[ignore = "pending litmus: un-ignore as real thread spawn lands"]

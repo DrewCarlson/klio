@@ -30,25 +30,23 @@ fn expected(stem: &str) -> String {
     out
 }
 
-const SMOKE: &[&str] = &[
-    "cs1_launch_delay",
-    "cs2_async_await",
-    "cs3_many_launch",
-    "cs4_suspend_seq",
-    "cs5_flow_builder",
-    "cs6_flow_operators",
-    "cs7_scope_builders",
-];
-
-#[test]
-fn coroutine_smoke() {
-    for stem in SMOKE {
-        let file = dir().join(format!("{stem}.kt"));
-        let want = expected(stem);
-        assert!(!want.is_empty(), "no //> lines in {stem}");
-        match klio_parity::run_with_packs(&file) {
-            Ok(got) => assert_eq!(got, want, "coroutine smoke {stem} regressed"),
-            Err(e) => panic!("coroutine smoke {stem}: {e}"),
-        }
+// Each smoke source is its own `#[test]` fn so cargo's test harness
+// can run them in parallel — the wall-clock for this binary was
+// previously dominated by 7 serial `run_with_packs` calls.
+fn run_smoke(stem: &str) {
+    let file = dir().join(format!("{stem}.kt"));
+    let want = expected(stem);
+    assert!(!want.is_empty(), "no //> lines in {stem}");
+    match klio_parity::run_with_packs(&file) {
+        Ok(got) => assert_eq!(got, want, "coroutine smoke {stem} regressed"),
+        Err(e) => panic!("coroutine smoke {stem}: {e}"),
     }
 }
+
+#[test] fn cs1_launch_delay()    { run_smoke("cs1_launch_delay"); }
+#[test] fn cs2_async_await()     { run_smoke("cs2_async_await"); }
+#[test] fn cs3_many_launch()     { run_smoke("cs3_many_launch"); }
+#[test] fn cs4_suspend_seq()     { run_smoke("cs4_suspend_seq"); }
+#[test] fn cs5_flow_builder()    { run_smoke("cs5_flow_builder"); }
+#[test] fn cs6_flow_operators()  { run_smoke("cs6_flow_operators"); }
+#[test] fn cs7_scope_builders()  { run_smoke("cs7_scope_builders"); }

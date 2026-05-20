@@ -1156,6 +1156,36 @@ fn embedded_stdlib_sources(
 
 /// independent of `~/.klio/packs`. Used by the memory-model
 /// conformance suite.
+/// Per-process pack-AST cache. Each test binary invokes
+/// `run_with_packs` many times; the pack sources themselves don't
+/// change within a single test process, but parsing thousands of
+/// upstream coroutine lines on every call dominates the wall-clock.
+mod pack_ast_cache {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    static CACHE: Mutex<Option<Vec<(PathBuf, Arc<Vec<klio_ast::KotlinFile>>)>>> =
+        Mutex::new(None);
+    pub fn get(pack_dir: &Path) -> Option<Arc<Vec<klio_ast::KotlinFile>>> {
+        let g = CACHE.lock().ok()?;
+        let entries = g.as_ref()?;
+        entries
+            .iter()
+            .find(|(d, _)| d == pack_dir)
+            .map(|(_, v)| Arc::clone(v))
+    }
+    pub fn insert(pack_dir: &Path, asts: Vec<klio_ast::KotlinFile>) {
+        if let Ok(mut g) = CACHE.lock() {
+            let entries = g.get_or_insert_with(Vec::new);
+            let arc = Arc::new(asts);
+            if let Some(slot) = entries.iter_mut().find(|(d, _)| d == pack_dir) {
+                slot.1 = arc;
+            } else {
+                entries.push((pack_dir.to_path_buf(), arc));
+            }
+        }
+    }
+}
+
 pub fn run_with_packs(file: &Path) -> Result<String, String> {
     fn parse(
         map: &mut SourceMap,
@@ -1241,9 +1271,38 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
         if !wanted {
             continue;
         }
-        for src_path in collect_manifest_sources(pack_dir)? {
-            let text = std::fs::read_to_string(&src_path).map_err(|e| e.to_string())?;
-            let ast = parse(&mut map, &src_path, text)?;
+        // Cache the parsed pack ASTs per-process: each pack's source
+        // set is bytes-static within a test run, but parsing the
+        // upstream kotlinx-coroutines commonMain on every call
+        // dominates a parity-test suite's wall-clock. The cache is
+        // keyed by pack-dir path and stores cloned ASTs so repeated
+        // calls only pay the deep-clone instead of the lex+parse
+        // sweep.
+        let cached = pack_ast_cache::get(pack_dir);
+        let pack_asts: std::sync::Arc<Vec<klio_ast::KotlinFile>> = if let Some(cached) = cached {
+            cached
+        } else {
+            let mut fresh: Vec<klio_ast::KotlinFile> = Vec::new();
+            for src_path in collect_manifest_sources(pack_dir)? {
+                let text = std::fs::read_to_string(&src_path).map_err(|e| e.to_string())?;
+                let ast = parse(&mut map, &src_path, text)?;
+                if let Some(pkg) = &ast.package {
+                    let path = pkg
+                        .path
+                        .iter()
+                        .map(|i| i.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    if !path.is_empty() {
+                        klio_stdlib::register_known_package(path);
+                    }
+                }
+                fresh.push(ast);
+            }
+            pack_ast_cache::insert(pack_dir, fresh);
+            pack_ast_cache::get(pack_dir).expect("just inserted")
+        };
+        for ast in pack_asts.iter() {
             if let Some(pkg) = &ast.package {
                 let path = pkg
                     .path
@@ -1255,7 +1314,9 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
                     klio_stdlib::register_known_package(path);
                 }
             }
-            asts.push(ast);
+        }
+        for ast in pack_asts.iter() {
+            asts.push(ast.clone());
         }
     }
     asts.push(user_ast);
@@ -1319,6 +1380,21 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
 
 /// Full parity check: compile + run both compilers, return a report.
 pub fn check(file: &Path) -> Result<ParityReport, ParityError> {
+    // Fast-cycle skip: every parity test that calls `check()` follows
+    // the same `if let Ok(report) = check(&file) { … }` shape and
+    // gracefully skips the byte-identical comparison when kotlinc
+    // isn't available. Setting `KLIO_SKIP_KOTLINC_PARITY=1` short-
+    // circuits the kotlinc invocation entirely, turning a 5-minute
+    // full sweep into a sub-30-second one for iteration cycles where
+    // klio's own output (the `assert_klio` half of every test) is
+    // already enough signal.
+    if env::var("KLIO_SKIP_KOTLINC_PARITY")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "0")
+        .is_some()
+    {
+        return Err(ParityError::NoKotlinc);
+    }
     let jar = compile_with_kotlinc(file)?;
     let (kotlinc_stdout, kotlinc_exit) = run_kotlinc_jar(&jar)?;
     match run_with_ktc(file) {

@@ -93,3 +93,20 @@ codegen-units = 1
 [profile.bench]
 inherits = "release"
 debug = 1
+
+# Fast test cycle: optimised enough that the interpreter is usable
+# (debug-mode interpreter is too slow to keep parity-test runtimes
+# tolerable), but skips `lto` and uses many codegen units so a
+# rebuild after a small source change compiles in seconds rather
+# than spending two minutes on the LTO pass. Use with
+# `cargo test --profile dev-fast …` or `cargo build --profile dev-fast`.
+[profile.dev-fast]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true
+
+# Same fast profile applied to test binaries themselves so
+# `cargo test --profile dev-fast` covers both crates and tests.
+[profile.dev-fast.package."*"]
+opt-level = 3

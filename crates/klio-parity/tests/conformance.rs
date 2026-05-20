@@ -79,12 +79,20 @@ const RUNNABLE: &[&str] = &[
 /// `RUNNABLE` when that stage lands. Empty: no rule is gated today.
 const GATED: &[(&str, &str)] = &[];
 
-#[test]
-fn conformance_runnable() {
-    for stem in RUNNABLE {
-        check(stem);
-    }
-}
+// Each runnable rule is its own `#[test]` so the cargo test harness
+// parallelises them — the previous single test serialised 11 long
+// `run_with_packs` calls and dominated this binary's wall-clock.
+#[test] fn mm1_no_tearing()         { check("mm1_no_tearing"); }
+#[test] fn mm2_drf_sc()             { check("mm2_drf_sc"); }
+#[test] fn mm3_no_oota()             { check("mm3_no_oota"); }
+#[test] fn mm4_safe_publication()    { check("mm4_safe_publication"); }
+#[test] fn mm5_volatile()            { check("mm5_volatile"); }
+#[test] fn mm6_monitor()             { check("mm6_monitor"); }
+#[test] fn mm7_atomics()             { check("mm7_atomics"); }
+#[test] fn mm8_thread_join()         { check("mm8_thread_join"); }
+#[test] fn mm9_coroutine_hb()        { check("mm9_coroutine_hb"); }
+#[test] fn mm10_channel_flow()       { check("mm10_channel_flow"); }
+#[test] fn mm11_no_lost_tearing()    { check("mm11_no_lost_tearing"); }
 
 #[test]
 #[ignore = "gated litmus: un-ignore as each owning stage lands"]
