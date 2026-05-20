@@ -84,7 +84,6 @@ fun main() { val p: P = Q(); println(p.tag) }
 }
 
 #[test]
-#[ignore = "tracked as task #40"]
 fn companion_inherited_via_class_ref() {
     let src = r#"
 open class Base { companion object { fun bye(): String = "BB" } }

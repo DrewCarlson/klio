@@ -5220,23 +5220,47 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // companion_singletons is keyed by simple name; an
             // embedded-stdlib / pack class can present its fqn, so
             // probe both the name and the fqn's simple tail.
-            let comp_name = self
-                .module
-                .registry
-                .companion_singletons
+            // Walks the supertype chain so an inherited companion
+            // (`class Sub : Base()` with `companion object` on
+            // `Base`) is reachable via `Sub.<member>`.
+            let mut probe_classes: Vec<String> = Vec::new();
+            probe_classes.push(cls.name.clone());
+            if !cls.fqn.is_empty() && cls.fqn != cls.name {
+                probe_classes.push(cls.fqn.clone());
+            }
+            // Walk supertypes for inherited companions.
+            let runtime_def_opt = self
+                .classes
+                .borrow()
                 .get(&cls.name)
-                .or_else(|| {
-                    self.module
-                        .registry
-                        .companion_singletons
-                        .get(&cls.fqn)
-                })
-                .or_else(|| {
-                    cls.fqn.rsplit('.').next().and_then(|s| {
-                        self.module.registry.companion_singletons.get(s)
-                    })
-                })
                 .cloned();
+            if let Some(def) = runtime_def_opt {
+                let mut cur = def.parent.borrow().clone();
+                while let Some(p) = cur {
+                    probe_classes.push(p.name.clone());
+                    if !p.fqn.is_empty() && p.fqn != p.name {
+                        probe_classes.push(p.fqn.clone());
+                    }
+                    cur = p.parent.borrow().clone();
+                }
+            }
+            let mut comp_name: Option<String> = None;
+            for k in &probe_classes {
+                if let Some(c) =
+                    self.module.registry.companion_singletons.get(k).cloned()
+                {
+                    comp_name = Some(c);
+                    break;
+                }
+                if let Some(tail) = k.rsplit('.').next() {
+                    if let Some(c) =
+                        self.module.registry.companion_singletons.get(tail).cloned()
+                    {
+                        comp_name = Some(c);
+                        break;
+                    }
+                }
+            }
             if let Some(comp_name) = comp_name {
                 let singleton = self.globals.borrow().lookup(&comp_name);
                 if let Some(singleton) = singleton {
