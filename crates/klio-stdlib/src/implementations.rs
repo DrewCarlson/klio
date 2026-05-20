@@ -360,6 +360,24 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Array.isNotEmpty", array_is_not_empty),
     ("kotlin.IntArray.isEmpty", array_is_empty),
     ("kotlin.IntArray.isNotEmpty", array_is_not_empty),
+    ("kotlin.IntArray.sum", array_sum_int),
+    ("kotlin.LongArray.sum", array_sum_int),
+    ("kotlin.DoubleArray.sum", array_sum_int),
+    ("kotlin.FloatArray.sum", array_sum_int),
+    ("kotlin.ShortArray.sum", array_sum_int),
+    ("kotlin.ByteArray.sum", array_sum_int),
+    ("kotlin.IntArray.average", array_average_impl),
+    ("kotlin.LongArray.average", array_average_impl),
+    ("kotlin.DoubleArray.average", array_average_impl),
+    ("kotlin.FloatArray.average", array_average_impl),
+    ("kotlin.ShortArray.average", array_average_impl),
+    ("kotlin.ByteArray.average", array_average_impl),
+    ("kotlin.IntArray.max", array_max),
+    ("kotlin.IntArray.min", array_min),
+    ("kotlin.LongArray.max", array_max),
+    ("kotlin.LongArray.min", array_min),
+    ("kotlin.DoubleArray.max", array_max),
+    ("kotlin.DoubleArray.min", array_min),
     ("kotlin.Array.joinToString", coll_array_join_to_string),
     ("kotlin.IntArray.joinToString", coll_array_join_to_string),
     ("kotlin.LongArray.joinToString", coll_array_join_to_string),
@@ -5499,6 +5517,122 @@ fn coll_set_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     Ok(Value::Bool(it.borrow().iter().any(|v| Value::structural_eq(v, needle))))
 }
+fn array_sum_impl(ctx: &mut CallCtx, what: &str) -> Result<Value, RuntimeError> {
+    let items = iterable_items(
+        ctx.args.first().ok_or_else(|| RuntimeError::Type(format!("{what} requires a receiver")))?,
+        what,
+    )?;
+    let mut int_acc: i64 = 0;
+    let mut dbl_acc: f64 = 0.0;
+    let mut as_double = false;
+    for v in &items {
+        match v {
+            Value::Int(_) | Value::Long(_) | Value::Short(_) | Value::Byte(_) => {
+                int_acc += v.as_i64().unwrap_or(0);
+            }
+            Value::Double(d) => {
+                if !as_double {
+                    dbl_acc = int_acc as f64;
+                    as_double = true;
+                }
+                dbl_acc += *d;
+            }
+            Value::Float(f) => {
+                if !as_double {
+                    dbl_acc = int_acc as f64;
+                    as_double = true;
+                }
+                dbl_acc += *f as f64;
+            }
+            _ => return Err(RuntimeError::Type(format!(
+                "{what}: non-numeric element"
+            ))),
+        }
+    }
+    if as_double {
+        Ok(Value::Double(dbl_acc))
+    } else {
+        Ok(Value::new_int(int_acc))
+    }
+}
+
+fn array_sum_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_sum_impl(ctx, "Array.sum")
+}
+
+fn array_average_impl(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(
+        ctx.args.first().ok_or_else(|| RuntimeError::Type("Array.average requires a receiver".into()))?,
+        "Array.average",
+    )?;
+    if items.is_empty() {
+        return Ok(Value::Double(f64::NAN));
+    }
+    let mut acc: f64 = 0.0;
+    for v in &items {
+        let n: f64 = match v {
+            Value::Int(_) | Value::Long(_) | Value::Short(_) | Value::Byte(_) => v.as_i64().unwrap_or(0) as f64,
+            Value::Double(d) => *d,
+            Value::Float(f) => *f as f64,
+            _ => return Err(RuntimeError::Type(
+                "Array.average: non-numeric element".into()
+            )),
+        };
+        acc += n;
+    }
+    Ok(Value::Double(acc / items.len() as f64))
+}
+
+fn array_max_impl(ctx: &mut CallCtx, what: &str) -> Result<Value, RuntimeError> {
+    let items = iterable_items(
+        ctx.args.first().ok_or_else(|| RuntimeError::Type(format!("{what} requires a receiver")))?,
+        what,
+    )?;
+    if items.is_empty() {
+        return Err(RuntimeError::Thrown(Value::Exception {
+            fqn: Arc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Arc::new(format!("{what}: empty"))),
+            cause: None,
+        }));
+    }
+    let mut best = items[0].clone();
+    for v in items.iter().skip(1) {
+        if compare_values(v, &best)? == std::cmp::Ordering::Greater {
+            best = v.clone();
+        }
+    }
+    Ok(best)
+}
+
+fn array_max(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_max_impl(ctx, "Array.max")
+}
+
+fn array_min_impl(ctx: &mut CallCtx, what: &str) -> Result<Value, RuntimeError> {
+    let items = iterable_items(
+        ctx.args.first().ok_or_else(|| RuntimeError::Type(format!("{what} requires a receiver")))?,
+        what,
+    )?;
+    if items.is_empty() {
+        return Err(RuntimeError::Thrown(Value::Exception {
+            fqn: Arc::new("kotlin.NoSuchElementException".into()),
+            message: Some(Arc::new(format!("{what}: empty"))),
+            cause: None,
+        }));
+    }
+    let mut best = items[0].clone();
+    for v in items.iter().skip(1) {
+        if compare_values(v, &best)? == std::cmp::Ordering::Less {
+            best = v.clone();
+        }
+    }
+    Ok(best)
+}
+
+fn array_min(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    array_min_impl(ctx, "Array.min")
+}
+
 fn coll_set_sorted(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_set_items(ctx.args, "Set.sorted")?;
     let mut copy: Vec<Value> = it.borrow().clone();

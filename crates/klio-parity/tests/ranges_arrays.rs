@@ -31,7 +31,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #54"]
 fn array_of_primitives_sum() {
     let src = r#"
 fun main() {
@@ -132,7 +131,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #54"]
 fn double_array_operations() {
     let src = r#"
 fun main() {
