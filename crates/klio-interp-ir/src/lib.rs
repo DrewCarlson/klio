@@ -7616,11 +7616,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 .and_then(|n| self.classes.borrow().get(n).cloned())
                         });
                     if let Some(pdef) = parent_def {
-                        let leaf = <Self as klio_ir::eval::Host>::new_instance(
+                        // Allocate the leaf shell under a guard so the
+                        // recursive `new_instance` doesn't re-enter
+                        // this same secondary ctor and recurse
+                        // unbounded.
+                        with_ctor_guard(|g| g.borrow_mut().push(class_def.name.clone()));
+                        let leaf_res = <Self as klio_ir::eval::Host>::new_instance(
                             self,
                             class,
                             &[],
-                        )?;
+                        );
+                        with_ctor_guard(|g| {
+                            g.borrow_mut().pop();
+                        });
+                        let leaf = leaf_res?;
                         if let klio_runtime::Value::Instance(leaf_inst) = &leaf {
                             for (p, value) in pdef.primary_params.iter().zip(target_args.iter()) {
                                 if p.property.is_some() {
@@ -7630,6 +7639,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 }
                             }
                         }
+                        // Dispatch the parent's matching secondary
+                        // ctor chain on the same leaf so its body and
+                        // any `: this(...)` delegations actually run.
+                        // Without this, only the leaf shell is
+                        // allocated and the parent's ctor body (which
+                        // typically sets fields) is skipped.
+                        self.run_super_ctor_chain(&leaf, &pdef.name, &target_args)?;
                         leaf
                     } else {
                         // No user ClassDef for the parent — it's a
@@ -8096,6 +8112,73 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
 }
 
 impl<'a> VmHost<'a> {
+    /// Run the chain of secondary-constructor bodies for `class_name`
+    /// with arity matching `args.len()` on an existing `leaf`
+    /// instance. Resolves `: this(...)` delegation by recursing on
+    /// the same class with the delegated args; `: super(...)` walks
+    /// up via the leaf's class parent. Bodies run with the same
+    /// `leaf` so fields accumulate across the chain.
+    fn run_super_ctor_chain(
+        &mut self,
+        leaf: &klio_runtime::Value,
+        class_name: &str,
+        args: &[klio_runtime::Value],
+    ) -> Result<(), klio_ir::eval::EvalError> {
+        let entries = self
+            .prog
+            .secondary_ctors
+            .get(class_name)
+            .cloned()
+            .unwrap_or_default();
+        let Some(entry) = entries.iter().find(|e| e.param_count == args.len()) else {
+            return Ok(());
+        };
+        let module = Arc::clone(&self.module);
+        let mut next_args: Vec<klio_runtime::Value> =
+            Vec::with_capacity(entry.delegation_arg_thunks.len());
+        for fid in &entry.delegation_arg_thunks {
+            let func = module
+                .funcs
+                .get(fid.0 as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    klio_ir::eval::EvalError::Type(format!(
+                        "secondary ctor arg FuncId {} out of range",
+                        fid.0
+                    ))
+                })?;
+            let v = klio_ir::eval::eval_with(&module, &func, args.to_vec(), self)?;
+            next_args.push(v);
+        }
+        if entry.is_this {
+            self.run_super_ctor_chain(leaf, class_name, &next_args)?;
+        } else if entry.is_super {
+            let parent_name = if let klio_runtime::Value::Instance(inst) = leaf {
+                inst.borrow()
+                    .class
+                    .parent
+                    .borrow()
+                    .clone()
+                    .map(|p| p.name.clone())
+            } else {
+                None
+            };
+            if let Some(p) = parent_name {
+                self.run_super_ctor_chain(leaf, &p, &next_args)?;
+            }
+        }
+        if let Some(body_fid) = entry.body {
+            if let Some(body_func) = module.funcs.get(body_fid.0 as usize).cloned() {
+                let mut all: Vec<klio_runtime::Value> =
+                    Vec::with_capacity(1 + args.len());
+                all.push(leaf.clone());
+                all.extend_from_slice(args);
+                klio_ir::eval::eval_with(&module, &body_func, all, self)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Drain a user-Instance iterable into a Value::List by invoking
     /// its iterator() / hasNext() / next() members. Used by the
     /// Iterable-extension fallback in `call_member`. Stops after

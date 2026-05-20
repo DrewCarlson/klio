@@ -83,7 +83,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #58 (secondary ctor stack-overflow)"]
 fn protected_with_secondary_constructors() {
     let src = r#"
 open class P {
