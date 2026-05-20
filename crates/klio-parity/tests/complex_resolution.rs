@@ -363,3 +363,158 @@ fun main() {
 "#;
     assert_klio("map_to_mutable", src, "a=1,b=2,c=3\n");
 }
+
+#[test]
+fn override_getter_chain_with_sum_of() {
+    let src = r#"
+open class Shape {
+    open val area: Double = 0.0
+    open fun describe(): String = "Shape(area=$area)"
+}
+class Rect(val w: Double, val h: Double) : Shape() {
+    override val area: Double get() = w * h
+    override fun describe(): String = "Rect(${w}x$h, area=$area)"
+}
+fun main() {
+    val shapes: List<Shape> = listOf(Rect(3.0, 4.0), Rect(1.0, 1.0))
+    val total = shapes.sumOf { it.area }
+    println("total=$total")
+    for (s in shapes) println(s.describe())
+}
+"#;
+    assert_klio("override_getter_chain", src,
+        "total=13.0\nRect(3.0x4.0, area=12.0)\nRect(1.0x1.0, area=1.0)\n");
+}
+
+#[test]
+fn protected_super_method_in_overriding_subclass() {
+    let src = r#"
+open class Cache<K, V> {
+    protected val store = mutableMapOf<K, V>()
+    open fun get(k: K): V? = store[k]
+    open fun put(k: K, v: V) { store[k] = v }
+}
+class TimedCache<K, V>(private val ttl: Long) : Cache<K, V>() {
+    private val timestamps = mutableMapOf<K, Long>()
+    private var clock: Long = 0
+    fun tick(by: Long) { clock += by }
+    override fun get(k: K): V? {
+        val t = timestamps[k] ?: return null
+        if (clock - t > ttl) {
+            store.remove(k); timestamps.remove(k); return null
+        }
+        return super.get(k)
+    }
+    override fun put(k: K, v: V) {
+        super.put(k, v)
+        timestamps[k] = clock
+    }
+}
+fun main() {
+    val c = TimedCache<String, Int>(10)
+    c.put("a", 1)
+    c.tick(11)
+    println(c.get("a"))
+    c.put("b", 2)
+    println(c.get("b"))
+}
+"#;
+    assert_klio("protected_super_subclass", src, "null\n2\n");
+}
+
+#[test]
+fn sealed_tree_visitor_two_results() {
+    let src = r#"
+sealed class Tree<T> {
+    abstract fun <R> visit(visitor: TreeVisitor<T, R>): R
+}
+class Empty<T> : Tree<T>() {
+    override fun <R> visit(visitor: TreeVisitor<T, R>): R = visitor.onEmpty()
+}
+class Branch<T>(val v: T, val l: Tree<T>, val r: Tree<T>) : Tree<T>() {
+    override fun <R> visit(visitor: TreeVisitor<T, R>): R =
+        visitor.onBranch(v, l.visit(visitor), r.visit(visitor))
+}
+interface TreeVisitor<T, R> {
+    fun onEmpty(): R
+    fun onBranch(v: T, l: R, r: R): R
+}
+class SumV : TreeVisitor<Int, Int> {
+    override fun onEmpty(): Int = 0
+    override fun onBranch(v: Int, l: Int, r: Int): Int = v + l + r
+}
+class RenderV<T> : TreeVisitor<T, String> {
+    override fun onEmpty(): String = "_"
+    override fun onBranch(v: T, l: String, r: String): String = "($l<-$v->$r)"
+}
+fun main() {
+    val t: Tree<Int> = Branch(5, Branch(3, Empty(), Empty()), Branch(7, Empty(), Empty()))
+    println(t.visit(SumV()))
+    println(t.visit(RenderV<Int>()))
+}
+"#;
+    assert_klio("sealed_tree_visitor", src,
+        "15\n((_<-3->_)<-5->(_<-7->_))\n");
+}
+
+#[test]
+fn lifecycle_subscribe_init_block_captures() {
+    let src = r#"
+class Lifecycle {
+    private val watchers = mutableListOf<(String) -> Unit>()
+    fun watch(w: (String) -> Unit): Lifecycle { watchers.add(w); return this }
+    private fun notify(state: String) { for (w in watchers.toList()) w(state) }
+    private var state = "init"
+    fun start() { state = "starting"; notify(state); state = "running"; notify(state) }
+    fun stop() { state = "stopping"; notify(state); state = "stopped"; notify(state) }
+}
+class Component(val name: String) {
+    val lc = Lifecycle()
+    val seen = mutableListOf<String>()
+    init {
+        lc.watch { seen.add("$name:$it") }
+    }
+}
+fun main() {
+    val a = Component("A")
+    a.lc.start(); a.lc.stop()
+    println(a.seen.joinToString(","))
+}
+"#;
+    assert_klio("lifecycle_subscribe", src,
+        "A:starting,A:running,A:stopping,A:stopped\n");
+}
+
+#[test]
+fn matrix_operator_plus_times_chain() {
+    let src = r#"
+class Matrix(val rows: Int, val cols: Int) {
+    private val data = Array(rows) { IntArray(cols) }
+    operator fun get(r: Int, c: Int): Int = data[r][c]
+    operator fun set(r: Int, c: Int, v: Int) { data[r][c] = v }
+    operator fun plus(other: Matrix): Matrix {
+        val r = Matrix(rows, cols)
+        for (i in 0 until rows) for (j in 0 until cols) r[i, j] = this[i, j] + other[i, j]
+        return r
+    }
+    operator fun times(other: Matrix): Matrix {
+        val r = Matrix(rows, other.cols)
+        for (i in 0 until rows) for (j in 0 until other.cols) for (k in 0 until cols) {
+            r[i, j] = r[i, j] + this[i, k] * other[k, j]
+        }
+        return r
+    }
+    fun render(): String = (0 until rows).joinToString("|") { r ->
+        (0 until cols).joinToString(",") { c -> this[r, c].toString() }
+    }
+}
+fun main() {
+    val a = Matrix(2, 2); a[0,0]=1; a[0,1]=2; a[1,0]=3; a[1,1]=4
+    val b = Matrix(2, 2); b[0,0]=10; b[0,1]=20; b[1,0]=30; b[1,1]=40
+    println((a + b).render())
+    println((a * b).render())
+}
+"#;
+    assert_klio("matrix_ops", src,
+        "11,22|33,44\n70,100|150,220\n");
+}
