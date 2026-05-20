@@ -9711,6 +9711,28 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             };
             return func(&mut ctx);
         }
+        // Callable instance (a user class declaring `operator fun
+        // invoke`): treat the Instance as a callable by dispatching
+        // through its `invoke` member. Lets a value like
+        // `Tagger("note")` pass directly as a transform (`xs.map(t)`).
+        if let klio_runtime::Value::Instance(_) = callable {
+            let mut vm_host = self.vm_host(out);
+            let r = <VmHost as klio_ir::eval::Host>::call_member(
+                &mut vm_host,
+                callable,
+                "invoke",
+                args,
+            );
+            return r.map_err(|e| match e {
+                klio_ir::eval::EvalError::Throw(v) => {
+                    klio_runtime::RuntimeError::Thrown(v)
+                }
+                klio_ir::eval::EvalError::NonLocalReturn(v) => {
+                    klio_runtime::RuntimeError::Return(v)
+                }
+                other => klio_runtime::RuntimeError::Type(format!("{other}")),
+            });
+        }
         Err(klio_runtime::RuntimeError::Unimplemented(format!(
             "Vm::invoke_callable on `{}`",
             callable.type_fqn()

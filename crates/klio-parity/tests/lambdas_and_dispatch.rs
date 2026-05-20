@@ -209,3 +209,20 @@ fun main() {
 "#;
     assert_klio("max_of_or_null", src, "7\n2\nnull\n");
 }
+
+#[test]
+fn invoke_operator_instance_used_as_lambda_value() {
+    let src = r#"
+class Tagger(val prefix: String) {
+    operator fun invoke(s: String): String = "$prefix:$s"
+}
+fun main() {
+    val t = Tagger("note")
+    println(t("hello"))
+    println(listOf("a","b").map(t).joinToString(","))
+    println(listOf("c","d").map(t::invoke).joinToString(","))
+}
+"#;
+    assert_klio("operator_invoke_value", src,
+        "note:hello\nnote:a,note:b\nnote:c,note:d\n");
+}
