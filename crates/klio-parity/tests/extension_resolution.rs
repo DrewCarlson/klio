@@ -154,3 +154,63 @@ fun main() {
     assert_klio("with_member_ext_virtual", src,
         "woof:1,woof:2,woof:3\n");
 }
+
+#[test]
+fn inline_member_extension_via_with_block() {
+    let src = r#"
+class Repo {
+    val tag = "R"
+    fun emit(s: String): String = "$tag:$s"
+    inline fun List<Int>.summary(prefix: String): String =
+        prefix + ":" + joinToString(",") { emit("$it") }
+}
+fun main() {
+    val r = Repo()
+    with(r) { println(listOf(1, 2, 3).summary("nums")) }
+}
+"#;
+    assert_klio("inline_member_ext_with", src, "nums:R:1,R:2,R:3\n");
+}
+
+#[test]
+fn inline_member_extension_on_int_in_method_body() {
+    let src = r#"
+class Container {
+    val cap = "X"
+    inline fun Int.tag(): String = "$cap-$this"
+    fun render(xs: List<Int>): String = xs.joinToString(",") { it.tag() }
+}
+fun main() {
+    println(Container().render(listOf(1, 2, 3)))
+}
+"#;
+    assert_klio("inline_member_ext_int", src, "X-1,X-2,X-3\n");
+}
+
+#[test]
+fn inline_dsl_block_with_nested_groups() {
+    let src = r#"
+class Builder {
+    val items = mutableListOf<String>()
+    inline fun group(name: String, body: Builder.() -> Unit): Builder {
+        items.add("<$name>")
+        this.body()
+        items.add("</$name>")
+        return this
+    }
+    fun text(s: String): Builder { items.add(s); return this }
+    fun result(): String = items.joinToString("")
+}
+fun main() {
+    val b = Builder()
+        .group("root") {
+            text("A")
+            group("inner") { text("B"); text("C") }
+            text("D")
+        }
+    println(b.result())
+}
+"#;
+    assert_klio("inline_dsl_nested", src,
+        "<root>A<inner>BC</inner>D</root>\n");
+}
