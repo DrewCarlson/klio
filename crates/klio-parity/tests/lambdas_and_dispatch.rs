@@ -22,7 +22,6 @@ fn assert_klio(name: &str, src: &str, expected: &str) {
 }
 
 #[test]
-#[ignore = "tracked as task #52"]
 fn function_reference_to_extension() {
     let src = r#"
 fun String.shout(): String = this.uppercase() + "!"
@@ -135,7 +134,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #53"]
 fn typed_callable_reference_to_class_method() {
     let src = r#"
 class Foo {

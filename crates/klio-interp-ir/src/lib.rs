@@ -9251,6 +9251,47 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         args: &[klio_runtime::Value],
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
+        // Bound method/property reference (`recv::method`,
+        // `Cls::method`): the lowering creates a synthetic Instance
+        // carrying `__bound_receiver__` + `__bound_name__`. When
+        // invoked through a HOF (`xs.map(f::greet)` /
+        // `joinToString(transform = String::shout)`), dispatch on
+        // the captured receiver. An unbound class-method ref
+        // (`String::shout` where receiver is a Class) passes its
+        // first arg as the receiver.
+        if let klio_runtime::Value::Instance(inst) = callable {
+            let snap = inst.borrow();
+            let recv = snap.get("__bound_receiver__");
+            let name_v = snap.get("__bound_name__");
+            drop(snap);
+            if let (Some(recv), Some(klio_runtime::Value::String(name))) =
+                (recv, name_v)
+            {
+                let mut vm_host = self.vm_host(out);
+                let result = if matches!(&recv, klio_runtime::Value::Class(_))
+                    && !args.is_empty()
+                {
+                    let first = args[0].clone();
+                    let rest: Vec<klio_runtime::Value> = args[1..].to_vec();
+                    <VmHost as klio_ir::eval::Host>::call_member(
+                        &mut vm_host, &first, &name, &rest,
+                    )
+                } else {
+                    <VmHost as klio_ir::eval::Host>::call_member(
+                        &mut vm_host, &recv, &name, args,
+                    )
+                };
+                return result.map_err(|e| match e {
+                    klio_ir::eval::EvalError::Throw(v) => {
+                        klio_runtime::RuntimeError::Thrown(v)
+                    }
+                    klio_ir::eval::EvalError::NonLocalReturn(v) => {
+                        klio_runtime::RuntimeError::Return(v)
+                    }
+                    other => klio_runtime::RuntimeError::Type(format!("{other}")),
+                });
+            }
+        }
         if let klio_runtime::Value::IrClosure { id, .. } = callable {
             let info = self
                 .closures

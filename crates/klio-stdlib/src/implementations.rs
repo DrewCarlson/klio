@@ -4476,7 +4476,14 @@ fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut effective: Vec<Value> = ctx.args[1..].to_vec();
     let mut transform_slot: Option<Value> = None;
     if let Some(last) = effective.last() {
-        if matches!(last, Value::IrClosure { .. } | Value::Lambda { .. }) {
+        let is_bound_ref = if let Value::Instance(inst) = last {
+            inst.borrow().class.name.starts_with("$bound_ref$")
+        } else {
+            false
+        };
+        if matches!(last, Value::IrClosure { .. } | Value::Lambda { .. } | Value::BoundMethod { .. })
+            || is_bound_ref
+        {
             transform_slot = effective.pop();
         }
     }
@@ -4537,7 +4544,14 @@ fn coll_array_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut effective: Vec<Value> = ctx.args[1..].to_vec();
     let mut transform_slot: Option<Value> = None;
     if let Some(last) = effective.last() {
-        if matches!(last, Value::IrClosure { .. } | Value::Lambda { .. }) {
+        let is_bound_ref = if let Value::Instance(inst) = last {
+            inst.borrow().class.name.starts_with("$bound_ref$")
+        } else {
+            false
+        };
+        if matches!(last, Value::IrClosure { .. } | Value::Lambda { .. } | Value::BoundMethod { .. })
+            || is_bound_ref
+        {
             transform_slot = effective.pop();
         }
     }
