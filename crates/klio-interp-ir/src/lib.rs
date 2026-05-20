@@ -8559,7 +8559,7 @@ fn default_value_for_primary(
         if let Path { segments, .. } = callee.as_ref() {
             if segments.len() == 1 {
                 match segments[0].name.as_str() {
-                    "mutableListOf" | "arrayListOf" => {
+                    "mutableListOf" | "arrayListOf" | "ArrayList" | "ArrayDeque" => {
                         return Some(klio_runtime::Value::List {
                             items: klio_runtime::ObjRef::new(Vec::new()),
                             mutable: true,
