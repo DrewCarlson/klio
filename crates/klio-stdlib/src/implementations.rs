@@ -525,6 +525,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Set.plus", coll_set_plus),
     ("kotlin.collections.Map.plus", coll_map_plus),
     ("kotlin.collections.Map.minus", coll_map_minus),
+    ("kotlin.collections.Map.toMutableMap", coll_map_to_mutable_map),
+    ("kotlin.collections.Map.toMap", coll_map_to_map),
+    ("kotlin.collections.MutableMap.toMutableMap", coll_map_to_mutable_map),
+    ("kotlin.collections.MutableMap.toMap", coll_map_to_map),
     ("kotlin.collections.MutableMap.plus", coll_map_plus),
     ("kotlin.collections.MutableMap.minus", coll_map_minus),
     ("kotlin.collections.Set.subtract", coll_set_subtract),
@@ -6015,6 +6019,22 @@ fn coll_set_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// `Map + Pair` / `Map + Map` / `Map + Iterable<Pair>` — returns a
 /// new map with the entries added (existing keys overwritten,
 /// last-write-wins via `make_map`).
+fn coll_map_to_mutable_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let entries = match ctx.args.first() {
+        Some(Value::Map { entries, .. }) => entries.borrow().clone(),
+        _ => return Err(RuntimeError::Type("toMutableMap requires a Map receiver".into())),
+    };
+    Ok(make_map(entries, true))
+}
+
+fn coll_map_to_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let entries = match ctx.args.first() {
+        Some(Value::Map { entries, .. }) => entries.borrow().clone(),
+        _ => return Err(RuntimeError::Type("toMap requires a Map receiver".into())),
+    };
+    Ok(make_map(entries, false))
+}
+
 fn coll_map_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "Map.plus")?;
     let mut out: Vec<(Value, Value)> = entries.borrow().clone();

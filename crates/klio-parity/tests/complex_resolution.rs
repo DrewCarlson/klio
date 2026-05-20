@@ -349,3 +349,17 @@ fun main() {
 "#;
     assert_klio("cmp_extreme_instance", src, "Box(10)\nBox(3)\n");
 }
+
+#[test]
+fn map_to_mutable_map_and_to_map() {
+    let src = r#"
+fun main() {
+    val m = mapOf("a" to 1, "b" to 2)
+    val mm = m.toMutableMap()
+    mm["c"] = 3
+    val rm = mm.toMap()
+    println(rm.entries.sortedBy { it.key }.joinToString(",") { "${it.key}=${it.value}" })
+}
+"#;
+    assert_klio("map_to_mutable", src, "a=1,b=2,c=3\n");
+}
