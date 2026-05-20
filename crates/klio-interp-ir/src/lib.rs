@@ -3723,6 +3723,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 .collect();
             let supertype_names: Vec<String> =
                 supertypes.iter().map(|t| t.name.name.clone()).collect();
+            // Resolve the first non-interface supertype as the parent
+            // class so inherited concrete methods reach the call_member
+            // chain walker. `object : Base() { … }` would otherwise
+            // have parent=None and call_member would only see the
+            // anon's own (override) methods.
+            let mut anon_parent: Option<Arc<klio_runtime::ClassDef>> = None;
+            {
+                let classes = self.classes.borrow();
+                for n in &supertype_names {
+                    if let Some(def) = classes.get(n).cloned() {
+                        if !def.is_interface {
+                            anon_parent = Some(def);
+                            break;
+                        }
+                    }
+                }
+            }
             let class_def = Arc::new(klio_runtime::ClassDef {
                 name: format!("$anon${identity}"),
                 fqn: format!("$anon${identity}"),
@@ -3743,7 +3760,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 is_anonymous: true,
                 secondary_ctors: Vec::new(),
                 supertype_names,
-                parent: klio_runtime::ObjRef::new(None),
+                parent: klio_runtime::ObjRef::new(anon_parent),
                 interfaces: klio_runtime::ObjRef::new(Vec::new()),
                 is_interface: false,
                 is_fun_interface: false,
@@ -3833,6 +3850,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 }
             }
+            // Register the anon ClassDef in the runtime class table
+            // so the call_member_named walker that resolves inherited
+            // methods through `supertype_names` can find this entry
+            // and follow the chain to the concrete superclass body.
+            self.classes
+                .borrow_mut()
+                .insert(class_def.name.clone(), class_def.clone());
             // Wire the captured outer `this` (if any) as the anon
             // instance's `outer`, so the runtime's outer-chain walk
             // can resolve enclosing-class member references emitted

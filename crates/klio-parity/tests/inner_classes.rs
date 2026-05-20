@@ -156,3 +156,44 @@ fun main() {
     assert_klio("inner_outer_ext_str", src,
         "[a::a],[b::b]\n");
 }
+
+#[test]
+fn anon_object_inherits_concrete_method_from_abstract() {
+    let src = r#"
+abstract class Shape {
+    abstract fun area(): Int
+    fun describe(): String = "area=${area()}"
+}
+fun rect(w: Int, h: Int): Shape = object : Shape() {
+    override fun area(): Int = w * h
+}
+fun triangle(b: Int, h: Int): Shape = object : Shape() {
+    override fun area(): Int = b * h / 2
+}
+fun main() {
+    println(rect(3, 4).describe())
+    println(triangle(6, 5).describe())
+}
+"#;
+    assert_klio("anon_abstract_concrete", src, "area=12\narea=15\n");
+}
+
+#[test]
+fn anon_object_subclass_uses_inherited_helper_in_lambda() {
+    let src = r#"
+abstract class Worker {
+    abstract fun item(): Int
+    fun pipeline(): String =
+        (1..3).joinToString(",") { "${it}:${item()}" }
+}
+fun make(seed: Int): Worker = object : Worker() {
+    override fun item(): Int = seed * seed
+}
+fun main() {
+    println(make(2).pipeline())
+    println(make(3).pipeline())
+}
+"#;
+    assert_klio("anon_abstract_pipeline", src,
+        "1:4,2:4,3:4\n1:9,2:9,3:9\n");
+}
