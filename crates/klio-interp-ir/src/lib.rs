@@ -7831,14 +7831,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         let n_primary = class_def.primary_params.len();
         let mut effective_args: Vec<klio_runtime::Value> = args.to_vec();
         if effective_args.len() < n_primary {
-            // Fill missing positional args with each param's default.
-            // Literal-only defaults resolve eagerly here; anything more
-            // complex needs a lowered thunk and lands when class lowering
-            // grows ctor-arg defaults as IR FuncIds.
             for idx in effective_args.len()..n_primary {
                 let p = &class_def.primary_params[idx];
                 let v = match &p.default {
-                    Some(e) => simple_literal(e).unwrap_or(klio_runtime::Value::Null),
+                    Some(e) => default_value_for_primary(e)
+                        .unwrap_or(klio_runtime::Value::Null),
                     None => klio_runtime::Value::Null,
                 };
                 effective_args.push(v);
@@ -8502,6 +8499,71 @@ fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
 /// runtime Value. Used by anonymous-object body-property
 /// initialisation where the IR module's full thunk-lowering
 /// hasn't run.
+/// Eagerly resolve a primary-constructor parameter default. Covers
+/// `simple_literal` shapes plus zero-arg empty-collection factory
+/// calls (`mutableListOf()` / `mutableMapOf()` / `mutableSetOf()` /
+/// `listOf()` / `setOf()` / `mapOf()` / `emptyList()` / `emptySet()`
+/// / `emptyMap()`) that arise in property-bag class declarations.
+fn default_value_for_primary(
+    e: &klio_ast::Expr,
+) -> Option<klio_runtime::Value> {
+    use klio_ast::Expr::*;
+    if let Some(v) = simple_literal(e) {
+        return Some(v);
+    }
+    if let Call { callee, args, .. } = e {
+        if !args.is_empty() {
+            return None;
+        }
+        if let Path { segments, .. } = callee.as_ref() {
+            if segments.len() == 1 {
+                match segments[0].name.as_str() {
+                    "mutableListOf" | "arrayListOf" => {
+                        return Some(klio_runtime::Value::List {
+                            items: klio_runtime::ObjRef::new(Vec::new()),
+                            mutable: true,
+                            enum_class: None,
+                        });
+                    }
+                    "listOf" | "emptyList" => {
+                        return Some(klio_runtime::Value::List {
+                            items: klio_runtime::ObjRef::new(Vec::new()),
+                            mutable: false,
+                            enum_class: None,
+                        });
+                    }
+                    "mutableSetOf" | "hashSetOf" | "linkedSetOf" => {
+                        return Some(klio_runtime::Value::Set {
+                            items: klio_runtime::ObjRef::new(Vec::new()),
+                            mutable: true,
+                        });
+                    }
+                    "setOf" | "emptySet" => {
+                        return Some(klio_runtime::Value::Set {
+                            items: klio_runtime::ObjRef::new(Vec::new()),
+                            mutable: false,
+                        });
+                    }
+                    "mutableMapOf" | "hashMapOf" | "linkedMapOf" => {
+                        return Some(klio_runtime::Value::Map {
+                            entries: klio_runtime::ObjRef::new(Vec::new()),
+                            mutable: true,
+                        });
+                    }
+                    "mapOf" | "emptyMap" => {
+                        return Some(klio_runtime::Value::Map {
+                            entries: klio_runtime::ObjRef::new(Vec::new()),
+                            mutable: false,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
 fn simple_literal(e: &klio_ast::Expr) -> Option<klio_runtime::Value> {
     use klio_ast::Expr::*;
     match e {

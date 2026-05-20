@@ -281,3 +281,21 @@ fun main() {
 "#;
     assert_klio("set_first_last_join", src, "a\nc\na|b|c\n");
 }
+
+#[test]
+fn primary_ctor_default_uses_empty_collection_factory() {
+    let src = r#"
+class Pipeline<T>(private val steps: MutableList<(T) -> T> = mutableListOf()) {
+    fun then(f: (T) -> T): Pipeline<T> { steps.add(f); return this }
+    fun apply(x: T): T = steps.fold(x) { acc, f -> f(acc) }
+}
+fun main() {
+    val p = Pipeline<Int>()
+        .then { it * 2 }
+        .then { it + 1 }
+        .then { it * 10 }
+    println(p.apply(5))
+}
+"#;
+    assert_klio("primary_default_factory", src, "110\n");
+}
