@@ -417,6 +417,27 @@ impl<'a> FuncBuilder<'a> {
     pub fn has_own_member(&self, name: &str) -> bool {
         self.own_members.contains(name)
     }
+    /// Swap-in a new owner_class + own_members pair and return the
+    /// previous values, so an inline splice can run the spliced body
+    /// in the inline fn's enclosing-class context and then restore
+    /// the caller's. Returns `(prev_owner_class, prev_own_members)`.
+    pub fn swap_owner_context(
+        &mut self,
+        owner_class: Option<String>,
+        own_members: std::collections::HashSet<String>,
+    ) -> (Option<String>, std::collections::HashSet<String>) {
+        let prev_class = std::mem::replace(&mut self.owner_class, owner_class);
+        let prev_members = std::mem::replace(&mut self.own_members, own_members);
+        (prev_class, prev_members)
+    }
+    pub fn restore_owner_context(
+        &mut self,
+        owner_class: Option<String>,
+        own_members: std::collections::HashSet<String>,
+    ) {
+        self.owner_class = owner_class;
+        self.own_members = own_members;
+    }
     pub fn set_param_thunk(&mut self, on: bool) {
         self.is_param_thunk = on;
     }

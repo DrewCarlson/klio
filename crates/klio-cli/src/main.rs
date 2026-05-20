@@ -1715,25 +1715,12 @@ fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
     }
     let user_asts = vec![ast];
     let (pack_asts, pack_bindings) = load_installed_packs(&user_asts, &mut map);
-    if pack_asts.is_empty() {
-        // No packs needed — fall back to the single-file build path.
-        let ast = user_asts.into_iter().next().expect("user ast");
-        let built = klio_interp_ir::build::build_module(&ast);
-        let (mut vm, main) = klio_interp_ir::Vm::from_built(built);
-        vm.set_installed_bindings(pack_bindings);
-        let Some(main_id) = main else {
-            eprintln!("error: no main function found");
-            return ExitCode::FAILURE;
-        };
-        let mut stdout = klio_runtime::StdoutOutput;
-        return match vm.run(main_id, &mut stdout) {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("runtime error: {e}");
-                ExitCode::FAILURE
-            }
-        };
-    }
+    // Unified build path: a script (single user file, no packs)
+    // and a pack-using program both flow through
+    // `build_module_files`. Eliminates the divergence where a script
+    // went through `build_module` and a pack program through
+    // `build_module_files`, so any lowering behaviour applies
+    // uniformly regardless of pack presence.
     let mut all_asts: Vec<klio_ast::KotlinFile> =
         Vec::with_capacity(pack_asts.len() + user_asts.len());
     all_asts.extend(pack_asts);
