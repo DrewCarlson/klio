@@ -2886,11 +2886,34 @@ fn num_extreme(args: &[Value], want_min: bool, what: &str) -> Result<Value, Runt
 }
 
 fn math_min(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    num_extreme(ctx.args, true, "min")
+    cmp_extreme(ctx, true, "min")
 }
 
 fn math_max(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    num_extreme(ctx.args, false, "max")
+    cmp_extreme(ctx, false, "max")
+}
+
+fn cmp_extreme(
+    ctx: &mut CallCtx,
+    want_min: bool,
+    what: &str,
+) -> Result<Value, RuntimeError> {
+    // Instance-aware path: a user receiver implementing Comparable
+    // (`operator fun compareTo`) reaches min/max via call_member,
+    // falling back to the primitive num_extreme for plain numbers.
+    if let [a, b] = ctx.args {
+        if matches!(a, Value::Instance(_)) || matches!(b, Value::Instance(_)) {
+            let CallCtx { out, host, .. } = ctx;
+            let ord = compare_host_aware(a, b, host, *out)?;
+            let pick_first = if want_min {
+                ord != std::cmp::Ordering::Greater
+            } else {
+                ord != std::cmp::Ordering::Less
+            };
+            return Ok(if pick_first { a.clone() } else { b.clone() });
+        }
+    }
+    num_extreme(ctx.args, want_min, what)
 }
 
 fn math_sqrt(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

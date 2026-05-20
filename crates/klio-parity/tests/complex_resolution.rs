@@ -332,3 +332,20 @@ fun main() {
 "#;
     assert_klio("array_deque_bfs", src, "1,2,3,4,5,6\n");
 }
+
+#[test]
+fn min_max_of_dispatch_through_comparable_instance() {
+    let src = r#"
+class Box(val v: Int) : Comparable<Box> {
+    override fun compareTo(other: Box): Int = v - other.v
+    override fun toString(): String = "Box($v)"
+}
+fun main() {
+    val a = Box(10)
+    val b = Box(3)
+    println(maxOf(a, b))
+    println(minOf(a, b))
+}
+"#;
+    assert_klio("cmp_extreme_instance", src, "Box(10)\nBox(3)\n");
+}
