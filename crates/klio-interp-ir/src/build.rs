@@ -508,13 +508,11 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
     // Per-class FQN overrides: each pack file's `package` header
     // attaches a `<package>.` prefix to every class declared in
     // that file. The combined module has `package = None`, so the
-    // build pass would otherwise emit bare-name FQNs and pack
-    // bindings keyed by `kotlinx.atomicfu.AtomicInt.<method>`
-    // wouldn't resolve at dispatch.
+    // build pass would otherwise emit bare-name FQNs and any
+    // FQN-keyed stdlib/pack binding wouldn't resolve at dispatch.
     // Keyed by each class declaration's span (unique per declaration)
     // rather than its simple name: two packs may declare the same
-    // simple name in different packages (`kotlinx.coroutines.internal
-    // .Segment` vs `kotlinx.io.Segment`), and a name-keyed map would
+    // simple name in different packages, and a name-keyed map would
     // collapse them to a single (last-writer) FQN.
     let mut fqn_overrides: std::collections::HashMap<klio_span::Span, String> =
         std::collections::HashMap::new();
@@ -951,10 +949,9 @@ fn build_module_with_overrides(
         module.registry.import_aliases.entry(leaf).or_insert(segs);
     }
     // Pre-register every class name so `class_id` resolves
-    // regardless of declaration order: a method body may reference a
-    // class declared later in the module (kotlinx-io's `Buffer`
-    // methods use `Segment` / `SegmentPool`, both declared after
-    // `Buffer`). `add_class` reuses these reserved slots.
+    // regardless of declaration order: a method body may reference
+    // a class declared later in the module. `add_class` reuses
+    // these reserved slots.
     for d in decls {
         if let Decl::Class(c) = d {
             module.reserve_class(&c.name.name);
@@ -1235,13 +1232,11 @@ fn build_module_with_overrides(
                             // Also key by the class's package-qualified
                             // FQN. Two packages may declare the same
                             // simple class name where only one has a
-                            // getter for this property
-                            // (`kotlinx.io.Segment.next` is a plain
-                            // field; the abstract
-                            // `kotlinx.coroutines.internal.Segment`
-                            // exposes a `next` getter). The FQN key
-                            // lets the lookup bind the getter to the
-                            // class that actually declares it.
+                            // getter for this property. Two classes
+                            // may share a simple name across
+                            // packages; the FQN key lets the lookup
+                            // bind the getter to the class that
+                            // actually declares it.
                             let cfqn = fqn_overrides
                                 .get(&c.span)
                                 .cloned()
@@ -1407,13 +1402,11 @@ fn build_module_with_overrides(
             });
             // Additionally key by the fully-qualified name. The
             // primary table is simple-name keyed, so two packs
-            // declaring the same simple name (the `internal`
-            // `kotlinx.coroutines.internal.Segment` vs the `public`
-            // `kotlinx.io.Segment`) collapse to a single entry — a
-            // constructor resolving to the abstract one then cannot
-            // reach the concrete sibling. The FQN entries are additive
-            // (distinct keys) so existing simple-name lookups are
-            // unaffected while both definitions stay reachable.
+            // declaring the same simple name would otherwise collapse
+            // to a single entry, blocking a constructor from reaching
+            // the sibling. The FQN entries are additive (distinct
+            // keys) so existing simple-name lookups are unaffected
+            // while both definitions stay reachable.
             if !def.fqn.is_empty() && def.fqn != c.name.name {
                 classes.insert(def.fqn.clone(), std::sync::Arc::clone(&def));
             }
@@ -1640,8 +1633,7 @@ fn build_module_with_overrides(
                 }
             }
             // Inherited members are reachable without an explicit
-            // receiver from an init block too (`initParentJob(parent)`
-            // in a `JobSupport` subclass `init`).
+            // receiver from an init block too.
             {
                 let mut seen_sup: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
@@ -2009,15 +2001,13 @@ fn build_module_with_overrides(
     // Inherited default arguments: Kotlin forbids an `override` from
     // repeating a default value, but a call that omits the argument
     // still uses the default declared on the overridden supertype
-    // member (`SendChannel.close(cause: Throwable? = null)` reached
-    // through `BufferedChannel.close(cause)`). The override's own
-    // FuncId therefore has no thunk for that parameter; without this
-    // the Vm pads the gap with `Unit`, so `_closeCause` is set to
-    // `Unit` and the `as Throwable?` cast in the `closeCause` getter
-    // throws. Propagate each supertype member's default-thunk slots
-    // onto the overriding member (matched by name + lowered arity, so
-    // the `this`-offset slot layout already lines up), leaving any
-    // slot the override itself defines untouched.
+    // member. The override's own FuncId therefore has no thunk for
+    // that parameter; without this the Vm pads the gap with `Unit`
+    // and downstream type-checked accesses fail. Propagate each
+    // supertype member's default-thunk slots onto the overriding
+    // member (matched by name + lowered arity, so the `this`-offset
+    // slot layout already lines up), leaving any slot the override
+    // itself defines untouched.
     {
         let abstract_defaults = module.registry.abstract_member_defaults.clone();
         let by_id: std::collections::HashMap<u32, usize> = module

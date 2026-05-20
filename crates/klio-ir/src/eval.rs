@@ -483,7 +483,7 @@ pub struct SuspendState {
     pub token: u64,
     pub frames: Vec<FrameSnapshot>,
     /// Opaque Layer-2 resume directive, set by the suspending API
-    /// (a `kotlinx.coroutines` primitive) and interpreted only by
+    /// (a suspending primitive) and interpreted only by
     /// the interceptor — never by Layer 1. The default cooperative
     /// interceptor reads it as virtual-time millis: `>= 0` resumes
     /// after that much virtual time, `< 0` parks indefinitely until
@@ -1404,12 +1404,11 @@ fn exec_inst(
             // implicit-receiver member probe and member dispatch and
             // bind the captured callable via the global path below.
             // But a genuine member of the implicit receiver still wins
-            // over an *over-captured* scoped global: anon-object
-            // capture sets are built from the whole visible scope, so
-            // a name like `emit` can land in the capture layer even
-            // though the real binding is the receiver's member
-            // (`SafeCollector.emit`). Only shadow when the receiver
-            // does not actually carry the member.
+            // over an over-captured scoped global: anon-object capture
+            // sets are built from the whole visible scope, so a bare
+            // name can land in the capture layer even though the real
+            // binding is the receiver's member. Only shadow when the
+            // receiver does not actually carry the member.
             let shadow_capture = host.is_shadowing_capture(&name_str)
                 && !(!matches!(this_val, Value::Null | Value::Unit)
                     && host.host_has_member(&this_val, &name_str));
@@ -1417,14 +1416,11 @@ fn exec_inst(
             // the lambda's own `this` or of any lexically enclosing
             // `this@…` outranks a same-named top-level extension.
             // Probe each receiver for a member only (no extension /
-            // SAM / global) before the general resolution below — so
-            // bare `collect` inside upstream `transform`'s
-            // `flow { collect { … } }` binds the enclosing source
-            // flow's `collect` member instead of the
-            // `Flow<T>.collect` extension on the inner `flow{}`
-            // collector. Extensions still resolve normally below when
-            // no receiver in the chain has the member (so `isEmpty`
-            // / `withData` etc. are unaffected).
+            // SAM / global) before the general resolution below — so a
+            // bare name inside a nested lambda binds the enclosing
+            // receiver's member when one is in scope. Extensions still
+            // resolve normally below when no receiver in the chain has
+            // the member.
             if !is_ctor_name && !shadow_capture {
                 let mut chain: Vec<Value> = Vec::new();
                 if !matches!(this_val, Value::Null | Value::Unit) {
@@ -1542,14 +1538,12 @@ fn exec_inst(
                     };
                 }
             }
-            // The receiver is known to carry this member but none of
-            // the probes above bound it (a pack actual class such as
-            // `SafeCollector` whose method is registered via the
-            // hierarchy map rather than the IR class table). Dispatch
-            // the member rather than fall through to the global path —
-            // an unqualified `emit` inside a Flow operator's receiver
-            // lambda is the collector's member, and the global path
-            // would mis-bind it to a captured closure and recurse.
+            // The receiver carries this member but none of the probes
+            // above bound it (a class whose method is registered via
+            // the hierarchy map rather than the IR class table).
+            // Dispatch the member rather than fall through to the
+            // global path, which would otherwise mis-bind to a
+            // captured closure and recurse.
             if resolved.is_none()
                 && !is_ctor_name
                 && !matches!(this_val, Value::Null | Value::Unit)
@@ -1585,19 +1579,13 @@ fn exec_inst(
                             )?,
                             None => {
                                 // Last resort: a bare call that is a
-                                // member of the frame's own `this`
-                                // (`this` is a bound param, not a
-                                // capture, in a method/extension body —
-                                // e.g. `detachChildIfNonReusable()` in
-                                // `CancellableContinuationImpl
-                                // .parentCancelled`). Dispatch it on
-                                // that receiver before giving up.
-                                // The frame's bound `this` param
-                                // (method/extension body) or, when the
-                                // bare call is inside a lambda (e.g.
-                                // the atomicfu `_state.loop { … }`
-                                // closure in `cancel`), the lexically
-                                // enclosing receiver.
+                                // The frame's bound `this` param (the
+                                // method / extension body) — or, when
+                                // the bare call is inside a lambda,
+                                // the lexically enclosing receiver.
+                                // Dispatch the bare call on it before
+                                // giving up so a sibling method
+                                // call resolves.
                                 let own_this = frame
                                     .func
                                     .params

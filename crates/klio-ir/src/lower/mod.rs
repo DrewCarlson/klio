@@ -930,7 +930,7 @@ pub fn lower_function_body_into(
 /// receiver excluded) so runtime overload resolution can match a
 /// lambda argument by its parameter count — the only way to tell
 /// apart overloads that differ solely in the shape of a functional
-/// parameter (e.g. kotlinx-io's two `UnsafeBufferOperations.writeToTail`).
+/// parameter.
 fn lowered_type_name(ty: &klio_ast::TypeRef) -> String {
     if let Some(ft) = &ty.function {
         return format!("Function{}", ft.params.len());
@@ -2370,9 +2370,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // genuine local function shadows; a same-named
                     // member function outranks the value, so skip the
                     // value-invocation path and fall through to member
-                    // dispatch. A bare param that is *not* a hierarchy
-                    // member (kotlinx-io's `yield: (Char)->Unit`
-                    // parameter) still invokes the value.
+                    // dispatch. A bare param that is not a hierarchy
+                    // member still invokes the value.
                     let redirect_to_member = {
                         let n = &segments[0].name;
                         let is_hierarchy_method = b
@@ -2501,17 +2500,17 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // Path-callee with a registered top-level fn → Call{func}.
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
-                    // When a class and a top-level function share this
-                    // name (e.g. kotlinx-io's `class ByteString` plus
-                    // the `fun ByteString(bytes)` factory), the call
-                    // is a constructor invocation whenever the
-                    // function isn't applicable to the supplied
-                    // argument count. Defer to the NewInstance path
-                    // below so the Vm's ctor overload resolution
-                    // picks the right (possibly private/secondary)
-                    // constructor. Only kicks in on the
-                    // class+function name clash, so ordinary
-                    // default/vararg calls are unaffected.
+                    // When a class and a top-level function share
+                    // this name (a class plus a same-named factory
+                    // function), the call is a constructor
+                    // invocation whenever the function isn't
+                    // applicable to the supplied argument count.
+                    // Defer to the NewInstance path below so the
+                    // Vm's ctor overload resolution picks the right
+                    // (possibly private/secondary) constructor.
+                    // Only kicks in on the class+function name
+                    // clash, so ordinary default/vararg calls are
+                    // unaffected.
                     // The factory function is applicable whenever it
                     // can accept the supplied positional count —
                     // fewer args than params is fine (trailing params
@@ -2863,16 +2862,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // class dispatch (including IR-native FuncId lookup)
             // fires.
             if let Expr::Path { segments, .. } = callee.as_ref() {
-                // A bare contract call carrying a trailing lazy-message
-                // lambda — `require(cond) { "msg" }` / `check(...) {
-                // ... }` — is the stdlib contract, not a same-named
-                // member. kotlinx-io's `Buffer` implements
-                // `Source.require(byteCount: Long)`, which would
-                // otherwise capture `require(boolean) { ... }` and run
-                // the Boolean condition through the `Long` member.
-                // Kotlin resolves this by applicability; here the
-                // trailing lambda is the discriminator (the member
-                // takes no lambda).
+                // A bare contract call carrying a trailing
+                // lazy-message lambda — `require(cond) { "msg" }` /
+                // `check(...) { ... }` — is the stdlib contract,
+                // not a same-named user member. Kotlin resolves
+                // this by applicability; here the trailing lambda
+                // is the discriminator.
                 let contract_with_msg = segments.len() == 1
                     && matches!(
                         segments[0].name.as_str(),
@@ -3045,14 +3040,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 }
             }
             // Package-qualified call to a user / pack top-level
-            // function: `kotlinx.atomicfu.atomic(0)`. `func_index` is
-            // keyed by simple name (the package prefix lives on the
-            // decl's `fqn`), so resolve the trailing segment and emit
-            // the same `Inst::Call` the bare-name form uses — eval's
-            // `pick_overload` then selects the right shape by runtime
-            // arg types. Only fires when the tail names a module
-            // function, so intrinsic FQNs (`kotlin.math.abs`) still
-            // take the LoadGlobal path below.
+            // function. `func_index` is keyed by simple name (the
+            // package prefix lives on the decl's `fqn`), so resolve
+            // the trailing segment and emit the same `Inst::Call`
+            // the bare-name form uses; eval's `pick_overload` then
+            // selects the right shape by runtime arg types. Only
+            // fires when the tail names a module function, so
+            // intrinsic FQNs still take the LoadGlobal path below.
             if let Expr::Member { .. } = callee.as_ref() {
                 if let Some(fqn) = collect_dotted_fqn(callee) {
                     if let (Some(head), Some(tail)) =

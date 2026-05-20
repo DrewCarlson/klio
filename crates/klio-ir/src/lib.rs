@@ -685,12 +685,10 @@ impl Module {
                 && existing.init_block.is_none();
             // A reserved-stub fill, or the same class re-lowered
             // (identical FQN), overwrites in place so forward
-            // references keep their id. A *different* fully-qualified
+            // references keep their id. A different fully-qualified
             // name sharing the simple name is a genuinely distinct
-            // class from another package
-            // (`kotlinx.coroutines.internal.Segment` vs
-            // `kotlinx.io.Segment`): give it its own ClassId so its
-            // methods are not collapsed onto the sibling. The
+            // class from another package: give it its own ClassId so
+            // its methods are not collapsed onto the sibling. The
             // simple-name index keeps its first entry, so `class_id`
             // and the reserve/forward-reference machinery are
             // unchanged; the distinct class is reachable via

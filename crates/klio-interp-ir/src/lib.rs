@@ -1582,10 +1582,9 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         ];
         // Loaded packs register their FQNs in `installed_bindings`.
         // For a bare-name reference, scan the overlay for a key that
-        // ends with `.{name}` — this lets user code call
-        // `runBlocking { … }` after `import kotlinx.coroutines.runBlocking`
-        // without having to teach `direct_probes` about every kotlinx
-        // package.
+        // ends with `.{name}` so user code can call an imported
+        // function by simple name without having to teach
+        // `direct_probes` about every pack's package.
         {
             let suffix = format!(".{name}");
             let entry: Option<(&'static str, klio_runtime::StdlibFn)> = self.prog
@@ -1707,13 +1706,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
         }
         // Package-qualified reference (not a call) to a user / pack
-        // top-level class: `kotlinx.atomicfu.AtomicInt::class`. The
-        // class table is keyed by simple name (the package prefix
-        // lives on each decl's `fqn`), so retry the trailing segment.
-        // Reached only after every other probe returned `None`, so a
-        // name that already resolves is untouched. Package-qualified
-        // *calls* are routed through `Inst::Call` at lower time so
-        // they keep overload resolution; this only covers bare refs.
+        // top-level class. The class table is keyed by simple name
+        // (the package prefix lives on each decl's `fqn`), so retry
+        // the trailing segment. Reached only after every other probe
+        // returned `None`, so a name that already resolves is
+        // untouched. Package-qualified *calls* are routed through
+        // `Inst::Call` at lower time so they keep overload
+        // resolution; this only covers bare refs.
         if let Some((_, tail)) = name.rsplit_once('.') {
             if tail != name && !tail.is_empty() {
                 if let Some(def) = self.classes.borrow().get(tail).cloned() {
@@ -2624,18 +2623,15 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let recv_fqn = inst.borrow().class.fqn.clone();
             let getter_fid = {
                 let mut found: Option<klio_ir::FuncId> = None;
-                // The receiver's own class is resolved by its
+                // Resolve the receiver's own class by its
                 // package-qualified FQN: the simple-name getter table
-                // collides across packages (`kotlinx.io.Segment.next`
-                // is a plain field; the abstract
-                // `kotlinx.coroutines.internal.Segment` has a `next`
-                // getter). When the class is package-qualified, only
-                // its FQN-keyed entry may bind the getter for its own
-                // properties; a miss means this class has no such
-                // getter (use the raw field) rather than borrowing a
-                // same-simple-name sibling's. Supertype levels keep
-                // the simple-name walk (their names are recorded
-                // simple and are package-local).
+                // can collide across packages. When the class is
+                // package-qualified, only its FQN-keyed entry may
+                // bind the getter for its own properties; a miss
+                // means this class has no such getter (use the raw
+                // field) rather than borrowing a same-simple-name
+                // sibling's. Supertype levels keep the simple-name
+                // walk (their names are recorded simple).
                 let own_is_qualified = recv_fqn != class_name;
                 if own_is_qualified {
                     found = self
@@ -2647,13 +2643,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 if found.is_none() {
                     let mut cur = if own_is_qualified {
                         // Skip the colliding own-class simple-name
-                        // probe and continue from *this instance's*
+                        // probe and continue from this instance's
                         // supertypes — `self.classes` is simple-name
                         // keyed, so looking the own class up there
-                        // would return a same-name sibling from
-                        // another package and walk its hierarchy
-                        // (`kotlinx.coroutines.internal.Segment :
-                        // ConcurrentLinkedListNode`).
+                        // could return a same-name sibling from
+                        // another package and walk its hierarchy.
                         inst.borrow().class.supertype_names.first().cloned()
                     } else {
                         Some(class_name.clone())
@@ -2814,10 +2808,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         // Kotlin: an inner class accessing an enclosing
                         // instance's property goes through that
                         // property's accessor. A getter-only outer
-                        // property (`BufferedChannel.closeCause`) has no
-                        // raw field, so resolve it via the outer's
-                        // getter — bounded by the identity+name guard so
-                        // mutually-forwarding instances cannot loop.
+                        // An outer-class property accessed through an
+                        // inner instance may not exist as a raw field
+                        // and only resolves through the outer's
+                        // getter — bounded by the identity+name guard
+                        // so mutually-forwarding instances cannot loop.
                         let oid =
                             klio_runtime::ObjRef::as_ptr(outer_inst) as usize;
                         if let Some(Ok(v)) = with_field_resolve_pair(
@@ -4581,10 +4576,9 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         type_args: &[String],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         // Overload resolution: when the target function shares its
-        // name with siblings (typical for packs like
-        // `kotlinx.atomicfu` declaring multiple `atomic(...)` shapes),
-        // the IR call site bakes in the first FuncId at lower time —
-        // pick the best match here using the runtime arg types.
+        // name with siblings, the IR call site bakes in the first
+        // FuncId at lower time — pick the best match here using the
+        // runtime arg types.
         let func = self.pick_overload(module, func, &args).unwrap_or(func);
         // Incompatible-receiver guard (sound, narrow): a bare call
         // baked to a top-level extension (`fun R.f`, param0
@@ -5691,8 +5685,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
                 // `CharArray.concatToString()` /
                 // `concatToString(startIndex, endIndex)` — join the
-                // Char elements (used by kotlinx-io's
-                // commonToUtf8String).
+                // Char elements.
                 ("concatToString", 0) | ("concatToString", 2) => {
                     let chars = items.borrow();
                     let (start, end) = if args.len() == 2 {
@@ -6086,14 +6079,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // each name maps back to a klio_ir::Class via the
             // module's class_index.
             let class_name = inst.borrow().class.name.clone();
-            // The receiver's own class is resolved by its
-            // fully-qualified name: two packages may declare the same
-            // simple name (`kotlinx.io.Segment` vs the abstract
-            // `kotlinx.coroutines.internal.Segment`); a bare-name
-            // lookup would bind the first IR class and lose this
-            // class's members (`Segment.writeInt`). Supertype levels
-            // keep the simple-name walk (their names are recorded
-            // simple).
+            // Resolve the receiver's own class by its fully-qualified
+            // name: two packages may declare the same simple name,
+            // and a bare-name lookup would bind the first IR class
+            // and lose this class's members. Supertype levels keep
+            // the simple-name walk (their names are recorded simple).
             let recv_fqn = inst.borrow().class.fqn.clone();
             let mut first = true;
             let mut queue: std::collections::VecDeque<String> =
@@ -6434,9 +6424,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let want = args.len() + 1;
             // Accept an extension whose declared arity is >= the
             // supplied (receiver + args) count when every trailing
-            // unsupplied parameter has a default — kotlinx-io's
-            // `fun Sink.writeString(s, startIndex = 0, endIndex =
-            // s.length)` is called as `sink.writeString("x")`.
+            // unsupplied parameter has a default.
             let candidates: Vec<(klio_ir::FuncId, klio_ir::Func)> = self
                 .module
                 .func_index
@@ -7169,14 +7157,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         // Positional / no-named-args instance call. Run normal
         // dispatch FIRST so klio's stdlib-intrinsic shadowing wins —
-        // e.g. the native `kotlinx.atomicfu.AtomicRef.compareAndSet`
-        // must beat the pack's IR fallback-stub body (which returns a
-        // constant `false`, making `_state.loop { … compareAndSet …
-        // }` spin forever). Only if `call_member` yields klio's
-        // "no such member" sentinel (`Unimplemented`) do we walk the
-        // class hierarchy in `module.classes` for a method that
-        // lowers with a class-qualified func name, reached bare from
-        // inside a closure — `host_has_member` reports present but
+        // A native stdlib-bound method must beat a pack's IR
+        // fallback-stub body of the same name (the stub typically
+        // returns a constant that would spin a CAS loop forever).
+        // Only if `call_member` yields klio's "no such member"
+        // sentinel (`Unimplemented`) do we walk the class hierarchy
+        // in `module.classes` for a method that lowers with a
+        // class-qualified func name, reached bare from inside a
+        // closure — `host_has_member` reports it as present but
         // `call_member` cannot dispatch the bare name alone.
         let primary = self.call_member(receiver, name, args);
         if !matches!(
@@ -7365,10 +7353,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // delegation arg thunks, recurse for `: this(...)`, then
         // run the optional body block.
         let n_primary = class_def.primary_params.len();
-        // A class with no primary constructor (e.g. kotlinx-io's
-        // `Segment`, all `private constructor(...)`) initialises its
-        // fields only in a secondary constructor body. When the arg
-        // count happens to equal the (empty) primary's, dispatch must
+        // A class with no primary constructor (only `private
+        // constructor(...)` declarations) initialises its fields
+        // only in a secondary constructor body. When the arg count
+        // happens to equal the (empty) primary's, dispatch must
         // still route to the matching secondary so its body runs —
         // otherwise the instance is left with uninitialised fields.
         let zero_primary_secondary = n_primary == 0
@@ -8557,22 +8545,21 @@ thread_local! {
     /// Re-entrancy stack of `(receiver-identity, name)` pairs whose
     /// `get_field` resolution is in progress along the heuristic
     /// outer-instance / enclosing-`this` fallbacks. An inner class
-    /// reading an enclosing instance's getter-only property
-    /// (`BufferedChannelIterator` reading `BufferedChannel.closeCause`)
-    /// must reach the outer's *getter* via a recursive `get_field` on
+    /// reading an enclosing instance's getter-only property must
+    /// reach the outer's *getter* via a recursive `get_field` on
     /// the outer — but the same `(outer, name)` pair must never be
-    /// re-resolved through these fallbacks while already on the stack,
-    /// or two instances that each forward the name to the other loop
-    /// forever. Keying on identity+name makes the fallbacks provably
-    /// terminating while still allowing the one legitimate hop.
+    /// re-resolved through these fallbacks while already on the
+    /// stack, or two instances that each forward the name to the
+    /// other loop forever. Keying on identity+name makes the
+    /// fallbacks provably terminating while still allowing the one
+    /// legitimate hop.
     static FIELD_RESOLVE_STACK: std::cell::RefCell<Vec<(usize, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Stack of the active coroutine's `CoroutineScope` value (the
     /// `runBlocking` / driven-root scope). The suspend-implicit
     /// `kotlin.coroutines.coroutineContext` intrinsic is the
     /// *running* coroutine's context, not a member of whatever `this`
-    /// a suspend member happens to have (`JobSupport.join()` reads it
-    /// to check the caller's cancellation). klio has no native
+    /// a suspend member happens to have. klio has no native
     /// intrinsic, so a bare `coroutineContext` read is redirected to
     /// the active scope's context via this stack.
     static ACTIVE_CORO_SCOPE: std::cell::RefCell<Vec<klio_runtime::Value>> =
