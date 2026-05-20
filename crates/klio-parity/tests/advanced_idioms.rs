@@ -65,7 +65,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #43"]
 fn sequence_lazy_evaluation() {
     let src = r#"
 fun main() {

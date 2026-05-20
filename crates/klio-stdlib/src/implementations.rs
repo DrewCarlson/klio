@@ -4725,6 +4725,159 @@ pub fn materialise_sequence(
                 args: &[Value],
                 out: &mut dyn klio_runtime::Output|
      -> Result<Value, RuntimeError> { host.invoke_callable(f, args, out) };
+    // Streaming fast path: when every op is a per-item stage (no
+    // sort, no flatmap, no distinct) we can pump source items
+    // through the pipeline one at a time so a `take(n)` short-
+    // circuits upstream side effects.
+    let all_streaming = seq.ops.iter().all(|op| {
+        matches!(
+            op,
+            SeqOp::Map(_)
+                | SeqOp::Filter(_)
+                | SeqOp::FilterNot(_)
+                | SeqOp::Take(_)
+                | SeqOp::Drop(_)
+                | SeqOp::TakeWhile(_)
+                | SeqOp::DropWhile(_)
+        )
+    });
+    if all_streaming {
+        // Per-op streaming state.
+        let n_ops = seq.ops.len();
+        let mut taken: Vec<usize> = vec![0; n_ops];
+        let mut dropped: Vec<usize> = vec![0; n_ops];
+        let mut take_while_live: Vec<bool> = vec![true; n_ops];
+        let mut drop_while_live: Vec<bool> = vec![true; n_ops];
+        let mut output: Vec<Value> = Vec::new();
+        let pump = |host: &mut dyn klio_runtime::IntrinsicHost,
+                    out: &mut dyn klio_runtime::Output,
+                    mut current: Value,
+                    seq_ops: &[SeqOp],
+                    taken: &mut [usize],
+                    dropped: &mut [usize],
+                    take_while_live: &mut [bool],
+                    drop_while_live: &mut [bool],
+                    output: &mut Vec<Value>|
+         -> Result<bool, RuntimeError> {
+            for (idx, op) in seq_ops.iter().enumerate() {
+                match op {
+                    SeqOp::Map(f) => {
+                        current = call(host, f, std::slice::from_ref(&current), out)?;
+                    }
+                    SeqOp::Filter(f) => {
+                        if !matches!(call(host, f, std::slice::from_ref(&current), out)?, Value::Bool(true)) {
+                            return Ok(true);
+                        }
+                    }
+                    SeqOp::FilterNot(f) => {
+                        if matches!(call(host, f, std::slice::from_ref(&current), out)?, Value::Bool(true)) {
+                            return Ok(true);
+                        }
+                    }
+                    SeqOp::Take(n) => {
+                        if taken[idx] >= *n as usize {
+                            return Ok(false);
+                        }
+                        taken[idx] += 1;
+                    }
+                    SeqOp::Drop(n) => {
+                        if dropped[idx] < *n as usize {
+                            dropped[idx] += 1;
+                            return Ok(true);
+                        }
+                    }
+                    SeqOp::TakeWhile(f) => {
+                        if !take_while_live[idx] {
+                            return Ok(false);
+                        }
+                        if !matches!(call(host, f, std::slice::from_ref(&current), out)?, Value::Bool(true)) {
+                            take_while_live[idx] = false;
+                            return Ok(false);
+                        }
+                    }
+                    SeqOp::DropWhile(f) => {
+                        if drop_while_live[idx] {
+                            if matches!(call(host, f, std::slice::from_ref(&current), out)?, Value::Bool(true)) {
+                                return Ok(true);
+                            }
+                            drop_while_live[idx] = false;
+                        }
+                    }
+                    _ => unreachable!("filtered above"),
+                }
+            }
+            output.push(current);
+            Ok(true)
+        };
+        // Has any Take stage reached its cap? If so, the pipeline
+        // is exhausted and the source must NOT be pulled again — a
+        // subsequent `map { side-effect }` would otherwise fire for
+        // an item that take(N) has already excluded.
+        let take_cap_reached = |taken: &[usize]| -> bool {
+            seq.ops.iter().zip(taken.iter()).any(|(op, &t)| {
+                matches!(op, SeqOp::Take(n) if t >= *n as usize)
+            })
+        };
+        match &seq.source {
+            SequenceSource::Items(v) => {
+                for v in v.iter() {
+                    if take_cap_reached(&taken) {
+                        break;
+                    }
+                    let cont = pump(
+                        host, out, v.clone(), &seq.ops,
+                        &mut taken, &mut dropped,
+                        &mut take_while_live, &mut drop_while_live,
+                        &mut output,
+                    )?;
+                    if !cont {
+                        break;
+                    }
+                }
+            }
+            SequenceSource::Generate { seed, next } => {
+                let mut cur = seed.as_ref().map(|b| (**b).clone());
+                let limit = 1_000_000usize;
+                let mut produced = 0usize;
+                loop {
+                    if take_cap_reached(&taken) {
+                        break;
+                    }
+                    let candidate = match &cur {
+                        Some(v) => v.clone(),
+                        None => {
+                            let r = call(host, next, &[], out)?;
+                            if matches!(r, Value::Null) {
+                                break;
+                            }
+                            r
+                        }
+                    };
+                    produced += 1;
+                    if produced > limit {
+                        return Err(RuntimeError::Type(
+                            "Sequence: generator exceeded 1,000,000 items".into(),
+                        ));
+                    }
+                    let cont = pump(
+                        host, out, candidate.clone(), &seq.ops,
+                        &mut taken, &mut dropped,
+                        &mut take_while_live, &mut drop_while_live,
+                        &mut output,
+                    )?;
+                    if !cont {
+                        break;
+                    }
+                    let r = call(host, next, std::slice::from_ref(&candidate), out)?;
+                    if matches!(r, Value::Null) {
+                        break;
+                    }
+                    cur = Some(r);
+                }
+            }
+        }
+        return Ok(output);
+    }
     let mut items: Vec<Value> = match &seq.source {
         SequenceSource::Items(v) => (**v).clone(),
         SequenceSource::Generate { seed, next } => {
