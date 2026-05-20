@@ -145,7 +145,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #39"]
 fn private_member_not_overridden() {
     let src = r#"
 open class P {

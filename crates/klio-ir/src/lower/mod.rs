@@ -814,6 +814,15 @@ pub fn lower_class_with_extras(
         }
     }
     let mut methods: Vec<crate::FuncId> = Vec::new();
+    // Track private methods lowered so far in declaration order so a
+    // later method's body can statically bind to an earlier private
+    // sibling's FuncId rather than virtual-dispatching it (Kotlin:
+    // private members are invisible to subclasses, so the dispatch
+    // is fixed to the declaring class). Forward-references would
+    // need a reservation pass; the common case (helper declared
+    // before its caller) is covered.
+    let mut private_method_fids: std::collections::HashMap<String, crate::FuncId> =
+        std::collections::HashMap::new();
     for m in &c.members {
         if let klio_ast::Decl::Function(f) = m {
             // Skip bodyless methods (abstract decls in
@@ -872,8 +881,13 @@ pub fn lower_class_with_extras(
             // Use the method's own FuncId, not `funcs.len() - 1`:
             // lowering a method also pushes its default-arg thunk
             // funcs, so the last slot is no longer the method body.
-            let placed = lower_method(module, f, &c.name.name, &own_member_names);
+            let placed = lower_method_with_private(
+                module, f, &c.name.name, &own_member_names, &private_method_fids,
+            );
             methods.push(placed.id);
+            if matches!(f.visibility, klio_ast::Visibility::Private) {
+                private_method_fids.insert(f.name.name.clone(), placed.id);
+            }
         }
     }
     let supertypes: Vec<crate::ClassId> = c
@@ -1056,6 +1070,16 @@ pub fn lower_method(
     owner_class: &str,
     own_members: &std::collections::HashSet<String>,
 ) -> crate::Func {
+    lower_method_with_private(module, f, owner_class, own_members, &std::collections::HashMap::new())
+}
+
+pub fn lower_method_with_private(
+    module: &mut crate::Module,
+    f: &klio_ast::Function,
+    owner_class: &str,
+    own_members: &std::collections::HashSet<String>,
+    private_method_fids: &std::collections::HashMap<String, crate::FuncId>,
+) -> crate::Func {
     // A member extension function (`class C { fun R.f(p) { … } }`)
     // binds its *extension* receiver as `this`, like a top-level
     // extension fn. A bare member reference in its body may be a
@@ -1089,12 +1113,13 @@ pub fn lower_method(
         record_method_param_defaults(module, f, id, None, None);
         return placed;
     }
-    let func = lower_function_body_with_implicit_owner(
+    let func = lower_function_body_with_implicit_owner_priv(
         module,
         f,
         &["this"],
         Some(owner_class),
         Some(own_members),
+        Some(private_method_fids),
     );
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
@@ -1111,6 +1136,19 @@ fn lower_function_body_with_implicit_owner(
     owner_class: Option<&str>,
     own_members: Option<&std::collections::HashSet<String>>,
 ) -> crate::Func {
+    lower_function_body_with_implicit_owner_priv(
+        module, f, implicit_params, owner_class, own_members, None,
+    )
+}
+
+fn lower_function_body_with_implicit_owner_priv(
+    module: &mut crate::Module,
+    f: &klio_ast::Function,
+    implicit_params: &[&str],
+    owner_class: Option<&str>,
+    own_members: Option<&std::collections::HashSet<String>>,
+    private_method_fids: Option<&std::collections::HashMap<String, crate::FuncId>>,
+) -> crate::Func {
     let mut b = FuncBuilder::new(module);
     let mut names: Vec<&str> = Vec::with_capacity(implicit_params.len() + f.params.len());
     names.extend_from_slice(implicit_params);
@@ -1121,6 +1159,9 @@ fn lower_function_body_with_implicit_owner(
     }
     if let Some(set) = own_members {
         let _ = b.set_own_members(set.clone());
+    }
+    if let Some(map) = private_method_fids {
+        b.set_private_method_fids(map.clone());
     }
     if f.is_tailrec {
         let _ = b.set_tailrec_self(f.name.name.clone());
@@ -2885,6 +2926,49 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     && b.has_own_member(&segments[0].name)
                 {
                     if let Some(this_reg) = b.resolve("this") {
+                        // Private own-class methods bind statically:
+                        // a `private fun` is invisible to subclasses,
+                        // so a bare call to one must reach the
+                        // declaring-class implementation rather than
+                        // a same-named override in a subclass that
+                        // happens to be the runtime receiver.
+                        if let Some(fid) =
+                            b.private_method_fid(&segments[0].name)
+                        {
+                            // Prepend `this` as the first positional
+                            // argument; the static call's param[0] is
+                            // the implicit receiver. The arg-names
+                            // vector also gets a leading None so a
+                            // named-arg call (`pick(b = 5)`) doesn't
+                            // mis-bind the `this` slot to the user's
+                            // first named parameter.
+                            let args_start = b.alloc_reg();
+                            b.push(Inst::Move {
+                                dst: args_start,
+                                src: this_reg,
+                            });
+                            for (i, a) in args.iter().enumerate() {
+                                let r = lower_expr(b, a);
+                                b.push(Inst::Move {
+                                    dst: Reg(args_start.0 + i as u32 + 1),
+                                    src: r,
+                                });
+                            }
+                            let mut user_arg_names: Vec<Option<String>> =
+                                vec![None];
+                            user_arg_names.extend(ast_arg_names.iter().cloned());
+                            let arg_names = intern_arg_names(b.module, &user_arg_names);
+                            let dst = b.alloc_reg();
+                            b.push(Inst::Call {
+                                dst,
+                                func: fid,
+                                args: args_start,
+                                n_args: args.len() as u8 + 1,
+                                arg_names,
+                                type_args: Vec::new(),
+                            });
+                            return dst;
+                        }
                         let (args_start, count) = lower_arg_run(b, args);
                         let arg_names = intern_arg_names(b.module, ast_arg_names);
                         let dst = b.alloc_reg();

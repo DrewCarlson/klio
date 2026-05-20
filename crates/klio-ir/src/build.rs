@@ -67,6 +67,14 @@ pub struct FuncBuilder<'a> {
     /// body lowering to know whether an unqualified `foo(...)`
     /// is `this.foo(...)` (a class member) or a global lookup.
     own_members: std::collections::HashSet<String>,
+    /// Private methods of `owner_class` that have already been
+    /// lowered (so their FuncIds are known). A bare call in this
+    /// builder's body resolving to a name in this map binds
+    /// statically to the listed FuncId rather than virtual-
+    /// dispatching, matching Kotlin's rule that a `private fun`
+    /// is invisible to subclasses and binds at the declaring
+    /// site.
+    private_method_fids: std::collections::HashMap<String, crate::FuncId>,
     /// When the function is `tailrec`, the simple name of the
     /// function itself. Self-calls (`Path("<name>")(...)`) are
     /// lowered as `Terminator::TailJump` to keep the stack
@@ -153,6 +161,7 @@ impl<'a> FuncBuilder<'a> {
             any_typed_locals: std::collections::HashSet::new(),
             owner_class: None,
             own_members: std::collections::HashSet::new(),
+            private_method_fids: std::collections::HashMap::new(),
             tailrec_self: None,
             param_names: std::collections::HashSet::new(),
             local_fns: std::collections::HashSet::new(),
@@ -413,6 +422,16 @@ impl<'a> FuncBuilder<'a> {
     }
     pub fn set_own_members(&mut self, set: std::collections::HashSet<String>) {
         self.own_members = set;
+    }
+    pub fn set_private_method_fids(
+        &mut self,
+        map: std::collections::HashMap<String, crate::FuncId>,
+    ) {
+        self.private_method_fids = map;
+    }
+    #[must_use]
+    pub fn private_method_fid(&self, name: &str) -> Option<crate::FuncId> {
+        self.private_method_fids.get(name).copied()
     }
     pub fn has_own_member(&self, name: &str) -> bool {
         self.own_members.contains(name)
