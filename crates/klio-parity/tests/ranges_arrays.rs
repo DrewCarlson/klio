@@ -117,7 +117,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #54"]
 fn int_array_indexed_iter() {
     let src = r#"
 fun main() {

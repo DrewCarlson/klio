@@ -361,6 +361,15 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.IntArray.isEmpty", array_is_empty),
     ("kotlin.IntArray.isNotEmpty", array_is_not_empty),
     ("kotlin.IntArray.sum", array_sum_int),
+    ("kotlin.Array.withIndex", coll_array_with_index),
+    ("kotlin.IntArray.withIndex", coll_array_with_index),
+    ("kotlin.LongArray.withIndex", coll_array_with_index),
+    ("kotlin.DoubleArray.withIndex", coll_array_with_index),
+    ("kotlin.FloatArray.withIndex", coll_array_with_index),
+    ("kotlin.ShortArray.withIndex", coll_array_with_index),
+    ("kotlin.ByteArray.withIndex", coll_array_with_index),
+    ("kotlin.CharArray.withIndex", coll_array_with_index),
+    ("kotlin.BooleanArray.withIndex", coll_array_with_index),
     ("kotlin.LongArray.sum", array_sum_int),
     ("kotlin.DoubleArray.sum", array_sum_int),
     ("kotlin.FloatArray.sum", array_sum_int),
@@ -6783,6 +6792,19 @@ fn coll_list_with_index(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .iter()
         .enumerate()
         .map(|(i, v)| Value::Pair(Box::new(Value::new_int(i)), Box::new(v.clone())))
+        .collect();
+    Ok(make_list(indexed, false))
+}
+
+fn coll_array_with_index(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(
+        ctx.args.first().ok_or_else(|| RuntimeError::Type("Array.withIndex requires a receiver".into()))?,
+        "Array.withIndex",
+    )?;
+    let indexed: Vec<Value> = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| Value::Pair(Box::new(Value::new_int(i)), Box::new(v)))
         .collect();
     Ok(make_list(indexed, false))
 }
