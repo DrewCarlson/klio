@@ -86,6 +86,12 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // ----- String -----
     ("kotlin.String.compareTo", string_compare_to),
     ("kotlin.String.contains", string_contains),
+    ("kotlin.String.filter", string_filter),
+    ("kotlin.String.count", string_count),
+    ("kotlin.String.map", string_map),
+    ("kotlin.String.any", string_any),
+    ("kotlin.String.all", string_all),
+    ("kotlin.String.none", string_none),
     ("kotlin.String.endsWith", string_ends_with),
     ("kotlin.String.get", string_get),
     ("kotlin.String.indexOf", string_index_of),
@@ -3113,6 +3119,93 @@ fn string_ends_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         "endsWith",
     )?;
     Ok(Value::Bool(s.ends_with(&suffix)))
+}
+
+fn string_filter(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.filter")?.clone();
+    if ctx.args.len() < 2 {
+        return Err(RuntimeError::Arity("filter requires a block".into()));
+    }
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result = String::new();
+    for ch in s.chars() {
+        let v = Value::Char(ch);
+        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+            result.push(ch);
+        }
+    }
+    Ok(Value::String(Arc::new(result)))
+}
+
+fn string_count(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.count")?.clone();
+    if ctx.args.len() == 1 {
+        return Ok(Value::new_int(s.chars().count() as i64));
+    }
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut n: i64 = 0;
+    for ch in s.chars() {
+        let v = Value::Char(ch);
+        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+            n += 1;
+        }
+    }
+    Ok(Value::new_int(n))
+}
+
+fn string_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.map")?.clone();
+    if ctx.args.len() < 2 {
+        return Err(RuntimeError::Arity("map requires a block".into()));
+    }
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result: Vec<Value> = Vec::with_capacity(s.chars().count());
+    for ch in s.chars() {
+        let v = Value::Char(ch);
+        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
+        result.push(r);
+    }
+    Ok(make_list(result, false))
+}
+
+fn string_any(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.any")?.clone();
+    if ctx.args.len() == 1 {
+        return Ok(Value::Bool(!s.is_empty()));
+    }
+    let block = ctx.args[1].clone();
+    let CallCtx { out, host, .. } = ctx;
+    for ch in s.chars() {
+        let v = Value::Char(ch);
+        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn string_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.all")?.clone();
+    let block = ctx.args.get(1).cloned();
+    let Some(block) = block else {
+        return Err(RuntimeError::Arity("all requires a block".into()));
+    };
+    let CallCtx { out, host, .. } = ctx;
+    for ch in s.chars() {
+        let v = Value::Char(ch);
+        if !matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn string_none(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let r = string_any(ctx)?;
+    Ok(Value::Bool(matches!(r, Value::Bool(false))))
 }
 
 fn string_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
