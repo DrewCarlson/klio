@@ -34,7 +34,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #44"]
 fn lateinit_var_with_isInitialized() {
     let src = r#"
 class Box { lateinit var name: String }
