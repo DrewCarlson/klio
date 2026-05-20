@@ -402,6 +402,14 @@ pub trait Host {
     /// Default: no-op (non-Vm Hosts have no enclosing-this stack).
     fn push_access_enclosing(&self, _v: &Value) {}
     fn pop_access_enclosing(&self) {}
+
+    /// Stash an outer-`this` candidate for a soon-to-be-allocated
+    /// inner-class instance. The host pops it at the matching
+    /// `pop_inner_outer_hint` call after `new_instance_named`
+    /// returns, and consults the top during init-block dispatch so
+    /// the instance carries `outer` before any init body runs.
+    fn push_inner_outer_hint(&mut self, _v: &Value) {}
+    fn pop_inner_outer_hint(&mut self) {}
     /// True when `name` is bound, in the innermost scoped-global layer
     /// (an anon-object method's capture env), to a callable value. A
     /// captured callable is a closed-over parameter/local, which in
@@ -1799,26 +1807,35 @@ fn exec_inst(
         Inst::NewInstance { dst, class, args, n_args, arg_names } => {
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
-            let result = host.new_instance_named(*class, &arg_values, &names)?;
             // A bare `Inner(args)` inside a member of the enclosing
             // class is `this@Outer.Inner(args)` — an `inner class`
-            // captures the enclosing instance. Wire its `outer` from
-            // the current `this` param when the qualified-receiver
-            // construction path didn't already set it.
+            // captures the enclosing instance. Surface the caller's
+            // `this` to the host *before* allocation so init blocks
+            // running on the new Inner instance can reach outer
+            // members through the `outer` chain.
+            let outer_hint = frame
+                .func
+                .params
+                .iter()
+                .position(|p| p.name == "this")
+                .and_then(|i| frame.params.get(i).cloned())
+                .filter(|v| matches!(v, Value::Instance(_)));
+            if let Some(h) = &outer_hint {
+                host.push_inner_outer_hint(h);
+            }
+            let result = host.new_instance_named(*class, &arg_values, &names);
+            if outer_hint.is_some() {
+                host.pop_inner_outer_hint();
+            }
+            let result = result?;
             if let Value::Instance(inst) = &result {
                 let needs_outer = {
                     let b = inst.borrow();
                     b.class.is_inner && b.outer.is_none()
                 };
                 if needs_outer {
-                    if let Some(this_idx) =
-                        frame.func.params.iter().position(|p| p.name == "this")
-                    {
-                        if let Some(this_val @ Value::Instance(_)) =
-                            frame.params.get(this_idx)
-                        {
-                            inst.borrow_mut().outer = Some(this_val.clone());
-                        }
+                    if let Some(h) = outer_hint {
+                        inst.borrow_mut().outer = Some(h);
                     }
                 }
             }

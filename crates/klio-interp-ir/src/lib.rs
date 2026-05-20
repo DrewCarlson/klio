@@ -1453,6 +1453,16 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         )
     }
 
+    fn push_inner_outer_hint(&mut self, v: &klio_runtime::Value) {
+        with_inner_outer_hint(|s| s.borrow_mut().push(v.clone()));
+    }
+
+    fn pop_inner_outer_hint(&mut self) {
+        with_inner_outer_hint(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+
     fn push_access_enclosing(&self, v: &klio_runtime::Value) {
         with_outer_this(|s| s.borrow_mut().push(v.clone()));
     }
@@ -8028,6 +8038,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 inst.borrow_mut().outer = Some(default_outer);
             }
         }
+        // Inner-class allocation: the caller's `Inst::NewInstance`
+        // handler stashed the active `this` so init bodies can resolve
+        // outer-class members through the outer-chain walk in
+        // `get_field`. Wire it on the instance before init runs.
+        if class_def.is_inner && inst.borrow().outer.is_none() {
+            if let Some(hint) =
+                with_inner_outer_hint(|s| s.borrow().last().cloned())
+            {
+                inst.borrow_mut().outer = Some(hint);
+            }
+        }
         // Publish object / companion singletons into globals *before*
         // their body-property initialisers and init blocks run, so a
         // companion whose initialiser (transitively) references the
@@ -8995,6 +9016,11 @@ struct ExecState {
     /// back to the top of this stack when the inner receiver lacks
     /// the member.
     outer_this: RefCell<Vec<klio_runtime::Value>>,
+    /// Outer-`this` candidates for inner-class allocation. Pushed by
+    /// the IR's `Inst::NewInstance` handler before each inner-class
+    /// new_instance call so init blocks can read the soon-to-be
+    /// `outer` field through the runtime's outer-chain walk.
+    inner_outer_hint: RefCell<Vec<klio_runtime::Value>>,
 }
 
 thread_local! {
@@ -9163,6 +9189,12 @@ fn with_ctor_guard<R>(f: impl FnOnce(&RefCell<Vec<String>>) -> R) -> R {
 
 /// Run `f` against this thread's enclosing-`this` stack for receiver
 /// lambdas.
+fn with_inner_outer_hint<R>(
+    f: impl FnOnce(&RefCell<Vec<klio_runtime::Value>>) -> R,
+) -> R {
+    EXEC.with(|e| f(&e.inner_outer_hint))
+}
+
 fn with_outer_this<R>(f: impl FnOnce(&RefCell<Vec<klio_runtime::Value>>) -> R) -> R {
     EXEC.with(|e| f(&e.outer_this))
 }

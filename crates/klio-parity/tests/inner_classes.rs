@@ -197,3 +197,29 @@ fun main() {
     assert_klio("anon_abstract_pipeline", src,
         "1:4,2:4,3:4\n1:9,2:9,3:9\n");
 }
+
+#[test]
+fn inner_class_init_block_sees_outer_field() {
+    let src = r#"
+class Listener
+class Bus {
+    val listeners = mutableListOf<Listener>()
+    inner class Subscription(val l: Listener) {
+        init { listeners.add(l) }
+        fun unsubscribe() { listeners.remove(l) }
+    }
+    fun subscribe(l: Listener): Subscription = Subscription(l)
+}
+fun main() {
+    val b = Bus()
+    val s1 = b.subscribe(Listener())
+    val s2 = b.subscribe(Listener())
+    println(b.listeners.size)
+    s1.unsubscribe()
+    println(b.listeners.size)
+    s2.unsubscribe()
+    println(b.listeners.size)
+}
+"#;
+    assert_klio("inner_init_outer", src, "2\n1\n0\n");
+}
