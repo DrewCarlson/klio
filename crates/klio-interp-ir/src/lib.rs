@@ -9767,7 +9767,26 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                         with_outer_this(|s| s.borrow_mut().push(p.clone()));
                     }
                 }
+                // The new receiver is bound to the lambda's captured
+                // `this` slot above. The member-extension visibility
+                // filter consults the runtime enclosing-this stack, not
+                // closure captures, so push the receiver for the
+                // duration of the lambda call: a `with(a) { … }` body
+                // that calls a member-extension declared on `a`'s
+                // class then sees that owner as visible.
+                let pushed_receiver = matches!(
+                    this,
+                    klio_runtime::Value::Instance(_)
+                );
+                if pushed_receiver {
+                    with_outer_this(|s| s.borrow_mut().push(this.clone()));
+                }
                 let result = self.invoke_callable(callable, &all, out);
+                if pushed_receiver {
+                    with_outer_this(|s| {
+                        s.borrow_mut().pop();
+                    });
+                }
                 if pushed_outer {
                     with_outer_this(|s| {
                         s.borrow_mut().pop();

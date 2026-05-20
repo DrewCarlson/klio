@@ -118,3 +118,39 @@ fun main() {
 "#;
     assert_klio("ext_qualifier", src, "6|6\n");
 }
+
+#[test]
+fn with_receiver_member_extension_visible_in_lambda() {
+    let src = r#"
+class A {
+    val tag = "T"
+    fun List<Int>.show(): String = joinToString(",") { "$tag:$it" }
+}
+fun main() {
+    val a = A()
+    val r = with(a) { listOf(1, 2, 3).show() }
+    println(r)
+}
+"#;
+    assert_klio("with_member_ext", src, "T:1,T:2,T:3\n");
+}
+
+#[test]
+fn with_receiver_member_extension_virtual_override() {
+    let src = r#"
+open class Animal {
+    open val sound: String = "?"
+    open fun List<Int>.tagged(): String = joinToString(",") { "$sound:$it" }
+}
+class Dog : Animal() {
+    override val sound: String = "woof"
+}
+fun main() {
+    val d = Dog()
+    val r = with(d) { listOf(1, 2, 3).tagged() }
+    println(r)
+}
+"#;
+    assert_klio("with_member_ext_virtual", src,
+        "woof:1,woof:2,woof:3\n");
+}
