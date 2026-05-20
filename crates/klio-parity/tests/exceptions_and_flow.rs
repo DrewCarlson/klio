@@ -103,7 +103,6 @@ fun main() {
 }
 
 #[test]
-#[ignore = "tracked as task #42"]
 fn finally_overrides_value_if_returns() {
     let src = r#"
 fun f(): Int {

@@ -685,6 +685,7 @@ fn run_frame_inner<'a>(
     host: &mut dyn Host,
 ) -> Result<Value, EvalError> {
     let mut pending_rethrow: Option<(BlockId, Value)> = None;
+    let mut pending_return: Option<(BlockId, Value)> = None;
     loop {
         // Push any catch / finally metadata attached to this block.
         let (insts, term, catches, finally) = {
@@ -779,6 +780,38 @@ fn run_frame_inner<'a>(
             }
             continue;
         }
+        // Finally exit with a pending return: replay the return
+        // through any outer finally, otherwise complete it.
+        if let Some((fin, _)) = &pending_return {
+            if *fin == cur && matches!(term, Terminator::Goto(_)) {
+                let (_, v) = pending_return.take().unwrap();
+                let mut chosen: Option<(usize, BlockId)> = None;
+                for i in (0..try_stack.len()).rev() {
+                    if let Some(fin2) = try_stack[i].2 {
+                        chosen = Some((i, fin2));
+                        break;
+                    }
+                }
+                if let Some((i, fin2)) = chosen {
+                    try_stack.truncate(i);
+                    pending_return = Some((fin2, v));
+                    cur = fin2;
+                    continue;
+                }
+                return Ok(v);
+            }
+            if *fin == cur
+                && matches!(
+                    term,
+                    Terminator::Return(_)
+                        | Terminator::NonLocalReturn(_)
+                        | Terminator::LabeledReturn(_, _)
+                        | Terminator::Throw(_)
+                )
+            {
+                pending_return = None;
+            }
+        }
         // Finally re-throw: if we entered the current block as a
         // finally on the uncaught-throw path, and the block exits
         // via a plain Goto (no `return` / `throw` swallowed the
@@ -834,7 +867,25 @@ fn run_frame_inner<'a>(
                 cur = if value_truthy(&v)? { t } else { f };
             }
             Terminator::Return(r) => {
-                return Ok(r.map(|r| frame.read(r)).unwrap_or(Value::Unit));
+                let v = r.map(|r| frame.read(r)).unwrap_or(Value::Unit);
+                // Walk the try-stack for the nearest finally; route
+                // the return through it (finally's own exit completes
+                // the return, and an inner `return` inside finally
+                // overrides the saved value).
+                let mut chosen: Option<(usize, BlockId)> = None;
+                for i in (0..try_stack.len()).rev() {
+                    if let Some(fin) = try_stack[i].2 {
+                        chosen = Some((i, fin));
+                        break;
+                    }
+                }
+                if let Some((i, fin)) = chosen {
+                    try_stack.truncate(i);
+                    pending_return = Some((fin, v));
+                    cur = fin;
+                    continue;
+                }
+                return Ok(v);
             }
             Terminator::NonLocalReturn(r) => {
                 let v = r.map(|r| frame.read(r)).unwrap_or(Value::Unit);
