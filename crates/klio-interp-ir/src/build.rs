@@ -516,7 +516,11 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
     // collapse them to a single (last-writer) FQN.
     let mut fqn_overrides: std::collections::HashMap<klio_span::Span, String> =
         std::collections::HashMap::new();
-    let mut func_fqn_overrides: std::collections::HashMap<String, String> =
+    // Span-keyed (each function declaration's span is unique) so two
+    // pack files declaring the same simple name in different
+    // packages don't collapse onto one FQN — same shape the
+    // class-side `fqn_overrides` already uses.
+    let mut func_fqn_overrides: std::collections::HashMap<klio_span::Span, String> =
         std::collections::HashMap::new();
     for f in files {
         let prefix: String = f
@@ -535,7 +539,7 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
             if let Decl::Function(fn_d) = d {
                 if !prefix.is_empty() {
                     func_fqn_overrides
-                        .insert(fn_d.name.name.clone(), format!("{}.{}", prefix, fn_d.name.name));
+                        .insert(fn_d.span, format!("{}.{}", prefix, fn_d.name.name));
                 }
             }
         }
@@ -653,7 +657,7 @@ fn collect_hierarchy_member_names(
 fn build_module_with_overrides(
     file: &KotlinFile,
     fqn_overrides: &std::collections::HashMap<klio_span::Span, String>,
-    func_fqn_overrides: &std::collections::HashMap<String, String>,
+    func_fqn_overrides: &std::collections::HashMap<klio_span::Span, String>,
 ) -> BuiltModule {
     let mut module = klio_ir::Module::default();
     let package_prefix: String = file
@@ -965,6 +969,13 @@ fn build_module_with_overrides(
     // qualified `Class.…` access it can lower. Set here, before the
     // body passes, since the registry is otherwise only finalised at
     // the end of this function.
+    //
+    // `combined.imports` lists pack-file imports first and the user
+    // file's imports last (see `build_module_files`). Insert with
+    // last-writer-wins so a user `import a.b.Foo` overrides a
+    // pack's internal `import x.y.Foo` for the same leaf — the
+    // pack's import was an implementation detail of that pack's
+    // body lowering, never a resolution the user opted into.
     for imp in &file.imports {
         if imp.wildcard || imp.path.is_empty() {
             continue;
@@ -975,7 +986,7 @@ fn build_module_with_overrides(
             .as_ref()
             .map(|a| a.name.clone())
             .unwrap_or_else(|| segs.last().unwrap().clone());
-        module.registry.import_aliases.entry(leaf).or_insert(segs);
+        module.registry.import_aliases.insert(leaf, segs);
     }
     // Pre-register every class name so `class_id` resolves
     // regardless of declaration order: a method body may reference
@@ -1019,7 +1030,7 @@ fn build_module_with_overrides(
         if let Decl::Function(f) = d {
             let id = klio_ir::FuncId(module.funcs.len() as u32);
             let fqn = func_fqn_overrides
-                .get(&f.name.name)
+                .get(&f.span)
                 .cloned()
                 .unwrap_or_else(|| {
                     if package_prefix.is_empty() {

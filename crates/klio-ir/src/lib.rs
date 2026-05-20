@@ -672,13 +672,32 @@ impl Module {
             .map(|(_, id)| *id)
     }
 
-    /// Look up a top-level function by simple name.
+    /// Look up a top-level function by simple name. Returns the
+    /// first match, mirroring how `class_id` resolves a bare type
+    /// reference; callers that already have an FQN should prefer
+    /// [`func_id_by_fqn`](Self::func_id_by_fqn) to disambiguate
+    /// same-simple-name declarations from different packages.
     #[must_use]
     pub fn func_id(&self, name: &str) -> Option<FuncId> {
         self.func_index
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, id)| *id)
+    }
+
+    /// Look up a top-level function by fully-qualified name (matches
+    /// `Func::fqn`). Symmetric with
+    /// [`class_id_by_fqn`](Self::class_id_by_fqn); use this when a
+    /// call site already resolved the FQN (e.g. through explicit
+    /// imports or member-qualified path lowering) so a same-simple-
+    /// name pack function in a different package can't shadow the
+    /// intended target.
+    #[must_use]
+    pub fn func_id_by_fqn(&self, fqn: &str) -> Option<FuncId> {
+        self.funcs
+            .iter()
+            .find(|f| f.fqn == fqn)
+            .map(|f| f.id)
     }
 
     /// Register a class declaration and return its id. If the name
