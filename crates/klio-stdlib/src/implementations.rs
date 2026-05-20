@@ -361,6 +361,12 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.List.first", coll_list_first),
     ("kotlin.collections.List.get", coll_list_get),
     ("kotlin.collections.List.indexOf", coll_list_index_of),
+    ("kotlin.collections.List.indexOfFirst", coll_iter_index_of_first),
+    ("kotlin.collections.List.indexOfLast", coll_iter_index_of_last),
+    ("kotlin.collections.MutableList.indexOfFirst", coll_iter_index_of_first),
+    ("kotlin.collections.MutableList.indexOfLast", coll_iter_index_of_last),
+    ("kotlin.collections.Iterable.indexOfFirst", coll_iter_index_of_first),
+    ("kotlin.collections.Iterable.indexOfLast", coll_iter_index_of_last),
     ("kotlin.Array.isEmpty", array_is_empty),
     ("kotlin.Array.isNotEmpty", array_is_not_empty),
     ("kotlin.collections.Array.isEmpty", array_is_empty),
@@ -4562,6 +4568,33 @@ fn coll_list_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let pos = it.borrow().iter().position(|v| Value::structural_eq(v, needle));
     Ok(Value::new_int(pos.map(|p| p as i64).unwrap_or(-1)))
 }
+fn coll_iter_index_of_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "indexOfFirst")?;
+    let block = ctx.args.get(1).cloned().ok_or_else(|| {
+        RuntimeError::Arity("indexOfFirst requires a block".into())
+    })?;
+    let CallCtx { out, host, .. } = ctx;
+    for (i, v) in items.iter().enumerate() {
+        if matches!(host.invoke_callable(&block, std::slice::from_ref(v), *out)?, Value::Bool(true)) {
+            return Ok(Value::new_int(i as i64));
+        }
+    }
+    Ok(Value::new_int(-1))
+}
+fn coll_iter_index_of_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "indexOfLast")?;
+    let block = ctx.args.get(1).cloned().ok_or_else(|| {
+        RuntimeError::Arity("indexOfLast requires a block".into())
+    })?;
+    let CallCtx { out, host, .. } = ctx;
+    let mut found: i64 = -1;
+    for (i, v) in items.iter().enumerate() {
+        if matches!(host.invoke_callable(&block, std::slice::from_ref(v), *out)?, Value::Bool(true)) {
+            found = i as i64;
+        }
+    }
+    Ok(Value::new_int(found))
+}
 fn coll_list_last_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.lastIndexOf")?;
     let Some(needle) = ctx.args.get(1) else {
@@ -5605,12 +5638,24 @@ fn coll_list_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn coll_list_zip(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let lhs = recv_list_items(ctx.args, "List.zip")?;
-    let Some(rhs_val) = ctx.args.get(1) else {
+    let Some(rhs_val) = ctx.args.get(1).cloned() else {
         return Err(RuntimeError::Arity("zip requires a second collection".into()));
     };
-    let rhs: Vec<Value> = match rhs_val {
+    // Optional transform: `xs.zip(ys) { x, y -> … }` packs the
+    // result via the lambda instead of producing Pair values.
+    let transform = ctx.args.get(2).cloned().filter(|v| {
+        matches!(
+            v,
+            Value::IrClosure { .. }
+                | Value::Lambda { .. }
+                | Value::BoundMethod { .. }
+                | Value::Instance(_)
+        )
+    });
+    let rhs: Vec<Value> = match &rhs_val {
         Value::List { items, .. } => items.borrow().clone(),
         Value::Set { items, .. } => items.borrow().clone(),
+        Value::Array { items, .. } => items.borrow().clone(),
         Value::Range { start, end, step, .. } => range_iter_int(*start, *end, *step)
             .map(Value::new_int)
             .collect(),
@@ -5620,13 +5665,18 @@ fn coll_list_zip(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             )))
         }
     };
-    let lhs_borrow = lhs.borrow();
-    let out: Vec<Value> = lhs_borrow
-        .iter()
-        .zip(rhs.iter())
-        .map(|(a, b)| Value::Pair(Box::new(a.clone()), Box::new(b.clone())))
-        .collect();
-    Ok(make_list(out, false))
+    let lhs_items: Vec<Value> = lhs.borrow().clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut result: Vec<Value> = Vec::with_capacity(lhs_items.len().min(rhs.len()));
+    for (a, b) in lhs_items.iter().zip(rhs.iter()) {
+        if let Some(t) = &transform {
+            let r = host.invoke_callable(t, &[a.clone(), b.clone()], *out)?;
+            result.push(r);
+        } else {
+            result.push(Value::Pair(Box::new(a.clone()), Box::new(b.clone())));
+        }
+    }
+    Ok(make_list(result, false))
 }
 
 fn range_iter_int(start: i64, end: i64, step: i64) -> Box<dyn Iterator<Item = i64>> {
