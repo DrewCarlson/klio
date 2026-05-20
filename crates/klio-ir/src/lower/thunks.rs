@@ -1,0 +1,272 @@
+//! Lowering helpers that wrap an expression or block as a synthetic
+//! 0/1/2-arg IR function. Used by the build pass to materialise
+//! default-arg producers, accessors, init blocks, and similar
+//! "expression-bodied" pieces of code without the surrounding fn /
+//! method machinery.
+
+use super::{bind_params, lower_block, lower_expr};
+use crate::build::FuncBuilder;
+use crate::{Const, Terminator};
+use klio_ast::Expr;
+
+/// Lower an arbitrary expression as a 0-arg synthetic function whose
+/// body returns the expression's value. The synthetic function is
+/// pushed onto the module so a downstream caller can invoke it via
+/// `eval_with` against `module.funcs[id]`.
+pub fn lower_expr_as_thunk(
+    module: &mut crate::Module,
+    expr: &Expr,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    let v = lower_expr(&mut b, expr);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+/// Lower a block as a 0-arg synthetic function. The block's trailing
+/// expression becomes the implicit return value.
+pub fn lower_block_as_thunk(
+    module: &mut crate::Module,
+    block: &klio_ast::Block,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    let v = lower_block(&mut b, block);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+/// 1-arg block thunk for setter bodies.
+pub fn lower_block_as_unary_thunk(
+    module: &mut crate::Module,
+    param_name: &str,
+    block: &klio_ast::Block,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    bind_params(&mut b, &[param_name]);
+    let v = lower_block(&mut b, block);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+/// Lower an expression as a 2-arg synthetic function bound under
+/// the supplied parameter names. Used for instance accessors whose
+/// first arg is `this` and second is the new value.
+pub fn lower_binary_expr_as_thunk(
+    module: &mut crate::Module,
+    param_a: &str,
+    param_b: &str,
+    expr: &Expr,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    bind_params(&mut b, &[param_a, param_b]);
+    let v = lower_expr(&mut b, expr);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+pub fn lower_expr_as_param_thunk(
+    module: &mut crate::Module,
+    params: &[&str],
+    expr: &Expr,
+    name: &str,
+) -> crate::FuncId {
+    lower_expr_as_param_thunk_scoped(module, params, expr, name, None, None)
+}
+
+/// Like [`lower_expr_as_param_thunk`] but additionally puts the
+/// enclosing class's name and own-member set in scope.
+pub fn lower_expr_as_param_thunk_scoped(
+    module: &mut crate::Module,
+    params: &[&str],
+    expr: &Expr,
+    name: &str,
+    owner_class: Option<&str>,
+    own_members: Option<&std::collections::HashSet<String>>,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    bind_params(&mut b, params);
+    b.set_param_thunk(true);
+    if let Some(owner) = owner_class {
+        let _ = b.set_owner_class(owner.to_string());
+    }
+    if let Some(set) = own_members {
+        let _ = b.set_own_members(set.clone());
+    }
+    let v = lower_expr(&mut b, expr);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+/// Lower an init-style block with arbitrary bound parameter names.
+pub fn lower_init_block_with_params(
+    module: &mut crate::Module,
+    owner_class: &str,
+    own_members: &std::collections::HashSet<String>,
+    params: &[&str],
+    block: &klio_ast::Block,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    let _ = b.set_owner_class(owner_class.to_string());
+    let _ = b.set_own_members(own_members.clone());
+    bind_params(&mut b, params);
+    let v = lower_block(&mut b, block);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+/// Lower a function shell that takes the named params and returns Unit.
+pub fn lower_empty_thunk(
+    module: &mut crate::Module,
+    params: &[&str],
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    bind_params(&mut b, params);
+    let unit = b.emit_const(Const::Unit);
+    b.terminate(Terminator::Return(Some(unit)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+/// Lower a class init block as a 1-arg IR function whose only
+/// parameter binds `this`.
+pub fn lower_init_block(
+    module: &mut crate::Module,
+    owner_class: &str,
+    own_members: &std::collections::HashSet<String>,
+    block: &klio_ast::Block,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    let _ = b.set_owner_class(owner_class.to_string());
+    let _ = b.set_own_members(own_members.clone());
+    bind_params(&mut b, &["this"]);
+    let v = lower_block(&mut b, block);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+/// Lower an instance accessor body.
+pub fn lower_accessor_expr(
+    module: &mut crate::Module,
+    owner_class: &str,
+    own_members: &std::collections::HashSet<String>,
+    params: &[&str],
+    expr: &Expr,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    let _ = b.set_owner_class(owner_class.to_string());
+    let _ = b.set_own_members(own_members.clone());
+    bind_params(&mut b, params);
+    let v = lower_expr(&mut b, expr);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    placed.params = accessor_params(params);
+    module.funcs.push(placed);
+    id
+}
+
+/// Record the accessor's bound parameters as `Func.params` so the eval
+/// `this`-parameter fallback can recover the receiver.
+fn accessor_params(params: &[&str]) -> Vec<crate::Param> {
+    params
+        .iter()
+        .map(|n| crate::Param {
+            name: (*n).to_string(),
+            ty: crate::TypeRef::unit(),
+            default: None,
+            is_property: false,
+            is_vararg: false,
+        })
+        .collect()
+}
+
+/// Variant of `lower_accessor_expr` for block-body accessors.
+pub fn lower_accessor_block(
+    module: &mut crate::Module,
+    owner_class: &str,
+    own_members: &std::collections::HashSet<String>,
+    params: &[&str],
+    block: &klio_ast::Block,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    let _ = b.set_owner_class(owner_class.to_string());
+    let _ = b.set_own_members(own_members.clone());
+    bind_params(&mut b, params);
+    let v = lower_block(&mut b, block);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
+pub fn lower_unary_expr_as_thunk(
+    module: &mut crate::Module,
+    param_name: &str,
+    expr: &Expr,
+    name: &str,
+) -> crate::FuncId {
+    let mut b = FuncBuilder::new(module);
+    bind_params(&mut b, &[param_name]);
+    let v = lower_expr(&mut b, expr);
+    b.terminate(Terminator::Return(Some(v)));
+    let func = b.finish(name, name, crate::TypeRef::unit());
+    let id = crate::FuncId(module.funcs.len() as u32);
+    let mut placed = func;
+    placed.id = id;
+    module.funcs.push(placed);
+    id
+}
+
