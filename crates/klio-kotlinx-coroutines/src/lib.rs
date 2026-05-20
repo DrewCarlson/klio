@@ -857,13 +857,20 @@ fn schedule_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// `__kxco_newSlot()` — a fresh unique slot id. Slots back
 /// indefinite parking: a coroutine parks on a slot and an explicit
 /// event resumes it (job completion, channel handoff).
+/// Process-global slot-id counter shared by every kxco rendezvous
+/// site. Process-global so cross-thread routing (slot → owning
+/// driver mailbox) cannot alias an id minted on another OS thread.
+/// Offset above the `kotlin.coroutines` layer's range so the two
+/// suspension surfaces never alias in the global slot-owner table.
+static KXCO_NEXT_SLOT: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(1 << 48);
+
+fn alloc_kxco_slot() -> i64 {
+    KXCO_NEXT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn new_slot(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let id = with_reg(|r| {
-        let id = r.next_slot;
-        r.next_slot = r.next_slot.wrapping_add(1);
-        id
-    });
-    Ok(Value::Long(id))
+    Ok(Value::Long(alloc_kxco_slot()))
 }
 
 /// `__kxco_parkSlot(slot)` — record that the current coroutine is

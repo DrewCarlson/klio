@@ -8908,7 +8908,88 @@ pub fn coroutine_time_mode() -> TimeMode {
 ///
 /// A stack of these supports nested `runBlocking` /
 /// `coroutineScope`.
+/// Cross-thread wakeup primitive shared between a `runBlocking`
+/// driver and any worker threads it has dispatched via
+/// `__kxco_dispatch` (real-thread `Dispatchers.Default`). Workers
+/// post resume entries into the mailbox and notify; the driver
+/// drains the mailbox and parks on the condvar when there is no
+/// local progress and at least one worker is still outstanding.
+pub struct DriverWakeup {
+    mailbox: std::sync::Mutex<Vec<(i64, klio_runtime::Value)>>,
+    pending_workers: std::sync::atomic::AtomicUsize,
+    cv: std::sync::Condvar,
+    owned_slots: std::sync::Mutex<std::collections::HashSet<i64>>,
+}
+
+impl DriverWakeup {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            mailbox: std::sync::Mutex::new(Vec::new()),
+            pending_workers: std::sync::atomic::AtomicUsize::new(0),
+            cv: std::sync::Condvar::new(),
+            owned_slots: std::sync::Mutex::new(std::collections::HashSet::new()),
+        })
+    }
+
+    fn post_resume(&self, slot: i64, value: klio_runtime::Value) {
+        self.mailbox.lock().unwrap().push((slot, value));
+        self.cv.notify_all();
+    }
+
+    fn drain_mailbox(&self) -> Vec<(i64, klio_runtime::Value)> {
+        std::mem::take(&mut *self.mailbox.lock().unwrap())
+    }
+
+    fn pending(&self) -> usize {
+        self.pending_workers.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn worker_started(&self) {
+        self.pending_workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn worker_done(&self) {
+        self.pending_workers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.cv.notify_all();
+    }
+
+    fn add_owned_slot(&self, slot: i64) {
+        self.owned_slots.lock().unwrap().insert(slot);
+    }
+
+    fn release_owned_slots(self: &Arc<Self>) {
+        let mut owned = self.owned_slots.lock().unwrap();
+        let slots: Vec<i64> = owned.drain().collect();
+        drop(owned);
+        let mut map = SLOT_OWNERS.lock().unwrap();
+        for s in slots {
+            map.remove(&s);
+        }
+    }
+}
+
+static SLOT_OWNERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<i64, Arc<DriverWakeup>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn register_slot_owner(slot: i64, wakeup: &Arc<DriverWakeup>) {
+    wakeup.add_owned_slot(slot);
+    SLOT_OWNERS.lock().unwrap().insert(slot, Arc::clone(wakeup));
+}
+
+fn lookup_slot_owner(slot: i64) -> Option<Arc<DriverWakeup>> {
+    SLOT_OWNERS.lock().unwrap().get(&slot).cloned()
+}
+
+fn unregister_slot(slot: i64) {
+    SLOT_OWNERS.lock().unwrap().remove(&slot);
+}
+
 struct CooperativeInterceptor {
+    /// Cross-thread wakeup. Shared with worker threads dispatched
+    /// from this driver and with `SLOT_OWNERS` entries for any slot
+    /// this driver owns. Workers post completion resumes through it.
+    wakeup: Arc<DriverWakeup>,
     mode: TimeMode,
     /// Wall-clock origin; `delay` deadlines are measured from here.
     /// Set lazily on first use so an all-virtual run never reads the
@@ -8942,6 +9023,7 @@ impl CooperativeInterceptor {
     /// Fresh interceptor honoring this thread's time mode.
     fn new() -> Self {
         Self {
+            wakeup: DriverWakeup::new(),
             mode: coroutine_time_mode(),
             started: None,
             next_token: 0,
@@ -9002,9 +9084,12 @@ impl CooperativeInterceptor {
     }
 
     /// Seam: record the slot the next indefinitely-parked
-    /// activation is waiting on (set by `__kxco_parkSlot`).
+    /// activation is waiting on (set by `__kxco_parkSlot`). Also
+    /// publishes the slot → driver mapping so a worker thread can
+    /// route its completion resume back through the driver's mailbox.
     fn set_pending_slot(&mut self, slot: i64) {
         self.pending_slot = Some(slot);
+        register_slot_owner(slot, &self.wakeup);
     }
 
     fn clear_pending_slot(&mut self) {
@@ -9016,6 +9101,7 @@ impl CooperativeInterceptor {
     /// found.
     fn resume_slot(&mut self, slot: i64) -> bool {
         if let Some(token) = self.slot_to_token.remove(&slot) {
+            unregister_slot(slot);
             self.ready.push_back(token);
             true
         } else {
@@ -9027,6 +9113,7 @@ impl CooperativeInterceptor {
     /// activation observes it as its suspending call's result.
     fn resume_slot_value(&mut self, slot: i64, value: klio_runtime::Value) -> bool {
         if let Some(token) = self.slot_to_token.remove(&slot) {
+            unregister_slot(slot);
             self.token_resume_value.insert(token, value);
             self.ready.push_back(token);
             true
@@ -9699,6 +9786,39 @@ impl<'a> VmIntrinsicHost<'a> {
             if advanced {
                 continue;
             }
+            // 3b. Cross-thread bridge: drain any resumes posted by
+            //     worker threads (e.g. `Dispatchers.Default`) into the
+            //     interceptor; if a worker is still in flight, park
+            //     on the driver's condvar until it posts.
+            let wakeup = with_top(|i| Arc::clone(&i.wakeup));
+            let drained = wakeup.drain_mailbox();
+            if !drained.is_empty() {
+                for (slot, val) in drained {
+                    with_top(|i| {
+                        i.resume_slot_value(slot, val);
+                    });
+                }
+                continue;
+            }
+            if wakeup.pending() > 0 {
+                let mb = wakeup.mailbox.lock().unwrap();
+                if mb.is_empty()
+                    && wakeup.pending() > 0
+                {
+                    let (mut guard, _) = wakeup
+                        .cv
+                        .wait_timeout(mb, std::time::Duration::from_millis(50))
+                        .unwrap();
+                    let pending: Vec<(i64, klio_runtime::Value)> = std::mem::take(&mut *guard);
+                    drop(guard);
+                    for (slot, val) in pending {
+                        with_top(|i| {
+                            i.resume_slot_value(slot, val);
+                        });
+                    }
+                }
+                continue;
+            }
             // 4. Nothing ready, no timers: done (or deadlocked on an
             //    indefinitely-parked coroutine with no resumer).
             if !progressed {
@@ -9719,9 +9839,14 @@ impl<'a> VmIntrinsicHost<'a> {
                 });
             }
         }
-        with_coro(|s| {
-            s.borrow_mut().pop();
+        // Release any global slot-owner entries still pointing at
+        // this driver's wakeup so cross-thread routing doesn't leak.
+        let popped_wakeup = with_coro(|s| {
+            s.borrow_mut().pop().map(|i| i.wakeup)
         });
+        if let Some(w) = popped_wakeup {
+            w.release_owned_slots();
+        }
         Ok(root_value.unwrap_or(klio_runtime::Value::Unit))
     }
 }
@@ -9787,6 +9912,15 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             false
         });
         if in_driver {
+            return;
+        }
+        // Cross-thread: the slot is owned by a driver running on a
+        // different OS thread (e.g. a `Dispatchers.Default` worker
+        // resuming `await` back on the main `runBlocking` pump).
+        // Route through the driver's mailbox + condvar so it observes
+        // the resume on its next pump cycle.
+        if let Some(wakeup) = lookup_slot_owner(slot) {
+            wakeup.post_resume(slot, value);
             return;
         }
         // Otherwise the coroutine parked inside a `startCoroutine`
@@ -10563,18 +10697,30 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         let time_mode = coroutine_time_mode();
         let id = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed);
         let gate: &'static DispatchGate = if elastic { io_gate() } else { default_gate() };
+        // Tag this dispatch against the currently-active driver so its
+        // pump knows to wait for the worker rather than treating "no
+        // local progress" as completion.
+        let driver_wakeup: Option<Arc<DriverWakeup>> = with_coro(|s| {
+            s.borrow().last().map(|top| Arc::clone(&top.wakeup))
+        });
+        if let Some(w) = driver_wakeup.as_ref() {
+            w.worker_started();
+        }
+        let worker_wakeup = driver_wakeup.clone();
 
         let handle = std::thread::Builder::new()
             .name(format!("klio-dispatch-{id}"))
+            .stack_size(64 * 1024 * 1024)
             .spawn(move || -> Result<(), klio_runtime::RuntimeError> {
-                // Bound concurrent bodies; the worker exists but only
-                // executes Kotlin once it holds a pool permit.
                 gate.acquire();
                 set_coroutine_time_mode(time_mode);
                 let mut vm = seed.materialize();
                 let r = vm.run_thread_block(&block);
-                klio_runtime::fence_and_publish(); // body completion → joiner
+                klio_runtime::fence_and_publish();
                 gate.release();
+                if let Some(w) = worker_wakeup.as_ref() {
+                    w.worker_done();
+                }
                 match r {
                     Ok(v) => {
                         v.publish_deep();

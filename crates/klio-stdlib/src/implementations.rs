@@ -7916,21 +7916,16 @@ fn coroutine_suspended_sentinel(_ctx: &mut CallCtx) -> Result<Value, RuntimeErro
     Ok(Value::CoroutineSuspended)
 }
 
-thread_local! {
-    /// Monotonic rendezvous-slot counter for the `kotlin.coroutines`
-    /// language layer. Distinct from the kotlinx.coroutines pack's
-    /// own counter so the two suspension surfaces never alias.
-    static CO_NEXT_SLOT: std::cell::Cell<i64> = const { std::cell::Cell::new(1) };
-}
+/// Process-global monotonic rendezvous-slot counter for the
+/// `kotlin.coroutines` language layer. Process-global so cross-thread
+/// resume routing (slot → owning runBlocking driver) cannot alias a
+/// slot id minted on a different thread.
+static CO_NEXT_SLOT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
 
 /// `__klio_co_newSlot()` — a fresh slot id for a `suspendCoroutine`
 /// rendezvous.
 fn coro_new_slot(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let id = CO_NEXT_SLOT.with(|c| {
-        let v = c.get();
-        c.set(v.wrapping_add(1));
-        v
-    });
+    let id = CO_NEXT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(Value::Long(id))
 }
 

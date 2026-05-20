@@ -119,69 +119,89 @@ fn store_bool(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>, v: bool) 
 
 // ---------- AtomicInt ----------
 
+/// Run `f` under a single exclusive borrow of the receiver
+/// instance so the read-modify-write is observed atomically by
+/// concurrent threads (the underlying `AdaptiveCell`'s write guard
+/// excludes every other reader and writer for the duration). `f`
+/// receives the current `Int`/`Long` value and returns the new
+/// value plus the call's result Value.
+fn with_int_field_mut<R>(
+    inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>,
+    f: impl FnOnce(i64) -> (i64, R),
+) -> Result<R, RuntimeError> {
+    let mut guard = inst.borrow_mut();
+    let cur = match guard.get("value") {
+        Some(Value::Int(i)) => i as i64,
+        Some(Value::Long(l)) => l,
+        _ => {
+            return Err(RuntimeError::Type(
+                "AtomicInt: receiver missing `value: Int`".into(),
+            ))
+        }
+    };
+    let (next, out) = f(cur);
+    guard.define("value", Value::new_int(next));
+    Ok(out)
+}
+
 fn atomic_int_cas(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let inst = receiver_instance(ctx)?;
-    let cur = int_field(inst)?;
     let expected = arg_int(ctx, 1)?;
     let update = arg_int(ctx, 2)?;
-    if cur == expected {
-        store_int(inst, update);
-        Ok(Value::Bool(true))
-    } else {
-        Ok(Value::Bool(false))
-    }
+    with_int_field_mut(inst, |cur| {
+        if cur == expected {
+            (update, Value::Bool(true))
+        } else {
+            (cur, Value::Bool(false))
+        }
+    })
 }
 
 fn atomic_int_get_and_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let inst = receiver_instance(ctx)?;
-    let prev = int_field(inst)?;
     let next = arg_int(ctx, 1)?;
-    store_int(inst, next);
-    Ok(Value::new_int(prev))
+    with_int_field_mut(inst, |cur| (next, Value::new_int(cur)))
 }
 
 fn atomic_int_get_and_increment(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let inst = receiver_instance(ctx)?;
-    let prev = int_field(inst)?;
-    store_int(inst, prev.wrapping_add(1));
-    Ok(Value::new_int(prev))
+    with_int_field_mut(inst, |cur| (cur.wrapping_add(1), Value::new_int(cur)))
 }
 
 fn atomic_int_get_and_decrement(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let inst = receiver_instance(ctx)?;
-    let prev = int_field(inst)?;
-    store_int(inst, prev.wrapping_sub(1));
-    Ok(Value::new_int(prev))
+    with_int_field_mut(inst, |cur| (cur.wrapping_sub(1), Value::new_int(cur)))
 }
 
 fn atomic_int_increment_and_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let inst = receiver_instance(ctx)?;
-    let next = int_field(inst)?.wrapping_add(1);
-    store_int(inst, next);
-    Ok(Value::new_int(next))
+    with_int_field_mut(inst, |cur| {
+        let n = cur.wrapping_add(1);
+        (n, Value::new_int(n))
+    })
 }
 
 fn atomic_int_decrement_and_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let inst = receiver_instance(ctx)?;
-    let next = int_field(inst)?.wrapping_sub(1);
-    store_int(inst, next);
-    Ok(Value::new_int(next))
+    with_int_field_mut(inst, |cur| {
+        let n = cur.wrapping_sub(1);
+        (n, Value::new_int(n))
+    })
 }
 
 fn atomic_int_get_and_add(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let inst = receiver_instance(ctx)?;
-    let prev = int_field(inst)?;
     let delta = arg_int(ctx, 1)?;
-    store_int(inst, prev.wrapping_add(delta));
-    Ok(Value::new_int(prev))
+    with_int_field_mut(inst, |cur| (cur.wrapping_add(delta), Value::new_int(cur)))
 }
 
 fn atomic_int_add_and_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let inst = receiver_instance(ctx)?;
     let delta = arg_int(ctx, 1)?;
-    let next = int_field(inst)?.wrapping_add(delta);
-    store_int(inst, next);
-    Ok(Value::new_int(next))
+    with_int_field_mut(inst, |cur| {
+        let n = cur.wrapping_add(delta);
+        (n, Value::new_int(n))
+    })
 }
 
 fn atomic_int_plus_assign(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
