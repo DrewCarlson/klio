@@ -808,6 +808,28 @@ fn run_frame_inner<'a>(
             }
             continue;
         }
+        // Symmetric try-stack pop on normal flow through finally.
+        // The push at the loop top is the only way a try-frame
+        // enters `try_stack`; without a corresponding pop on
+        // normal completion, an entry leaks past the try, and a
+        // later `Return` (e.g. the enclosing lambda's overall
+        // return terminator) can mis-route through `pending_return`
+        // and replay the same finally a second time. When the
+        // current block IS the finally and its terminator is a
+        // plain `Goto`, the try has run to normal completion;
+        // discard the matching try-stack entry so subsequent
+        // returns don't see it.
+        if matches!(term, Terminator::Goto(_))
+            && pending_rethrow.is_none()
+            && pending_return.is_none()
+        {
+            let pos = try_stack
+                .iter()
+                .rposition(|(_, _, f)| matches!(*f, Some(b) if b == cur));
+            if let Some(p) = pos {
+                try_stack.remove(p);
+            }
+        }
         // Finally exit with a pending return: replay the return
         // through any outer finally, otherwise complete it.
         if let Some((fin, _)) = &pending_return {

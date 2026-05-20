@@ -79,7 +79,6 @@ fun main() = runBlocking {
 }
 
 #[test]
-#[ignore = "tracked as task #48"]
 fn coroutine_with_finally_cleanup() {
     let src = r#"
 import kotlinx.coroutines.*
