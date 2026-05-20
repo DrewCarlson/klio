@@ -1421,6 +1421,75 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         with_outer_this(|s| s.borrow().iter().rev().cloned().collect())
     }
 
+    fn callable_receiver_shape(
+        &self,
+        v: &klio_runtime::Value,
+    ) -> Option<(usize, bool)> {
+        if let klio_runtime::Value::IrClosure { id, .. } = v {
+            let info = self.closures.get(*id as usize)?;
+            let func = self.module.funcs.get(info.body_func.0 as usize)?;
+            let first_is_this = func
+                .params
+                .first()
+                .map(|p| p.name == "this")
+                .unwrap_or(false);
+            return Some((info.n_params, first_is_this));
+        }
+        None
+    }
+
+    /// True when the closure captures a `this` slot whose current
+    /// value isn't a usable Instance — used by CallValue to decide
+    /// whether to override the slot with the calling frame's `this`
+    /// for a receiver-typed lambda invoked bare (`body()` rather
+    /// than `this.body()`).
+    fn closure_needs_this_capture(
+        &self,
+        v: &klio_runtime::Value,
+    ) -> bool {
+        if let klio_runtime::Value::IrClosure { id, captures } = v {
+            let info = match self.closures.get(*id as usize) {
+                Some(i) => i,
+                None => return false,
+            };
+            let idx = match info
+                .capture_names
+                .iter()
+                .position(|n| n == "this")
+            {
+                Some(i) => i,
+                None => return false,
+            };
+            let snap = captures.get(idx);
+            !matches!(snap, Some(klio_runtime::Value::Instance(_)))
+        } else {
+            false
+        }
+    }
+
+    fn override_closure_this(
+        &mut self,
+        v: &klio_runtime::Value,
+        new_this: &klio_runtime::Value,
+    ) {
+        if let klio_runtime::Value::IrClosure { id, .. } = v {
+            if let Some(info) = self.closures.get(*id as usize) {
+                if let Some(idx) =
+                    info.capture_names.iter().position(|n| n == "this")
+                {
+                    let captures = info.captures.clone();
+                    let mut cap = captures.borrow_mut();
+                    if idx < cap.len() {
+                        cap[idx] = new_this.clone();
+                    } else {
+                        cap.resize(idx + 1, klio_runtime::Value::Null);
+                        cap[idx] = new_this.clone();
+                    }
+                }
+            }
+        }
+    }
+
     fn call_member_only(
         &mut self,
         receiver: &klio_runtime::Value,

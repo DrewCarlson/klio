@@ -377,6 +377,29 @@ pub trait Host {
     fn enclosing_this_chain(&self) -> Vec<Value> {
         self.enclosing_this().into_iter().collect()
     }
+
+    /// Report `(n_params, first_param_is_this)` for a callable whose
+    /// dispatch shape the IR's call sites need to know. Returns
+    /// `None` when the callable isn't a closure / shape the host can
+    /// introspect. Used by `CallValue` to prepend the calling frame's
+    /// `this` when invoking a receiver-typed lambda value as `body()`
+    /// (no explicit `this.body()`).
+    fn callable_receiver_shape(&self, _v: &Value) -> Option<(usize, bool)> {
+        None
+    }
+
+    /// True when the closure carries a captured `this` slot whose
+    /// current value isn't a usable receiver — a sign the lambda is
+    /// being invoked as `body()` instead of `recv.body()` and the
+    /// receiver should be supplied from the calling frame.
+    fn closure_needs_this_capture(&self, _v: &Value) -> bool {
+        false
+    }
+
+    /// Override the closure's captured `this` slot with `new_this`
+    /// for the duration of the impending invocation. Paired with
+    /// `closure_needs_this_capture`.
+    fn override_closure_this(&mut self, _v: &Value, _new_this: &Value) {}
     /// Resolve `name` as a *member* of `receiver` only — the
     /// instance / class / anon-object method walk — without falling
     /// back to a top-level extension, SAM dispatch, or a global.
@@ -1361,9 +1384,64 @@ fn exec_inst(
         }
         Inst::CallValue { dst, callee, args, n_args, arg_names } => {
             let callee_v = frame.read(*callee);
-            let arg_values = read_arg_run(frame, *args, *n_args);
-            let names = resolve_arg_names(frame.module, arg_names);
-            let result = host.call_value_named(&callee_v, &arg_values, &names)?;
+            let mut arg_values = read_arg_run(frame, *args, *n_args);
+            let mut names = resolve_arg_names(frame.module, arg_names);
+            // Receiver-typed lambda bare invocation: `body()` where
+            // `body: T.()->R` declares `this:T` as its leading param.
+            // When the supplied arg count is one short and the
+            // closure's first declared param is `this`, prepend the
+            // calling frame's `this` so the body sees its expected
+            // receiver. Without this the body's bare references to
+            // T's members fall through to globals.
+            let caller_this: Option<Value> = frame
+                .func
+                .params
+                .iter()
+                .position(|p| p.name == "this")
+                .and_then(|i| frame.params.get(i).cloned())
+                .filter(|v| matches!(v, Value::Instance(_)));
+            if let Some((n_params, first_is_this)) =
+                host.callable_receiver_shape(&callee_v)
+            {
+                if first_is_this && arg_values.len() + 1 == n_params {
+                    if let Some(ct) = &caller_this {
+                        arg_values.insert(0, ct.clone());
+                        names.insert(0, None);
+                    }
+                }
+            }
+            // Receiver lambda whose `this` arrives via a captured
+            // slot (not a leading param). `body()` from inside a
+            // method body needs the method's `this` substituted in.
+            if host.closure_needs_this_capture(&callee_v) {
+                if let Some(ct) = &caller_this {
+                    host.override_closure_this(&callee_v, ct);
+                }
+            }
+            // Receiver-lambda fallback for bare names lowered as
+            // LoadGlobal: push the calling frame's `this` so the
+            // global-miss path in LoadGlobal can fall back to a
+            // member of the receiver. Only fires when invoking a
+            // lambda value bare from inside a method — same scope
+            // as the `body()` style invocation.
+            let pushed_caller_this = if matches!(
+                callee_v,
+                Value::IrClosure { .. } | Value::Lambda { .. }
+            ) {
+                if let Some(ct) = &caller_this {
+                    host.push_access_enclosing(ct);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let result = host.call_value_named(&callee_v, &arg_values, &names);
+            if pushed_caller_this {
+                host.pop_access_enclosing();
+            }
+            let result = result?;
             frame.write(*dst, result);
         }
         Inst::CallValueWithThis { dst, callee, receiver, args, n_args, arg_names } => {
@@ -1961,9 +2039,36 @@ fn exec_inst(
                 Const::String(s) => s.clone(),
                 _ => return Err(EvalError::Type("LoadGlobal: name not a string const".into())),
             };
-            let v = host
-                .lookup_global_throwing(&name_str)?
-                .ok_or_else(|| EvalError::Unbound(format!("unresolved global `{name_str}`")))?;
+            let v = match host.lookup_global_throwing(&name_str)? {
+                Some(v) => v,
+                None => {
+                    // Receiver-lambda fallback: a lambda body whose
+                    // bare reference was lowered as LoadGlobal (the
+                    // lower had no type info and assumed top-level)
+                    // may actually name a member of an enclosing
+                    // receiver — pushed onto enclosing-this by
+                    // `invoke_callable_with_this` for scope functions
+                    // and by `CallValue`'s caller-this assist for
+                    // bare receiver-typed lambda invocations.
+                    let mut resolved: Option<Value> = None;
+                    for outer in host.enclosing_this_chain() {
+                        if matches!(outer, Value::Null | Value::Unit) {
+                            continue;
+                        }
+                        if let Ok(v) = host.get_field(&outer, &name_str) {
+                            if !matches!(v, Value::Unit) {
+                                resolved = Some(v);
+                                break;
+                            }
+                        }
+                    }
+                    resolved.ok_or_else(|| {
+                        EvalError::Unbound(format!(
+                            "unresolved global `{name_str}`"
+                        ))
+                    })?
+                }
+            };
             frame.write(*dst, v);
         }
         Inst::LoadCapture { dst, idx } => {

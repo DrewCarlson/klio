@@ -263,3 +263,44 @@ fun main() {
 "#;
     assert_klio("lambda_identity_remove", src, "a:1,b:1,b:2\n");
 }
+
+#[test]
+fn receiver_typed_lambda_invoked_bare_uses_enclosing_this() {
+    let src = r#"
+class Html {
+    private val sb = StringBuilder()
+    fun tag(name: String, body: Html.() -> Unit) {
+        sb.append("<$name>")
+        body()
+        sb.append("</$name>")
+    }
+    fun text(s: String) { sb.append(s) }
+    fun result(): String = sb.toString()
+}
+fun main() {
+    val h = Html()
+    h.tag("div") {
+        tag("p") { text("first") }
+        tag("p") { text("second") }
+    }
+    println(h.result())
+}
+"#;
+    assert_klio("receiver_lambda_bare",
+        src,
+        "<div><p>first</p><p>second</p></div>\n");
+}
+
+#[test]
+fn receiver_typed_lambda_bare_invocation_field_read() {
+    let src = r#"
+class Pipe {
+    val name = "p"
+    fun pump(action: Pipe.() -> Unit) { action() }
+}
+fun main() {
+    Pipe().pump { println(name) }
+}
+"#;
+    assert_klio("receiver_lambda_field", src, "p\n");
+}
