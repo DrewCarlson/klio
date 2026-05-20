@@ -14,9 +14,45 @@
 //! shim observes it through `__kxco_tokenIsCancelled`.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use klio_runtime::{CallCtx, RuntimeError, Value};
+
+/// State for a klio-native Channel: a bounded FIFO with optional
+/// suspend-waiters. Stored per-instance keyed on the synthesised
+/// `Instance.identity` so the Rust intrinsic seam can find it from
+/// any binding entry-point. `closed` short-circuits future receives
+/// to throw `ClosedReceiveChannelException` after the buffer drains.
+struct ChannelState {
+    buffer: VecDeque<Value>,
+    capacity: usize,
+    closed: bool,
+    /// Slot ids of `receive()` callers currently parked because the
+    /// buffer was empty. The next `send` resumes the head waiter.
+    receive_waiters: VecDeque<i64>,
+    /// Iterator-style waiters: a parked `for (v in ch)` hasNext()
+    /// caller plus a handle to its iterator instance, so the next
+    /// send can stash the value in `__pending__` on the iterator
+    /// and resume hasNext with `Bool(true)` (instead of the value).
+    receive_iter_waiters: VecDeque<(i64, klio_runtime::ObjRef<klio_runtime::InstanceData>)>,
+    /// Slot ids of `send(v)` callers parked because the buffer was
+    /// full. The next `receive()` resumes the head and admits its
+    /// pending value into the buffer.
+    send_waiters: VecDeque<(i64, Value)>,
+}
+
+impl ChannelState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buffer: VecDeque::new(),
+            capacity,
+            closed: false,
+            receive_waiters: VecDeque::new(),
+            receive_iter_waiters: VecDeque::new(),
+            send_waiters: VecDeque::new(),
+        }
+    }
+}
 
 /// Layer-2 coroutine library state for one interpreting thread —
 /// the single owned per-thread context for this crate, alongside
@@ -37,6 +73,11 @@ struct CoroutineRegistry {
     /// point: a coroutine parks indefinitely on it and an explicit
     /// event (job completion, channel item) resumes it.
     next_slot: i64,
+    /// klio-native channel registry keyed on the synthesised
+    /// channel `Instance.identity`. Lets the channel send/receive
+    /// bindings find their state from any entry-point without
+    /// threading a host handle through the call stack.
+    channels: HashMap<u64, ChannelState>,
 }
 
 impl CoroutineRegistry {
@@ -46,6 +87,7 @@ impl CoroutineRegistry {
             next_token: 1,
             sched_queue: Vec::new(),
             next_slot: 1,
+            channels: HashMap::new(),
         }
     }
 }
@@ -99,6 +141,18 @@ klio_stdlib::host_bindings! {
         "kotlinx.coroutines.ReceiveChannel.cancel"      => job_cancel,
         "kotlinx.coroutines.JobSupport.cancelImpl"      => job_cancel,
         "kotlinx.coroutines.JobSupport.cancelCoroutine" => job_cancel,
+        "kotlinx.coroutines.channels.Channel"           => channel_create,
+        "kotlinx.coroutines.channels.KlioChannel.send"  => channel_send,
+        "kotlinx.coroutines.channels.KlioChannel.trySend" => channel_try_send,
+        "kotlinx.coroutines.channels.KlioChannel.receive" => channel_receive,
+        "kotlinx.coroutines.channels.KlioChannel.tryReceive" => channel_try_receive,
+        "kotlinx.coroutines.channels.KlioChannel.close" => channel_close,
+        "kotlinx.coroutines.channels.KlioChannel.isClosedForSend" => channel_is_closed_for_send,
+        "kotlinx.coroutines.channels.KlioChannel.isClosedForReceive" => channel_is_closed_for_receive,
+        "kotlinx.coroutines.channels.KlioChannel.isEmpty" => channel_is_empty,
+        "kotlinx.coroutines.channels.KlioChannel.iterator" => channel_iterator,
+        "kotlinx.coroutines.channels.KlioChannelIterator.hasNext" => channel_iter_has_next,
+        "kotlinx.coroutines.channels.KlioChannelIterator.next" => channel_iter_next,
         "kotlinx.coroutines.TimeoutCoroutine.cancelCoroutine" => job_cancel,
         "kotlinx.coroutines.AbstractCoroutine.cancelCoroutine" => job_cancel,
         "kotlinx.coroutines.StandaloneCoroutine.cancelCoroutine" => job_cancel,
@@ -111,6 +165,501 @@ klio_stdlib::host_bindings! {
 /// `try { … } catch (e: CancellationException)` arms fire and
 /// `withTimeoutOrNull` observes the timeout. Indefinite parks
 /// (job-join, channel rendezvous) aren't touched.
+/// `Channel(capacity)` — klio-native factory. Bypasses upstream
+/// `BufferedChannel`'s CAS-loop allocation (klio's `kotlinx.atomicfu`
+/// shims don't implement real CAS, so the upstream impl spins).
+/// Returns a synthesised `Value::Instance` whose `identity` keys a
+/// `ChannelState` in this thread's registry; every channel member
+/// binding finds the state by that key.
+fn channel_create(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    // First arg is the capacity (Int / Long). Defaults / overloads
+    // ship `0` (RENDEZVOUS) and `-1` (UNLIMITED) as sentinel ints.
+    let cap_arg = ctx.args.first().cloned().unwrap_or(Value::new_int(0));
+    let capacity: i64 = match cap_arg {
+        Value::Int(n) => n as i64,
+        Value::Long(n) => n,
+        _ => 0,
+    };
+    let effective_cap = if capacity < 0 {
+        usize::MAX // UNLIMITED / BUFFERED
+    } else if capacity == 0 {
+        1 // rendezvous degenerate: one-slot buffer in our model
+    } else {
+        capacity as usize
+    };
+    let id = ctx.host.alloc_instance_id();
+    with_reg(|r| {
+        r.channels.insert(id, ChannelState::new(effective_cap));
+    });
+    let inst = ctx.host.new_synth_instance(
+        "kotlinx.coroutines.channels.KlioChannel",
+        id,
+        Vec::new(),
+    );
+    Ok(inst)
+}
+
+fn channel_id(arg0: &Value) -> Option<u64> {
+    if let Value::Instance(i) = arg0 {
+        Some(i.borrow().identity)
+    } else {
+        None
+    }
+}
+
+fn channel_send(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("Channel.send expects a receiver".into())
+    })?;
+    let value = ctx.args.get(1).cloned().unwrap_or(Value::Unit);
+    let id = channel_id(&recv).ok_or_else(|| {
+        RuntimeError::Type("Channel.send: bad receiver".into())
+    })?;
+    // Direct rendezvous: if a receiver is parked, hand the value
+    // straight to it without buffering. Else if buffer has room,
+    // push and return. Else park this sender and suspend.
+    let outcome = with_reg(|r| -> Result<ChannelSendOutcome, RuntimeError> {
+        let action = {
+            let state = r.channels.get_mut(&id).ok_or_else(|| {
+                RuntimeError::Type("Channel.send: missing state".into())
+            })?;
+            if state.closed {
+                return Err(RuntimeError::Thrown(closed_send_exc()));
+            }
+            // Iterator waiters take priority — write the value into
+            // the iter's `__pending__` field and resume with Bool(true).
+            if let Some((slot, iter_inst)) =
+                state.receive_iter_waiters.pop_front()
+            {
+                ChannelSendDispatch::HandToIter(slot, iter_inst, value.clone())
+            } else if let Some(slot) = state.receive_waiters.pop_front() {
+                ChannelSendDispatch::HandToReceiver(slot, value.clone())
+            } else if state.buffer.len() < state.capacity {
+                state.buffer.push_back(value.clone());
+                ChannelSendDispatch::Buffered
+            } else {
+                ChannelSendDispatch::ParkSender
+            }
+        };
+        let outcome = match action {
+            ChannelSendDispatch::HandToIter(slot, iter, v) => {
+                iter.borrow_mut().define("__pending__", v);
+                ChannelSendOutcome::HandToIter(slot)
+            }
+            ChannelSendDispatch::HandToReceiver(slot, v) => {
+                ChannelSendOutcome::HandToReceiver(slot, v)
+            }
+            ChannelSendDispatch::Buffered => ChannelSendOutcome::Buffered,
+            ChannelSendDispatch::ParkSender => {
+                let slot = r.next_slot;
+                r.next_slot = r.next_slot.wrapping_add(1);
+                if let Some(state) = r.channels.get_mut(&id) {
+                    state.send_waiters.push_back((slot, value.clone()));
+                }
+                ChannelSendOutcome::ParkOnSlot(slot)
+            }
+        };
+        Ok(outcome)
+    })?;
+    match outcome {
+        ChannelSendOutcome::HandToReceiver(slot, v) => {
+            ctx.host.coroutine_resume_slot_value(slot, v);
+            Ok(Value::Unit)
+        }
+        ChannelSendOutcome::HandToIter(slot) => {
+            ctx.host
+                .coroutine_resume_slot_value(slot, Value::Bool(true));
+            Ok(Value::Unit)
+        }
+        ChannelSendOutcome::Buffered => Ok(Value::Unit),
+        ChannelSendOutcome::ParkOnSlot(slot) => {
+            ctx.host.coroutine_arm_slot(slot);
+            Err(RuntimeError::Suspend(-1))
+        }
+    }
+}
+
+enum ChannelSendOutcome {
+    HandToReceiver(i64, Value),
+    HandToIter(i64),
+    Buffered,
+    ParkOnSlot(i64),
+}
+
+enum ChannelSendDispatch {
+    HandToIter(i64, klio_runtime::ObjRef<klio_runtime::InstanceData>, Value),
+    HandToReceiver(i64, Value),
+    Buffered,
+    ParkSender,
+}
+
+fn channel_try_send(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("Channel.trySend expects a receiver".into())
+    })?;
+    let value = ctx.args.get(1).cloned().unwrap_or(Value::Unit);
+    let id = channel_id(&recv).ok_or_else(|| {
+        RuntimeError::Type("Channel.trySend: bad receiver".into())
+    })?;
+    let outcome = with_reg(|r| -> Result<ChannelTrySendOutcome, RuntimeError> {
+        let state = r.channels.get_mut(&id).ok_or_else(|| {
+            RuntimeError::Type("Channel.trySend: missing state".into())
+        })?;
+        if state.closed {
+            return Ok(ChannelTrySendOutcome::Closed);
+        }
+        if let Some(slot) = state.receive_waiters.pop_front() {
+            return Ok(ChannelTrySendOutcome::HandToReceiver(slot, value.clone()));
+        }
+        if state.buffer.len() < state.capacity {
+            state.buffer.push_back(value.clone());
+            return Ok(ChannelTrySendOutcome::Success);
+        }
+        Ok(ChannelTrySendOutcome::Full)
+    })?;
+    let result = match outcome {
+        ChannelTrySendOutcome::HandToReceiver(slot, v) => {
+            ctx.host.coroutine_resume_slot_value(slot, v);
+            Value::Bool(true)
+        }
+        ChannelTrySendOutcome::Success => Value::Bool(true),
+        ChannelTrySendOutcome::Full | ChannelTrySendOutcome::Closed => {
+            Value::Bool(false)
+        }
+    };
+    Ok(result)
+}
+
+enum ChannelTrySendOutcome {
+    HandToReceiver(i64, Value),
+    Success,
+    Full,
+    Closed,
+}
+
+fn channel_receive(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("Channel.receive expects a receiver".into())
+    })?;
+    let id = channel_id(&recv).ok_or_else(|| {
+        RuntimeError::Type("Channel.receive: bad receiver".into())
+    })?;
+    let outcome = with_reg(|r| -> Result<ChannelReceiveOutcome, RuntimeError> {
+        let (got, closed) = {
+            let state = r.channels.get_mut(&id).ok_or_else(|| {
+                RuntimeError::Type("Channel.receive: missing state".into())
+            })?;
+            if let Some(v) = state.buffer.pop_front() {
+                let resumed_sender = state.send_waiters.pop_front();
+                if let Some((_, pending)) = &resumed_sender {
+                    state.buffer.push_back(pending.clone());
+                }
+                return Ok(ChannelReceiveOutcome::Got(
+                    v,
+                    resumed_sender.map(|(s, _)| s),
+                ));
+            }
+            (None::<Value>, state.closed)
+        };
+        let _ = got;
+        if closed {
+            return Err(RuntimeError::Thrown(closed_receive_exc()));
+        }
+        let slot = r.next_slot;
+        r.next_slot = r.next_slot.wrapping_add(1);
+        if let Some(state) = r.channels.get_mut(&id) {
+            state.receive_waiters.push_back(slot);
+        }
+        Ok(ChannelReceiveOutcome::ParkOnSlot(slot))
+    })?;
+    match outcome {
+        ChannelReceiveOutcome::Got(v, resumed) => {
+            if let Some(slot) = resumed {
+                ctx.host.coroutine_resume_slot(slot);
+            }
+            Ok(v)
+        }
+        ChannelReceiveOutcome::ParkOnSlot(slot) => {
+            ctx.host.coroutine_arm_slot(slot);
+            Err(RuntimeError::Suspend(-1))
+        }
+    }
+}
+
+enum ChannelReceiveOutcome {
+    Got(Value, Option<i64>),
+    ParkOnSlot(i64),
+}
+
+fn channel_try_receive(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("Channel.tryReceive expects a receiver".into())
+    })?;
+    let id = channel_id(&recv).ok_or_else(|| {
+        RuntimeError::Type("Channel.tryReceive: bad receiver".into())
+    })?;
+    let outcome = with_reg(|r| {
+        let state = r.channels.get_mut(&id)?;
+        if let Some(v) = state.buffer.pop_front() {
+            let resumed_sender = state.send_waiters.pop_front();
+            if let Some((_, pending)) = &resumed_sender {
+                state.buffer.push_back(pending.clone());
+            }
+            Some((Some(v), resumed_sender.map(|(s, _)| s), false))
+        } else if state.closed {
+            Some((None, None, true))
+        } else {
+            Some((None, None, false))
+        }
+    });
+    if let Some((value, resumed_slot, closed)) = outcome {
+        if let Some(slot) = resumed_slot {
+            ctx.host.coroutine_resume_slot(slot);
+        }
+        let _ = closed;
+        Ok(value.unwrap_or(Value::Null))
+    } else {
+        Ok(Value::Null)
+    }
+}
+
+fn channel_close(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("Channel.close expects a receiver".into())
+    })?;
+    let id = channel_id(&recv).ok_or_else(|| {
+        RuntimeError::Type("Channel.close: bad receiver".into())
+    })?;
+    let waiters = with_reg(|r| {
+        let state = r.channels.get_mut(&id)?;
+        state.closed = true;
+        let recvs: Vec<i64> = state.receive_waiters.drain(..).collect();
+        let iters: Vec<(
+            i64,
+            klio_runtime::ObjRef<klio_runtime::InstanceData>,
+        )> = state.receive_iter_waiters.drain(..).collect();
+        let sends: Vec<(i64, Value)> =
+            state.send_waiters.drain(..).collect();
+        Some((recvs, iters, sends))
+    });
+    if let Some((recvs, iters, sends)) = waiters {
+        let exc = closed_receive_exc();
+        for slot in recvs {
+            let failure = Value::Result {
+                ok: false,
+                payload: Box::new(exc.clone()),
+            };
+            ctx.host.coroutine_resume_slot_value(slot, failure);
+        }
+        // Iterator-style waiters resume with `Bool(false)` so the
+        // for-loop hasNext() returns false and the loop exits.
+        for (slot, _iter) in iters {
+            ctx.host
+                .coroutine_resume_slot_value(slot, Value::Bool(false));
+        }
+        let send_exc = closed_send_exc();
+        for (slot, _v) in sends {
+            let failure = Value::Result {
+                ok: false,
+                payload: Box::new(send_exc.clone()),
+            };
+            ctx.host.coroutine_resume_slot_value(slot, failure);
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn channel_is_closed_for_send(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("isClosedForSend expects a receiver".into())
+    })?;
+    let id = channel_id(&recv).ok_or_else(|| {
+        RuntimeError::Type("isClosedForSend: bad receiver".into())
+    })?;
+    let closed = with_reg(|r| r.channels.get(&id).map(|s| s.closed).unwrap_or(true));
+    Ok(Value::Bool(closed))
+}
+
+fn channel_is_closed_for_receive(
+    ctx: &mut CallCtx,
+) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("isClosedForReceive expects a receiver".into())
+    })?;
+    let id = channel_id(&recv).ok_or_else(|| {
+        RuntimeError::Type("isClosedForReceive: bad receiver".into())
+    })?;
+    let drained_closed = with_reg(|r| {
+        r.channels
+            .get(&id)
+            .map(|s| s.closed && s.buffer.is_empty())
+            .unwrap_or(true)
+    });
+    Ok(Value::Bool(drained_closed))
+}
+
+fn channel_iterator(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("Channel.iterator expects a receiver".into())
+    })?;
+    let ch_id = channel_id(&recv).ok_or_else(|| {
+        RuntimeError::Type("Channel.iterator: bad receiver".into())
+    })?;
+    let id = ctx.host.alloc_instance_id();
+    let inst = ctx.host.new_synth_instance(
+        "kotlinx.coroutines.channels.KlioChannelIterator",
+        id,
+        vec![
+            (
+                "__channel_id__".to_string(),
+                Value::Long(ch_id as i64),
+            ),
+            ("__pending__".to_string(), Value::Null),
+        ],
+    );
+    Ok(inst)
+}
+
+fn channel_iter_has_next(
+    ctx: &mut CallCtx,
+) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("hasNext expects a receiver".into())
+    })?;
+    let (iter_inst, ch_id) = match &recv {
+        Value::Instance(i) => {
+            let b = i.borrow();
+            let ch_id = b
+                .get("__channel_id__")
+                .and_then(|v| match v {
+                    Value::Long(n) => Some(n as u64),
+                    Value::Int(n) => Some(n as u64),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    RuntimeError::Type("hasNext: missing channel id".into())
+                })?;
+            (i.clone(), ch_id)
+        }
+        _ => return Err(RuntimeError::Type("hasNext: bad receiver".into())),
+    };
+    // Already have a cached pending value? Report true without
+    // touching the channel.
+    let pending = iter_inst.borrow().get("__pending__");
+    if let Some(c) = pending {
+        if !matches!(c, Value::Null) {
+            return Ok(Value::Bool(true));
+        }
+    }
+    // Try a synchronous pull. If the buffer holds a value, cache it
+    // and return true; if the channel is drained-and-closed, return
+    // false; otherwise queue an iterator-style waiter and suspend.
+    let outcome = with_reg(|r| {
+        let state = r.channels.get_mut(&ch_id)?;
+        if let Some(v) = state.buffer.pop_front() {
+            let resumed_sender = state.send_waiters.pop_front();
+            if let Some((_, pending)) = &resumed_sender {
+                state.buffer.push_back(pending.clone());
+            }
+            return Some((Some(v), resumed_sender.map(|(s, _)| s), false));
+        }
+        Some((None, None, state.closed))
+    });
+    if let Some((maybe_v, resumed_slot, closed)) = outcome {
+        if let Some(slot) = resumed_slot {
+            ctx.host.coroutine_resume_slot(slot);
+        }
+        if let Some(v) = maybe_v {
+            iter_inst.borrow_mut().define("__pending__", v);
+            return Ok(Value::Bool(true));
+        }
+        if closed {
+            return Ok(Value::Bool(false));
+        }
+    }
+    let slot = with_reg(|r| {
+        let s = r.next_slot;
+        r.next_slot = r.next_slot.wrapping_add(1);
+        if let Some(state) = r.channels.get_mut(&ch_id) {
+            state.receive_iter_waiters.push_back((s, iter_inst.clone()));
+        }
+        s
+    });
+    ctx.host.coroutine_arm_slot(slot);
+    Err(RuntimeError::Suspend(-1))
+}
+
+fn channel_iter_next(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("next expects a receiver".into())
+    })?;
+    let inst = match &recv {
+        Value::Instance(i) => i.clone(),
+        _ => return Err(RuntimeError::Type("next: bad receiver".into())),
+    };
+    let pending = inst.borrow().get("__pending__");
+    if let Some(v) = pending {
+        if !matches!(v, Value::Null) {
+            inst.borrow_mut()
+                .define("__pending__", Value::Null);
+            return Ok(v);
+        }
+    }
+    Err(RuntimeError::Thrown(Value::Exception {
+        fqn: std::sync::Arc::new(
+            "kotlin.NoSuchElementException".into(),
+        ),
+        message: Some(std::sync::Arc::new(
+            "ChannelIterator.next called before hasNext".into(),
+        )),
+        cause: None,
+    }))
+}
+
+fn channel_is_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx.args.first().cloned().ok_or_else(|| {
+        RuntimeError::Arity("isEmpty expects a receiver".into())
+    })?;
+    let id = channel_id(&recv).ok_or_else(|| {
+        RuntimeError::Type("isEmpty: bad receiver".into())
+    })?;
+    let empty = with_reg(|r| {
+        r.channels
+            .get(&id)
+            .map(|s| s.buffer.is_empty())
+            .unwrap_or(true)
+    });
+    Ok(Value::Bool(empty))
+}
+
+fn closed_receive_exc() -> Value {
+    Value::Exception {
+        fqn: std::sync::Arc::new(
+            "kotlinx.coroutines.channels.ClosedReceiveChannelException".into(),
+        ),
+        message: Some(std::sync::Arc::new("Channel was closed".into())),
+        cause: None,
+    }
+}
+
+fn closed_send_exc() -> Value {
+    Value::Exception {
+        fqn: std::sync::Arc::new(
+            "kotlinx.coroutines.channels.ClosedSendChannelException".into(),
+        ),
+        message: Some(std::sync::Arc::new("Channel was closed".into())),
+        cause: None,
+    }
+}
+
+fn next_slot() -> i64 {
+    with_reg(|r| {
+        let s = r.next_slot;
+        r.next_slot = r.next_slot.wrapping_add(1);
+        s
+    })
+}
+
 fn job_cancel(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // args[0] is the Job receiver. args[1], if present, is the
     // CancellationException cause supplied by the caller (e.g.

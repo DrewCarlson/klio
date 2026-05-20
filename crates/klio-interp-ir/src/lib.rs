@@ -10235,6 +10235,67 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         self.globals.borrow().lookup(name)
     }
 
+    fn alloc_instance_id(&mut self) -> u64 {
+        self.instance_id_counter
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1
+    }
+
+    fn new_synth_instance(
+        &mut self,
+        class_fqn: &str,
+        identity: u64,
+        fields: Vec<(String, klio_runtime::Value)>,
+    ) -> klio_runtime::Value {
+        let simple = class_fqn
+            .rsplit('.')
+            .next()
+            .unwrap_or(class_fqn)
+            .to_string();
+        let class_def = Arc::new(klio_runtime::ClassDef {
+            name: simple,
+            fqn: class_fqn.to_string(),
+            annotation_names: Vec::new(),
+            primary_params: Vec::new(),
+            methods: Vec::new(),
+            body_properties: Vec::new(),
+            init_blocks: Vec::new(),
+            init_block_property_positions: Vec::new(),
+            is_data: false,
+            is_value: false,
+            is_object: false,
+            is_enum: false,
+            is_sealed: false,
+            is_open: false,
+            is_abstract: false,
+            is_inner: false,
+            is_anonymous: true,
+            secondary_ctors: Vec::new(),
+            supertype_names: Vec::new(),
+            parent: klio_runtime::ObjRef::new(None),
+            interfaces: klio_runtime::ObjRef::new(Vec::new()),
+            is_interface: false,
+            is_fun_interface: false,
+            parent_ctor_args: Vec::new(),
+            enum_entries: klio_runtime::ObjRef::new(Vec::new()),
+            companion: klio_runtime::ObjRef::new(None),
+            enclosing_class: klio_runtime::ObjRef::new(None),
+            nested_classes: klio_runtime::ObjRef::new(Vec::new()),
+            captured_env: klio_runtime::ObjRef::new(klio_runtime::Env::new()),
+            supertype_delegates: klio_runtime::ObjRef::new(Vec::new()),
+            delegate_forwarders: klio_runtime::ObjRef::new(Vec::new()),
+            object_singleton: klio_runtime::ObjRef::new(None),
+        });
+        let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
+            class: class_def,
+            fields,
+            outer: None,
+            identity,
+            native_state: None,
+        });
+        klio_runtime::Value::Instance(inst)
+    }
+
     fn invoke_method(
         &mut self,
         receiver: &klio_runtime::Value,

@@ -140,7 +140,6 @@ fun main() = runBlocking {
 }
 
 #[test]
-#[ignore = "tracked as task #46"]
 fn channel_send_receive() {
     let src = r#"
 import kotlinx.coroutines.*

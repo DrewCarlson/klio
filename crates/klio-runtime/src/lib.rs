@@ -727,6 +727,27 @@ pub trait IntrinsicHost {
         None
     }
 
+    /// Allocate a fresh `Instance.identity` value (monotonic across
+    /// the interpreter run). klio-native intrinsics that synthesise
+    /// `Value::Instance` (e.g. the channels factory) call this so
+    /// the identity space stays disjoint from regular allocations.
+    fn alloc_instance_id(&mut self) -> u64 {
+        0
+    }
+
+    /// Synthesise a `Value::Instance` of class `class_fqn` (a name
+    /// not declared in user IR) with the given `identity` and
+    /// `fields`. Used by klio-native intrinsics that need to return
+    /// an opaque user-visible handle bound to host state.
+    fn new_synth_instance(
+        &mut self,
+        _class_fqn: &str,
+        _identity: u64,
+        _fields: Vec<(String, Value)>,
+    ) -> Value {
+        Value::Unit
+    }
+
     /// Run `block` as the root of a cooperative coroutine and drive
     /// the scheduler to completion: launched children interleave at
     /// suspension points and `delay` advances *virtual* time so a
