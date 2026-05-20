@@ -2355,11 +2355,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             }
             // A single-name callee that resolves to a local binding
             // or parameter is a value invocation — the local
-            // shadows any same-named top-level function. Critical
-            // when packs collide with a lambda parameter name:
-            // kotlinx-io's `processUtf16Chars(yield: (Char)->Unit)`
-            // calls `yield(...)`, which must hit the parameter, not
-            // kotlinx.coroutines' suspend `yield()`.
+            // shadows any same-named top-level function — a lambda
+            // parameter named `yield` (or any other top-level fn name)
+            // must bind to the parameter at the call site, not to the
+            // global function.
             if let Expr::Path { segments, .. } = callee.as_ref() {
                 if segments.len() == 1 {
                     // Kotlin keeps the function and property namespaces
@@ -2698,20 +2697,16 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                     arg_names = names;
                                 }
                                 let type_args = intern_type_args(b.module, ast_type_args);
-                                // Kotlin: at an unqualified call inside a
-                                // receiver scope, a member of the
-                                // (possibly smart-cast) implicit receiver
-                                // outranks a same-named top-level
-                                // extension. Route through `call_member`
-                                // on `this` so the full precedence applies
-                                // — receiver member (incl. a runtime
-                                // subtype's, e.g. `DispatchedContinuation`
-                                // when the static type is `Continuation`),
-                                // then the builtin/stdlib intrinsic (so a
-                                // `kotlin.Result` receiver hits Result's
-                                // own `getOrElse`, not an unrelated
-                                // `Bag.getOrElse` extension), then the
-                                // best-by-receiver extension-fn fallback.
+                                // Unqualified call inside a receiver
+                                // scope: a member of the (possibly
+                                // smart-cast) implicit receiver outranks
+                                // a same-named top-level extension. Route
+                                // through `call_member` on `this` so the
+                                // full precedence applies: receiver
+                                // member (using the runtime subtype),
+                                // then the builtin/stdlib intrinsic,
+                                // then the best-by-receiver extension
+                                // fallback.
                                 // A direct `Call` to one resolved
                                 // `func_id` bypassed all of that and
                                 // could recurse (`resumeCancellableWith`)

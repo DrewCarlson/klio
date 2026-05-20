@@ -4590,13 +4590,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // baked to a top-level extension (`fun R.f`, param0
         // == "this") whose declared receiver `R` is a *user / pack
         // class* — never a builtin and never an interface/Any a
-        // builtin could satisfy — but whose actual receiver arg is a
-        // *builtin value* (String/StringBuilder/Int/Array/…) cannot
-        // be correct: a builtin value is never an instance of a user
-        // class. Without this, a kotlinx-io `ByteStringBuilder.append`
-        // selected for a `kotlin.text.StringBuilder` receiver
-        // self-recurses. Re-dispatch as a member call so the builtin
-        // member wins. Instance / Class receivers never trip this, so
+        // builtin could satisfy, with an actual receiver that is a
+        // builtin value (String/StringBuilder/Int/Array/…), cannot be
+        // correct: a builtin value is never an instance of a user
+        // class. Re-dispatch as a member call so the builtin member
+        // wins. Instance / Class receivers never trip this, so
         // interface- and subtype-receiver extensions are unaffected.
         if let Some(f) = module.funcs.get(func.0 as usize) {
             if f.params.first().map(|p| p.name == "this").unwrap_or(false)
@@ -6288,10 +6286,9 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
         }
         // `kotlin.Unit` is the singleton `object Unit`; its `Any`
-        // methods are well-defined. Upstream `JobSupport`'s state
-        // machine compares state values with `==`, and a state slot
-        // can legitimately be `Unit`, so `Unit.equals(x)` must answer
-        // (`x === Unit`) rather than fail to resolve.
+        // methods must be well-defined so any code path comparing a
+        // state slot or container value to Unit with `==` resolves
+        // through `Unit.equals(x)` rather than failing to dispatch.
         if matches!(receiver, klio_runtime::Value::Unit) {
             match (name, args.len()) {
                 ("equals", 1) => {
@@ -6559,16 +6556,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 // the same (name, receiver-instance) is legitimate at
                 // bounded depth (e.g. a coroutine `dispatchResume`
                 // chain), but *unbounded* same-key re-entry is the
-                // pathological extension self-rebind — upstream
-                // `transform`'s bare `collect` mis-binds the
-                // `Flow<T>.collect` extension on the `flow{}` block's
-                // SafeCollector, whose body re-calls `collect` on the
-                // same SafeCollector forever. Allow a generous depth,
+                // pathological extension self-rebind: a generic
+                // extension whose body calls itself on the same
+                // receiver re-enters forever. Allow a generous depth,
                 // then decline so CallMemberOrGlobal continues to the
-                // lexically enclosing receiver (the source flow's
-                // `collect` member). Legitimate recursive *member*
-                // methods dispatch through the IR method walk above,
-                // not here, so they are unaffected entirely.
+                // lexically enclosing receiver. Legitimate recursive
+                // *member* methods dispatch through the IR method
+                // walk above, not here.
                 const MAX_SAME_KEY_DEPTH: u32 = 48;
                 struct ExtGuard(Option<(String, u64)>);
                 impl Drop for ExtGuard {
@@ -7137,13 +7131,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                 .get(fid.0 as usize)
                                 // Tolerate a package/class-qualified
                                 // lowered name (`Cls.method`) as well as
-                                // the bare `method` — same matching
-                                // `host_has_member` uses, so a member it
-                                // reports present is actually
-                                // dispatchable (a pack class such as
-                                // `CancellableContinuationImpl` whose
-                                // private methods lower with a qualified
-                                // name).
+                                // Bare method name OR its trailing
+                                // qualified-name segment — matches what
+                                // `host_has_member` reports, so a
+                                // member it sees as present is actually
+                                // dispatchable.
                                 .map(|f| {
                                     f.name == name
                                         || f.name.rsplit('.').next()
@@ -7182,12 +7174,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // constant `false`, making `_state.loop { … compareAndSet …
         // }` spin forever). Only if `call_member` yields klio's
         // "no such member" sentinel (`Unimplemented`) do we walk the
-        // class hierarchy in `module.classes` for a pack method that
-        // lowers with a class-qualified func name (e.g.
-        // `CancellableContinuationImpl.detachChildIfNonReusable`,
-        // reached bare from inside the atomicfu `loop {}` closure) —
-        // which `host_has_member` reports present but `call_member`
-        // cannot dispatch.
+        // class hierarchy in `module.classes` for a method that
+        // lowers with a class-qualified func name, reached bare from
+        // inside a closure — `host_has_member` reports present but
+        // `call_member` cannot dispatch the bare name alone.
         let primary = self.call_member(receiver, name, args);
         if !matches!(
             primary,
@@ -7316,12 +7306,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             ))
         })?;
         // A constructor's target is never abstract. Resolving to an
-        // abstract class here is a simple-name collision artifact: the
-        // public concrete `kotlinx.io.Segment` is shadowed in the
-        // simple-name table by the abstract
-        // `kotlinx.coroutines.internal.Segment`. Redirect to the
-        // same-simple-name sibling whose definition is concrete,
-        // reachable via the additive FQN-keyed entries.
+        // abstract class here is a simple-name collision artifact: two
+        // distinct fully-qualified classes share a simple name, and
+        // the abstract one happened to be registered last. Redirect to
+        // the same-simple-name concrete sibling via the FQN entries.
         if class_def.is_abstract {
             let want = ir_class.name.clone();
             let concrete = {
