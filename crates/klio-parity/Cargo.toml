@@ -32,6 +32,7 @@ klio-kotlinx-atomicfu   = { workspace = true }
 klio-kotlinx-datetime   = { workspace = true }
 klio-kotlinx-serialization = { workspace = true }
 klio-kotlinx-io         = { workspace = true }
+stacker                 = "0.1"
 
 [lints]
 workspace = true

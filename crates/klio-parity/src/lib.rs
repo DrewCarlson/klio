@@ -1187,6 +1187,18 @@ mod pack_ast_cache {
 }
 
 pub fn run_with_packs(file: &Path) -> Result<String, String> {
+    // Run the front-end + Vm on a heap-allocated 16 MiB stack.
+    // Cargo's default test thread caps at 2 MiB, which is enough for
+    // the curated `klio run` path but not for the parity harness:
+    // here we typecheck and lower the full upstream
+    // kotlinx-coroutines `common/src` (~1k Kotlin files) on every
+    // smoke run, and a few deeply-nested coroutine builders push the
+    // recursive front-end past 2 MiB. `stacker::grow` ensures the
+    // budget matches what a production binary's main thread has.
+    stacker::grow(16 * 1024 * 1024, || run_with_packs_inner(file))
+}
+
+fn run_with_packs_inner(file: &Path) -> Result<String, String> {
     fn parse(
         map: &mut SourceMap,
         path: &Path,
