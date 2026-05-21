@@ -558,6 +558,12 @@ struct FnSig {
     /// True when declared with the `suspend` modifier. Drives the §18.1
     /// function-colouring check at call sites.
     is_suspend: bool,
+    /// True when the function is declared `inline` and the
+    /// parameter at the same index is marked `crossinline`. Drives
+    /// the call-site check that a lambda literal passed to a
+    /// `crossinline` parameter contains no non-local `return`
+    /// targeting the caller (T0056 — spec §4.2.5).
+    is_crossinline_param: Vec<bool>,
 }
 
 /// Description of a user-declared class.
@@ -3433,6 +3439,11 @@ impl<'r> Checker<'r> {
             f.params.iter().map(|p| class_name_from_typeref(&p.ty)).collect();
         let (type_param_names, type_param_bounds) =
             Self::collect_type_param_bounds(&f.type_params, &f.where_bounds);
+        let is_crossinline_param: Vec<bool> = if f.is_inline {
+            f.params.iter().map(|p| p.is_crossinline).collect()
+        } else {
+            vec![false; f.params.len()]
+        };
         FnSig {
             params,
             has_default,
@@ -3446,6 +3457,7 @@ impl<'r> Checker<'r> {
             param_class_names,
             decl_span: Some(f.name.span),
             is_suspend: f.is_suspend,
+            is_crossinline_param,
         }
     }
 
@@ -3502,6 +3514,7 @@ impl<'r> Checker<'r> {
                 .collect(),
             decl_span: None,
             is_suspend: false,
+            is_crossinline_param: vec![false; c.primary_params.len()],
         };
         if !c.primary_params.is_empty() || !c.is_interface {
             info.ctor = Some(ctor_sig);
@@ -7598,6 +7611,67 @@ impl<'r> Checker<'r> {
     /// signature. Falls back to the first arity-matching signature when
     /// no candidate's parameter types are a clean fit, and to the first
     /// declared signature when even arity has no match.
+    /// True when `e` contains a non-local `return` — one that
+    /// targets the enclosing function rather than a nested lambda /
+    /// anonymous-function literal. Crossinline lambdas must not
+    /// contain such a return because the spliced body lives in the
+    /// inline call's frame.
+    fn lambda_body_has_nonlocal_return(stmts: &[Stmt]) -> bool {
+        scan_lambda_stmts_for_return(stmts)
+    }
+
+    /// Scan each positional lambda argument against the candidates'
+    /// `is_crossinline_param` flags. Emit T0056 when a lambda
+    /// argument whose corresponding parameter is `crossinline` in
+    /// any candidate carries a non-local `return`. Named-arg
+    /// positions are resolved against each candidate's
+    /// `param_names`.
+    fn check_crossinline_arg_returns(
+        &mut self,
+        sigs: &[FnSig],
+        args: &[Expr],
+        arg_names: &[Option<String>],
+    ) {
+        if sigs.is_empty() {
+            return;
+        }
+        if !sigs.iter().any(|s| s.is_crossinline_param.iter().any(|x| *x)) {
+            return;
+        }
+        let mut next_pos: usize = 0;
+        for (i, arg) in args.iter().enumerate() {
+            let param_idx = match arg_names.get(i).and_then(|n| n.as_ref()) {
+                Some(name) => sigs
+                    .iter()
+                    .find_map(|s| s.param_names.iter().position(|p| p == name)),
+                None => {
+                    let idx = next_pos;
+                    next_pos += 1;
+                    Some(idx)
+                }
+            };
+            let Some(idx) = param_idx else { continue };
+            let is_crossinline_here = sigs
+                .iter()
+                .any(|s| s.is_crossinline_param.get(idx).copied().unwrap_or(false));
+            if !is_crossinline_here {
+                continue;
+            }
+            if let Expr::Lambda { body, span, .. } = arg {
+                if Self::lambda_body_has_nonlocal_return(&body.stmts) {
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            "non-local `return` is not allowed inside a lambda passed to a `crossinline` parameter"
+                                .to_string(),
+                            *span,
+                        )
+                        .with_code(codes::TYPE_CROSSINLINE_PARAM_LEAK),
+                    );
+                }
+            }
+        }
+    }
+
     fn check_overloaded_call(
         &mut self,
         sigs: &[FnSig],
@@ -7606,6 +7680,15 @@ impl<'r> Checker<'r> {
         type_args: &[TypeRef],
         call_span: Span,
     ) -> Type {
+        // Crossinline-lambda non-local-return diagnostic (spec
+        // §4.2.5 / T0056). If any overload candidate marks the
+        // current arg position `crossinline` and the argument is a
+        // lambda literal whose body contains a non-local `return`
+        // (one not nested inside another lambda), the lambda
+        // violates `crossinline`'s contract — the spliced body's
+        // return would target the enclosing inline fn's caller, the
+        // exact escape `crossinline` forbids.
+        self.check_crossinline_arg_returns(sigs, args, arg_names);
         // Spec §11.2.6 / §11.2.8: filter the candidate set before any MSC
         // procedure runs. Named-arg names must each map to some parameter
         // of every surviving candidate; explicit `<...>` must match exactly
@@ -9413,6 +9496,81 @@ fn class_name_from_typeref(t: &TypeRef) -> Option<String> {
         return None;
     }
     Some(t.name.name.clone())
+}
+
+/// Walk a lambda body for a non-local `return`. A `return` inside a
+/// nested lambda / anon-fun / object-expression targets that nested
+/// frame and is fine; one at the top level targets the enclosing
+/// function frame, which is the escape `crossinline` forbids.
+fn scan_lambda_stmts_for_return(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Expr(e) => scan_lambda_expr_for_return(e),
+        Stmt::Assign { target, value, .. } => {
+            scan_lambda_expr_for_return(target) || scan_lambda_expr_for_return(value)
+        }
+        Stmt::DestructuringDecl { init, .. } => scan_lambda_expr_for_return(init),
+        Stmt::Decl(klio_ast::Decl::Property(p)) => p
+            .init
+            .as_ref()
+            .map(scan_lambda_expr_for_return)
+            .unwrap_or(false),
+        _ => false,
+    })
+}
+
+fn scan_lambda_expr_for_return(e: &Expr) -> bool {
+    match e {
+        Expr::Return { .. } => true,
+        Expr::Lambda { .. } | Expr::AnonFun { .. } | Expr::ObjectExpr { .. } => false,
+        Expr::Block(b) => scan_lambda_stmts_for_return(&b.stmts),
+        Expr::If { cond, then_branch, else_branch, .. } => {
+            scan_lambda_expr_for_return(cond)
+                || scan_lambda_expr_for_return(then_branch)
+                || else_branch.as_ref().map(|e| scan_lambda_expr_for_return(e)).unwrap_or(false)
+        }
+        Expr::While { cond, body, .. } => {
+            scan_lambda_expr_for_return(cond) || scan_lambda_expr_for_return(body)
+        }
+        Expr::DoWhile { body, cond, .. } => {
+            body.as_ref().map(|b| scan_lambda_expr_for_return(b)).unwrap_or(false)
+                || scan_lambda_expr_for_return(cond)
+        }
+        Expr::For { iter, body, .. } => {
+            scan_lambda_expr_for_return(iter) || scan_lambda_expr_for_return(body)
+        }
+        Expr::When { subject, branches, .. } => {
+            subject.as_ref().map(|s| scan_lambda_expr_for_return(s)).unwrap_or(false)
+                || branches.iter().any(|br| scan_lambda_expr_for_return(&br.body))
+        }
+        Expr::Try { body, catches, finally, .. } => {
+            scan_lambda_stmts_for_return(&body.stmts)
+                || catches.iter().any(|c| scan_lambda_stmts_for_return(&c.body.stmts))
+                || finally
+                    .as_ref()
+                    .map(|fb| scan_lambda_stmts_for_return(&fb.stmts))
+                    .unwrap_or(false)
+        }
+        Expr::Labeled { expr, .. }
+        | Expr::Unary { expr, .. }
+        | Expr::Postfix { expr, .. }
+        | Expr::Throw { value: expr, .. }
+        | Expr::Spread { expr, .. }
+        | Expr::As { expr, .. }
+        | Expr::IsCheck { expr, .. } => scan_lambda_expr_for_return(expr),
+        Expr::Member { receiver, .. } | Expr::MemberRef { receiver, .. } => {
+            scan_lambda_expr_for_return(receiver)
+        }
+        Expr::Call { callee, args, .. } => {
+            scan_lambda_expr_for_return(callee) || args.iter().any(scan_lambda_expr_for_return)
+        }
+        Expr::Index { receiver, args, .. } => {
+            scan_lambda_expr_for_return(receiver) || args.iter().any(scan_lambda_expr_for_return)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            scan_lambda_expr_for_return(lhs) || scan_lambda_expr_for_return(rhs)
+        }
+        _ => false,
+    }
 }
 
 /// Member names that always have a base in the built-in shape hierarchy
