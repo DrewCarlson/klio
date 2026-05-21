@@ -470,9 +470,28 @@ pub struct Block {
     pub catches: Vec<CatchHandler>,
     /// Finally-block id to execute on every exit from this block's
     /// try-region (normal fall-through, catches, returns, throws).
-    /// Set by lowering when the try has a finally clause.
+    /// Set by lowering when the try has a finally clause. Paired
+    /// with [`Block::finally_done`] (the synthesized exit sentinel)
+    /// so the eval can tell "I'm jumping into finally" apart from
+    /// "I've finished finally."
     #[serde(default)]
     pub finally: Option<BlockId>,
+    /// The post-finally sentinel for this try-region — control
+    /// reaches it only after the user finally body has run to
+    /// completion. The eval keys its pop / pending-return /
+    /// pending-rethrow checks against this rather than
+    /// [`Block::finally`], so a finally body with internal control
+    /// flow (an `if`, a `when`) still pops cleanly.
+    #[serde(default)]
+    pub finally_done: Option<BlockId>,
+    /// When this block IS the post-finally sentinel for some
+    /// try-region, this carries the BlockId of that region's body
+    /// entry — the matching key for the [`crate::eval::TryFrame::body`]
+    /// the eval popped. Set on the sentinel itself rather than the
+    /// body so the eval can detect "I just left a finally region"
+    /// directly from the current block's metadata.
+    #[serde(default)]
+    pub finally_done_for: Option<BlockId>,
 }
 
 /// A function body in IR form.

@@ -57,6 +57,7 @@ const KLIO_STDLIB_ACTUAL_FILES: &[&str] = &[
     "kotlin-collections/Builders.kt",
     "kotlin-standard/Standard.kt",
     "kotlin-standard/Preconditions.kt",
+    "kotlin-io/Closeable.kt",
 ];
 
 /// Locate the local upstream Kotlin checkout's `libraries/stdlib`

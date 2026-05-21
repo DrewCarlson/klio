@@ -22,10 +22,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // collection/text builders bridge to Rust-native Value containers;
     // `lazy` / `lazyOf` need the Lazy<T> interface and field-stored
     // callables — both moves planned in the intrinsics-to-Kotlin
-    // migration's later tiers. `use` would migrate cleanly except
-    // the IR lowers `try { ... } finally { ... }` inside an inline
-    // fn with two generic type parameters by duplicating the finally
-    // body — see plans/INTRINSICS-TO-KOTLIN.md.
+    // migration's later tiers.
     ("kotlin.error", contract_error),
     ("kotlin.TODO", contract_todo),
     ("kotlin.collections.buildList", builders_build_list),
@@ -34,9 +31,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.text.buildString", builders_build_string),
     ("kotlin.lazy", lazy_lazy),
     ("kotlin.lazyOf", lazy_lazy_of),
-    ("kotlin.io.use", io_use),
-    ("kotlin.AutoCloseable.use", io_use),
-    ("java.io.Closeable.use", io_use),
 
     // ----- threads / monitors (serialized-interpreter semantics) -----
     ("kotlin.synchronized", concurrent_synchronized),
@@ -1155,23 +1149,6 @@ const PARAM_NAMES: &[(&str, &[&str])] = &[
 // `ctx.host.invoke_callable`. The intrinsic doesn't see the lambda's
 // body — the host wires that back into the interpreter's
 // `invoke_callable_value` path.
-
-fn io_use(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("use expects (receiver, block)".into()));
-    }
-    let recv = ctx.args[0].clone();
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let res = host.invoke_callable(&block, std::slice::from_ref(&recv), *out);
-    // Invoke close() unconditionally on a non-null receiver. The
-    // host's `invoke_method` returns None when the dispatcher isn't
-    // wired (script harnesses), making the close call a no-op there.
-    if !matches!(recv, Value::Null) {
-        let _ = host.invoke_method(&recv, "close", &[], *out);
-    }
-    res
-}
 
 fn iterable_items(v: &Value, what: &str) -> Result<Vec<Value>, RuntimeError> {
     match v {

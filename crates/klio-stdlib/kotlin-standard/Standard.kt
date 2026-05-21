@@ -19,7 +19,7 @@ public inline fun <R> run(block: () -> R): R {
 
 public inline fun <T, R> T.run(block: T.() -> R): R {
     contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }
-    return this.block()
+    return block()
 }
 
 public inline fun <T, R> with(receiver: T, block: T.() -> R): R {
@@ -29,7 +29,7 @@ public inline fun <T, R> with(receiver: T, block: T.() -> R): R {
 
 public inline fun <T> T.apply(block: T.() -> Unit): T {
     contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }
-    this.block()
+    block()
     return this
 }
 

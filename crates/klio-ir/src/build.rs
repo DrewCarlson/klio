@@ -94,6 +94,21 @@ pub struct FuncBuilder<'a> {
     /// Subset of `local_fns` declared as extensions (`fun R.f(...)`);
     /// a bare call must prepend the implicit receiver as `this`.
     local_ext_fns: std::collections::HashSet<String>,
+    /// Params whose declared type is a receiver-typed function
+    /// (`block: T.() -> R`). A bare call `block(...)` on one of
+    /// these must dispatch with the enclosing `this` as the
+    /// implicit receiver, mirroring kotlinc's inline expansion
+    /// where `block()` resolves to `this.block()`.
+    receiver_lambda_params: std::collections::HashSet<String>,
+    /// Stack of user `finally { … }` blocks (innermost on top)
+    /// whose lexical scope encloses the current cursor. A
+    /// `return X` reached during inline expansion replays each
+    /// finally body inline before exiting — matching the JVM's
+    /// `try-finally` bytecode shape where the finally is copied at
+    /// every non-fallthrough exit. Plain (non-inline) `return`
+    /// still routes through the eval's Terminator::Return walk
+    /// instead.
+    finally_stack: Vec<klio_ast::Block>,
     is_lambda_body: bool,
     is_named_local_fn: bool,
     is_inline: bool,
@@ -144,6 +159,8 @@ impl<'a> FuncBuilder<'a> {
             terminator: Terminator::Return(None),
             catches: Vec::new(),
             finally: None,
+            finally_done: None,
+            finally_done_for: None,
         };
         Self {
             module,
@@ -166,6 +183,8 @@ impl<'a> FuncBuilder<'a> {
             param_names: std::collections::HashSet::new(),
             local_fns: std::collections::HashSet::new(),
             local_ext_fns: std::collections::HashSet::new(),
+            receiver_lambda_params: std::collections::HashSet::new(),
+            finally_stack: Vec::new(),
             is_lambda_body: false,
             is_named_local_fn: false,
             is_inline: false,
@@ -481,6 +500,28 @@ impl<'a> FuncBuilder<'a> {
     pub fn is_local_ext_fn(&self, name: &str) -> bool {
         self.local_ext_fns.contains(name)
     }
+    pub fn mark_receiver_lambda_param(&mut self, name: &str) {
+        self.receiver_lambda_params.insert(name.to_string());
+    }
+    pub fn is_receiver_lambda_param(&self, name: &str) -> bool {
+        self.receiver_lambda_params.contains(name)
+    }
+    pub fn push_finally(&mut self, block: klio_ast::Block) {
+        self.finally_stack.push(block);
+    }
+    pub fn pop_finally(&mut self) {
+        self.finally_stack.pop();
+    }
+    #[must_use]
+    pub fn active_finallys(&self) -> Vec<klio_ast::Block> {
+        self.finally_stack.clone()
+    }
+    pub fn swap_finally_stack(
+        &mut self,
+        replacement: Vec<klio_ast::Block>,
+    ) -> Vec<klio_ast::Block> {
+        std::mem::replace(&mut self.finally_stack, replacement)
+    }
     pub fn mark_param(&mut self, name: &str) {
         self.param_names.insert(name.to_string());
     }
@@ -509,6 +550,18 @@ impl<'a> FuncBuilder<'a> {
         let cur = block.0 as usize;
         self.blocks[cur].catches = catches;
         self.blocks[cur].finally = finally;
+    }
+
+    /// Mark `done` as the post-finally sentinel for the try-region
+    /// whose body's entry block is `body_entry`. Cross-links both
+    /// directions: the body block knows where its finally region
+    /// exits, and the sentinel knows which body it belongs to.
+    /// The eval uses these to detect "I just left this finally
+    /// region" regardless of the user finally body's internal
+    /// control flow.
+    pub fn set_finally_done_for(&mut self, body_entry: BlockId, done: BlockId) {
+        self.blocks[body_entry.0 as usize].finally_done = Some(done);
+        self.blocks[done.0 as usize].finally_done_for = Some(body_entry);
     }
 
     /// Snapshot every register currently bound in any live scope.
@@ -579,6 +632,8 @@ impl<'a> FuncBuilder<'a> {
             terminator: Terminator::Unreachable,
             catches: Vec::new(),
             finally: None,
+            finally_done: None,
+            finally_done_for: None,
         });
         id
     }

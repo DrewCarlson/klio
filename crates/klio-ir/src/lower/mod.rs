@@ -892,6 +892,22 @@ fn lower_function_body_with_implicit_owner_priv(
     names.extend_from_slice(implicit_params);
     names.extend(f.params.iter().map(|p| p.name.name.as_str()));
     bind_params(&mut b, &names);
+    // A param whose declared type is a receiver-typed function
+    // (`block: T.() -> R`) carries that fact so a bare call
+    // `block(...)` inside the body lowers to a member-call with
+    // the enclosing `this` as receiver. Implicit params (like the
+    // class `this` injected for methods) never come in this shape,
+    // so we only walk the source params.
+    for p in &f.params {
+        if p.ty
+            .function
+            .as_ref()
+            .and_then(|ft| ft.receiver.as_ref())
+            .is_some()
+        {
+            b.mark_receiver_lambda_param(&p.name.name);
+        }
+    }
     if let Some(owner) = owner_class {
         let _ = b.set_owner_class(owner.to_string());
     }
@@ -2232,6 +2248,39 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         } else {
                             reg
                         };
+                        // A bare call to a parameter whose declared
+                        // type is a receiver-typed function
+                        // (`block: T.() -> R`) dispatches with the
+                        // enclosing `this` as the receiver — matching
+                        // kotlinc's rewrite of `block()` to
+                        // `this.block()` inside such a fn.
+                        if b.is_receiver_lambda_param(&segments[0].name) {
+                            let this_reg = b.resolve("this").or_else(|| {
+                                if b.knows_outer("this") || b.is_lambda_body() {
+                                    let idx = b.record_capture("this");
+                                    let d = b.alloc_reg();
+                                    b.push(Inst::LoadCapture { dst: d, idx });
+                                    Some(d)
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(this_reg) = this_reg {
+                                let (args_start, count) = lower_arg_run(b, args);
+                                let arg_names =
+                                    intern_arg_names(b.module, ast_arg_names);
+                                let dst = b.alloc_reg();
+                                b.push(Inst::CallValueWithThis {
+                                    dst,
+                                    callee: callee_reg,
+                                    receiver: this_reg,
+                                    args: args_start,
+                                    n_args: count,
+                                    arg_names,
+                                });
+                                return dst;
+                            }
+                        }
                         // A bare call to a *local extension* function
                         // (`fun Appendable.two(x)` declared in this
                         // scope, called `two(n)`) takes the enclosing
@@ -3224,6 +3273,25 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     if let Some(rr) = r {
                         b.push(Inst::Move { dst: res, src: rr });
                     }
+                    // Replay every active `finally { … }` block
+                    // inline before exiting, matching JVM `try-
+                    // finally` bytecode shape: each non-fallthrough
+                    // exit from the try body copies the finally body
+                    // at the exit point. Lower top-down (innermost
+                    // first); each replay's own statements run with
+                    // the remaining (outer) finallys still active so
+                    // a `return` inside a finally body skips its own
+                    // finally but still threads any further outers.
+                    let pending = b.active_finallys();
+                    if !pending.is_empty() {
+                        let prior = b.swap_finally_stack(Vec::new());
+                        for (idx, blk) in pending.iter().rev().enumerate() {
+                            let outer = prior[..prior.len() - (idx + 1)].to_vec();
+                            b.swap_finally_stack(outer);
+                            let _ = lower_block(b, blk);
+                        }
+                        b.swap_finally_stack(prior);
+                    }
                     b.terminate(Terminator::Goto(join));
                     let dead = b.alloc_block();
                     b.switch_to(dead);
@@ -3297,9 +3365,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // each handler's type_name, jumps to the matching
             // handler with the exception bound to its
             // exception_reg, and runs finally on every exit.
+            //
             let result = b.alloc_reg();
             let exit = b.alloc_block();
-            let finally_blk = finally.as_ref().map(|_| b.alloc_block());
+            let finally_entry = finally.as_ref().map(|_| b.alloc_block());
 
             // Pre-allocate each catch handler's entry block + the
             // exception register. We'll fill in their bodies after
@@ -3328,10 +3397,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     exception_reg: *exc,
                 })
                 .collect();
-            b.attach_catches(cur_id, catch_handlers, finally_blk);
+            b.attach_catches(cur_id, catch_handlers, finally_entry);
+            if let Some(blk) = finally {
+                b.push_finally(blk.clone());
+            }
             let body_val = lower_block(b, body);
             b.push(Inst::Move { dst: result, src: body_val });
-            if let Some(fin) = finally_blk {
+            if let Some(fin) = finally_entry {
                 b.terminate(Terminator::Goto(fin));
             } else {
                 b.terminate(Terminator::Goto(exit));
@@ -3346,22 +3418,40 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let v = lower_block(b, &c.body);
                 b.push(Inst::Move { dst: result, src: v });
                 b.pop_scope();
-                if let Some(fin) = finally_blk {
+                if let Some(fin) = finally_entry {
                     b.terminate(Terminator::Goto(fin));
                 } else {
                     b.terminate(Terminator::Goto(exit));
                 }
             }
 
-            // Finally body (if present): lower then fall through
-            // to exit. (Re-throw on uncaught propagation is a
-            // future refinement; the simple model runs finally
-            // once on caught + normal-exit paths.)
-            if let Some(fin) = finally_blk {
+            // Finally body (if present): lower it inside
+            // `finally_entry`. Pop the active-finally stack first
+            // so a `return` inside the finally body doesn't replay
+            // itself.
+            //
+            // Routing every path out of the finally through a
+            // separate sentinel `finally_done` block is what makes
+            // the eval's pop-on-Goto check robust: the user finally
+            // body may contain its own control flow (an `if`, a
+            // `when`) so its last basic block isn't necessarily
+            // `finally_entry`. We pin every fallthrough exit to
+            // `finally_done` so the eval can pop the try-stack
+            // entry when (and only when) `cur == finally_done` —
+            // without that, a later `Return` walking outer scopes
+            // would re-enter this finally a second time.
+            if let Some(fin) = finally_entry {
+                if finally.is_some() {
+                    b.pop_finally();
+                }
+                let finally_done = b.alloc_block();
                 b.switch_to(fin);
                 if let Some(blk) = finally {
                     let _ = lower_block(b, blk);
                 }
+                b.terminate(Terminator::Goto(finally_done));
+                b.switch_to(finally_done);
+                b.set_finally_done_for(cur_id, finally_done);
                 b.terminate(Terminator::Goto(exit));
             }
 

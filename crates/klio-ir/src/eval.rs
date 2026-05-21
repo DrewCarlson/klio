@@ -487,6 +487,28 @@ pub enum EvalError {
     Suspended(Box<SuspendState>),
 }
 
+/// One active try-region recorded on the eval's try-stack. Separates
+/// the *entry* (where to jump to start running finally / catch) from
+/// the *done sentinel* (the synthesized block whose entry signals
+/// the finally body has run to completion regardless of any internal
+/// control flow in the user finally body).
+#[derive(Debug, Clone)]
+pub struct TryFrame {
+    /// The try body's entry block — the key for matching pop /
+    /// pending-return / pending-rethrow against `Block::finally_done_for`.
+    pub body: BlockId,
+    pub catches: Vec<crate::CatchHandler>,
+    /// Where to jump to start running the finally / first catch.
+    /// `None` for a try with only catches and no finally.
+    pub finally_entry: Option<BlockId>,
+    /// The post-finally sentinel block: control reaches this only
+    /// after the user finally body has finished, no matter what its
+    /// internal control flow looked like. The eval keys its
+    /// pop / pending-return / pending-rethrow checks against this
+    /// rather than `finally_entry`.
+    pub finally_done: Option<BlockId>,
+}
+
 /// One paused `eval_with_captures` activation. Enough to re-enter
 /// the block loop exactly where it left off.
 #[derive(Debug, Clone)]
@@ -498,7 +520,7 @@ pub struct FrameSnapshot {
     pub regs: Vec<Value>,
     pub params: Vec<Value>,
     pub captures: Vec<Value>,
-    pub try_stack: Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)>,
+    pub try_stack: Vec<TryFrame>,
     pub is_lambda: bool,
     /// Register the resumed value is written into before execution
     /// continues (the destination of the suspending call site).
@@ -610,7 +632,7 @@ pub fn eval_with_captures(
     // conservative defaults sufficient for the deepest known
     // interpreted call chains in the pack corpus.
     stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
-        let mut try_stack: Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)> = Vec::new();
+        let mut try_stack: Vec<TryFrame> = Vec::new();
         let func_name = func.name.clone();
         let mut frame = Frame::new_with_captures(module, func, args, captures);
         let cur = func.entry;
@@ -720,7 +742,7 @@ pub fn resume_continuation(
 fn run_frame<'a>(
     module: &'a Module,
     frame: &mut Frame<'a>,
-    try_stack: &mut Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)>,
+    try_stack: &mut Vec<TryFrame>,
     cur: BlockId,
     resume_idx: usize,
     host: &mut dyn Host,
@@ -737,7 +759,7 @@ fn run_frame<'a>(
 fn run_frame_inner<'a>(
     module: &'a Module,
     frame: &mut Frame<'a>,
-    try_stack: &mut Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)>,
+    try_stack: &mut Vec<TryFrame>,
     mut cur: BlockId,
     mut resume_idx: usize,
     mut resume_throw: Option<Value>,
@@ -747,17 +769,23 @@ fn run_frame_inner<'a>(
     let mut pending_return: Option<(BlockId, Value)> = None;
     loop {
         // Push any catch / finally metadata attached to this block.
-        let (insts, term, catches, finally) = {
+        let (insts, term, catches, finally, finally_done) = {
             let block = frame.block(cur);
             (
                 block.insts.clone(),
                 block.terminator.clone(),
                 block.catches.clone(),
                 block.finally,
+                block.finally_done,
             )
         };
         if resume_idx == 0 && (!catches.is_empty() || finally.is_some()) {
-            try_stack.push((cur, catches, finally));
+            try_stack.push(TryFrame {
+                body: cur,
+                catches,
+                finally_entry: finally,
+                finally_done,
+            });
         }
         let mut thrown: Option<Value> = None;
         let mut start_idx = std::mem::take(&mut resume_idx);
@@ -814,8 +842,8 @@ fn run_frame_inner<'a>(
         if let Some(exc) = thrown {
             // Mid-block throw — same try-stack walk as Terminator::Throw.
             let mut routed = false;
-            while let Some((_blk, hcatches, hfinally)) = try_stack.pop() {
-                if let Some(h) = hcatches.iter().find(|h| host.instance_of(
+            while let Some(tf) = try_stack.pop() {
+                if let Some(h) = tf.catches.iter().find(|h| host.instance_of(
                     &exc,
                     &TypeRef {
                         name: h.type_name.clone(),
@@ -827,8 +855,9 @@ fn run_frame_inner<'a>(
                     cur = h.handler;
                     routed = true;
                     break;
-                } else if let Some(fin) = hfinally {
-                    pending_rethrow = Some((fin, exc.clone()));
+                } else if let Some(fin) = tf.finally_entry {
+                    let key = tf.finally_done.unwrap_or(fin);
+                    pending_rethrow = Some((key, exc.clone()));
                     cur = fin;
                     routed = true;
                     break;
@@ -845,38 +874,54 @@ fn run_frame_inner<'a>(
         // normal completion, an entry leaks past the try, and a
         // later `Return` (e.g. the enclosing lambda's overall
         // return terminator) can mis-route through `pending_return`
-        // and replay the same finally a second time. When the
-        // current block IS the finally and its terminator is a
-        // plain `Goto`, the try has run to normal completion;
-        // discard the matching try-stack entry so subsequent
-        // returns don't see it.
+        // and replay the same finally a second time.
+        //
+        // The pop fires on either of two signals:
+        //   * `block.finally_done_for == Some(body_entry)` — this
+        //     block is the post-finally sentinel synthesized by the
+        //     try lowering. Pop the try-stack entry whose body
+        //     entry matches, no matter what the user finally body's
+        //     internal control flow looks like.
+        //   * Legacy match `cur == entry.finally` — kept for
+        //     non-Try blocks that share the `finally` field shape
+        //     and for safety until the sentinel is everywhere.
         if matches!(term, Terminator::Goto(_))
             && pending_rethrow.is_none()
             && pending_return.is_none()
         {
-            let pos = try_stack
-                .iter()
-                .rposition(|(_, _, f)| matches!(*f, Some(b) if b == cur));
+            let done_for = frame.block(cur).finally_done_for;
+            let pos = if let Some(body) = done_for {
+                try_stack.iter().rposition(|tf| tf.body == body)
+            } else {
+                try_stack
+                    .iter()
+                    .rposition(|tf| matches!(tf.finally_entry, Some(b) if b == cur))
+            };
             if let Some(p) = pos {
                 try_stack.remove(p);
             }
         }
         // Finally exit with a pending return: replay the return
-        // through any outer finally, otherwise complete it.
+        // through any outer finally, otherwise complete it. The key
+        // pinned in `pending_return` is the *done sentinel* — the
+        // synthesized exit block of the user finally body, so an
+        // `if`/`when` inside the finally still resolves here once
+        // its join reaches the sentinel.
         if let Some((fin, _)) = &pending_return {
             if *fin == cur && matches!(term, Terminator::Goto(_)) {
                 let (_, v) = pending_return.take().unwrap();
-                let mut chosen: Option<(usize, BlockId)> = None;
+                let mut chosen: Option<(usize, BlockId, BlockId)> = None;
                 for i in (0..try_stack.len()).rev() {
-                    if let Some(fin2) = try_stack[i].2 {
-                        chosen = Some((i, fin2));
+                    if let Some(fin2) = try_stack[i].finally_entry {
+                        let key = try_stack[i].finally_done.unwrap_or(fin2);
+                        chosen = Some((i, fin2, key));
                         break;
                     }
                 }
-                if let Some((i, fin2)) = chosen {
+                if let Some((i, jump, key)) = chosen {
                     try_stack.truncate(i);
-                    pending_return = Some((fin2, v));
-                    cur = fin2;
+                    pending_return = Some((key, v));
+                    cur = jump;
                     continue;
                 }
                 return Ok(v);
@@ -902,8 +947,8 @@ fn run_frame_inner<'a>(
             if *fin == cur && matches!(term, Terminator::Goto(_)) {
                 let (_, exc) = pending_rethrow.take().unwrap();
                 let mut routed = false;
-                while let Some((_blk, hcatches, hfinally)) = try_stack.pop() {
-                    if let Some(h) = hcatches.iter().find(|h| host.instance_of(
+                while let Some(tf) = try_stack.pop() {
+                    if let Some(h) = tf.catches.iter().find(|h| host.instance_of(
                         &exc,
                         &TypeRef {
                             name: h.type_name.clone(),
@@ -915,8 +960,9 @@ fn run_frame_inner<'a>(
                         cur = h.handler;
                         routed = true;
                         break;
-                    } else if let Some(fin2) = hfinally {
-                        pending_rethrow = Some((fin2, exc.clone()));
+                    } else if let Some(fin2) = tf.finally_entry {
+                        let key = tf.finally_done.unwrap_or(fin2);
+                        pending_rethrow = Some((key, exc.clone()));
                         cur = fin2;
                         routed = true;
                         break;
@@ -952,18 +998,22 @@ fn run_frame_inner<'a>(
                 // Walk the try-stack for the nearest finally; route
                 // the return through it (finally's own exit completes
                 // the return, and an inner `return` inside finally
-                // overrides the saved value).
-                let mut chosen: Option<(usize, BlockId)> = None;
+                // overrides the saved value). The pinned key is the
+                // *done sentinel* so a finally body with internal
+                // control flow still completes the return when its
+                // join reaches the sentinel.
+                let mut chosen: Option<(usize, BlockId, BlockId)> = None;
                 for i in (0..try_stack.len()).rev() {
-                    if let Some(fin) = try_stack[i].2 {
-                        chosen = Some((i, fin));
+                    if let Some(fin) = try_stack[i].finally_entry {
+                        let key = try_stack[i].finally_done.unwrap_or(fin);
+                        chosen = Some((i, fin, key));
                         break;
                     }
                 }
-                if let Some((i, fin)) = chosen {
+                if let Some((i, jump, key)) = chosen {
                     try_stack.truncate(i);
-                    pending_return = Some((fin, v));
-                    cur = fin;
+                    pending_return = Some((key, v));
+                    cur = jump;
                     continue;
                 }
                 return Ok(v);
@@ -986,7 +1036,9 @@ fn run_frame_inner<'a>(
                 let exc = frame.read(r);
                 // Walk the try stack for a matching handler.
                 let mut routed = false;
-                while let Some((_blk, hcatches, hfinally)) = try_stack.pop() {
+                while let Some(tf) = try_stack.pop() {
+                    let hcatches = &tf.catches;
+                    let hfinally = tf.finally_entry;
                     if let Some(h) = hcatches.iter().find(|h| host.instance_of(
                         &exc,
                         &TypeRef {
@@ -1006,7 +1058,8 @@ fn run_frame_inner<'a>(
                         // exception when finally exits normally
                         // (Goto). A `return` / `throw` inside
                         // finally clears the pending re-throw.
-                        pending_rethrow = Some((fin, exc.clone()));
+                        let key = tf.finally_done.unwrap_or(fin);
+                        pending_rethrow = Some((key, exc.clone()));
                         cur = fin;
                         routed = true;
                         break;
