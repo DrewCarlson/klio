@@ -6900,7 +6900,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     .into_iter()
                     .next()
                     .filter(|(_, f)| {
-                        self.overload_score_arg(&f.params[0].ty, receiver).is_some()
+                        // Reject only when the receiver is a class
+                        // instance whose hierarchy provably can't
+                        // satisfy the candidate's declared receiver
+                        // type. Built-in / Unit / Null values
+                        // historically reached extensions whose body
+                        // happened to tolerate the shape, so the
+                        // filter is intentionally narrow — its only
+                        // job is to keep e.g. the shipped
+                        // `Iterable<T>.all` shim from hijacking a
+                        // `Logged` instance's `all()` that should
+                        // forward to its `Repository by inner`
+                        // delegate. A wider filter (any `None`
+                        // score) regressed the existing dispatch
+                        // for builtin / Unit receivers that worked
+                        // by happenstance.
+                        if matches!(receiver, klio_runtime::Value::Instance(_)) {
+                            self.overload_score_arg(&f.params[0].ty, receiver).is_some()
+                        } else {
+                            true
+                        }
                     })
             } else if unique_exact.is_some() {
                 unique_exact
@@ -7003,9 +7022,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     // against the wrong shape — usually surfacing as
                     // an `iterator()` lookup failure when the body
                     // tries to iterate the receiver.
-                    let recv_score = match self.overload_score_arg(&f.params[0].ty, receiver) {
+                    let recv_score_opt = self.overload_score_arg(&f.params[0].ty, receiver);
+                    // Same narrow filter as the single-candidate
+                    // fast path: only an Instance receiver with a
+                    // provably-mismatching class hierarchy is hard
+                    // dropped. Other receivers fall back to a -1
+                    // score so the original picks-by-tie behavior
+                    // is preserved.
+                    let recv_score = match recv_score_opt {
                         Some(s) => s,
-                        None => continue,
+                        None if matches!(receiver, klio_runtime::Value::Instance(_)) => continue,
+                        None => -1,
                     };
                     let mut score = recv_score;
                     for (i, a) in args.iter().enumerate() {
