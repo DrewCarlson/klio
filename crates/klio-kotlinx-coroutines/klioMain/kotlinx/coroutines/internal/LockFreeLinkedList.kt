@@ -1,21 +1,26 @@
 // klio actual for the upstream `expect` lock-free intrusive list.
 //
-// Not actually lock-free: every mutation and traversal takes the
-// monitor on the list's head node. This is correct (multiple
-// `Dispatchers.Default` workers can call `addLast` / `remove` /
-// `forEach` concurrently without losing entries or seeing a torn
-// list) at the cost of coarse-grained exclusion. Upgrading to a
-// real CAS-based lock-free node would let multiple workers progress
-// in parallel on disjoint list operations, but the cancellation
-// handler list (the primary upstream consumer) is short-lived
-// per-coroutine, so contention is naturally low.
+// Caveat: this implementation is intentionally lock-based, NOT
+// lock-free, despite the class name carrying the upstream contract.
+// Direct port of upstream's Sundell-Tsigas algorithm (see
+// `upstream/kotlinx-coroutines-core/concurrent/src/internal/LockFreeLinkedList.kt`)
+// works correctly in isolation but transitively reaches kxco
+// internals (Segment-based semaphore queues,
+// ConcurrentLinkedList helpers) whose `acquirers` / segment-class
+// shape klio's runtime does not yet resolve. Until that gap is
+// closed, this locked port keeps the cancellation handler list
+// and Job-children list semantically correct under
+// `Dispatchers.Default` contention — at the cost of coarse-grained
+// exclusion. Tracked in `plans/LANGUAGE-GAPS.md`.
 //
 // The monitor is rooted at the head node so all nodes that belong
 // to a single list serialize through the same lock — `addLast` /
 // `remove` mutate two adjacent links and must be atomic with
 // respect to a concurrent `forEach` that walks them. Each node
-// caches a reference to its head so non-head mutators can find
-// the right lock without an extra parameter.
+// caches a reference to its head so non-head mutators find the
+// right lock without an extra parameter. `forEach` snapshots the
+// visit set under the lock and invokes the user block outside it
+// so a handler that removes itself doesn't self-deadlock.
 
 package kotlinx.coroutines.internal
 
