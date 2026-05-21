@@ -6887,7 +6887,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
             };
             let chosen = if candidates.len() <= 1 {
-                candidates.into_iter().next()
+                // Single candidate: still verify the receiver type is
+                // compatible. Without this guard, a same-simple-name
+                // extension declared on an unrelated receiver (e.g.
+                // the shipped `Iterable<T>.all` shim picked for a
+                // `Logged` instance that delegates `Repository` via
+                // `by`) wins by default and its body runs against the
+                // wrong shape — usually surfacing as an `iterator()`
+                // lookup failure when the body tries to iterate the
+                // receiver.
+                candidates
+                    .into_iter()
+                    .next()
+                    .filter(|(_, f)| {
+                        self.overload_score_arg(&f.params[0].ty, receiver).is_some()
+                    })
             } else if unique_exact.is_some() {
                 unique_exact
             } else {
@@ -6979,9 +6993,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 let mut best: Option<((klio_ir::FuncId, klio_ir::Func), (i32, i32, i32))> =
                     None;
                 for (idx, (fid, f)) in candidates.into_iter().enumerate() {
-                    let mut score = self
-                        .overload_score_arg(&f.params[0].ty, receiver)
-                        .unwrap_or(-1);
+                    // Drop candidates whose declared receiver type
+                    // can't accommodate this call's actual receiver.
+                    // Without this filter, a same-simple-name extension
+                    // declared on an unrelated receiver (e.g. the
+                    // shipped `Iterable<T>.all` shim picked for a
+                    // `Logged` instance that delegates `Repository`
+                    // via `by`) wins by default and its body runs
+                    // against the wrong shape — usually surfacing as
+                    // an `iterator()` lookup failure when the body
+                    // tries to iterate the receiver.
+                    let recv_score = match self.overload_score_arg(&f.params[0].ty, receiver) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let mut score = recv_score;
                     for (i, a) in args.iter().enumerate() {
                         if let Some(p) = f.params.get(i + 1) {
                             score += self.overload_score_arg(&p.ty, a).unwrap_or(-1);
