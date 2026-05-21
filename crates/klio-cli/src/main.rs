@@ -1133,14 +1133,24 @@ fn load_installed_packs(
         }
     };
     let merged = merged_host_bindings();
+    // Collect every candidate pack on disk once. Loading is then a
+    // fixed-point loop over this list: each pass loads packs whose
+    // `library_id` matches a currently-known import prefix, and the
+    // pass's freshly-loaded ASTs contribute their own imports to
+    // the prefix set for the next pass. This lets a pack that
+    // transitively depends on another pack (e.g. coroutines on
+    // atomicfu) pull its dependency in even when the user program
+    // imports only the outer library.
+    struct PackCandidate {
+        pack: klio_pack::PackReader,
+        manifest: klio_pack::schema::PackManifest,
+    }
+    let mut candidates: Vec<PackCandidate> = Vec::new();
     for e in entries.flatten() {
         let p = e.path();
         if p.extension().map(|x| x != "klio-pack").unwrap_or(true) {
             continue;
         }
-        // The stdlib pack ships bytecode the interpreter has already
-        // statically linked; skip it so we don't double-load the
-        // implicit-aliases surface.
         if p.file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.starts_with("stdlib"))
@@ -1166,19 +1176,31 @@ fn load_installed_packs(
             Some(m) => m,
             None => continue,
         };
-        // Only load packs whose `library_id` matches an import the
-        // user actually wrote (prefix match — `kotlinx.coroutines`
-        // is loaded when the source contains `import
-        // kotlinx.coroutines.runBlocking`).
-        let lib_id = &manifest.library_id;
-        let wanted = user_import_prefixes.iter().any(|imp| {
-            imp == lib_id
-                || imp.starts_with(&format!("{lib_id}."))
-                || lib_id.starts_with(&format!("{imp}."))
-        });
-        if !wanted {
-            continue;
-        }
+        candidates.push(PackCandidate { pack, manifest });
+    }
+    let mut known_prefixes = user_import_prefixes.clone();
+    let mut loaded_lib_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let mut progressed = false;
+        let mut new_imports: Vec<String> = Vec::new();
+        for c in &candidates {
+            let lib_id = &c.manifest.library_id;
+            if loaded_lib_ids.contains(lib_id) {
+                continue;
+            }
+            let wanted = known_prefixes.iter().any(|imp| {
+                imp == lib_id
+                    || imp.starts_with(&format!("{lib_id}."))
+                    || lib_id.starts_with(&format!("{imp}."))
+            });
+            if !wanted {
+                continue;
+            }
+            loaded_lib_ids.insert(lib_id.clone());
+            progressed = true;
+            let manifest = &c.manifest;
+            let pack = &c.pack;
+            let lib_id = lib_id.clone();
         // Teach the resolver every package this pack ships +
         // declares implicit, so user `import kotlinx.*` lines
         // resolve instead of tripping the "only kotlin.* is known"
@@ -1224,6 +1246,15 @@ fn load_installed_packs(
                             klio_stdlib::register_known_package(path);
                         }
                     }
+                    for imp in &ast.imports {
+                        new_imports.push(
+                            imp.path
+                                .iter()
+                                .map(|i| i.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("."),
+                        );
+                    }
                     out_asts.push(ast);
                     loaded_from_sources = true;
                 }
@@ -1243,6 +1274,15 @@ fn load_installed_packs(
                             if !path.is_empty() {
                                 klio_stdlib::register_known_package(path);
                             }
+                        }
+                        for imp in &f.kotlin_file.imports {
+                            new_imports.push(
+                                imp.path
+                                    .iter()
+                                    .map(|i| i.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("."),
+                            );
                         }
                         out_asts.push(f.kotlin_file);
                     }
@@ -1275,24 +1315,18 @@ fn load_installed_packs(
                 out_bindings.register(fqn, f);
             }
         }
-    }
-    // Re-derive the import set including the freshly-loaded pack
-    // ASTs so a pack that imports kotlin.time pulls in the embedded
-    // stdlib kotlin.time sources too.
-    let mut combined_prefixes = user_import_prefixes.clone();
-    for f in &out_asts {
-        for imp in &f.imports {
-            combined_prefixes.insert(
-                imp.path
-                    .iter()
-                    .map(|i| i.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join("."),
-            );
+        }
+        if !progressed {
+            break;
+        }
+        for imp in new_imports {
+            if !imp.is_empty() {
+                known_prefixes.insert(imp);
+            }
         }
     }
     load_embedded_stdlib_sources(
-        &combined_prefixes,
+        &known_prefixes,
         source_map,
         &mut out_asts,
         &mut out_bindings,
