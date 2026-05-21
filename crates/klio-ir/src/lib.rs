@@ -694,31 +694,23 @@ impl Module {
     /// Look up a top-level function by simple name. When multiple
     /// candidates share the simple name (e.g. a user `fun produce(...)`
     /// declared alongside a star-imported
-    /// `kotlinx.coroutines.channels.produce`), a candidate from the
-    /// no-package scope — i.e. one whose `Func::fqn` equals its simple
-    /// name — wins so the user's top-level decl shadows the packaged
-    /// import at a bare call site, matching Kotlin's rule that an
-    /// explicit declaration in the current scope beats a wildcard-
-    /// imported symbol. Callers that already have an FQN should prefer
+    /// `kotlinx.coroutines.channels.produce`, or a user `fun use(...)`
+    /// alongside the shipped `kotlin.use` extension), the *last*
+    /// registered candidate wins. Build pipelines order ASTs as
+    /// `[pack..., stdlib..., user]` so the user's declaration is
+    /// registered last and shadows any stdlib / pack decl of the
+    /// same simple name — matching Kotlin's rule that an explicit
+    /// declaration in the current scope beats a wildcard-imported
+    /// symbol. Callers that already have an FQN should prefer
     /// [`func_id_by_fqn`](Self::func_id_by_fqn) to disambiguate
     /// same-simple-name declarations from different packages.
     #[must_use]
     pub fn func_id(&self, name: &str) -> Option<FuncId> {
-        let mut first: Option<FuncId> = None;
-        for (n, id) in &self.func_index {
-            if n != name {
-                continue;
-            }
-            if first.is_none() {
-                first = Some(*id);
-            }
-            if let Some(f) = self.funcs.get(id.0 as usize) {
-                if f.fqn == name {
-                    return Some(*id);
-                }
-            }
-        }
-        first
+        self.func_index
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| *id)
     }
 
     /// Look up a top-level function by fully-qualified name (matches
