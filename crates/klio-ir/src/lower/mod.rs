@@ -2042,21 +2042,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         if let Some(lam) = b.inline_lambda_for(nm) {
                             return splice_inline_lambda(b, &lam, args);
                         }
-                        if let Some(f) = inline_fn_ast(nm) {
-                            // Inline a suspending builder (continuation
-                            // capture) or any inline fn called with a
-                            // lambda that does a non-local `return`
-                            // (must target the caller). Other inline
-                            // calls keep the normal path so the inline
-                            // graph cannot expand combinatorially.
-                            let needs_inline = f.is_suspend
-                                || arg_lambda_has_nonlocal_return(args);
-                            if needs_inline {
-                                if let Some(r) = try_inline_call(
-                                    b, nm, args, ast_arg_names, None,
-                                ) {
-                                    return r;
-                                }
+                        if inline_fn_ast(nm).is_some() {
+                            // Every `inline fun` splices into the
+                            // caller, matching Kotlin's bytecode
+                            // semantics. `try_inline_call` returns
+                            // `None` on the safety paths that used to
+                            // be guarded by the old "suspend or
+                            // non-local-return" heuristic (recursive
+                            // expansion, `INLINE_EXPAND_MAX` ceiling,
+                            // missing default args), so the call
+                            // falls back to a normal dispatch in
+                            // those cases.
+                            if let Some(r) = try_inline_call(
+                                b, nm, args, ast_arg_names, None,
+                            ) {
+                                return r;
                             }
                         }
                     }

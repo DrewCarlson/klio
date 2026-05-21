@@ -2260,6 +2260,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
             return Ok(receiver.clone());
         }
+        // Value-class internal-field read on `kotlin.Result` /
+        // `kotlinx.coroutines.channels.ChannelResult`. Both upstream
+        // declarations are inline value classes wrapping a single
+        // `Any?`; klio represents both as `Value::Result { ok,
+        // payload }`. A bare field read on either's internal
+        // `value` / `holder` slot yields the payload (success values
+        // are the bare value, failures hold the `Throwable`-shaped
+        // Value::Exception). The names are upstream-internal, so an
+        // exact-name match is safe.
+        if matches!(name, "value" | "holder") {
+            if let klio_runtime::Value::Result { payload, .. } = receiver {
+                return Ok((**payload).clone());
+            }
+        }
         // Backing-field bypass: getter / setter bodies that reference
         // `field` lower into a member read on this synthetic name.
         // Route straight to the raw instance slot to break recursion.
