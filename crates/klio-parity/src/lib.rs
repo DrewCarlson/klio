@@ -854,11 +854,25 @@ pub fn run_with_ktc(file: &Path) -> Result<String, String> {
     if diags.has_errors() {
         return Err(format!("parse diagnostics: {:?}", diags.diagnostics()));
     }
+    // Pull in the embedded stdlib pack's curated commonMain sources
+    // (scope functions, preconditions, list factories, kotlin.time,
+    // kotlin.coroutines) so the run sees the same surface a
+    // production `klio run` does. Without this, recently-migrated
+    // scope/precondition shims appear unresolved when the parity
+    // check runs the no-pack path.
+    let user_asts = vec![ast];
+    let stdlib_asts = embedded_stdlib_sources(&user_asts, &mut map);
+    let mut asts: Vec<klio_ast::KotlinFile> =
+        Vec::with_capacity(user_asts.len() + stdlib_asts.len());
+    asts.extend(stdlib_asts);
+    asts.extend(user_asts);
     klio_interp_ir::set_coroutine_time_mode(klio_interp_ir::TimeMode::Virtual);
     let mut out = CaptureOutput::default();
-    let r = klio_resolver::resolve(&ast);
-    let _ = klio_typeck::typecheck(&ast, &r);
-    let built = build_module(&ast);
+    for ast in &asts {
+        let r = klio_resolver::resolve(ast);
+        let _ = klio_typeck::typecheck(ast, &r);
+    }
+    let built = klio_interp_ir::build::build_module_files(&asts);
     let Some(main_id) = built.main else {
         return Err("no main function in module".into());
     };
