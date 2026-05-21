@@ -23,23 +23,36 @@ package kotlinx.datetime
 import kotlin.time.Instant
 
 // --- internal native helpers (bound natively by the klio host) ----
+//
+// Each body below is unreachable when the kotlinx-datetime pack
+// loads its Rust binding table at startup: the binding shadows the
+// AST dispatch. If a caller still reaches the AST body (binding
+// missing or removed), failing loudly with `NotImplementedError`
+// is correct — silent zero / "UTC" returns hid binding-registration
+// regressions in the past.
 
-internal fun __kxdt_currentTimeMillis(): Long = 0L
-internal fun __kxdt_currentNanosOfSecond(): Int = 0
-internal fun __kxdt_currentSystemTimeZoneId(): String = "UTC"
+internal fun __kxdt_currentTimeMillis(): Long =
+    throw NotImplementedError("__kxdt_currentTimeMillis: host binding not installed")
+
+internal fun __kxdt_currentNanosOfSecond(): Int =
+    throw NotImplementedError("__kxdt_currentNanosOfSecond: host binding not installed")
+
+internal fun __kxdt_currentSystemTimeZoneId(): String =
+    throw NotImplementedError("__kxdt_currentSystemTimeZoneId: host binding not installed")
 
 // Returns [year, month, day, hour, minute, second, nanosecond].
 internal fun __kxdt_instantToLocalParts(epochSeconds: Long, nanos: Int, tz: String): LongArray =
-    longArrayOf(1970L, 1L, 1L, 0L, 0L, 0L, 0L)
+    throw NotImplementedError("__kxdt_instantToLocalParts: host binding not installed")
 
 // Returns [epochSeconds, nanos].
 internal fun __kxdt_localToInstant(
     year: Int, month: Int, day: Int,
     hour: Int, minute: Int, second: Int, nano: Int,
     tz: String,
-): LongArray = longArrayOf(0L, 0L)
+): LongArray = throw NotImplementedError("__kxdt_localToInstant: host binding not installed")
 
-internal fun __kxdt_validateTimeZone(id: String): Boolean = true
+internal fun __kxdt_validateTimeZone(id: String): Boolean =
+    throw NotImplementedError("__kxdt_validateTimeZone: host binding not installed")
 
 // Returns [epochSeconds, nanos] after applying the calendar period
 // in the given tz.
@@ -54,7 +67,7 @@ internal fun __kxdt_addPeriod(
     seconds: Int,
     nanoAdjust: Long,
     tz: String,
-): LongArray = longArrayOf(epochSeconds, nanos.toLong())
+): LongArray = throw NotImplementedError("__kxdt_addPeriod: host binding not installed")
 
 // --- LocalDate / LocalTime / LocalDateTime actuals ---------------
 
