@@ -29,8 +29,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.buildSet", builders_build_set),
     ("kotlin.collections.buildMap", builders_build_map),
     ("kotlin.text.buildString", builders_build_string),
-    ("kotlin.lazy", lazy_lazy),
-    ("kotlin.lazyOf", lazy_lazy_of),
 
     // ----- threads / monitors (serialized-interpreter semantics) -----
     ("kotlin.synchronized", concurrent_synchronized),
@@ -87,12 +85,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String.endsWith", string_ends_with),
     ("kotlin.String.get", string_get),
     ("kotlin.String.indexOf", string_index_of),
-    ("kotlin.String.ifBlank", string_if_blank),
-    ("kotlin.String.ifEmpty", string_if_empty),
-    ("kotlin.String.isBlank", string_is_blank),
-    ("kotlin.String.isEmpty", string_is_empty),
-    ("kotlin.String.isNotBlank", string_is_not_blank),
-    ("kotlin.String.isNotEmpty", string_is_not_empty),
     ("kotlin.String.toString", string_to_string),
     ("kotlin.String.lastIndexOf", string_last_index_of),
     ("kotlin.String.length", string_length),
@@ -2201,26 +2193,6 @@ fn coll_iter_filter_not(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_list(result, false))
 }
 
-fn lazy_lazy(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 1 {
-        return Err(RuntimeError::Arity("lazy expects (block)".into()));
-    }
-    let producer = ctx.args[0].clone();
-    Ok(Value::Delegate(ObjRef::new(
-        klio_runtime::DelegateKind::Lazy { producer, cached: None },
-    )))
-}
-
-fn lazy_lazy_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 1 {
-        return Err(RuntimeError::Arity("lazyOf expects (value)".into()));
-    }
-    let v = ctx.args[0].clone();
-    Ok(Value::Delegate(ObjRef::new(
-        klio_runtime::DelegateKind::Lazy { producer: Value::Null, cached: Some(v) },
-    )))
-}
-
 fn builders_build_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.is_empty() || ctx.args.len() > 2 {
         return Err(RuntimeError::Arity("buildList expects (block) or (capacity, block)".into()));
@@ -2859,56 +2831,10 @@ fn string_length(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::new_int(s.chars().count()))
 }
 
-fn string_is_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let s = recv_string(ctx.args, "String.isEmpty")?;
-    Ok(Value::Bool(s.is_empty()))
-}
-
-fn string_is_not_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let s = recv_string(ctx.args, "String.isNotEmpty")?;
-    Ok(Value::Bool(!s.is_empty()))
-}
-
-fn string_is_blank(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let s = recv_string(ctx.args, "String.isBlank")?;
-    Ok(Value::Bool(s.chars().all(char::is_whitespace)))
-}
-
-/// `CharSequence.ifEmpty(default)` — the receiver when non-empty,
-/// else the result of invoking `default`. Common in DSL/text code.
-fn string_if_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let s = recv_string(ctx.args, "String.ifEmpty")?.clone();
-    if !s.is_empty() {
-        return Ok(Value::String(s));
-    }
-    let default = ctx.args.get(1).cloned().ok_or_else(|| {
-        RuntimeError::Type("String.ifEmpty: missing default block".into())
-    })?;
-    ctx.host.invoke_callable(&default, &[], ctx.out)
-}
-
-/// `CharSequence.ifBlank(default)` — the receiver when non-blank,
-/// else the result of invoking `default`.
-fn string_if_blank(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let s = recv_string(ctx.args, "String.ifBlank")?.clone();
-    if !s.chars().all(char::is_whitespace) {
-        return Ok(Value::String(s));
-    }
-    let default = ctx.args.get(1).cloned().ok_or_else(|| {
-        RuntimeError::Type("String.ifBlank: missing default block".into())
-    })?;
-    ctx.host.invoke_callable(&default, &[], ctx.out)
-}
-
 /// `String.toString()` — the receiver itself.
 fn string_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toString")?.clone();
     Ok(Value::String(s))
-}
-
-fn string_is_not_blank(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let s = recv_string(ctx.args, "String.isNotBlank")?;
-    Ok(Value::Bool(s.chars().any(|c| !c.is_whitespace())))
 }
 
 fn string_uppercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
