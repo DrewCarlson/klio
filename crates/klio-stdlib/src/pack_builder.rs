@@ -54,6 +54,7 @@ const KLIO_STDLIB_ACTUAL_FILES: &[&str] = &[
     "kotlin-time/Actuals.kt",
     "kotlin-coroutines/Actuals.kt",
     "kotlin-coroutines/Intrinsics.kt",
+    "kotlin-collections/Builders.kt",
 ];
 
 /// Locate the local upstream Kotlin checkout's `libraries/stdlib`

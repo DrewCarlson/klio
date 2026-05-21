@@ -44,10 +44,7 @@ fun main() = runBlocking {
     val ch = Channel<Event>(capacity = 4)
 
     val producerJob = launch { runProducer(ch, 20, stats) }
-    val workers = mutableListOf<Job>()
-    for (wid in 0 until 3) {
-        workers.add(launch { runConsumer(wid, ch, stats) })
-    }
+    val workers = List(3) { wid -> launch { runConsumer(wid, ch, stats) } }
     producerJob.join()
     for (w in workers) w.join()
 
@@ -93,11 +90,10 @@ fun main() = runBlocking {
     // Real mutex across dispatched coroutines: 8×125 increments under synchronized
     val lock = Any()
     var shared = 0
-    val mjobs = mutableListOf<Job>()
-    for (k in 0 until 8) {
-        mjobs.add(launch(Dispatchers.Default) {
+    val mjobs = List(8) {
+        launch(Dispatchers.Default) {
             repeat(125) { synchronized(lock) { shared += 1 } }
-        })
+        }
     }
     for (j in mjobs) j.join()
     println("shared=$shared")

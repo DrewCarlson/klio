@@ -1032,7 +1032,16 @@ fn load_embedded_stdlib_sources(
         parsed.push((pkg, ast));
     }
 
-    let wanted = parsed.iter().any(|(pkg, _)| {
+    // Always load files in implicitly-imported packages
+    // (kotlin.collections, kotlin.ranges, ...) — per spec §10.1
+    // these are visible in every source file without an explicit
+    // import, so their builders/extensions must be available to user
+    // code unconditionally. Other curated sources stay all-or-nothing
+    // and gated on a matching user import.
+    let any_non_implicit = parsed
+        .iter()
+        .any(|(pkg, _)| !pkg.is_empty() && !klio_stdlib::is_implicitly_imported_package(pkg));
+    let imported_match = parsed.iter().any(|(pkg, _)| {
         !pkg.is_empty()
             && user_import_prefixes.iter().any(|imp| {
                 imp == pkg
@@ -1040,11 +1049,14 @@ fn load_embedded_stdlib_sources(
                     || pkg.starts_with(&format!("{imp}."))
             })
     });
-    if !wanted {
-        return;
-    }
+    let load_gated = imported_match || !any_non_implicit;
 
     for (pkg, ast) in parsed {
+        let is_implicit = !pkg.is_empty()
+            && klio_stdlib::is_implicitly_imported_package(&pkg);
+        if !is_implicit && !load_gated {
+            continue;
+        }
         if !pkg.is_empty() {
             klio_stdlib::register_known_package(pkg);
         }
