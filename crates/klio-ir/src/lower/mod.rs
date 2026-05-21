@@ -2930,13 +2930,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     if let (Some(head), Some(tail)) =
                         (fqn.split('.').next(), fqn.rsplit('.').next())
                     {
+                        // A real package root (`kotlin.…`, `kotlinx.…`,
+                        // …) is never a member of an enclosing
+                        // receiver, even when `this` is bound — Kotlin
+                        // resolves the qualified call against the
+                        // package, not the receiver. Allow the FQN
+                        // flattening through in that case so a
+                        // `kotlin.synchronized(this, block)` call
+                        // inside an extension function body doesn't
+                        // get misread as `this.kotlin.synchronized`.
+                        let head_is_real_pkg = is_pkg_root(head);
                         if tail != fqn
                             && is_package_head(head)
-                            && (is_pkg_root(head) || !b.is_lambda_body())
+                            && (head_is_real_pkg || !b.is_lambda_body())
                             && b.resolve(head).is_none()
                             && !b.knows_outer(head)
                             && b.module.class_id(head).is_none()
-                            && b.resolve("this").is_none()
+                            && (head_is_real_pkg || b.resolve("this").is_none())
                         {
                             if let Some(func_id) = b.module.func_id(tail) {
                                 let (args_start, n_args) = lower_arg_run(b, args);
@@ -2966,8 +2976,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             if let Expr::Member { .. } = callee.as_ref() {
                 if let Some(fqn) = collect_dotted_fqn(callee) {
                     if let Some(head) = fqn.split('.').next() {
+                        let head_is_real_pkg = is_pkg_root(head);
                         if is_package_head(head)
-                            && (is_pkg_root(head) || !b.is_lambda_body())
+                            && (head_is_real_pkg || !b.is_lambda_body())
                             && b.resolve(head).is_none()
                             && !b.knows_outer(head)
                             && b.module.class_id(head).is_none()
@@ -2975,8 +2986,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             // method body) the head could be a
                             // field on `this`; don't treat it as a
                             // package FQN unless that field doesn't
-                            // exist on the receiver class.
-                            && b.resolve("this").is_none()
+                            // exist on the receiver class. A real
+                            // package root (`kotlin.…`, `kotlinx.…`)
+                            // is never a member of `this`, so allow
+                            // it through unconditionally.
+                            && (head_is_real_pkg || b.resolve("this").is_none())
                         {
                             let callee_r = b.alloc_reg();
                             let n = b.module.intern_const(Const::String(fqn));

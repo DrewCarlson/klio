@@ -109,6 +109,7 @@ klio_stdlib::host_bindings! {
         "kotlinx.coroutines.__kxco_spawn"               => spawn_launch_block,
         "kotlinx.coroutines.__kxco_dispatch"            => dispatch_coroutine,
         "kotlinx.coroutines.internal.synchronizedImpl"  => synchronized_impl,
+        "kotlinx.coroutines.internal.__kxco_systemProp" => kxco_system_prop,
         "kotlinx.coroutines.__kxco_dispatchIo"          => dispatch_coroutine_io,
         "kotlinx.coroutines.__kxco_joinDispatched"      => join_dispatched,
         "kotlinx.coroutines.__kxco_scheduleResume"      => schedule_resume,
@@ -769,6 +770,28 @@ fn scheduler_enqueue(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// scheduler so the enclosing `runBlocking` pump can drive it on
 /// the next drain pass. Launches no longer run inline on the
 /// calling stack.
+/// `kotlinx.coroutines.internal.__kxco_systemProp(name): String?` —
+/// reads tuning out of the host environment so kxco honors the
+/// `kotlinx.coroutines.*` knobs JVM callers spell via
+/// `System.getProperty`. Probes the env for the exact property
+/// name first, then a `.` → `_` alias.
+fn kxco_system_prop(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let key = match ctx.args.first() {
+        Some(Value::String(s)) => s.as_ref().clone(),
+        _ => return Ok(Value::Null),
+    };
+    if let Ok(v) = std::env::var(&key) {
+        return Ok(Value::String(std::sync::Arc::new(v)));
+    }
+    let alias: String = key.chars().map(|c| if c == '.' { '_' } else { c }).collect();
+    if alias != key {
+        if let Ok(v) = std::env::var(&alias) {
+            return Ok(Value::String(std::sync::Arc::new(v)));
+        }
+    }
+    Ok(Value::Null)
+}
+
 /// `kotlinx.coroutines.internal.synchronizedImpl(lock, block)` —
 /// klio's platform actual for the kxco internal monitor primitive.
 /// Routes through the same per-object monitor as

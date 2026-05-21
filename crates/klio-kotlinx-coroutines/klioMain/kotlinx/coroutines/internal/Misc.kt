@@ -35,4 +35,13 @@ internal actual class DiagnosticCoroutineContextException actual constructor(
 )
 internal actual annotation class IgnoreJreRequirement()
 
-internal actual fun systemProp(propertyName: String): String? = null
+// Tuning is read from the host environment so kxco internals
+// (scheduler core-pool size, channel debug flags, etc.) honor the
+// same `kotlinx.coroutines.*` knobs the JVM actual reads from
+// `System.getProperty`. The host binding probes for an exact
+// env-var match and a "dot to underscore" alias (`a.b.c` →
+// `a_b_c`) so callers can spell properties either way.
+internal actual fun systemProp(propertyName: String): String? =
+    __kxco_systemProp(propertyName)
+
+internal fun __kxco_systemProp(propertyName: String): String? = null
