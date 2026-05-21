@@ -692,25 +692,47 @@ impl Module {
     }
 
     /// Look up a top-level function by simple name. When multiple
-    /// candidates share the simple name (e.g. a user `fun produce(...)`
-    /// declared alongside a star-imported
-    /// `kotlinx.coroutines.channels.produce`, or a user `fun use(...)`
-    /// alongside the shipped `kotlin.use` extension), the *last*
-    /// registered candidate wins. Build pipelines order ASTs as
-    /// `[pack..., stdlib..., user]` so the user's declaration is
-    /// registered last and shadows any stdlib / pack decl of the
-    /// same simple name — matching Kotlin's rule that an explicit
+    /// candidates share the simple name, the resolver prefers a user
+    /// declaration (i.e. one whose FQN sits outside the stdlib /
+    /// pack package prefixes `kotlin.`, `kotlinx.`, `java.`) over a
+    /// shipped one — matching Kotlin's rule that an explicit
     /// declaration in the current scope beats a wildcard-imported
-    /// symbol. Callers that already have an FQN should prefer
+    /// symbol. With no user candidate the first-registered match
+    /// wins (preserving pack-internal overload resolution where the
+    /// pack ships multiple overloads under one simple name and the
+    /// declared overload order is the spec-correct fallback for
+    /// `overload_score` ties at the seeding step). Callers that
+    /// already have an FQN should prefer
     /// [`func_id_by_fqn`](Self::func_id_by_fqn) to disambiguate
     /// same-simple-name declarations from different packages.
     #[must_use]
     pub fn func_id(&self, name: &str) -> Option<FuncId> {
-        self.func_index
-            .iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, id)| *id)
+        let mut first: Option<FuncId> = None;
+        let mut first_user: Option<FuncId> = None;
+        for (n, id) in &self.func_index {
+            if n != name {
+                continue;
+            }
+            if first.is_none() {
+                first = Some(*id);
+            }
+            if first_user.is_some() {
+                continue;
+            }
+            if let Some(f) = self.funcs.get(id.0 as usize) {
+                let fqn = f.fqn.as_str();
+                let is_shipped = fqn.starts_with("kotlin.")
+                    || fqn.starts_with("kotlinx.")
+                    || fqn.starts_with("java.")
+                    || fqn == "kotlin"
+                    || fqn == "kotlinx"
+                    || fqn == "java";
+                if !is_shipped {
+                    first_user = Some(*id);
+                }
+            }
+        }
+        first_user.or(first)
     }
 
     /// Look up a top-level function by fully-qualified name (matches

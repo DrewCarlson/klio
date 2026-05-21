@@ -1360,18 +1360,16 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
             asts.push(ast.clone());
         }
     }
+    asts.push(user_ast);
 
     // Mirror the production binary: surface the embedded stdlib pack's
     // curated `SOURCES` (the real `kotlin.coroutines` / `kotlin.time`
-    // commonMain + klio actuals, plus the migrated scope / precondition
-    // shims) as runtime declarations BEFORE the user file so any
-    // same-simple-name decl in the user file is registered last and
-    // wins the `func_id` lookup. Without this ordering a user
-    // `fun use(...)` in a packaged source can lose to the shipped
-    // `kotlin.use` extension.
-    let mut with_user = asts.clone();
-    with_user.push(user_ast.clone());
-    for ast in embedded_stdlib_sources(&with_user, &mut map) {
+    // commonMain + klio actuals) as runtime declarations, gated on the
+    // imports actually in play, so a pack consuming real upstream
+    // resolves `kotlin.coroutines.EmptyCoroutineContext` &c. against
+    // the stdlib layer instead of needing the kotlinx pack to redeclare
+    // it. Without this the harness diverges from `klio run`.
+    for ast in embedded_stdlib_sources(&asts, &mut map) {
         if let Some(pkg) = &ast.package {
             let path = pkg
                 .path
@@ -1385,7 +1383,6 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
         }
         asts.push(ast);
     }
-    asts.push(user_ast);
 
     let mut bindings = klio_stdlib::HostBindings::with_stdlib_defaults();
     for (sym, f) in klio_kotlinx_coroutines::host_bindings().entries() {
