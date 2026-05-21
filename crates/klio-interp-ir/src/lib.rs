@@ -479,6 +479,34 @@ impl Vm {
         let module = Arc::clone(&self.module);
         let mut out_sink = self.out_sink.clone();
         let out: &mut dyn Output = &mut out_sink;
+        // Allocate every `object Foo { … }` singleton FIRST, so a
+        // top-level property initialiser that captures the object
+        // (e.g. `private object SENT; class Box { var v: Any? = SENT }`)
+        // observes the same instance the main body will, preserving
+        // `===` identity across init contexts.
+        let object_names: Vec<String> = self.module.registry.object_names.clone();
+        for obj_name in &object_names {
+            let class_id = match module.class_id(obj_name) {
+                Some(id) => id,
+                None => continue,
+            };
+            let inst = {
+                let mut host = self.make_host(out);
+                <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
+                    .map_err(VmError::from)?
+            };
+            if let klio_runtime::Value::Instance(i) = &inst {
+                if let Some((outer_name, _)) = obj_name.split_once("$Companion$") {
+                    if let Some(outer_def) =
+                        self.classes.borrow().get(outer_name).cloned()
+                    {
+                        i.borrow_mut().outer =
+                            Some(klio_runtime::Value::Class(outer_def));
+                    }
+                }
+            }
+            self.globals.borrow_mut().define(obj_name, inst);
+        }
         // Run top-level property initialisers before main so global
         // reads against the env see the initial values.
         let inits: Vec<(String, klio_ir::FuncId)> = self.top_level_props.clone();
@@ -569,39 +597,9 @@ impl Vm {
                 }
             }
         }
-        // Allocate one instance per `object Foo { … }` decl and
-        // publish it as a global so bare-name `Foo` references
-        // resolve. Each object's class is synthesised in build.rs
-        // alongside regular classes; the singleton runs that class's
-        // primary ctor (parent chain + body props + init blocks)
-        // with zero args.
-        let object_names: Vec<String> = self.module.registry.object_names.clone();
-        for obj_name in &object_names {
-            let class_id = match module.class_id(obj_name) {
-                Some(id) => id,
-                None => continue,
-            };
-            let inst = {
-                let mut host = self.make_host(out);
-                <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
-                    .map_err(VmError::from)?
-            };
-            // Companion singletons get their `outer` field wired to
-            // the enclosing class so method bodies that read
-            // bare-name members (e.g. enum `entries`) resolve via
-            // the outer-chain walk in get_field.
-            if let klio_runtime::Value::Instance(i) = &inst {
-                if let Some((outer_name, _)) = obj_name.split_once("$Companion$") {
-                    if let Some(outer_def) =
-                        self.classes.borrow().get(outer_name).cloned()
-                    {
-                        i.borrow_mut().outer =
-                            Some(klio_runtime::Value::Class(outer_def));
-                    }
-                }
-            }
-            self.globals.borrow_mut().define(obj_name, inst);
-        }
+        // Object singletons were allocated upfront before the
+        // top-level prop init loop above so `===` identity holds
+        // across init contexts.
         let func = module
             .funcs
             .get(main.0 as usize)
