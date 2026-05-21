@@ -1427,21 +1427,6 @@ fn rebuild_cache_index(cache: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Read the cache sidecar index. Returns `None` if absent or stale.
-/// Staleness check: the index is considered fresh when every entry's
-/// path exists on disk; mismatch means a manual `rm` happened and we
-/// fall back to the full directory walk.
-fn read_cache_index(cache: &std::path::Path) -> Option<Vec<CacheIndexEntry>> {
-    let bytes = std::fs::read(cache.join(CACHE_INDEX_NAME)).ok()?;
-    let entries: Vec<CacheIndexEntry> = serde_json::from_slice(&bytes).ok()?;
-    for e in &entries {
-        if !std::path::Path::new(&e.path).exists() {
-            return None;
-        }
-    }
-    Some(entries)
-}
-
 fn list_cache_packs() -> Result<(), String> {
     let cache = klio_cache_dir()?;
     let Ok(entries) = std::fs::read_dir(&cache) else {

@@ -22,10 +22,10 @@ mod literals;
 mod thunks;
 mod when_expr;
 use ast_scan::{
-    collect_dotted_fqn, collect_path_idents, collect_path_idents_stmt, collect_var_decls,
-    compute_boxed_vars, is_boxed_to_any_form, names_referenced_in_lambdas,
+    collect_dotted_fqn, collect_path_idents, collect_path_idents_stmt,
+    compute_boxed_vars, is_boxed_to_any_form,
 };
-use inline_state::{inline_expand_enter, inline_expand_leave, inline_fn_ast};
+use inline_state::inline_fn_ast;
 use for_loop::{lower_for, lower_for_labeled};
 pub use thunks::{
     lower_accessor_block, lower_accessor_expr, lower_binary_expr_as_thunk,
@@ -35,7 +35,7 @@ pub use thunks::{
     lower_unary_expr_as_thunk,
 };
 use inline_call::{
-    arg_lambda_has_nonlocal_return, splice_inline_lambda, try_inline_call,
+    arg_lambda_has_nonlocal_return, splice_inline_lambda,
     try_inline_call_with_type_args,
 };
 use lambda_body::{

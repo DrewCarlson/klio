@@ -630,7 +630,7 @@ pub fn eval_with_captures(
 /// the next-outer frame's resume register, and so on up the stack.
 pub fn resume_continuation(
     module: &Module,
-    mut state: SuspendState,
+    state: SuspendState,
     resume_value: Value,
     host: &mut dyn Host,
 ) -> Result<Value, EvalError> {
@@ -721,8 +721,8 @@ fn run_frame<'a>(
     module: &'a Module,
     frame: &mut Frame<'a>,
     try_stack: &mut Vec<(BlockId, Vec<crate::CatchHandler>, Option<BlockId>)>,
-    mut cur: BlockId,
-    mut resume_idx: usize,
+    cur: BlockId,
+    resume_idx: usize,
     host: &mut dyn Host,
 ) -> Result<Value, EvalError> {
     run_frame_inner(module, frame, try_stack, cur, resume_idx, None, host)

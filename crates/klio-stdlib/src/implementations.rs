@@ -12,7 +12,6 @@
 //! interpreter at runtime.
 
 use std::io::BufRead;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use klio_runtime::{CallCtx, ObjRef, RuntimeError, StdlibFn, Value};
@@ -6041,7 +6040,7 @@ fn coll_map_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(arg) = ctx.args.get(1) else {
         return Err(RuntimeError::Arity("plus requires an argument".into()));
     };
-    let mut add_pair = |out: &mut Vec<(Value, Value)>, p: &Value| {
+    let add_pair = |out: &mut Vec<(Value, Value)>, p: &Value| {
         if let Value::Pair(k, v) = p {
             out.push(((**k).clone(), (**v).clone()));
         }

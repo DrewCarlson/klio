@@ -123,23 +123,11 @@ pub(super) fn splice_inline_lambda(
 }
 
 /// Expand a call to a `suspend inline fun` by splicing its body into
-/// the caller. When the inline fn carries reified type parameters,
-/// `type_args` carries the call-site `<T = SomeType>` so the splice
-/// can bind each reified parameter's name to the resolved class
-/// value before lowering the body — `T::class` and `is T` reads
-/// inside the spliced body then resolve to the call site's type.
-pub(super) fn try_inline_call(
-    b: &mut FuncBuilder<'_>,
-    fname: &str,
-    args: &[Expr],
-    arg_names: &[Option<String>],
-    this_arg: Option<&Expr>,
-) -> Option<Reg> {
-    try_inline_call_with_type_args(b, fname, args, arg_names, this_arg, &[])
-}
-
-/// Same as [`try_inline_call`] but plumbs the call site's
-/// `type_args`. Used by the bare-call branch's reified-aware splice.
+/// the caller. `type_args` carries the call-site `<T = SomeType>` for
+/// reified type parameters so the splice can bind each reified
+/// parameter's name to the resolved class value before lowering the
+/// body — `T::class` and `is T` reads inside the spliced body then
+/// resolve to the call site's type.
 pub(super) fn try_inline_call_with_type_args(
     b: &mut FuncBuilder<'_>,
     fname: &str,

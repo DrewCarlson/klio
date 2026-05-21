@@ -6,11 +6,9 @@
 //! the other.
 #![allow(unsafe_code)] // `ObjRef`'s adaptive cell; see its safety docs.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;

@@ -4304,31 +4304,6 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         false
     }
 
-    /// `{` is at the cursor. Decide whether this is a lambda (has `->` at
-    fn looks_like_lambda(&self) -> bool {
-        if !matches!(self.peek_kind(), TokenKind::LBrace) {
-            return false;
-        }
-        let mut depth = 1i32;
-        let mut i = self.pos + 1;
-        while let Some(tok) = self.tokens.get(i) {
-            match &tok.kind {
-                TokenKind::LBrace => depth += 1,
-                TokenKind::RBrace => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return false;
-                    }
-                }
-                TokenKind::Arrow if depth == 1 => return true,
-                TokenKind::Eof => return false,
-                _ => {}
-            }
-            i += 1;
-        }
-        false
-    }
-
     fn parse_lambda_literal(&mut self) -> Option<Expr> {
         // We're at `{`. Header is `params ->` (optional). Body is a
         // statement list.

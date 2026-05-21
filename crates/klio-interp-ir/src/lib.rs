@@ -27,7 +27,6 @@ pub mod build;
 /// here is mutated after construction, so sharing it across threads
 /// needs no synchronization.
 pub struct ProgramImage {
-    module: Arc<klio_ir::Module>,
     /// Top-level property name → 0-arg initializer FuncId. Mirrors
     /// `Vm::top_level_props` so a `VmHost` can drive a property's
     /// initializer on demand when it is read before the in-order
@@ -286,7 +285,6 @@ impl Vm {
             anon_methods: klio_runtime::ObjRef::new(std::collections::HashMap::new()),
             closures: SharedClosures::new(),
             prog: Arc::new(ProgramImage {
-                module,
                 top_level_prop_inits: std::collections::HashMap::new(),
                 body_prop_inits: std::collections::HashMap::new(),
                 instance_prop_getters: std::collections::HashMap::new(),
@@ -326,7 +324,6 @@ impl Vm {
         vm.top_level_props = built.top_level_props;
         vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
         vm.prog = Arc::new(ProgramImage {
-            module: built.module,
             top_level_prop_inits: vm
                 .top_level_props
                 .iter()
@@ -405,7 +402,7 @@ impl Vm {
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
         use klio_runtime::IntrinsicHost;
         let mut sink = self.out_sink.clone();
-        let mut host = self.make_host(&mut sink);
+        let host = self.make_host(&mut sink);
         let mut sink2 = host.out_sink.clone();
         let mut intrinsic = VmIntrinsicHost {
             scheduler: &mut *host.scheduler,
@@ -6808,7 +6805,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 let chain = self.enclosing_this_chain();
                 let mut set: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
-                let mut add_class_and_supers = |cls: &Arc<klio_runtime::ClassDef>,
+                let add_class_and_supers = |cls: &Arc<klio_runtime::ClassDef>,
                                                 set: &mut std::collections::HashSet<String>| {
                     set.insert(cls.name.clone());
                     if !cls.fqn.is_empty() && cls.fqn != cls.name {
@@ -9774,7 +9771,7 @@ impl<'a> VmIntrinsicHost<'a> {
             // 1. Start any queued child launches.
             let launched: Vec<klio_runtime::Value> =
                 with_top(CooperativeInterceptor::drain_launched);
-            let mut progressed = !launched.is_empty();
+            let progressed = !launched.is_empty();
             for child in launched {
                 match self.eval_closure_raw(&child, &[], Some(scope), out) {
                     Ok(_) => {}
@@ -9794,7 +9791,6 @@ impl<'a> VmIntrinsicHost<'a> {
             if let Some(tok) = next_ready {
                 let entry = with_top(|i| i.take_parked(tok));
                 if let Some((st, _)) = entry {
-                    progressed = true;
                     let resume_with = with_top(|i| i.take_resume_value(tok))
                         .unwrap_or(klio_runtime::Value::Unit);
                     match self.resume_raw(st, resume_with, out) {
@@ -9807,7 +9803,6 @@ impl<'a> VmIntrinsicHost<'a> {
                         Err(klio_ir::eval::EvalError::Suspended(st2)) => {
                             let new_tok = self.park(*st2);
                             if Some(tok) == root_token {
-                                // Root re-suspended — track its new token.
                                 root_token = Some(new_tok);
                             }
                         }
@@ -10073,7 +10068,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     .map(|i| i.drain_launched())
                     .unwrap_or_default()
             });
-            let mut progressed = !launched.is_empty();
+            let progressed = !launched.is_empty();
             let scope = active_coro_scope().unwrap_or(klio_runtime::Value::Unit);
             for child in launched {
                 match self.eval_closure_raw(&child, &[], Some(&scope), out) {
@@ -10110,7 +10105,6 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                         .and_then(|i| i.take_parked(tok))
                 });
                 if let Some((st, _)) = entry {
-                    progressed = true;
                     let resume_with = with_coro(|s| {
                         s.borrow_mut()
                             .last_mut()
