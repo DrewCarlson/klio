@@ -1130,52 +1130,66 @@ impl<'a> VmHost<'a> {
         if candidates.len() < 2 {
             return None;
         }
-        let mut best: Option<(klio_ir::FuncId, i32)> = None;
+        // Seed the search with the lowering's chosen candidate so a
+        // strictly better runtime match can still win, but ties keep
+        // the call site's FQN-aware resolution intact. Without this,
+        // two same-simple-name functions in different packages
+        // collapsed to "first in func_index wins" regardless of which
+        // FuncId the IR emitted — silently flipping the dispatch
+        // away from the explicitly-imported declaration.
+        let seed = self.overload_score(module, func, args).map(|s| (func, s));
+        let mut best: Option<(klio_ir::FuncId, i32)> = seed;
+        let seed_func = func;
+        let _ = name;
         for cand in &candidates {
-            let f = module.funcs.get(cand.0 as usize)?;
-            // Default-argument-aware applicability: a call may supply
-            // fewer arguments than the function has parameters when
-            // every omitted trailing parameter carries a default
-            // (`systemProp(name, 32)` binding the 4-param
-            // `(String, Int, Int = 1, Int = MAX): Int` overload). An
-            // exact-arity match is preferred (no default penalty) so a
-            // dedicated N-arg overload still outranks a defaulted one.
-            let last_vararg = f.params.last().map(|p| p.is_vararg).unwrap_or(false);
-            if f.params.len() < args.len() && !last_vararg {
+            if *cand == seed_func {
                 continue;
             }
-            if f.params.len() > args.len() {
-                let defaults = self.prog.func_defaults.get(cand);
-                let all_defaulted = (args.len()..f.params.len()).all(|i| {
-                    defaults
-                        .and_then(|d| d.get(i))
-                        .map(|slot| slot.is_some())
-                        .unwrap_or(false)
-                });
-                if !all_defaulted {
-                    continue;
+            if let Some(total) = self.overload_score(module, *cand, args) {
+                if best.map(|(_, s)| total > s).unwrap_or(true) {
+                    best = Some((*cand, total));
                 }
-            }
-            let mut total: i32 = if f.params.len() == args.len() {
-                0
-            } else {
-                -1
-            };
-            let mut ok = true;
-            for (p, a) in f.params.iter().zip(args.iter()) {
-                match self.overload_score_arg(&p.ty, a) {
-                    Some(s) => total += s,
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok && best.map(|(_, s)| total > s).unwrap_or(true) {
-                best = Some((*cand, total));
             }
         }
         best.map(|(id, _)| id)
+    }
+
+    /// Score a single candidate's applicability for `args`. `None`
+    /// means the candidate is inapplicable (arity / param-type
+    /// mismatch); a higher score means a better match. Exact arity
+    /// scores baseline 0, a defaulted-trailing-param fill scores -1
+    /// so a dedicated N-arg overload still outranks a defaulted one.
+    fn overload_score(
+        &self,
+        module: &klio_ir::Module,
+        cand: klio_ir::FuncId,
+        args: &[klio_runtime::Value],
+    ) -> Option<i32> {
+        let f = module.funcs.get(cand.0 as usize)?;
+        let last_vararg = f.params.last().map(|p| p.is_vararg).unwrap_or(false);
+        if f.params.len() < args.len() && !last_vararg {
+            return None;
+        }
+        if f.params.len() > args.len() {
+            let defaults = self.prog.func_defaults.get(&cand);
+            let all_defaulted = (args.len()..f.params.len()).all(|i| {
+                defaults
+                    .and_then(|d| d.get(i))
+                    .map(|slot| slot.is_some())
+                    .unwrap_or(false)
+            });
+            if !all_defaulted {
+                return None;
+            }
+        }
+        let mut total: i32 = if f.params.len() == args.len() { 0 } else { -1 };
+        for (p, a) in f.params.iter().zip(args.iter()) {
+            match self.overload_score_arg(&p.ty, a) {
+                Some(s) => total += s,
+                None => return None,
+            }
+        }
+        Some(total)
     }
 
     /// Look up an intrinsic by FQN. Probes the pack-supplied

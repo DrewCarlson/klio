@@ -2380,6 +2380,65 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         }
                         return dst;
                     }
+                    // FQN-precedence for the bare call: when this
+                    // module declares multiple functions sharing the
+                    // simple name (i.e. cross-package collision), an
+                    // explicit `import a.b.foo` routes `foo()` to
+                    // `a.b.foo` instead of whichever candidate landed
+                    // first in `func_index`. Matches Kotlin's
+                    // resolver where an explicit import beats any
+                    // wildcard / default candidate. Limited to the
+                    // collision case so single-candidate lookups stay
+                    // on their existing path (pack-internal calls
+                    // would otherwise be diverted by stray imports
+                    // they neither own nor expect to honour).
+                    let collision = b
+                        .module
+                        .func_index
+                        .iter()
+                        .filter(|(n, _)| n == &segments[0].name)
+                        .count()
+                        > 1;
+                    let imported_func_id = if collision {
+                        b.module
+                            .registry
+                            .import_aliases
+                            .get(&segments[0].name)
+                            .filter(|segs| segs.len() >= 2)
+                            .and_then(|segs| {
+                                b.module.func_id_by_fqn(&segs.join("."))
+                            })
+                    } else {
+                        None
+                    };
+                    if let Some(func_id) = imported_func_id.filter(|_| !shadowed_by_class) {
+                        // Skip the redirect when the resolved
+                        // candidate is itself an extension whose
+                        // dispatch the regular func_id path
+                        // (this-prepended) handles correctly — the
+                        // bare-call branch would lose the receiver.
+                        let needs_this = b
+                            .module
+                            .funcs
+                            .get(func_id.0 as usize)
+                            .map(|f| f.params.first().map(|p| p.name == "this").unwrap_or(false))
+                            .unwrap_or(false);
+                        if !needs_this {
+                            let (args_start, count) = lower_arg_run(b, args);
+                            let arg_names = intern_arg_names(b.module, ast_arg_names);
+                            let type_args = intern_type_args(b.module, ast_type_args);
+                            let dst = b.alloc_reg();
+                            b.push(Inst::Call {
+                                dst,
+                                func: func_id,
+                                args: args_start,
+                                n_args: count,
+                                arg_names,
+                                type_args,
+                            });
+                            return dst;
+                        }
+                    }
                     if let Some(func_id) =
                         b.module.func_id(&segments[0].name).filter(|_| !shadowed_by_class)
                     {
