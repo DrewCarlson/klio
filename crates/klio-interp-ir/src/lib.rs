@@ -2747,10 +2747,39 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         if let klio_runtime::Value::Instance(inst) = receiver {
             let class_name = inst.borrow().class.name.clone();
-            if self.module.registry
-                .delegated_body_props
-                .contains(&(class_name.clone(), name.to_string()))
-            {
+            // Walk the supertype chain looking for `(class, name)` in
+            // the delegated-body-props registry. The instance's own
+            // class is checked first; a hit on an ancestor means the
+            // delegate was declared there, but the underlying field
+            // slot is still present on this instance (instances
+            // inherit superclass body fields).
+            let delegate_owner: Option<String> = {
+                let mut owner: Option<String> = None;
+                let mut cur = Some(class_name.clone());
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                while let Some(cn) = cur.take() {
+                    if !seen.insert(cn.clone()) {
+                        break;
+                    }
+                    if self
+                        .module
+                        .registry
+                        .delegated_body_props
+                        .contains(&(cn.clone(), name.to_string()))
+                    {
+                        owner = Some(cn);
+                        break;
+                    }
+                    cur = self
+                        .classes
+                        .borrow()
+                        .get(&cn)
+                        .and_then(|d| d.supertype_names.first().cloned());
+                }
+                owner
+            };
+            if delegate_owner.is_some() {
                 let raw = inst.borrow().get(name);
                 if let Some(d) = raw {
                     let prop_ref = klio_runtime::Value::PropertyRef {
