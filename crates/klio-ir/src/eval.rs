@@ -1762,6 +1762,47 @@ fn exec_inst(
                     }
                 }
             }
+            // Lexically-enclosing receivers as extension candidates.
+            // The chain probe above used `call_member_only` so it
+            // never tried a same-named extension (`Iterable<T>.forEach`)
+            // declared on an OUTER lexical receiver — only members.
+            // Now walk the chain with full `call_member` so extension
+            // dispatch is given a chance to score against each
+            // enclosing `this@…` before the bare-name global path
+            // commits to a `func_id` candidate without receiver-type
+            // awareness. Without this, `forEach { emit(it) }` inside
+            // `Iterable<T>.asFlow() = flow { forEach { … } }` resolves
+            // its bare `forEach` to the pack's `Flow<T>.forEach`
+            // deprecation stub instead of `Iterable<T>.forEach`,
+            // because the bare-name global path can't tell those
+            // overloads apart.
+            if resolved.is_none() && !is_ctor_name && !shadow_capture {
+                let mut chain: Vec<Value> = Vec::new();
+                if !matches!(this_val, Value::Null | Value::Unit) {
+                    chain.push(this_val.clone());
+                }
+                chain.extend(host.enclosing_this_chain());
+                for recv in chain.iter().skip(1) {
+                    if matches!(recv, Value::Null | Value::Unit) {
+                        continue;
+                    }
+                    match host.call_member_named(
+                        recv, &name_str, &arg_values, &names,
+                    ) {
+                        Ok(v) => {
+                            resolved = Some(v);
+                            break;
+                        }
+                        Err(e @ EvalError::Suspended(_)) => return Err(e),
+                        Err(EvalError::Unimplemented(_)) => {}
+                        Err(e) => {
+                            if first_real_err.is_none() {
+                                first_real_err = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
             let result = match resolved {
                 Some(v) => v,
                 None => {
