@@ -4301,6 +4301,32 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if matches!(value, klio_runtime::Value::Null) {
             return ty.nullable;
         }
+        // Reified type parameter resolution: the inline-fn splice
+        // binds the reified type-param name (e.g. `T`) to the
+        // call-site type argument's class value as a global. An
+        // `x is T` check against the unresolved type-param name
+        // redirects to a check against that bound class's simple
+        // name. Without this, the body's `is T` would test
+        // against a non-existent class `T` and always fall
+        // through to `true`. Only fires when the type name is
+        // not already a class in the module — otherwise a
+        // legitimate `is Foo` check where `Foo` happens to be
+        // registered as a global would recurse forever resolving
+        // its own name.
+        if self.module.class_id(&ty.name).is_none() {
+            if let Some(bound) = self.lookup_global(&ty.name) {
+                if let klio_runtime::Value::Class(cls) = bound {
+                    if cls.name != ty.name {
+                        let resolved = klio_ir::TypeRef {
+                            name: cls.name.clone(),
+                            nullable: ty.nullable,
+                            args: ty.args.clone(),
+                        };
+                        return self.instance_of(value, &resolved);
+                    }
+                }
+            }
+        }
         // `Any` is the universal supertype for non-null values.
         if ty.name == "Any" {
             return true;

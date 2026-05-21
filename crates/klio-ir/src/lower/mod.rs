@@ -34,7 +34,10 @@ pub use thunks::{
     lower_expr_as_thunk, lower_init_block, lower_init_block_with_params,
     lower_unary_expr_as_thunk,
 };
-use inline_call::{arg_lambda_has_nonlocal_return, splice_inline_lambda, try_inline_call};
+use inline_call::{
+    arg_lambda_has_nonlocal_return, splice_inline_lambda, try_inline_call,
+    try_inline_call_with_type_args,
+};
 use lambda_body::{
     lower_lambda_body_capturing, lower_lambda_body_capturing_kind,
     lower_lambda_body_capturing_kind_with, resolve_capture,
@@ -2044,16 +2047,31 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         }
                         if let Some(f) = inline_fn_ast(nm) {
                             // Inline a suspending builder (continuation
-                            // capture) or any inline fn called with a
-                            // lambda that does a non-local `return`
-                            // (must target the caller). Other inline
-                            // calls keep the normal path so the inline
-                            // graph cannot expand combinatorially.
+                            // capture), an inline fn whose lambda arg
+                            // does a non-local `return` (must target
+                            // the caller's frame), or any `inline fun
+                            // <reified T>` (`T::class` / `is T` reads
+                            // in the body need the call-site type
+                            // argument substituted at splice time —
+                            // the non-splice path has no `Inst` to
+                            // bind a runtime type-parameter value).
+                            // Other inline calls keep the normal call
+                            // path so the splice graph cannot expand
+                            // combinatorially through Flow / Channel
+                            // operator chains.
+                            let has_reified =
+                                f.type_params.iter().any(|tp| tp.is_reified);
                             let needs_inline = f.is_suspend
-                                || arg_lambda_has_nonlocal_return(args);
+                                || arg_lambda_has_nonlocal_return(args)
+                                || has_reified;
                             if needs_inline {
-                                if let Some(r) = try_inline_call(
-                                    b, nm, args, ast_arg_names, None,
+                                if let Some(r) = try_inline_call_with_type_args(
+                                    b,
+                                    nm,
+                                    args,
+                                    ast_arg_names,
+                                    None,
+                                    ast_type_args,
                                 ) {
                                     return r;
                                 }

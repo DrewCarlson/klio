@@ -123,13 +123,30 @@ pub(super) fn splice_inline_lambda(
 }
 
 /// Expand a call to a `suspend inline fun` by splicing its body into
-/// the caller.
+/// the caller. When the inline fn carries reified type parameters,
+/// `type_args` carries the call-site `<T = SomeType>` so the splice
+/// can bind each reified parameter's name to the resolved class
+/// value before lowering the body — `T::class` and `is T` reads
+/// inside the spliced body then resolve to the call site's type.
 pub(super) fn try_inline_call(
     b: &mut FuncBuilder<'_>,
     fname: &str,
     args: &[Expr],
     arg_names: &[Option<String>],
     this_arg: Option<&Expr>,
+) -> Option<Reg> {
+    try_inline_call_with_type_args(b, fname, args, arg_names, this_arg, &[])
+}
+
+/// Same as [`try_inline_call`] but plumbs the call site's
+/// `type_args`. Used by the bare-call branch's reified-aware splice.
+pub(super) fn try_inline_call_with_type_args(
+    b: &mut FuncBuilder<'_>,
+    fname: &str,
+    args: &[Expr],
+    arg_names: &[Option<String>],
+    this_arg: Option<&Expr>,
+    type_args: &[klio_ast::TypeRef],
 ) -> Option<Reg> {
     let f = inline_fn_ast(fname)?;
     if b.inline_in_progress(fname) {
@@ -204,6 +221,36 @@ pub(super) fn try_inline_call(
             let rr = lower_expr(b, recv);
             b.bind("this".to_string(), rr);
         }
+    }
+    // Bind each reified type parameter to the resolved class value
+    // at the call site. Two bindings are needed:
+    //
+    //   * Local: `T` resolves as a value (the spliced body's
+    //     `T::class` read lowers as a bare `T` Path → MemberRef
+    //     `.class`, the Path resolves through the local bind).
+    //   * Global: `Inst::InstanceOf { ty: TypeRef "T" }` checks
+    //     the value against the global named "T" (mirroring how
+    //     `call_func_typed` binds runtime type-args). Without the
+    //     global, `x is T` would test against a non-existent
+    //     class `T` and silently fall through to `true`.
+    //
+    // The global isn't saved/restored — same shape klio uses for
+    // type-arg binding in non-inline calls. A nested splice
+    // overwrites it; a later restore happens implicitly when the
+    // enclosing call returns.
+    for (tp_idx, tp) in f.type_params.iter().enumerate() {
+        if !tp.is_reified {
+            continue;
+        }
+        let Some(arg) = type_args.get(tp_idx) else {
+            continue;
+        };
+        let cls_reg = b.alloc_reg();
+        let arg_name = b.module.intern_const(Const::String(arg.name.name.clone()));
+        b.push(Inst::LoadGlobal { dst: cls_reg, name: arg_name });
+        b.bind(tp.name.name.clone(), cls_reg);
+        let tp_global = b.module.intern_const(Const::String(tp.name.name.clone()));
+        b.push(Inst::StoreGlobal { name: tp_global, value: cls_reg });
     }
     let result = b.alloc_reg();
     let unit0 = b.emit_const(Const::Unit);
