@@ -529,6 +529,15 @@ pub fn compile_with_kotlinc(file: &Path) -> Result<PathBuf, ParityError> {
     if out.is_file() {
         return Ok(out);
     }
+    // Cache compile failures too — many parity tests intentionally
+    // contain Kotlin code that kotlinc rejects (e.g. recursive
+    // inline fns we still want klio to handle). Without the
+    // negative-result cache, every rerun pays a fresh ~2.5s kotlinc
+    // startup before failing.
+    let err_path = dir.join(format!("{key}.err"));
+    if let Ok(prior) = fs::read_to_string(&err_path) {
+        return Err(ParityError::Compile(prior));
+    }
     let result = Command::new(&kotlinc)
         .arg(file)
         .arg("-include-runtime")
@@ -536,11 +545,13 @@ pub fn compile_with_kotlinc(file: &Path) -> Result<PathBuf, ParityError> {
         .arg(&out)
         .output()?;
     if !result.status.success() {
-        return Err(ParityError::Compile(format!(
+        let msg = format!(
             "{}\n{}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)
-        )));
+        );
+        let _ = fs::write(&err_path, &msg);
+        return Err(ParityError::Compile(msg));
     }
     Ok(out)
 }
@@ -868,10 +879,6 @@ pub fn run_with_ktc(file: &Path) -> Result<String, String> {
     asts.extend(user_asts);
     klio_interp_ir::set_coroutine_time_mode(klio_interp_ir::TimeMode::Virtual);
     let mut out = CaptureOutput::default();
-    for ast in &asts {
-        let r = klio_resolver::resolve(ast);
-        let _ = klio_typeck::typecheck(ast, &r);
-    }
     let built = klio_interp_ir::build::build_module_files(&asts);
     let Some(main_id) = built.main else {
         return Err("no main function in module".into());
