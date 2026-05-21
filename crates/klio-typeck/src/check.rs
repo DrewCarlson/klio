@@ -41,14 +41,74 @@ impl TypeCheck {
 /// file; the checker reads it but does not mutate it.
 #[must_use]
 pub fn typecheck(file: &KotlinFile, resolution: &Resolution) -> TypeCheck {
+    klio_cfa::analyses::contracts::set_user_inline_contracts(scan_user_inline_contracts(file));
     let mut tc = Checker::new(resolution);
     tc.run(file);
     apply_suppress_annotations(file, &mut tc.diagnostics);
+    klio_cfa::analyses::contracts::set_user_inline_contracts(std::collections::HashMap::new());
     TypeCheck {
         types: tc.types,
         diagnostics: tc.diagnostics,
         cfgs: tc.cfgs,
     }
+}
+
+/// Walk every top-level `inline fun` in `file` and record any
+/// `contract { callsInPlace(p, InvocationKind.EXACTLY_ONCE) }`
+/// declarations as a map of fn-simple-name → exactly-once param
+/// names. Consumed by `klio-cfa`'s lowering to extend its
+/// trailing-lambda inline scheme to user contracts so a `val`
+/// assigned inside the lambda is observed as definitely assigned
+/// at the call site.
+fn scan_user_inline_contracts(
+    file: &KotlinFile,
+) -> std::collections::HashMap<String, Vec<String>> {
+    use klio_ast::{Decl, Expr, FunctionBody, Stmt};
+    let mut out: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for d in &file.decls {
+        let Decl::Function(f) = d else { continue };
+        if !f.is_inline {
+            continue;
+        }
+        let stmts: &[Stmt] = match &f.body {
+            Some(FunctionBody::Block(b)) => &b.stmts,
+            _ => continue,
+        };
+        let Some(first) = stmts.first() else { continue };
+        let Stmt::Expr(Expr::Call { callee, args, .. }) = first else { continue };
+        if !matches!(callee.as_ref(), Expr::Path { segments, .. } if segments.last().is_some_and(|s| s.name == "contract"))
+        {
+            continue;
+        }
+        let Some(Expr::Lambda { body, .. }) = args.last() else { continue };
+        let mut once: Vec<String> = Vec::new();
+        for s in &body.stmts {
+            let Stmt::Expr(Expr::Call { callee, args, .. }) = s else { continue };
+            if !matches!(callee.as_ref(), Expr::Path { segments, .. } if segments.last().is_some_and(|s| s.name == "callsInPlace"))
+            {
+                continue;
+            }
+            if args.len() < 2 {
+                continue;
+            }
+            let Expr::Path { segments: target_segs, .. } = &args[0] else { continue };
+            let Some(target_name) = target_segs.last().map(|s| s.name.clone()) else { continue };
+            let kind_tail = match &args[1] {
+                Expr::Path { segments, .. } => segments.last().map(|s| s.name.clone()),
+                Expr::Member { name, .. } => Some(name.name.clone()),
+                _ => None,
+            };
+            if kind_tail.as_deref() != Some("EXACTLY_ONCE") {
+                continue;
+            }
+            once.push(target_name);
+        }
+        if !once.is_empty() {
+            out.insert(f.name.name.clone(), once);
+        }
+    }
+    out
 }
 
 /// Multi-file entry point. Synthesizes a merged `KotlinFile` whose decls

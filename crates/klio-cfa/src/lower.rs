@@ -1200,11 +1200,25 @@ fn lambda_calls_in_place(callee: &Expr, args: &[Expr]) -> bool {
             name.name.as_str(),
             "let" | "run" | "apply" | "also"
         ),
-        // `run { ... }` / `with(x) { ... }` — top-level scope fns.
-        Expr::Path { segments, .. } if segments.len() == 1 => matches!(
-            segments[0].name.as_str(),
-            "run" | "with"
-        ),
+        Expr::Path { segments, .. } if segments.len() == 1 => {
+            let name = segments[0].name.as_str();
+            // `run { ... }` / `with(x) { ... }` — top-level scope fns.
+            if matches!(name, "run" | "with") {
+                return true;
+            }
+            // User-declared `contract { callsInPlace(block,
+            // EXACTLY_ONCE) }`: if the registry records the
+            // trailing-arg position as exactly-once, treat the
+            // call like a scope function so the lambda body's
+            // assignments / smart-casts flow to the caller scope.
+            // Positional check by the trailing arg's name in the
+            // candidate user fn's contract list — sufficient for
+            // the EXACTLY_ONCE shape since the inlining only
+            // needs to identify the lambda arg, not the exact
+            // declared param.
+            let user_params = crate::analyses::contracts::user_exactly_once_params(name);
+            !user_params.is_empty()
+        }
         _ => false,
     }
 }

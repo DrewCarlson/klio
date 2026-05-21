@@ -4,9 +4,15 @@
 //! runs a specific number of times, or a smart-cast established by
 //! a runtime check.
 //!
-//! For now we hardcode the stdlib contracts. User contracts declared
-//! via `kotlin.contracts.contract { ... }` extend the same table
-//! when the typechecker parses them — landing in a follow-up.
+//! Stdlib contracts live in [`stdlib_contract`] (hardcoded by simple
+//! name). User contracts declared via
+//! `kotlin.contracts.contract { … }` populate
+//! [`USER_INLINE_CONTRACTS`] before lowering — the build pass walks
+//! every `inline fun` body once for the contract block and records
+//! each `callsInPlace(blockName, EXACTLY_ONCE)` it finds. The
+//! lowering then treats a call to that user fn the same way it
+//! treats a `let { … }` call: inline the trailing-lambda body into
+//! the current block so VIA and smart-cast see the body's effects.
 
 /// One effect a contract imposes on the call site's post-call state.
 /// Multiple effects can apply to the same call (e.g. a function
@@ -22,6 +28,35 @@ pub enum ContractEffect {
     /// `AssumeRefEq` refinement the lowering recorded for that
     /// register is replayed on the post-call block.
     AssumePredicate { arg_idx: usize },
+}
+
+thread_local! {
+    /// User-declared `contract { callsInPlace(p, EXACTLY_ONCE) }`
+    /// records, keyed by the inline fn's simple name. Each value
+    /// lists the parameter names that are invoked exactly once on
+    /// the normal path (Kotlin's `InvocationKind.EXACTLY_ONCE`).
+    /// The lowering uses this to extend its trailing-lambda inline
+    /// scheme to user contracts so a `val` assigned inside the
+    /// lambda is observed as definitely assigned at the call site.
+    static USER_INLINE_CONTRACTS: std::cell::RefCell<
+        std::collections::HashMap<String, Vec<String>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Replace the user-contract registry. Called once per module
+/// build, before any per-function lowering starts. Passing an
+/// empty map effectively clears the registry between modules.
+pub fn set_user_inline_contracts(
+    map: std::collections::HashMap<String, Vec<String>>,
+) {
+    USER_INLINE_CONTRACTS.with(|c| *c.borrow_mut() = map);
+}
+
+/// Lookup the param names of the user inline fn `name` whose
+/// contract declares `callsInPlace(p, EXACTLY_ONCE)`. Empty when no
+/// user contract is registered for that name.
+pub fn user_exactly_once_params(name: &str) -> Vec<String> {
+    USER_INLINE_CONTRACTS.with(|c| c.borrow().get(name).cloned().unwrap_or_default())
 }
 
 /// Lookup table for stdlib functions that participate in contract
