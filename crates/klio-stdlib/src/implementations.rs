@@ -17,21 +17,17 @@ use std::sync::Arc;
 use klio_runtime::{CallCtx, ObjRef, RuntimeError, StdlibFn, Value};
 
 const TABLE: &[(&str, StdlibFn)] = &[
-    // ----- scope functions (lambda-driven) -----
-    ("kotlin.let", scope_let),
-    ("kotlin.run", scope_run),
-    ("kotlin.apply", scope_apply),
-    ("kotlin.also", scope_also),
-    ("kotlin.with", scope_with),
-    ("kotlin.takeIf", scope_take_if),
-    ("kotlin.takeUnless", scope_take_unless),
-    ("kotlin.repeat", scope_repeat),
-    ("kotlin.require", contract_require),
-    ("kotlin.check", contract_check),
+    // ----- non-scope lambda-driven utilities still on the Rust path -----
+    // `error` and `TODO` rely on `Nothing`-return throw flow; the
+    // collection/text builders bridge to Rust-native Value containers;
+    // `lazy` / `lazyOf` need the Lazy<T> interface and field-stored
+    // callables — both moves planned in the intrinsics-to-Kotlin
+    // migration's later tiers. `use` would migrate cleanly except
+    // the IR lowers `try { ... } finally { ... }` inside an inline
+    // fn with two generic type parameters by duplicating the finally
+    // body — see plans/INTRINSICS-TO-KOTLIN.md.
     ("kotlin.error", contract_error),
     ("kotlin.TODO", contract_todo),
-    ("kotlin.requireNotNull", contract_require_not_null),
-    ("kotlin.checkNotNull", contract_check_not_null),
     ("kotlin.collections.buildList", builders_build_list),
     ("kotlin.collections.buildSet", builders_build_set),
     ("kotlin.collections.buildMap", builders_build_map),
@@ -1160,91 +1156,21 @@ const PARAM_NAMES: &[(&str, &[&str])] = &[
 // body — the host wires that back into the interpreter's
 // `invoke_callable_value` path.
 
-fn split_receiver_and_block(ctx: &CallCtx) -> Result<(Value, Value), RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity(
-            "scope-fn expects (receiver, block)".into(),
-        ));
-    }
-    Ok((ctx.args[0].clone(), ctx.args[1].clone()))
-}
-
-fn split_block(ctx: &CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 1 {
-        return Err(RuntimeError::Arity("scope-fn expects (block)".into()));
-    }
-    Ok(ctx.args[0].clone())
-}
-
-fn scope_let(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let (recv, block) = split_receiver_and_block(ctx)?;
-    let CallCtx { out, host, .. } = ctx;
-    host.invoke_callable(&block, std::slice::from_ref(&recv), *out)
-}
-
-fn scope_run(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() == 2 {
-        let (recv, block) = split_receiver_and_block(ctx)?;
-        let CallCtx { out, host, .. } = ctx;
-        host.invoke_callable_with_this(&block, &[], &recv, *out)
-    } else {
-        let block = split_block(ctx)?;
-        let CallCtx { out, host, .. } = ctx;
-        host.invoke_callable(&block, &[], *out)
-    }
-}
-
-fn scope_apply(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let (recv, block) = split_receiver_and_block(ctx)?;
-    let CallCtx { out, host, .. } = ctx;
-    host.invoke_callable_with_this(&block, &[], &recv, *out)?;
-    Ok(recv)
-}
-
-fn scope_also(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let (recv, block) = split_receiver_and_block(ctx)?;
-    let CallCtx { out, host, .. } = ctx;
-    host.invoke_callable(&block, std::slice::from_ref(&recv), *out)?;
-    Ok(recv)
-}
-
 fn io_use(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let (recv, block) = split_receiver_and_block(ctx)?;
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("use expects (receiver, block)".into()));
+    }
+    let recv = ctx.args[0].clone();
+    let block = ctx.args[1].clone();
     let CallCtx { out, host, .. } = ctx;
     let res = host.invoke_callable(&block, std::slice::from_ref(&recv), *out);
-    // Invoke close() unconditionally. invoke_method returns None when
-    // the host doesn't expose the dispatcher (script harnesses), in
-    // which case the close call is a no-op.
-    let _ = host.invoke_method(&recv, "close", &[], *out);
+    // Invoke close() unconditionally on a non-null receiver. The
+    // host's `invoke_method` returns None when the dispatcher isn't
+    // wired (script harnesses), making the close call a no-op there.
+    if !matches!(recv, Value::Null) {
+        let _ = host.invoke_method(&recv, "close", &[], *out);
+    }
     res
-}
-
-fn scope_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let (recv, block) = split_receiver_and_block(ctx)?;
-    let CallCtx { out, host, .. } = ctx;
-    host.invoke_callable_with_this(&block, &[], &recv, *out)
-}
-
-fn scope_take_if(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let (recv, block) = split_receiver_and_block(ctx)?;
-    let CallCtx { out, host, .. } = ctx;
-    let pred = host.invoke_callable(&block, std::slice::from_ref(&recv), *out)?;
-    Ok(if matches!(pred, Value::Bool(true)) {
-        recv
-    } else {
-        Value::Null
-    })
-}
-
-fn scope_take_unless(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let (recv, block) = split_receiver_and_block(ctx)?;
-    let CallCtx { out, host, .. } = ctx;
-    let pred = host.invoke_callable(&block, std::slice::from_ref(&recv), *out)?;
-    Ok(if matches!(pred, Value::Bool(false)) {
-        recv
-    } else {
-        Value::Null
-    })
 }
 
 fn iterable_items(v: &Value, what: &str) -> Result<Vec<Value>, RuntimeError> {
@@ -2391,50 +2317,6 @@ fn builders_build_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::String(Arc::new(s.borrow().clone())))
 }
 
-fn contract_msg(ctx: &mut CallCtx, default: &str) -> Result<String, RuntimeError> {
-    if let Some(arg) = ctx.args.get(1).cloned() {
-        if matches!(&arg, Value::Lambda { .. } | Value::IrClosure { .. }) {
-            let CallCtx { out, host, .. } = ctx;
-            let r = host.invoke_callable(&arg, &[], *out)?;
-            return Ok(format!("{r}"));
-        }
-        return Ok(format!("{arg}"));
-    }
-    Ok(default.to_string())
-}
-
-fn contract_require(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let cond = ctx.args.first().cloned().unwrap_or(Value::Null);
-    let Value::Bool(b) = cond else {
-        return Err(RuntimeError::Type("require expects a Bool".into()));
-    };
-    if b {
-        return Ok(Value::Unit);
-    }
-    let msg = contract_msg(ctx, "Failed requirement.")?;
-    Err(RuntimeError::Thrown(Value::Exception {
-        fqn: Arc::new("kotlin.IllegalArgumentException".into()),
-        message: Some(Arc::new(msg)),
-        cause: None,
-    }))
-}
-
-fn contract_check(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let cond = ctx.args.first().cloned().unwrap_or(Value::Null);
-    let Value::Bool(b) = cond else {
-        return Err(RuntimeError::Type("check expects a Bool".into()));
-    };
-    if b {
-        return Ok(Value::Unit);
-    }
-    let msg = contract_msg(ctx, "Check failed.")?;
-    Err(RuntimeError::Thrown(Value::Exception {
-        fqn: Arc::new("kotlin.IllegalStateException".into()),
-        message: Some(Arc::new(msg)),
-        cause: None,
-    }))
-}
-
 fn contract_error(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = ctx.args.first().cloned().unwrap_or(Value::Null);
     let msg = match v {
@@ -2459,48 +2341,6 @@ fn contract_todo(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         message: Some(Arc::new(msg)),
         cause: None,
     }))
-}
-
-fn contract_require_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let v = ctx.args.first().cloned().unwrap_or(Value::Null);
-    if !matches!(v, Value::Null) {
-        return Ok(v);
-    }
-    let msg = contract_msg(ctx, "Required value was null.")?;
-    Err(RuntimeError::Thrown(Value::Exception {
-        fqn: Arc::new("kotlin.IllegalArgumentException".into()),
-        message: Some(Arc::new(msg)),
-        cause: None,
-    }))
-}
-
-fn contract_check_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let v = ctx.args.first().cloned().unwrap_or(Value::Null);
-    if !matches!(v, Value::Null) {
-        return Ok(v);
-    }
-    let msg = contract_msg(ctx, "Required value was null.")?;
-    Err(RuntimeError::Thrown(Value::Exception {
-        fqn: Arc::new("kotlin.IllegalStateException".into()),
-        message: Some(Arc::new(msg)),
-        cause: None,
-    }))
-}
-
-fn scope_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("repeat expects (times, block)".into()));
-    }
-    let times = ctx.args[0]
-        .as_i64()
-        .ok_or_else(|| RuntimeError::Type("repeat: first arg must be Int".into()))?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    for i in 0..times {
-        let arg = Value::new_int(i);
-        host.invoke_callable(&block, std::slice::from_ref(&arg), *out)?;
-    }
-    Ok(Value::Unit)
 }
 
 /// State of one reentrant monitor: which thread (if any) currently

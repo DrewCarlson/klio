@@ -1140,7 +1140,16 @@ fn embedded_stdlib_sources(
         parsed.push((pkg, ast));
     }
 
-    let wanted = parsed.iter().any(|(pkg, _)| {
+    // Always include files in implicitly-imported packages (spec
+    // §10.1: `kotlin`, `kotlin.collections`, ...) so the shimmed
+    // common-Kotlin definitions of scope functions, precondition
+    // helpers, and list factories are visible without any explicit
+    // import. Non-implicit curated sources (e.g. `kotlin.time`) stay
+    // all-or-nothing and gated on a matching import.
+    let any_non_implicit = parsed
+        .iter()
+        .any(|(pkg, _)| !pkg.is_empty() && !klio_stdlib::is_implicitly_imported_package(pkg));
+    let imported_match = parsed.iter().any(|(pkg, _)| {
         !pkg.is_empty()
             && import_prefixes.iter().any(|imp| {
                 imp == pkg
@@ -1148,10 +1157,16 @@ fn embedded_stdlib_sources(
                     || pkg.starts_with(&format!("{imp}."))
             })
     });
-    if !wanted {
-        return Vec::new();
-    }
-    parsed.into_iter().map(|(_, ast)| ast).collect()
+    let load_gated = imported_match || !any_non_implicit;
+    parsed
+        .into_iter()
+        .filter(|(pkg, _)| {
+            let is_implicit =
+                !pkg.is_empty() && klio_stdlib::is_implicitly_imported_package(pkg);
+            is_implicit || load_gated
+        })
+        .map(|(_, ast)| ast)
+        .collect()
 }
 
 /// independent of `~/.klio/packs`. Used by the memory-model
