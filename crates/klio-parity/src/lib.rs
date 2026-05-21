@@ -1395,10 +1395,6 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
     // Conformance / smoke determinism: timed coroutine programs are
     // only byte-deterministic under virtual time.
     klio_interp_ir::set_coroutine_time_mode(klio_interp_ir::TimeMode::Virtual);
-    for ast in &asts {
-        let r = klio_resolver::resolve(ast);
-        let _ = klio_typeck::typecheck(ast, &r);
-    }
     let built = klio_interp_ir::build::build_module_files(&asts);
     let Some(main_id) = built.main else {
         return Err("no main function in module".into());
