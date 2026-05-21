@@ -175,7 +175,26 @@ pub(super) fn try_inline_call(
         let a = a.as_ref().expect("filled above");
         let r = lower_expr(b, a);
         b.bind(p.name.name.clone(), r);
-        if matches!(a, Expr::Lambda { .. }) {
+        // `noinline` parameters opt out of the inline-lambda
+        // splicing path. Their argument value still flows through
+        // the binding above, but a call to that parameter inside
+        // the inlined body lowers as a normal CallValue against
+        // the reg instead of inlining the lambda literal. Without
+        // this gate, every inline call would splice every lambda
+        // argument's body — defeating `noinline`'s point of
+        // letting the lambda be passed on or stored.
+        //
+        // `crossinline` keeps the inline-lambda path, but a bare
+        // `return` in the lambda body is illegal: the inlined
+        // body's return targets the enclosing inline fn's caller,
+        // and `crossinline` promises that the lambda will not
+        // perform such a non-local return. Klio doesn't currently
+        // emit a parser-level diagnostic for the violation; the
+        // runtime semantics still match Kotlin (the lambda's body
+        // executes inside the inline call's scope and a `return`
+        // would jump too far), but a future change should add the
+        // typeck diagnostic.
+        if !p.is_noinline && matches!(a, Expr::Lambda { .. }) {
             lambda_map.insert(p.name.name.clone(), a.clone());
         }
     }
