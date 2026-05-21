@@ -2075,24 +2075,42 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 i += 1;
             }
             let mut acc_visibility: Option<Visibility> = None;
-            if let Some(tok) = self.tokens.get(i) {
-                if matches!(tok.kind, TokenKind::Ident) {
-                    let txt = self.text(tok.span);
-                    let v = match txt {
-                        "public" => Some(Visibility::Public),
-                        "private" => Some(Visibility::Private),
-                        "protected" => Some(Visibility::Protected),
-                        "internal" => Some(Visibility::Internal),
-                        _ => None,
-                    };
-                    if v.is_some() {
-                        acc_visibility = v;
-                        i += 1;
-                        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
-                            i += 1;
-                        }
-                    }
+            let mut acc_inline = false;
+            // Accept `inline` and / or a visibility modifier in either
+            // order ahead of the `get` / `set` keyword. Kotlin allows
+            // `inline get()` and `private inline set(v)`; both
+            // combinations parse here. Lookahead-only: the `pos` is
+            // committed below once the accessor is confirmed.
+            loop {
+                let Some(tok) = self.tokens.get(i) else { break };
+                if !matches!(tok.kind, TokenKind::Ident) {
+                    break;
                 }
+                let txt = self.text(tok.span);
+                let v = match txt {
+                    "public" => Some(Visibility::Public),
+                    "private" => Some(Visibility::Private),
+                    "protected" => Some(Visibility::Protected),
+                    "internal" => Some(Visibility::Internal),
+                    _ => None,
+                };
+                if v.is_some() && acc_visibility.is_none() {
+                    acc_visibility = v;
+                    i += 1;
+                    while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if txt == "inline" && !acc_inline {
+                    acc_inline = true;
+                    i += 1;
+                    while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+                        i += 1;
+                    }
+                    continue;
+                }
+                break;
             }
             let Some(tok) = self.tokens.get(i) else { break };
             if !matches!(tok.kind, TokenKind::Ident) {
@@ -2109,7 +2127,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             // accessor in place but restricts visibility. We synthesize a
             // bodyless accessor whose presence carries only the visibility.
             let is_bodyless = !matches!(next, Some(TokenKind::LParen));
-            if is_bodyless && acc_visibility.is_none() {
+            if is_bodyless && acc_visibility.is_none() && !acc_inline {
                 // No modifier and no `(` — not an accessor, bail.
                 break;
             }
@@ -2163,6 +2181,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 return_type,
                 body,
                 visibility: acc_visibility,
+                is_inline: acc_inline,
                 annotations: Vec::new(),
                 span: start_span.join(end),
             };

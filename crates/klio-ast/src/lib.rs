@@ -294,6 +294,13 @@ pub struct Accessor {
     /// Per-accessor visibility — typically used as `var x; private set` to
     /// keep the getter public while restricting writes. Spec §4.6 / §4.3.4.
     pub visibility: Option<Visibility>,
+    /// `inline get()` / `inline set(v)` — the individual accessor body
+    /// is inlined at every read/write site, independent of any other
+    /// accessor on the same property. Distinct from the whole-property
+    /// `inline val/var foo` form which marks the property declaration
+    /// (`Property::is_inline`) and implicitly inlines both accessors.
+    #[serde(default)]
+    pub is_inline: bool,
     pub annotations: Vec<Annotation>,
     pub span: Span,
 }
