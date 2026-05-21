@@ -767,22 +767,22 @@ fn run_frame_inner<'a>(
 ) -> Result<Value, EvalError> {
     let mut pending_rethrow: Option<(BlockId, Value)> = None;
     let mut pending_return: Option<(BlockId, Value)> = None;
+    let func: &'a Func = frame.func;
     loop {
         // Push any catch / finally metadata attached to this block.
-        let (insts, term, catches, finally, finally_done) = {
-            let block = frame.block(cur);
-            (
-                block.insts.clone(),
-                block.terminator.clone(),
-                block.catches.clone(),
-                block.finally,
-                block.finally_done,
-            )
-        };
-        if resume_idx == 0 && (!catches.is_empty() || finally.is_some()) {
+        // The `func` reference (lifetime `'a`) lets us read block
+        // contents without cloning the instruction vector or the
+        // (usually empty) catch list every loop iteration.
+        let block = &func.blocks[cur.0 as usize];
+        let insts: &[Inst] = &block.insts;
+        let term = block.terminator.clone();
+        let finally = block.finally;
+        let finally_done = block.finally_done;
+        let has_catches = !block.catches.is_empty();
+        if resume_idx == 0 && (has_catches || finally.is_some()) {
             try_stack.push(TryFrame {
                 body: cur,
-                catches,
+                catches: block.catches.clone(),
                 finally_entry: finally,
                 finally_done,
             });

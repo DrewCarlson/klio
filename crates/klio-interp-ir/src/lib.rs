@@ -1118,15 +1118,11 @@ impl<'a> VmHost<'a> {
         args: &[klio_runtime::Value],
     ) -> Option<klio_ir::FuncId> {
         let name = module.funcs.get(func.0 as usize)?.name.clone();
-        let candidates: Vec<klio_ir::FuncId> = module
-            .func_index
-            .iter()
-            .filter(|(n, _)| n == &name)
-            .map(|(_, id)| *id)
-            .collect();
+        let candidates = module.funcs_by_simple_name(&name);
         if candidates.len() < 2 {
             return None;
         }
+        let candidates: Vec<klio_ir::FuncId> = candidates.to_vec();
         // Seed the search with the lowering's chosen candidate so a
         // strictly better runtime match can still win, but ties keep
         // the call site's FQN-aware resolution intact. Without this,
@@ -1270,10 +1266,9 @@ impl<'a> VmHost<'a> {
         let want = args.len() + 1;
         let candidates: Vec<(klio_ir::FuncId, klio_ir::Func)> = self
             .module
-            .func_index
+            .funcs_by_simple_name(name)
             .iter()
-            .filter(|(n, _)| n == name)
-            .filter_map(|(_, fid)| {
+            .filter_map(|fid| {
                 self.module.funcs.get(fid.0 as usize).cloned().map(|f| (*fid, f))
             })
             .filter(|(_fid, f)| !f.params.is_empty())
@@ -5619,17 +5614,15 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // exists, it must win over the SAM-invoke shortcut, which
             // would otherwise just call the receiver and discard the
             // intended dispatch. Defer to the extension-fn fallback.
-            let has_ext = self.module.func_index.iter().any(|(n, fid)| {
-                n == name
-                    && self
-                        .module
-                        .funcs
-                        .get(fid.0 as usize)
-                        .map(|f| {
-                            f.params.first().map(|p| p.name == "this").unwrap_or(false)
-                                && f.params.len() >= args.len() + 1
-                        })
-                        .unwrap_or(false)
+            let has_ext = self.module.funcs_by_simple_name(name).iter().any(|fid| {
+                self.module
+                    .funcs
+                    .get(fid.0 as usize)
+                    .map(|f| {
+                        f.params.first().map(|p| p.name == "this").unwrap_or(false)
+                            && f.params.len() >= args.len() + 1
+                    })
+                    .unwrap_or(false)
             });
             if name != "invoke" && !has_ext {
                 if let Ok(v) = self.call_value(receiver, args) {
@@ -6726,10 +6719,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
             let want = args.len() + 1;
             let mut found = false;
-            for (fname, fid) in self.module.func_index.iter() {
-                if fname != name {
-                    continue;
-                }
+            for fid in self.module.funcs_by_simple_name(name) {
                 let owner_ok = self
                     .module
                     .registry
@@ -6836,10 +6826,9 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             };
             let candidates: Vec<(klio_ir::FuncId, klio_ir::Func)> = self
                 .module
-                .func_index
+                .funcs_by_simple_name(name)
                 .iter()
-                .filter(|(n, _)| n == name)
-                .filter_map(|(_, fid)| {
+                .filter_map(|fid| {
                     self.module
                         .funcs
                         .get(fid.0 as usize)
@@ -8081,10 +8070,9 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // real arity.)
             let module = Arc::clone(&self.module);
             let factory = module
-                .func_index
+                .funcs_by_simple_name(&class_def.name)
                 .iter()
-                .filter(|(n, _)| *n == class_def.name)
-                .filter_map(|(_, fid)| {
+                .filter_map(|fid| {
                     module.funcs.get(fid.0 as usize).map(|f| (*fid, f))
                 })
                 .find(|(_, f)| {
@@ -10830,6 +10818,7 @@ mod tests {
         placed.id = main_id;
         module.funcs.push(placed);
         module.func_index.push(("main".into(), main_id));
+        module.func_name_index.entry("main".into()).or_default().push(main_id);
         module.top_level.push(main_id);
 
         let mut vm = Vm::new(Arc::new(module));
@@ -10866,6 +10855,7 @@ mod tests {
         placed.id = main_id;
         module.funcs.push(placed);
         module.func_index.push(("main".into(), main_id));
+        module.func_name_index.entry("main".into()).or_default().push(main_id);
         module.top_level.push(main_id);
 
         let mut vm = Vm::new(Arc::new(module));

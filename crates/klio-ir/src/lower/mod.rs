@@ -652,7 +652,9 @@ pub fn lower_function_with_file(
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
     placed.id = id;
-    module.func_index.push((f.name.name.clone(), id));
+    let nm = f.name.name.clone();
+    module.func_index.push((nm.clone(), id));
+    module.func_name_index.entry(nm).or_default().push(id);
     module.funcs.push(placed.clone());
     placed
 }
@@ -836,7 +838,9 @@ pub fn lower_method_with_private(
         let mut placed = func;
         placed.id = id;
         module.funcs.push(placed.clone());
-        module.func_index.push((f.name.name.clone(), id));
+        let nm = f.name.name.clone();
+        module.func_index.push((nm.clone(), id));
+        module.func_name_index.entry(nm).or_default().push(id);
         // Tag this member-extension with its declaring class so the
         // runtime extension-fallback dispatch can filter it out at
         // call sites whose enclosing class chain doesn't include
@@ -2461,10 +2465,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // they neither own nor expect to honour).
                     let collision = b
                         .module
-                        .func_index
-                        .iter()
-                        .filter(|(n, _)| n == &segments[0].name)
-                        .count()
+                        .funcs_by_simple_name(&segments[0].name)
+                        .len()
                         > 1;
                     let imported_func_id = if collision {
                         b.module

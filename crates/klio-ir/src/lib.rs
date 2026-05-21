@@ -577,6 +577,17 @@ pub struct Module {
     /// Lowering routes Path-callees that match a registered name
     /// to `Inst::Call { func }` instead of LoadGlobal+CallValue.
     pub func_index: Vec<(String, FuncId)>,
+    /// Parallel index of [`func_index`] keyed by simple name for
+    /// O(1) `name → all matching FuncIds (in declaration order)`
+    /// lookup. The IR build paths in `klio_ir::lower` and the
+    /// `klio-interp-ir` Vm rebuild this incrementally as functions
+    /// are added; serialized modules rebuild it on first use via
+    /// [`Self::rebuild_func_name_index`]. Hand-written test
+    /// fixtures that mutate `func_index` directly should call
+    /// [`Self::rebuild_func_name_index`] before invoking
+    /// [`Self::func_id`] / [`Self::funcs_by_simple_name`].
+    #[serde(skip)]
+    pub func_name_index: std::collections::HashMap<String, Vec<FuncId>>,
     /// Package path for FQN qualification.
     pub package: Option<String>,
     /// Top-level function names declared `tailrec`. Populated by the
@@ -705,8 +716,65 @@ impl Module {
     /// already have an FQN should prefer
     /// [`func_id_by_fqn`](Self::func_id_by_fqn) to disambiguate
     /// same-simple-name declarations from different packages.
+    /// Rebuild [`Self::func_name_index`] from the declaration-order
+    /// [`Self::func_index`]. Cheap (one walk + hashmap insert per
+    /// entry); the IR build pipelines call this whenever they're
+    /// done extending `func_index`, and deserialized modules call it
+    /// lazily on first `func_id` lookup.
+    pub fn rebuild_func_name_index(&mut self) {
+        self.func_name_index.clear();
+        for (n, id) in &self.func_index {
+            self.func_name_index.entry(n.clone()).or_default().push(*id);
+        }
+    }
+
+    /// All `FuncId`s registered under the given simple name, in
+    /// declaration order. Returns an empty slice when no match exists
+    /// or when the [`Self::func_name_index`] hasn't been populated
+    /// for a freshly-deserialized module.
+    #[must_use]
+    pub fn funcs_by_simple_name(&self, name: &str) -> &[FuncId] {
+        self.func_name_index
+            .get(name)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
     #[must_use]
     pub fn func_id(&self, name: &str) -> Option<FuncId> {
+        let candidates = self.funcs_by_simple_name(name);
+        if candidates.is_empty() {
+            // Fallback for callers that mutate `func_index` directly
+            // without rebuilding the name-index — preserve the old
+            // O(n) walk so the answer stays correct in that path.
+            return self.func_id_legacy(name);
+        }
+        let mut first: Option<FuncId> = None;
+        let mut first_user: Option<FuncId> = None;
+        for id in candidates {
+            if first.is_none() {
+                first = Some(*id);
+            }
+            if first_user.is_some() {
+                continue;
+            }
+            if let Some(f) = self.funcs.get(id.0 as usize) {
+                let fqn = f.fqn.as_str();
+                let is_shipped = fqn.starts_with("kotlin.")
+                    || fqn.starts_with("kotlinx.")
+                    || fqn.starts_with("java.")
+                    || fqn == "kotlin"
+                    || fqn == "kotlinx"
+                    || fqn == "java";
+                if !is_shipped {
+                    first_user = Some(*id);
+                }
+            }
+        }
+        first_user.or(first)
+    }
+
+    fn func_id_legacy(&self, name: &str) -> Option<FuncId> {
         let mut first: Option<FuncId> = None;
         let mut first_user: Option<FuncId> = None;
         for (n, id) in &self.func_index {

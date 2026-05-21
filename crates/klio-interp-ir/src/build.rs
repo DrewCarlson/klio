@@ -1070,7 +1070,9 @@ fn build_module_with_overrides(
                 is_inline: f.is_inline,
                 capture_order: Vec::new(),
             });
-            module.func_index.push((f.name.name.clone(), id));
+            let nm = f.name.name.clone();
+            module.func_index.push((nm.clone(), id));
+            module.func_name_index.entry(nm).or_default().push(id);
             if f.is_tailrec {
                 module.tailrec_fn_names.push(f.name.name.clone());
             }
