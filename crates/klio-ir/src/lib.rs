@@ -672,17 +672,34 @@ impl Module {
             .map(|(_, id)| *id)
     }
 
-    /// Look up a top-level function by simple name. Returns the
-    /// first match, mirroring how `class_id` resolves a bare type
-    /// reference; callers that already have an FQN should prefer
+    /// Look up a top-level function by simple name. When multiple
+    /// candidates share the simple name (e.g. a user `fun produce(...)`
+    /// declared alongside a star-imported
+    /// `kotlinx.coroutines.channels.produce`), a candidate from the
+    /// no-package scope — i.e. one whose `Func::fqn` equals its simple
+    /// name — wins so the user's top-level decl shadows the packaged
+    /// import at a bare call site, matching Kotlin's rule that an
+    /// explicit declaration in the current scope beats a wildcard-
+    /// imported symbol. Callers that already have an FQN should prefer
     /// [`func_id_by_fqn`](Self::func_id_by_fqn) to disambiguate
     /// same-simple-name declarations from different packages.
     #[must_use]
     pub fn func_id(&self, name: &str) -> Option<FuncId> {
-        self.func_index
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, id)| *id)
+        let mut first: Option<FuncId> = None;
+        for (n, id) in &self.func_index {
+            if n != name {
+                continue;
+            }
+            if first.is_none() {
+                first = Some(*id);
+            }
+            if let Some(f) = self.funcs.get(id.0 as usize) {
+                if f.fqn == name {
+                    return Some(*id);
+                }
+            }
+        }
+        first
     }
 
     /// Look up a top-level function by fully-qualified name (matches
