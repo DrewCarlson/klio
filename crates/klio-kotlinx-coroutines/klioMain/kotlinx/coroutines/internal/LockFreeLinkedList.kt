@@ -1,110 +1,159 @@
 // klio actual for the upstream `expect` lock-free intrusive list.
 //
-// Caveat: this implementation is intentionally lock-based, NOT
-// lock-free, despite the class name carrying the upstream contract.
-// Direct port of upstream's Sundell-Tsigas algorithm (see
-// `upstream/kotlinx-coroutines-core/concurrent/src/internal/LockFreeLinkedList.kt`)
-// works correctly in isolation but transitively reaches kxco
-// internals (Segment-based semaphore queues,
-// ConcurrentLinkedList helpers) whose `acquirers` / segment-class
-// shape klio's runtime does not yet resolve. Until that gap is
-// closed, this locked port keeps the cancellation handler list
-// and Job-children list semantically correct under
-// `Dispatchers.Default` contention — at the cost of coarse-grained
-// exclusion. Tracked in `plans/LANGUAGE-GAPS.md`.
-//
-// The monitor is rooted at the head node so all nodes that belong
-// to a single list serialize through the same lock — `addLast` /
-// `remove` mutate two adjacent links and must be atomic with
-// respect to a concurrent `forEach` that walks them. Each node
-// caches a reference to its head so non-head mutators find the
-// right lock without an extra parameter. `forEach` snapshots the
-// visit set under the lock and invokes the user block outside it
-// so a handler that removes itself doesn't self-deadlock.
+// Verbatim Sundell-Tsigas algorithm structure adapted from
+// `upstream/kotlinx-coroutines-core/concurrent/src/internal/LockFreeLinkedList.kt`:
+// every link is an `atomic` reference, removed nodes are marked
+// with the `Removed` sentinel on `_next`, and `correctPrev` runs
+// the helping protocol when an observer encounters a half-completed
+// remove. klio's atomicfu CAS is observed atomically under
+// contention (see the kotlinx-atomicfu Rust-side single-borrow
+// RMW), so the algorithm is sound across real `Dispatchers.Default`
+// worker threads.
 
 package kotlinx.coroutines.internal
 
+import kotlinx.atomicfu.atomic
+import kotlinx.atomicfu.loop
+
+private typealias Node = LockFreeLinkedListNode
+
+@Suppress("LeakingThis")
 public actual open class LockFreeLinkedListNode actual constructor() {
-    private var nextRef: LockFreeLinkedListNode = this
-    private var prevRef: LockFreeLinkedListNode = this
-    private var removed: Boolean = false
-    private var forbidden: Int = 0
+    private val _next = atomic<Any>(this) // Node | Removed
+    private val _prev = atomic(this) // Node to the left (cannot be marked as removed)
+    private val _removedRef = atomic<Removed?>(null) // lazily cached removed ref to this
 
-    // Head of the list this node belongs to. A free-standing node
-    // (not yet linked) is its own head, which makes single-node
-    // operations on a detached node lock its own monitor — fine
-    // because no other worker can see it yet.
-    internal var head: LockFreeLinkedListNode = this
+    private fun removed(): Removed {
+        val cached = _removedRef.value
+        if (cached != null) return cached
+        val r = Removed(this)
+        _removedRef.lazySet(r)
+        return r
+    }
 
-    public actual val isRemoved: Boolean get() = kotlin.synchronized(head) { removed }
-    public actual val nextNode: LockFreeLinkedListNode get() = kotlin.synchronized(head) { nextRef }
-    public actual val prevNode: LockFreeLinkedListNode get() = kotlin.synchronized(head) { prevRef }
+    public actual open val isRemoved: Boolean get() = _next.value is Removed
 
-    public actual fun addLast(node: LockFreeLinkedListNode, permissionsBitmask: Int): Boolean =
-        kotlin.synchronized(head) {
-            if (forbidden and permissionsBitmask != 0) return@synchronized false
-            val prev = this.prevRef
-            node.nextRef = this
-            node.prevRef = prev
-            node.head = head
-            prev.nextRef = node
-            this.prevRef = node
-            true
+    public actual val nextNode: Node get() {
+        val n = _next.value
+        return if (n is Removed) n.ref else n as Node
+    }
+
+    public actual val prevNode: Node
+        get() = correctPrev() ?: findPrevNonRemoved(_prev.value)
+
+    private tailrec fun findPrevNonRemoved(current: Node): Node {
+        if (!current.isRemoved) return current
+        return findPrevNonRemoved(current._prev.value)
+    }
+
+    public actual fun addOneIfEmpty(node: Node): Boolean {
+        node._prev.lazySet(this)
+        node._next.lazySet(this)
+        while (true) {
+            val next = _next.value
+            if (next !== this) return false
+            if (_next.compareAndSet(this, node)) {
+                node.finishAdd(this)
+                return true
+            }
         }
+    }
 
-    public actual fun addOneIfEmpty(node: LockFreeLinkedListNode): Boolean =
-        kotlin.synchronized(head) {
-            if (nextRef !== this) return@synchronized false
-            // Inline of addLast(node, 0) under the same monitor so
-            // the "empty" check + insert is one atomic step.
-            val prev = this.prevRef
-            node.nextRef = this
-            node.prevRef = prev
-            node.head = head
-            prev.nextRef = node
-            this.prevRef = node
-            true
+    public actual fun addLast(node: Node, permissionsBitmask: Int): Boolean {
+        while (true) {
+            val currentPrev = prevNode
+            if (currentPrev is ListClosed) {
+                return currentPrev.forbiddenElementsBitmask and permissionsBitmask == 0 &&
+                    currentPrev.addLast(node, permissionsBitmask)
+            }
+            if (currentPrev.addNext(node, this)) return true
         }
-
-    public actual open fun remove(): Boolean = kotlin.synchronized(head) {
-        if (removed) return@synchronized false
-        val p = prevRef
-        val n = nextRef
-        p.nextRef = n
-        n.prevRef = p
-        removed = true
-        true
     }
 
     public actual fun close(forbiddenElementsBit: Int) {
-        kotlin.synchronized(head) {
-            forbidden = forbidden or forbiddenElementsBit
+        addLast(ListClosed(forbiddenElementsBit), forbiddenElementsBit)
+    }
+
+    internal fun addNext(node: Node, next: Node): Boolean {
+        node._prev.lazySet(this)
+        node._next.lazySet(next)
+        if (!_next.compareAndSet(next, node)) return false
+        node.finishAdd(next)
+        return true
+    }
+
+    public actual open fun remove(): Boolean = removeOrNext() == null
+
+    internal fun removeOrNext(): Node? {
+        while (true) {
+            val next = _next.value
+            if (next is Removed) return next.ref
+            if (next === this) return next as Node
+            val r = (next as Node).removed()
+            if (_next.compareAndSet(next, r)) {
+                next.correctPrev()
+                return null
+            }
         }
     }
 
-    internal fun headForEach(block: (LockFreeLinkedListNode) -> Unit) {
-        // Snapshot the visit set under the lock, then invoke the
-        // user block outside the lock so a callback that re-enters
-        // the list (a handler that removes itself) doesn't
-        // self-deadlock on the same monitor.
-        val visit = kotlin.synchronized(head) {
-            val acc = ArrayList<LockFreeLinkedListNode>()
-            var cur = nextRef
-            while (cur !== this) {
-                if (!cur.removed) acc.add(cur)
-                cur = cur.nextRef
+    private fun finishAdd(next: Node) {
+        next._prev.loop { nextPrev ->
+            if (_next.value !== next) return
+            if (next._prev.compareAndSet(nextPrev, this)) {
+                if (isRemoved) next.correctPrev()
+                return
             }
-            acc
         }
-        for (node in visit) block(node)
+    }
+
+    private tailrec fun correctPrev(): Node? {
+        val oldPrev = _prev.value
+        var prev: Node = oldPrev
+        var last: Node? = null
+        while (true) {
+            val prevNext: Any = prev._next.value
+            when {
+                prevNext === this -> {
+                    if (oldPrev === prev) return prev
+                    if (!_prev.compareAndSet(oldPrev, prev)) return correctPrev()
+                    return prev
+                }
+                isRemoved -> return null
+                prevNext is Removed -> {
+                    val lastNode = last
+                    if (lastNode !== null) {
+                        if (!lastNode._next.compareAndSet(prev, prevNext.ref)) return correctPrev()
+                        prev = lastNode
+                        last = null
+                    } else {
+                        prev = prev._prev.value
+                    }
+                }
+                else -> {
+                    last = prev
+                    prev = prevNext as Node
+                }
+            }
+        }
     }
 }
 
+private class Removed(val ref: Node)
+
 public actual open class LockFreeLinkedListHead actual constructor() : LockFreeLinkedListNode() {
-    public actual inline fun forEach(block: (LockFreeLinkedListNode) -> Unit) {
-        headForEach(block)
+    public actual inline fun forEach(block: (Node) -> Unit) {
+        var cur: Node = nextNode
+        while (cur !== this) {
+            block(cur)
+            cur = cur.nextNode
+        }
     }
 
     public actual final override fun remove(): Nothing =
         throw UnsupportedOperationException("head cannot be removed")
+
+    override val isRemoved: Boolean get() = false
 }
+
+private class ListClosed(val forbiddenElementsBitmask: Int) : LockFreeLinkedListNode()
