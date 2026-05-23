@@ -2657,6 +2657,10 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::LessEq, Double(a), Double(b)) => Ok(Bool(a <= b)),
         (BinOp::Greater, Double(a), Double(b)) => Ok(Bool(a > b)),
         (BinOp::GreaterEq, Double(a), Double(b)) => Ok(Bool(a >= b)),
+        (BinOp::Less, Value::Char(a), Value::Char(b)) => Ok(Bool(a < b)),
+        (BinOp::LessEq, Value::Char(a), Value::Char(b)) => Ok(Bool(a <= b)),
+        (BinOp::Greater, Value::Char(a), Value::Char(b)) => Ok(Bool(a > b)),
+        (BinOp::GreaterEq, Value::Char(a), Value::Char(b)) => Ok(Bool(a >= b)),
         // Mixed-type comparisons widen to the larger of the two.
         (BinOp::Less, Int(a), Long(b)) => Ok(Bool((*a as i64) < *b)),
         (BinOp::Less, Long(a), Int(b)) => Ok(Bool(*a < *b as i64)),

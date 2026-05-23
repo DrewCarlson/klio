@@ -471,6 +471,8 @@ pub struct ObjectDecl {
     /// `actual object` — the platform definition that supersedes a
     /// matching `expect object`.
     pub is_actual: bool,
+    #[serde(default)]
+    pub visibility: Visibility,
     pub span: Span,
 }
 

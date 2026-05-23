@@ -2588,9 +2588,22 @@ impl Value {
                     return enum_class.is_some();
                 }
                 if *mutable {
-                    matches!(name, "MutableList" | "List" | "Collection" | "Iterable" | "Any")
+                    matches!(
+                        name,
+                        "MutableList"
+                            | "List"
+                            | "Collection"
+                            | "MutableCollection"
+                            | "Iterable"
+                            | "MutableIterable"
+                            | "RandomAccess"
+                            | "Any"
+                    )
                 } else {
-                    matches!(name, "List" | "Collection" | "Iterable" | "Any")
+                    matches!(
+                        name,
+                        "List" | "Collection" | "Iterable" | "RandomAccess" | "Any"
+                    )
                 }
             }
             Value::Set { mutable, .. } => {

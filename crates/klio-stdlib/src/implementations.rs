@@ -89,8 +89,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String.lastIndexOf", string_last_index_of),
     ("kotlin.String.length", string_length),
     ("kotlin.String.lowercase", string_lowercase),
-    ("kotlin.String.padEnd", string_pad_end),
-    ("kotlin.String.padStart", string_pad_start),
     ("kotlin.String.plus", string_plus),
     ("kotlin.String.repeat", string_repeat),
     ("kotlin.String.replace", string_replace),
@@ -343,16 +341,12 @@ const TABLE: &[(&str, StdlibFn)] = &[
 
     // ----- List / Set members -----
     ("kotlin.collections.List.contains", coll_list_contains),
-    ("kotlin.collections.List.first", coll_list_first),
-    ("kotlin.collections.Set.first", coll_iter_first),
-    ("kotlin.collections.MutableSet.first", coll_iter_first),
-    ("kotlin.collections.Iterable.first", coll_iter_first),
-    ("kotlin.collections.Set.firstOrNull", coll_iter_first_or_null),
-    ("kotlin.collections.MutableSet.firstOrNull", coll_iter_first_or_null),
-    ("kotlin.collections.Iterable.firstOrNull", coll_iter_first_or_null),
-    ("kotlin.collections.Iterable.last", coll_iter_last),
-    ("kotlin.collections.Set.last", coll_iter_last),
-    ("kotlin.collections.MutableSet.last", coll_iter_last),
+    // first / firstOrNull / last / lastOrNull / single / singleOrNull /
+    // find / fold / reduce / filterNot / filterIndexed / mapIndexed /
+    // forEachIndexed / takeWhile / dropWhile / flatMap / partition
+    // are shipped from kotlin-collections/Iterable.kt (Iterable<T>
+    // extensions cover all list/set receivers via the runtime
+    // extension-fn fallback's receiver-type scoring).
     ("kotlin.collections.List.get", coll_list_get),
     ("kotlin.collections.List.indexOf", coll_list_index_of),
     ("kotlin.collections.List.indexOfFirst", coll_iter_index_of_first),
@@ -425,7 +419,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableSet.joinToString", coll_list_join_to_string),
     ("kotlin.collections.Iterable.joinToString", coll_list_join_to_string),
     ("kotlin.collections.Collection.joinToString", coll_list_join_to_string),
-    ("kotlin.collections.List.last", coll_list_last),
     ("kotlin.collections.List.average", coll_list_average),
     ("kotlin.collections.List.chunked", coll_list_chunked),
     ("kotlin.collections.List.distinct", coll_list_distinct),
@@ -437,7 +430,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.List.minOrNull", coll_list_min_or_null),
     ("kotlin.collections.List.sum", coll_list_sum),
     ("kotlin.collections.List.toMap", coll_list_to_map),
-    ("kotlin.collections.List.drop", coll_list_drop),
     ("kotlin.collections.List.dropLast", coll_list_drop_last),
     ("kotlin.collections.List.lastIndexOf", coll_list_last_index_of),
     ("kotlin.collections.List.minus", coll_list_minus),
@@ -448,7 +440,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.List.sorted", coll_list_sorted),
     ("kotlin.collections.List.sortedDescending", coll_list_sorted_descending),
     ("kotlin.collections.List.subList", coll_list_sublist),
-    ("kotlin.collections.List.take", coll_list_take),
     ("kotlin.collections.List.takeLast", coll_list_take_last),
     ("kotlin.collections.List.windowed", coll_list_windowed),
     ("kotlin.collections.List.zip", coll_list_zip),
@@ -457,13 +448,11 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.add", coll_mut_list_add),
     ("kotlin.collections.MutableList.clear", coll_mut_list_clear),
     ("kotlin.collections.MutableList.contains", coll_list_contains),
-    ("kotlin.collections.MutableList.first", coll_list_first),
     ("kotlin.collections.MutableList.get", coll_list_get),
     ("kotlin.collections.MutableList.indexOf", coll_list_index_of),
     ("kotlin.collections.MutableList.isEmpty", coll_list_is_empty),
     ("kotlin.collections.MutableList.isNotEmpty", coll_list_is_not_empty),
     ("kotlin.collections.MutableList.joinToString", coll_list_join_to_string),
-    ("kotlin.collections.MutableList.last", coll_list_last),
     ("kotlin.collections.MutableList.average", coll_list_average),
     ("kotlin.collections.MutableList.chunked", coll_list_chunked),
     ("kotlin.collections.MutableList.indices", coll_list_indices),
@@ -475,7 +464,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.sum", coll_list_sum),
     ("kotlin.collections.MutableList.toMap", coll_list_to_map),
     ("kotlin.collections.MutableList.distinct", coll_list_distinct),
-    ("kotlin.collections.MutableList.drop", coll_list_drop),
     ("kotlin.collections.MutableList.dropLast", coll_list_drop_last),
     ("kotlin.collections.MutableList.lastIndexOf", coll_list_last_index_of),
     ("kotlin.collections.MutableList.minus", coll_list_minus),
@@ -491,7 +479,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.sorted", coll_list_sorted),
     ("kotlin.collections.MutableList.sortedDescending", coll_list_sorted_descending),
     ("kotlin.collections.MutableList.subList", coll_list_sublist),
-    ("kotlin.collections.MutableList.take", coll_list_take),
     ("kotlin.collections.MutableList.takeLast", coll_list_take_last),
     ("kotlin.collections.MutableList.windowed", coll_list_windowed),
     ("kotlin.collections.MutableList.zip", coll_list_zip),
@@ -702,10 +689,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Int.toChar", int_to_char),
 
     // ----- Additional List ops -----
-    ("kotlin.collections.List.firstOrNull", coll_list_first_or_null),
-    ("kotlin.collections.List.lastOrNull", coll_list_last_or_null),
-    ("kotlin.collections.List.single", coll_list_single),
-    ("kotlin.collections.List.singleOrNull", coll_list_single_or_null),
     ("kotlin.collections.List.flatten", coll_list_flatten),
     ("kotlin.collections.List.unzip", coll_list_unzip),
     ("kotlin.collections.List.containsAll", coll_list_contains_all),
@@ -714,10 +697,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.List.toSet", coll_list_to_set),
     ("kotlin.collections.List.toMutableSet", coll_list_to_mutable_set),
     ("kotlin.collections.List.withIndex", coll_list_with_index),
-    ("kotlin.collections.MutableList.firstOrNull", coll_list_first_or_null),
-    ("kotlin.collections.MutableList.lastOrNull", coll_list_last_or_null),
-    ("kotlin.collections.MutableList.single", coll_list_single),
-    ("kotlin.collections.MutableList.singleOrNull", coll_list_single_or_null),
     ("kotlin.collections.MutableList.flatten", coll_list_flatten),
     ("kotlin.collections.MutableList.unzip", coll_list_unzip),
     ("kotlin.collections.MutableList.containsAll", coll_list_contains_all),
@@ -762,39 +741,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // (entry-typed) and Array.filterNotNull stay on the intrinsic
     // path until the Map.Entry / kotlin.Array surface is shipped
     // as Kotlin too.
-    ("kotlin.collections.Map.forEach", coll_iter_for_each),
-    ("kotlin.collections.MutableMap.forEach", coll_iter_for_each),
-    ("kotlin.collections.Map.map", coll_iter_map),
-    ("kotlin.collections.MutableMap.map", coll_iter_map),
-    ("kotlin.collections.Map.filter", coll_iter_filter),
-    ("kotlin.collections.MutableMap.filter", coll_iter_filter),
-    ("kotlin.collections.List.filterNot", coll_iter_filter_not),
     ("kotlin.Array.filterNotNull", coll_iter_filter_not_null),
-    ("kotlin.collections.MutableList.filterNot", coll_iter_filter_not),
-    ("kotlin.collections.Set.filterNot", coll_iter_filter_not),
-    ("kotlin.collections.MutableSet.filterNot", coll_iter_filter_not),
-    ("kotlin.collections.Map.filterNot", coll_iter_filter_not),
-    ("kotlin.collections.MutableMap.filterNot", coll_iter_filter_not),
-    ("kotlin.collections.Map.any", coll_iter_any),
-    ("kotlin.collections.MutableMap.any", coll_iter_any),
-    ("kotlin.collections.Map.all", coll_iter_all),
-    ("kotlin.collections.MutableMap.all", coll_iter_all),
-    ("kotlin.collections.Map.none", coll_iter_none),
-    ("kotlin.collections.MutableMap.none", coll_iter_none),
-    ("kotlin.collections.List.find", coll_iter_find),
-    ("kotlin.collections.MutableList.find", coll_iter_find),
-    ("kotlin.collections.Set.find", coll_iter_find),
-    ("kotlin.collections.MutableSet.find", coll_iter_find),
-    ("kotlin.collections.List.fold", coll_iter_fold),
-    ("kotlin.collections.MutableList.fold", coll_iter_fold),
-    ("kotlin.collections.Set.fold", coll_iter_fold),
-    ("kotlin.collections.MutableSet.fold", coll_iter_fold),
-    ("kotlin.collections.Map.fold", coll_iter_fold),
-    ("kotlin.collections.MutableMap.fold", coll_iter_fold),
-    ("kotlin.collections.List.reduce", coll_iter_reduce),
-    ("kotlin.collections.MutableList.reduce", coll_iter_reduce),
-    ("kotlin.collections.Set.reduce", coll_iter_reduce),
-    ("kotlin.collections.MutableSet.reduce", coll_iter_reduce),
     ("kotlin.collections.List.sumOf", coll_iter_sum_of),
     ("kotlin.collections.MutableList.sumOf", coll_iter_sum_of),
     ("kotlin.collections.Set.sumOf", coll_iter_sum_of),
@@ -809,26 +756,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.minOfOrNull", coll_iter_min_of_or_null),
     ("kotlin.collections.Set.minOfOrNull", coll_iter_min_of_or_null),
     ("kotlin.collections.Iterable.minOfOrNull", coll_iter_min_of_or_null),
-    ("kotlin.collections.List.takeWhile", coll_iter_take_while),
-    ("kotlin.collections.MutableList.takeWhile", coll_iter_take_while),
-    ("kotlin.collections.Set.takeWhile", coll_iter_take_while),
-    ("kotlin.collections.MutableSet.takeWhile", coll_iter_take_while),
-    ("kotlin.collections.List.dropWhile", coll_iter_drop_while),
-    ("kotlin.collections.MutableList.dropWhile", coll_iter_drop_while),
-    ("kotlin.collections.Set.dropWhile", coll_iter_drop_while),
-    ("kotlin.collections.MutableSet.dropWhile", coll_iter_drop_while),
-    ("kotlin.collections.List.partition", coll_iter_partition),
-    ("kotlin.collections.MutableList.partition", coll_iter_partition),
-    ("kotlin.collections.Set.partition", coll_iter_partition),
-    ("kotlin.collections.MutableSet.partition", coll_iter_partition),
     ("kotlin.collections.List.distinctBy", coll_iter_distinct_by),
     ("kotlin.collections.MutableList.distinctBy", coll_iter_distinct_by),
     ("kotlin.collections.Set.distinctBy", coll_iter_distinct_by),
     ("kotlin.collections.MutableSet.distinctBy", coll_iter_distinct_by),
-    ("kotlin.collections.List.flatMap", coll_iter_flat_map),
-    ("kotlin.collections.MutableList.flatMap", coll_iter_flat_map),
-    ("kotlin.collections.Set.flatMap", coll_iter_flat_map),
-    ("kotlin.collections.MutableSet.flatMap", coll_iter_flat_map),
     ("kotlin.collections.List.groupBy", coll_iter_group_by),
     ("kotlin.collections.MutableList.groupBy", coll_iter_group_by),
     ("kotlin.collections.Set.groupBy", coll_iter_group_by),
@@ -880,26 +811,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.mapNotNull", coll_iter_map_not_null),
     ("kotlin.collections.Set.mapNotNull", coll_iter_map_not_null),
     ("kotlin.collections.MutableSet.mapNotNull", coll_iter_map_not_null),
-    ("kotlin.collections.List.mapIndexed", coll_iter_map_indexed),
-    ("kotlin.collections.MutableList.mapIndexed", coll_iter_map_indexed),
-    ("kotlin.collections.Set.mapIndexed", coll_iter_map_indexed),
-    ("kotlin.collections.MutableSet.mapIndexed", coll_iter_map_indexed),
-    ("kotlin.collections.List.forEachIndexed", coll_iter_for_each_indexed),
-    ("kotlin.collections.MutableList.forEachIndexed", coll_iter_for_each_indexed),
-    ("kotlin.collections.Set.forEachIndexed", coll_iter_for_each_indexed),
-    ("kotlin.collections.MutableSet.forEachIndexed", coll_iter_for_each_indexed),
-    ("kotlin.collections.List.filterIndexed", coll_iter_filter_indexed),
-    ("kotlin.collections.MutableList.filterIndexed", coll_iter_filter_indexed),
-    ("kotlin.collections.Set.filterIndexed", coll_iter_filter_indexed),
-    ("kotlin.collections.MutableSet.filterIndexed", coll_iter_filter_indexed),
-    ("kotlin.collections.Map.filterKeys", map_filter_keys),
-    ("kotlin.collections.MutableMap.filterKeys", map_filter_keys),
-    ("kotlin.collections.Map.filterValues", map_filter_values),
-    ("kotlin.collections.MutableMap.filterValues", map_filter_values),
-    ("kotlin.collections.Map.mapKeys", map_map_keys),
-    ("kotlin.collections.MutableMap.mapKeys", map_map_keys),
-    ("kotlin.collections.Map.mapValues", map_map_values),
-    ("kotlin.collections.MutableMap.mapValues", map_map_values),
     ("kotlin.collections.Map.getOrElse", map_get_or_else),
     ("kotlin.collections.MutableMap.getOrElse", map_get_or_else),
     ("kotlin.collections.MutableMap.getOrPut", map_get_or_put),
@@ -1055,8 +966,6 @@ const PARAM_NAMES: &[(&str, &[&str])] = &[
         "size", "step", "partialWindows", "transform",
     ]),
     ("kotlin.String.chunked", &["size", "transform"]),
-    ("kotlin.String.padEnd", &["length", "padChar"]),
-    ("kotlin.String.padStart", &["length", "padChar"]),
     ("kotlin.String.repeat", &["n"]),
     ("kotlin.String.replace", &["oldValue", "newValue", "ignoreCase"]),
     ("kotlin.String.split", &["delimiters", "ignoreCase", "limit"]),
@@ -1136,50 +1045,6 @@ fn iterable_items(v: &Value, what: &str) -> Result<Vec<Value>, RuntimeError> {
     }
 }
 
-fn coll_iter_for_each(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("forEach expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "forEach")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    for v in items {
-        host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-    }
-    Ok(Value::Unit)
-}
-
-fn coll_iter_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("map expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "map")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::with_capacity(items.len());
-    for v in items {
-        result.push(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?);
-    }
-    Ok(make_list(result, false))
-}
-
-fn coll_iter_filter(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("filter expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "filter")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::new();
-    for v in items {
-        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-        if matches!(r, Value::Bool(true)) {
-            result.push(v);
-        }
-    }
-    Ok(make_list(result, false))
-}
-
 fn coll_iter_filter_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let items = iterable_items(&ctx.args[0], "filterNotNull")?;
     let result: Vec<Value> = items
@@ -1187,88 +1052,6 @@ fn coll_iter_filter_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .filter(|v| !matches!(v, Value::Null))
         .collect();
     Ok(make_list(result, false))
-}
-
-fn coll_iter_any(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let items = iterable_items(&ctx.args[0], "any")?;
-    if ctx.args.len() == 1 {
-        return Ok(Value::Bool(!items.is_empty()));
-    }
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    for v in items {
-        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-            return Ok(Value::Bool(true));
-        }
-    }
-    Ok(Value::Bool(false))
-}
-
-fn coll_iter_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("all expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "all")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    for v in items {
-        if !matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-            return Ok(Value::Bool(false));
-        }
-    }
-    Ok(Value::Bool(true))
-}
-
-fn coll_iter_none(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let items = iterable_items(&ctx.args[0], "none")?;
-    if ctx.args.len() == 1 {
-        return Ok(Value::Bool(items.is_empty()));
-    }
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    for v in items {
-        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-            return Ok(Value::Bool(false));
-        }
-    }
-    Ok(Value::Bool(true))
-}
-
-fn coll_iter_fold(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 3 {
-        return Err(RuntimeError::Arity("fold expects (receiver, initial, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "fold")?;
-    let mut acc = ctx.args[1].clone();
-    let block = ctx.args[2].clone();
-    let CallCtx { out, host, .. } = ctx;
-    for v in items {
-        let lam_args = [acc.clone(), v];
-        acc = host.invoke_callable(&block, &lam_args, *out)?;
-    }
-    Ok(acc)
-}
-
-fn coll_iter_reduce(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("reduce expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "reduce")?;
-    let mut iter = items.into_iter();
-    let Some(mut acc) = iter.next() else {
-        return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Arc::new("kotlin.UnsupportedOperationException".into()),
-            message: Some(Arc::new("Empty collection can't be reduced.".into())),
-            cause: None,
-        }));
-    };
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    for v in iter {
-        let lam_args = [acc.clone(), v];
-        acc = host.invoke_callable(&block, &lam_args, *out)?;
-    }
-    Ok(acc)
 }
 
 fn coll_iter_sum_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -1356,88 +1139,6 @@ fn coll_iter_min_of_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(best.unwrap_or(Value::Null))
 }
 
-fn coll_iter_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let items = iterable_items(&ctx.args[0], "first")?;
-    items
-        .into_iter()
-        .next()
-        .ok_or_else(|| RuntimeError::Type("first on empty collection".into()))
-}
-
-fn coll_iter_first_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let items = iterable_items(&ctx.args[0], "firstOrNull")?;
-    Ok(items.into_iter().next().unwrap_or(Value::Null))
-}
-
-fn coll_iter_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let items = iterable_items(&ctx.args[0], "last")?;
-    items
-        .into_iter()
-        .last()
-        .ok_or_else(|| RuntimeError::Type("last on empty collection".into()))
-}
-
-fn coll_iter_take_while(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("takeWhile expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "takeWhile")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::new();
-    for v in items {
-        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-        if matches!(r, Value::Bool(true)) {
-            result.push(v);
-        } else {
-            break;
-        }
-    }
-    Ok(make_list(result, false))
-}
-
-fn coll_iter_drop_while(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("dropWhile expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "dropWhile")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::new();
-    let mut dropping = true;
-    for v in items {
-        if dropping {
-            let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-            if matches!(r, Value::Bool(true)) {
-                continue;
-            }
-            dropping = false;
-        }
-        result.push(v);
-    }
-    Ok(make_list(result, false))
-}
-
-fn coll_iter_partition(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("partition expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "partition")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut yes = Vec::new();
-    let mut no = Vec::new();
-    for v in items {
-        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-        if matches!(r, Value::Bool(true)) {
-            yes.push(v);
-        } else {
-            no.push(v);
-        }
-    }
-    Ok(Value::Pair(Box::new(make_list(yes, false)), Box::new(make_list(no, false))))
-}
-
 fn coll_iter_distinct_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() != 2 {
         return Err(RuntimeError::Arity("distinctBy expects (receiver, block)".into()));
@@ -1452,29 +1153,6 @@ fn coll_iter_distinct_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         if !keys.iter().any(|k| Value::structural_eq(k, &key)) {
             keys.push(key);
             result.push(v);
-        }
-    }
-    Ok(make_list(result, false))
-}
-
-fn coll_iter_flat_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("flatMap expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "flatMap")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::new();
-    for v in items {
-        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-        match r {
-            Value::List { items, .. } => result.extend(items.borrow().clone()),
-            Value::Set { items, .. } => result.extend(items.borrow().clone()),
-            other => {
-                return Err(RuntimeError::Type(format!(
-                    "flatMap selector must return a List/Set, got {other:?}"
-                )))
-            }
         }
     }
     Ok(make_list(result, false))
@@ -1813,124 +1491,11 @@ fn coll_iter_map_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_list(result, false))
 }
 
-fn coll_iter_map_indexed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("mapIndexed expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "mapIndexed")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::with_capacity(items.len());
-    for (i, v) in items.into_iter().enumerate() {
-        let lam_args = [Value::new_int(i as i64), v];
-        result.push(host.invoke_callable(&block, &lam_args, *out)?);
-    }
-    Ok(make_list(result, false))
-}
-
-fn coll_iter_for_each_indexed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("forEachIndexed expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "forEachIndexed")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    for (i, v) in items.into_iter().enumerate() {
-        let lam_args = [Value::new_int(i as i64), v];
-        host.invoke_callable(&block, &lam_args, *out)?;
-    }
-    Ok(Value::Unit)
-}
-
-fn coll_iter_filter_indexed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("filterIndexed expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "filterIndexed")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::new();
-    for (i, v) in items.into_iter().enumerate() {
-        let lam_args = [Value::new_int(i as i64), v.clone()];
-        let r = host.invoke_callable(&block, &lam_args, *out)?;
-        if matches!(r, Value::Bool(true)) {
-            result.push(v);
-        }
-    }
-    Ok(make_list(result, false))
-}
-
 fn map_entries_clone(v: &Value, what: &str) -> Result<Vec<(Value, Value)>, RuntimeError> {
     match v {
         Value::Map { entries, .. } => Ok(entries.borrow().clone()),
         _ => Err(RuntimeError::Type(format!("{what} requires a Map receiver"))),
     }
-}
-
-fn map_filter_keys(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("filterKeys expects (receiver, block)".into()));
-    }
-    let entries = map_entries_clone(&ctx.args[0], "filterKeys")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::new();
-    for (k, v) in entries {
-        let r = host.invoke_callable(&block, std::slice::from_ref(&k), *out)?;
-        if matches!(r, Value::Bool(true)) {
-            result.push((k, v));
-        }
-    }
-    Ok(make_map(result, false))
-}
-
-fn map_filter_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("filterValues expects (receiver, block)".into()));
-    }
-    let entries = map_entries_clone(&ctx.args[0], "filterValues")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::new();
-    for (k, v) in entries {
-        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-        if matches!(r, Value::Bool(true)) {
-            result.push((k, v));
-        }
-    }
-    Ok(make_map(result, false))
-}
-
-fn map_map_keys(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("mapKeys expects (receiver, block)".into()));
-    }
-    let entries = map_entries_clone(&ctx.args[0], "mapKeys")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::new();
-    for (k, v) in entries {
-        let entry = Value::MapEntry { key: Box::new(k.clone()), value: Box::new(v.clone()) };
-        let new_k = host.invoke_callable(&block, std::slice::from_ref(&entry), *out)?;
-        result.push((new_k, v));
-    }
-    Ok(make_map(result, false))
-}
-
-fn map_map_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("mapValues expects (receiver, block)".into()));
-    }
-    let entries = map_entries_clone(&ctx.args[0], "mapValues")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::new();
-    for (k, v) in entries {
-        let entry = Value::MapEntry { key: Box::new(k.clone()), value: Box::new(v.clone()) };
-        let new_v = host.invoke_callable(&block, std::slice::from_ref(&entry), *out)?;
-        result.push((k, new_v));
-    }
-    Ok(make_map(result, false))
 }
 
 fn map_get_or_else(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -2135,38 +1700,6 @@ fn cmp_compare_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         },
     };
     Ok(Value::new_int(n as i64))
-}
-
-fn coll_iter_find(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("find expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "find")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    for v in items {
-        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-            return Ok(v);
-        }
-    }
-    Ok(Value::Null)
-}
-
-fn coll_iter_filter_not(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("filterNot expects (receiver, block)".into()));
-    }
-    let items = iterable_items(&ctx.args[0], "filterNot")?;
-    let block = ctx.args[1].clone();
-    let CallCtx { out, host, .. } = ctx;
-    let mut result = Vec::new();
-    for v in items {
-        let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-        if matches!(r, Value::Bool(false)) {
-            result.push(v);
-        }
-    }
-    Ok(make_list(result, false))
 }
 
 fn builders_build_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -3166,58 +2699,7 @@ fn string_reversed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::String(Arc::new(s.chars().rev().collect())))
 }
 
-fn string_pad_start(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let (s, target, pad) = string_pad_args(ctx, "padStart")?;
-    let cur = s.chars().count();
-    if cur >= target {
-        return Ok(Value::String(Arc::new((**s).clone())));
-    }
-    let needed = target - cur;
-    let mut out = String::with_capacity(s.len() + needed);
-    for _ in 0..needed {
-        out.push(pad);
-    }
-    out.push_str(s);
-    Ok(Value::String(Arc::new(out)))
-}
-
-fn string_pad_end(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let (s, target, pad) = string_pad_args(ctx, "padEnd")?;
-    let cur = s.chars().count();
-    if cur >= target {
-        return Ok(Value::String(Arc::new((**s).clone())));
-    }
-    let needed = target - cur;
-    let mut out = String::with_capacity(s.len() + needed);
-    out.push_str(s);
-    for _ in 0..needed {
-        out.push(pad);
-    }
-    Ok(Value::String(Arc::new(out)))
-}
-
 #[allow(clippy::type_complexity)]
-fn string_pad_args<'a>(
-    ctx: &'a CallCtx<'_>,
-    what: &str,
-) -> Result<(&'a Arc<String>, usize, char), RuntimeError> {
-    let s = recv_string(ctx.args, what)?;
-    let target = match ctx.args.get(1) {
-        Some(Value::Int(n)) if *n >= 0 => *n as usize,
-        _ => return Err(RuntimeError::Type(format!("{what} requires non-negative Int length"))),
-    };
-    let pad = match ctx.args.get(2) {
-        None => ' ',
-        Some(Value::Char(c)) => *c,
-        Some(other) => {
-            return Err(RuntimeError::Type(format!(
-                "{what} pad must be a Char, got {other:?}"
-            )))
-        }
-    };
-    Ok((s, target, pad))
-}
-
 fn string_compare_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.compareTo")?;
     let Some(Value::String(other)) = ctx.args.get(1) else {
@@ -4356,57 +3838,6 @@ fn coll_list_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     Ok(borrow[i as usize].clone())
 }
-fn coll_list_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() >= 2 {
-        let items = iterable_items(&ctx.args[0], "first")?;
-        let block = ctx.args[1].clone();
-        let CallCtx { out, host, .. } = ctx;
-        for v in items {
-            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-                return Ok(v);
-            }
-        }
-        return Err(RuntimeError::Thrown(Value::Exception {
-            fqn: Arc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Arc::new("Collection contains no element matching the predicate.".into())),
-            cause: None,
-        }));
-    }
-    let it = recv_list_items(ctx.args, "List.first")?;
-    it.borrow().first().cloned().ok_or_else(|| {
-        RuntimeError::Thrown(Value::Exception {
-            fqn: Arc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Arc::new("List is empty.".into())),
-            cause: None,
-        })
-    })
-}
-fn coll_list_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() >= 2 {
-        let items = iterable_items(&ctx.args[0], "last")?;
-        let block = ctx.args[1].clone();
-        let CallCtx { out, host, .. } = ctx;
-        let mut found: Option<Value> = None;
-        for v in items {
-            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-                found = Some(v);
-            }
-        }
-        return found.ok_or_else(|| RuntimeError::Thrown(Value::Exception {
-            fqn: Arc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Arc::new("Collection contains no element matching the predicate.".into())),
-            cause: None,
-        }));
-    }
-    let it = recv_list_items(ctx.args, "List.last")?;
-    it.borrow().last().cloned().ok_or_else(|| {
-        RuntimeError::Thrown(Value::Exception {
-            fqn: Arc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Arc::new("List is empty.".into())),
-            cause: None,
-        })
-    })
-}
 fn coll_list_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.contains")?;
     let Some(needle) = ctx.args.get(1) else {
@@ -5408,20 +4839,6 @@ fn list_take_count(ctx: &CallCtx<'_>, what: &str) -> Result<i64, RuntimeError> {
     Ok(n)
 }
 
-fn coll_list_take(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let it = recv_list_items(ctx.args, "List.take")?;
-    let n = list_take_count(ctx, "take")? as usize;
-    let borrow = it.borrow();
-    let end = n.min(borrow.len());
-    Ok(make_list(borrow[..end].to_vec(), false))
-}
-fn coll_list_drop(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let it = recv_list_items(ctx.args, "List.drop")?;
-    let n = list_take_count(ctx, "drop")? as usize;
-    let borrow = it.borrow();
-    let start = n.min(borrow.len());
-    Ok(make_list(borrow[start..].to_vec(), false))
-}
 fn coll_list_take_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.takeLast")?;
     let n = list_take_count(ctx, "takeLast")? as usize;
@@ -7003,58 +6420,6 @@ fn int_to_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 // Additional List ops
 // ============================================================
 
-fn coll_list_first_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() >= 2 {
-        let items = iterable_items(&ctx.args[0], "firstOrNull")?;
-        let block = ctx.args[1].clone();
-        let CallCtx { out, host, .. } = ctx;
-        for v in items {
-            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-                return Ok(v);
-            }
-        }
-        return Ok(Value::Null);
-    }
-    let it = recv_list_items(ctx.args, "List.firstOrNull")?;
-    Ok(it.borrow().first().cloned().unwrap_or(Value::Null))
-}
-fn coll_list_last_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() >= 2 {
-        let items = iterable_items(&ctx.args[0], "lastOrNull")?;
-        let block = ctx.args[1].clone();
-        let CallCtx { out, host, .. } = ctx;
-        let mut found: Option<Value> = None;
-        for v in items {
-            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-                found = Some(v);
-            }
-        }
-        return Ok(found.unwrap_or(Value::Null));
-    }
-    let it = recv_list_items(ctx.args, "List.lastOrNull")?;
-    Ok(it.borrow().last().cloned().unwrap_or(Value::Null))
-}
-fn coll_list_single(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let it = recv_list_items(ctx.args, "List.single")?;
-    let b = it.borrow();
-    match b.len() {
-        0 => Err(RuntimeError::Thrown(make_exception(
-            "kotlin.NoSuchElementException",
-            Some("List is empty.".into()),
-        ))),
-        1 => Ok(b[0].clone()),
-        _ => Err(RuntimeError::Thrown(make_exception(
-            "kotlin.IllegalArgumentException",
-            Some("List has more than one element.".into()),
-        ))),
-    }
-}
-fn coll_list_single_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let it = recv_list_items(ctx.args, "List.singleOrNull")?;
-    let b = it.borrow();
-    Ok(if b.len() == 1 { b[0].clone() } else { Value::Null })
-}
-
 fn coll_list_flatten(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.flatten")?;
     let mut out: Vec<Value> = Vec::new();
@@ -7120,23 +6485,6 @@ fn coll_list_to_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn coll_list_to_mutable_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.toMutableSet")?;
     Ok(make_set(it.borrow().clone(), true))
-}
-
-fn coll_list_count_no_pred(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() >= 2 {
-        let items = iterable_items(&ctx.args[0], "count")?;
-        let block = ctx.args[1].clone();
-        let CallCtx { out, host, .. } = ctx;
-        let mut n = 0i64;
-        for v in items {
-            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-                n += 1;
-            }
-        }
-        return Ok(Value::new_int(n));
-    }
-    let it = recv_list_items(ctx.args, "List.count")?;
-    Ok(Value::new_int(it.borrow().len()))
 }
 
 fn coll_list_with_index(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -7283,23 +6631,6 @@ fn coll_set_with_index(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .map(|(i, v)| Value::Pair(Box::new(Value::new_int(i)), Box::new(v.clone())))
         .collect();
     Ok(make_list(indexed, false))
-}
-
-fn coll_set_count_no_pred(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() >= 2 {
-        let items = iterable_items(&ctx.args[0], "count")?;
-        let block = ctx.args[1].clone();
-        let CallCtx { out, host, .. } = ctx;
-        let mut n = 0i64;
-        for v in items {
-            if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-                n += 1;
-            }
-        }
-        return Ok(Value::new_int(n));
-    }
-    let it = recv_set_items(ctx.args, "Set.count")?;
-    Ok(Value::new_int(it.borrow().len()))
 }
 
 fn coll_mut_set_add_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -8990,21 +8321,6 @@ mod tests {
         assert_eq!(*before, "a");
         let Ok(Value::String(after)) = call(string_substring_after_last, &[s, Value::String(Arc::new(".".into()))]) else { panic!() };
         assert_eq!(*after, "c");
-    }
-
-    #[test]
-    fn list_first_or_null_handles_empty() {
-        let empty = make_list(Vec::new(), false);
-        assert!(matches!(call(coll_list_first_or_null, &[empty]), Ok(Value::Null)));
-        let one = make_list(vec![Value::Int(7)], false);
-        assert!(matches!(call(coll_list_first_or_null, &[one]), Ok(Value::Int(7))));
-    }
-
-    #[test]
-    fn list_single_throws_when_multi() {
-        let multi = make_list(vec![Value::Int(1), Value::Int(2)], false);
-        let err = call(coll_list_single, &[multi]).unwrap_err();
-        assert!(matches!(err, RuntimeError::Thrown(_)));
     }
 
     #[test]

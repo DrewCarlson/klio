@@ -433,7 +433,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     self.parse_companion_object_as_class(flags.visibility, flags.annotations)
                         .map(Decl::Class)
                 } else {
-                    self.parse_object(flags.is_data, flags.is_expect, flags.is_actual)
+                    self.parse_object(flags.is_data, flags.is_expect, flags.is_actual, flags.visibility)
                         .map(Decl::Object)
                 }
             }
@@ -1061,6 +1061,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         is_data: bool,
         is_expect: bool,
         is_actual: bool,
+        visibility: Visibility,
     ) -> Option<ObjectDecl> {
         let kw = self.bump(); // `object`
         let name = self.parse_ident("object name")?;
@@ -1075,6 +1076,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             is_data,
             is_expect,
             is_actual,
+            visibility,
             span: kw.span.join(end),
         })
     }
@@ -2742,7 +2744,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 // and falls through to expression parsing.
                 let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
                 if matches!(next, Some(TokenKind::Ident)) {
-                    self.parse_object(flags.is_data, flags.is_expect, flags.is_actual)
+                    self.parse_object(flags.is_data, flags.is_expect, flags.is_actual, flags.visibility)
                         .map(|o| Stmt::Decl(Decl::Object(o)))
                 } else {
                     // Roll back modifiers so the expression parser sees

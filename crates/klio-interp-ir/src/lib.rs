@@ -945,8 +945,18 @@ impl<'a> VmHost<'a> {
             _ => &[],
         };
         let nm_simple = nm.rsplit('.').next().unwrap_or(nm);
-        if builtin_supers.contains(&nm) || builtin_supers.contains(&nm_simple) {
-            return Some(55);
+        // Position in the supers list = distance from the runtime
+        // type. Closer (lower index) outranks further (higher index)
+        // so an exact-class match wins, then the immediate supertype,
+        // then progressively further ones. Without this graduation a
+        // call like `mutableList.last()` scores `Iterable.last` and
+        // `List.last` identically (both 55) and the first-registered
+        // candidate wins — which lets a generic shim recurse on its
+        // own smart-cast-narrowed `this.last()` call.
+        if let Some(pos) =
+            builtin_supers.iter().position(|s| *s == nm || *s == nm_simple)
+        {
+            return Some(75 - (pos as i32).min(20));
         }
         // Generic single-letter type-parameter — accept any.
         if nm.len() <= 2 && nm.chars().all(|c| c.is_ascii_uppercase()) {
@@ -1121,13 +1131,6 @@ impl<'a> VmHost<'a> {
             return None;
         }
         let candidates: Vec<klio_ir::FuncId> = candidates.to_vec();
-        // Seed the search with the lowering's chosen candidate so a
-        // strictly better runtime match can still win, but ties keep
-        // the call site's FQN-aware resolution intact. Without this,
-        // two same-simple-name functions in different packages
-        // collapsed to "first in func_index wins" regardless of which
-        // FuncId the IR emitted — silently flipping the dispatch
-        // away from the explicitly-imported declaration.
         let seed = self.overload_score(module, func, args).map(|s| (func, s));
         let mut best: Option<(klio_ir::FuncId, i32)> = seed;
         let seed_func = func;
@@ -1271,6 +1274,32 @@ impl<'a> VmHost<'a> {
             })
             .filter(|(_fid, f)| !f.params.is_empty())
             .collect();
+        // Receiver-type filter: drop candidates whose declared
+        // receiver type can't accept the actual receiver. If every
+        // candidate is filtered AND a type-prefixed intrinsic for
+        // this receiver exists, return None so the caller falls
+        // through to the intrinsic probe path. Otherwise (no class-
+        // specific intrinsic — typical of an implicit / Unit
+        // receiver dispatch) keep the original set so existing
+        // resolution shapes are unchanged.
+        let any_compat = candidates
+            .iter()
+            .any(|(_, f)| receiver_compatible_with_param(receiver, &f.params[0].ty));
+        let candidates: Vec<(klio_ir::FuncId, klio_ir::Func)> = if any_compat {
+            candidates
+                .into_iter()
+                .filter(|(_, f)| {
+                    receiver_compatible_with_param(receiver, &f.params[0].ty)
+                })
+                .collect()
+        } else {
+            let type_fqn = receiver.type_fqn();
+            let intrinsic_probe = format!("{type_fqn}.{name}");
+            if self.lookup_intrinsic(&intrinsic_probe).is_some() {
+                return None;
+            }
+            candidates
+        };
         if candidates.len() <= 1 {
             return candidates.into_iter().next().map(|(fid, _)| fid);
         }
@@ -1631,22 +1660,25 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         // User-declared top-level function: surface its body via
         // a synthetic Function value so calls like `val f = ::name;
-        // f(args)` route through Vm::call_value.
+        // f(args)` route through Vm::call_value. Skip bodyless
+        // `expect` declarations — their `actual` lives in the host's
+        // intrinsic table and the implicit-alias / direct-probe path
+        // below resolves it.
         if let Some(fid) = self.module.func_id(name) {
-            // Wrap the FuncId in a closure with no captures so the
-            // Vm's CallValue path dispatches through eval_with.
             let func = self.module.funcs.get(fid.0 as usize).cloned()?;
-            let n_params = func.params.len();
-            let id = self.closures.push(ClosureInfo {
-                body_func: fid,
-                n_params,
-                capture_names: Vec::new(),
-                captures: klio_runtime::ObjRef::new(Vec::new()),
-            });
-            return Some(klio_runtime::Value::IrClosure {
-                id,
-                captures: Arc::new(Vec::new()),
-            });
+            if !func.blocks.is_empty() {
+                let n_params = func.params.len();
+                let id = self.closures.push(ClosureInfo {
+                    body_func: fid,
+                    n_params,
+                    capture_names: Vec::new(),
+                    captures: klio_runtime::ObjRef::new(Vec::new()),
+                });
+                return Some(klio_runtime::Value::IrClosure {
+                    id,
+                    captures: Arc::new(Vec::new()),
+                });
+            }
         }
         // Probe stdlib by FQN for known package surfaces. Covers
         // bare references to `IntArray`, `compareBy`, `buildList`,
@@ -4583,7 +4615,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             return false;
         }
         let nominal = value.type_fqn();
-        nominal == ty.name || nominal.ends_with(&format!(".{}", ty.name))
+        if nominal == ty.name || nominal.ends_with(&format!(".{}", ty.name)) {
+            return true;
+        }
+        // Builtin runtime types satisfy their nominal supertypes.
+        value.is_runtime_type(&ty.name)
     }
 
     fn call_func(
@@ -4605,6 +4641,44 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let Some(intrinsic) = self.prog.installed_bindings.resolve(&f.fqn) {
             let v = self.dispatch_intrinsic(intrinsic, &args)?;
             return Ok(v);
+        }
+        // Bodyless `expect` decl: redirect to a same-name same-arity
+        // sibling with a body. Source files are lowered in order, so
+        // an actual declared in a later-loaded file isn't available
+        // when the expect's caller is lowered; the caller's
+        // `Inst::Call` was baked to the expect's FuncId.
+        if f.blocks.is_empty() {
+            let want = args.len();
+            let cands: Vec<klio_ir::FuncId> = module
+                .funcs_by_simple_name(&f.name)
+                .to_vec();
+            for cand in &cands {
+                if *cand == func {
+                    continue;
+                }
+                if let Some(g) = module.funcs.get(cand.0 as usize) {
+                    if g.blocks.is_empty() {
+                        continue;
+                    }
+                    let g_params = g.params.len();
+                    let g_user_params = if g
+                        .params
+                        .first()
+                        .map_or(false, |p| p.name == "this")
+                    {
+                        g_params - 1
+                    } else {
+                        g_params
+                    };
+                    if g_user_params != want
+                        && !g.params.last().map_or(false, |p| p.is_vararg)
+                    {
+                        continue;
+                    }
+                    let new_args = args.clone();
+                    return self.call_func(module, *cand, new_args);
+                }
+            }
         }
         // Pad missing positional args with each param's default
         // value (from the registered default-init thunks).
@@ -5235,6 +5309,46 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let probe_fqn = format!("{}.{}", cls.fqn, name);
             if let Some(func) = self.lookup_intrinsic(&probe_fqn) {
                 return self.dispatch_intrinsic(func, args);
+            }
+        }
+        // `List<T>.optimizeReadOnlyList()` — an internal upstream
+        // helper that collapses 0/1-element ArrayLists into the
+        // shared `EmptyList` / `listOf(single)` singletons. klio's
+        // runtime lists are uniform, so the helper is a no-op:
+        // return the receiver unchanged.
+        if name == "optimizeReadOnlyList" && args.is_empty() {
+            if matches!(receiver, klio_runtime::Value::List { .. }) {
+                return Ok(receiver.clone());
+            }
+        }
+        // `listIterator(index)` and `listIterator()` on a List: a
+        // ListIterator starting from the given position. klio's
+        // runtime models it with the same `Value::Iterator` shape as
+        // a plain iterator — the upstream stdlib bodies only use
+        // `hasNext`/`next` on the result.
+        if name == "listIterator" && args.len() <= 1 {
+            if let klio_runtime::Value::List { items, .. } = receiver {
+                let start = match args.first() {
+                    Some(klio_runtime::Value::Int(n)) => *n as usize,
+                    Some(klio_runtime::Value::Long(n)) => *n as usize,
+                    None => 0,
+                    _ => 0,
+                };
+                let items_clone: Vec<klio_runtime::Value> =
+                    items.borrow().clone();
+                return Ok(klio_runtime::Value::Iterator {
+                    items: klio_runtime::ObjRef::new(items_clone),
+                    pos: klio_runtime::ObjRef::new(start),
+                    prim: None,
+                });
+            }
+        }
+        // `for (x in someIterator)` lowers as `someIterator.iterator()`
+        // → the iterator itself (matches Kotlin's `Iterator: Iterable`
+        // / self-iterator convention upstream stdlib relies on).
+        if name == "iterator" && args.is_empty() {
+            if matches!(receiver, klio_runtime::Value::Iterator { .. }) {
+                return Ok(receiver.clone());
             }
         }
         // Built-in iterator protocol for collections + ranges. The
@@ -6901,6 +7015,25 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                 })
                 .collect();
+            // Receiver-type filter (call_member fallback): when at
+            // least one candidate's declared receiver type accepts
+            // the actual receiver, keep only those.
+            let any_compat = candidates.iter().any(|(_, f)| {
+                receiver_compatible_with_param(receiver, &f.params[0].ty)
+            });
+            let candidates: Vec<(klio_ir::FuncId, klio_ir::Func)> = if any_compat {
+                candidates
+                    .into_iter()
+                    .filter(|(_, f)| {
+                        receiver_compatible_with_param(
+                            receiver,
+                            &f.params[0].ty,
+                        )
+                    })
+                    .collect()
+            } else {
+                candidates
+            };
             let unique_exact: Option<(klio_ir::FuncId, klio_ir::Func)> = {
                 // Kotlin disambiguates same-named extensions by
                 // applicable arity first. When exactly one candidate's
@@ -8638,6 +8771,31 @@ impl<'a> VmHost<'a> {
 /// builtin satisfies (`Any`, `CharSequence`, `Comparable`, …), or a
 /// bare type parameter. Such a receiver can never be a builtin
 /// value, so the extension is definitively inapplicable to one.
+/// Permissive receiver/param-type compatibility used by extension
+/// overload pickers. Returns false only when the runtime value
+/// (built-in: List, Map, Result, String, …) provably does not satisfy
+/// the parameter's nominal type. Instances and unconstrained / Any /
+/// function-typed / generic parameters always pass — the per-candidate
+/// scorer decides among compatible candidates.
+fn receiver_compatible_with_param(
+    receiver: &klio_runtime::Value,
+    param_ty: &klio_ir::TypeRef,
+) -> bool {
+    if matches!(receiver, klio_runtime::Value::Instance(_)) {
+        return true;
+    }
+    let pn = param_ty.name.as_str();
+    let pn_simple = pn.rsplit('.').next().unwrap_or(pn);
+    if matches!(pn_simple, "Any" | "Any?" | "Unit")
+        || pn_simple.starts_with("Function")
+        || (pn_simple.len() <= 2
+            && pn_simple.chars().all(|c| c.is_ascii_uppercase()))
+    {
+        return true;
+    }
+    receiver.is_runtime_type(pn_simple)
+}
+
 fn ext_decl_recv_is_user_class(ty_name: &str) -> bool {
     let s = ty_name.rsplit('.').next().unwrap_or(ty_name);
     if s.is_empty() {

@@ -184,6 +184,20 @@ enum DiagFormat {
 }
 
 fn main() -> ExitCode {
+    // Run the CLI on a worker thread with a 64 MiB stack so the IR
+    // interpreter's recursion (each Kotlin call frame adds several
+    // Rust frames) has plenty of headroom; the default 8 MiB main
+    // stack on macOS isn't enough for upstream stdlib bodies with
+    // nested `is`-checks and inline expansions.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(main_inner)
+        .expect("spawn worker")
+        .join()
+        .unwrap_or(ExitCode::FAILURE)
+}
+
+fn main_inner() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Lex { file } => run_lex(&file),
@@ -1007,15 +1021,30 @@ fn load_embedded_stdlib_sources(
     // declares.
     let mut parsed: Vec<(String, klio_ast::KotlinFile)> = Vec::with_capacity(bundle.files.len());
     for sf in &bundle.files {
+        if std::env::var_os("KLIO_PACK_DIAG").is_some()
+            && (sf.rel_path.contains("Maps.kt") || sf.rel_path.contains("Sets.kt"))
+        {
+            eprintln!("[embed source] {}", sf.rel_path);
+        }
         let text = String::from_utf8_lossy(&sf.bytes).into_owned();
         let fid = source_map.add(&sf.rel_path, text);
         let src = source_map.get(fid).source.clone();
         let lexed = klio_lexer::Lexer::new(fid, &src).tokenize();
         if lexed.diagnostics.has_errors() {
+            if std::env::var_os("KLIO_PACK_DIAG").is_some() {
+                eprintln!("[embed lex err] {}: {} diags", sf.rel_path,
+                    lexed.diagnostics.diagnostics().len());
+            }
             continue;
         }
         let (ast, diags) = klio_parser::Parser::new(fid, &src, &lexed.tokens).parse_file();
         if diags.has_errors() {
+            if std::env::var_os("KLIO_PACK_DIAG").is_some() {
+                for d in diags.diagnostics() {
+                    eprintln!("[embed parse err] {}:{:?}: {}", sf.rel_path,
+                        d.primary.span, d.message);
+                }
+            }
             continue;
         }
         let pkg = ast

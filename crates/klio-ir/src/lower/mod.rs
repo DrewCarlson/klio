@@ -11,7 +11,7 @@
 use klio_ast::{BinOp as AstBinOp, Block as AstBlock, Expr, Stmt, UnOp as AstUnOp};
 
 use crate::build::FuncBuilder;
-use crate::{BinOp, BlockId, Const, Inst, Reg, Terminator, UnOp};
+use crate::{BinOp, BlockId, Const, Func, FuncId, Inst, Reg, Terminator, UnOp};
 
 mod ast_scan;
 mod for_loop;
@@ -2508,8 +2508,112 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             return dst;
                         }
                     }
+                    // Arity-aware bare-call lookup. The legacy
+                    // `Module::func_id` returns the first user-FQN or
+                    // first overall — when multiple same-named
+                    // overloads exist (e.g. `CharSequence.maxOf(selector)`
+                    // and the top-level `kotlin.comparisons.maxOf(a, b)`)
+                    // it can return one whose arity doesn't fit the
+                    // call. Prefer a candidate that matches arity.
+                    let want = args.len();
+                    let cands: Vec<FuncId> = b
+                        .module
+                        .funcs_by_simple_name(&segments[0].name)
+                        .to_vec();
+                    let user_params = |f: &Func| {
+                        if f.params.first().map_or(false, |p| p.name == "this") {
+                            f.params.len() - 1
+                        } else {
+                            f.params.len()
+                        }
+                    };
+                    let arity_match = |fid: &FuncId| -> bool {
+                        b.module
+                            .funcs
+                            .get(fid.0 as usize)
+                            .map_or(false, |f| {
+                                // A bodyless `expect` decl can't be
+                                // called directly — its actual lives
+                                // in the host's intrinsic table.
+                                // Skip it so the binding falls through
+                                // to the implicit-alias / global
+                                // path that resolves the actual.
+                                !f.blocks.is_empty() && user_params(f) == want
+                            })
+                    };
+                    let non_ext = |fid: &FuncId| {
+                        b.module
+                            .funcs
+                            .get(fid.0 as usize)
+                            .map_or(false, |f| {
+                                f.params
+                                    .first()
+                                    .map(|p| p.name != "this")
+                                    .unwrap_or(true)
+                            })
+                    };
+                    // Names known to be backed by an intrinsic /
+                    // implicit-alias (kotlin.* top-level). When no
+                    // arity-matching IR func exists for these, decline
+                    // the bind so the call routes through the global
+                    // intrinsic path that the interp host populates.
+                    // Mirrors a subset of `klio_stdlib::IMPLICIT_ALIASES`;
+                    // klio-ir can't depend on klio-stdlib so the list
+                    // is duplicated here.
+                    let name_is_alias = matches!(
+                        segments[0].name.as_str(),
+                        "maxOf"
+                            | "minOf"
+                            | "max"
+                            | "min"
+                            | "print"
+                            | "println"
+                            | "listOf"
+                            | "mutableListOf"
+                            | "arrayListOf"
+                            | "setOf"
+                            | "mutableSetOf"
+                            | "hashSetOf"
+                            | "linkedSetOf"
+                            | "mapOf"
+                            | "mutableMapOf"
+                            | "hashMapOf"
+                            | "linkedMapOf"
+                            | "arrayOf"
+                            | "emptyList"
+                            | "emptySet"
+                            | "emptyMap"
+                            | "listOfNotNull"
+                            | "setOfNotNull"
+                            | "buildList"
+                            | "buildSet"
+                            | "buildMap"
+                            | "buildString"
+                            | "TODO"
+                            | "error"
+                            | "compareValues"
+                            | "compareValuesBy"
+                            | "compareBy"
+                            | "compareByDescending"
+                            | "naturalOrder"
+                            | "reverseOrder"
+                    );
+                    let bare_func_id: Option<FuncId> = cands
+                        .iter()
+                        .find(|fid| non_ext(fid) && arity_match(fid))
+                        .copied()
+                        .or_else(|| {
+                            cands.iter().find(|fid| !non_ext(fid) && arity_match(fid)).copied()
+                        })
+                        .or_else(|| {
+                            if name_is_alias {
+                                None
+                            } else {
+                                b.module.func_id(&segments[0].name)
+                            }
+                        });
                     if let Some(func_id) =
-                        b.module.func_id(&segments[0].name).filter(|_| !shadowed_by_class)
+                        bare_func_id.filter(|_| !shadowed_by_class)
                     {
                         // Extension fn called by its bare name from inside
                         // a receiver-typed scope: prepend the active
@@ -2951,14 +3055,18 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // Built-in stdlib companion shortcuts: `Result.success(x)`,
             // `Result.failure(e)`, etc. The callee parses as
             // Member { Path("Result"), "success" }; rewrite to a
-            // direct stdlib FQN dispatch since `Result` isn't a
-            // value in the runtime globals.
+            // direct stdlib FQN dispatch. The class_id check is
+            // intentionally omitted for these specific names — once
+            // upstream `kotlin/util/Result.kt` is shipped, klio's
+            // class table contains a `Result` entry and the shortcut
+            // would otherwise be skipped, causing the call to fall
+            // through to a member-dispatch path that doesn't know
+            // about the Companion.
             if let Expr::Member { receiver: recv_box, name: mname, .. } = callee.as_ref() {
                 if let Expr::Path { segments, .. } = recv_box.as_ref() {
                     if segments.len() == 1
                         && b.resolve(&segments[0].name).is_none()
                         && !b.knows_outer(&segments[0].name)
-                        && b.module.class_id(&segments[0].name).is_none()
                     {
                         let head = &segments[0].name;
                         let companion_fqns: &[(&str, &str, &str)] = &[
@@ -3017,7 +3125,52 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             && b.module.class_id(head).is_none()
                             && (head_is_real_pkg || b.resolve("this").is_none())
                         {
-                            if let Some(func_id) = b.module.func_id(tail) {
+                            // Arity-aware lookup for FQN-flatten calls:
+                            // `kotlin.math.max(3, 9)` must bind to the
+                            // 2-arg `max` (`kotlin.comparisons.max` /
+                            // `kotlin.math.max`), not the 1-param
+                            // `CharSequence.max()` from `_Strings.kt`.
+                            // Prefer an FQN match, then arity-matched
+                            // non-extension, then any FQN match.
+                            let want = args.len();
+                            let prefix = &fqn;
+                            let cands: Vec<FuncId> = b
+                                .module
+                                .funcs_by_simple_name(tail)
+                                .to_vec();
+                            let pick = cands
+                                .iter()
+                                .find(|fid| {
+                                    let f = match b
+                                        .module
+                                        .funcs
+                                        .get(fid.0 as usize)
+                                    {
+                                        Some(f) => f,
+                                        None => return false,
+                                    };
+                                    f.fqn == *prefix && f.params.len() == want
+                                })
+                                .or_else(|| {
+                                    cands.iter().find(|fid| {
+                                        let f = match b
+                                            .module
+                                            .funcs
+                                            .get(fid.0 as usize)
+                                        {
+                                            Some(f) => f,
+                                            None => return false,
+                                        };
+                                        let first_is_this = f
+                                            .params
+                                            .first()
+                                            .map(|p| p.name == "this")
+                                            .unwrap_or(false);
+                                        !first_is_this && f.params.len() == want
+                                    })
+                                })
+                                .copied();
+                            if let Some(func_id) = pick {
                                 let (args_start, n_args) = lower_arg_run(b, args);
                                 let arg_names =
                                     intern_arg_names(b.module, ast_arg_names);
@@ -3210,6 +3363,82 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                 });
                                 return dst;
                             }
+                        }
+                    }
+                    // Statically rebind `(e as T).f(args)` to the `f`
+                    // overload whose first-param type is `T`. Upstream
+                    // bodies (`String.padStart` → `(this as CharSequence).
+                    // padStart(...).toString()`) rely on JVM-style
+                    // static-receiver dispatch; klio dispatches by
+                    // the runtime value's type, so without this the
+                    // call rebinds to the `String` overload and
+                    // recurses. Only fires for non-safe `as`-casts —
+                    // safe `as?` semantics need a null branch.
+                    if let Expr::As { ty: cast_ty, safe: false, .. } =
+                        receiver.as_ref()
+                    {
+                        let want_user = args.len();
+                        let chosen = b
+                            .module
+                            .funcs_by_simple_name(&name.name)
+                            .iter()
+                            .filter_map(|fid| {
+                                let f = b.module.funcs.get(fid.0 as usize)?;
+                                if f.blocks.is_empty() {
+                                    return None;
+                                }
+                                let p0 = f.params.first()?;
+                                if p0.name != "this" || p0.ty.name != cast_ty.name.name {
+                                    return None;
+                                }
+                                let user = f.params.len() - 1;
+                                let arity_ok = user == want_user
+                                    || (want_user < user
+                                        && f.params[(1 + want_user)..]
+                                            .iter()
+                                            .all(|p| p.default.is_some() || p.is_vararg))
+                                    || (want_user > user
+                                        && f.params
+                                            .last()
+                                            .map_or(false, |p| p.is_vararg));
+                                if arity_ok { Some(*fid) } else { None }
+                            })
+                            .next();
+                        if let Some(func_id) = chosen {
+                            // Build a contiguous arg run: receiver at
+                            // slot 0, user args following. lower the
+                            // receiver expression (the `as`-cast is a
+                            // no-op on klio runtime values, but the
+                            // emitted `Inst::Cast` keeps the schema
+                            // honest), then lower each user arg.
+                            let recv_reg = lower_receiver(b, receiver);
+                            let mut arg_regs: Vec<Reg> =
+                                Vec::with_capacity(args.len() + 1);
+                            arg_regs.push(recv_reg);
+                            for a in args {
+                                arg_regs.push(lower_expr(b, a));
+                            }
+                            let n = arg_regs.len() as u8;
+                            let start = b.alloc_reg();
+                            b.push(Inst::Move { dst: start, src: arg_regs[0] });
+                            for r in &arg_regs[1..] {
+                                let slot = b.alloc_reg();
+                                b.push(Inst::Move { dst: slot, src: *r });
+                            }
+                            let arg_names =
+                                intern_arg_names(b.module, ast_arg_names);
+                            let type_args =
+                                intern_type_args(b.module, ast_type_args);
+                            let dst = b.alloc_reg();
+                            b.push(Inst::Call {
+                                dst,
+                                func: func_id,
+                                args: start,
+                                n_args: n,
+                                arg_names,
+                                type_args,
+                            });
+                            return dst;
                         }
                     }
                     let recv = lower_receiver(b, receiver);
