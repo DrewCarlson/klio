@@ -455,7 +455,7 @@ pub enum EvalError {
     Unsupported(&'static str),
     #[error("IR type error: {0}")]
     Type(String),
-    #[error("uncaught throw inside IR evaluator")]
+    #[error("uncaught throw inside IR evaluator: {0:?}")]
     Throw(Value),
     /// `return` from a nested lambda whose target is an
     /// enclosing IR function frame. `eval_with` catches this at
