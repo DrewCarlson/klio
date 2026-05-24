@@ -2107,29 +2107,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         if let Some(lam) = b.inline_lambda_for(nm) {
                             return splice_inline_lambda(b, &lam, args);
                         }
-                        // Upstream `suspendCoroutineUninterceptedOrReturn(block)`
-                        // ships with a body that throws NotImplementedError
-                        // (compiler-intrinsic placeholder). Substitute the
-                        // call with a direct invocation of `block` —
-                        // klio's runtime treats a returned
-                        // COROUTINE_SUSPENDED sentinel as the suspend
-                        // request and any other value as the immediate
-                        // resume value.
-                        if nm == "suspendCoroutineUninterceptedOrReturn"
-                            && args.len() == 1
-                        {
-                            return lower_expr(
-                                b,
-                                &Expr::Call {
-                                    callee: Box::new(args[0].clone()),
-                                    args: Vec::new(),
-                                    arg_names: Vec::new(),
-                                    type_args: Vec::new(),
-                                    is_infix: false,
-                                    span: expr_span(callee.as_ref()),
-                                },
-                            );
-                        }
                         if let Some(f) = inline_fn_ast(nm) {
                             // Inline a suspending builder (continuation
                             // capture), an inline fn whose lambda arg
