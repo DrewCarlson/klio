@@ -188,21 +188,48 @@ fn lift_class_recursive(
         std::collections::HashSet<String>,
     >,
     enclosing_class: &mut std::collections::HashMap<String, String>,
+    nested_object_aliases: &mut std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    >,
 ) {
     for m in &c.members {
         if let Decl::Object(co) = m {
             // Nested `object Foo { … }` inside a class. Lift as
-            // a standalone singleton class — `Outer.Foo` reads
-            // resolve the global by the bare name.
-            object_names.push(co.name.name.clone());
-            enclosing_class.insert(co.name.name.clone(), c.name.name.clone());
+            // a standalone singleton class. When the source marked
+            // it `private`, rename the lifted class to `Outer$Foo`
+            // so a same-named user top-level declaration can
+            // coexist; record an alias so the outer's method
+            // bodies still resolve bare `Foo`.
+            let is_private = matches!(co.visibility, klio_ast::Visibility::Private);
+            let (lifted_name, alias_simple) = if is_private {
+                let renamed = format!("{}${}", c.name.name, co.name.name);
+                (renamed, Some(co.name.name.clone()))
+            } else {
+                (co.name.name.clone(), None)
+            };
+            object_names.push(lifted_name.clone());
+            enclosing_class.insert(lifted_name.clone(), c.name.name.clone());
             let mut extras: std::collections::HashSet<String> =
                 collect_enclosing_member_names(c);
             for outer_c in enclosing_chain.iter().rev() {
                 extras.extend(collect_enclosing_member_names(outer_c));
             }
-            nested_outer_members.insert(co.name.name.clone(), extras);
-            out_decls.push(Decl::Class(synthesize_class_from_object(co)));
+            nested_outer_members.insert(lifted_name.clone(), extras);
+            if let Some(simple) = alias_simple {
+                nested_object_aliases
+                    .entry(c.name.name.clone())
+                    .or_default()
+                    .insert(simple, lifted_name.clone());
+            }
+            let mut synth = synthesize_class_from_object(co);
+            if is_private {
+                synth.name = klio_ast::Ident {
+                    name: lifted_name,
+                    span: co.name.span,
+                };
+            }
+            out_decls.push(Decl::Class(synth));
         } else if let Decl::Class(nested) = m {
             if nested.is_companion {
                 let comp_name =
@@ -256,6 +283,7 @@ fn lift_class_recursive(
                     companion_singletons,
                     nested_outer_members,
                     enclosing_class,
+                    nested_object_aliases,
                 );
                 out_decls.push(Decl::Class(renamed));
                 companion_singletons.insert(c.name.name.clone(), comp_name);
@@ -293,6 +321,7 @@ fn lift_class_recursive(
                     companion_singletons,
                     nested_outer_members,
                     enclosing_class,
+                    nested_object_aliases,
                 );
                 out_decls.push(Decl::Class(nested.clone()));
             }
@@ -690,6 +719,10 @@ fn build_module_with_overrides(
     > = std::collections::HashMap::new();
     let mut enclosing_class: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut nested_object_aliases: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = std::collections::HashMap::new();
     // An `actual object Foo` supersedes a matching `expect object
     // Foo`. Collect actual-object names up front so the superseded
     // `expect` singleton is neither synthesised into a class nor
@@ -722,6 +755,7 @@ fn build_module_with_overrides(
                     &mut companion_singletons,
                     &mut nested_outer_members,
                     &mut enclosing_class,
+                    &mut nested_object_aliases,
                 );
                 all_decls.push(d.clone());
             }
@@ -893,6 +927,7 @@ fn build_module_with_overrides(
     // (the registry is otherwise only assembled at the end of this
     // function, too late for lowering to consult).
     module.registry.hierarchy_methods = hierarchy_methods.clone();
+    module.registry.nested_object_aliases = nested_object_aliases.clone();
     // Make every `inline fun` body (top-level or nested) available to
     // the lowerer by simple name. The lowerer only expands a suspend
     // builder (continuation capture) or an inline call whose lambda
@@ -2189,6 +2224,7 @@ fn build_module_with_overrides(
         import_aliases,
         abstract_member_defaults,
         member_ext_owner_class,
+        nested_object_aliases: nested_object_aliases.clone(),
     };
     BuiltModule {
         module: Arc::new(module),

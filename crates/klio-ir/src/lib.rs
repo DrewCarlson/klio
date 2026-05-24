@@ -690,6 +690,16 @@ pub struct ModuleRegistry {
     /// since the lowering pass otherwise carries no import context.
     #[serde(default)]
     pub import_aliases: std::collections::HashMap<String, Vec<String>>,
+    /// Nested-object simple-name aliases, keyed by enclosing class
+    /// name. Populated when a `private object Inner { … }` inside an
+    /// outer class is lifted to a top-level synth class with the
+    /// qualified name `Outer$Inner` to avoid colliding with same-name
+    /// user top-level declarations. Lowering of bare identifier
+    /// references inside the outer's method bodies consults this
+    /// map to redirect `Inner` to `Outer$Inner`.
+    #[serde(default)]
+    pub nested_object_aliases:
+        std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 }
 
 impl Module {

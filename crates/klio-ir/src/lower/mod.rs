@@ -1262,7 +1262,32 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             dst
         }
         Expr::Block(block) => lower_block(b, block),
-        Expr::Path { segments, .. } => {
+        Expr::Path { segments, span } => {
+            // Nested-object alias rewrite: when inside an outer class
+            // whose lift renamed a `private object Inner` to
+            // `Outer$Inner` (to avoid colliding with a same-named user
+            // top-level), bare references to `Inner` in the outer's
+            // method bodies redirect to the renamed lifted class.
+            if let Some(owner) = b.owner_class().map(str::to_string) {
+                let renamed = b
+                    .module
+                    .registry
+                    .nested_object_aliases
+                    .get(&owner)
+                    .and_then(|m| m.get(&segments[0].name))
+                    .cloned();
+                if let Some(renamed) = renamed {
+                    if b.resolve(&segments[0].name).is_none() {
+                        let mut new_segs = segments.clone();
+                        new_segs[0] = klio_ast::Ident {
+                            name: renamed,
+                            span: segments[0].span,
+                        };
+                        let rewritten = Expr::Path { segments: new_segs, span: *span };
+                        return lower_expr(b, &rewritten);
+                    }
+                }
+            }
             if segments.len() == 1 {
                 // Bare `Unit` is the Unit singleton value (`fun
                 // hintEmit(): Unit = Unit`), not a member read — it
