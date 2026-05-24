@@ -1059,6 +1059,14 @@ fn run_frame_inner<'a>(
             }
             Terminator::Throw(r) => {
                 let exc = frame.read(r);
+                if std::env::var("KLIO_THROW_TRACE").is_ok() {
+                    eprintln!(
+                        "[throw-trace] from fn {} (fqn={}): {}",
+                        frame.func.name,
+                        frame.func.fqn,
+                        display_throw(&exc)
+                    );
+                }
                 // Walk the try stack for a matching handler.
                 let mut routed = false;
                 while let Some(tf) = try_stack.pop() {
