@@ -155,6 +155,8 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "common/src/generated/_UComparisons.kt",
     "common/src/generated/_URanges.kt",
     "common/src/generated/_USequences.kt",
+    "common/src/generated/_Arrays.kt",
+    "common/src/generated/_UArrays.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
     "src/kotlin/text/HexFormat.kt",
