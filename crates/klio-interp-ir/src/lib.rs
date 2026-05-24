@@ -7965,6 +7965,29 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         args: &[klio_runtime::Value],
         arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Specific intrinsic-backed classes whose constructor must
+        // produce klio's host-owned runtime value (Value::StringBuilder,
+        // Value::Map, …) rather than a generic Instance. Listed by
+        // FQN so the resolver routes upstream `expect class …`
+        // shells to the host ctor without disturbing user-defined
+        // classes that happen to share a name.
+        if let Some(ir_class) = self.module.classes.get(class.0 as usize) {
+            let fqn = ir_class.fqn.as_str();
+            let intrinsic_class = matches!(
+                fqn,
+                "kotlin.text.StringBuilder"
+                    | "kotlin.collections.HashMap"
+                    | "kotlin.collections.HashSet"
+                    | "kotlin.collections.LinkedHashMap"
+                    | "kotlin.collections.LinkedHashSet"
+                    | "kotlin.collections.ArrayList"
+            );
+            if intrinsic_class {
+                if let Some(intrinsic) = self.lookup_intrinsic(fqn) {
+                    return self.dispatch_intrinsic(intrinsic, args);
+                }
+            }
+        }
         if arg_names.iter().all(|n| n.is_none()) {
             return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
         }
