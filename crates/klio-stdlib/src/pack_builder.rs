@@ -167,6 +167,7 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/coroutines/cancellation/CancellationExceptionH.kt",
     "src/kotlin/collections/ArrayDeque.kt",
     "src/kotlin/collections/UArraySorting.kt",
+    "src/kotlin/Primitives.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
     "src/kotlin/text/HexFormat.kt",

@@ -2370,11 +2370,16 @@ fn apply_unop(op: UnOp, v: &Value) -> Result<Value, EvalError> {
         (UnOp::Neg, Value::Int(i)) => Ok(Value::Int(-i)),
         (UnOp::Neg, Value::Long(l)) => Ok(Value::Long(-l)),
         (UnOp::Neg, Value::Double(d)) => Ok(Value::Double(-d)),
+        (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
         (UnOp::Plus, v) => Ok(v.clone()),
         (UnOp::Inc, Value::Int(i)) => Ok(Value::Int(i.wrapping_add(1))),
         (UnOp::Inc, Value::Long(l)) => Ok(Value::Long(l.wrapping_add(1))),
+        (UnOp::Inc, Value::Float(f)) => Ok(Value::Float(f + 1.0)),
+        (UnOp::Inc, Value::Double(d)) => Ok(Value::Double(d + 1.0)),
         (UnOp::Dec, Value::Int(i)) => Ok(Value::Int(i.wrapping_sub(1))),
         (UnOp::Dec, Value::Long(l)) => Ok(Value::Long(l.wrapping_sub(1))),
+        (UnOp::Dec, Value::Float(f)) => Ok(Value::Float(f - 1.0)),
+        (UnOp::Dec, Value::Double(d)) => Ok(Value::Double(d - 1.0)),
         _ => Err(EvalError::Type(format!("UnOp::{op:?} on {v:?}"))),
     }
 }
