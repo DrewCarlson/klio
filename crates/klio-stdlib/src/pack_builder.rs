@@ -174,6 +174,8 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "common/src/kotlin/JvmAnnotationsH.kt",
     "src/kotlin/annotations/NativeAnnotations.kt",
     "src/kotlin/annotations/NativeConcurrentAnnotations.kt",
+    "src/kotlin/concurrent/atomics/AtomicArrays.common.kt",
+    "src/kotlin/concurrent/atomics/Atomics.common.kt",
     "src/kotlin/Primitives.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
