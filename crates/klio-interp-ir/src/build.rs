@@ -886,7 +886,30 @@ fn build_module_with_overrides(
     // Drop superseded `expect` decls so every downstream pass sees
     // only the active definition for each name.
     all_decls.retain(|d| match d {
-        Decl::Function(f) => !(f.is_expect && actual_func_names_set.contains(&f.name.name)),
+        Decl::Function(f) => {
+            if !f.is_expect {
+                return true;
+            }
+            if actual_func_names_set.contains(&f.name.name) {
+                return false;
+            }
+            // An upstream `expect fun` whose declared FQN is already
+            // implemented by a klio intrinsic is shadowed by the
+            // host's actual — drop the expect so resolution at lower
+            // / runtime time doesn't bind to a bodyless declaration
+            // and stop the intrinsic dispatch path from firing.
+            let fqn = func_fqn_overrides
+                .get(&f.span)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if package_prefix.is_empty() {
+                        f.name.name.clone()
+                    } else {
+                        format!("{}.{}", package_prefix, f.name.name)
+                    }
+                });
+            klio_stdlib::implementation(&fqn).is_none()
+        }
         Decl::Class(c) => !(c.is_expect && actual_class_names_set.contains(&c.name.name)),
         Decl::Object(o) => !(o.is_expect && actual_object_names_set.contains(&o.name.name)),
         _ => true,
