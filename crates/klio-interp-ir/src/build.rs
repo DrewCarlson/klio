@@ -910,6 +910,18 @@ fn build_module_with_overrides(
     // only the active definition for each name.
     all_decls.retain(|d| match d {
         Decl::Function(f) => {
+            // suspendCoroutineUninterceptedOrReturn ships in upstream
+            // commonMain as a non-expect inline fn whose body just
+            // throws NotImplementedError ("Implementation is intrinsic")
+            // — meant to be replaced by the compiler's intrinsic
+            // lowering. Klio handles this natively via the coroutine
+            // scheduler; drop the upstream body so the call routes
+            // through klio's dispatch instead of throwing at runtime.
+            if !f.is_expect
+                && f.name.name == "suspendCoroutineUninterceptedOrReturn"
+            {
+                return false;
+            }
             if !f.is_expect {
                 return true;
             }
@@ -946,6 +958,18 @@ fn build_module_with_overrides(
         }
         Decl::Class(c) => !(c.is_expect && actual_class_names_set.contains(&c.name.name)),
         Decl::Object(o) => !(o.is_expect && actual_object_names_set.contains(&o.name.name)),
+        Decl::Property(p) if matches!(
+            p.name.name.as_str(),
+            "coroutineContext" | "isInitialized"
+        ) => {
+            // Upstream declares these as `inline val` whose getter
+            // throws NotImplementedError ("Implementation is intrinsic")
+            // — meant for compiler intrinsic substitution. Klio
+            // substitutes them at runtime (active coroutine scope,
+            // lateinit-state probe); drop the upstream stub so the
+            // call routes through klio's dispatch.
+            false
+        }
         _ => true,
     });
     let decls: &[Decl] = &all_decls;

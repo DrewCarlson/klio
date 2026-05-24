@@ -185,6 +185,7 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/io/encoding/Base64.kt",
     "src/kotlin/coroutines/CoroutinesH.kt",
     "src/kotlin/coroutines/CoroutinesIntrinsicsH.kt",
+    "src/kotlin/coroutines/intrinsics/Intrinsics.kt",
     "common/src/kotlin/collections/AbstractMutableCollection.kt",
     "common/src/kotlin/collections/AbstractMutableList.kt",
     "common/src/kotlin/collections/AbstractMutableMap.kt",
