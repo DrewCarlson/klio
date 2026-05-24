@@ -484,7 +484,13 @@ impl Vm {
         // (e.g. `private object SENT; class Box { var v: Any? = SENT }`)
         // observes the same instance the main body will, preserving
         // `===` identity across init contexts.
-        let object_names: Vec<String> = self.module.registry.object_names.clone();
+        // Order: non-companion top-level objects first, then synth
+        // companion objects. A companion's `val` initializer may
+        // reference a top-level singleton (e.g. `val CURRENT =
+        // SomePrivateObject.get()`), so the dependency target must be
+        // bound in globals before the companion's init runs.
+        let mut object_names: Vec<String> = self.module.registry.object_names.clone();
+        object_names.sort_by_key(|n| n.contains("$Companion$"));
         for obj_name in &object_names {
             let class_id = match module.class_id(obj_name) {
                 Some(id) => id,
