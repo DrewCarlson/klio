@@ -931,7 +931,18 @@ fn build_module_with_overrides(
                         format!("{}.{}", package_prefix, f.name.name)
                     }
                 });
-            klio_stdlib::implementation(&fqn).is_none()
+            if klio_stdlib::implementation(&fqn).is_some() {
+                return false;
+            }
+            // Coroutine intrinsic expect funcs: klio implements the
+            // coroutine surface natively (continuation passing /
+            // scheduler), not via per-FQN intrinsics. Drop upstream
+            // bodyless expects so callers don't bind to them and
+            // bounce through klio's native dispatch instead.
+            if fqn.starts_with("kotlin.coroutines.") {
+                return false;
+            }
+            true
         }
         Decl::Class(c) => !(c.is_expect && actual_class_names_set.contains(&c.name.name)),
         Decl::Object(o) => !(o.is_expect && actual_object_names_set.contains(&o.name.name)),
