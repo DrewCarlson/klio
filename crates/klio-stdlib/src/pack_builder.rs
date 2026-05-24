@@ -110,6 +110,8 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/contextParameters/Context.kt",
     "src/kotlin/contextParameters/ContextOf.kt",
     "src/kotlin/properties/Delegates.kt",
+    "src/kotlin/Function.kt",
+    "src/kotlin/random/URandom.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
     "src/kotlin/text/HexFormat.kt",
