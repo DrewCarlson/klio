@@ -158,8 +158,6 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "common/src/generated/_Arrays.kt",
     "common/src/generated/_UArrays.kt",
     "common/src/kotlin/ExceptionsH.kt",
-    "common/src/kotlin/ioH.kt",
-    "common/src/kotlin/KotlinH.kt",
     "common/src/kotlin/MathH.kt",
     "common/src/kotlin/TextH.kt",
     "common/src/kotlin/SequencesH.kt",
