@@ -761,14 +761,18 @@ impl Module {
         }
         let mut first: Option<FuncId> = None;
         let mut first_user: Option<FuncId> = None;
+        let mut first_body: Option<FuncId> = None;
         for id in candidates {
             if first.is_none() {
                 first = Some(*id);
             }
-            if first_user.is_some() {
-                continue;
-            }
             if let Some(f) = self.funcs.get(id.0 as usize) {
+                if first_body.is_none() && !f.blocks.is_empty() {
+                    first_body = Some(*id);
+                }
+                if first_user.is_some() {
+                    continue;
+                }
                 let fqn = f.fqn.as_str();
                 let is_shipped = fqn.starts_with("kotlin.")
                     || fqn.starts_with("kotlinx.")
@@ -781,7 +785,12 @@ impl Module {
                 }
             }
         }
-        first_user.or(first)
+        // Prefer body over bodyless: a same-name `expect` (bodyless)
+        // should not hide a same-name `actual` / non-expect body
+        // sibling. Without this an upstream `expect fun println(...)`
+        // in commonMain ioH.kt can hide the resolution path that
+        // routes to klio's `kotlin.io.println` intrinsic.
+        first_user.or(first_body).or(first)
     }
 
     fn func_id_legacy(&self, name: &str) -> Option<FuncId> {
