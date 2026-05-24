@@ -1263,6 +1263,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         }
         Expr::Block(block) => lower_block(b, block),
         Expr::Path { segments, span } => {
+            // Inline a bare reference to an enclosing class's (or its
+            // companion's) `const val name = <literal>` directly as a
+            // constant load — Kotlin's `const val` is compile-time
+            // inlined, sidestepping companion-singleton init order
+            // (relevant when the companion `object Default : Outer(…)`
+            // inherits the outer class and the outer's ctor reads a
+            // companion const before the Default singleton is ready).
+            if segments.len() == 1 {
+                if let Some(owner) = b.owner_class().map(str::to_string) {
+                    if b.resolve(&segments[0].name).is_none() {
+                        let key = (owner, segments[0].name.clone());
+                        if let Some(c) = b.module.registry.class_const_inits.get(&key).cloned() {
+                            return b.emit_const(c);
+                        }
+                    }
+                }
+            }
             // Nested-object alias rewrite: when inside an outer class
             // whose lift renamed a `private object Inner` to
             // `Outer$Inner` (to avoid colliding with a same-named user

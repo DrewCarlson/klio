@@ -700,6 +700,16 @@ pub struct ModuleRegistry {
     #[serde(default)]
     pub nested_object_aliases:
         std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    /// `(class_name, member_name) → Const` for class / companion
+    /// `const val name = <literal>`. Populated at build time so the
+    /// lowering pass can inline a bare reference to a class const
+    /// directly as a constant load — sidesteps companion-singleton
+    /// initialization order (a `const val` of the enclosing class's
+    /// companion is referenced from the class's own primary-ctor
+    /// body before the companion's singleton is materialized).
+    #[serde(default)]
+    pub class_const_inits:
+        std::collections::HashMap<(String, String), Const>,
 }
 
 impl Module {

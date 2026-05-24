@@ -683,6 +683,29 @@ fn collect_hierarchy_member_names(
     }
 }
 
+fn literal_to_const(e: &klio_ast::Expr) -> Option<klio_ir::Const> {
+    use klio_ast::Expr;
+    match e {
+        Expr::IntLit { value, kind, .. } => match kind {
+            klio_ast::IntLitKind::Int => Some(klio_ir::Const::Int(*value as i32)),
+            klio_ast::IntLitKind::Long => Some(klio_ir::Const::Long(*value)),
+            klio_ast::IntLitKind::UInt => Some(klio_ir::Const::Int(*value as i32)),
+            klio_ast::IntLitKind::ULong => Some(klio_ir::Const::Long(*value)),
+        },
+        Expr::FloatLit { value, kind, .. } => match kind {
+            klio_ast::FloatLitKind::Double => Some(klio_ir::Const::Double(*value)),
+            klio_ast::FloatLitKind::Float => Some(klio_ir::Const::Float(*value as f32)),
+        },
+        Expr::BoolLit { value, .. } => Some(klio_ir::Const::Bool(*value)),
+        Expr::CharLit { value, .. } => Some(klio_ir::Const::Char(*value)),
+        Expr::StringTemplate { parts, .. } if parts.len() == 1 => match &parts[0] {
+            klio_ast::StringPart::Text(s) => Some(klio_ir::Const::String(s.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn build_module_with_overrides(
     file: &KotlinFile,
     fqn_overrides: &std::collections::HashMap<klio_span::Span, String>,
@@ -925,6 +948,41 @@ fn build_module_with_overrides(
         if let Decl::Class(c) = d {
             file_classes.insert(c.name.name.clone(), c);
         }
+    }
+    // Collect class / companion `const val name = <literal>` so the
+    // lowering pass can inline bare references to them — avoids
+    // companion-singleton init order issues when the enclosing
+    // class's primary ctor body reads a companion's `const val`.
+    {
+        let mut class_const_inits: std::collections::HashMap<(String, String), klio_ir::Const> =
+            std::collections::HashMap::new();
+        fn collect_consts(
+            cls_name: &str,
+            members: &[Decl],
+            out: &mut std::collections::HashMap<(String, String), klio_ir::Const>,
+        ) {
+            for m in members {
+                match m {
+                    Decl::Property(p) if p.is_const => {
+                        if let Some(init) = &p.init {
+                            if let Some(c) = literal_to_const(init) {
+                                out.insert((cls_name.to_string(), p.name.name.clone()), c);
+                            }
+                        }
+                    }
+                    Decl::Class(inner) if inner.is_companion => {
+                        collect_consts(cls_name, &inner.members, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for d in decls {
+            if let Decl::Class(c) = d {
+                collect_consts(&c.name.name, &c.members, &mut class_const_inits);
+            }
+        }
+        module.registry.class_const_inits = class_const_inits;
     }
     // Per-class transitive member-function-name set, so the lowerer
     // can resolve a call-position `name(args)` to a hierarchy member
@@ -2248,6 +2306,7 @@ fn build_module_with_overrides(
         abstract_member_defaults,
         member_ext_owner_class,
         nested_object_aliases: nested_object_aliases.clone(),
+        class_const_inits: std::mem::take(&mut module.registry.class_const_inits),
     };
     BuiltModule {
         module: Arc::new(module),
