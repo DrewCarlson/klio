@@ -3291,6 +3291,28 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }) {
             return Ok(v);
         }
+        // Bare member of the enclosing class's companion accessed
+        // from inside an instance method (Kotlin: companion statics
+        // are visible by bare name from class body). Lowering emits
+        // a `this.<name>` GetField; fall back to looking up the
+        // companion singleton by the receiver's class name and
+        // reading the member from there.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let cls_name = inst.borrow().class.name.clone();
+            if let Some(comp_name) =
+                self.module.registry.companion_singletons.get(&cls_name).cloned()
+            {
+                let comp = self.globals.borrow().lookup(&comp_name);
+                if let Some(comp) = comp {
+                    if !matches!(&comp, klio_runtime::Value::Instance(c) if klio_runtime::ObjRef::ptr_eq(c, inst))
+                    {
+                        if let Ok(v) = self.get_field(&comp, name) {
+                            return Ok(v);
+                        }
+                    }
+                }
+            }
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::get_field `{name}` on `{}`",
             receiver.type_fqn()
