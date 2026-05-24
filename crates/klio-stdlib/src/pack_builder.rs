@@ -164,6 +164,7 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "common/src/kotlin/TextH.kt",
     "common/src/kotlin/SequencesH.kt",
     "common/src/kotlin/collections/CollectionsH.kt",
+    "src/kotlin/coroutines/cancellation/CancellationExceptionH.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
     "src/kotlin/text/HexFormat.kt",
