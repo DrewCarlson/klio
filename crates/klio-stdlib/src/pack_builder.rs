@@ -168,6 +168,8 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/collections/Sequences.kt",
     "src/kotlin/ranges/PrimitiveRanges.kt",
     "src/kotlin/util/KotlinVersion.kt",
+    "src/kotlin/collections/PrimitiveIterators.kt",
+    "src/kotlin/collections/Arrays.kt",
     "src/kotlin/Primitives.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
