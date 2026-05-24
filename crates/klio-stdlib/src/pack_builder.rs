@@ -104,6 +104,8 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/contextParameters/ExperimentalContextParameters.kt",
     "src/kotlin/ranges/Range.kt",
     "src/kotlin/ranges/Ranges.kt",
+    "src/kotlin/ranges/Progressions.kt",
+    "src/kotlin/ranges/ProgressionIterators.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
     "src/kotlin/text/HexFormat.kt",
