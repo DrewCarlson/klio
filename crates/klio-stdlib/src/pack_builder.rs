@@ -149,6 +149,8 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/Char.kt",
     "src/kotlin/Arrays.kt",
     "src/kotlin/ArrayIntrinsics.kt",
+    "common/src/generated/_OneToManyTitlecaseMappings.kt",
+    "common/src/generated/_Comparisons.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
     "src/kotlin/text/HexFormat.kt",
