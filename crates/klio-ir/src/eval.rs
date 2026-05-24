@@ -14,6 +14,31 @@
 
 use klio_runtime::Value;
 
+fn display_throw(v: &Value) -> String {
+    match v {
+        Value::Exception { fqn, message, .. } => match message {
+            Some(m) => format!("{}({})", fqn, m),
+            None => format!("{}", fqn),
+        },
+        Value::Instance(inst) => {
+            let b = inst.borrow();
+            let name = b.class.name.clone();
+            let msg = b.fields.iter().find_map(|(k, v)| {
+                if k == "message" {
+                    if let Value::String(s) = v { Some(s.to_string()) } else { None }
+                } else {
+                    None
+                }
+            });
+            match msg {
+                Some(m) => format!("{}({})", name, m),
+                None => name,
+            }
+        }
+        _ => format!("{v:?}"),
+    }
+}
+
 use crate::{BinOp, BlockId, Const, Func, FuncId, Inst, Module, Reg, Terminator, TypeRef, UnOp};
 
 /// Pluggable callbacks the evaluator delegates non-trivial dispatch
@@ -455,7 +480,7 @@ pub enum EvalError {
     Unsupported(&'static str),
     #[error("IR type error: {0}")]
     Type(String),
-    #[error("uncaught throw inside IR evaluator: {0:?}")]
+    #[error("uncaught throw inside IR evaluator: {}", display_throw(.0))]
     Throw(Value),
     /// `return` from a nested lambda whose target is an
     /// enclosing IR function frame. `eval_with` catches this at
