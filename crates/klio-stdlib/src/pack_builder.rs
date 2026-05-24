@@ -178,6 +178,7 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/concurrent/atomics/Atomics.common.kt",
     "src/kotlin/util/Lazy.kt",
     "common/src/kotlin/KotlinH.kt",
+    "common/src/kotlin/MathH.kt",
     "src/kotlin/Primitives.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
