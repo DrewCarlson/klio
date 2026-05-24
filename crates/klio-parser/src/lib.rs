@@ -1654,6 +1654,41 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                         span: t.name.span.join(seg.span),
                     };
                     t.span = t.span.join(seg.span);
+                } else if matches!(after, Some(TokenKind::Dot))
+                    && matches!(after_next, Some(TokenKind::Ident))
+                    && matches!(after_2, Some(TokenKind::Lt))
+                {
+                    // Pattern: `.Ident<...>` — nested type with generic
+                    // args (e.g. `Map.Entry<K, V>.component1()`). Fold
+                    // the `.Ident<...>` into receiver only when a
+                    // following `.Ident` exists for the function name.
+                    let save_pos = self.pos;
+                    self.bump(); // '.'
+                    let Some(seg) = self.parse_ident("type segment") else {
+                        self.pos = save_pos;
+                        break;
+                    };
+                    let args = if matches!(self.peek_kind(), TokenKind::Lt) {
+                        self.parse_type_args()
+                    } else {
+                        Vec::new()
+                    };
+                    // Require following `.Ident` (the function name).
+                    if !matches!(self.peek_kind(), TokenKind::Dot)
+                        || !matches!(
+                            self.tokens.get(self.pos + 1).map(|tk| &tk.kind),
+                            Some(TokenKind::Ident)
+                        )
+                    {
+                        self.pos = save_pos;
+                        break;
+                    }
+                    t.name = Ident {
+                        name: format!("{}.{}", t.name.name, seg.name),
+                        span: t.name.span.join(seg.span),
+                    };
+                    t.type_args = args;
+                    t.span = t.span.join(seg.span);
                 } else {
                     break;
                 }

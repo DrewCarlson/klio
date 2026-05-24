@@ -15,7 +15,7 @@ internal fun checkCountOverflow(count: Int): Int {
     return count
 }
 
-internal fun mapCapacity(expectedSize: Int): Int = expectedSize
+internal actual fun mapCapacity(expectedSize: Int): Int = expectedSize
 
 internal inline fun <E> buildListInternal(builderAction: MutableList<E>.() -> Unit): List<E> {
     val list = ArrayList<E>()

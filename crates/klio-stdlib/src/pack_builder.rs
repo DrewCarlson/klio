@@ -138,7 +138,6 @@ const KLIO_STDLIB_ACTUAL_FILES: &[&str] = &[
     "kotlin-collections/CollectionsActuals.kt",
     "kotlin-io/Closeable.kt",
     "kotlin-io/Serializable.kt",
-    "kotlin-collections/Maps.kt",
     "kotlin-util/Lazy.kt",
 ];
 
