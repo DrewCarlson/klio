@@ -114,6 +114,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
 
     // ----- Char -----
     ("kotlin.Char.code", char_code),
+    ("kotlin.Char.toInt", char_code),
     ("kotlin.Char.digitToInt", char_digit_to_int),
     ("kotlin.Char.isDigit", char_is_digit),
     ("kotlin.Char.isLetter", char_is_letter),
