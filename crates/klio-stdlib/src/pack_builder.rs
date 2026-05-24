@@ -177,6 +177,7 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/concurrent/atomics/AtomicArrays.common.kt",
     "src/kotlin/concurrent/atomics/Atomics.common.kt",
     "src/kotlin/util/Lazy.kt",
+    "common/src/kotlin/KotlinH.kt",
     "src/kotlin/Primitives.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
@@ -211,7 +212,8 @@ const KLIO_STDLIB_ACTUAL_FILES: &[&str] = &[
     "kotlin-collections/CollectionsActuals.kt",
     "kotlin-io/Closeable.kt",
     "kotlin-io/Serializable.kt",
-    "kotlin-util/Lazy.kt",
+    "kotlin-internal/SerializationActuals.kt",
+    "kotlin-util/LazyActuals.kt",
 ];
 
 /// Locate the local upstream Kotlin checkout's `libraries/stdlib`
