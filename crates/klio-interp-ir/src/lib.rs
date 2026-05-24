@@ -1689,7 +1689,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Probe stdlib by FQN for known package surfaces. Covers
         // bare references to `IntArray`, `compareBy`, `buildList`,
         // `naturalOrder`, `PI`, etc. that aren't in IMPLICIT_ALIASES.
-        let direct_probes: [String; 11] = [
+        let direct_probes: [String; 12] = [
             name.to_string(),
             format!("kotlin.{name}"),
             format!("kotlin.collections.{name}"),
@@ -1701,6 +1701,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             format!("kotlin.coroutines.{name}"),
             format!("kotlin.coroutines.intrinsics.{name}"),
             format!("kotlin.internal.{name}"),
+            format!("kotlin.io.{name}"),
         ];
         // Loaded packs register their FQNs in `installed_bindings`.
         // For a bare-name reference, scan the overlay for a key that
@@ -4684,6 +4685,35 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                     let new_args = args.clone();
                     return self.call_func(module, *cand, new_args);
+                }
+            }
+            // No same-name body sibling — fall through to the
+            // intrinsic table. Try the declared FQN first; if the
+            // expect's fqn carries no package qualifier (the lowering
+            // pass left it bare), probe the common stdlib packages by
+            // simple name as a fallback so a bodyless
+            // `expect fun println(message: Any?)` reaches klio's
+            // `kotlin.io.println` intrinsic.
+            if let Some(intrinsic) = self.lookup_intrinsic(&f.fqn) {
+                return self.dispatch_intrinsic(intrinsic, &args);
+            }
+            let simple = f.name.as_str();
+            let probes = [
+                format!("kotlin.{simple}"),
+                format!("kotlin.io.{simple}"),
+                format!("kotlin.math.{simple}"),
+                format!("kotlin.text.{simple}"),
+                format!("kotlin.collections.{simple}"),
+                format!("kotlin.ranges.{simple}"),
+                format!("kotlin.comparisons.{simple}"),
+                format!("kotlin.concurrent.{simple}"),
+                format!("kotlin.coroutines.{simple}"),
+                format!("kotlin.coroutines.intrinsics.{simple}"),
+                format!("kotlin.internal.{simple}"),
+            ];
+            for p in &probes {
+                if let Some(intrinsic) = self.lookup_intrinsic(p) {
+                    return self.dispatch_intrinsic(intrinsic, &args);
                 }
             }
         }
