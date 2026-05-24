@@ -168,7 +168,6 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/collections/ArrayDeque.kt",
     "src/kotlin/collections/UArraySorting.kt",
     "src/kotlin/Primitives.kt",
-    "src/kotlin/util/Lazy.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
     "src/kotlin/text/HexFormat.kt",
@@ -203,7 +202,7 @@ const KLIO_STDLIB_ACTUAL_FILES: &[&str] = &[
     "kotlin-collections/CollectionsActuals.kt",
     "kotlin-io/Closeable.kt",
     "kotlin-io/Serializable.kt",
-    "kotlin-internal/SerializationActuals.kt",
+    "kotlin-util/Lazy.kt",
 ];
 
 /// Locate the local upstream Kotlin checkout's `libraries/stdlib`
