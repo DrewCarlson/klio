@@ -1683,7 +1683,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // Probe stdlib by FQN for known package surfaces. Covers
         // bare references to `IntArray`, `compareBy`, `buildList`,
         // `naturalOrder`, `PI`, etc. that aren't in IMPLICIT_ALIASES.
-        let direct_probes: [String; 10] = [
+        let direct_probes: [String; 11] = [
             name.to_string(),
             format!("kotlin.{name}"),
             format!("kotlin.collections.{name}"),
@@ -1694,6 +1694,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             format!("kotlin.concurrent.{name}"),
             format!("kotlin.coroutines.{name}"),
             format!("kotlin.coroutines.intrinsics.{name}"),
+            format!("kotlin.internal.{name}"),
         ];
         // Loaded packs register their FQNs in `installed_bindings`.
         // For a bare-name reference, scan the overlay for a key that

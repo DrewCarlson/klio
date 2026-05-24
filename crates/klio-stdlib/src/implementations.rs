@@ -115,6 +115,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // ----- Char -----
     ("kotlin.Char.code", char_code),
     ("kotlin.Char.toInt", char_code),
+    ("kotlin.internal.getProgressionLastElement", internal_get_progression_last_element),
     ("kotlin.Char.digitToInt", char_digit_to_int),
     ("kotlin.Char.isDigit", char_is_digit),
     ("kotlin.Char.isLetter", char_is_letter),
@@ -2915,6 +2916,53 @@ fn recv_char(args: &[Value], what: &str) -> Result<char, RuntimeError> {
 
 fn char_code(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::new_int(u32::from(recv_char(ctx.args, "Char.code")?)))
+}
+
+fn internal_get_progression_last_element(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let args = ctx.args;
+    if args.len() != 3 {
+        return Err(RuntimeError::Type(
+            "getProgressionLastElement expects (start, end, step)".into(),
+        ));
+    }
+    fn imod(a: i64, b: i64) -> i64 {
+        let m = a.rem_euclid(b);
+        if m >= 0 { m } else { m + b }
+    }
+    let (start, end, step, is_long) = match (&args[0], &args[1], &args[2]) {
+        (Value::Long(s), Value::Long(e), Value::Long(p)) => (*s, *e, *p, true),
+        (Value::Int(s), Value::Int(e), Value::Int(p)) => {
+            (i64::from(*s), i64::from(*e), i64::from(*p), false)
+        }
+        _ => {
+            return Err(RuntimeError::Type(
+                "getProgressionLastElement: args must be all Int or all Long".into(),
+            ));
+        }
+    };
+    let last = if step > 0 {
+        if start >= end {
+            end
+        } else {
+            let diff = imod(imod(end, step) - imod(start, step), step);
+            end - diff
+        }
+    } else if step < 0 {
+        if start <= end {
+            end
+        } else {
+            let neg = -step;
+            let diff = imod(imod(start, neg) - imod(end, neg), neg);
+            end + diff
+        }
+    } else {
+        return Err(RuntimeError::Type("Step is zero.".into()));
+    };
+    if is_long {
+        Ok(Value::Long(last))
+    } else {
+        Ok(Value::new_int(last as i32))
+    }
 }
 // Char predicates follow kotlinc-native 2.3.21 semantics, driven by Unicode
 // general categories rather than Rust's `char::is_*` (which differ on a

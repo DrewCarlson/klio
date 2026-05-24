@@ -166,6 +166,7 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "src/kotlin/collections/ArrayDeque.kt",
     "src/kotlin/collections/UArraySorting.kt",
     "src/kotlin/collections/Sequences.kt",
+    "src/kotlin/ranges/PrimitiveRanges.kt",
     "src/kotlin/Primitives.kt",
     "src/kotlin/random/Random.kt",
     "src/kotlin/random/XorWowRandom.kt",
