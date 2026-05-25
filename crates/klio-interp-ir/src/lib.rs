@@ -2049,7 +2049,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let v = simple_literal(init).unwrap_or(klio_runtime::Value::Null);
                     fields.push((p.name.clone(), v));
                 } else if p.getter.is_none() && p.delegate.is_none() {
-                    fields.push((p.name.clone(), klio_runtime::Value::Null));
+                    let v = p.primitive_zero.clone().unwrap_or(klio_runtime::Value::Null);
+                    fields.push((p.name.clone(), v));
                 }
             }
             let default_outer = self
@@ -3584,6 +3585,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     delegate: p.delegate.as_ref().map(|e| Arc::new(e.clone())),
                     is_abstract: p.is_abstract,
                     is_lateinit: p.is_lateinit,
+                    primitive_zero: crate::build::primitive_zero_for(p),
                 }),
                 _ => None,
             })
@@ -3925,6 +3927,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         delegate: p.delegate.as_ref().map(|e| Arc::new(e.clone())),
                         is_abstract: p.is_abstract,
                         is_lateinit: p.is_lateinit,
+                        primitive_zero: crate::build::primitive_zero_for(p),
                     }),
                     _ => None,
                 })
@@ -4031,7 +4034,8 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     };
                     fields.push((p.name.clone(), v));
                 } else {
-                    fields.push((p.name.clone(), klio_runtime::Value::Null));
+                    let v = p.primitive_zero.clone().unwrap_or(klio_runtime::Value::Null);
+                    fields.push((p.name.clone(), v));
                 }
             }
             // Populate parent's primary-param fields from
@@ -8496,6 +8500,27 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             }
         }
         let _ = (&class_def.primary_params, args);
+        // Seed non-nullable primitive `var` fields with their type
+        // zero so reads before the (possibly missing) init thunk
+        // runs don't observe `Null`. Matters for upstream `expect`
+        // classes like `AbstractMutableList.modCount: Int` whose
+        // declaration has no initializer expression.
+        {
+            let mut cur = Some(Arc::clone(&class_def));
+            while let Some(c) = cur {
+                for p in c.body_properties.iter() {
+                    if p.init.is_some() || p.getter.is_some() || p.delegate.is_some() {
+                        continue;
+                    }
+                    if let Some(v) = p.primitive_zero.clone() {
+                        if !fields.iter().any(|(n, _)| n == &p.name) {
+                            fields.push((p.name.clone(), v));
+                        }
+                    }
+                }
+                cur = c.parent.borrow().clone();
+            }
+        }
         // Materialise the instance with primary-param fields now so
         // body-property initialisers can reference `this` (and read
         // already-bound fields). Body props get appended into the

@@ -706,6 +706,33 @@ fn literal_to_const(e: &klio_ast::Expr) -> Option<klio_ir::Const> {
     }
 }
 
+/// Default `Value` for a property declared as a non-nullable primitive
+/// with no initializer. Used so an `expect`-declared `protected var
+/// modCount: Int` and similar non-null fields start as `0` instead of
+/// `Null` at instance construction.
+pub(crate) fn primitive_zero_for(p: &klio_ast::Property) -> Option<klio_runtime::Value> {
+    if p.init.is_some() || p.is_abstract || p.is_lateinit
+        || p.getter.is_some() || p.delegate.is_some()
+    {
+        return None;
+    }
+    let ty = p.ty.as_ref()?;
+    if ty.nullable {
+        return None;
+    }
+    match ty.name.name.as_str() {
+        "Int" => Some(klio_runtime::Value::Int(0)),
+        "Long" => Some(klio_runtime::Value::Long(0)),
+        "Short" => Some(klio_runtime::Value::Short(0)),
+        "Byte" => Some(klio_runtime::Value::Byte(0)),
+        "Float" => Some(klio_runtime::Value::Float(0.0)),
+        "Double" => Some(klio_runtime::Value::Double(0.0)),
+        "Boolean" => Some(klio_runtime::Value::Bool(false)),
+        "Char" => Some(klio_runtime::Value::Char('\0')),
+        _ => None,
+    }
+}
+
 fn build_module_with_overrides(
     file: &KotlinFile,
     fqn_overrides: &std::collections::HashMap<klio_span::Span, String>,
@@ -910,15 +937,16 @@ fn build_module_with_overrides(
     // only the active definition for each name.
     all_decls.retain(|d| match d {
         Decl::Function(f) => {
-            // suspendCoroutineUninterceptedOrReturn ships in upstream
-            // commonMain as a non-expect inline fn whose body just
-            // throws NotImplementedError ("Implementation is intrinsic")
-            // — meant to be replaced by the compiler's intrinsic
-            // lowering. Klio handles this natively via the coroutine
-            // scheduler; drop the upstream body so the call routes
-            // through klio's dispatch instead of throwing at runtime.
+            // Upstream's `suspend inline fun suspendCoroutineUninterceptedOrReturn`
+            // is a stub that throws NotImplementedError; the compiler is
+            // expected to substitute it. Klio ships a real non-inline,
+            // non-suspend implementation in kotlin-coroutines/Intrinsics.kt
+            // that drives the slot machinery. Distinguish them by signature
+            // so only the upstream stub is dropped.
             if !f.is_expect
                 && f.name.name == "suspendCoroutineUninterceptedOrReturn"
+                && f.is_inline
+                && f.is_suspend
             {
                 return false;
             }
@@ -1080,7 +1108,7 @@ fn build_module_with_overrides(
             String,
             std::rc::Rc<klio_ast::Function>,
         > = std::collections::HashMap::new();
-        for d in &file.decls {
+        for d in &all_decls {
             collect_inline(d, &mut inline_fns);
         }
         klio_ir::lower::set_inline_fn_asts(inline_fns);
@@ -1522,6 +1550,7 @@ fn build_module_with_overrides(
                         delegate: p.delegate.as_ref().map(|e| std::sync::Arc::new(e.clone())),
                         is_abstract: p.is_abstract,
                         is_lateinit: p.is_lateinit,
+                        primitive_zero: primitive_zero_for(p),
                     }),
                     _ => None,
                 })

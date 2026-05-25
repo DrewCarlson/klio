@@ -1605,6 +1605,12 @@ pub struct PropertyDef {
     /// `true` for a `lateinit var`. Reads before the first write throw
     /// `kotlin.UninitializedPropertyAccessException`.
     pub is_lateinit: bool,
+    /// Declared non-nullable primitive type name (`Int`, `Long`, `Short`,
+    /// `Byte`, `Float`, `Double`, `Boolean`, `Char`) for properties with
+    /// no initializer. Lets construction supply the type's zero value
+    /// instead of leaving the field `Null` — matters for `protected var
+    /// modCount: Int` and similar declarations in `expect` classes.
+    pub primitive_zero: Option<Value>,
 }
 
 #[derive(Debug)]
