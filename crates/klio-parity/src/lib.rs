@@ -1367,7 +1367,6 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
             asts.push(ast.clone());
         }
     }
-    asts.push(user_ast);
 
     // Mirror the production binary: surface the embedded stdlib pack's
     // curated `SOURCES` (the real `kotlin.coroutines` / `kotlin.time`
@@ -1376,7 +1375,17 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
     // resolves `kotlin.coroutines.EmptyCoroutineContext` &c. against
     // the stdlib layer instead of needing the kotlinx pack to redeclare
     // it. Without this the harness diverges from `klio run`.
-    for ast in embedded_stdlib_sources(&asts, &mut map) {
+    //
+    // Stdlib comes before the user file so a user-declared simple name
+    // (e.g. `class State`) is appended last and wins over a same-named
+    // private top-level singleton in the stdlib (`AbstractIterator`'s
+    // `private object State`).
+    let import_probe_asts: Vec<klio_ast::KotlinFile> = asts
+        .iter()
+        .cloned()
+        .chain(std::iter::once(user_ast.clone()))
+        .collect();
+    for ast in embedded_stdlib_sources(&import_probe_asts, &mut map) {
         if let Some(pkg) = &ast.package {
             let path = pkg
                 .path
@@ -1390,6 +1399,7 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
         }
         asts.push(ast);
     }
+    asts.push(user_ast);
 
     let mut bindings = klio_stdlib::HostBindings::with_stdlib_defaults();
     for (sym, f) in klio_kotlinx_coroutines::host_bindings().entries() {
