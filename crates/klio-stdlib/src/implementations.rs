@@ -362,6 +362,18 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.mutableListOf", coll_mutable_list_of),
     ("kotlin.collections.mutableMapOf", coll_mutable_map_of),
     ("kotlin.collections.mutableSetOf", coll_mutable_set_of),
+    ("kotlin.collections.arrayListOf", coll_mutable_list_of),
+    ("kotlin.collections.linkedMapOf", coll_mutable_map_of),
+    ("kotlin.collections.hashMapOf", coll_mutable_map_of),
+    ("kotlin.collections.linkedStringMapOf", coll_mutable_map_of),
+    ("kotlin.collections.hashSetOf", coll_mutable_set_of),
+    ("kotlin.collections.linkedSetOf", coll_mutable_set_of),
+    ("kotlin.collections.sortedSetOf", coll_sorted_set_of),
+    ("kotlin.collections.sortedMapOf", coll_sorted_map_of),
+    ("kotlin.collections.setOfNotNull", coll_set_of_not_null),
+    ("kotlin.collections.Set.toTypedArray", coll_to_typed_array),
+    ("kotlin.collections.Collection.toTypedArray", coll_to_typed_array),
+    ("kotlin.collections.Iterable.toTypedArray", coll_to_typed_array),
     ("kotlin.collections.setOf", coll_set_of),
     ("kotlin.to", coll_to_infix),
     ("kotlin.collections.ArrayList", coll_array_list_ctor),
@@ -4052,6 +4064,66 @@ fn coll_mutable_map_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn coll_empty_map(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_map(Vec::new(), false))
+}
+
+fn coll_to_typed_array(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(
+        ctx.args
+            .first()
+            .ok_or_else(|| RuntimeError::Type("toTypedArray requires a receiver".into()))?,
+        "toTypedArray",
+    )?;
+    Ok(Value::Array { items: ObjRef::new(items), prim: None })
+}
+
+fn coll_set_of_not_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items: Vec<Value> = ctx
+        .args
+        .iter()
+        .filter(|v| !matches!(v, Value::Null))
+        .cloned()
+        .collect();
+    Ok(make_set(items, false))
+}
+
+/// `sortedSetOf(vararg elements)` — a (mutable) set with keys in natural order.
+fn coll_sorted_set_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let mut items = ctx.args.to_vec();
+    let mut err: Option<RuntimeError> = None;
+    items.sort_by(|a, b| match compare_values(a, b) {
+        Ok(o) => o,
+        Err(e) => {
+            err = Some(e);
+            std::cmp::Ordering::Equal
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(make_set(items, true))
+}
+
+/// `sortedMapOf(vararg pairs)` — a (mutable) map with entries in natural key order.
+fn coll_sorted_map_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let mut entries: Vec<(Value, Value)> = Vec::with_capacity(ctx.args.len());
+    for v in ctx.args {
+        let Value::Pair(k, val) = v else {
+            return Err(RuntimeError::Type("sortedMapOf expects Pair arguments".into()));
+        };
+        entries.push(((**k).clone(), (**val).clone()));
+    }
+    let mut err: Option<RuntimeError> = None;
+    entries.sort_by(|a, b| match compare_values(&a.0, &b.0) {
+        Ok(o) => o,
+        Err(e) => {
+            err = Some(e);
+            std::cmp::Ordering::Equal
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(make_map(entries, true))
 }
 
 /// `ArrayList()` / `ArrayList(initialCapacity)` — same storage as our

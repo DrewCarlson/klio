@@ -4601,6 +4601,83 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 klio_runtime::Value::List { enum_class: Some(_), .. }
             );
         }
+        // Builtin collection / array / range values match their Kotlin
+        // supertype names. klio represents these as host value variants
+        // (not user Instances), so without this an `is`/`as` against
+        // List/Collection/Iterable/Array/Set/Map/range fails — notably the
+        // `(toTypedArray() as Array<T>)` cast inside upstream Iterable.sorted
+        // and the `as List`/`as Collection` in many stdlib bodies, which
+        // surfaced as "cast to `Array` failed". Mutable views match the
+        // Mutable* supertypes only when the value is actually mutable.
+        match value {
+            klio_runtime::Value::Array { .. } => {
+                if ty.name == "Array" {
+                    return true;
+                }
+            }
+            // The read-only/mutable distinction is erased on the JVM (both map
+            // to java.util.List/Set/Map), so kotlinc reports `listOf(…) is
+            // MutableList` as true. Match that — our parity oracle is JVM
+            // kotlinc — rather than gating on klio's mutability flag.
+            klio_runtime::Value::List { .. } => {
+                if matches!(
+                    ty.name.as_str(),
+                    "List"
+                        | "Collection"
+                        | "Iterable"
+                        | "AbstractList"
+                        | "AbstractCollection"
+                        | "MutableList"
+                        | "MutableCollection"
+                        | "MutableIterable"
+                        | "ArrayList"
+                        | "AbstractMutableList"
+                ) {
+                    return true;
+                }
+            }
+            klio_runtime::Value::Set { .. } => {
+                if matches!(
+                    ty.name.as_str(),
+                    "Set"
+                        | "Collection"
+                        | "Iterable"
+                        | "AbstractSet"
+                        | "MutableSet"
+                        | "MutableCollection"
+                        | "MutableIterable"
+                        | "HashSet"
+                        | "LinkedHashSet"
+                ) {
+                    return true;
+                }
+            }
+            klio_runtime::Value::Map { .. } => {
+                if matches!(
+                    ty.name.as_str(),
+                    "Map" | "AbstractMap" | "MutableMap" | "HashMap" | "LinkedHashMap"
+                ) {
+                    return true;
+                }
+            }
+            klio_runtime::Value::Range { .. } => {
+                if matches!(
+                    ty.name.as_str(),
+                    "IntRange"
+                        | "LongRange"
+                        | "CharRange"
+                        | "IntProgression"
+                        | "LongProgression"
+                        | "CharProgression"
+                        | "ClosedRange"
+                        | "OpenEndRange"
+                        | "Iterable"
+                ) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
         // Lambda / function values match `Function<R>`, `Function0`,
         // `Function1`, `Function2`, … (the arity-indexed `FunctionN`
         // hierarchy from kotlin.jvm.functions).
@@ -7106,6 +7183,24 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // receiver's supertype chain reaches the Throwable family,
         // probe `kotlin.Throwable.<name>` too so those resolve.
         let mut probes = probes;
+        // A MutableList/Set/Map IS-A List/Set/Map, so an op registered only on
+        // the read-only type (e.g. Set.sorted / Set.toTypedArray) must also be
+        // reachable from a mutable receiver — otherwise it falls through to a
+        // fragile upstream body. Probe the immutable supertype's type-prefixed
+        // intrinsic right after the mutable one.
+        if let Some(super_fqn) = match type_fqn {
+            "kotlin.collections.MutableList" => Some("kotlin.collections.List"),
+            "kotlin.collections.MutableSet" => Some("kotlin.collections.Set"),
+            "kotlin.collections.MutableMap" => Some("kotlin.collections.Map"),
+            _ => None,
+        } {
+            let probe = format!("{super_fqn}.{name}");
+            let anchor = format!("{type_fqn}.{name}");
+            match probes.iter().position(|p| p == &anchor) {
+                Some(pos) => probes.insert(pos + 1, probe),
+                None => probes.push(probe),
+            }
+        }
         if let klio_runtime::Value::Instance(inst) = receiver {
             let is_throwable = {
                 let classes = self.classes.borrow();

@@ -1074,6 +1074,42 @@ fn build_module_with_overrides(
                     return false;
                 }
             }
+            // Collection factory functions whose upstream bodies build the
+            // result via Array.toMap(dest)/toCollection(dest)/filterNotNull —
+            // ops that misbehave on klio's host Array (the destination
+            // overload is dropped / a generic `as Array` cast fails), so the
+            // factory silently yields an empty or first-only collection. klio
+            // implements these factories directly as intrinsics; drop the
+            // bodied upstream version (FQN-gated to kotlin.collections, and
+            // only when the intrinsic exists) so the bare call routes to the
+            // intrinsic instead of the broken body.
+            if !f.is_expect
+                && matches!(
+                    f.name.name.as_str(),
+                    "linkedMapOf"
+                        | "hashMapOf"
+                        | "linkedStringMapOf"
+                        | "hashSetOf"
+                        | "linkedSetOf"
+                        | "sortedSetOf"
+                        | "sortedMapOf"
+                        | "arrayListOf"
+                        | "listOfNotNull"
+                        | "setOfNotNull"
+                )
+            {
+                let expected = format!("kotlin.collections.{}", f.name.name);
+                let fqn = func_fqn_overrides.get(&f.span).cloned().unwrap_or_else(|| {
+                    if package_prefix.is_empty() {
+                        f.name.name.clone()
+                    } else {
+                        format!("{}.{}", package_prefix, f.name.name)
+                    }
+                });
+                if fqn == expected && klio_stdlib::implementation(&expected).is_some() {
+                    return false;
+                }
+            }
             if !f.is_expect {
                 return true;
             }
