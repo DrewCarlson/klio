@@ -2836,30 +2836,86 @@ impl Value {
     /// `BoxedEq` / `BoxedNotEq` ops when an operand came through
     /// an `as Any` cast or its static type is `Any` — per spec
     /// boxed-number equality is identity-based rather than IEEE.
+    /// Equality with *boxed* `Number` semantics, as the JVM applies when a
+    /// numeric is stored as `Any` / inside a collection: each boxed type's
+    /// `equals` only matches its own type, so `Integer(1) != Long(1)` and
+    /// `1 != 1.0`. Collections compare their elements boxed too (that is how
+    /// `listOf(1) == listOf(1L)` evaluates to `false`). Non-numeric,
+    /// non-collection values fall back to the structural rules.
     pub fn structural_eq_boxed(a: &Value, b: &Value) -> bool {
         use Value::*;
         match (a, b) {
             (Double(x), Double(y)) => x.to_bits() == y.to_bits(),
             (Float(x), Float(y)) => x.to_bits() == y.to_bits(),
-            (Double(x), Float(y)) => x.to_bits() == (*y as f64).to_bits(),
-            (Float(x), Double(y)) => (*x as f64).to_bits() == y.to_bits(),
+            (Int(x), Int(y)) => x == y,
+            (Long(x), Long(y)) => x == y,
+            (Short(x), Short(y)) => x == y,
+            (Byte(x), Byte(y)) => x == y,
+            (UInt(x), UInt(y)) => x == y,
+            (ULong(x), ULong(y)) => x == y,
+            (UShort(x), UShort(y)) => x == y,
+            (UByte(x), UByte(y)) => x == y,
+            (List { items: a, .. }, List { items: b, .. }) => {
+                let (ab, bb) = (a.borrow(), b.borrow());
+                ab.len() == bb.len()
+                    && ab.iter().zip(bb.iter()).all(|(x, y)| Value::structural_eq_boxed(x, y))
+            }
+            (Set { items: a, .. }, Set { items: b, .. }) => {
+                let (ab, bb) = (a.borrow(), b.borrow());
+                ab.len() == bb.len()
+                    && ab.iter().all(|x| bb.iter().any(|y| Value::structural_eq_boxed(x, y)))
+            }
+            (Map { entries: a, .. }, Map { entries: b, .. }) => {
+                let (ab, bb) = (a.borrow(), b.borrow());
+                ab.len() == bb.len()
+                    && ab.iter().all(|(k, v)| {
+                        bb.iter().any(|(k2, v2)| {
+                            Value::structural_eq_boxed(k, k2)
+                                && Value::structural_eq_boxed(v, v2)
+                        })
+                    })
+            }
+            (Pair(a1, a2), Pair(b1, b2)) => {
+                Value::structural_eq_boxed(a1, b1) && Value::structural_eq_boxed(a2, b2)
+            }
+            (Triple(a1, a2, a3), Triple(b1, b2, b3)) => {
+                Value::structural_eq_boxed(a1, b1)
+                    && Value::structural_eq_boxed(a2, b2)
+                    && Value::structural_eq_boxed(a3, b3)
+            }
+            (MapEntry { key: k1, value: v1, .. }, MapEntry { key: k2, value: v2, .. }) => {
+                Value::structural_eq_boxed(k1, k2) && Value::structural_eq_boxed(v1, v2)
+            }
+            // Any other mix of two numerics (Int vs Long, Int vs Double, …)
+            // is a cross-type boxed comparison: never equal.
+            _ if a.is_numeric() && b.is_numeric() => false,
             _ => Value::structural_eq(a, b),
         }
     }
 
     pub fn structural_eq(a: &Value, b: &Value) -> bool {
         use Value::*;
-        // Cross-type numeric equality follows Kotlin's `equals` semantics for
-        // boxed Number subtypes: integer-vs-integer compares values exactly;
-        // mixing with floats compares as f64 (Float widens losslessly to
-        // Double via `as f64`). NaN never equals anything.
+        // Numeric `equals` matches Kotlin's boxed `Number` semantics: each
+        // type only equals its own type (`1 != 1L`, `1 != 1.0`). Valid Kotlin
+        // only compares same-typed numerics with `==` (or boxes both to a
+        // common supertype, which still dispatches per-type `equals`), so
+        // type-strict matching is correct here and lets a generic
+        // `equals` (e.g. data-class / Pair component comparison) reject a
+        // cross-type pair the way the JVM does.
         if a.is_numeric() && b.is_numeric() {
-            if a.is_integral() && b.is_integral() {
-                return a.as_i64().unwrap() == b.as_i64().unwrap();
-            }
-            let av = a.as_f64().unwrap();
-            let bv = b.as_f64().unwrap();
-            return av == bv;
+            return match (a, b) {
+                (Int(x), Int(y)) => x == y,
+                (Long(x), Long(y)) => x == y,
+                (Short(x), Short(y)) => x == y,
+                (Byte(x), Byte(y)) => x == y,
+                (UInt(x), UInt(y)) => x == y,
+                (ULong(x), ULong(y)) => x == y,
+                (UShort(x), UShort(y)) => x == y,
+                (UByte(x), UByte(y)) => x == y,
+                (Double(x), Double(y)) => x == y,
+                (Float(x), Float(y)) => x == y,
+                _ => false,
+            };
         }
         match (a, b) {
             (Bool(x), Bool(y)) => x == y,
@@ -2872,17 +2928,20 @@ impl Value {
                 Range { start: a1, end: a2, step: s1, kind: k1 },
                 Range { start: b1, end: b2, step: s2, kind: k2 },
             ) => a1 == b1 && a2 == b2 && s1 == s2 && k1 == k2,
+            // Collection elements / tuple components are boxed, so they
+            // compare with boxed `Number` semantics: `listOf(1) == listOf(1L)`
+            // is `false` even though `1 == 1` at the top level is `true`.
             (List { items: a, .. }, List { items: b, .. }) => {
                 let ab = a.borrow();
                 let bb = b.borrow();
                 ab.len() == bb.len()
-                    && ab.iter().zip(bb.iter()).all(|(x, y)| Value::structural_eq(x, y))
+                    && ab.iter().zip(bb.iter()).all(|(x, y)| Value::structural_eq_boxed(x, y))
             }
             (Set { items: a, .. }, Set { items: b, .. }) => {
                 let ab = a.borrow();
                 let bb = b.borrow();
                 ab.len() == bb.len()
-                    && ab.iter().all(|x| bb.iter().any(|y| Value::structural_eq(x, y)))
+                    && ab.iter().all(|x| bb.iter().any(|y| Value::structural_eq_boxed(x, y)))
             }
             (Map { entries: a, .. }, Map { entries: b, .. }) => {
                 let ab = a.borrow();
@@ -2890,20 +2949,20 @@ impl Value {
                 ab.len() == bb.len()
                     && ab.iter().all(|(k, v)| {
                         bb.iter().any(|(k2, v2)| {
-                            Value::structural_eq(k, k2) && Value::structural_eq(v, v2)
+                            Value::structural_eq_boxed(k, k2) && Value::structural_eq_boxed(v, v2)
                         })
                     })
             }
             (Pair(a1, a2), Pair(b1, b2)) => {
-                Value::structural_eq(a1, b1) && Value::structural_eq(a2, b2)
+                Value::structural_eq_boxed(a1, b1) && Value::structural_eq_boxed(a2, b2)
             }
             (Triple(a1, a2, a3), Triple(b1, b2, b3)) => {
-                Value::structural_eq(a1, b1)
-                    && Value::structural_eq(a2, b2)
-                    && Value::structural_eq(a3, b3)
+                Value::structural_eq_boxed(a1, b1)
+                    && Value::structural_eq_boxed(a2, b2)
+                    && Value::structural_eq_boxed(a3, b3)
             }
             (MapEntry { key: k1, value: v1, .. }, MapEntry { key: k2, value: v2, .. }) => {
-                Value::structural_eq(k1, k2) && Value::structural_eq(v1, v2)
+                Value::structural_eq_boxed(k1, k2) && Value::structural_eq_boxed(v1, v2)
             }
             (Result { ok: o1, payload: p1 }, Result { ok: o2, payload: p2 }) => {
                 o1 == o2 && Value::structural_eq(p1, p2)
