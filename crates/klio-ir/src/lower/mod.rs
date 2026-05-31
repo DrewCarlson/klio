@@ -2655,6 +2655,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             | "compareByDescending"
                             | "naturalOrder"
                             | "reverseOrder"
+                            | "sequenceOf"
+                            | "emptySequence"
+                            | "generateSequence"
                     );
                     let bare_func_id: Option<FuncId> = cands
                         .iter()
