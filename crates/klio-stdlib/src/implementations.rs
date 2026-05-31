@@ -316,6 +316,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.listOfNotNull", coll_list_of_not_null),
     ("kotlin.arrayOf", coll_array_of),
     ("kotlin.arrayOfNulls", coll_array_of_nulls),
+    ("kotlin.emptyArray", coll_empty_array),
     ("kotlin.intArrayOf", coll_int_array_of),
     ("kotlin.longArrayOf", coll_long_array_of),
     ("kotlin.shortArrayOf", coll_short_array_of),
@@ -3686,6 +3687,9 @@ fn coll_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn coll_array_of_nulls(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     array_ctor_impl(ctx, "arrayOfNulls", None, Value::Null)
+}
+fn coll_empty_array(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Array { items: ObjRef::new(Vec::new()), prim: None })
 }
 fn coll_int_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Array {

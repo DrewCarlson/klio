@@ -8028,10 +8028,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     | "kotlin.DoubleArray"
                     | "kotlin.BooleanArray"
                     | "kotlin.CharArray"
+                    | "kotlin.Array"
             );
             if intrinsic_class {
-                if let Some(intrinsic) = self.lookup_intrinsic(fqn) {
-                    return self.dispatch_intrinsic(intrinsic, args);
+                // Skip the intrinsic path when the first arg is itself
+                // an Array — that shape (`Array(items)` copy / wrap)
+                // doesn't match any klio array ctor and the generic
+                // Instance allocation handles it correctly.
+                let first_is_array = matches!(
+                    args.first(),
+                    Some(klio_runtime::Value::Array { .. })
+                );
+                if !first_is_array {
+                    if let Some(intrinsic) = self.lookup_intrinsic(fqn) {
+                        return self.dispatch_intrinsic(intrinsic, args);
+                    }
                 }
             }
         }
