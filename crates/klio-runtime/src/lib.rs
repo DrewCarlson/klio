@@ -1957,6 +1957,13 @@ pub enum SeqOp {
     Map(Value),
     Filter(Value),
     FilterNot(Value),
+    /// `onEach { }` — run the lambda for its side effect, pass the item through.
+    OnEach(Value),
+    /// `mapIndexed { index, value -> }` — like Map but the lambda also receives
+    /// the 0-based index of the item within this op's input stream.
+    MapIndexed(Value),
+    /// `filterIndexed { index, value -> }`.
+    FilterIndexed(Value),
     Take(i64),
     Drop(i64),
     TakeWhile(Value),
@@ -3651,6 +3658,9 @@ fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
                     SeqOp::Map(v)
                     | SeqOp::Filter(v)
                     | SeqOp::FilterNot(v)
+                    | SeqOp::OnEach(v)
+                    | SeqOp::MapIndexed(v)
+                    | SeqOp::FilterIndexed(v)
                     | SeqOp::TakeWhile(v)
                     | SeqOp::DropWhile(v)
                     | SeqOp::FlatMap(v)

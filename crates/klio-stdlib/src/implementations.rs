@@ -654,6 +654,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.sequences.Sequence.toSet", seq_to_set),
     ("kotlin.sequences.Sequence.count", seq_count_no_pred),
     ("kotlin.sequences.Sequence.first", seq_first),
+    ("kotlin.sequences.Sequence.firstOrNull", seq_first_or_null),
+    ("kotlin.sequences.Sequence.find", seq_first_or_null),
+    ("kotlin.sequences.Sequence.any", seq_any),
+    ("kotlin.sequences.Sequence.none", seq_none),
     ("kotlin.sequences.Sequence.last", seq_last),
     ("kotlin.sequences.Sequence.toString", seq_to_string),
 
@@ -4846,6 +4850,21 @@ pub fn materialise_sequence(
     host: &mut dyn klio_runtime::IntrinsicHost,
     out: &mut dyn klio_runtime::Output,
 ) -> Result<Vec<Value>, RuntimeError> {
+    materialise_sequence_bounded(seq_val, host, out, None)
+}
+
+/// Materialize a Sequence, optionally stopping once `max` items have been
+/// produced. The bound makes short-circuiting terminals (`first`, `find`,
+/// `any`, `take(n).toList()`) pull only as far as needed instead of running
+/// the whole (possibly infinite) source — true Kotlin Sequence laziness.
+/// The bound applies on the streaming fast path; ops that must buffer (sort,
+/// flatMap, distinct) fall back to full materialization, as in Kotlin.
+pub fn materialise_sequence_bounded(
+    seq_val: &Value,
+    host: &mut dyn klio_runtime::IntrinsicHost,
+    out: &mut dyn klio_runtime::Output,
+    max: Option<usize>,
+) -> Result<Vec<Value>, RuntimeError> {
     use klio_runtime::{SeqOp, SequenceSource};
     let Value::Sequence(seq) = seq_val else {
         return Err(RuntimeError::Type("materialise_sequence: not a Sequence".into()));
@@ -4869,6 +4888,9 @@ pub fn materialise_sequence(
                 | SeqOp::Drop(_)
                 | SeqOp::TakeWhile(_)
                 | SeqOp::DropWhile(_)
+                | SeqOp::OnEach(_)
+                | SeqOp::MapIndexed(_)
+                | SeqOp::FilterIndexed(_)
         )
     });
     if all_streaming {
@@ -4878,6 +4900,7 @@ pub fn materialise_sequence(
         let mut dropped: Vec<usize> = vec![0; n_ops];
         let mut take_while_live: Vec<bool> = vec![true; n_ops];
         let mut drop_while_live: Vec<bool> = vec![true; n_ops];
+        let mut indices: Vec<usize> = vec![0; n_ops];
         let mut output: Vec<Value> = Vec::new();
         let pump = |host: &mut dyn klio_runtime::IntrinsicHost,
                     out: &mut dyn klio_runtime::Output,
@@ -4887,12 +4910,36 @@ pub fn materialise_sequence(
                     dropped: &mut [usize],
                     take_while_live: &mut [bool],
                     drop_while_live: &mut [bool],
+                    indices: &mut [usize],
                     output: &mut Vec<Value>|
          -> Result<bool, RuntimeError> {
             for (idx, op) in seq_ops.iter().enumerate() {
                 match op {
                     SeqOp::Map(f) => {
                         current = call(host, f, std::slice::from_ref(&current), out)?;
+                    }
+                    SeqOp::OnEach(f) => {
+                        call(host, f, std::slice::from_ref(&current), out)?;
+                    }
+                    SeqOp::MapIndexed(f) => {
+                        let i = indices[idx];
+                        indices[idx] += 1;
+                        current = call(
+                            host,
+                            f,
+                            &[Value::new_int(i as i64), current.clone()],
+                            out,
+                        )?;
+                    }
+                    SeqOp::FilterIndexed(f) => {
+                        let i = indices[idx];
+                        indices[idx] += 1;
+                        if !matches!(
+                            call(host, f, &[Value::new_int(i as i64), current.clone()], out)?,
+                            Value::Bool(true)
+                        ) {
+                            return Ok(true);
+                        }
                     }
                     SeqOp::Filter(f) => {
                         if !matches!(call(host, f, std::slice::from_ref(&current), out)?, Value::Bool(true)) {
@@ -4958,10 +5005,15 @@ pub fn materialise_sequence(
                         host, out, v.clone(), &seq.ops,
                         &mut taken, &mut dropped,
                         &mut take_while_live, &mut drop_while_live,
-                        &mut output,
+                        &mut indices, &mut output,
                     )?;
                     if !cont {
                         break;
+                    }
+                    if let Some(m) = max {
+                        if output.len() >= m {
+                            break;
+                        }
                     }
                 }
             }
@@ -4993,10 +5045,15 @@ pub fn materialise_sequence(
                         host, out, candidate.clone(), &seq.ops,
                         &mut taken, &mut dropped,
                         &mut take_while_live, &mut drop_while_live,
-                        &mut output,
+                        &mut indices, &mut output,
                     )?;
                     if !cont {
                         break;
+                    }
+                    if let Some(m) = max {
+                        if output.len() >= m {
+                            break;
+                        }
                     }
                     let r = call(host, next, std::slice::from_ref(&candidate), out)?;
                     if matches!(r, Value::Null) {
@@ -5041,6 +5098,30 @@ pub fn materialise_sequence(
                 let mut nx: Vec<Value> = Vec::with_capacity(items.len());
                 for v in &items {
                     nx.push(call(host, f, std::slice::from_ref(v), out)?);
+                }
+                items = nx;
+            }
+            SeqOp::OnEach(f) => {
+                for v in &items {
+                    call(host, f, std::slice::from_ref(v), out)?;
+                }
+            }
+            SeqOp::MapIndexed(f) => {
+                let mut nx: Vec<Value> = Vec::with_capacity(items.len());
+                for (i, v) in items.iter().enumerate() {
+                    nx.push(call(host, f, &[Value::new_int(i as i64), v.clone()], out)?);
+                }
+                items = nx;
+            }
+            SeqOp::FilterIndexed(f) => {
+                let mut nx: Vec<Value> = Vec::new();
+                for (i, v) in items.iter().enumerate() {
+                    if matches!(
+                        call(host, f, &[Value::new_int(i as i64), v.clone()], out)?,
+                        Value::Bool(true)
+                    ) {
+                        nx.push(v.clone());
+                    }
                 }
                 items = nx;
             }
@@ -6641,19 +6722,79 @@ fn seq_count_no_pred(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     Ok(Value::new_int(items.len()))
 }
-fn seq_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(items) = recv_seq_eager(ctx.args, "Sequence.first")? else {
-        return Err(RuntimeError::Unimplemented(
-            "Sequence.first on a non-trivial source/op chain".into(),
-        ));
-    };
-    items.first().cloned().ok_or_else(|| {
-        RuntimeError::Thrown(Value::Exception {
-            fqn: Arc::new("kotlin.NoSuchElementException".into()),
-            message: Some(Arc::new("Sequence is empty.".into())),
-            cause: None,
-        })
+/// Append one more op to a Sequence, returning a new lazy Sequence value. Used
+/// by predicate terminals (`first { p }` == `filter { p }.first()`) so they
+/// short-circuit through the same bounded materializer rather than each
+/// reimplementing the pull loop.
+fn seq_with_extra_op(seq_val: &Value, op: klio_runtime::SeqOp) -> Value {
+    match seq_val {
+        Value::Sequence(d) => {
+            let mut ops = d.ops.clone();
+            ops.push(op);
+            Value::Sequence(Arc::new(klio_runtime::SequenceData {
+                source: d.source.clone(),
+                ops,
+            }))
+        }
+        other => other.clone(),
+    }
+}
+
+/// The receiver Sequence, with a trailing `Filter(predicate)` op when the call
+/// supplies one (the `first { p }` / `find { p }` / `any { p }` shape).
+fn seq_with_optional_filter(ctx: &CallCtx, who: &str) -> Result<Value, RuntimeError> {
+    let seq = ctx
+        .args
+        .first()
+        .filter(|v| matches!(v, Value::Sequence(_)))
+        .cloned()
+        .ok_or_else(|| RuntimeError::Type(format!("{who} requires a Sequence receiver")))?;
+    Ok(match ctx.args.get(1) {
+        Some(pred) => seq_with_extra_op(&seq, klio_runtime::SeqOp::Filter(pred.clone())),
+        None => seq,
     })
+}
+
+fn seq_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let target = seq_with_optional_filter(ctx, "Sequence.first")?;
+    let CallCtx { out, host, .. } = ctx;
+    materialise_sequence_bounded(&target, *host, *out, Some(1))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            RuntimeError::Thrown(Value::Exception {
+                fqn: Arc::new("kotlin.NoSuchElementException".into()),
+                message: Some(Arc::new(
+                    "Sequence contains no element matching the predicate.".into(),
+                )),
+                cause: None,
+            })
+        })
+}
+
+fn seq_first_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let target = seq_with_optional_filter(ctx, "Sequence.firstOrNull")?;
+    let CallCtx { out, host, .. } = ctx;
+    Ok(materialise_sequence_bounded(&target, *host, *out, Some(1))?
+        .into_iter()
+        .next()
+        .unwrap_or(Value::Null))
+}
+
+fn seq_any(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let target = seq_with_optional_filter(ctx, "Sequence.any")?;
+    let CallCtx { out, host, .. } = ctx;
+    Ok(Value::Bool(
+        !materialise_sequence_bounded(&target, *host, *out, Some(1))?.is_empty(),
+    ))
+}
+
+fn seq_none(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let target = seq_with_optional_filter(ctx, "Sequence.none")?;
+    let CallCtx { out, host, .. } = ctx;
+    Ok(Value::Bool(
+        materialise_sequence_bounded(&target, *host, *out, Some(1))?.is_empty(),
+    ))
 }
 fn seq_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(items) = recv_seq_eager(ctx.args, "Sequence.last")? else {

@@ -5768,8 +5768,9 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     | "sum"
                     | "average"
                     | "sumOf"
-                    | "first"
-                    | "firstOrNull"
+                    // first/firstOrNull/find/any/none are handled by
+                    // short-circuiting Sequence intrinsics (bounded
+                    // materialization) — must NOT be eagerly materialized here.
                     | "last"
                     | "lastOrNull"
                     | "forEach"
@@ -5787,9 +5788,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     | "maxOf"
                     | "minOf"
                     | "joinToString"
-                    | "any"
                     | "all"
-                    | "none"
                     | "contains"
                     | "groupBy"
                     | "associate"
@@ -5828,6 +5827,15 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             };
             match (name, args.len()) {
                 ("map", 1) => return Ok(make_seq(klio_runtime::SeqOp::Map(args[0].clone()))),
+                ("onEach", 1) => {
+                    return Ok(make_seq(klio_runtime::SeqOp::OnEach(args[0].clone())))
+                }
+                ("mapIndexed", 1) => {
+                    return Ok(make_seq(klio_runtime::SeqOp::MapIndexed(args[0].clone())))
+                }
+                ("filterIndexed", 1) => {
+                    return Ok(make_seq(klio_runtime::SeqOp::FilterIndexed(args[0].clone())))
+                }
                 ("filter", 1) => {
                     return Ok(make_seq(klio_runtime::SeqOp::Filter(args[0].clone())))
                 }
