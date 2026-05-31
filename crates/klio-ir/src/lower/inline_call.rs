@@ -203,6 +203,28 @@ pub(super) fn try_inline_call_with_type_args(
             lambda_map.insert(p.name.name.clone(), a.clone());
         }
     }
+    // Mark params whose declared type is one of this inline fn's own
+    // generic type-parameters, so a comparison operator on such an
+    // operand inside the spliced body lowers to `compareTo` (total
+    // order for Double/Float) — matching the reference compiler. The
+    // splice binds the body in the caller's builder, so record which
+    // names we add and remove them once the body is lowered to avoid
+    // leaking the mark onto a same-named caller local.
+    let mut marked_generic: Vec<String> = Vec::new();
+    if !f.type_params.is_empty() {
+        let tp_names: std::collections::HashSet<&str> =
+            f.type_params.iter().map(|tp| tp.name.name.as_str()).collect();
+        for p in &f.params {
+            if p.ty.function.is_none()
+                && !p.ty.nullable
+                && tp_names.contains(p.ty.name.name.as_str())
+                && !b.is_generic_typed_param(&p.name.name)
+            {
+                b.mark_generic_typed_param(&p.name.name);
+                marked_generic.push(p.name.name.clone());
+            }
+        }
+    }
     b.push_inline_lambda_frame(lambda_map);
     if f.receiver_type.is_some() {
         if let Some(recv) = this_arg {

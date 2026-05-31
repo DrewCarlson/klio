@@ -522,6 +522,9 @@ impl<'a> FuncBuilder<'a> {
     pub fn is_generic_typed_param(&self, name: &str) -> bool {
         self.generic_typed_params.contains(name)
     }
+    pub fn clear_generic_typed_param(&mut self, name: &str) {
+        self.generic_typed_params.remove(name);
+    }
     pub fn push_finally(&mut self, block: klio_ast::Block) {
         self.finally_stack.push(block);
     }
