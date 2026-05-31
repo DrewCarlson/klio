@@ -100,6 +100,18 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.text.skipWhile", string_skip_while),
     ("kotlin.CharSequence.skipWhile", string_skip_while),
     ("kotlin.String.substring", string_substring),
+    // `subSequence(start, end)` shares `substring`'s semantics (klio
+    // represents a CharSequence as a String). A host impl is required:
+    // the abstract `CharSequence.subSequence` member otherwise falls to
+    // upstream's deprecated `inline fun String.subSequence(s,e) =
+    // subSequence(s,e)`, which re-binds itself in klio and recurses
+    // forever (stack overflow; padStart/padEnd then never terminate).
+    ("kotlin.String.subSequence", string_substring),
+    ("kotlin.CharSequence.subSequence", string_substring),
+    ("kotlin.String.padStart", string_pad_start),
+    ("kotlin.CharSequence.padStart", string_pad_start),
+    ("kotlin.String.padEnd", string_pad_end),
+    ("kotlin.CharSequence.padEnd", string_pad_end),
     ("kotlin.String.chunked", string_chunked),
     ("kotlin.String.split", string_split),
     ("kotlin.String.toDouble", string_to_double),
@@ -973,6 +985,12 @@ const PARAM_NAMES: &[(&str, &[&str])] = &[
     ("kotlin.String.replace", &["oldValue", "newValue", "ignoreCase"]),
     ("kotlin.String.split", &["delimiters", "ignoreCase", "limit"]),
     ("kotlin.String.substring", &["startIndex", "endIndex"]),
+    ("kotlin.String.subSequence", &["startIndex", "endIndex"]),
+    ("kotlin.CharSequence.subSequence", &["startIndex", "endIndex"]),
+    ("kotlin.String.padStart", &["length", "padChar"]),
+    ("kotlin.CharSequence.padStart", &["length", "padChar"]),
+    ("kotlin.String.padEnd", &["length", "padChar"]),
+    ("kotlin.CharSequence.padEnd", &["length", "padChar"]),
     ("kotlin.String.windowed", &[
         "size", "step", "partialWindows", "transform",
     ]),
@@ -2411,6 +2429,56 @@ fn string_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let out: String = chars[start as usize..end as usize].iter().collect();
     Ok(Value::String(Arc::new(out)))
+}
+
+/// `CharSequence.padStart(length, padChar = ' ')` / `padEnd`. Host
+/// impls so the call doesn't route to upstream's `String.padStart =
+/// (this as CharSequence).padStart(...)`, whose explicit upcast klio
+/// ignores in overload selection — it re-dispatches to `String.padStart`
+/// and recurses forever, allocating a StringBuilder each level (OOM).
+fn string_pad(ctx: &mut CallCtx, at_start: bool, who: &str) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, who)?;
+    let chars: Vec<char> = s.chars().collect();
+    let cur_len = chars.len() as i64;
+    let length = ctx
+        .args
+        .get(1)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RuntimeError::Arity(format!("{who} requires an Int length")))?;
+    if length < 0 {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IllegalArgumentException",
+            Some(format!("Desired length {length} is less than zero.")),
+        )));
+    }
+    let pad = match ctx.args.get(2) {
+        Some(Value::Char(c)) => *c,
+        None => ' ',
+        Some(other) => {
+            return Err(RuntimeError::Type(format!(
+                "{who}: padChar must be a Char, got {other}"
+            )))
+        }
+    };
+    if length <= cur_len {
+        return Ok(Value::String(Arc::clone(s)));
+    }
+    let pad_count = (length - cur_len) as usize;
+    let padding: String = std::iter::repeat(pad).take(pad_count).collect();
+    let out = if at_start {
+        format!("{padding}{s}")
+    } else {
+        format!("{s}{padding}")
+    };
+    Ok(Value::String(Arc::new(out)))
+}
+
+fn string_pad_start(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    string_pad(ctx, true, "padStart")
+}
+
+fn string_pad_end(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    string_pad(ctx, false, "padEnd")
 }
 
 fn string_starts_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
