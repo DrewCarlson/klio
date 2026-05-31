@@ -100,6 +100,15 @@ pub struct FuncBuilder<'a> {
     /// implicit receiver, mirroring kotlinc's inline expansion
     /// where `block()` resolves to `this.block()`.
     receiver_lambda_params: std::collections::HashSet<String>,
+    /// Params (and locals) whose declared type is an unconstrained
+    /// generic type-parameter (`T` of a `fun <T : Comparable<T>>`).
+    /// Kotlin desugars a comparison operator (`<`, `>`, `<=`, `>=`) on
+    /// such an operand to `a.compareTo(b) <op> 0`, which for `Double`/
+    /// `Float` is the *total* order (NaN greatest) — unlike the IEEE
+    /// primitive operators. Lowering consults this so the generic body
+    /// of `maxOf`/`minOf` (and any user generic `Comparable` compare)
+    /// matches the reference compiler.
+    generic_typed_params: std::collections::HashSet<String>,
     /// Stack of user `finally { … }` blocks (innermost on top)
     /// whose lexical scope encloses the current cursor. A
     /// `return X` reached during inline expansion replays each
@@ -184,6 +193,7 @@ impl<'a> FuncBuilder<'a> {
             local_fns: std::collections::HashSet::new(),
             local_ext_fns: std::collections::HashSet::new(),
             receiver_lambda_params: std::collections::HashSet::new(),
+            generic_typed_params: std::collections::HashSet::new(),
             finally_stack: Vec::new(),
             is_lambda_body: false,
             is_named_local_fn: false,
@@ -505,6 +515,12 @@ impl<'a> FuncBuilder<'a> {
     }
     pub fn is_receiver_lambda_param(&self, name: &str) -> bool {
         self.receiver_lambda_params.contains(name)
+    }
+    pub fn mark_generic_typed_param(&mut self, name: &str) {
+        self.generic_typed_params.insert(name.to_string());
+    }
+    pub fn is_generic_typed_param(&self, name: &str) -> bool {
+        self.generic_typed_params.contains(name)
     }
     pub fn push_finally(&mut self, block: klio_ast::Block) {
         self.finally_stack.push(block);

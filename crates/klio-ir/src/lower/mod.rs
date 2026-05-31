@@ -912,6 +912,23 @@ fn lower_function_body_with_implicit_owner_priv(
             b.mark_receiver_lambda_param(&p.name.name);
         }
     }
+    // A param whose declared type is one of the function's own generic
+    // type-parameters (e.g. `a: T` of `fun <T : Comparable<T>>`).
+    // Comparison operators on such an operand follow Kotlin's
+    // `compareTo`-based total order, not the IEEE primitive — the
+    // comparison-lowering arm consults this.
+    if !f.type_params.is_empty() {
+        let tp_names: std::collections::HashSet<&str> =
+            f.type_params.iter().map(|tp| tp.name.name.as_str()).collect();
+        for p in &f.params {
+            if p.ty.function.is_none()
+                && !p.ty.nullable
+                && tp_names.contains(p.ty.name.name.as_str())
+            {
+                b.mark_generic_typed_param(&p.name.name);
+            }
+        }
+    }
     if let Some(owner) = owner_class {
         let _ = b.set_owner_class(owner.to_string());
     }
@@ -1137,6 +1154,43 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     b.terminate(Terminator::Goto(join));
                 }
                 b.switch_to(join);
+                return dst;
+            }
+            // Comparison on a generic type-parameter operand
+            // (`a < b` where `a: T`): Kotlin desugars this to
+            // `a.compareTo(b) <op> 0`. For `Double`/`Float` that is the
+            // total order (NaN greatest), not the IEEE primitive — so a
+            // generic `maxOf`/`minOf` body returns NaN like the
+            // reference compiler. Concrete-typed operands keep the
+            // primitive op (e.g. `Double.NaN < 1.0` stays `false`).
+            let is_generic_operand = |e: &Expr| -> bool {
+                matches!(
+                    e,
+                    Expr::Path { segments, .. }
+                        if segments.len() == 1
+                            && b.is_generic_typed_param(&segments[0].name)
+                )
+            };
+            if matches!(op, AstBinOp::Lt | AstBinOp::Le | AstBinOp::Gt | AstBinOp::Ge)
+                && (is_generic_operand(lhs) || is_generic_operand(rhs))
+            {
+                let recv = lower_expr(b, lhs);
+                let arg_slot = b.alloc_reg();
+                let r = lower_expr(b, rhs);
+                b.push(Inst::Move { dst: arg_slot, src: r });
+                let cmp = b.alloc_reg();
+                let nm = b.module.intern_const(Const::String("compareTo".into()));
+                b.push(Inst::CallMember {
+                    dst: cmp,
+                    receiver: recv,
+                    name: nm,
+                    args: arg_slot,
+                    n_args: 1,
+                    arg_names: Vec::new(),
+                });
+                let zero = b.emit_const(Const::Int(0));
+                let dst = b.alloc_reg();
+                b.push(Inst::BinOp { dst, op: ast_binop(*op), lhs: cmp, rhs: zero });
                 return dst;
             }
             let l = lower_expr(b, lhs);
