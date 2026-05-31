@@ -1076,6 +1076,8 @@ const PARAM_NAMES: &[(&str, &[&str])] = &[
     ]),
     ("kotlin.String.toInt", &["radix"]),
     ("kotlin.String.toIntOrNull", &["radix"]),
+    ("kotlin.String.toLong", &["radix"]),
+    ("kotlin.String.toLongOrNull", &["radix"]),
     ("kotlin.Int.toString", &["radix"]),
 
     // Set parallels.
@@ -3001,12 +3003,16 @@ fn string_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Some(format!("radix {radix} was not in valid range 2..36")),
         )));
     }
-    parse_int_radix(&s, radix as u32).map(Value::new_int).map_err(|_| {
-        RuntimeError::Thrown(make_exception(
-            "kotlin.NumberFormatException",
-            Some(format!("For input string: \"{s}\"")),
-        ))
-    })
+    parse_int_radix(&s, radix as u32)
+        .ok()
+        .filter(|v| (i32::MIN as i64..=i32::MAX as i64).contains(v))
+        .map(Value::new_int)
+        .ok_or_else(|| {
+            RuntimeError::Thrown(make_exception(
+                "kotlin.NumberFormatException",
+                Some(format!("For input string: \"{s}\"")),
+            ))
+        })
 }
 
 fn string_to_int_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -3018,7 +3024,13 @@ fn string_to_int_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if !(2..=36).contains(&radix) {
         return Ok(Value::Null);
     }
-    Ok(parse_int_radix(&s, radix as u32).map(Value::new_int).unwrap_or(Value::Null))
+    // Bounds-check against the Int range: a value that fits i64 but overflows
+    // i32 must return null, not a truncated Int.
+    Ok(parse_int_radix(&s, radix as u32)
+        .ok()
+        .filter(|v| (i32::MIN as i64..=i32::MAX as i64).contains(v))
+        .map(Value::new_int)
+        .unwrap_or(Value::Null))
 }
 
 fn parse_int_radix(s: &str, radix: u32) -> Result<i64, ()> {
@@ -6953,19 +6965,31 @@ fn string_to_char_array(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn string_to_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toLong")?;
-    s.parse::<i64>()
-        .map(Value::Long)
-        .map_err(|_| {
-            RuntimeError::Thrown(make_exception(
-                "kotlin.NumberFormatException",
-                Some(format!("For input string: \"{s}\"")),
-            ))
-        })
+    let radix = recv_int_radix(ctx.args.get(1), "String.toLong")?;
+    if !(2..=36).contains(&radix) {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IllegalArgumentException",
+            Some(format!("radix {radix} was not in valid range 2..36")),
+        )));
+    }
+    parse_int_radix(&s, radix as u32).map(Value::Long).map_err(|_| {
+        RuntimeError::Thrown(make_exception(
+            "kotlin.NumberFormatException",
+            Some(format!("For input string: \"{s}\"")),
+        ))
+    })
 }
 
 fn string_to_long_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toLongOrNull")?;
-    Ok(s.parse::<i64>().map(Value::Long).unwrap_or(Value::Null))
+    let radix = match recv_int_radix(ctx.args.get(1), "String.toLongOrNull") {
+        Ok(r) => r,
+        Err(_) => return Ok(Value::Null),
+    };
+    if !(2..=36).contains(&radix) {
+        return Ok(Value::Null);
+    }
+    Ok(parse_int_radix(&s, radix as u32).map(Value::Long).unwrap_or(Value::Null))
 }
 
 fn string_to_double_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
