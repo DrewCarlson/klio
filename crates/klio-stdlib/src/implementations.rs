@@ -63,7 +63,24 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.math.max", math_max),
     ("kotlin.math.min", math_min),
     ("kotlin.math.round", math_round),
+    ("kotlin.math.cbrt", math_cbrt),
     ("kotlin.math.sign", math_sign),
+    ("kotlin.Double.roundToInt", num_round_to_int),
+    ("kotlin.Float.roundToInt", num_round_to_int),
+    ("kotlin.Double.roundToLong", num_round_to_long),
+    ("kotlin.Float.roundToLong", num_round_to_long),
+    ("kotlin.Double.mod", num_float_mod),
+    ("kotlin.Float.mod", num_float_mod),
+    ("kotlin.Double.rem", num_float_rem),
+    ("kotlin.Float.rem", num_float_rem),
+    ("kotlin.Int.takeHighestOneBit", num_take_highest_one_bit),
+    ("kotlin.Long.takeHighestOneBit", num_take_highest_one_bit),
+    ("kotlin.Int.takeLowestOneBit", num_take_lowest_one_bit),
+    ("kotlin.Long.takeLowestOneBit", num_take_lowest_one_bit),
+    ("kotlin.Int.rotateLeft", num_rotate_left),
+    ("kotlin.Long.rotateLeft", num_rotate_left),
+    ("kotlin.Int.rotateRight", num_rotate_right),
+    ("kotlin.Long.rotateRight", num_rotate_right),
     ("kotlin.math.sin", math_sin),
     ("kotlin.math.sqrt", math_sqrt),
     ("kotlin.math.tan", math_tan),
@@ -2302,7 +2319,9 @@ fn math_ceil(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Double(as_double(arg1(ctx, "ceil")?, "ceil")?.ceil()))
 }
 fn math_round(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::Double(as_double(arg1(ctx, "round")?, "round")?.round()))
+    // Kotlin's kotlin.math.round rounds half to even (IEEE rint), unlike
+    // Rust's round() which rounds half away from zero.
+    Ok(Value::Double(as_double(arg1(ctx, "round")?, "round")?.round_ties_even()))
 }
 fn math_truncate(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Double(as_double(arg1(ctx, "truncate")?, "truncate")?.trunc()))
@@ -2313,13 +2332,147 @@ fn math_hypot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn math_sign(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = arg1(ctx, "sign")?;
+    // Kotlin's sign preserves a signed/NaN zero: sign(0.0)=0.0, sign(-0.0)=-0.0,
+    // sign(NaN)=NaN. Rust's signum() returns ±1.0 for zero, so special-case it.
+    fn fsign(n: f64) -> f64 {
+        if n == 0.0 || n.is_nan() {
+            n
+        } else {
+            n.signum()
+        }
+    }
     match v {
         Value::Int(n) => Ok(Value::Int(n.signum())),
         Value::Long(n) => Ok(Value::Int(n.signum() as i32)),
-        Value::Float(n) => Ok(Value::Float(n.signum())),
-        Value::Double(n) => Ok(Value::Double(n.signum())),
+        Value::Float(n) => Ok(Value::Float(fsign(*n as f64) as f32)),
+        Value::Double(n) => Ok(Value::Double(fsign(*n))),
         other => Err(RuntimeError::Type(format!("sign requires a number, got {other:?}"))),
     }
+}
+
+fn math_cbrt(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "cbrt")?, "cbrt")?.cbrt()))
+}
+
+/// `roundToInt()` / `roundToLong()`: round half toward +∞ (Java `Math.round`),
+/// throw on NaN, clamp out-of-range to the type's MIN/MAX.
+fn num_round_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let d = as_double(arg1(ctx, "roundToInt")?, "roundToInt")?;
+    if d.is_nan() {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IllegalArgumentException",
+            Some("Cannot round NaN value.".into()),
+        )));
+    }
+    let r = (d + 0.5).floor();
+    let v = if r >= i32::MAX as f64 {
+        i32::MAX
+    } else if r <= i32::MIN as f64 {
+        i32::MIN
+    } else {
+        r as i32
+    };
+    Ok(Value::Int(v))
+}
+
+fn num_round_to_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let d = as_double(arg1(ctx, "roundToLong")?, "roundToLong")?;
+    if d.is_nan() {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IllegalArgumentException",
+            Some("Cannot round NaN value.".into()),
+        )));
+    }
+    let r = (d + 0.5).floor();
+    let v = if r >= i64::MAX as f64 {
+        i64::MAX
+    } else if r <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        r as i64
+    };
+    Ok(Value::Long(v))
+}
+
+fn num_take_highest_one_bit(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    match arg1(ctx, "takeHighestOneBit")? {
+        Value::Int(n) => {
+            let u = *n as u32;
+            Ok(Value::Int(if u == 0 { 0 } else { (1u32 << (31 - u.leading_zeros())) as i32 }))
+        }
+        Value::Long(n) => {
+            let u = *n as u64;
+            Ok(Value::Long(if u == 0 { 0 } else { (1u64 << (63 - u.leading_zeros())) as i64 }))
+        }
+        other => Err(RuntimeError::Type(format!(
+            "takeHighestOneBit requires an integer, got {other:?}"
+        ))),
+    }
+}
+
+fn num_take_lowest_one_bit(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    match arg1(ctx, "takeLowestOneBit")? {
+        Value::Int(n) => Ok(Value::Int(n & n.wrapping_neg())),
+        Value::Long(n) => Ok(Value::Long(n & n.wrapping_neg())),
+        other => Err(RuntimeError::Type(format!(
+            "takeLowestOneBit requires an integer, got {other:?}"
+        ))),
+    }
+}
+
+fn num_rotate_left(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "rotateLeft")?;
+    let n = b
+        .as_i64()
+        .ok_or_else(|| RuntimeError::Type("rotateLeft bitCount must be Int".into()))?;
+    match a {
+        Value::Int(x) => Ok(Value::Int(x.rotate_left(n.rem_euclid(32) as u32))),
+        Value::Long(x) => Ok(Value::Long(x.rotate_left(n.rem_euclid(64) as u32))),
+        other => Err(RuntimeError::Type(format!(
+            "rotateLeft requires an integer, got {other:?}"
+        ))),
+    }
+}
+
+fn num_rotate_right(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "rotateRight")?;
+    let n = b
+        .as_i64()
+        .ok_or_else(|| RuntimeError::Type("rotateRight bitCount must be Int".into()))?;
+    match a {
+        Value::Int(x) => Ok(Value::Int(x.rotate_right(n.rem_euclid(32) as u32))),
+        Value::Long(x) => Ok(Value::Long(x.rotate_right(n.rem_euclid(64) as u32))),
+        other => Err(RuntimeError::Type(format!(
+            "rotateRight requires an integer, got {other:?}"
+        ))),
+    }
+}
+
+/// `Double.rem(Double)` / `Float.rem` — IEEE remainder (sign of dividend),
+/// same as the `%` operator.
+fn num_float_rem(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "rem")?;
+    let r = as_double(a, "rem")? % as_double(b, "rem")?;
+    Ok(if matches!(a, Value::Float(_)) {
+        Value::Float(r as f32)
+    } else {
+        Value::Double(r)
+    })
+}
+
+/// `Double.mod(Double)` / `Float.mod` — floored modulus (sign of divisor).
+fn num_float_mod(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "mod")?;
+    let (x, y) = (as_double(a, "mod")?, as_double(b, "mod")?);
+    let mut r = x % y;
+    if r != 0.0 && (r < 0.0) != (y < 0.0) {
+        r += y;
+    }
+    Ok(if matches!(a, Value::Float(_)) {
+        Value::Float(r as f32)
+    } else {
+        Value::Double(r)
+    })
 }
 
 fn math_pi(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

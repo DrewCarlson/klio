@@ -2670,6 +2670,11 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::Sub, Double(a), Double(b)) => Ok(Double(a - b)),
         (BinOp::Mul, Double(a), Double(b)) => Ok(Double(a * b)),
         (BinOp::Div, Double(a), Double(b)) => Ok(Double(a / b)),
+        // `%` on floating-point is IEEE remainder (sign of the dividend),
+        // matching Rust's `%` and Kotlin's Double/Float.rem.
+        (BinOp::Mod, Double(a), Double(b)) => Ok(Double(a % b)),
+        (BinOp::Mod, Double(a), Int(b)) => Ok(Double(a % (*b as f64))),
+        (BinOp::Mod, Int(a), Double(b)) => Ok(Double((*a as f64) % b)),
         (BinOp::Eq, a, b) => Ok(Bool(Value::structural_eq(a, b))),
         (BinOp::NotEq, a, b) => Ok(Bool(!Value::structural_eq(a, b))),
         (BinOp::BoxedEq, a, b) => Ok(Bool(Value::structural_eq_boxed(a, b))),
