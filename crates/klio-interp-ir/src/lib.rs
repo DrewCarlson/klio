@@ -5644,9 +5644,26 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         }
         // Nested-class construction on a class receiver:
         // `Container.Nested(args)` or `Sealed.Variant(args)` — look
-        // up the named class in the module table and construct.
-        if let klio_runtime::Value::Class(_) = receiver {
-            if let Some(class_id) = self.module.class_id(name) {
+        // up the named class in the module table and construct. Prefer
+        // the receiver's OWN nested member (resolved by qualified FQN)
+        // over a same-simple-name global: a user `sealed class S { data
+        // class Error(...) }` declares `S.Error`, which must not
+        // resolve to the builtin `kotlin.Error` that shares the simple
+        // name. Fall back to the bare simple-name lookup for nested
+        // types whose qualified FQN isn't registered.
+        if let klio_runtime::Value::Class(cls) = receiver {
+            let qualified = self
+                .module
+                .class_id_by_fqn(&format!("{}.{}", cls.fqn, name))
+                .or_else(|| {
+                    if cls.name != cls.fqn {
+                        self.module
+                            .class_id_by_fqn(&format!("{}.{}", cls.name, name))
+                    } else {
+                        None
+                    }
+                });
+            if let Some(class_id) = qualified.or_else(|| self.module.class_id(name)) {
                 return <Self as klio_ir::eval::Host>::new_instance(self, class_id, args);
             }
         }
