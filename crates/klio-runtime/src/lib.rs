@@ -1144,6 +1144,14 @@ pub enum Value {
         pos: ObjRef<usize>,
         prim: Option<PrimitiveArrayKind>,
     },
+    /// Lazy O(1)-memory iterator over a `Range`/progression. Unlike
+    /// `Iterator`, which carries a fully-materialised `Vec`, this
+    /// computes each element arithmetically from `cur`/`step`, matching
+    /// the JVM `IntProgressionIterator`. `cur` is the only mutable
+    /// state. `kind` selects the element width (`Int`/`Long`/`Char`).
+    /// Produced by `iterator()` on a `Value::Range` so `for (i in a..b)`,
+    /// `repeat(n)`, and `range.forEach { }` never allocate per-element.
+    RangeIter { cur: ObjRef<i64>, end: i64, step: i64, kind: RangeKind },
     /// A built-in property delegate produced by `lazy { … }` /
     /// `Delegates.observable(...)` / `Delegates.notNull()`. Carries the
     /// state the delegate needs across calls (cached value, change
@@ -2035,6 +2043,11 @@ impl fmt::Debug for Value {
                 pos.borrow(),
                 items.borrow().len()
             ),
+            Self::RangeIter { cur, end, step, kind } => write!(
+                f,
+                "RangeIter(cur={}, end={end}, step={step}, kind={kind:?})",
+                cur.borrow()
+            ),
             Self::Class(c) => write!(f, "Class({})", c.fqn),
             Self::BoundInnerClass { class, .. } => write!(f, "BoundInnerClass({})", class.fqn),
             Self::Instance(i) => write!(f, "Instance({})", i.borrow().class.fqn),
@@ -2177,6 +2190,11 @@ impl fmt::Display for Value {
             Self::Iterator { prim, .. } => match prim {
                 Some(p) => write!(f, "{}Iterator", p.simple_name()),
                 None => write!(f, "kotlin.collections.Iterator"),
+            },
+            Self::RangeIter { kind, .. } => match kind {
+                RangeKind::Int => write!(f, "kotlin.ranges.IntProgressionIterator"),
+                RangeKind::Long => write!(f, "kotlin.ranges.LongProgressionIterator"),
+                RangeKind::Char => write!(f, "kotlin.ranges.CharProgressionIterator"),
             },
             Self::Class(c) => write!(f, "class {}", c.name),
             Self::BoundInnerClass { class, .. } => write!(f, "class {}", class.name),
@@ -2526,6 +2544,11 @@ impl Value {
                 Some(PrimitiveArrayKind::UByte) => "kotlin.collections.UByteIterator",
                 None => "kotlin.collections.Iterator",
             },
+            Self::RangeIter { kind, .. } => match kind {
+                RangeKind::Int => "kotlin.collections.IntIterator",
+                RangeKind::Long => "kotlin.collections.LongIterator",
+                RangeKind::Char => "kotlin.collections.CharIterator",
+            },
             // User classes/instances live outside the stdlib dispatch path
             // and never key into the intrinsic table.
             Self::Class(_) | Self::BoundInnerClass { .. } => "kotlin.reflect.KClass",
@@ -2638,6 +2661,16 @@ impl Value {
                 match prim {
                     Some(p) => name == &format!("{}Iterator", p.simple_name())[..],
                     None => false,
+                }
+            }
+            Value::RangeIter { kind, .. } => {
+                if matches!(name, "Iterator" | "Any") {
+                    return true;
+                }
+                match kind {
+                    RangeKind::Int => name == "IntIterator",
+                    RangeKind::Long => name == "LongIterator",
+                    RangeKind::Char => name == "CharIterator",
                 }
             }
             Value::Comparator { .. } => matches!(name, "Comparator" | "Any"),
@@ -3513,6 +3546,12 @@ fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
                 }
             }
             mark_cell(pos, seen);
+        }
+        // The lazy range iterator's only ObjRef is the `cur` counter
+        // (an i64 cell — no nested values to walk). Publish the cell so
+        // the cross-thread fence applies.
+        Value::RangeIter { cur, .. } => {
+            mark_cell(cur, seen);
         }
         Value::Map { entries, .. } => {
             if mark_cell(entries, seen) {

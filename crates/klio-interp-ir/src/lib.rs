@@ -5423,7 +5423,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // → the iterator itself (matches Kotlin's `Iterator: Iterable`
         // / self-iterator convention upstream stdlib relies on).
         if name == "iterator" && args.is_empty() {
-            if matches!(receiver, klio_runtime::Value::Iterator { .. }) {
+            if matches!(
+                receiver,
+                klio_runtime::Value::Iterator { .. } | klio_runtime::Value::RangeIter { .. }
+            ) {
                 return Ok(receiver.clone());
             }
         }
@@ -5465,11 +5468,15 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     });
                 }
                 klio_runtime::Value::Range { start, end, step, kind } => {
-                    let items = materialise_range_items(*start, *end, *step, *kind);
-                    return Ok(klio_runtime::Value::Iterator {
-                        items: klio_runtime::ObjRef::new(items),
-                        pos: klio_runtime::ObjRef::new(0),
-                        prim: None,
+                    // Lazy O(1)-memory iterator: compute each element
+                    // arithmetically rather than materialising the whole
+                    // range into a Vec (a `for (i in 0..N)` / `repeat(N)`
+                    // would otherwise allocate N Values up front and OOM).
+                    return Ok(klio_runtime::Value::RangeIter {
+                        cur: klio_runtime::ObjRef::new(*start),
+                        end: *end,
+                        step: *step,
+                        kind: *kind,
                     });
                 }
                 klio_runtime::Value::Array { items, prim } => {
@@ -6347,6 +6354,56 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     })?;
                     *pos.borrow_mut() = p + 1;
                     return Ok(v);
+                }
+                _ => {}
+            }
+        }
+        // Lazy range-iterator protocol: compute the next element from
+        // `cur`/`step` so iteration is O(1) memory. `hasNext` compares
+        // against the inclusive `end` honoring the step's sign; `next`
+        // yields the current value (widened by `kind`) then advances.
+        if let klio_runtime::Value::RangeIter { cur, end, step, kind } = receiver {
+            match name {
+                "hasNext" if args.is_empty() => {
+                    let c = *cur.borrow();
+                    let more = if *step > 0 {
+                        c <= *end
+                    } else if *step < 0 {
+                        c >= *end
+                    } else {
+                        false
+                    };
+                    return Ok(klio_runtime::Value::Bool(more));
+                }
+                "next" | "nextInt" | "nextLong" | "nextChar" | "nextByte"
+                | "nextShort" | "nextDouble" | "nextFloat" | "nextBoolean"
+                    if args.is_empty() =>
+                {
+                    let c = *cur.borrow();
+                    let more = if *step > 0 {
+                        c <= *end
+                    } else if *step < 0 {
+                        c >= *end
+                    } else {
+                        false
+                    };
+                    if !more {
+                        return Err(klio_ir::eval::EvalError::Throw(
+                            klio_runtime::Value::Exception {
+                                fqn: Arc::new("kotlin.NoSuchElementException".to_string()),
+                                message: Some(Arc::new("iterator exhausted".into())),
+                                cause: None,
+                            },
+                        ));
+                    }
+                    *cur.borrow_mut() = c.saturating_add(*step);
+                    return Ok(match kind {
+                        klio_runtime::RangeKind::Int => klio_runtime::Value::new_int(c),
+                        klio_runtime::RangeKind::Long => klio_runtime::Value::Long(c),
+                        klio_runtime::RangeKind::Char => {
+                            klio_runtime::Value::Char(c as u8 as char)
+                        }
+                    });
                 }
                 _ => {}
             }
