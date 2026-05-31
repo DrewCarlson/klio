@@ -1046,6 +1046,22 @@ fn build_module_with_overrides(
             {
                 return false;
             }
+            // Lazy-sequence factories: klio represents a Sequence as the
+            // host Value::Sequence and implements take/map/filter/toList
+            // etc. as intrinsics on it. The upstream factory bodies
+            // construct upstream Sequence-class INSTANCES
+            // (GeneratorSequence/TakeSequence/…) that klio's intrinsics
+            // don't recognise (iterating one hits `hasNext on Nothing`).
+            // Drop the bodies so the bare call routes to klio's
+            // `kotlin.sequences.*` intrinsic, yielding a Value::Sequence.
+            if !f.is_expect
+                && matches!(
+                    f.name.name.as_str(),
+                    "generateSequence" | "sequenceOf" | "emptySequence"
+                )
+            {
+                return false;
+            }
             if !f.is_expect {
                 return true;
             }
