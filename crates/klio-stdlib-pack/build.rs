@@ -12,18 +12,27 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=KLIO_STDLIB_PACK_FORCE_REBUILD");
-    // Re-run when any klio-stdlib source changes.
+    // Re-run when any klio-stdlib source changes. This must cover the
+    // ENTIRE klio-stdlib crate: the Rust binding/intrinsic sources
+    // under `src/` AND every klio-authored `kotlin-*` actuals tree
+    // (kotlin-collections, kotlin-io, kotlin-text, kotlin-util,
+    // kotlin-internal, kotlin-coroutines, kotlin-time, …). Watching
+    // only a subset silently embeds a STALE pack when an unwatched
+    // actuals file is edited — a correctness/validation hazard.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let klio_stdlib_dir = PathBuf::from(&manifest_dir).join("..").join("klio-stdlib");
-    rerun_dir(&klio_stdlib_dir.join("src"));
-    // The curated stdlib SOURCES path also embeds the klio-authored
-    // `actual` files and the upstream kotlin.time commonMain checkout;
-    // re-pack when either changes.
-    rerun_dir(&klio_stdlib_dir.join("kotlin-time"));
-    rerun_dir(&klio_stdlib_dir.join("kotlin-coroutines"));
-    let ws_root = PathBuf::from(&manifest_dir).join("..").join("..");
-    rerun_dir(&ws_root.join("kotlin").join("libraries").join("stdlib").join("src").join("kotlin").join("time"));
-    rerun_dir(&ws_root.join("kotlin").join("libraries").join("stdlib").join("src").join("kotlin").join("coroutines"));
+    rerun_dir(&klio_stdlib_dir);
+    // The pack also embeds curated upstream commonMain sources. Watch
+    // the source roots the curated include list draws from so a change
+    // to any consumed upstream `.kt` re-packs.
+    let upstream = PathBuf::from(&manifest_dir)
+        .join("..")
+        .join("..")
+        .join("kotlin")
+        .join("libraries")
+        .join("stdlib");
+    rerun_dir(&upstream.join("src"));
+    rerun_dir(&upstream.join("common").join("src"));
 
     let bytes = klio_stdlib::build_stdlib_pack(true).expect("build stdlib pack");
     std::fs::write(&dest, &bytes).expect("write stdlib pack");
