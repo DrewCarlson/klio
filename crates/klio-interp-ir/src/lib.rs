@@ -8077,6 +8077,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     | "kotlin.collections.LinkedHashMap"
                     | "kotlin.collections.LinkedHashSet"
                     | "kotlin.collections.ArrayList"
+                    | "kotlin.collections.ArrayDeque"
                     | "kotlin.IntArray"
                     | "kotlin.LongArray"
                     | "kotlin.ShortArray"
