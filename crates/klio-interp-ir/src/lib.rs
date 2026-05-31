@@ -1278,7 +1278,10 @@ impl<'a> VmHost<'a> {
             .filter_map(|fid| {
                 self.module.funcs.get(fid.0 as usize).cloned().map(|f| (*fid, f))
             })
-            .filter(|(_fid, f)| !f.params.is_empty())
+            // Only genuine extension fns (synthetic `this` first param)
+            // are candidates for member-call resolution; a plain
+            // top-level fn sharing the name is not an extension.
+            .filter(|(_fid, f)| f.params.first().map_or(false, |p| p.name == "this"))
             .collect();
         // Receiver-type filter: drop candidates whose declared
         // receiver type can't accept the actual receiver. If every
@@ -7157,7 +7160,18 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .cloned()
                         .map(|f| (*fid, f))
                 })
-                .filter(|(_fid, f)| !f.params.is_empty() && f.params.len() >= want)
+                // Only genuine extension / member-extension fns
+                // participate in `recv.name(args)` dispatch: their
+                // lowered first param is the synthetic receiver `this`.
+                // A plain top-level `fun name(a, b)` (first param not
+                // `this`) is NOT an extension and must never be a
+                // member-call candidate — otherwise a user `fun
+                // apply(f, x)` would shadow the stdlib `T.apply` and
+                // bind the receiver to its first value param.
+                .filter(|(_fid, f)| {
+                    f.params.len() >= want
+                        && f.params.first().map_or(false, |p| p.name == "this")
+                })
                 .filter(|(fid, _)| {
                     match self.module.registry.member_ext_owner_class.get(fid) {
                         None => true, // top-level extension: always visible
