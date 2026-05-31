@@ -8598,7 +8598,9 @@ fn sb_arg(args: &[Value], what: &str) -> Result<ObjRef<String>, RuntimeError> {
 fn string_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = match ctx.args.first() {
         None => String::new(),
-        Some(Value::Array { items, .. }) => {
+        // CharArray is a Value::Array, but some producers (e.g. toCharArray)
+        // yield a Value::List of chars — accept either.
+        Some(Value::Array { items, .. }) | Some(Value::List { items, .. }) => {
             let chars = items.borrow();
             let (start, count) = if ctx.args.len() >= 3 {
                 let off = ctx.args[1].as_i64().unwrap_or(0).max(0) as usize;
