@@ -11,11 +11,61 @@ use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Mutex, Once};
+use std::time::{Duration, Instant};
+
+/// Process-wide memory backstop. The parity harness runs klio **in-process**
+/// (`run_with_ktc` / `run_with_packs`), so a pathological allocation — a
+/// runaway test program, or an interpreter regression that materializes an
+/// unbounded range/sequence — would exhaust system memory and crash the
+/// machine rather than just failing a test. This watchdog polls the harness
+/// process's own RSS and aborts it the instant it exceeds a hard cap, so the
+/// blast radius is one harness process, never the whole machine.
+///
+/// Cap via `KLIO_PARITY_RSS_CAP_KB` (default 6 GiB — comfortably above the
+/// legitimate peak of an N-way parallel sweep, well below system memory).
+static MEMORY_WATCHDOG: Once = Once::new();
+
+pub fn start_memory_watchdog() {
+    MEMORY_WATCHDOG.call_once(|| {
+        let cap_kb: u64 = env::var("KLIO_PARITY_RSS_CAP_KB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(6 * 1024 * 1024);
+        let pid = std::process::id();
+        std::thread::Builder::new()
+            .name("klio-parity-memguard".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if let Some(rss) = current_rss_kb(pid) {
+                    if rss > cap_kb {
+                        eprintln!(
+                            "[klio-parity] RSS {rss}KB exceeded cap {cap_kb}KB — aborting \
+                             to avoid system OOM (raise KLIO_PARITY_RSS_CAP_KB if intentional)"
+                        );
+                        std::process::abort();
+                    }
+                }
+            })
+            .ok();
+    });
+}
+
+fn current_rss_kb(pid: u32) -> Option<u64> {
+    let out = Command::new("ps")
+        .arg("-o")
+        .arg("rss=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+}
 
 use klio_interp_ir::Vm;
 use klio_lexer::Lexer;
@@ -558,11 +608,78 @@ pub fn compile_with_kotlinc(file: &Path) -> Result<PathBuf, ParityError> {
     Ok(out)
 }
 
+/// Wall-clock cap (seconds) for a single `java` baseline run, via
+/// `KLIO_PARITY_JAVA_TIMEOUT_SECS` (default 60). A non-terminating program
+/// (klio is what we want to catch, but kotlinc's jar runs the same source) is
+/// killed instead of hanging the harness.
+fn java_timeout() -> Duration {
+    let secs = env::var("KLIO_PARITY_JAVA_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+/// JVM heap cap (MiB) for baseline runs, via `KLIO_PARITY_JAVA_XMX_MB`
+/// (default 2048). Bounds a runaway-allocating program to an
+/// `OutOfMemoryError` inside a memory-limited JVM child rather than letting it
+/// grow until the machine OOMs.
+fn java_xmx_mb() -> u64 {
+    env::var("KLIO_PARITY_JAVA_XMX_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(2048)
+}
+
+/// Run `cmd` capturing stdout/stderr, killing the child if it outlives
+/// `timeout`. Reader threads drain the pipes so a chatty child can't deadlock
+/// on a full pipe buffer while we wait.
+fn run_capped(mut cmd: Command, timeout: Duration) -> std::io::Result<std::process::Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let h_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(s) = stdout.as_mut() {
+            let _ = s.read_to_end(&mut b);
+        }
+        b
+    });
+    let h_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(s) = stderr.as_mut() {
+            let _ = s.read_to_end(&mut b);
+        }
+        b
+    });
+    let start = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = h_out.join().unwrap_or_default();
+    let stderr = h_err.join().unwrap_or_default();
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
 /// Run a previously-compiled jar under `java -jar`, returning captured stdout
-/// and exit code. Exposed so the parity test can time the stages individually.
+/// and exit code. Bounded by a JVM heap cap and a wall-clock timeout so a
+/// pathological program can neither exhaust memory nor hang the harness.
+/// Exposed so the parity test can time the stages individually.
 pub fn run_kotlinc_jar(jar: &Path) -> Result<(String, Option<i32>), ParityError> {
     let java = locate_java()?;
-    let result = Command::new(java).arg("-jar").arg(jar).output()?;
+    let mut cmd = Command::new(java);
+    cmd.arg(format!("-Xmx{}m", java_xmx_mb())).arg("-jar").arg(jar);
+    let result = run_capped(cmd, java_timeout())?;
     let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
     Ok((stdout, result.status.code()))
 }
@@ -782,6 +899,7 @@ impl SweepResult {
 /// in-process `klio` run. `jobs` worker threads share the file list. A fully
 /// warm sweep spawns neither kotlinc nor java.
 pub fn run_sweep(label: &str, paths: &[PathBuf], jobs: usize, per_file_timeout: Duration) -> Result<SweepResult, ParityError> {
+    start_memory_watchdog();
     let build = compile_corpus(label, paths)?;
     let entries = build.classes;
     let jar = build.jar;
@@ -844,7 +962,12 @@ fn sweep_one(jar: &Path, entry: &CorpusEntry, per_file_timeout: Duration) -> Swe
 /// corpus build, where one jar contains all corpus mains in distinct packages.
 pub fn run_class(jar: &Path, fqcn: &str) -> Result<(String, Option<i32>), ParityError> {
     let java = locate_java()?;
-    let result = Command::new(java).arg("-cp").arg(jar).arg(fqcn).output()?;
+    let mut cmd = Command::new(java);
+    cmd.arg(format!("-Xmx{}m", java_xmx_mb()))
+        .arg("-cp")
+        .arg(jar)
+        .arg(fqcn);
+    let result = run_capped(cmd, java_timeout())?;
     let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
     Ok((stdout, result.status.code()))
 }
@@ -1128,6 +1251,7 @@ mod inject_tests {
 /// Run a `.kt` file directly through the `klio` interpreter library, returning
 /// captured stdout. Diagnostic output is folded into the returned error.
 pub fn run_with_ktc(file: &Path) -> Result<String, String> {
+    start_memory_watchdog();
     let src = fs::read_to_string(file).map_err(|e| e.to_string())?;
     let mut map = SourceMap::new();
     let id = map.add(file, src.clone());
@@ -1498,6 +1622,7 @@ mod pack_ast_cache {
 }
 
 pub fn run_with_packs(file: &Path) -> Result<String, String> {
+    start_memory_watchdog();
     // Run the front-end + Vm on a heap-allocated 16 MiB stack.
     // Cargo's default test thread caps at 2 MiB, which is enough for
     // the curated `klio run` path but not for the parity harness:
@@ -1709,6 +1834,7 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
 
 /// Full parity check: compile + run both compilers, return a report.
 pub fn check(file: &Path) -> Result<ParityReport, ParityError> {
+    start_memory_watchdog();
     // Fast-cycle skip: every parity test that calls `check()` follows
     // the same `if let Ok(report) = check(&file) { … }` shape and
     // gracefully skips the byte-identical comparison when kotlinc
