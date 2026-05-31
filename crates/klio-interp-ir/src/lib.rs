@@ -5803,6 +5803,17 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     | "windowed"
                     | "chunked"
                     | "zipWithNext"
+                    | "zip"
+                    | "unzip"
+                    | "scan"
+                    | "runningFold"
+                    | "runningReduce"
+                    | "plus"
+                    | "minus"
+                    | "average"
+                    | "reduceOrNull"
+                    | "foldRight"
+                    | "reduceRight"
             );
             if terminal {
                 let items = self.materialise_sequence(receiver)?;
@@ -5811,7 +5822,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     mutable: false,
                     enum_class: None,
                 };
-                return self.call_member(&as_list, name, args);
+                // Materialize Sequence arguments too, so ops that take another
+                // sequence (e.g. `seq.zip(otherSeq)`) reach the List intrinsic
+                // with a List argument it can iterate.
+                let mut margs: Vec<klio_runtime::Value> = Vec::with_capacity(args.len());
+                for a in args {
+                    if matches!(a, klio_runtime::Value::Sequence(_)) {
+                        let it = self.materialise_sequence(a)?;
+                        margs.push(klio_runtime::Value::List {
+                            items: klio_runtime::ObjRef::new(it),
+                            mutable: false,
+                            enum_class: None,
+                        });
+                    } else {
+                        margs.push(a.clone());
+                    }
+                }
+                return self.call_member(&as_list, name, &margs);
             }
         }
         // Sequence pipeline ops: append the op to a fresh
@@ -5882,6 +5909,11 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 ("sortedWith", 1) => {
                     return Ok(make_seq(klio_runtime::SeqOp::SortedWith(args[0].clone())))
                 }
+                // `constrainOnce()` constrains a sequence to a single
+                // iteration. klio re-materializes from the (immutable) source
+                // each time rather than holding a consumable iterator, so the
+                // constraint is a no-op: return the sequence unchanged.
+                ("constrainOnce", 0) => return Ok(receiver.clone()),
                 _ => {}
             }
         }
