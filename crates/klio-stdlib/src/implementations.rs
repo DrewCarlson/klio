@@ -445,6 +445,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.List.minOrNull", coll_list_min_or_null),
     ("kotlin.collections.List.sum", coll_list_sum),
     ("kotlin.collections.List.toMap", coll_list_to_map),
+    ("kotlin.collections.Iterable.toMap", coll_list_to_map),
+    ("kotlin.collections.Set.toMap", coll_list_to_map),
+    ("kotlin.Array.toMap", coll_list_to_map),
     ("kotlin.collections.List.dropLast", coll_list_drop_last),
     ("kotlin.collections.List.lastIndexOf", coll_list_last_index_of),
     ("kotlin.collections.List.minus", coll_list_minus),
@@ -4927,14 +4930,15 @@ fn compare_host_aware(
     compare_values(a, b)
 }
 
-fn coll_list_to_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let it = recv_list_items(ctx.args, "List.toMap")?;
+/// Collect `(key, value)` entries from a slice of `Value::Pair`s,
+/// last-write-wins on duplicate keys (matching `toMap`/`putAll`).
+fn pairs_from_values(items: &[Value], who: &str) -> Result<Vec<(Value, Value)>, RuntimeError> {
     let mut entries: Vec<(Value, Value)> = Vec::new();
-    for v in it.borrow().iter() {
+    for v in items {
         let Value::Pair(k, val) = v else {
-            return Err(RuntimeError::Type(
-                "List.toMap requires a List<Pair<K, V>>".into(),
-            ));
+            return Err(RuntimeError::Type(format!(
+                "{who} requires a collection of Pair<K, V>"
+            )));
         };
         let key = (**k).clone();
         if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &key)) {
@@ -4943,7 +4947,18 @@ fn coll_list_to_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             entries.push((key, (**val).clone()));
         }
     }
-    Ok(make_map(entries, false))
+    Ok(entries)
+}
+
+fn coll_list_to_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    // Accept List/Set (recv_list_items) and Array receivers uniformly:
+    // upstream `Array<out Pair>.toMap()` and `Iterable<Pair>.toMap()`
+    // share this body.
+    let items: Vec<Value> = match ctx.args.first() {
+        Some(Value::Array { items, .. }) => items.borrow().clone(),
+        _ => recv_list_items(ctx.args, "toMap")?.borrow().clone(),
+    };
+    Ok(make_map(pairs_from_values(&items, "toMap")?, false))
 }
 
 fn coll_list_distinct(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -6852,9 +6867,25 @@ fn coll_mut_map_put_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(arg) = ctx.args.get(1) else {
         return Err(RuntimeError::Arity("putAll requires a Map".into()));
     };
+    // Upstream has four putAll overloads: putAll(Map) and
+    // putAll(Array/Iterable/Sequence<Pair>). Accept a Map's entries
+    // directly, or any Pair-bearing collection.
     let to_add: Vec<(Value, Value)> = match arg {
         Value::Map { entries, .. } => entries.borrow().clone(),
-        _ => return Err(RuntimeError::Type("putAll requires a Map".into())),
+        Value::Array { items, .. }
+        | Value::List { items, .. }
+        | Value::Set { items, .. } => {
+            pairs_from_values(&items.borrow(), "putAll")?
+        }
+        Value::Sequence(_) => {
+            let seq = ctx.args[1].clone();
+            let CallCtx { out, host, .. } = ctx;
+            let items = materialise_sequence(&seq, *host, *out)?;
+            pairs_from_values(&items, "putAll")?
+        }
+        _ => return Err(RuntimeError::Type(
+            "putAll requires a Map or a collection of Pairs".into(),
+        )),
     };
     let mut b = entries.borrow_mut();
     for (k, v) in to_add {
