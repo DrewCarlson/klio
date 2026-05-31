@@ -394,6 +394,26 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.List.get", coll_list_get),
     ("kotlin.collections.List.indexOf", coll_list_index_of),
     ("kotlin.collections.List.indexOfFirst", coll_iter_index_of_first),
+    ("kotlin.collections.List.foldRight", coll_list_fold_right),
+    ("kotlin.collections.Array.foldRight", coll_list_fold_right),
+    ("kotlin.Array.foldRight", coll_list_fold_right),
+    ("kotlin.collections.List.reduceRight", coll_list_reduce_right),
+    ("kotlin.collections.Array.reduceRight", coll_list_reduce_right),
+    ("kotlin.Array.reduceRight", coll_list_reduce_right),
+    ("kotlin.collections.List.reduceRightOrNull", coll_list_reduce_right_or_null),
+    ("kotlin.Array.reduceRightOrNull", coll_list_reduce_right_or_null),
+    ("kotlin.collections.List.last", coll_list_last),
+    ("kotlin.collections.Set.last", coll_list_last),
+    ("kotlin.collections.Iterable.last", coll_list_last),
+    ("kotlin.Array.last", coll_list_last),
+    ("kotlin.collections.List.lastOrNull", coll_list_last_or_null),
+    ("kotlin.collections.Set.lastOrNull", coll_list_last_or_null),
+    ("kotlin.collections.Iterable.lastOrNull", coll_list_last_or_null),
+    ("kotlin.Array.lastOrNull", coll_list_last_or_null),
+    ("kotlin.collections.List.findLast", coll_list_last_or_null),
+    ("kotlin.collections.Set.findLast", coll_list_last_or_null),
+    ("kotlin.collections.Iterable.findLast", coll_list_last_or_null),
+    ("kotlin.Array.findLast", coll_list_last_or_null),
     ("kotlin.collections.List.indexOfLast", coll_iter_index_of_last),
     ("kotlin.collections.MutableList.indexOfFirst", coll_iter_index_of_first),
     ("kotlin.collections.MutableList.indexOfLast", coll_iter_index_of_last),
@@ -4251,6 +4271,107 @@ fn coll_iter_index_of_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     Ok(Value::new_int(found))
 }
+/// `foldRight(initial) { elem, acc -> … }` — fold from the end. Upstream uses
+/// a backward ListIterator (hasPrevious) klio doesn't model, so iterate in
+/// reverse directly.
+fn coll_list_fold_right(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "foldRight")?;
+    let mut acc = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("foldRight requires an initial value".into()))?;
+    let block = ctx
+        .args
+        .get(2)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("foldRight requires a block".into()))?;
+    let CallCtx { out, host, .. } = ctx;
+    for v in items.iter().rev() {
+        acc = host.invoke_callable(&block, &[v.clone(), acc.clone()], *out)?;
+    }
+    Ok(acc)
+}
+
+/// `reduceRight { elem, acc -> … }` — reduce from the end; throws on empty.
+/// `or_null` true for reduceRightOrNull (returns null on empty).
+fn reduce_right_impl(ctx: &mut CallCtx, or_null: bool) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "reduceRight")?;
+    let block = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("reduceRight requires a block".into()))?;
+    if items.is_empty() {
+        return if or_null {
+            Ok(Value::Null)
+        } else {
+            Err(RuntimeError::Thrown(make_exception(
+                "kotlin.UnsupportedOperationException",
+                Some("Empty collection can't be reduced.".into()),
+            )))
+        };
+    }
+    let CallCtx { out, host, .. } = ctx;
+    let mut acc = items[items.len() - 1].clone();
+    for i in (0..items.len() - 1).rev() {
+        acc = host.invoke_callable(&block, &[items[i].clone(), acc.clone()], *out)?;
+    }
+    Ok(acc)
+}
+
+fn coll_list_reduce_right(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    reduce_right_impl(ctx, false)
+}
+
+fn coll_list_reduce_right_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    reduce_right_impl(ctx, true)
+}
+
+/// `last()` / `last { predicate }` / `lastOrNull { predicate }` /
+/// `findLast { predicate }`. With no block, returns the last element (throwing
+/// on empty for `last`). With a block, scans in reverse for the last match.
+/// `or_null` controls the empty/no-match behavior.
+fn coll_list_last_impl(ctx: &mut CallCtx, or_null: bool) -> Result<Value, RuntimeError> {
+    let items = iterable_items(&ctx.args[0], "last")?;
+    if ctx.args.len() >= 2 {
+        let block = ctx.args[1].clone();
+        let CallCtx { out, host, .. } = ctx;
+        for v in items.iter().rev() {
+            if matches!(
+                host.invoke_callable(&block, std::slice::from_ref(v), *out)?,
+                Value::Bool(true)
+            ) {
+                return Ok(v.clone());
+            }
+        }
+        return if or_null {
+            Ok(Value::Null)
+        } else {
+            Err(RuntimeError::Thrown(make_exception(
+                "kotlin.NoSuchElementException",
+                Some("Collection contains no element matching the predicate.".into()),
+            )))
+        };
+    }
+    match items.last() {
+        Some(v) => Ok(v.clone()),
+        None if or_null => Ok(Value::Null),
+        None => Err(RuntimeError::Thrown(make_exception(
+            "kotlin.NoSuchElementException",
+            Some("Collection is empty.".into()),
+        ))),
+    }
+}
+
+fn coll_list_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    coll_list_last_impl(ctx, false)
+}
+
+fn coll_list_last_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    coll_list_last_impl(ctx, true)
+}
+
 fn coll_list_last_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.lastIndexOf")?;
     let Some(needle) = ctx.args.get(1) else {
