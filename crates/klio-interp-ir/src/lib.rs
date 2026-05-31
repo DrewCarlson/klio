@@ -4814,7 +4814,20 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         // The thunk binds the parameters preceding
                         // this one, so a default like `endIndex =
                         // s.length` can read earlier args.
-                        let v = klio_ir::eval::eval_with(module, &dfunc, args.clone(), self)?;
+                        //
+                        // A thunk lowered inside an extension fn body
+                        // that references the receiver records `this`
+                        // as a capture, not a param — seed capture[0]
+                        // with the receiver so a bare member read like
+                        // `size` resolves through it.
+                        let captures: Vec<klio_runtime::Value> = if !args.is_empty() {
+                            vec![args[0].clone()]
+                        } else {
+                            Vec::new()
+                        };
+                        let v = klio_ir::eval::eval_with_captures(
+                            module, &dfunc, args.clone(), captures, self,
+                        )?;
                         args.push(v);
                     } else {
                         args.push(klio_runtime::Value::Null);
@@ -8007,6 +8020,14 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     | "kotlin.collections.LinkedHashMap"
                     | "kotlin.collections.LinkedHashSet"
                     | "kotlin.collections.ArrayList"
+                    | "kotlin.IntArray"
+                    | "kotlin.LongArray"
+                    | "kotlin.ShortArray"
+                    | "kotlin.ByteArray"
+                    | "kotlin.FloatArray"
+                    | "kotlin.DoubleArray"
+                    | "kotlin.BooleanArray"
+                    | "kotlin.CharArray"
             );
             if intrinsic_class {
                 if let Some(intrinsic) = self.lookup_intrinsic(fqn) {
@@ -9025,10 +9046,22 @@ fn pad_args_with_defaults<H: klio_ir::eval::Host>(
                         dfid.0
                     ))
                 })?;
-            let v = klio_ir::eval::eval_with(
+            // A default-arg thunk lowered inside an extension fn
+            // body that references the receiver (`toIndex = size` on
+            // `IntArray.fill`) records `this` as a capture, not a
+            // param. Seed the capture slot with the receiver so the
+            // bare `size` resolves through it instead of failing as
+            // an unresolved global.
+            let captures: Vec<klio_runtime::Value> = if !call_args.is_empty() {
+                vec![call_args[0].clone()]
+            } else {
+                Vec::new()
+            };
+            let v = klio_ir::eval::eval_with_captures(
                 module,
                 &dfunc,
                 call_args.clone(),
+                captures,
                 host,
             )?;
             call_args.push(v);
