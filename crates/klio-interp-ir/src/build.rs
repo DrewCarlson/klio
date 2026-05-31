@@ -950,6 +950,21 @@ fn build_module_with_overrides(
             {
                 return false;
             }
+            // Upstream's empty-collection factories return singleton
+            // `internal object` instances (EmptyList/EmptySet/EmptyMap)
+            // that klio's operator dispatch can't recognise as the
+            // matching Value::List/Set/Map. Drop the bodies so the
+            // klio-stdlib intrinsic returns the right Value kind and
+            // `list + elem`, `map - key`, etc. work uniformly.
+            if !f.is_expect
+                && matches!(
+                    f.name.name.as_str(),
+                    "emptyList" | "emptySet" | "emptyMap"
+                )
+                && f.params.is_empty()
+            {
+                return false;
+            }
             if !f.is_expect {
                 return true;
             }
