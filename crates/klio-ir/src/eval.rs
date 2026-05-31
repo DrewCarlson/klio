@@ -2469,22 +2469,13 @@ fn render_value(v: &Value) -> String {
         Value::ULong(u) => u.to_string(),
         Value::UShort(u) => u.to_string(),
         Value::UByte(u) => u.to_string(),
-        Value::Double(d) => {
-            if d.is_finite() && d.fract() == 0.0 && !d.is_sign_negative() && d.abs() < 1e16 {
-                format!("{d:.1}")
-            } else if d.is_finite() && d.fract() == 0.0 && d.is_sign_negative() && d.abs() < 1e16 {
-                format!("{d:.1}")
-            } else {
-                format!("{d}")
-            }
-        }
-        Value::Float(f) => {
-            if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e7 {
-                format!("{f:.1}")
-            } else {
-                format!("{f}")
-            }
-        }
+        // Use the same Kotlin-faithful formatters as `Value`'s Display so a
+        // Double/Float in a string template (`"$x"`) or `+` concatenation
+        // renders identically to `println(x)` — Kotlin's `1.0E20`,
+        // `1.0E-7`, `Infinity`, `NaN`, not Rust's `100000000000000000000`,
+        // `0.0000001`, `inf`.
+        Value::Double(d) => klio_runtime::kotlin_double_to_string(*d),
+        Value::Float(f) => klio_runtime::kotlin_float_to_string(*f),
         Value::Bool(b) => b.to_string(),
         Value::String(s) => s.as_str().to_string(),
         Value::Char(c) => c.to_string(),

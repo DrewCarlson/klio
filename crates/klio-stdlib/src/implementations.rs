@@ -513,6 +513,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Map.minus", coll_map_minus),
     ("kotlin.collections.Map.toMutableMap", coll_map_to_mutable_map),
     ("kotlin.collections.Map.toMap", coll_map_to_map),
+    ("kotlin.collections.Map.toSortedMap", coll_map_to_sorted_map),
+    ("kotlin.collections.MutableMap.toSortedMap", coll_map_to_sorted_map),
     ("kotlin.collections.MutableMap.toMutableMap", coll_map_to_mutable_map),
     ("kotlin.collections.MutableMap.toMap", coll_map_to_map),
     ("kotlin.collections.MutableMap.plus", coll_map_plus),
@@ -6978,6 +6980,52 @@ fn coll_map_to_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .map(|(k, v)| Value::Pair(Box::new(k.clone()), Box::new(v.clone())))
         .collect();
     Ok(make_list(pairs, false))
+}
+
+/// `Map.toSortedMap()` / `toSortedMap(comparator)` — a map whose entries are
+/// ordered by key. klio's Map preserves insertion order, so we return a new
+/// Map with entries pre-sorted by key. The no-arg form sorts by natural key
+/// order; a `naturalOrder()`/`reverseOrder()` Comparator is honored directly.
+fn coll_map_to_sorted_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("toSortedMap requires a Map receiver".into()))?;
+    let mut entries = map_entries_clone(recv, "toSortedMap")?;
+    // Optional comparator: support naturalOrder/reverseOrder (no selector
+    // steps). A selector-based Comparator (compareBy { … }) would need to run
+    // the selector lambda per key; not yet handled.
+    let descending = match ctx.args.get(1) {
+        None => false,
+        Some(Value::Comparator { steps, descending }) if steps.is_empty() => *descending,
+        Some(Value::Comparator { .. }) => {
+            return Err(RuntimeError::Type(
+                "toSortedMap with a selector comparator is not yet supported".into(),
+            ));
+        }
+        Some(_) => {
+            return Err(RuntimeError::Type(
+                "toSortedMap expects a Comparator argument".into(),
+            ));
+        }
+    };
+    let mut err: Option<RuntimeError> = None;
+    entries.sort_by(|a, b| {
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match compare_values(&a.0, &b.0) {
+            Ok(o) => if descending { o.reverse() } else { o },
+            Err(e) => {
+                err = Some(e);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(make_map(entries, false))
 }
 
 fn coll_map_count_no_pred(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
