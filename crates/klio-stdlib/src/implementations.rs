@@ -131,6 +131,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.CharSequence.padEnd", string_pad_end),
     ("kotlin.String.chunked", string_chunked),
     ("kotlin.String.split", string_split),
+    ("kotlin.String.splitToSequence", string_split_to_sequence),
+    ("kotlin.CharSequence.splitToSequence", string_split_to_sequence),
     ("kotlin.String.toDouble", string_to_double),
     ("kotlin.String.toInt", string_to_int),
     ("kotlin.String.toIntOrNull", string_to_int_or_null),
@@ -3109,7 +3111,19 @@ fn string_to_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn string_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let s = recv_string(ctx.args, "String.split")?;
+    Ok(make_list(string_split_items(ctx, "String.split")?, false))
+}
+
+/// `splitToSequence(...)` shares `split`'s delimiter handling and
+/// yields the same substrings as a `Sequence<String>`. klio collects
+/// eagerly and wraps the result (faithful for finite inputs, which is
+/// every `String`).
+fn string_split_to_sequence(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(make_sequence(string_split_items(ctx, "String.splitToSequence")?))
+}
+
+fn string_split_items(ctx: &mut CallCtx, who: &str) -> Result<Vec<Value>, RuntimeError> {
+    let s = recv_string(ctx.args, who)?;
     if let Some(Value::Regex(r)) = ctx.args.get(1) {
         let limit = match ctx.args.get(2) {
             None => 0i64,
@@ -3121,11 +3135,10 @@ fn string_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         } else {
             r.re.splitn(s, limit as usize).collect()
         };
-        let items: Vec<Value> = parts
+        return Ok(parts
             .into_iter()
             .map(|p| Value::String(Arc::new(p.to_string())))
-            .collect();
-        return Ok(make_list(items, false));
+            .collect());
     }
     // `split(vararg delimiters: String/Char, ignoreCase = false, limit = 0)`:
     // collect every String/Char delimiter, plus a trailing Bool (ignoreCase)
@@ -3180,7 +3193,7 @@ fn string_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             "String.split requires at least one delimiter".into(),
         ));
     }
-    Ok(make_list(split_on_any(&s, &delims, ignore_case, limit), false))
+    Ok(split_on_any(&s, &delims, ignore_case, limit))
 }
 
 /// Split `s` on any of `delims` (left-to-right, non-overlapping), honoring a
