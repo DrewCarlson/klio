@@ -786,11 +786,82 @@ fn build_module_with_overrides(
             _ => None,
         })
         .collect();
+    // A `private` top-level `object` declared in a pack package (e.g.
+    // `private object State` in kotlin.collections/AbstractIterator.kt)
+    // is file-private upstream, but klio publishes every top-level
+    // object's singleton under its bare simple name. When a user
+    // program declares a type with the same simple name (`class State`),
+    // the pack singleton shadows it in bare-name resolution and
+    // `State.Active` mis-resolves. To prevent that, such a colliding
+    // pack-private object is registered under a `$`-mangled FQN-derived
+    // name, and an alias (simple -> mangled) is recorded for every pack
+    // class declared in the SAME package so the pack's own bodies (the
+    // object is only referenced from siblings in its file/package) keep
+    // resolving the bare name. Detection: a top-level object WITH an
+    // fqn_override (packaged) whose simple name matches a top-level
+    // type WITHOUT an fqn_override (the package-less user program).
+    let user_top_type_names: std::collections::HashSet<String> = file
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Class(c) if !fqn_overrides.contains_key(&c.span) => Some(c.name.name.clone()),
+            Decl::Object(o) if !fqn_overrides.contains_key(&o.span) => Some(o.name.name.clone()),
+            _ => None,
+        })
+        .collect();
+    // package -> set of pack class/object simple names declared in it
+    // (used to scope the bare-name alias for a mangled object).
+    let mut pack_pkg_types: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for d in &file.decls {
+        let (span, simple) = match d {
+            Decl::Class(c) => (c.span, c.name.name.clone()),
+            Decl::Object(o) => (o.span, o.name.name.clone()),
+            _ => continue,
+        };
+        if let Some(fqn) = fqn_overrides.get(&span) {
+            if let Some((pkg, _)) = fqn.rsplit_once('.') {
+                pack_pkg_types.entry(pkg.to_string()).or_default().insert(simple);
+            }
+        }
+    }
+    // Pending aliases for mangled pack-private objects, applied after
+    // all class names are known: (referencing-class-simple-name,
+    // object-simple-name, mangled-name).
+    let mut pending_object_aliases: Vec<(String, String, String)> = Vec::new();
     let mut all_decls: Vec<Decl> = Vec::with_capacity(file.decls.len());
     for d in &file.decls {
         match d {
             Decl::Object(o) => {
                 if o.is_expect && actual_object_names.contains(&o.name.name) {
+                    continue;
+                }
+                let is_pack_private = matches!(o.visibility, klio_ast::Visibility::Private)
+                    && fqn_overrides.contains_key(&o.span);
+                let collides = user_top_type_names.contains(&o.name.name);
+                if is_pack_private && collides {
+                    let fqn = fqn_overrides.get(&o.span).cloned().unwrap_or_default();
+                    let mangled = fqn.replace('.', "$");
+                    object_names.push(mangled.clone());
+                    let mut synth = synthesize_class_from_object(o);
+                    synth.name = klio_ast::Ident { name: mangled.clone(), span: o.name.span };
+                    all_decls.push(Decl::Class(synth));
+                    // Record the alias for every pack class in this
+                    // object's package so their bodies keep resolving
+                    // the bare object name to the mangled singleton.
+                    if let Some((pkg, _)) = fqn.rsplit_once('.') {
+                        if let Some(types) = pack_pkg_types.get(pkg) {
+                            for cls in types {
+                                if cls != &o.name.name {
+                                    pending_object_aliases.push((
+                                        cls.clone(),
+                                        o.name.name.clone(),
+                                        mangled.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 object_names.push(o.name.name.clone());
@@ -811,6 +882,16 @@ fn build_module_with_overrides(
             }
             other => all_decls.push(other.clone()),
         }
+    }
+    // Wire the package-scoped aliases for any mangled pack-private
+    // top-level objects (see the collision note above): each pack class
+    // in the object's package resolves the bare object name to its
+    // mangled singleton, mirroring the per-class nested-object alias.
+    for (cls, simple, mangled) in pending_object_aliases {
+        nested_object_aliases
+            .entry(cls)
+            .or_default()
+            .insert(simple, mangled);
     }
     // The inline lift loop below has been replaced by
     // `lift_class_recursive`. Disable the original arm so it
