@@ -2413,6 +2413,15 @@ fn apply_unop(op: UnOp, v: &Value) -> Result<Value, EvalError> {
         (UnOp::Dec, Value::Long(l)) => Ok(Value::Long(l.wrapping_sub(1))),
         (UnOp::Dec, Value::Float(f)) => Ok(Value::Float(f - 1.0)),
         (UnOp::Dec, Value::Double(d)) => Ok(Value::Double(d - 1.0)),
+        // Char.inc()/dec() step the code point. klio's Char is a Rust char
+        // (no lone surrogates), so a step that lands in the surrogate gap
+        // keeps the original char rather than panicking.
+        (UnOp::Inc, Value::Char(c)) => {
+            Ok(Value::Char(char::from_u32(*c as u32 + 1).unwrap_or(*c)))
+        }
+        (UnOp::Dec, Value::Char(c)) => {
+            Ok(Value::Char(char::from_u32((*c as u32).wrapping_sub(1)).unwrap_or(*c)))
+        }
         _ => Err(EvalError::Type(format!("UnOp::{op:?} on {v:?}"))),
     }
 }

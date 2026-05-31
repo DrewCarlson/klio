@@ -728,6 +728,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // ----- Additional Char -----
     ("kotlin.Char.uppercaseChar", char_uppercase_char),
     ("kotlin.Char.lowercaseChar", char_lowercase_char),
+    ("kotlin.Char.isHighSurrogate", char_false),
+    ("kotlin.Char.isLowSurrogate", char_false),
+    ("kotlin.Char.isSurrogate", char_false),
     ("kotlin.Char.digitToIntOrNull", char_digit_to_int_or_null),
 
     // ----- Additional Int -----
@@ -3342,15 +3345,37 @@ fn char_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn char_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::String(Arc::new(recv_char(ctx.args, "Char.toString")?.to_string())))
 }
+/// The radix argument of `digitToInt(radix)` / `digitToIntOrNull(radix)`,
+/// validated to Kotlin's 2..36 range (default 10). Returns the radix or an
+/// IllegalArgumentException.
+fn char_digit_radix(args: &[Value]) -> Result<u32, RuntimeError> {
+    let radix = args.get(1).and_then(Value::as_i64).unwrap_or(10);
+    if !(2..=36).contains(&radix) {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IllegalArgumentException",
+            Some(format!("radix {radix} is not in valid range 2..36")),
+        )));
+    }
+    Ok(radix as u32)
+}
+
 fn char_digit_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let c = recv_char(ctx.args, "Char.digitToInt")?;
-    match c.to_digit(10) {
+    let radix = char_digit_radix(ctx.args)?;
+    match c.to_digit(radix) {
         Some(d) => Ok(Value::new_int(d)),
         None => Err(RuntimeError::Thrown(make_exception(
             "kotlin.IllegalArgumentException",
-            Some(format!("Char {c:?} is not a digit")),
+            Some(format!("Char {c:?} is not a digit in the given radix={radix}")),
         ))),
     }
+}
+
+/// klio's `Value::Char` is a Rust `char`, which cannot hold a lone UTF-16
+/// surrogate, so a surrogate-ness test is always false for any representable
+/// char. (Used by e.g. commonPrefixWith.)
+fn char_false(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Bool(false))
 }
 
 // ============================================================
@@ -6967,19 +6992,30 @@ fn string_to_boolean_strict_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeE
 // Additional Char
 // ============================================================
 
+/// Single-Char case mapping: Kotlin's uppercaseChar()/lowercaseChar() return
+/// the original char when the full case mapping isn't a single character
+/// (e.g. 'ß'.uppercaseChar() == 'ß', not 'S' — only the multi-char
+/// uppercase() yields "SS").
+fn single_case_char(c: char, mut mapping: impl Iterator<Item = char>) -> char {
+    let first = mapping.next().unwrap_or(c);
+    if mapping.next().is_some() {
+        c
+    } else {
+        first
+    }
+}
 fn char_uppercase_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let c = recv_char(ctx.args, "Char.uppercaseChar")?;
-    let up = c.to_uppercase().next().unwrap_or(c);
-    Ok(Value::Char(up))
+    Ok(Value::Char(single_case_char(c, c.to_uppercase())))
 }
 fn char_lowercase_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let c = recv_char(ctx.args, "Char.lowercaseChar")?;
-    let lo = c.to_lowercase().next().unwrap_or(c);
-    Ok(Value::Char(lo))
+    Ok(Value::Char(single_case_char(c, c.to_lowercase())))
 }
 fn char_digit_to_int_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let c = recv_char(ctx.args, "Char.digitToIntOrNull")?;
-    Ok(c.to_digit(10).map(|d| Value::new_int(d)).unwrap_or(Value::Null))
+    let radix = char_digit_radix(ctx.args)?;
+    Ok(c.to_digit(radix).map(|d| Value::new_int(d)).unwrap_or(Value::Null))
 }
 
 // ============================================================
@@ -9081,11 +9117,10 @@ fn char_titlecase_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             "Char.titlecaseChar requires a Char receiver".into(),
         )),
     };
-    // Title-case 1:1 mapping — for chars without a specific title form,
-    // this is the uppercase mapping.
-    let upper: String = c.to_uppercase().collect();
-    let titled = upper.chars().next().unwrap_or(c);
-    Ok(Value::Char(titled))
+    // Title-case 1:1 mapping — for chars without a specific title form this
+    // is the uppercase mapping, and (like uppercaseChar) the original char
+    // when the uppercase mapping isn't a single character ('ß' -> 'ß').
+    Ok(Value::Char(single_case_char(c, c.to_uppercase())))
 }
 
 #[cfg(test)]
