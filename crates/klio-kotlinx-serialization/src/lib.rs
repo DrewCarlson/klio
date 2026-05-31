@@ -57,6 +57,7 @@ fn ctor_param_names(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         items: klio_runtime::ObjRef::new(items),
         mutable: false,
         enum_class: None,
+        backing: None,
     })
 }
 

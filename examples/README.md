@@ -94,6 +94,7 @@ cargo run -p klio-cli -- run examples/<name>.kt
 | `member_references.kt`     | Bound and unbound property / getter / function references, invoked directly and passed as transforms (`map(Class::prop)`, `map(::topLevelFun)`). |
 | `reified_filter.kt`        | `reified` type parameters: `filterIsInstance<T>()` over lists, and a user-defined `inline fun <reified T>` extension that composes with it. |
 | `text_transforms.kt`       | `chunked(size) { transform }`, `Regex.replace`/`replaceFirst` with a `(MatchResult)->CharSequence` lambda and `$group` replacement templates. |
+| `map_views.kt`             | Live `MutableMap` `keys`/`values`/`entries` views: `remove`/`removeAll`/`retainAll`/`clear` and `MutableEntry.setValue` write through to the map. |
 | `m6b_taste.kt`             | Exceptions, lambdas, scope functions, and the broad numeric/string/char intrinsic surface together. |
 
 ## Integration showcases

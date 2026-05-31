@@ -2281,6 +2281,7 @@ fn exec_inst(
                     items: klio_runtime::ObjRef::new(items),
                     mutable: false,
                     enum_class: None,
+                    backing: None,
                 },
             );
         }

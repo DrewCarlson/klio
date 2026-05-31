@@ -1010,6 +1010,22 @@ impl Scheduler for InProcessScheduler {
     }
 }
 
+/// Which face of a `MutableMap` a live view exposes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapViewKind {
+    Keys,
+    Values,
+    Entries,
+}
+
+/// Back-reference carried by a live `MutableMap.keys` / `.values` /
+/// `.entries` collection so its mutators edit the originating map.
+#[derive(Clone, Debug)]
+pub struct MapBacking {
+    pub entries: ObjRef<Vec<(Value, Value)>>,
+    pub kind: MapViewKind,
+}
+
 #[derive(Clone)]
 pub enum Value {
     Unit,
@@ -1087,6 +1103,10 @@ pub enum Value {
         items: ObjRef<Vec<Value>>,
         mutable: bool,
         enum_class: Option<Arc<String>>,
+        /// Set when this list is a live `MutableMap.values` view: bulk
+        /// mutators (`remove`/`clear`/`removeAll`/`retainAll`) propagate
+        /// back to the backing map's entries. `None` for ordinary lists.
+        backing: Option<Box<MapBacking>>,
     },
     /// `kotlin.Array<T>` and the primitive-array siblings (`IntArray`,
     /// `DoubleArray`, …). Fixed-size, mutable element storage. The
@@ -1099,7 +1119,14 @@ pub enum Value {
     },
     /// `kotlin.collections.Set` / `MutableSet`. Vec-backed with linear-scan
     /// uniqueness, matching `LinkedHashSet` semantics (insertion order).
-    Set { items: ObjRef<Vec<Value>>, mutable: bool },
+    Set {
+        items: ObjRef<Vec<Value>>,
+        mutable: bool,
+        /// Set when this set is a live `MutableMap.keys` / `.entries`
+        /// view: bulk mutators propagate to the backing map. `None` for
+        /// ordinary sets.
+        backing: Option<Box<MapBacking>>,
+    },
     /// `kotlin.collections.Map` / `MutableMap`. Vec-backed, insertion-ordered
     /// (mirrors `LinkedHashMap`, which is Kotlin's default Map impl).
     Map { entries: ObjRef<Vec<(Value, Value)>>, mutable: bool },
@@ -1109,7 +1136,13 @@ pub enum Value {
     Triple(Box<Value>, Box<Value>, Box<Value>),
     /// `kotlin.collections.Map.Entry`. Yielded by iterating a `Map`.
     /// Exposes `.key` / `.value`. `toString` renders as `key=value`.
-    MapEntry { key: Box<Value>, value: Box<Value> },
+    /// `backing`, when set, is the live map's entries: `setValue`
+    /// writes through to the slot keyed by `key`.
+    MapEntry {
+        key: Box<Value>,
+        value: Box<Value>,
+        backing: Option<ObjRef<Vec<(Value, Value)>>>,
+    },
     /// `kotlin.Result<T>`. `ok` distinguishes success from failure; `payload`
     /// is the success value or the captured `kotlin.Throwable`.
     Result { ok: bool, payload: Box<Value> },
@@ -2020,14 +2053,14 @@ impl fmt::Debug for Value {
                 Some(m) => write!(f, "Exception({fqn}: {m:?})"),
                 None => write!(f, "Exception({fqn})"),
             },
-            Self::List { items, mutable, enum_class } => {
+            Self::List { items, mutable, enum_class, .. } => {
                 let tag = match enum_class {
                     Some(n) => format!("EnumEntries<{n}>"),
                     None => (if *mutable { "mut" } else { "ro" }).to_string(),
                 };
                 write!(f, "List({}, {} items)", tag, items.borrow().len())
             }
-            Self::Set { items, mutable } => {
+            Self::Set { items, mutable, .. } => {
                 write!(f, "Set({}, {} items)", if *mutable { "mut" } else { "ro" }, items.borrow().len())
             }
             Self::Map { entries, mutable } => {
@@ -2035,7 +2068,7 @@ impl fmt::Debug for Value {
             }
             Self::Pair(a, b) => write!(f, "Pair({a:?}, {b:?})"),
             Self::Triple(a, b, c) => write!(f, "Triple({a:?}, {b:?}, {c:?})"),
-            Self::MapEntry { key, value } => write!(f, "Map.Entry({key:?}={value:?})"),
+            Self::MapEntry { key, value, .. } => write!(f, "Map.Entry({key:?}={value:?})"),
             Self::Result { ok, payload } => write!(f, "Result(ok={ok}, payload={payload:?})"),
             Self::Comparator { steps, descending } => write!(
                 f,
@@ -2176,7 +2209,7 @@ impl fmt::Display for Value {
                 write_collection_element(f, c)?;
                 write!(f, ")")
             }
-            Self::MapEntry { key, value } => {
+            Self::MapEntry { key, value, .. } => {
                 write_collection_element(f, key)?;
                 write!(f, "=")?;
                 write_collection_element(f, value)
@@ -2869,7 +2902,7 @@ impl Value {
                     && Value::structural_eq(a2, b2)
                     && Value::structural_eq(a3, b3)
             }
-            (MapEntry { key: k1, value: v1 }, MapEntry { key: k2, value: v2 }) => {
+            (MapEntry { key: k1, value: v1, .. }, MapEntry { key: k2, value: v2, .. }) => {
                 Value::structural_eq(k1, k2) && Value::structural_eq(v1, v2)
             }
             (Result { ok: o1, payload: p1 }, Result { ok: o2, payload: p2 }) => {
@@ -3537,9 +3570,22 @@ fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
         | Value::Match(_)
         | Value::MatchGroup { .. } => {}
 
-        Value::List { items, .. }
-        | Value::Array { items, .. }
-        | Value::Set { items, .. } => {
+        Value::List { items, backing, .. } | Value::Set { items, backing, .. } => {
+            if mark_cell(items, seen) {
+                for elem in items.borrow().iter() {
+                    publish_value(elem, seen);
+                }
+            }
+            if let Some(b) = backing {
+                if mark_cell(&b.entries, seen) {
+                    for (k, v) in b.entries.borrow().iter() {
+                        publish_value(k, seen);
+                        publish_value(v, seen);
+                    }
+                }
+            }
+        }
+        Value::Array { items, .. } => {
             if mark_cell(items, seen) {
                 for elem in items.borrow().iter() {
                     publish_value(elem, seen);
@@ -3618,9 +3664,17 @@ fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
             publish_value(b, seen);
             publish_value(c, seen);
         }
-        Value::MapEntry { key, value } => {
+        Value::MapEntry { key, value, backing } => {
             publish_value(key, seen);
             publish_value(value, seen);
+            if let Some(b) = backing {
+                if mark_cell(b, seen) {
+                    for (k, v) in b.borrow().iter() {
+                        publish_value(k, seen);
+                        publish_value(v, seen);
+                    }
+                }
+            }
         }
         Value::Result { payload, .. } => publish_value(payload, seen),
         Value::Exception { cause, .. } => {
@@ -3920,7 +3974,7 @@ fn gc_mark_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
             gc_mark_value(b, seen);
             gc_mark_value(c, seen);
         }
-        Value::MapEntry { key, value } => {
+        Value::MapEntry { key, value, backing: None } => {
             gc_mark_value(key, seen);
             gc_mark_value(value, seen);
         }
@@ -4063,7 +4117,7 @@ mod tests {
         let entries = Value::List {
             items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
-            enum_class: Some(Arc::new("Color".to_string())),
+            enum_class: Some(Arc::new("Color".to_string())), backing: None,
         };
         assert!(entries.is_runtime_type("List"));
         assert!(entries.is_runtime_type("EnumEntries"));
@@ -4072,7 +4126,7 @@ mod tests {
         let plain = Value::List {
             items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
-            enum_class: None,
+            enum_class: None, backing: None,
         };
         assert!(plain.is_runtime_type("List"));
         assert!(!plain.is_runtime_type("EnumEntries"));
@@ -4096,7 +4150,7 @@ mod tests {
             native_state: None,
         });
         let items = ObjRef::new(vec![Value::Instance(inst.clone())]);
-        let root = Value::List { items: items.clone(), mutable: false, enum_class: None };
+        let root = Value::List { items: items.clone(), mutable: false, enum_class: None, backing: None };
 
         assert!(!items.is_shared());
         assert!(!inst.is_shared());
@@ -4159,7 +4213,7 @@ mod tests {
     fn publish_deep_is_idempotent() {
         let cell = ObjRef::new(Value::Int(1));
         let items = ObjRef::new(vec![Value::Cell(cell.clone())]);
-        let root = Value::List { items: items.clone(), mutable: true, enum_class: None };
+        let root = Value::List { items: items.clone(), mutable: true, enum_class: None, backing: None };
 
         root.publish_deep();
         root.publish_deep();
@@ -4188,7 +4242,7 @@ mod tests {
         let entries = Value::List {
             items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
-            enum_class: Some(Arc::new("Color".to_string())),
+            enum_class: Some(Arc::new("Color".to_string())), backing: None,
         };
         assert_eq!(entries.type_fqn(), "kotlin.collections.List");
     }
@@ -4206,7 +4260,7 @@ mod tests {
         let live = ObjRef::new(vec![Value::Int(7)]);
         env.borrow_mut().define(
             "xs",
-            Value::List { items: live.clone(), mutable: true, enum_class: None },
+            Value::List { items: live.clone(), mutable: true, enum_class: None, backing: None },
         );
         gc::register_root_env(&env);
 

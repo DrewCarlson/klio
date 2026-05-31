@@ -581,6 +581,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableSet.isEmpty", coll_set_is_empty),
     ("kotlin.collections.MutableSet.isNotEmpty", coll_set_is_not_empty),
     ("kotlin.collections.MutableSet.remove", coll_mut_set_remove),
+    ("kotlin.collections.MutableSet.removeAll", coll_mut_set_remove_all),
+    ("kotlin.collections.MutableSet.retainAll", coll_mut_set_retain_all),
     ("kotlin.collections.MutableSet.size", coll_set_size),
     ("kotlin.collections.MutableSet.toString", coll_set_to_string),
 
@@ -1139,6 +1141,7 @@ fn iterable_items(v: &Value, what: &str) -> Result<Vec<Value>, RuntimeError> {
             .map(|(k, v)| Value::MapEntry {
                 key: Box::new(k.clone()),
                 value: Box::new(v.clone()),
+                backing: None,
             })
             .collect()),
         _ => Err(RuntimeError::Type(format!(
@@ -1813,13 +1816,14 @@ fn builders_build_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         items: ObjRef::new(Vec::new()),
         mutable: true,
         enum_class: None,
+        backing: None,
     };
     {
         let CallCtx { out, host, .. } = ctx;
         host.invoke_callable_with_this(&block, &[], &buildable, *out)?;
     }
     let Value::List { items, .. } = buildable else { unreachable!() };
-    Ok(Value::List { items, mutable: false, enum_class: None })
+    Ok(Value::List { items, mutable: false, enum_class: None, backing: None })
 }
 
 fn builders_build_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -1831,6 +1835,7 @@ fn builders_build_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         items: ObjRef::new(Vec::new()),
         mutable: true,
         enum_class: None,
+        backing: None,
     };
     {
         let CallCtx { out, host, .. } = ctx;
@@ -1843,7 +1848,7 @@ fn builders_build_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             deduped.push(v.clone());
         }
     }
-    Ok(Value::Set { items: ObjRef::new(deduped), mutable: false })
+    Ok(Value::Set { items: ObjRef::new(deduped), mutable: false, backing: None })
 }
 
 fn builders_build_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -4095,7 +4100,7 @@ fn throwable_cause(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 // ============================================================
 
 fn make_list(items: Vec<Value>, mutable: bool) -> Value {
-    Value::List { items: ObjRef::new(items), mutable, enum_class: None }
+    Value::List { items: ObjRef::new(items), mutable, enum_class: None, backing: None }
 }
 
 fn make_set(items: Vec<Value>, mutable: bool) -> Value {
@@ -4105,7 +4110,7 @@ fn make_set(items: Vec<Value>, mutable: bool) -> Value {
             deduped.push(v);
         }
     }
-    Value::Set { items: ObjRef::new(deduped), mutable }
+    Value::Set { items: ObjRef::new(deduped), mutable, backing: None }
 }
 
 fn make_map(entries: Vec<(Value, Value)>, mutable: bool) -> Value {
@@ -4820,6 +4825,7 @@ fn coll_mut_list_remove_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn coll_mut_list_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "MutableList.clear")?;
     it.borrow_mut().clear();
+    sync_map_view(&ctx.args[0]);
     Ok(Value::Unit)
 }
 
@@ -5937,7 +5943,7 @@ fn coll_set_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
         single => push(&mut out, single.clone()),
     }
-    Ok(Value::Set { items: ObjRef::new(out), mutable: false })
+    Ok(Value::Set { items: ObjRef::new(out), mutable: false, backing: None })
 }
 
 fn coll_set_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5955,7 +5961,7 @@ fn coll_set_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .filter(|v| !removals.iter().any(|r| Value::structural_eq(r, v)))
         .cloned()
         .collect();
-    Ok(Value::Set { items: ObjRef::new(out), mutable: false })
+    Ok(Value::Set { items: ObjRef::new(out), mutable: false, backing: None })
 }
 
 /// `Map + Pair` / `Map + Map` / `Map + Iterable<Pair>` — returns a
@@ -6043,13 +6049,55 @@ fn coll_set_intersect(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .filter(|v| other.iter().any(|o| Value::structural_eq(o, v)))
         .cloned()
         .collect();
-    Ok(Value::Set { items: ObjRef::new(out), mutable: false })
+    Ok(Value::Set { items: ObjRef::new(out), mutable: false, backing: None })
 }
 fn coll_set_subtract(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     coll_set_minus(ctx)
 }
 
 // ----- Set helpers -----
+
+/// After a live `MutableMap.keys`/`.values`/`.entries` view has had its
+/// `items` mutated (remove/removeAll/retainAll/clear), rebuild the backing
+/// map's entries to mirror the surviving elements. Order-preserving;
+/// value-multiplicity-aware for the `values` view.
+fn sync_map_view(receiver: &Value) {
+    let (items, backing) = match receiver {
+        Value::Set { items, backing: Some(b), .. }
+        | Value::List { items, backing: Some(b), .. } => (items.clone(), b.clone()),
+        _ => return,
+    };
+    let items_b = items.borrow();
+    let kind = backing.kind;
+    let mut entries = backing.entries.borrow_mut();
+    // The surviving `items` are an order-preserving subsequence of the
+    // pre-mutation projection of the entries (keys / values / entry-keys).
+    // Walk both in lockstep: keep an entry when its projection matches the
+    // next surviving item, advancing the item cursor; drop it otherwise.
+    // Subsequence (not multiset) matching keeps the right entry when values
+    // repeat — `values.remove(v)` drops the entry of the *first* matching
+    // value, exactly as the JVM view does.
+    let mut j = 0usize;
+    entries.retain(|(k, v)| {
+        let proj = match kind {
+            klio_runtime::MapViewKind::Values => v,
+            _ => k,
+        };
+        let matched = items_b.get(j).is_some_and(|it| {
+            let target = match (kind, it) {
+                (klio_runtime::MapViewKind::Entries, Value::MapEntry { key, .. }) => key.as_ref(),
+                _ => it,
+            };
+            Value::structural_eq(proj, target)
+        });
+        if matched {
+            j += 1;
+            true
+        } else {
+            false
+        }
+    });
+}
 
 fn recv_set_items<'a>(args: &'a [Value], what: &str) -> Result<ObjRef<Vec<Value>>, RuntimeError> {
     match args.first() {
@@ -6271,17 +6319,60 @@ fn coll_mut_set_remove(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(arg) = ctx.args.get(1) else {
         return Err(RuntimeError::Arity("remove requires an argument".into()));
     };
-    let mut borrow = it.borrow_mut();
-    if let Some(pos) = borrow.iter().position(|v| Value::structural_eq(v, arg)) {
-        borrow.remove(pos);
-        Ok(Value::Bool(true))
-    } else {
-        Ok(Value::Bool(false))
+    let removed = {
+        let mut borrow = it.borrow_mut();
+        if let Some(pos) = borrow.iter().position(|v| Value::structural_eq(v, arg)) {
+            borrow.remove(pos);
+            true
+        } else {
+            false
+        }
+    };
+    if removed {
+        sync_map_view(&ctx.args[0]);
     }
+    Ok(Value::Bool(removed))
 }
 fn coll_mut_set_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     recv_set_items(ctx.args, "MutableSet.clear")?.borrow_mut().clear();
+    sync_map_view(&ctx.args[0]);
     Ok(Value::Unit)
+}
+fn coll_mut_set_remove_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let it = recv_set_items(ctx.args, "MutableSet.removeAll")?;
+    let other: Vec<Value> = match ctx.args.get(1) {
+        Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
+        Some(Value::Array { items, .. }) => items.borrow().clone(),
+        _ => return Err(RuntimeError::Type("removeAll requires a collection".into())),
+    };
+    let changed = {
+        let mut b = it.borrow_mut();
+        let before = b.len();
+        b.retain(|v| !other.iter().any(|o| Value::structural_eq(v, o)));
+        b.len() != before
+    };
+    if changed {
+        sync_map_view(&ctx.args[0]);
+    }
+    Ok(Value::Bool(changed))
+}
+fn coll_mut_set_retain_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let it = recv_set_items(ctx.args, "MutableSet.retainAll")?;
+    let other: Vec<Value> = match ctx.args.get(1) {
+        Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
+        Some(Value::Array { items, .. }) => items.borrow().clone(),
+        _ => return Err(RuntimeError::Type("retainAll requires a collection".into())),
+    };
+    let changed = {
+        let mut b = it.borrow_mut();
+        let before = b.len();
+        b.retain(|v| other.iter().any(|o| Value::structural_eq(v, o)));
+        b.len() != before
+    };
+    if changed {
+        sync_map_view(&ctx.args[0]);
+    }
+    Ok(Value::Bool(changed))
 }
 
 // ----- Map helpers -----
@@ -6338,12 +6429,27 @@ fn coll_map_contains_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn coll_map_keys(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "Map.keys")?;
     let keys: Vec<Value> = entries.borrow().iter().map(|(k, _)| k.clone()).collect();
-    Ok(make_set(keys, false))
+    Ok(Value::Set {
+        items: ObjRef::new(keys),
+        mutable: true,
+        backing: Some(Box::new(klio_runtime::MapBacking {
+            entries,
+            kind: klio_runtime::MapViewKind::Keys,
+        })),
+    })
 }
 fn coll_map_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "Map.values")?;
     let values: Vec<Value> = entries.borrow().iter().map(|(_, v)| v.clone()).collect();
-    Ok(make_list(values, false))
+    Ok(Value::List {
+        items: ObjRef::new(values),
+        mutable: true,
+        enum_class: None,
+        backing: Some(Box::new(klio_runtime::MapBacking {
+            entries,
+            kind: klio_runtime::MapViewKind::Values,
+        })),
+    })
 }
 fn coll_map_entries(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "Map.entries")?;
@@ -6353,9 +6459,17 @@ fn coll_map_entries(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .map(|(k, v)| Value::MapEntry {
             key: Box::new(k.clone()),
             value: Box::new(v.clone()),
+            backing: Some(entries.clone()),
         })
         .collect();
-    Ok(make_set(map_entries, false))
+    Ok(Value::Set {
+        items: ObjRef::new(map_entries),
+        mutable: true,
+        backing: Some(Box::new(klio_runtime::MapBacking {
+            entries,
+            kind: klio_runtime::MapViewKind::Entries,
+        })),
+    })
 }
 fn coll_map_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = ctx.args.first().ok_or_else(|| RuntimeError::Type("Map.toString requires a receiver".into()))?;
@@ -6611,7 +6725,7 @@ fn run_seq_builder(ctx: &mut CallCtx, who: &str) -> Result<ObjRef<Vec<Value>>, R
             id,
             vec![(
                 "__seq_buffer".to_string(),
-                Value::List { items: buffer.clone(), mutable: true, enum_class: None },
+                Value::List { items: buffer.clone(), mutable: true, enum_class: None, backing: None },
             )],
         )
     };
@@ -7707,13 +7821,19 @@ fn coll_mut_list_remove(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(arg) = ctx.args.get(1) else {
         return Err(RuntimeError::Arity("remove requires an argument".into()));
     };
-    let mut b = it.borrow_mut();
-    if let Some(pos) = b.iter().position(|v| Value::structural_eq(v, arg)) {
-        b.remove(pos);
-        Ok(Value::Bool(true))
-    } else {
-        Ok(Value::Bool(false))
+    let removed = {
+        let mut b = it.borrow_mut();
+        if let Some(pos) = b.iter().position(|v| Value::structural_eq(v, arg)) {
+            b.remove(pos);
+            true
+        } else {
+            false
+        }
+    };
+    if removed {
+        sync_map_view(&ctx.args[0]);
     }
+    Ok(Value::Bool(removed))
 }
 
 fn coll_mut_list_remove_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -7722,10 +7842,16 @@ fn coll_mut_list_remove_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
         _ => return Err(RuntimeError::Type("removeAll requires a collection".into())),
     };
-    let mut b = it.borrow_mut();
-    let before = b.len();
-    b.retain(|v| !other.iter().any(|o| Value::structural_eq(v, o)));
-    Ok(Value::Bool(b.len() != before))
+    let changed = {
+        let mut b = it.borrow_mut();
+        let before = b.len();
+        b.retain(|v| !other.iter().any(|o| Value::structural_eq(v, o)));
+        b.len() != before
+    };
+    if changed {
+        sync_map_view(&ctx.args[0]);
+    }
+    Ok(Value::Bool(changed))
 }
 
 fn coll_mut_list_retain_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -7734,10 +7860,16 @@ fn coll_mut_list_retain_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
         _ => return Err(RuntimeError::Type("retainAll requires a collection".into())),
     };
-    let mut b = it.borrow_mut();
-    let before = b.len();
-    b.retain(|v| other.iter().any(|o| Value::structural_eq(v, o)));
-    Ok(Value::Bool(b.len() != before))
+    let changed = {
+        let mut b = it.borrow_mut();
+        let before = b.len();
+        b.retain(|v| other.iter().any(|o| Value::structural_eq(v, o)));
+        b.len() != before
+    };
+    if changed {
+        sync_map_view(&ctx.args[0]);
+    }
+    Ok(Value::Bool(changed))
 }
 
 fn coll_mut_list_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

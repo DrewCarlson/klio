@@ -2488,7 +2488,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: Some(Arc::new(cls.name.clone())),
+                        enum_class: Some(Arc::new(cls.name.clone())), backing: None,
                     });
                 }
                 if let Some((_, v)) = cls
@@ -2541,7 +2541,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                             return Ok(klio_runtime::Value::List {
                                 items: klio_runtime::ObjRef::new(items),
                                 mutable: false,
-                                enum_class: None,
+                                enum_class: None, backing: None,
                             });
                         }
                         _ => {}
@@ -2794,7 +2794,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: None,
+                        enum_class: None, backing: None,
                     });
                 }
                 "supertypes" => {
@@ -2812,7 +2812,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: None,
+                        enum_class: None, backing: None,
                     });
                 }
                 "sealedSubclasses" => {
@@ -2826,7 +2826,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: None,
+                        enum_class: None, backing: None,
                     });
                 }
                 _ => {}
@@ -3217,7 +3217,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: Some(Arc::new(class_def.name.clone())),
+                        enum_class: Some(Arc::new(class_def.name.clone())), backing: None,
                     });
                 }
             }
@@ -5770,7 +5770,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         .iter()
                         .map(|(k, v)| klio_runtime::Value::MapEntry {
                             key: Box::new(k.clone()),
-                            value: Box::new(v.clone()),
+                            value: Box::new(v.clone()), backing: None,
                         })
                         .collect();
                     return Ok(klio_runtime::Value::Iterator {
@@ -5877,7 +5877,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 let as_list = klio_runtime::Value::List {
                     items: klio_runtime::ObjRef::new(items),
                     mutable: false,
-                    enum_class: None,
+                    enum_class: None, backing: None,
                 };
                 // Materialize Sequence arguments too, so ops that take another
                 // sequence (e.g. `seq.zip(otherSeq)`) reach the List intrinsic
@@ -5889,7 +5889,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         margs.push(klio_runtime::Value::List {
                             items: klio_runtime::ObjRef::new(it),
                             mutable: false,
-                            enum_class: None,
+                            enum_class: None, backing: None,
                         });
                     } else {
                         margs.push(a.clone());
@@ -6100,7 +6100,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 return Ok(klio_runtime::Value::List {
                     items: klio_runtime::ObjRef::new(items),
                     mutable: false,
-                    enum_class: Some(Arc::new(cls.name.clone())),
+                    enum_class: Some(Arc::new(cls.name.clone())), backing: None,
                 });
             }
             // Enum.valueOf("X") — find entry by name.
@@ -6301,7 +6301,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                                     return Ok(klio_runtime::Value::List {
                                         items: klio_runtime::ObjRef::new(items),
                                         mutable: false,
-                                        enum_class: None,
+                                        enum_class: None, backing: None,
                                     });
                                 }
                                 _ => {}
@@ -6390,7 +6390,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(sorted),
                         mutable: false,
-                        enum_class: None,
+                        enum_class: None, backing: None,
                     });
                 }
             }
@@ -6563,7 +6563,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(v),
                         mutable: false,
-                        enum_class: None,
+                        enum_class: None, backing: None,
                     });
                 }
                 ("toMutableList", 0) => {
@@ -6571,7 +6571,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(v),
                         mutable: true,
-                        enum_class: None,
+                        enum_class: None, backing: None,
                     });
                 }
                 ("asList", 0) => {
@@ -6579,7 +6579,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(v),
                         mutable: false,
-                        enum_class: None,
+                        enum_class: None, backing: None,
                     });
                 }
                 ("toTypedArray", 0) => {
@@ -6593,7 +6593,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let v: Vec<klio_runtime::Value> = items.borrow().clone();
                     return Ok(klio_runtime::Value::Set {
                         items: klio_runtime::ObjRef::new(v),
-                        mutable: false,
+                        mutable: false, backing: None,
                     });
                 }
                 // `CharArray.concatToString()` /
@@ -6738,6 +6738,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             (klio_runtime::Value::Triple(_, _, c), "component3" | "third") => return Ok((**c).clone()),
             (klio_runtime::Value::MapEntry { key, .. }, "component1" | "key") => return Ok((**key).clone()),
             (klio_runtime::Value::MapEntry { value, .. }, "component2" | "value") => return Ok((**value).clone()),
+            // `MutableMap.MutableEntry.setValue(v)` writes through to the
+            // backing map (when this entry came from a live `entries` view)
+            // and returns the previous value.
+            (klio_runtime::Value::MapEntry { key, value, backing }, "setValue") => {
+                let new_v = args.first().cloned().unwrap_or(klio_runtime::Value::Unit);
+                let prev = (**value).clone();
+                if let Some(entries) = backing {
+                    let mut b = entries.borrow_mut();
+                    if let Some(slot) =
+                        b.iter_mut().find(|(k, _)| klio_runtime::Value::structural_eq(k, key))
+                    {
+                        slot.1 = new_v;
+                    }
+                }
+                return Ok(prev);
+            }
             _ => {}
         }
         if let klio_runtime::Value::Iterator { items, pos, .. } = receiver {
@@ -7487,7 +7503,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let as_list = klio_runtime::Value::List {
                 items: klio_runtime::ObjRef::new(items),
                 mutable: false,
-                enum_class: None,
+                enum_class: None, backing: None,
             };
             return self.call_member(&as_list, name, args);
         }
@@ -9385,7 +9401,7 @@ impl<'a> VmHost<'a> {
         Ok(klio_runtime::Value::List {
             items: klio_runtime::ObjRef::new(items),
             mutable: false,
-            enum_class: None,
+            enum_class: None, backing: None,
         })
     }
 
@@ -9789,26 +9805,26 @@ fn default_value_for_primary(
                         return Some(klio_runtime::Value::List {
                             items: klio_runtime::ObjRef::new(Vec::new()),
                             mutable: true,
-                            enum_class: None,
+                            enum_class: None, backing: None,
                         });
                     }
                     "listOf" | "emptyList" => {
                         return Some(klio_runtime::Value::List {
                             items: klio_runtime::ObjRef::new(Vec::new()),
                             mutable: false,
-                            enum_class: None,
+                            enum_class: None, backing: None,
                         });
                     }
                     "mutableSetOf" | "hashSetOf" | "linkedSetOf" => {
                         return Some(klio_runtime::Value::Set {
                             items: klio_runtime::ObjRef::new(Vec::new()),
-                            mutable: true,
+                            mutable: true, backing: None,
                         });
                     }
                     "setOf" | "emptySet" => {
                         return Some(klio_runtime::Value::Set {
                             items: klio_runtime::ObjRef::new(Vec::new()),
-                            mutable: false,
+                            mutable: false, backing: None,
                         });
                     }
                     "mutableMapOf" | "hashMapOf" | "linkedMapOf" => {
