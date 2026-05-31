@@ -2288,6 +2288,21 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // `e::class.simpleName` / `.qualifiedName` for a builtin exception:
+        // `e::class` returns the Exception value itself (klio has no ClassDef
+        // for the builtin Throwable hierarchy), so resolve the reflective name
+        // fields off its fqn. simpleName is the last FQN segment; qualifiedName
+        // is the full kotlin.* name.
+        if matches!(name, "simpleName" | "qualifiedName") {
+            if let klio_runtime::Value::Exception { fqn, .. } = receiver {
+                let v = if name == "simpleName" {
+                    fqn.rsplit('.').next().unwrap_or(fqn).to_string()
+                } else {
+                    (**fqn).clone()
+                };
+                return Ok(klio_runtime::Value::String(Arc::new(v)));
+            }
+        }
         // Suspend-implicit `kotlin.coroutines.coroutineContext`
         // intrinsic: it is the *running* coroutine's context, not a
         // member of whatever `this` a suspend member carries. klio
@@ -4754,6 +4769,10 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 ("IllegalArgumentException", "RuntimeException")
                     | ("IllegalStateException", "RuntimeException")
                     | ("IndexOutOfBoundsException", "RuntimeException")
+                    | ("ArrayIndexOutOfBoundsException", "IndexOutOfBoundsException")
+                    | ("ArrayIndexOutOfBoundsException", "RuntimeException")
+                    | ("StringIndexOutOfBoundsException", "IndexOutOfBoundsException")
+                    | ("StringIndexOutOfBoundsException", "RuntimeException")
                     | ("NullPointerException", "RuntimeException")
                     | ("ArithmeticException", "RuntimeException")
                     | ("ClassCastException", "RuntimeException")
@@ -6509,7 +6528,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let len = b.len();
                     return Err(klio_ir::eval::EvalError::Throw(
                         klio_runtime::Value::Exception {
-                            fqn: Arc::new("kotlin.IndexOutOfBoundsException".to_string()),
+                            fqn: Arc::new("kotlin.ArrayIndexOutOfBoundsException".to_string()),
                             message: Some(Arc::new(format!(
                                 "Index {idx} out of bounds for length {len}"
                             ))),
@@ -6529,7 +6548,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     }
                     return Err(klio_ir::eval::EvalError::Throw(
                         klio_runtime::Value::Exception {
-                            fqn: Arc::new("kotlin.IndexOutOfBoundsException".to_string()),
+                            fqn: Arc::new("kotlin.ArrayIndexOutOfBoundsException".to_string()),
                             message: Some(Arc::new(format!(
                                 "Index {idx} out of bounds for length {len}"
                             ))),
