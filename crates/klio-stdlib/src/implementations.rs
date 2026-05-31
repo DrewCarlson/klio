@@ -2408,7 +2408,15 @@ fn num_extreme(args: &[Value], want_min: bool, what: &str) -> Result<Value, Runt
             as_f(a).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
             as_f(b).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
         );
-        return Ok(Value::Double(if want_min { x.min(y) } else { x.max(y) }));
+        // Kotlin's minOf/maxOf use Math.min/max, which propagate NaN — unlike
+        // Rust's f64::min/max which return the non-NaN operand.
+        return Ok(Value::Double(if x.is_nan() || y.is_nan() {
+            f64::NAN
+        } else if want_min {
+            x.min(y)
+        } else {
+            x.max(y)
+        }));
     }
     let (x, y) = (
         as_i(a).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
@@ -3862,11 +3870,9 @@ fn float_compare_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let b = ctx.args.get(1).and_then(Value::as_f32).ok_or_else(|| {
         RuntimeError::Type("Float.compareTo requires a number".into())
     })?;
-    Ok(Value::new_int(a.partial_cmp(&b).map_or(0, |o| match o {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    })))
+    // `compareTo` is a total order (NaN greatest, -0.0 < 0.0), unlike the
+    // IEEE `<`/`>` operators.
+    Ok(Value::new_int(kotlin_float_total_cmp(a as f64, b as f64) as i64))
 }
 
 // Double additional conversions (Float).
@@ -4063,11 +4069,9 @@ fn double_compare_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let b = ctx.args.get(1).and_then(Value::as_f64).ok_or_else(|| {
         RuntimeError::Type("Double.compareTo requires a number".into())
     })?;
-    Ok(Value::Int(a.partial_cmp(&b).map_or(0, |o| match o {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    })))
+    // `compareTo` is a total order (NaN greatest, -0.0 < 0.0), unlike the
+    // IEEE `<`/`>` operators.
+    Ok(Value::Int(kotlin_float_total_cmp(a, b) as i32))
 }
 
 // ============================================================
@@ -5464,17 +5468,37 @@ pub fn materialise_sequence_bounded(
     Ok(items)
 }
 
+/// Kotlin's `Double`/`Float` total order (matching `java.lang.Double.compare`):
+/// every `NaN` is greater than all other values (including `+Infinity`) and all
+/// `NaN`s are equal, and `-0.0 < 0.0`. Implemented via the bit ordering Java's
+/// `doubleToLongBits` defines, with `NaN` canonicalised so klio's negative-NaN
+/// bit pattern still sorts as the greatest value. (The IEEE `<`/`>` operators
+/// keep their own non-total semantics elsewhere.)
+fn kotlin_float_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if a < b {
+        Ordering::Less
+    } else if a > b {
+        Ordering::Greater
+    } else {
+        let bits = |x: f64| -> i64 {
+            if x.is_nan() {
+                0x7ff8_0000_0000_0000u64 as i64
+            } else {
+                x.to_bits() as i64
+            }
+        };
+        bits(a).cmp(&bits(b))
+    }
+}
+
 pub fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, RuntimeError> {
     use std::cmp::Ordering::*;
     if a.is_numeric() && b.is_numeric() {
         if a.is_integral() && b.is_integral() {
             return Ok(a.as_i64().unwrap().cmp(&b.as_i64().unwrap()));
         }
-        return Ok(a
-            .as_f64()
-            .unwrap()
-            .partial_cmp(&b.as_f64().unwrap())
-            .unwrap_or(Equal));
+        return Ok(kotlin_float_total_cmp(a.as_f64().unwrap(), b.as_f64().unwrap()));
     }
     Ok(match (a, b) {
         (Value::String(x), Value::String(y)) => crate::text::compare_utf16(x, y),
