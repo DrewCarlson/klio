@@ -1963,6 +1963,27 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 ));
             }
         }
+        // Top-level delegated property backed by an Instance delegate
+        // (e.g. `by Delegates.notNull()` which inlines to a
+        // NotNullProperty instance): dispatch getValue and PROPAGATE its
+        // throw. `lookup_global` calls getValue too but swallows the
+        // error and falls back to returning the delegate instance, so a
+        // NotNullProperty read-before-init silently yielded the delegate
+        // instead of throwing IllegalStateException.
+        if self.module.registry.top_level_delegated_props.contains(name) {
+            if let Some(v @ klio_runtime::Value::Instance(_)) = raw.clone() {
+                let prop_ref = klio_runtime::Value::PropertyRef {
+                    name: Arc::new(name.to_string()),
+                };
+                let result = <Self as klio_ir::eval::Host>::call_member(
+                    self,
+                    &v,
+                    "getValue",
+                    &[klio_runtime::Value::Null, prop_ref],
+                )?;
+                return Ok(Some(result));
+            }
+        }
         Ok(self.lookup_global(name))
     }
 
