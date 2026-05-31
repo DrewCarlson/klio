@@ -1488,16 +1488,30 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 }
                 if !b.is_param_thunk() {
                 if let Some(this_reg) = b.resolve("this") {
-                    let dst = b.alloc_reg();
-                    let nm = b
+                    // A bare name that resolves to a known top-level
+                    // function is a value-position function reference,
+                    // not an implicit `this.<name>` field read. Skip
+                    // the GetField shortcut so the global lookup wins
+                    // — `get_field` on a non-Instance receiver (List,
+                    // Map, Array …) can synthesise misleading values
+                    // for unknown field names that downstream calls
+                    // then invoke as the callable.
+                    let is_known_global = b
                         .module
-                        .intern_const(Const::String(segments[0].name.clone()));
-                    b.push(Inst::GetField {
-                        dst,
-                        receiver: this_reg,
-                        field: nm,
-                    });
-                    return dst;
+                        .func_id(&segments[0].name)
+                        .is_some();
+                    if !is_known_global {
+                        let dst = b.alloc_reg();
+                        let nm = b
+                            .module
+                            .intern_const(Const::String(segments[0].name.clone()));
+                        b.push(Inst::GetField {
+                            dst,
+                            receiver: this_reg,
+                            field: nm,
+                        });
+                        return dst;
+                    }
                 }
                 }
                 let this_idx = b.record_capture("this");
