@@ -5,12 +5,12 @@
 
 package kotlin.collections
 
-internal fun checkIndexOverflow(index: Int): Int {
+internal actual fun checkIndexOverflow(index: Int): Int {
     if (index < 0) throw ArithmeticException("Index overflow has happened.")
     return index
 }
 
-internal fun checkCountOverflow(count: Int): Int {
+internal actual fun checkCountOverflow(count: Int): Int {
     if (count < 0) throw ArithmeticException("Count overflow has happened.")
     return count
 }
