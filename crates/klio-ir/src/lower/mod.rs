@@ -1780,6 +1780,61 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             });
             dst
         }
+        // A member call onto an inline `reified` extension
+        // (`xs.filterIsInstance<T>()`): member dispatch drops type
+        // arguments, so the reified `is T` / `T::class` reads in the
+        // body would test an unbound `T` and accept everything. Splice
+        // the extension body with the receiver bound as `this` and each
+        // reified type-param bound to its call-site class. Only reified
+        // targets take this path — ordinary member extensions keep the
+        // normal dispatch so the splice graph stays bounded. (A member
+        // function can never be `reified`, so a reified inline target
+        // resolved by name is always the intended extension.)
+        Expr::Call { callee, args, arg_names: ast_arg_names, type_args: ast_type_args, is_infix, .. }
+            if !*is_infix
+                && !ast_type_args.is_empty()
+                && matches!(callee.as_ref(), Expr::Member { safe: false, .. })
+                && match callee.as_ref() {
+                    Expr::Member { name, .. } => inline_fn_ast(&name.name)
+                        .map(|f| {
+                            f.receiver_type.is_some()
+                                && f.type_params.iter().any(|tp| tp.is_reified)
+                        })
+                        .unwrap_or(false)
+                        && !b.inline_in_progress(&name.name),
+                    _ => false,
+                } =>
+        {
+            let Expr::Member { receiver, name, .. } = callee.as_ref() else {
+                unreachable!()
+            };
+            if let Some(r) = try_inline_call_with_type_args(
+                b,
+                &name.name,
+                args,
+                ast_arg_names,
+                Some(receiver.as_ref()),
+                ast_type_args,
+            ) {
+                return r;
+            }
+            // Splice bailed (recursion guard / default-arg gap):
+            // fall back to a plain member dispatch.
+            let recv = lower_receiver(b, receiver);
+            let (args_start, n_args) = lower_arg_run(b, args);
+            let arg_names = intern_arg_names(b.module, ast_arg_names);
+            let nm = b.module.intern_const(Const::String(name.name.clone()));
+            let dst = b.alloc_reg();
+            b.push(Inst::CallMember {
+                dst,
+                receiver: recv,
+                name: nm,
+                args: args_start,
+                n_args,
+                arg_names,
+            });
+            return dst;
+        }
         // `repeat(n) { … }` — inline-desugar to a counted loop so
         // the body runs in the caller's eval frame. This must win
         // over the closure-mutating-lambda arms below (the body
