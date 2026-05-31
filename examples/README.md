@@ -91,6 +91,7 @@ cargo run -p klio-cli -- run examples/<name>.kt
 | `notnull_assertion.kt`     | The `!!` operator.                                             |
 | `user_exception_hierarchy.kt` | `throw` / `try` / `catch` / `finally` over a user exception hierarchy. |
 | `reflection_lite.kt`       | `::class`, `::member`, basic `KClass` introspection.           |
+| `member_references.kt`     | Bound and unbound property / getter / function references, invoked directly and passed as transforms (`map(Class::prop)`, `map(::topLevelFun)`). |
 | `m6b_taste.kt`             | Exceptions, lambdas, scope functions, and the broad numeric/string/char intrinsic surface together. |
 
 ## Integration showcases

@@ -681,6 +681,57 @@ impl From<klio_ir::eval::EvalError> for VmError {
 /// here. Methods that have no native implementation yet raise
 /// `EvalError::Unimplemented` (carrying the surface name) so the
 /// failure surfaces are easy to identify and migrate one by one.
+/// Whether `name` names a property (not a function) reachable on
+/// `receiver`'s class. Drives bound/unbound member-reference
+/// invocation: a property reference reads the field, a function
+/// reference calls the method. Walks the parent chain and declared
+/// supertypes so inherited properties resolve too. A stored field
+/// already present on the instance is conclusive.
+fn member_is_property(
+    classes: &klio_runtime::ObjRef<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>,
+    receiver: &klio_runtime::Value,
+    name: &str,
+) -> bool {
+    let start = match receiver {
+        klio_runtime::Value::Instance(inst) => {
+            let b = inst.borrow();
+            if b.fields.iter().any(|(n, _)| n == name) {
+                return true;
+            }
+            Arc::clone(&b.class)
+        }
+        klio_runtime::Value::Class(cls) => Arc::clone(cls),
+        _ => return false,
+    };
+    let mut stack = vec![start];
+    let mut seen: Vec<String> = Vec::new();
+    while let Some(c) = stack.pop() {
+        if seen.iter().any(|s| s == &c.name) {
+            continue;
+        }
+        seen.push(c.name.clone());
+        if c
+            .primary_params
+            .iter()
+            .any(|p| p.property.is_some() && p.name == name)
+        {
+            return true;
+        }
+        if c.body_properties.iter().any(|p| p.name == name) {
+            return true;
+        }
+        if let Some(p) = c.parent.borrow().clone() {
+            stack.push(p);
+        }
+        for sn in &c.supertype_names {
+            if let Some(sc) = classes.borrow().get(sn).cloned() {
+                stack.push(sc);
+            }
+        }
+    }
+    false
+}
+
 struct VmHost<'a> {
     globals: klio_runtime::ObjRef<klio_runtime::Env>,
     module: Arc<klio_ir::Module>,
@@ -2049,7 +2100,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let first = args[0].clone();
                     let rest: Vec<klio_runtime::Value> =
                         args[1..].to_vec();
+                    if rest.is_empty() && member_is_property(&self.classes, &first, &name) {
+                        return self.get_field(&first, &name);
+                    }
                     return self.call_member(&first, &name, &rest);
+                }
+                if args.is_empty() && member_is_property(&self.classes, &recv, &name) {
+                    return self.get_field(&recv, &name);
                 }
                 return self.call_member(&recv, &name, args);
             }
@@ -6123,11 +6180,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     // Field reads on the ref itself; handled by
                     // get_field.
                 } else if matches!(&rc, klio_runtime::Value::Class(_)) {
-                    // Unbound property reference: `r.get(arg)` /
-                    // `r.invoke(arg)` reads `arg.<n>`.
-                    if matches!(name, "get" | "call" | "invoke") && args.len() == 1 {
-                        return self.get_field(&args[0], &n);
+                    // Unbound reference invoked through `get`/`call`/
+                    // `invoke`: a property ref reads `arg.<n>`, a
+                    // function ref calls `arg.<n>(rest)`.
+                    if matches!(name, "get" | "call" | "invoke") && !args.is_empty() {
+                        let first = args[0].clone();
+                        let rest: Vec<klio_runtime::Value> = args[1..].to_vec();
+                        if rest.is_empty() && member_is_property(&self.classes, &first, &n) {
+                            return self.get_field(&first, &n);
+                        }
+                        return self.call_member(&first, &n, &rest);
                     }
+                } else if matches!(name, "get" | "call" | "invoke")
+                    && args.is_empty()
+                    && member_is_property(&self.classes, &rc, &n)
+                {
+                    // Bound property reference invoked with no args.
+                    return self.get_field(&rc, &n);
                 } else {
                     // Bound method reference: forward the call.
                     return self.call_member(&rc, &n, args);
@@ -11146,18 +11215,24 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             if let (Some(recv), Some(klio_runtime::Value::String(name))) =
                 (recv, name_v)
             {
+                let unbound = matches!(&recv, klio_runtime::Value::Class(_))
+                    && !args.is_empty();
+                let (target, member_args): (klio_runtime::Value, Vec<klio_runtime::Value>) =
+                    if unbound {
+                        (args[0].clone(), args[1..].to_vec())
+                    } else {
+                        (recv.clone(), args.to_vec())
+                    };
+                let as_property =
+                    member_args.is_empty() && member_is_property(&self.classes, &target, &name);
                 let mut vm_host = self.vm_host(out);
-                let result = if matches!(&recv, klio_runtime::Value::Class(_))
-                    && !args.is_empty()
-                {
-                    let first = args[0].clone();
-                    let rest: Vec<klio_runtime::Value> = args[1..].to_vec();
-                    <VmHost as klio_ir::eval::Host>::call_member(
-                        &mut vm_host, &first, &name, &rest,
+                let result = if as_property {
+                    <VmHost as klio_ir::eval::Host>::get_field(
+                        &mut vm_host, &target, &name,
                     )
                 } else {
                     <VmHost as klio_ir::eval::Host>::call_member(
-                        &mut vm_host, &recv, &name, args,
+                        &mut vm_host, &target, &name, &member_args,
                     )
                 };
                 return result.map_err(|e| match e {
