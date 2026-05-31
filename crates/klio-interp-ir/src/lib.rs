@@ -7056,6 +7056,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 _ => {}
             }
         }
+        // `hashCode()` on a builtin value type (number, Char, Boolean, String,
+        // collection, range). These have no user override and no `<type>.
+        // hashCode` intrinsic, so without an explicit handler the call fell
+        // through to a fallback that recursed and exhausted memory. Compute
+        // the Kotlin-faithful hash directly. Instances keep their own
+        // identity/override path below.
+        if args.is_empty()
+            && name == "hashCode"
+            && !matches!(
+                receiver,
+                klio_runtime::Value::Instance(_)
+                    | klio_runtime::Value::Class(_)
+                    | klio_runtime::Value::PropertyRef { .. }
+            )
+        {
+            return Ok(klio_runtime::Value::new_int(kotlin_hash_code(receiver) as i64));
+        }
         // Stdlib member dispatch: probe the receiver's type FQN
         // for a `<typeFqn>.<name>` intrinsic, then for the common
         // package-extension fallbacks. For 0-arg call shapes the
@@ -9380,6 +9397,89 @@ fn pad_args_with_defaults<H: klio_ir::eval::Host>(
 
 /// Structural value hash matching `Value::structural_eq`. Used by
 /// data-class auto `hashCode`. Mirrors klio-interp's helper.
+/// Kotlin-faithful `hashCode()` for builtin value types. Matches the values
+/// `kotlinc` produces so a program that prints `x.hashCode()` agrees, and —
+/// critically — terminates: dispatching `hashCode` on a primitive/collection
+/// previously found no handler and fell through to a recursive fallback that
+/// allocated without bound (OOM). Instances are handled by their own
+/// identity/override path and are not routed here.
+fn kotlin_hash_code(v: &klio_runtime::Value) -> i32 {
+    use klio_runtime::Value::*;
+    match v {
+        Null => 0,
+        Bool(b) => if *b { 1231 } else { 1237 },
+        Char(c) => *c as i32,
+        Byte(x) => *x as i32,
+        Short(x) => *x as i32,
+        Int(x) => *x,
+        UByte(x) => *x as i32,
+        UShort(x) => *x as i32,
+        UInt(x) => *x as i32,
+        Long(l) => (*l ^ (((*l as u64) >> 32) as i64)) as i32,
+        ULong(u) => (*u ^ (*u >> 32)) as i32,
+        // Kotlin/JVM Float/Double.hashCode use the IEEE bit pattern.
+        Float(f) => f.to_bits() as i32,
+        Double(d) => {
+            let b = d.to_bits() as i64;
+            (b ^ (((b as u64) >> 32) as i64)) as i32
+        }
+        // java.lang.String polynomial hash: s[0]*31^(n-1) + … + s[n-1].
+        String(s) => {
+            let mut h: i32 = 0;
+            for ch in s.encode_utf16() {
+                h = h.wrapping_mul(31).wrapping_add(ch as i32);
+            }
+            h
+        }
+        // List: h=1; h = 31*h + e.hashCode().  Set: sum of element hashes.
+        List { items, .. } => {
+            let mut h: i32 = 1;
+            for e in items.borrow().iter() {
+                h = h.wrapping_mul(31).wrapping_add(kotlin_hash_code(e));
+            }
+            h
+        }
+        Set { items, .. } => items
+            .borrow()
+            .iter()
+            .fold(0i32, |acc, e| acc.wrapping_add(kotlin_hash_code(e))),
+        Map { entries, .. } => entries.borrow().iter().fold(0i32, |acc, (k, val)| {
+            acc.wrapping_add(kotlin_hash_code(k) ^ kotlin_hash_code(val))
+        }),
+        Array { items, .. } => {
+            // Arrays use identity hashCode in Kotlin, but a deterministic
+            // structural fold is the least-surprising answer here and avoids
+            // leaking a nondeterministic identity. (Array.hashCode() is rarely
+            // printed; contentHashCode() is the structural API.)
+            let mut h: i32 = 1;
+            for e in items.borrow().iter() {
+                h = h.wrapping_mul(31).wrapping_add(kotlin_hash_code(e));
+            }
+            h
+        }
+        // Kotlin hashes a plain `IntRange`/`CharRange` (`a..b`, `a until b`,
+        // step 1) as `31*first+last`, but an `IntProgression` (`downTo`,
+        // `step n`) as `31*(31*first+last)+step`. klio's Value::Range carries
+        // no range-vs-progression tag, so use step==1 as the discriminant
+        // (the common case; `a..b step 1` — a step-1 progression — is the only
+        // rare divergence). Empty ranges hash to -1.
+        Range { start, end, step, .. } => {
+            let (f, l, s) = (*start as i32, *end as i32, *step as i32);
+            let empty = if *step > 0 { start > end } else { start < end };
+            if empty {
+                -1
+            } else if *step == 1 {
+                31i32.wrapping_mul(f).wrapping_add(l)
+            } else {
+                (31i32.wrapping_mul(31i32.wrapping_mul(f).wrapping_add(l))).wrapping_add(s)
+            }
+        }
+        // Anything else (closures, opaque host values): fall back to the
+        // structural digest — terminating, just not JVM-identical.
+        other => value_structural_hash(other),
+    }
+}
+
 fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
     use klio_runtime::Value::*;
     use std::hash::{Hash, Hasher};

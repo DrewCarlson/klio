@@ -937,6 +937,11 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.text.StringBuilder.setLength", string_builder_set_length),
     ("kotlin.text.StringBuilder.reverse", string_builder_reverse),
     ("kotlin.text.StringBuilder.substring", string_builder_substring),
+    ("kotlin.text.StringBuilder.subSequence", string_builder_substring),
+    ("kotlin.text.StringBuilder.delete", string_builder_delete_range),
+    ("kotlin.text.StringBuilder.setCharAt", string_builder_set_char_at),
+    ("kotlin.text.StringBuilder.replace", string_builder_replace),
+    ("kotlin.text.StringBuilder.lastIndex", string_builder_last_index),
 
     // ----- String.format / kotlin.text.format -----
     ("kotlin.text.String.format", string_format_static),
@@ -8081,6 +8086,71 @@ fn string_builder_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb_byte = sb_char_byte(&buf, start).unwrap();
     let eb_byte = sb_char_byte(&buf, end).unwrap();
     Ok(Value::String(Arc::new(buf[sb_byte..eb_byte].to_string())))
+}
+
+fn string_builder_set_char_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let sb = sb_arg(ctx.args, "StringBuilder.setCharAt")?;
+    let idx = match ctx.args.get(1).and_then(Value::as_i64) {
+        Some(n) => n,
+        _ => return Err(RuntimeError::Type("setCharAt index must be Int".into())),
+    };
+    let ch = match ctx.args.get(2) {
+        Some(Value::Char(c)) => *c,
+        _ => return Err(RuntimeError::Type("setCharAt requires a Char".into())),
+    };
+    let mut buf = sb.borrow_mut();
+    let n = buf.chars().count() as i64;
+    if idx < 0 || idx >= n {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IndexOutOfBoundsException",
+            Some(format!("index: {idx}, length: {n}")),
+        )));
+    }
+    let byte = sb_char_byte(&buf, idx).unwrap();
+    let old = buf[byte..].chars().next().unwrap();
+    buf.replace_range(byte..byte + old.len_utf8(), &ch.to_string());
+    drop(buf);
+    Ok(Value::Unit)
+}
+
+/// `replace(startIndex, endIndex, newString)` — splice `newString` over the
+/// `[start, end)` char range. Returns the builder (Kotlin/JVM semantics).
+fn string_builder_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let sb = sb_arg(ctx.args, "StringBuilder.replace")?;
+    let start = match ctx.args.get(1).and_then(Value::as_i64) {
+        Some(n) => n,
+        _ => return Err(RuntimeError::Type("replace start must be Int".into())),
+    };
+    let end = match ctx.args.get(2).and_then(Value::as_i64) {
+        Some(n) => n,
+        _ => return Err(RuntimeError::Type("replace end must be Int".into())),
+    };
+    let repl = match ctx.args.get(3) {
+        Some(Value::String(s)) => (**s).clone(),
+        Some(other) => format!("{other}"),
+        None => return Err(RuntimeError::Type("replace requires a replacement string".into())),
+    };
+    let mut buf = sb.borrow_mut();
+    let n = buf.chars().count() as i64;
+    if start < 0 || start > n || start > end {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IndexOutOfBoundsException",
+            Some(format!("start {start}, end {end}, length {n}")),
+        )));
+    }
+    // Kotlin/JVM clamps the end to the current length.
+    let end = end.min(n);
+    let sb_byte = sb_char_byte(&buf, start).unwrap();
+    let eb_byte = sb_char_byte(&buf, end).unwrap();
+    buf.replace_range(sb_byte..eb_byte, &repl);
+    drop(buf);
+    Ok(Value::StringBuilder(sb))
+}
+
+fn string_builder_last_index(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let sb = sb_arg(ctx.args, "StringBuilder.lastIndex")?;
+    let n = sb.borrow().chars().count() as i64;
+    Ok(Value::new_int(n - 1))
 }
 
 // ============================================================
