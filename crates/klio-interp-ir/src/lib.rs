@@ -6499,19 +6499,43 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if name == "get" && args.len() == 1 {
             if let klio_runtime::Value::Array { items, .. } = receiver {
                 if let Some(idx) = args[0].as_i64() {
-                    if let Some(v) = items.borrow().get(idx as usize).cloned() {
+                    let b = items.borrow();
+                    if let Some(v) = b.get(idx as usize).cloned() {
                         return Ok(v);
                     }
+                    // Out-of-bounds (or negative) array index: throw a catchable
+                    // IndexOutOfBoundsException, not fall through to a path that
+                    // mis-casts and raises ClassCastException.
+                    let len = b.len();
+                    return Err(klio_ir::eval::EvalError::Throw(
+                        klio_runtime::Value::Exception {
+                            fqn: Arc::new("kotlin.IndexOutOfBoundsException".to_string()),
+                            message: Some(Arc::new(format!(
+                                "Index {idx} out of bounds for length {len}"
+                            ))),
+                            cause: None,
+                        },
+                    ));
                 }
             }
         }
         if name == "set" && args.len() == 2 {
             if let klio_runtime::Value::Array { items, .. } = receiver {
                 if let Some(idx) = args[0].as_i64() {
+                    let len = items.borrow().len();
                     if let Some(slot) = items.borrow_mut().get_mut(idx as usize) {
                         *slot = args[1].clone();
                         return Ok(klio_runtime::Value::Unit);
                     }
+                    return Err(klio_ir::eval::EvalError::Throw(
+                        klio_runtime::Value::Exception {
+                            fqn: Arc::new("kotlin.IndexOutOfBoundsException".to_string()),
+                            message: Some(Arc::new(format!(
+                                "Index {idx} out of bounds for length {len}"
+                            ))),
+                            cause: None,
+                        },
+                    ));
                 }
             }
         }
