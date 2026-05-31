@@ -989,6 +989,21 @@ fn build_module_with_overrides(
             if klio_stdlib::implementation(&fqn).is_some() {
                 return false;
             }
+            // Some upstream array factories ship a second overload in a
+            // different package than the klio intrinsic — e.g. the
+            // internal `kotlin.collections.arrayOfNulls(reference, size)`
+            // beside the public `kotlin.arrayOfNulls(size)`. The
+            // exact-FQN check above only drops the matching-package
+            // expect, leaving the other bodyless overload to shadow the
+            // intrinsic in bare-name resolution (a call binds the empty
+            // body and yields Unit). Drop any bodyless array-factory
+            // expect whose simple name is backed by a `kotlin.<name>`
+            // intrinsic so all overloads route to the host ctor.
+            if matches!(f.name.name.as_str(), "arrayOfNulls" | "emptyArray")
+                && klio_stdlib::implementation(&format!("kotlin.{}", f.name.name)).is_some()
+            {
+                return false;
+            }
             // Coroutine intrinsic expect funcs: klio implements the
             // coroutine surface natively (continuation passing /
             // scheduler), not via per-FQN intrinsics. Drop upstream

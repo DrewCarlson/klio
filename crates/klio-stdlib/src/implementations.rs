@@ -3686,6 +3686,17 @@ fn coll_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     })
 }
 fn coll_array_of_nulls(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    // Two shapes resolve to this intrinsic:
+    //   public  fun <reified T> arrayOfNulls(size: Int): Array<T?>
+    //   internal fun <T> arrayOfNulls(reference: Array<T>, size: Int): Array<T>
+    // The 2-arg internal form (used by toTypedArray / ArrayDeque) passes
+    // an existing array as the reified-type carrier; only the trailing
+    // `size` matters here, so build `size` nulls regardless of shape.
+    if ctx.args.len() == 2 && matches!(ctx.args.first(), Some(Value::Array { .. })) {
+        let n = array_size_arg(&ctx.args[1], "arrayOfNulls")?;
+        let items: Vec<Value> = (0..n).map(|_| Value::Null).collect();
+        return Ok(Value::Array { items: ObjRef::new(items), prim: None });
+    }
     array_ctor_impl(ctx, "arrayOfNulls", None, Value::Null)
 }
 fn coll_empty_array(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

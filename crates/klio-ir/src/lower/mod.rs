@@ -2636,6 +2636,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             | "hashMapOf"
                             | "linkedMapOf"
                             | "arrayOf"
+                            | "arrayOfNulls"
+                            | "emptyArray"
                             | "emptyList"
                             | "emptySet"
                             | "emptyMap"
