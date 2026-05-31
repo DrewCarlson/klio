@@ -6105,42 +6105,92 @@ fn range_endpoint(kind: klio_runtime::RangeKind, v: i64) -> Value {
     }
 }
 
+/// View a receiver as a range's `(start, end, step, kind)`.
+///
+/// klio represents a range two ways: the host `Value::Range`, and — when the
+/// upstream `kotlin.ranges.{Int,Long,Char}{Range,Progression}` constructor is
+/// invoked as a class (e.g. `Array<T>.indices`'s getter does `IntRange(0,
+/// lastIndex)`) — a generic `Value::Instance` carrying the same `first`/`last`/
+/// `step` fields. Range intrinsics accept either so an op like `reversed` works
+/// regardless of which form a range value took, without a caller having to
+/// normalize first.
+fn as_range_view(v: &Value) -> Option<(i64, i64, i64, klio_runtime::RangeKind)> {
+    use klio_runtime::RangeKind;
+    match v {
+        Value::Range { start, end, step, kind } => Some((*start, *end, *step, *kind)),
+        Value::Instance(inst) => {
+            let b = inst.borrow();
+            let fqn = b.class.fqn.as_str();
+            if !fqn.starts_with("kotlin.ranges.") {
+                return None;
+            }
+            let kind = if fqn.contains("Long") {
+                RangeKind::Long
+            } else if fqn.contains("Char") {
+                RangeKind::Char
+            } else if fqn.contains("Int") {
+                RangeKind::Int
+            } else {
+                return None;
+            };
+            // IntProgression stores first/last/step; IntRange also exposes
+            // start/endInclusive — accept whichever the lowered fields carry.
+            let num = |names: &[&str]| -> Option<i64> {
+                for n in names {
+                    if let Some(val) = b.get(n) {
+                        if let Some(i) = val.as_i64() {
+                            return Some(i);
+                        }
+                        if let Value::Char(c) = val {
+                            return Some(c as i64);
+                        }
+                    }
+                }
+                None
+            };
+            let start = num(&["first", "start"])?;
+            let end = num(&["last", "endInclusive"])?;
+            let step = num(&["step"]).unwrap_or(1);
+            Some((start, end, step, kind))
+        }
+        _ => None,
+    }
+}
+
+fn range_view_arg(ctx: &CallCtx, op: &str) -> Result<(i64, i64, i64, klio_runtime::RangeKind), RuntimeError> {
+    ctx.args
+        .first()
+        .and_then(as_range_view)
+        .ok_or_else(|| RuntimeError::Type(format!("{op} requires a Range receiver")))
+}
+
 fn range_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(Value::Range { start, kind, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("first requires a Range receiver".into()));
-    };
-    Ok(range_endpoint(*kind, *start))
+    let (start, _end, _step, kind) = range_view_arg(ctx, "first")?;
+    Ok(range_endpoint(kind, start))
 }
 
 fn range_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(Value::Range { end, kind, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("last requires a Range receiver".into()));
-    };
-    Ok(range_endpoint(*kind, *end))
+    let (_start, end, _step, kind) = range_view_arg(ctx, "last")?;
+    Ok(range_endpoint(kind, end))
 }
 
 fn range_step_field(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(Value::Range { step, kind, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("step requires a Range receiver".into()));
-    };
-    Ok(range_endpoint(*kind, step.abs()))
+    let (_start, _end, step, kind) = range_view_arg(ctx, "step")?;
+    Ok(range_endpoint(kind, step.abs()))
 }
 
 fn range_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(v @ Value::Range { .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("toString requires a Range receiver".into()));
-    };
-    Ok(Value::String(Arc::new(format!("{v}"))))
+    let (start, end, step, kind) = range_view_arg(ctx, "toString")?;
+    let r = Value::Range { start, end, step, kind };
+    Ok(Value::String(Arc::new(format!("{r}"))))
 }
 
 fn range_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(Value::Range { start, end, step, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("contains requires a Range receiver".into()));
-    };
+    let (start, end, step, _kind) = range_view_arg(ctx, "contains")?;
     let Some(n) = ctx.args.get(1).and_then(Value::as_i64) else {
         return Err(RuntimeError::Type("Range.contains requires an Int argument".into()));
     };
-    let (lo, hi) = if *step > 0 { (*start, *end) } else { (*end, *start) };
+    let (lo, hi) = if step > 0 { (start, end) } else { (end, start) };
     let in_bounds = n >= lo && n <= hi;
     if !in_bounds {
         return Ok(Value::Bool(false));
@@ -6150,41 +6200,33 @@ fn range_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn range_is_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(Value::Range { start, end, step, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("isEmpty requires a Range receiver".into()));
-    };
-    let empty = if *step > 0 { start > end } else { start < end };
+    let (start, end, step, _kind) = range_view_arg(ctx, "isEmpty")?;
+    let empty = if step > 0 { start > end } else { start < end };
     Ok(Value::Bool(empty))
 }
 
 fn range_reversed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(Value::Range { start, end, step, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("reversed requires a Range receiver".into()));
-    };
-    Ok(Value::Range { start: *end, end: *start, step: -*step, kind: klio_runtime::RangeKind::Int })
+    let (start, end, step, kind) = range_view_arg(ctx, "reversed")?;
+    Ok(Value::Range { start: end, end: start, step: -step, kind })
 }
 
 fn range_to_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(Value::Range { start, end, step, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("toList requires a Range receiver".into()));
-    };
-    let items: Vec<Value> = range_iter_int(*start, *end, *step).map(Value::new_int).collect();
+    let (start, end, step, kind) = range_view_arg(ctx, "toList")?;
+    let items: Vec<Value> = range_iter_int(start, end, step)
+        .map(|v| range_endpoint(kind, v))
+        .collect();
     Ok(make_list(items, false))
 }
 
 fn range_count(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(Value::Range { start, end, step, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("count requires a Range receiver".into()));
-    };
-    let n = range_iter_int(*start, *end, *step).count() as i64;
+    let (start, end, step, _kind) = range_view_arg(ctx, "count")?;
+    let n = range_iter_int(start, end, step).count() as i64;
     Ok(Value::new_int(n))
 }
 
 fn range_sum(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(Value::Range { start, end, step, kind }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("sum requires a Range receiver".into()));
-    };
-    let s: i64 = range_iter_int(*start, *end, *step).sum();
+    let (start, end, step, kind) = range_view_arg(ctx, "sum")?;
+    let s: i64 = range_iter_int(start, end, step).sum();
     Ok(match kind {
         klio_runtime::RangeKind::Long => Value::Long(s),
         klio_runtime::RangeKind::Int => Value::new_int(s),
