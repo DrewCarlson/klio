@@ -1291,7 +1291,13 @@ fn exec_inst(
             // through call_member so the stdlib intrinsic handles
             // the merge/remove, just like a user `operator fun`.
             if matches!(*op, BinOp::Add | BinOp::Sub)
-                && matches!(l, Value::Map { .. } | Value::List { .. } | Value::Set { .. })
+                && matches!(
+                    l,
+                    Value::Map { .. }
+                        | Value::List { .. }
+                        | Value::Set { .. }
+                        | Value::Sequence(_)
+                )
             {
                 let method = if matches!(*op, BinOp::Add) { "plus" } else { "minus" };
                 let result = host.call_member(&l, method, std::slice::from_ref(&r))?;

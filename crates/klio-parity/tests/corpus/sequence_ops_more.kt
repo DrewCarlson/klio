@@ -7,4 +7,7 @@ fun main() {
     println(sequenceOf(1, 2, 3).zip(sequenceOf("a", "b", "c")).toList())
     println(sequenceOf(1, 2, 3).map { it * 2 }.zip(sequenceOf(9, 8, 7)).toList())
     println((1..6).asSequence().mapIndexed { i, v -> i to v }.filterIndexed { i, _ -> i % 2 == 0 }.toList())
+    println((sequenceOf(1, 2) + sequenceOf(3, 4)).toList())
+    println((sequenceOf(1, 2, 3) + 10).toList())
+    println((sequenceOf(1, 2, 3, 2) - 2).toList())
 }
