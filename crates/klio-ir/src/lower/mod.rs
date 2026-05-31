@@ -2741,10 +2741,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                     })
                                     .unwrap_or_default();
                                 let user_arg_count = all.len() - 1;
+                                // Only the trailing-LAMBDA case routes the
+                                // last user arg to the target's last param
+                                // (`obj.launch(ctx=default) { block }`). A
+                                // non-lambda last arg with fewer args than
+                                // params is ordinary positional/vararg/
+                                // default filling — e.g. `split(" ")` where
+                                // `" "` is a vararg delimiter, NOT the
+                                // trailing `limit` param. Re-tagging it as
+                                // the last param mis-binds it.
+                                let trailing_lambda_call =
+                                    matches!(args.last(), Some(Expr::Lambda { .. }));
                                 if !target_params.is_empty()
                                     && user_arg_count >= 1
                                     && (1 + user_arg_count) < target_params.len()
                                     && ast_arg_names.iter().all(|n| n.is_none())
+                                    && trailing_lambda_call
                                 {
                                     // Synthesise arg_names: positional for
                                     // injected `this` + each user arg,
@@ -2787,7 +2799,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                         < target_params.len()
                                     && ast_arg_names
                                         .iter()
-                                        .all(|n| n.is_none());
+                                        .all(|n| n.is_none())
+                                    && trailing_lambda_call;
                                 if !synth_names_needed {
                                     // Kotlin: a member of the
                                     // (smart-cast) implicit receiver
