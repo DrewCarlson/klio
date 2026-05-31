@@ -2948,17 +2948,62 @@ fn string_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::String(Arc::new(s.replace(&old, &new))))
 }
 
+/// trim / trimStart / trimEnd, honoring the optional argument: a vararg Char
+/// set, a `(Char)->Boolean` predicate, or nothing (whitespace).
+fn string_trim_generic(
+    ctx: &mut CallCtx,
+    trim_start: bool,
+    trim_end: bool,
+    who: &str,
+) -> Result<Value, RuntimeError> {
+    let cs: Vec<char> = recv_string(ctx.args, who)?.chars().collect();
+    let extra: Vec<Value> = ctx.args[1..].to_vec();
+    // `keep[i]` = char i is NOT trimmable.
+    let keep: Vec<bool> = if extra.is_empty() {
+        cs.iter().map(|c| !c.is_whitespace()).collect()
+    } else if extra.iter().all(|v| matches!(v, Value::Char(_))) {
+        let set: Vec<char> = extra
+            .iter()
+            .map(|v| match v {
+                Value::Char(c) => *c,
+                _ => unreachable!(),
+            })
+            .collect();
+        cs.iter().map(|c| !set.contains(c)).collect()
+    } else {
+        let block = extra[0].clone();
+        let CallCtx { out, host, .. } = ctx;
+        let mut keep = Vec::with_capacity(cs.len());
+        for c in &cs {
+            let trimmable = matches!(
+                host.invoke_callable(&block, &[Value::Char(*c)], *out)?,
+                Value::Bool(true)
+            );
+            keep.push(!trimmable);
+        }
+        keep
+    };
+    let lo = if trim_start {
+        keep.iter().position(|&k| k).unwrap_or(cs.len())
+    } else {
+        0
+    };
+    let hi = if trim_end {
+        keep.iter().rposition(|&k| k).map(|p| p + 1).unwrap_or(0)
+    } else {
+        cs.len()
+    };
+    let hi = hi.max(lo);
+    Ok(Value::String(Arc::new(cs[lo..hi].iter().collect::<String>())))
+}
 fn string_trim(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let s = recv_string(ctx.args, "String.trim")?;
-    Ok(Value::String(Arc::new(s.trim().to_string())))
+    string_trim_generic(ctx, true, true, "String.trim")
 }
 fn string_trim_start(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let s = recv_string(ctx.args, "String.trimStart")?;
-    Ok(Value::String(Arc::new(s.trim_start().to_string())))
+    string_trim_generic(ctx, true, false, "String.trimStart")
 }
 fn string_trim_end(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let s = recv_string(ctx.args, "String.trimEnd")?;
-    Ok(Value::String(Arc::new(s.trim_end().to_string())))
+    string_trim_generic(ctx, false, true, "String.trimEnd")
 }
 
 fn string_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -3083,23 +3128,107 @@ fn string_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             .collect();
         return Ok(make_list(items, false));
     }
-    let delim = match ctx.args.get(1) {
-        Some(Value::String(d)) => (**d).clone(),
-        Some(Value::Char(c)) => c.to_string(),
-        _ => {
-            return Err(RuntimeError::Type(
-                "String.split requires a String, Char, or Regex delimiter".into(),
-            ))
+    // `split(vararg delimiters: String/Char, ignoreCase = false, limit = 0)`:
+    // collect every String/Char delimiter, plus a trailing Bool (ignoreCase)
+    // and Int (limit). Splitting on the FIRST delimiter only, or ignoring the
+    // limit, were both bugs.
+    let mut delims: Vec<String> = Vec::new();
+    let mut ignore_case = false;
+    let mut limit = 0i64;
+    let mut push_delim = |v: &Value, delims: &mut Vec<String>| -> bool {
+        match v {
+            Value::String(d) => {
+                delims.push((**d).clone());
+                true
+            }
+            Value::Char(c) => {
+                delims.push(c.to_string());
+                true
+            }
+            _ => false,
         }
     };
-    let parts: Vec<Value> = if delim.is_empty() {
-        s.chars().map(|c| Value::String(Arc::new(c.to_string()))).collect()
-    } else {
-        s.split(&delim)
-            .map(|p| Value::String(Arc::new(p.to_string())))
-            .collect()
-    };
-    Ok(make_list(parts, false))
+    for a in &ctx.args[1..] {
+        match a {
+            Value::String(_) | Value::Char(_) => {
+                push_delim(a, &mut delims);
+            }
+            Value::Bool(b) => ignore_case = *b,
+            // The vararg `delimiters` may arrive packed into an Array/List
+            // (named-argument call form, e.g. `split(",", limit = 2)`).
+            Value::Array { items, .. } | Value::List { items, .. } => {
+                for it in items.borrow().iter() {
+                    if !push_delim(it, &mut delims) {
+                        return Err(RuntimeError::Type(
+                            "String.split delimiters must be String or Char".into(),
+                        ));
+                    }
+                }
+            }
+            v if v.is_integral() => limit = v.as_i64().unwrap(),
+            // A skipped default parameter (e.g. ignoreCase when only limit is
+            // named) arrives as Null — ignore it.
+            Value::Null => {}
+            _ => {
+                return Err(RuntimeError::Type(
+                    "String.split requires String, Char, or Regex delimiters".into(),
+                ))
+            }
+        }
+    }
+    if delims.is_empty() {
+        return Err(RuntimeError::Type(
+            "String.split requires at least one delimiter".into(),
+        ));
+    }
+    Ok(make_list(split_on_any(&s, &delims, ignore_case, limit), false))
+}
+
+/// Split `s` on any of `delims` (left-to-right, non-overlapping), honoring a
+/// positive `limit` (max substrings) and ASCII `ignore_case`. An empty
+/// delimiter is skipped.
+fn split_on_any(s: &str, delims: &[String], ignore_case: bool, limit: i64) -> Vec<Value> {
+    let nonempty: Vec<&str> = delims.iter().map(String::as_str).filter(|d| !d.is_empty()).collect();
+    if nonempty.is_empty() {
+        return vec![Value::String(Arc::new(s.to_string()))];
+    }
+    let mut out: Vec<Value> = Vec::new();
+    let mut seg_start = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        if limit > 0 && out.len() as i64 == limit - 1 {
+            break;
+        }
+        if !s.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let mut matched: Option<usize> = None;
+        for d in &nonempty {
+            let end = i + d.len();
+            if end <= s.len() && s.is_char_boundary(end) {
+                let cand = &s[i..end];
+                let eq = if ignore_case {
+                    cand.eq_ignore_ascii_case(d)
+                } else {
+                    cand == *d
+                };
+                if eq {
+                    matched = Some(d.len());
+                    break;
+                }
+            }
+        }
+        if let Some(dlen) = matched {
+            out.push(Value::String(Arc::new(s[seg_start..i].to_string())));
+            i += dlen;
+            seg_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(Value::String(Arc::new(s[seg_start..].to_string())));
+    out
 }
 
 fn string_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
