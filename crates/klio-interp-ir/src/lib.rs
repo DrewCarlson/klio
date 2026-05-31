@@ -8158,6 +8158,22 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 class.0
             ))
         })?;
+        // The builtin Throwable hierarchy ships as declaration-only
+        // `expect` classes (no `actual` body stores `message`/`cause`):
+        // their construction is host-backed and must produce a
+        // `Value::Exception` via the `excn_*` intrinsic, not a generic
+        // Instance whose secondary-ctor `super(message)` chain has
+        // nowhere to bind the detail message. Gate on the class's own
+        // builtin FQN so a user subclass (its own FQN) still allocates a
+        // real Instance and chains up through the normal ctor path.
+        {
+            let fqn = ir_class.fqn.clone();
+            if is_builtin_throwable_fqn(&fqn) {
+                if let Some(intrinsic) = self.lookup_intrinsic(&fqn) {
+                    return self.dispatch_intrinsic(intrinsic, args);
+                }
+            }
+        }
         let mut class_def = self.classes.borrow().get(&ir_class.name).cloned().ok_or_else(|| {
             klio_ir::eval::EvalError::Unimplemented(format!(
                 "Vm::new_instance: no runtime ClassDef registered for `{}`",
@@ -8524,8 +8540,13 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         | "ConcurrentModificationException"
                         | "UnsupportedOperationException"
                 );
-                let parent_def = self.classes.borrow().get(&pname).cloned();
-                if is_throwable_name && parent_def.is_none() {
+                // A builtin Throwable parent stores neither `message`
+                // nor `cause` itself (its `expect` ctors have no body),
+                // whether or not an `expect`-shell ClassDef is
+                // registered for it. Evaluate this class's
+                // parent-ctor-arg thunks to recover the `super(...)`
+                // message/cause and bind them on the leaf.
+                if is_throwable_name {
                     if let Some(thunks) = self.prog.parent_ctor_args.get(&cur_class).cloned() {
                         for (idx, fid) in thunks.iter().enumerate() {
                             if let Some(func) =
@@ -9008,6 +9029,35 @@ fn ext_decl_recv_is_user_class(ty_name: &str) -> bool {
             | "MutableList" | "Collection" | "Iterable" | "Map"
             | "MutableMap" | "Set" | "MutableSet" | "Sequence"
             | "Comparable" | "Any" | "Unit"
+    )
+}
+
+/// True when `fqn` names a builtin `kotlin.*` Throwable-hierarchy class
+/// that klio constructs as a host `Value::Exception` (via an `excn_*`
+/// intrinsic) rather than a generic Instance. These ship as
+/// declaration-only `expect` classes whose constructors have no body to
+/// store `message`/`cause`, so their construction must route to the host
+/// constructor. Matching is on the exact builtin FQN, so a user subclass
+/// — which carries its own FQN — is never intercepted.
+fn is_builtin_throwable_fqn(fqn: &str) -> bool {
+    matches!(
+        fqn,
+        "kotlin.Throwable"
+            | "kotlin.Exception"
+            | "kotlin.Error"
+            | "kotlin.RuntimeException"
+            | "kotlin.IllegalArgumentException"
+            | "kotlin.IllegalStateException"
+            | "kotlin.IndexOutOfBoundsException"
+            | "kotlin.NullPointerException"
+            | "kotlin.ArithmeticException"
+            | "kotlin.ClassCastException"
+            | "kotlin.NoSuchElementException"
+            | "kotlin.NumberFormatException"
+            | "kotlin.UnsupportedOperationException"
+            | "kotlin.NoWhenBranchMatchedException"
+            | "kotlin.ConcurrentModificationException"
+            | "kotlin.AssertionError"
     )
 }
 
