@@ -1262,7 +1262,7 @@ fn coll_iter_distinct_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut result: Vec<Value> = Vec::new();
     for v in items {
         let key = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-        if !keys.iter().any(|k| Value::structural_eq(k, &key)) {
+        if !keys.iter().any(|k| Value::structural_eq_boxed(k, &key)) {
             keys.push(key);
             result.push(v);
         }
@@ -1280,7 +1280,7 @@ fn coll_iter_group_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
     for v in items {
         let key = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-        if let Some(slot) = groups.iter_mut().find(|(k, _)| Value::structural_eq(k, &key)) {
+        if let Some(slot) = groups.iter_mut().find(|(k, _)| Value::structural_eq_boxed(k, &key)) {
             slot.1.push(v);
         } else {
             groups.push((key, vec![v]));
@@ -1333,7 +1333,7 @@ fn coll_grouping_each_count(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut counts: Vec<(Value, i64)> = Vec::new();
     for v in items {
         let k = host.invoke_callable(&key, std::slice::from_ref(&v), *out)?;
-        if let Some(slot) = counts.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &k)) {
+        if let Some(slot) = counts.iter_mut().find(|(kk, _)| Value::structural_eq_boxed(kk, &k)) {
             slot.1 += 1;
         } else {
             counts.push((k, 1));
@@ -1361,7 +1361,7 @@ fn coll_grouping_fold(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut acc: Vec<(Value, Value)> = Vec::new();
     for v in items {
         let k = host.invoke_callable(&key, std::slice::from_ref(&v), *out)?;
-        let pos = acc.iter().position(|(kk, _)| Value::structural_eq(kk, &k));
+        let pos = acc.iter().position(|(kk, _)| Value::structural_eq_boxed(kk, &k));
         let cur = match pos {
             Some(p) => acc[p].1.clone(),
             None => {
@@ -1393,7 +1393,7 @@ fn coll_grouping_reduce(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut acc: Vec<(Value, Value)> = Vec::new();
     for v in items {
         let k = host.invoke_callable(&key, std::slice::from_ref(&v), *out)?;
-        match acc.iter().position(|(kk, _)| Value::structural_eq(kk, &k)) {
+        match acc.iter().position(|(kk, _)| Value::structural_eq_boxed(kk, &k)) {
             Some(p) => {
                 let cur = acc[p].1.clone();
                 // reduce operation is (key, accumulator, element)
@@ -1432,7 +1432,7 @@ fn coll_iter_associate(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             ));
         };
         let key = *k;
-        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &key)) {
+        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq_boxed(kk, &key)) {
             slot.1 = *val;
         } else {
             entries.push((key, *val));
@@ -1451,7 +1451,7 @@ fn coll_iter_associate_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut entries: Vec<(Value, Value)> = Vec::new();
     for v in items {
         let key = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &key)) {
+        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq_boxed(kk, &key)) {
             slot.1 = v;
         } else {
             entries.push((key, v));
@@ -1470,7 +1470,7 @@ fn coll_iter_associate_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut entries: Vec<(Value, Value)> = Vec::new();
     for v in items {
         let val = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
-        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &v)) {
+        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq_boxed(kk, &v)) {
             slot.1 = val;
         } else {
             entries.push((v, val));
@@ -1739,7 +1739,7 @@ fn map_get_or_else(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let entries = map_entries_clone(&ctx.args[0], "getOrElse")?;
     let key = ctx.args[1].clone();
-    if let Some((_, v)) = entries.iter().find(|(k, _)| Value::structural_eq(k, &key)) {
+    if let Some((_, v)) = entries.iter().find(|(k, _)| Value::structural_eq_boxed(k, &key)) {
         return Ok(v.clone());
     }
     let block = ctx.args[2].clone();
@@ -1757,7 +1757,7 @@ fn map_get_or_put(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let entries_rc = entries.clone();
     let key = ctx.args[1].clone();
-    if let Some((_, v)) = entries_rc.borrow().iter().find(|(k, _)| Value::structural_eq(k, &key)) {
+    if let Some((_, v)) = entries_rc.borrow().iter().find(|(k, _)| Value::structural_eq_boxed(k, &key)) {
         return Ok(v.clone());
     }
     let block = ctx.args[2].clone();
@@ -1974,7 +1974,7 @@ fn builders_build_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Value::List { items, .. } = buildable else { unreachable!() };
     let mut deduped: Vec<Value> = Vec::new();
     for v in items.borrow().iter() {
-        if !deduped.iter().any(|x| Value::structural_eq(x, v)) {
+        if !deduped.iter().any(|x| Value::structural_eq_boxed(x, v)) {
             deduped.push(v.clone());
         }
     }
@@ -4240,7 +4240,7 @@ fn make_list(items: Vec<Value>, mutable: bool) -> Value {
 fn make_set(items: Vec<Value>, mutable: bool) -> Value {
     let mut deduped: Vec<Value> = Vec::with_capacity(items.len());
     for v in items {
-        if !deduped.iter().any(|x| Value::structural_eq(x, &v)) {
+        if !deduped.iter().any(|x| Value::structural_eq_boxed(x, &v)) {
             deduped.push(v);
         }
     }
@@ -4251,7 +4251,7 @@ fn make_map(entries: Vec<(Value, Value)>, mutable: bool) -> Value {
     // Deduplicate keys, last write wins (matches `mapOf("a" to 1, "a" to 2)`).
     let mut out: Vec<(Value, Value)> = Vec::with_capacity(entries.len());
     for (k, v) in entries {
-        if let Some(slot) = out.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &k)) {
+        if let Some(slot) = out.iter_mut().find(|(kk, _)| Value::structural_eq_boxed(kk, &k)) {
             slot.1 = v;
         } else {
             out.push((k, v));
@@ -4576,14 +4576,14 @@ fn coll_list_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(needle) = ctx.args.get(1) else {
         return Err(RuntimeError::Arity("contains requires an argument".into()));
     };
-    Ok(Value::Bool(it.borrow().iter().any(|v| Value::structural_eq(v, needle))))
+    Ok(Value::Bool(it.borrow().iter().any(|v| Value::structural_eq_boxed(v, needle))))
 }
 fn coll_list_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.indexOf")?;
     let Some(needle) = ctx.args.get(1) else {
         return Err(RuntimeError::Arity("indexOf requires an argument".into()));
     };
-    let pos = it.borrow().iter().position(|v| Value::structural_eq(v, needle));
+    let pos = it.borrow().iter().position(|v| Value::structural_eq_boxed(v, needle));
     Ok(Value::new_int(pos.map(|p| p as i64).unwrap_or(-1)))
 }
 fn coll_iter_index_of_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -4720,7 +4720,7 @@ fn coll_list_last_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Arity("lastIndexOf requires an argument".into()));
     };
     let borrow = it.borrow();
-    let pos = borrow.iter().rposition(|v| Value::structural_eq(v, needle));
+    let pos = borrow.iter().rposition(|v| Value::structural_eq_boxed(v, needle));
     Ok(Value::new_int(pos.map(|p| p as i64).unwrap_or(-1)))
 }
 fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -5360,7 +5360,7 @@ pub fn materialise_sequence_bounded(
                 let mut seen: Vec<Value> = Vec::new();
                 let mut nx: Vec<Value> = Vec::new();
                 for v in &items {
-                    if !seen.iter().any(|s| Value::structural_eq(s, v)) {
+                    if !seen.iter().any(|s| Value::structural_eq_boxed(s, v)) {
                         seen.push(v.clone());
                         nx.push(v.clone());
                     }
@@ -5372,7 +5372,7 @@ pub fn materialise_sequence_bounded(
                 let mut nx: Vec<Value> = Vec::new();
                 for v in &items {
                     let key = call(host, f, std::slice::from_ref(v), out)?;
-                    if !seen.iter().any(|s| Value::structural_eq(s, &key)) {
+                    if !seen.iter().any(|s| Value::structural_eq_boxed(s, &key)) {
                         seen.push(key);
                         nx.push(v.clone());
                     }
@@ -5738,7 +5738,7 @@ fn pairs_from_values(items: &[Value], who: &str) -> Result<Vec<(Value, Value)>, 
             )));
         };
         let key = (**k).clone();
-        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &key)) {
+        if let Some(slot) = entries.iter_mut().find(|(kk, _)| Value::structural_eq_boxed(kk, &key)) {
             slot.1 = (**val).clone();
         } else {
             entries.push((key, (**val).clone()));
@@ -5762,7 +5762,7 @@ fn coll_list_distinct(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.distinct")?;
     let mut out: Vec<Value> = Vec::new();
     for v in it.borrow().iter() {
-        if !out.iter().any(|x| Value::structural_eq(x, v)) {
+        if !out.iter().any(|x| Value::structural_eq_boxed(x, v)) {
             out.push(v.clone());
         }
     }
@@ -5896,7 +5896,7 @@ fn coll_list_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut out: Vec<Value> = Vec::new();
     let mut remaining = removals.clone();
     for v in it.borrow().iter() {
-        if let Some(pos) = remaining.iter().position(|r| Value::structural_eq(r, v)) {
+        if let Some(pos) = remaining.iter().position(|r| Value::structural_eq_boxed(r, v)) {
             remaining.remove(pos);
         } else {
             out.push(v.clone());
@@ -6082,7 +6082,7 @@ fn coll_set_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_set_items(ctx.args, "Set.plus")?;
     let mut out: Vec<Value> = it.borrow().clone();
     let push = |out: &mut Vec<Value>, v: Value| {
-        if !out.iter().any(|x| Value::structural_eq(x, &v)) {
+        if !out.iter().any(|x| Value::structural_eq_boxed(x, &v)) {
             out.push(v);
         }
     };
@@ -6112,7 +6112,7 @@ fn coll_set_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let out: Vec<Value> = it
         .borrow()
         .iter()
-        .filter(|v| !removals.iter().any(|r| Value::structural_eq(r, v)))
+        .filter(|v| !removals.iter().any(|r| Value::structural_eq_boxed(r, v)))
         .cloned()
         .collect();
     Ok(Value::Set { items: ObjRef::new(out), mutable: false, backing: None })
@@ -6179,7 +6179,7 @@ fn coll_map_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let out: Vec<(Value, Value)> = entries
         .borrow()
         .iter()
-        .filter(|(k, _)| !keys.iter().any(|rk| Value::structural_eq(rk, k)))
+        .filter(|(k, _)| !keys.iter().any(|rk| Value::structural_eq_boxed(rk, k)))
         .cloned()
         .collect();
     Ok(make_map(out, false))
@@ -6200,7 +6200,7 @@ fn coll_set_intersect(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let out: Vec<Value> = it
         .borrow()
         .iter()
-        .filter(|v| other.iter().any(|o| Value::structural_eq(o, v)))
+        .filter(|v| other.iter().any(|o| Value::structural_eq_boxed(o, v)))
         .cloned()
         .collect();
     Ok(Value::Set { items: ObjRef::new(out), mutable: false, backing: None })
@@ -6242,7 +6242,7 @@ fn sync_map_view(receiver: &Value) {
                 (klio_runtime::MapViewKind::Entries, Value::MapEntry { key, .. }) => key.as_ref(),
                 _ => it,
             };
-            Value::structural_eq(proj, target)
+            Value::structural_eq_boxed(proj, target)
         });
         if matched {
             j += 1;
@@ -6275,7 +6275,7 @@ fn coll_set_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(needle) = ctx.args.get(1) else {
         return Err(RuntimeError::Arity("contains requires an argument".into()));
     };
-    Ok(Value::Bool(it.borrow().iter().any(|v| Value::structural_eq(v, needle))))
+    Ok(Value::Bool(it.borrow().iter().any(|v| Value::structural_eq_boxed(v, needle))))
 }
 fn array_slice_impl(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let recv = ctx.args.first().ok_or_else(|| {
@@ -6462,7 +6462,7 @@ fn coll_mut_set_add(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Arity("add requires an argument".into()));
     };
     let mut borrow = it.borrow_mut();
-    if borrow.iter().any(|v| Value::structural_eq(v, arg)) {
+    if borrow.iter().any(|v| Value::structural_eq_boxed(v, arg)) {
         return Ok(Value::Bool(false));
     }
     borrow.push(arg.clone());
@@ -6475,7 +6475,7 @@ fn coll_mut_set_remove(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let removed = {
         let mut borrow = it.borrow_mut();
-        if let Some(pos) = borrow.iter().position(|v| Value::structural_eq(v, arg)) {
+        if let Some(pos) = borrow.iter().position(|v| Value::structural_eq_boxed(v, arg)) {
             borrow.remove(pos);
             true
         } else {
@@ -6502,7 +6502,7 @@ fn coll_mut_set_remove_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let changed = {
         let mut b = it.borrow_mut();
         let before = b.len();
-        b.retain(|v| !other.iter().any(|o| Value::structural_eq(v, o)));
+        b.retain(|v| !other.iter().any(|o| Value::structural_eq_boxed(v, o)));
         b.len() != before
     };
     if changed {
@@ -6520,7 +6520,7 @@ fn coll_mut_set_retain_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let changed = {
         let mut b = it.borrow_mut();
         let before = b.len();
-        b.retain(|v| other.iter().any(|o| Value::structural_eq(v, o)));
+        b.retain(|v| other.iter().any(|o| Value::structural_eq_boxed(v, o)));
         b.len() != before
     };
     if changed {
@@ -6558,7 +6558,7 @@ fn coll_map_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(entries
         .borrow()
         .iter()
-        .find(|(k, _)| Value::structural_eq(k, key))
+        .find(|(k, _)| Value::structural_eq_boxed(k, key))
         .map(|(_, v)| v.clone())
         .unwrap_or(Value::Null))
 }
@@ -6568,7 +6568,7 @@ fn coll_map_contains_key(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Arity("containsKey requires a key".into()));
     };
     Ok(Value::Bool(
-        entries.borrow().iter().any(|(k, _)| Value::structural_eq(k, key)),
+        entries.borrow().iter().any(|(k, _)| Value::structural_eq_boxed(k, key)),
     ))
 }
 fn coll_map_contains_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -6577,7 +6577,7 @@ fn coll_map_contains_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Arity("containsValue requires a value".into()));
     };
     Ok(Value::Bool(
-        entries.borrow().iter().any(|(_, v)| Value::structural_eq(v, value)),
+        entries.borrow().iter().any(|(_, v)| Value::structural_eq_boxed(v, value)),
     ))
 }
 fn coll_map_keys(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -6638,7 +6638,7 @@ fn coll_mut_map_put(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Arity("put requires a value".into()));
     };
     let mut borrow = entries.borrow_mut();
-    if let Some(slot) = borrow.iter_mut().find(|(k, _)| Value::structural_eq(k, key)) {
+    if let Some(slot) = borrow.iter_mut().find(|(k, _)| Value::structural_eq_boxed(k, key)) {
         let prev = std::mem::replace(&mut slot.1, value.clone());
         Ok(prev)
     } else {
@@ -6652,7 +6652,7 @@ fn coll_mut_map_remove(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Arity("remove requires a key".into()));
     };
     let mut borrow = entries.borrow_mut();
-    if let Some(pos) = borrow.iter().position(|(k, _)| Value::structural_eq(k, key)) {
+    if let Some(pos) = borrow.iter().position(|(k, _)| Value::structural_eq_boxed(k, key)) {
         let (_, v) = borrow.remove(pos);
         Ok(v)
     } else {
@@ -6679,13 +6679,13 @@ fn map_find(entries: &ObjRef<Vec<(Value, Value)>>, key: &Value) -> Option<Value>
     entries
         .borrow()
         .iter()
-        .find(|(k, _)| Value::structural_eq(k, key))
+        .find(|(k, _)| Value::structural_eq_boxed(k, key))
         .map(|(_, v)| v.clone())
 }
 
 fn map_set(entries: &ObjRef<Vec<(Value, Value)>>, key: Value, value: Value) {
     let mut b = entries.borrow_mut();
-    if let Some(slot) = b.iter_mut().find(|(k, _)| Value::structural_eq(k, &key)) {
+    if let Some(slot) = b.iter_mut().find(|(k, _)| Value::structural_eq_boxed(k, &key)) {
         slot.1 = value;
     } else {
         b.push((key, value));
@@ -6694,7 +6694,7 @@ fn map_set(entries: &ObjRef<Vec<(Value, Value)>>, key: Value, value: Value) {
 
 fn map_remove_key(entries: &ObjRef<Vec<(Value, Value)>>, key: &Value) {
     let mut b = entries.borrow_mut();
-    if let Some(pos) = b.iter().position(|(k, _)| Value::structural_eq(k, key)) {
+    if let Some(pos) = b.iter().position(|(k, _)| Value::structural_eq_boxed(k, key)) {
         b.remove(pos);
     }
 }
@@ -6747,7 +6747,7 @@ fn map_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         let old = ctx.args[2].clone();
         let new = ctx.args[3].clone();
         match map_find(&entries, &key) {
-            Some(cur) if Value::structural_eq(&cur, &old) => {
+            Some(cur) if Value::structural_eq_boxed(&cur, &old) => {
                 map_set(&entries, key, new);
                 Ok(Value::Bool(true))
             }
@@ -7904,7 +7904,7 @@ fn coll_list_contains_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let me = it.borrow();
     Ok(Value::Bool(
-        other.iter().all(|o| me.iter().any(|m| Value::structural_eq(m, o))),
+        other.iter().all(|o| me.iter().any(|m| Value::structural_eq_boxed(m, o))),
     ))
 }
 
@@ -7977,7 +7977,7 @@ fn coll_mut_list_remove(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let removed = {
         let mut b = it.borrow_mut();
-        if let Some(pos) = b.iter().position(|v| Value::structural_eq(v, arg)) {
+        if let Some(pos) = b.iter().position(|v| Value::structural_eq_boxed(v, arg)) {
             b.remove(pos);
             true
         } else {
@@ -7999,7 +7999,7 @@ fn coll_mut_list_remove_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let changed = {
         let mut b = it.borrow_mut();
         let before = b.len();
-        b.retain(|v| !other.iter().any(|o| Value::structural_eq(v, o)));
+        b.retain(|v| !other.iter().any(|o| Value::structural_eq_boxed(v, o)));
         b.len() != before
     };
     if changed {
@@ -8017,7 +8017,7 @@ fn coll_mut_list_retain_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let changed = {
         let mut b = it.borrow_mut();
         let before = b.len();
-        b.retain(|v| other.iter().any(|o| Value::structural_eq(v, o)));
+        b.retain(|v| other.iter().any(|o| Value::structural_eq_boxed(v, o)));
         b.len() != before
     };
     if changed {
@@ -8057,7 +8057,7 @@ fn coll_set_contains_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let me = it.borrow();
     Ok(Value::Bool(
-        other.iter().all(|o| me.iter().any(|m| Value::structural_eq(m, o))),
+        other.iter().all(|o| me.iter().any(|m| Value::structural_eq_boxed(m, o))),
     ))
 }
 
@@ -8101,7 +8101,7 @@ fn coll_mut_set_add_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut b = it.borrow_mut();
     let mut changed = false;
     for v in to_add {
-        if !b.iter().any(|x| Value::structural_eq(x, &v)) {
+        if !b.iter().any(|x| Value::structural_eq_boxed(x, &v)) {
             b.push(v);
             changed = true;
         }
@@ -8124,7 +8124,7 @@ fn coll_map_get_or_default(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(entries
         .borrow()
         .iter()
-        .find(|(k, _)| Value::structural_eq(k, key))
+        .find(|(k, _)| Value::structural_eq_boxed(k, key))
         .map(|(_, v)| v.clone())
         .unwrap_or_else(|| default.clone()))
 }
@@ -8137,7 +8137,7 @@ fn coll_map_get_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     entries
         .borrow()
         .iter()
-        .find(|(k, _)| Value::structural_eq(k, key))
+        .find(|(k, _)| Value::structural_eq_boxed(k, key))
         .map(|(_, v)| v.clone())
         .ok_or_else(|| {
             RuntimeError::Thrown(make_exception(
@@ -8247,7 +8247,7 @@ fn coll_mut_map_put_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let mut b = entries.borrow_mut();
     for (k, v) in to_add {
-        if let Some(slot) = b.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &k)) {
+        if let Some(slot) = b.iter_mut().find(|(kk, _)| Value::structural_eq_boxed(kk, &k)) {
             slot.1 = v;
         } else {
             b.push((k, v));
