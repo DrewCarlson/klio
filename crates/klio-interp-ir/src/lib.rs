@@ -7338,15 +7338,23 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // A MutableList/Set/Map IS-A List/Set/Map, so an op registered only on
         // the read-only type (e.g. Set.sorted / Set.toTypedArray) must also be
         // reachable from a mutable receiver — otherwise it falls through to a
-        // fragile upstream body. Probe the immutable supertype's type-prefixed
-        // intrinsic right after the mutable one.
-        if let Some(super_fqn) = match type_fqn {
+        // fragile upstream body. The reverse also holds: read-only/mutable are
+        // erased on the JVM, and a genuinely-mutable value (e.g. `MutableMap.keys`,
+        // which is a `MutableSet`) can carry a read-only runtime tag, so the
+        // mutator intrinsics (`remove`/`add`/`clear`) must stay reachable from a
+        // read-only receiver too — otherwise dispatch falls through to a
+        // decl-only upstream shim that self-recurses. Probe the sibling type's
+        // intrinsic right after this type's own.
+        if let Some(sibling_fqn) = match type_fqn {
             "kotlin.collections.MutableList" => Some("kotlin.collections.List"),
             "kotlin.collections.MutableSet" => Some("kotlin.collections.Set"),
             "kotlin.collections.MutableMap" => Some("kotlin.collections.Map"),
+            "kotlin.collections.List" => Some("kotlin.collections.MutableList"),
+            "kotlin.collections.Set" => Some("kotlin.collections.MutableSet"),
+            "kotlin.collections.Map" => Some("kotlin.collections.MutableMap"),
             _ => None,
         } {
-            let probe = format!("{super_fqn}.{name}");
+            let probe = format!("{sibling_fqn}.{name}");
             let anchor = format!("{type_fqn}.{name}");
             match probes.iter().position(|p| p == &anchor) {
                 Some(pos) => probes.insert(pos + 1, probe),
