@@ -11,7 +11,7 @@ package kotlin
 import kotlin.contracts.InvocationKind
 import kotlin.contracts.contract
 
-public inline fun <T : AutoCloseable?, R> T.use(block: (T) -> R): R {
+public actual inline fun <T : AutoCloseable?, R> T.use(block: (T) -> R): R {
     contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }
     try {
         return block(this)
