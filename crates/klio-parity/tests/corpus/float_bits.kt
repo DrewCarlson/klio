@@ -1,0 +1,18 @@
+fun main() {
+    println((1.0).toRawBits())
+    println((1.0).toBits())
+    println(Double.fromBits(4607182418800017408L))
+    println((1.5).toRawBits())
+    println((-0.0).toRawBits())
+    println((0.0).toRawBits())
+    println((2.0f).toRawBits())
+    println((2.0f).toBits())
+    println(Float.fromBits(1073741824))
+    println(Float.fromBits(0))
+    println((Double.NaN).toBits())
+    println((Float.NaN).toBits())
+    println(Double.fromBits((3.14159).toRawBits()))
+    println(Float.fromBits((2.71828f).toRawBits()))
+    println((100.0).toRawBits())
+    println(Double.MAX_VALUE.toRawBits())
+}

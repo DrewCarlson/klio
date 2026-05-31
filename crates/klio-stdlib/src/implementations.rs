@@ -295,6 +295,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Double.toLong", double_to_long),
     ("kotlin.Double.toShort", double_to_short),
     ("kotlin.Double.toString", double_to_string),
+    ("kotlin.Double.toRawBits", double_to_raw_bits),
+    ("kotlin.Double.toBits", double_to_bits),
+    ("kotlin.Double.fromBits", double_from_bits),
+    ("kotlin.Double.Companion.fromBits", double_from_bits),
 
     // ----- Float -----
     ("kotlin.Float.compareTo", float_compare_to),
@@ -308,6 +312,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Float.toLong", float_to_long),
     ("kotlin.Float.toShort", float_to_short),
     ("kotlin.Float.toString", float_to_string),
+    ("kotlin.Float.toRawBits", float_to_raw_bits),
+    ("kotlin.Float.toBits", float_to_bits),
+    ("kotlin.Float.fromBits", float_from_bits),
+    ("kotlin.Float.Companion.fromBits", float_from_bits),
 
     // ----- Boolean -----
     ("kotlin.Boolean.toString", bool_to_string),
@@ -4070,6 +4078,47 @@ fn f32_to_i64_kotlin(d: f32) -> i64 {
 }
 fn double_is_nan(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Bool(recv_double(ctx.args, "Double.isNaN")?.is_nan()))
+}
+
+// IEEE-754 bit reflection. `toRawBits` preserves the exact bit pattern;
+// `toBits` collapses every NaN to the single canonical quiet NaN
+// (matching `java.lang.Double.doubleToLongBits`/`Float.floatToIntBits`);
+// `fromBits` reconstructs the value.
+fn double_to_raw_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let d = recv_double(ctx.args, "Double.toRawBits")?;
+    Ok(Value::Long(d.to_bits() as i64))
+}
+fn double_to_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let d = recv_double(ctx.args, "Double.toBits")?;
+    let bits = if d.is_nan() { 0x7ff8_0000_0000_0000u64 } else { d.to_bits() };
+    Ok(Value::Long(bits as i64))
+}
+fn double_from_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let bits = ctx
+        .args
+        .iter()
+        .rev()
+        .find_map(Value::as_i64)
+        .ok_or_else(|| RuntimeError::Type("Double.fromBits requires a Long".into()))?;
+    Ok(Value::Double(f64::from_bits(bits as u64)))
+}
+fn float_to_raw_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let f = recv_float(ctx.args, "Float.toRawBits")?;
+    Ok(Value::new_int(f.to_bits() as i32 as i64))
+}
+fn float_to_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let f = recv_float(ctx.args, "Float.toBits")?;
+    let bits = if f.is_nan() { 0x7fc0_0000u32 } else { f.to_bits() };
+    Ok(Value::new_int(bits as i32 as i64))
+}
+fn float_from_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let bits = ctx
+        .args
+        .iter()
+        .rev()
+        .find_map(Value::as_i64)
+        .ok_or_else(|| RuntimeError::Type("Float.fromBits requires an Int".into()))?;
+    Ok(Value::Float(f32::from_bits(bits as u32)))
 }
 fn double_is_infinite(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Bool(recv_double(ctx.args, "Double.isInfinite")?.is_infinite()))
