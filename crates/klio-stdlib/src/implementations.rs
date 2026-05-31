@@ -981,6 +981,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.text.MatchGroup.range", match_group_range),
 
     // ----- StringBuilder -----
+    ("kotlin.String", string_ctor),
     ("kotlin.text.StringBuilder", string_builder_ctor),
     ("kotlin.StringBuilder", string_builder_ctor),
     ("kotlin.text.StringBuilder.append", string_builder_append),
@@ -8589,6 +8590,43 @@ fn sb_arg(args: &[Value], what: &str) -> Result<ObjRef<String>, RuntimeError> {
             "{what} requires a StringBuilder receiver"
         ))),
     }
+}
+
+/// `String()` / `String(chars: CharArray)` / `String(chars, offset, length)`
+/// / `String(other: CharSequence)`. klio registers `String` as a host ctor so
+/// these shapes don't hit a 0-arg-only declaration.
+fn string_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = match ctx.args.first() {
+        None => String::new(),
+        Some(Value::Array { items, .. }) => {
+            let chars = items.borrow();
+            let (start, count) = if ctx.args.len() >= 3 {
+                let off = ctx.args[1].as_i64().unwrap_or(0).max(0) as usize;
+                let cnt = ctx.args[2].as_i64().unwrap_or(0).max(0) as usize;
+                (off, cnt)
+            } else {
+                (0, chars.len())
+            };
+            let end = start.saturating_add(count).min(chars.len());
+            if start > chars.len() || end > chars.len() {
+                return Err(RuntimeError::Thrown(make_exception(
+                    "kotlin.IndexOutOfBoundsException",
+                    Some(format!("offset {start}, count {count}, size {}", chars.len())),
+                )));
+            }
+            chars[start..end]
+                .iter()
+                .map(|v| match v {
+                    Value::Char(c) => *c,
+                    _ => '\u{0}',
+                })
+                .collect()
+        }
+        Some(Value::String(s)) => (**s).clone(),
+        Some(Value::StringBuilder(sb)) => sb.borrow().clone(),
+        Some(other) => format!("{other}"),
+    };
+    Ok(Value::String(Arc::new(s)))
 }
 
 fn string_builder_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

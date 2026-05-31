@@ -8386,16 +8386,18 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     | "kotlin.BooleanArray"
                     | "kotlin.CharArray"
                     | "kotlin.Array"
+                    | "kotlin.String"
             );
             if intrinsic_class {
                 // Skip the intrinsic path when the first arg is itself
                 // an Array — that shape (`Array(items)` copy / wrap)
                 // doesn't match any klio array ctor and the generic
-                // Instance allocation handles it correctly.
+                // Instance allocation handles it correctly. `String` is
+                // exempt: `String(CharArray)` legitimately takes an array.
                 let first_is_array = matches!(
                     args.first(),
                     Some(klio_runtime::Value::Array { .. })
-                );
+                ) && fqn != "kotlin.String";
                 if !first_is_array {
                     if let Some(intrinsic) = self.lookup_intrinsic(fqn) {
                         return self.dispatch_intrinsic(intrinsic, args);
