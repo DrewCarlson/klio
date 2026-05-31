@@ -2658,6 +2658,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             | "sequenceOf"
                             | "emptySequence"
                             | "generateSequence"
+                            | "sequence"
                     );
                     let bare_func_id: Option<FuncId> = cands
                         .iter()

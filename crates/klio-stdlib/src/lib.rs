@@ -83,6 +83,7 @@ pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
     ("sequenceOf", "kotlin.sequences.sequenceOf"),
     ("emptySequence", "kotlin.sequences.emptySequence"),
     ("generateSequence", "kotlin.sequences.generateSequence"),
+    ("sequence", "kotlin.sequences.sequence"),
     ("downTo", "kotlin.ranges.downTo"),
     ("step", "kotlin.ranges.step"),
     ("until", "kotlin.ranges.until"),

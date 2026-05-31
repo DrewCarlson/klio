@@ -594,6 +594,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.sequences.sequenceOf", seq_of),
     ("kotlin.sequences.emptySequence", seq_empty),
     ("kotlin.sequences.generateSequence", seq_generate_sequence),
+    ("kotlin.sequences.sequence", seq_builder),
+    ("kotlin.sequences.iterator", seq_iterator_builder),
+    ("kotlin.sequences.SequenceScope.yield", seq_scope_yield),
+    ("kotlin.sequences.SequenceScope.yieldAll", seq_scope_yield_all),
     ("kotlin.sequences.Sequence.toList", seq_to_list),
     ("kotlin.sequences.Sequence.toMutableList", seq_to_mutable_list),
     ("kotlin.sequences.Sequence.toSet", seq_to_set),
@@ -5767,6 +5771,90 @@ fn make_sequence(items: Vec<Value>) -> Value {
         source: klio_runtime::SequenceSource::Items(Arc::new(items)),
         ops: Vec::new(),
     }))
+}
+
+/// `sequence { yield(...) ; yieldAll(...) }` builder. klio runs the
+/// `suspend SequenceScope<T>.() -> Unit` block eagerly: a host
+/// SequenceScope instance carries a shared mutable buffer that the
+/// `yield`/`yieldAll` intrinsics append to; the collected items become
+/// a `Value::Sequence`. Faithful for finite builders (the common case);
+/// an unbounded `while (true) { yield(..) }` would grow the buffer and
+/// is bounded by the dev memory guard rather than truly lazy.
+fn seq_scope_buffer(scope: &Value) -> Option<ObjRef<Vec<Value>>> {
+    if let Value::Instance(inst) = scope {
+        if let Some(Value::List { items, .. }) = inst.borrow().get("__seq_buffer") {
+            return Some(items);
+        }
+    }
+    None
+}
+
+fn run_seq_builder(ctx: &mut CallCtx, who: &str) -> Result<ObjRef<Vec<Value>>, RuntimeError> {
+    let block = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity(format!("{who} expects a block")))?;
+    let buffer: ObjRef<Vec<Value>> = ObjRef::new(Vec::new());
+    let scope = {
+        let id = ctx.host.alloc_instance_id();
+        ctx.host.new_synth_instance(
+            "kotlin.sequences.SequenceScope",
+            id,
+            vec![(
+                "__seq_buffer".to_string(),
+                Value::List { items: buffer.clone(), mutable: true, enum_class: None },
+            )],
+        )
+    };
+    let CallCtx { out, host, .. } = ctx;
+    host.invoke_callable_with_this(&block, &[], &scope, *out)?;
+    Ok(buffer)
+}
+
+fn seq_builder(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let buffer = run_seq_builder(ctx, "sequence")?;
+    let items = buffer.borrow().clone();
+    Ok(make_sequence(items))
+}
+
+fn seq_iterator_builder(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let buffer = run_seq_builder(ctx, "iterator")?;
+    let items = buffer.borrow().clone();
+    Ok(Value::Iterator { items: ObjRef::new(items), pos: ObjRef::new(0), prim: None })
+}
+
+fn seq_scope_yield(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let buffer = seq_scope_buffer(&ctx.args[0])
+        .ok_or_else(|| RuntimeError::Type("yield: not a SequenceScope".into()))?;
+    if let Some(v) = ctx.args.get(1) {
+        buffer.borrow_mut().push(v.clone());
+    }
+    Ok(Value::Unit)
+}
+
+fn seq_scope_yield_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let buffer = seq_scope_buffer(&ctx.args[0])
+        .ok_or_else(|| RuntimeError::Type("yieldAll: not a SequenceScope".into()))?;
+    let elems: Vec<Value> = match ctx.args.get(1) {
+        Some(Value::List { items, .. })
+        | Some(Value::Set { items, .. })
+        | Some(Value::Array { items, .. })
+        | Some(Value::Iterator { items, .. }) => items.borrow().clone(),
+        Some(Value::Sequence(_)) => {
+            let seq = ctx.args[1].clone();
+            let CallCtx { out, host, .. } = ctx;
+            materialise_sequence(&seq, *host, *out)?
+        }
+        Some(other) => {
+            return Err(RuntimeError::Type(format!(
+                "yieldAll: expected an Iterable/Iterator/Sequence, got {other}"
+            )))
+        }
+        None => return Ok(Value::Unit),
+    };
+    buffer.borrow_mut().extend(elems);
+    Ok(Value::Unit)
 }
 
 fn seq_from_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

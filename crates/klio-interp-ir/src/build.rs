@@ -1046,21 +1046,33 @@ fn build_module_with_overrides(
             {
                 return false;
             }
-            // Lazy-sequence factories: klio represents a Sequence as the
-            // host Value::Sequence and implements take/map/filter/toList
-            // etc. as intrinsics on it. The upstream factory bodies
-            // construct upstream Sequence-class INSTANCES
-            // (GeneratorSequence/TakeSequence/…) that klio's intrinsics
-            // don't recognise (iterating one hits `hasNext on Nothing`).
-            // Drop the bodies so the bare call routes to klio's
-            // `kotlin.sequences.*` intrinsic, yielding a Value::Sequence.
+            // Lazy-sequence factories/builders: klio represents a
+            // Sequence as the host Value::Sequence and implements
+            // take/map/filter/toList etc. as intrinsics on it. The
+            // upstream factory bodies construct upstream Sequence-class
+            // INSTANCES (GeneratorSequence/TakeSequence/…) that klio's
+            // intrinsics don't recognise (iterating one hits `hasNext on
+            // Nothing`); the `sequence { }` / `iterator { }` builders
+            // construct a coroutine state machine klio can't run. Drop
+            // the bodies so the bare call routes to klio's
+            // `kotlin.sequences.*` intrinsic. Gated on the
+            // `kotlin.sequences` package FQN so a same-named user fn
+            // (especially `iterator`, which collides with many member
+            // iterators) is never dropped.
             if !f.is_expect
                 && matches!(
                     f.name.name.as_str(),
-                    "generateSequence" | "sequenceOf" | "emptySequence"
+                    "generateSequence"
+                        | "sequenceOf"
+                        | "emptySequence"
+                        | "sequence"
+                        | "iterator"
                 )
             {
-                return false;
+                let fqn = func_fqn_overrides.get(&f.span).map(String::as_str);
+                if fqn == Some(&format!("kotlin.sequences.{}", f.name.name)[..]) {
+                    return false;
+                }
             }
             if !f.is_expect {
                 return true;

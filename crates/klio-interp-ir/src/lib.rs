@@ -5382,6 +5382,28 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     return self.dispatch_intrinsic(func, &all_args);
                 }
             }
+            // klio-stdlib intrinsics keyed by `<classFqn>.<name>` also
+            // back host-synthesised instances created by
+            // `new_synth_instance` (e.g. the `kotlin.sequences.SequenceScope`
+            // from the `sequence { }` builder, whose `yield`/`yieldAll`
+            // members are intrinsics). Restricted to anonymous/synth
+            // classes so a real user/data-class instance (e.g.
+            // `Value`-backed `Triple`, whose `kotlin.Triple.toList`
+            // intrinsic expects the `Value::Triple` variant, not an
+            // Instance) keeps its normal method/extension dispatch.
+            if inst.borrow().class.is_anonymous {
+                let synth_probes =
+                    [format!("{cls_fqn}.{name}"), format!("{cls_name}.{name}")];
+                for p in &synth_probes {
+                    if let Some(func) = self.lookup_intrinsic(p) {
+                        let mut all_args: Vec<klio_runtime::Value> =
+                            Vec::with_capacity(args.len() + 1);
+                        all_args.push(receiver.clone());
+                        all_args.extend_from_slice(args);
+                        return self.dispatch_intrinsic(func, &all_args);
+                    }
+                }
+            }
             // Built-in Any/AutoCloseable extension probes for a user
             // Instance receiver. `kotlin.io.use` / `kotlin.AutoCloseable.use`
             // are bound on the stdlib side; let the call site reach
