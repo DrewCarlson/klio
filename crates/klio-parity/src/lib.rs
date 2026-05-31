@@ -777,6 +777,20 @@ pub fn examples_dir() -> PathBuf {
     workspace_root().join("examples")
 }
 
+/// Worker count for a parallel sweep. The klio side runs IN-PROCESS and each
+/// worker holds its own parsed stdlib module (~600 MiB), so unbounded
+/// parallelism multiplies memory until the watchdog trips. Cap the default at
+/// 6 (peak ~3.6 GiB, comfortably under the 6 GiB watchdog) regardless of core
+/// count; override with `KLIO_PARITY_JOBS` for machines with more headroom.
+#[must_use]
+pub fn default_jobs() -> usize {
+    if let Some(j) = env::var("KLIO_PARITY_JOBS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return j.max(1);
+    }
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    cores.min(6).max(1)
+}
+
 /// Every `.kt` file directly under `dir`, sorted by path.
 #[must_use]
 pub fn collect_kt(dir: &Path) -> Vec<PathBuf> {

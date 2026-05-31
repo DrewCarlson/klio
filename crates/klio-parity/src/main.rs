@@ -74,7 +74,7 @@ fn run_sweep_cmd(which: &str) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let jobs = klio_parity::default_jobs();
     let timeout = Duration::from_secs(60);
     let mut groups: Vec<(&str, Vec<PathBuf>)> = Vec::new();
     if which == "corpus" || which == "all" {

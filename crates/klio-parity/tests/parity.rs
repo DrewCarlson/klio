@@ -32,7 +32,7 @@ fn check_paths(label: &'static str, paths: &[PathBuf]) {
         return;
     }
 
-    let jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let jobs = klio_parity::default_jobs();
     let res = klio_parity::run_sweep(label, paths, jobs, stage_timeout())
         .unwrap_or_else(|e| panic!("bulk kotlinc compile failed for {label}: {e}"));
 
