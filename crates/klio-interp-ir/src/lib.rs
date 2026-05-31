@@ -1673,7 +1673,42 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         // `expect` declarations — their `actual` lives in the host's
         // intrinsic table and the implicit-alias / direct-probe path
         // below resolves it.
-        if let Some(fid) = self.module.func_id(name) {
+        //
+        // A bare (unqualified, receiverless) reference must never
+        // resolve to an extension function (`fun T.name(...)`, lowered
+        // with a synthetic `this` first param): an extension is only
+        // callable on a receiver, so binding one here would consume a
+        // positional argument as the receiver — e.g. bare `min(a, b)`
+        // (an `import kotlin.math.min`) hijacked by the same-named
+        // `IntArray.min()` collection extension, whose `this.size`
+        // then ran against the `Int` argument. When `func_id` lands on
+        // an extension, prefer a non-extension same-named sibling and
+        // otherwise fall through to the intrinsic probes below.
+        let is_ext_fid = |fid: klio_ir::FuncId, m: &klio_ir::Module| {
+            m.funcs
+                .get(fid.0 as usize)
+                .and_then(|f| f.params.first())
+                .map_or(false, |p| p.name == "this")
+        };
+        let chosen = self.module.func_id(name).and_then(|fid| {
+            if is_ext_fid(fid, &self.module) {
+                self.module
+                    .funcs_by_simple_name(name)
+                    .iter()
+                    .copied()
+                    .find(|&c| {
+                        !is_ext_fid(c, &self.module)
+                            && self
+                                .module
+                                .funcs
+                                .get(c.0 as usize)
+                                .map_or(false, |f| !f.blocks.is_empty())
+                    })
+            } else {
+                Some(fid)
+            }
+        });
+        if let Some(fid) = chosen {
             let func = self.module.funcs.get(fid.0 as usize).cloned()?;
             if !func.blocks.is_empty() {
                 let n_params = func.params.len();
