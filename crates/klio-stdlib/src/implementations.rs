@@ -806,6 +806,12 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableMap.count", coll_map_count_no_pred),
     ("kotlin.collections.MutableMap.putAll", coll_mut_map_put_all),
     ("kotlin.collections.MutableMap.set", coll_mut_map_set),
+    ("kotlin.collections.MutableMap.merge", map_merge),
+    ("kotlin.collections.MutableMap.putIfAbsent", map_put_if_absent),
+    ("kotlin.collections.MutableMap.replace", map_replace),
+    ("kotlin.collections.MutableMap.computeIfAbsent", map_compute_if_absent),
+    ("kotlin.collections.MutableMap.computeIfPresent", map_compute_if_present),
+    ("kotlin.collections.MutableMap.compute", map_compute),
 
     // ----- Iterable higher-order (lambda-driven) -----
     // forEach / map / filter / filterNotNull / any / all / none on
@@ -6091,6 +6097,158 @@ fn coll_mut_map_remove(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn coll_mut_map_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     recv_map_entries(ctx.args, "MutableMap.clear")?.borrow_mut().clear();
     Ok(Value::Unit)
+}
+
+/// Shared accessor: the entries ObjRef of a `Value::Map` receiver.
+fn mut_map_entries_rc(
+    recv: &Value,
+    who: &str,
+) -> Result<ObjRef<Vec<(Value, Value)>>, RuntimeError> {
+    match recv {
+        Value::Map { entries, .. } => Ok(entries.clone()),
+        _ => Err(RuntimeError::Type(format!("{who} requires a MutableMap receiver"))),
+    }
+}
+
+fn map_find(entries: &ObjRef<Vec<(Value, Value)>>, key: &Value) -> Option<Value> {
+    entries
+        .borrow()
+        .iter()
+        .find(|(k, _)| Value::structural_eq(k, key))
+        .map(|(_, v)| v.clone())
+}
+
+fn map_set(entries: &ObjRef<Vec<(Value, Value)>>, key: Value, value: Value) {
+    let mut b = entries.borrow_mut();
+    if let Some(slot) = b.iter_mut().find(|(k, _)| Value::structural_eq(k, &key)) {
+        slot.1 = value;
+    } else {
+        b.push((key, value));
+    }
+}
+
+fn map_remove_key(entries: &ObjRef<Vec<(Value, Value)>>, key: &Value) {
+    let mut b = entries.borrow_mut();
+    if let Some(pos) = b.iter().position(|(k, _)| Value::structural_eq(k, key)) {
+        b.remove(pos);
+    }
+}
+
+/// `merge(key, value) { old, new -> … }`: insert `value` if absent, else store
+/// the remapping result (or remove the key if it returns null). Returns the new
+/// value, or null if removed.
+fn map_merge(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let entries = mut_map_entries_rc(&ctx.args[0].clone(), "merge")?;
+    let key = ctx.args.get(1).cloned().ok_or_else(|| RuntimeError::Arity("merge requires a key".into()))?;
+    let value = ctx.args.get(2).cloned().ok_or_else(|| RuntimeError::Arity("merge requires a value".into()))?;
+    let block = ctx.args.get(3).cloned().ok_or_else(|| RuntimeError::Arity("merge requires a remapping block".into()))?;
+    let existing = map_find(&entries, &key);
+    let CallCtx { out, host, .. } = ctx;
+    let new_val = match existing {
+        None => value,
+        Some(old) => host.invoke_callable(&block, &[old, value], *out)?,
+    };
+    if matches!(new_val, Value::Null) {
+        map_remove_key(&entries, &key);
+    } else {
+        map_set(&entries, key, new_val.clone());
+    }
+    Ok(new_val)
+}
+
+/// `putIfAbsent(key, value)`: store only if absent; return the previous value
+/// (or null).
+fn map_put_if_absent(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let entries = mut_map_entries_rc(&ctx.args[0].clone(), "putIfAbsent")?;
+    let key = ctx.args.get(1).cloned().ok_or_else(|| RuntimeError::Arity("putIfAbsent requires a key".into()))?;
+    let value = ctx.args.get(2).cloned().ok_or_else(|| RuntimeError::Arity("putIfAbsent requires a value".into()))?;
+    match map_find(&entries, &key) {
+        Some(old) => Ok(old),
+        None => {
+            map_set(&entries, key, value);
+            Ok(Value::Null)
+        }
+    }
+}
+
+/// `replace(key, value)`: replace only if the key is present; return the
+/// previous value (or null). The 3-arg `replace(key, old, new): Boolean` form
+/// is handled when a third arg is supplied.
+fn map_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let entries = mut_map_entries_rc(&ctx.args[0].clone(), "replace")?;
+    let key = ctx.args.get(1).cloned().ok_or_else(|| RuntimeError::Arity("replace requires a key".into()))?;
+    if ctx.args.len() >= 4 {
+        // replace(key, oldValue, newValue): Boolean
+        let old = ctx.args[2].clone();
+        let new = ctx.args[3].clone();
+        match map_find(&entries, &key) {
+            Some(cur) if Value::structural_eq(&cur, &old) => {
+                map_set(&entries, key, new);
+                Ok(Value::Bool(true))
+            }
+            _ => Ok(Value::Bool(false)),
+        }
+    } else {
+        let value = ctx.args.get(2).cloned().ok_or_else(|| RuntimeError::Arity("replace requires a value".into()))?;
+        match map_find(&entries, &key) {
+            Some(old) => {
+                map_set(&entries, key, value);
+                Ok(old)
+            }
+            None => Ok(Value::Null),
+        }
+    }
+}
+
+/// `computeIfAbsent(key) { key -> value }`: compute & store a value only if the
+/// key is absent; returns the present-or-computed value.
+fn map_compute_if_absent(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let entries = mut_map_entries_rc(&ctx.args[0].clone(), "computeIfAbsent")?;
+    let key = ctx.args.get(1).cloned().ok_or_else(|| RuntimeError::Arity("computeIfAbsent requires a key".into()))?;
+    if let Some(v) = map_find(&entries, &key) {
+        return Ok(v);
+    }
+    let block = ctx.args.get(2).cloned().ok_or_else(|| RuntimeError::Arity("computeIfAbsent requires a block".into()))?;
+    let CallCtx { out, host, .. } = ctx;
+    let v = host.invoke_callable(&block, std::slice::from_ref(&key), *out)?;
+    map_set(&entries, key, v.clone());
+    Ok(v)
+}
+
+/// `computeIfPresent(key) { key, old -> new? }`: recompute only if present;
+/// remove on null. Returns the new value (or null).
+fn map_compute_if_present(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let entries = mut_map_entries_rc(&ctx.args[0].clone(), "computeIfPresent")?;
+    let key = ctx.args.get(1).cloned().ok_or_else(|| RuntimeError::Arity("computeIfPresent requires a key".into()))?;
+    let block = ctx.args.get(2).cloned().ok_or_else(|| RuntimeError::Arity("computeIfPresent requires a block".into()))?;
+    let Some(old) = map_find(&entries, &key) else {
+        return Ok(Value::Null);
+    };
+    let CallCtx { out, host, .. } = ctx;
+    let new_val = host.invoke_callable(&block, &[key.clone(), old], *out)?;
+    if matches!(new_val, Value::Null) {
+        map_remove_key(&entries, &key);
+    } else {
+        map_set(&entries, key, new_val.clone());
+    }
+    Ok(new_val)
+}
+
+/// `compute(key) { key, old? -> new? }`: recompute from the (possibly null)
+/// current value; remove on null. Returns the new value (or null).
+fn map_compute(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let entries = mut_map_entries_rc(&ctx.args[0].clone(), "compute")?;
+    let key = ctx.args.get(1).cloned().ok_or_else(|| RuntimeError::Arity("compute requires a key".into()))?;
+    let block = ctx.args.get(2).cloned().ok_or_else(|| RuntimeError::Arity("compute requires a block".into()))?;
+    let old = map_find(&entries, &key).unwrap_or(Value::Null);
+    let CallCtx { out, host, .. } = ctx;
+    let new_val = host.invoke_callable(&block, &[key.clone(), old], *out)?;
+    if matches!(new_val, Value::Null) {
+        map_remove_key(&entries, &key);
+    } else {
+        map_set(&entries, key, new_val.clone());
+    }
+    Ok(new_val)
 }
 
 // ----- Pair members -----
