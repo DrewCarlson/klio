@@ -854,6 +854,13 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableList.groupBy", coll_iter_group_by),
     ("kotlin.collections.Set.groupBy", coll_iter_group_by),
     ("kotlin.collections.MutableSet.groupBy", coll_iter_group_by),
+    ("kotlin.collections.List.groupingBy", coll_iter_grouping_by),
+    ("kotlin.collections.MutableList.groupingBy", coll_iter_grouping_by),
+    ("kotlin.collections.Set.groupingBy", coll_iter_grouping_by),
+    ("kotlin.collections.MutableSet.groupingBy", coll_iter_grouping_by),
+    ("kotlin.collections.Grouping.eachCount", coll_grouping_each_count),
+    ("kotlin.collections.Grouping.fold", coll_grouping_fold),
+    ("kotlin.collections.Grouping.reduce", coll_grouping_reduce),
     ("kotlin.collections.List.associate", coll_iter_associate),
     ("kotlin.collections.MutableList.associate", coll_iter_associate),
     ("kotlin.collections.Set.associate", coll_iter_associate),
@@ -1284,6 +1291,129 @@ fn coll_iter_group_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .map(|(k, vs)| (k, make_list(vs, false)))
         .collect();
     Ok(make_map(entries, false))
+}
+
+/// `Iterable.groupingBy(keySelector)` — klio represents the lazy
+/// `Grouping<T, K>` as a synthetic instance carrying the source items and
+/// the key selector. The `Grouping.*` terminals below consume it.
+fn coll_iter_grouping_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("groupingBy expects (receiver, keySelector)".into()));
+    }
+    let items = iterable_items(&ctx.args[0], "groupingBy")?;
+    let block = ctx.args[1].clone();
+    let id = ctx.host.alloc_instance_id();
+    Ok(ctx.host.new_synth_instance(
+        "kotlin.collections.Grouping",
+        id,
+        vec![
+            ("__grouping_src".to_string(), make_list(items, false)),
+            ("__grouping_key".to_string(), block),
+        ],
+    ))
+}
+
+/// Extract the (source items, key selector) a `groupingBy` stashed in its
+/// synthetic Grouping instance.
+fn grouping_parts(v: &Value) -> Result<(Vec<Value>, Value), RuntimeError> {
+    if let Value::Instance(inst) = v {
+        let b = inst.borrow();
+        if let (Some(Value::List { items, .. }), Some(key)) =
+            (b.get("__grouping_src"), b.get("__grouping_key"))
+        {
+            return Ok((items.borrow().clone(), key));
+        }
+    }
+    Err(RuntimeError::Type("expected a Grouping receiver".into()))
+}
+
+fn coll_grouping_each_count(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (items, key) = grouping_parts(&ctx.args[0])?;
+    let CallCtx { out, host, .. } = ctx;
+    let mut counts: Vec<(Value, i64)> = Vec::new();
+    for v in items {
+        let k = host.invoke_callable(&key, std::slice::from_ref(&v), *out)?;
+        if let Some(slot) = counts.iter_mut().find(|(kk, _)| Value::structural_eq(kk, &k)) {
+            slot.1 += 1;
+        } else {
+            counts.push((k, 1));
+        }
+    }
+    let entries: Vec<(Value, Value)> =
+        counts.into_iter().map(|(k, c)| (k, Value::new_int(c))).collect();
+    Ok(make_map(entries, false))
+}
+
+/// `Grouping.fold(initial) { acc, e -> ... }` and
+/// `Grouping.fold(initialSelector, operation)`. The two-arg form's first
+/// argument is the constant initial value; klio also accepts a callable
+/// initial selector `(key, element) -> R`.
+fn coll_grouping_fold(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (items, key) = grouping_parts(&ctx.args[0])?;
+    let initial = ctx.args.get(1).cloned().unwrap_or(Value::Null);
+    let op = ctx
+        .args
+        .get(2)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("fold expects (initial, operation)".into()))?;
+    let CallCtx { out, host, .. } = ctx;
+    // entry order follows first appearance of each key
+    let mut acc: Vec<(Value, Value)> = Vec::new();
+    for v in items {
+        let k = host.invoke_callable(&key, std::slice::from_ref(&v), *out)?;
+        let pos = acc.iter().position(|(kk, _)| Value::structural_eq(kk, &k));
+        let cur = match pos {
+            Some(p) => acc[p].1.clone(),
+            None => {
+                // initial may be a constant or a (key, element) selector
+                if is_callable(&initial) {
+                    host.invoke_callable(&initial, &[k.clone(), v.clone()], *out)?
+                } else {
+                    initial.clone()
+                }
+            }
+        };
+        let next = host.invoke_callable(&op, &[cur, v.clone()], *out)?;
+        match pos {
+            Some(p) => acc[p].1 = next,
+            None => acc.push((k, next)),
+        }
+    }
+    Ok(make_map(acc, false))
+}
+
+fn coll_grouping_reduce(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (items, key) = grouping_parts(&ctx.args[0])?;
+    let op = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("reduce expects (operation)".into()))?;
+    let CallCtx { out, host, .. } = ctx;
+    let mut acc: Vec<(Value, Value)> = Vec::new();
+    for v in items {
+        let k = host.invoke_callable(&key, std::slice::from_ref(&v), *out)?;
+        match acc.iter().position(|(kk, _)| Value::structural_eq(kk, &k)) {
+            Some(p) => {
+                let cur = acc[p].1.clone();
+                // reduce operation is (key, accumulator, element)
+                acc[p].1 = host.invoke_callable(&op, &[k, cur, v], *out)?;
+            }
+            None => acc.push((k, v)),
+        }
+    }
+    Ok(make_map(acc, false))
+}
+
+fn is_callable(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Lambda { .. }
+            | Value::IrClosure { .. }
+            | Value::Function { .. }
+            | Value::Intrinsic { .. }
+            | Value::Instance(_)
+    )
 }
 
 fn coll_iter_associate(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
