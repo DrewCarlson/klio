@@ -2458,6 +2458,19 @@ fn cmp_extreme(
             };
             return Ok(if pick_first { a.clone() } else { b.clone() });
         }
+        // Numeric operands use `num_extreme` (width widening +
+        // Math.min/max NaN propagation). Any other `Comparable`
+        // (`maxOf("a","b")`, Char) picks by the total comparison
+        // order, mirroring the generic `maxOf<T : Comparable<T>>`.
+        if !(a.is_numeric() && b.is_numeric()) {
+            let ord = compare_values(a, b)?;
+            let pick_first = if want_min {
+                ord != std::cmp::Ordering::Greater
+            } else {
+                ord != std::cmp::Ordering::Less
+            };
+            return Ok(if pick_first { a.clone() } else { b.clone() });
+        }
     }
     num_extreme(ctx.args, want_min, what)
 }

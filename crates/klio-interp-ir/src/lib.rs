@@ -732,6 +732,41 @@ fn member_is_property(
     false
 }
 
+/// Whether a body's declared primitive parameter type can accept `v`.
+/// Conservative: only a *definite* concrete-primitive-vs-different-
+/// primitive pairing rejects. A generic / supertype / non-primitive
+/// param type, or a non-primitive argument, always accepts — so this
+/// never rejects a legitimately-bound overload, only flags a body
+/// bound to the wrong type-specialized sibling.
+fn primitive_param_accepts(type_name: &str, v: &klio_runtime::Value) -> bool {
+    use klio_runtime::Value::*;
+    let arg_is_primitive = matches!(
+        v,
+        Int(_) | Long(_) | Short(_) | Byte(_)
+            | UInt(_) | ULong(_) | UShort(_) | UByte(_)
+            | Double(_) | Float(_) | Char(_) | Bool(_) | String(_)
+    );
+    if !arg_is_primitive {
+        return true;
+    }
+    match type_name {
+        "Int" => matches!(v, Int(_)),
+        "Long" => matches!(v, Long(_)),
+        "Short" => matches!(v, Short(_)),
+        "Byte" => matches!(v, Byte(_)),
+        "UInt" => matches!(v, UInt(_)),
+        "ULong" => matches!(v, ULong(_)),
+        "UShort" => matches!(v, UShort(_)),
+        "UByte" => matches!(v, UByte(_)),
+        "Double" => matches!(v, Double(_)),
+        "Float" => matches!(v, Float(_)),
+        "Char" => matches!(v, Char(_)),
+        "Boolean" => matches!(v, Bool(_)),
+        "String" => matches!(v, String(_)),
+        _ => true,
+    }
+}
+
 struct VmHost<'a> {
     globals: klio_runtime::ObjRef<klio_runtime::Env>,
     module: Arc<klio_ir::Module>,
@@ -4965,6 +5000,33 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         if let Some(intrinsic) = self.prog.installed_bindings.resolve(&f.fqn) {
             let v = self.dispatch_intrinsic(intrinsic, &args)?;
             return Ok(v);
+        }
+        // Mis-bound type-specialized overload fallback. A bare call
+        // (`maxOf(a, b)`) is lowered to a single FuncId with no
+        // argument-type information, so it can bind to the wrong
+        // type-specialized overload — e.g. `maxOf(Double, Double)`
+        // binding to the `maxOf(UInt, UInt)` body, whose `if (a >= b)`
+        // runs an IEEE compare on the Double args and drops NaN. When
+        // the resolved body's concrete primitive parameter types
+        // definitely mismatch the runtime arguments and a same-FQN
+        // intrinsic exists, dispatch the intrinsic (which inspects the
+        // real argument types). General across any such mis-binding; a
+        // body whose params match, or that has no intrinsic, runs
+        // unchanged.
+        if !f.blocks.is_empty() && !args.is_empty() {
+            let user_offset = usize::from(
+                f.params.first().map_or(false, |p| p.name == "this"),
+            );
+            let mismatch = args.iter().enumerate().any(|(i, v)| {
+                f.params
+                    .get(user_offset + i)
+                    .map_or(false, |p| !p.is_vararg && !primitive_param_accepts(&p.ty.name, v))
+            });
+            if mismatch {
+                if let Some(intrinsic) = self.lookup_intrinsic(&f.fqn) {
+                    return self.dispatch_intrinsic(intrinsic, &args);
+                }
+            }
         }
         // Bodyless `expect` decl: redirect to a same-name same-arity
         // sibling with a body. Source files are lowered in order, so

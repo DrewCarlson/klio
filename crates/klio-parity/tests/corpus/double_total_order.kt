@@ -24,11 +24,20 @@ fun main() {
     println(myMax(3, 9))
     println(myMin(3, 9))
     println(myMax("a", "b"))
-    // non-NaN stdlib maxOf/minOf
+    // the stdlib maxOf/minOf use Math.min/max for floats — NaN
+    // propagates regardless of argument order or numeric type.
+    println(maxOf(Double.NaN, 1.0))
+    println(minOf(Double.NaN, 1.0))
+    println(maxOf(1.0, Double.NaN))
+    println(minOf(1.0, Double.NaN))
+    println(maxOf(2.0f, Float.NaN))
     println(maxOf(3.0, 7.0))
     println(minOf(3.0, 7.0))
     println(maxOf(1, 5))
+    println(minOf(7, 2))
+    println(maxOf(1L, 9L))
     println(maxOf("a", "b"))
+    println(minOf("a", "b"))
     // Float total order
     println(listOf(2.0f, Float.NaN, 1.0f, -0.0f, 0.0f).sorted())
     println(Float.NaN.compareTo(1.0f))
