@@ -2928,15 +2928,9 @@ fn byte_to_char_index(s: &str, byte: Option<usize>) -> i64 {
 fn string_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.replace")?;
     if let Some(Value::Regex(r)) = ctx.args.get(1) {
-        let repl = match ctx.args.get(2) {
-            Some(Value::String(s)) => (**s).clone(),
-            _ => return Err(RuntimeError::Type(
-                "replace(Regex, replacement: String) — lambda form not supported".into(),
-            )),
-        };
-        return Ok(Value::String(Arc::new(
-            r.re.replace_all(s, repl.as_str()).into_owned(),
-        )));
+        let (r, s) = (Arc::clone(r), Arc::clone(s));
+        let repl = ctx.args.get(2).cloned();
+        return perform_regex_replace(ctx, &r, &s, repl, false, "replace");
     }
     let old = arg_as_string(
         ctx.args
@@ -3249,14 +3243,33 @@ fn string_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }));
     }
     let size = *size as usize;
+    let transform = match ctx.args.get(2) {
+        Some(Value::Null) | None => None,
+        Some(v) => Some(v.clone()),
+    };
     let chars: Vec<char> = s.chars().collect();
-    let mut out: Vec<Value> = Vec::new();
+    let mut pieces: Vec<String> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         let end = (i + size).min(chars.len());
-        let chunk: String = chars[i..end].iter().collect();
-        out.push(Value::String(Arc::new(chunk)));
+        pieces.push(chars[i..end].iter().collect());
         i += size;
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(pieces.len());
+    match transform {
+        None => {
+            for p in pieces {
+                out.push(Value::String(Arc::new(p)));
+            }
+        }
+        Some(block) => {
+            let CallCtx { out: sink, host, .. } = ctx;
+            for p in pieces {
+                let arg = Value::String(Arc::new(p));
+                let r = host.invoke_callable(&block, std::slice::from_ref(&arg), *sink)?;
+                out.push(r);
+            }
+        }
     }
     Ok(make_list(out, false))
 }
@@ -5732,13 +5745,36 @@ fn coll_list_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }));
     }
     let size = *size as usize;
-    let borrow = it.borrow();
-    let mut groups: Vec<Value> = Vec::new();
-    let mut i = 0;
-    while i < borrow.len() {
-        let end = (i + size).min(borrow.len());
-        groups.push(make_list(borrow[i..end].to_vec(), false));
-        i += size;
+    let transform = match ctx.args.get(2) {
+        Some(Value::Null) | None => None,
+        Some(v) => Some(v.clone()),
+    };
+    let chunks: Vec<Vec<Value>> = {
+        let borrow = it.borrow();
+        let mut chunks: Vec<Vec<Value>> = Vec::new();
+        let mut i = 0;
+        while i < borrow.len() {
+            let end = (i + size).min(borrow.len());
+            chunks.push(borrow[i..end].to_vec());
+            i += size;
+        }
+        chunks
+    };
+    let mut groups: Vec<Value> = Vec::with_capacity(chunks.len());
+    match transform {
+        None => {
+            for c in chunks {
+                groups.push(make_list(c, false));
+            }
+        }
+        Some(block) => {
+            let CallCtx { out, host, .. } = ctx;
+            for c in chunks {
+                let window = make_list(c, false);
+                let r = host.invoke_callable(&block, std::slice::from_ref(&window), *out)?;
+                groups.push(r);
+            }
+        }
     }
     Ok(make_list(groups, false))
 }
@@ -7149,6 +7185,11 @@ fn string_substring_after_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
 
 fn string_replace_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.replaceFirst")?;
+    if let Some(Value::Regex(r)) = ctx.args.get(1) {
+        let (r, s) = (Arc::clone(r), Arc::clone(s));
+        let repl = ctx.args.get(2).cloned();
+        return perform_regex_replace(ctx, &r, &s, repl, true, "replaceFirst");
+    }
     let old = arg_as_string(
         ctx.args.get(1).ok_or_else(|| RuntimeError::Arity("replaceFirst requires old".into()))?,
         "replaceFirst",
@@ -8500,19 +8541,152 @@ fn regex_matches_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
 }
 
+/// Expand a Kotlin replacement template against a single match's
+/// groups. Kotlin's syntax differs from Rust's: `$n` / `${n}` reference
+/// a group by index, `${name}` references a named group, and `\`
+/// escapes the next character (`\$` is a literal `$`, `\\` a literal
+/// `\`). A `$` not followed by a digit or `{` is itself an error in
+/// Kotlin; we emit it literally to stay total.
+fn expand_kotlin_replacement(
+    template: &str,
+    regex: &RegexData,
+    groups: &[Option<MatchGroupData>],
+) -> String {
+    let group_text = |idx: usize| -> &str {
+        groups
+            .get(idx)
+            .and_then(|g| g.as_ref())
+            .map(|g| g.value.as_str())
+            .unwrap_or("")
+    };
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                if i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            '$' => {
+                i += 1;
+                if i < chars.len() && chars[i] == '{' {
+                    i += 1;
+                    let mut key = String::new();
+                    while i < chars.len() && chars[i] != '}' {
+                        key.push(chars[i]);
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        i += 1; // consume '}'
+                    }
+                    if let Ok(idx) = key.parse::<usize>() {
+                        out.push_str(group_text(idx));
+                    } else if let Some(idx) =
+                        regex.re.capture_names().position(|n| n == Some(key.as_str()))
+                    {
+                        out.push_str(group_text(idx));
+                    }
+                } else {
+                    let mut num = String::new();
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        num.push(chars[i]);
+                        i += 1;
+                    }
+                    if let Ok(idx) = num.parse::<usize>() {
+                        out.push_str(group_text(idx));
+                    } else {
+                        out.push('$');
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Shared engine for `Regex.replace` / `Regex.replaceFirst` and the
+/// `String.replace(Regex, …)` family. `repl` is either a `String`
+/// template (Kotlin `$group` substitution) or a callable
+/// `(MatchResult) -> CharSequence`.
+fn perform_regex_replace(
+    ctx: &mut CallCtx,
+    r: &Arc<RegexData>,
+    s: &Arc<String>,
+    repl: Option<Value>,
+    first_only: bool,
+    who: &str,
+) -> Result<Value, RuntimeError> {
+    match repl {
+        Some(Value::String(template)) => {
+            let mut out = String::with_capacity(s.len());
+            let mut last = 0usize;
+            for caps in r.re.captures_iter(s) {
+                let m0 = caps.get(0).unwrap();
+                out.push_str(&s[last..m0.start()]);
+                last = m0.end();
+                let md = build_match(r, s, caps);
+                out.push_str(&expand_kotlin_replacement(&template, r, &md.groups));
+                if first_only {
+                    break;
+                }
+            }
+            out.push_str(&s[last..]);
+            Ok(Value::String(Arc::new(out)))
+        }
+        Some(block) => {
+            // Collect match spans first so the call-back borrow of `ctx`
+            // does not overlap the regex iterator's borrow of `s`.
+            let mut spans: Vec<(usize, usize, MatchData)> = Vec::new();
+            for caps in r.re.captures_iter(s) {
+                let m0 = caps.get(0).unwrap();
+                let (start, end) = (m0.start(), m0.end());
+                spans.push((start, end, build_match(r, s, caps)));
+                if first_only {
+                    break;
+                }
+            }
+            let mut out = String::with_capacity(s.len());
+            let mut last = 0usize;
+            let CallCtx { out: sink, host, .. } = ctx;
+            for (start, end, md) in spans {
+                out.push_str(&s[last..start]);
+                last = end;
+                let mr = Value::Match(Arc::new(md));
+                let rv = host.invoke_callable(&block, std::slice::from_ref(&mr), *sink)?;
+                match rv {
+                    Value::String(rs) => out.push_str(&rs),
+                    Value::Char(c) => out.push(c),
+                    other => {
+                        return Err(RuntimeError::Type(format!(
+                            "{who} transform must return a CharSequence, got {other:?}"
+                        )))
+                    }
+                }
+            }
+            out.push_str(&s[last..]);
+            Ok(Value::String(Arc::new(out)))
+        }
+        None => Err(RuntimeError::Arity(format!("{who} requires a replacement"))),
+    }
+}
+
 fn regex_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let r = regex_arg(ctx.args, "Regex.replace")?;
     let s = match ctx.args.get(1) {
         Some(Value::String(s)) => s.clone(),
         _ => return Err(RuntimeError::Type("Regex.replace requires a String".into())),
     };
-    let repl = match ctx.args.get(2) {
-        Some(Value::String(s)) => (**s).clone(),
-        _ => return Err(RuntimeError::Type(
-            "Regex.replace lambda form not supported here".into(),
-        )),
-    };
-    Ok(Value::String(Arc::new(r.re.replace_all(&s, repl.as_str()).into_owned())))
+    let repl = ctx.args.get(2).cloned();
+    perform_regex_replace(ctx, &r, &s, repl, false, "Regex.replace")
 }
 
 fn regex_replace_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -8521,13 +8695,8 @@ fn regex_replace_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(Value::String(s)) => s.clone(),
         _ => return Err(RuntimeError::Type("Regex.replaceFirst requires a String".into())),
     };
-    let repl = match ctx.args.get(2) {
-        Some(Value::String(s)) => (**s).clone(),
-        _ => return Err(RuntimeError::Type(
-            "Regex.replaceFirst requires a String replacement".into(),
-        )),
-    };
-    Ok(Value::String(Arc::new(r.re.replace(&s, repl.as_str()).into_owned())))
+    let repl = ctx.args.get(2).cloned();
+    perform_regex_replace(ctx, &r, &s, repl, true, "Regex.replaceFirst")
 }
 
 fn regex_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
