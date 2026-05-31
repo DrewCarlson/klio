@@ -13,8 +13,10 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
-use klio_interp_ir::build::build_module;
 use klio_interp_ir::Vm;
 use klio_lexer::Lexer;
 use klio_parser::Parser as KtParser;
@@ -40,7 +42,7 @@ impl klio_runtime::Output for CaptureOutput {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParityReport {
     pub matched: bool,
     pub kotlinc_stdout: String,
@@ -563,6 +565,279 @@ pub fn run_kotlinc_jar(jar: &Path) -> Result<(String, Option<i32>), ParityError>
     let result = Command::new(java).arg("-jar").arg(jar).output()?;
     let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
     Ok((stdout, result.status.code()))
+}
+
+/// On-disk cache of kotlinc *output* (stdout + exit), keyed by a caller-chosen
+/// key. kotlinc output is deterministic for a fixed source + compiler version,
+/// so once recorded a rerun needs neither `kotlinc` nor `java`. Namespaced by
+/// `TARGET_VERSION` so a compiler bump invalidates the whole set.
+fn expected_cache_dir() -> PathBuf {
+    parity_cache_dir().join(format!("expected-{TARGET_VERSION}"))
+}
+
+fn read_expected(key: &str) -> Option<(String, Option<i32>)> {
+    let dir = expected_cache_dir();
+    let out = fs::read_to_string(dir.join(format!("{key}.out"))).ok()?;
+    // Exit code is optional: a missing/empty `.exit` means "unknown".
+    let exit = fs::read_to_string(dir.join(format!("{key}.exit")))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok());
+    Some((out, exit))
+}
+
+fn write_expected(key: &str, stdout: &str, exit: Option<i32>) {
+    let dir = expected_cache_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = fs::write(dir.join(format!("{key}.out")), stdout);
+    if let Some(code) = exit {
+        let _ = fs::write(dir.join(format!("{key}.exit")), code.to_string());
+    }
+}
+
+/// kotlinc output for a single `.kt` file, cached by content hash. On a cache
+/// miss it compiles (jar is itself content-hash cached) and runs once, then
+/// records the output so subsequent runs touch neither kotlinc nor java.
+pub fn kotlinc_output(file: &Path) -> Result<(String, Option<i32>), ParityError> {
+    let key = cache_key(file);
+    if let Some(hit) = read_expected(&key) {
+        return Ok(hit);
+    }
+    let jar = compile_with_kotlinc(file)?;
+    let (stdout, exit) = run_kotlinc_jar(&jar)?;
+    write_expected(&key, &stdout, exit);
+    Ok((stdout, exit))
+}
+
+/// Content-hash key for one bulk-compiled corpus/examples entry. Keyed on the
+/// bytes of the STAGED source (package shim + `inject_jvm_inline` rewrite), so
+/// it captures both the original source and any staging-logic change — those
+/// are exactly what determine the program's output (`toString`/qualified
+/// names). `TARGET_VERSION` is folded in via [`expected_cache_dir`].
+fn corpus_entry_key(staged: &Path) -> String {
+    let mut h = DefaultHasher::new();
+    fs::read(staged).unwrap_or_default().hash(&mut h);
+    format!("corpus-{:016x}", h.finish())
+}
+
+/// kotlinc output for one corpus/examples entry compiled as part of a bulk
+/// `compile_corpus` jar. Keyed on the staged-source bytes so the
+/// `java -cp jar <fqcn>` run is skipped on a hit; `run_jar` is invoked only on
+/// a miss. A fully-warm sweep therefore spawns no `java` at all.
+pub fn corpus_entry_output(
+    staged: &Path,
+    run_jar: impl FnOnce() -> Result<(String, Option<i32>), ParityError>,
+) -> Result<(String, Option<i32>), ParityError> {
+    let key = corpus_entry_key(staged);
+    if let Some(hit) = read_expected(&key) {
+        return Ok(hit);
+    }
+    let (stdout, exit) = run_jar()?;
+    write_expected(&key, &stdout, exit);
+    Ok((stdout, exit))
+}
+
+/// True when every staged entry already has a cached corpus output.
+#[must_use]
+pub fn corpus_outputs_all_cached(staged: &[PathBuf]) -> bool {
+    staged.iter().all(|s| read_expected(&corpus_entry_key(s)).is_some())
+}
+
+/// The workspace corpus directory (`crates/klio-parity/tests/corpus`).
+#[must_use]
+pub fn corpus_dir() -> PathBuf {
+    workspace_root()
+        .join("crates")
+        .join("klio-parity")
+        .join("tests")
+        .join("corpus")
+}
+
+/// The workspace `examples/` directory.
+#[must_use]
+pub fn examples_dir() -> PathBuf {
+    workspace_root().join("examples")
+}
+
+/// Every `.kt` file directly under `dir`, sorted by path.
+#[must_use]
+pub fn collect_kt(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("kt") {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// klio's `Math.pow` matches Kotlin/Native; JVM `StrictMath.pow` differs in the
+/// last bit on some inputs. The corpus tolerates a ULP-1 double diff for the
+/// known files so the rest of each file's lines still get compared. Two outputs
+/// are "equal modulo ULP-1 doubles" only when every diverging line parses as
+/// `f64` and agrees to within one ULP.
+#[must_use]
+pub fn known_jvm_float_diff(path: &Path, kotlinc_out: &str, klio_out: &str) -> bool {
+    const FILES: &[&str] = &["double_pow.kt"];
+    let basename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if !FILES.contains(&basename) {
+        return false;
+    }
+    let a: Vec<&str> = kotlinc_out.lines().collect();
+    let b: Vec<&str> = klio_out.lines().collect();
+    if a.len() != b.len() {
+        return false;
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x == y {
+            continue;
+        }
+        let (Ok(xd), Ok(yd)) = (x.parse::<f64>(), y.parse::<f64>()) else {
+            return false;
+        };
+        let xb = xd.to_bits();
+        let yb = yd.to_bits();
+        if xb.max(yb) - xb.min(yb) > 1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Run `f` on a worker thread; on timeout the worker is detached (Rust has no
+/// portable safe thread-kill) and the caller moves on. Bounds a klio interp
+/// hang so one bad file can't wedge the whole sweep.
+fn run_with_timeout<T, F>(timeout: Duration, f: F) -> Result<T, ()>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).map_err(|_| ())
+}
+
+/// One file's parity verdict in a [`run_sweep`].
+#[derive(Debug, Clone)]
+pub enum SweepVerdict {
+    /// klio stdout matched kotlinc (byte-identical, or ULP-1 for the known
+    /// float file).
+    Pass,
+    /// klio ran but its stdout differed; carries the diffable report.
+    Mismatch(Box<ParityReport>),
+    /// klio errored (lex/parse/runtime) before producing output.
+    KlioError(String),
+    /// kotlinc side could not be produced (compile failure / no kotlinc).
+    KotlincError(String),
+    /// klio exceeded the per-file timeout.
+    Timeout,
+}
+
+/// Per-file outcome of a sweep: the original path and its verdict.
+#[derive(Debug, Clone)]
+pub struct SweepEntryResult {
+    pub path: PathBuf,
+    pub verdict: SweepVerdict,
+}
+
+/// Result of [`run_sweep`]: every file's verdict, in input order.
+#[derive(Debug, Default, Clone)]
+pub struct SweepResult {
+    pub results: Vec<SweepEntryResult>,
+}
+
+impl SweepResult {
+    #[must_use]
+    pub fn passed(&self) -> usize {
+        self.results.iter().filter(|r| matches!(r.verdict, SweepVerdict::Pass)).count()
+    }
+    /// Files that are genuine parity failures (mismatch / klio error / timeout).
+    /// A `KotlincError` is a harness problem (no kotlinc), not a klio failure.
+    #[must_use]
+    pub fn failures(&self) -> Vec<&SweepEntryResult> {
+        self.results
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.verdict,
+                    SweepVerdict::Mismatch(_) | SweepVerdict::KlioError(_) | SweepVerdict::Timeout
+                )
+            })
+            .collect()
+    }
+}
+
+/// Run the corpus/examples parity sweep for `paths`: bulk-compile with kotlinc
+/// once (the jar is content-hash cached, so kotlinc runs only when a file
+/// changed), then in parallel compare each file's kotlinc stdout (text-cached
+/// per staged source — `java` runs only on a cache miss) against a fresh
+/// in-process `klio` run. `jobs` worker threads share the file list. A fully
+/// warm sweep spawns neither kotlinc nor java.
+pub fn run_sweep(label: &str, paths: &[PathBuf], jobs: usize, per_file_timeout: Duration) -> Result<SweepResult, ParityError> {
+    let build = compile_corpus(label, paths)?;
+    let entries = build.classes;
+    let jar = build.jar;
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<SweepVerdict>>> = entries.iter().map(|_| Mutex::new(None)).collect();
+    let jobs = jobs.max(1);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= entries.len() {
+                    break;
+                }
+                let entry = &entries[i];
+                let verdict = sweep_one(&jar, entry, per_file_timeout);
+                *slots[i].lock().unwrap() = Some(verdict);
+            });
+        }
+    });
+    let results = entries
+        .into_iter()
+        .zip(slots)
+        .map(|(entry, slot)| SweepEntryResult {
+            path: entry.original,
+            verdict: slot.into_inner().unwrap().unwrap_or(SweepVerdict::Timeout),
+        })
+        .collect();
+    Ok(SweepResult { results })
+}
+
+fn sweep_one(jar: &Path, entry: &CorpusEntry, per_file_timeout: Duration) -> SweepVerdict {
+    let (kotlinc_stdout, kotlinc_exit) =
+        match corpus_entry_output(&entry.staged, || run_class(jar, &entry.fqcn)) {
+            Ok(v) => v,
+            Err(e) => return SweepVerdict::KotlincError(e.to_string()),
+        };
+    let staged = entry.staged.clone();
+    match run_with_timeout(per_file_timeout, move || run_with_ktc(&staged)) {
+        Ok(Ok(klio_stdout)) => {
+            if kotlinc_stdout == klio_stdout
+                || known_jvm_float_diff(&entry.original, &kotlinc_stdout, &klio_stdout)
+            {
+                SweepVerdict::Pass
+            } else {
+                SweepVerdict::Mismatch(Box::new(ParityReport {
+                    matched: false,
+                    kotlinc_stdout,
+                    klio_stdout,
+                    kotlinc_exit,
+                    klio_error: None,
+                }))
+            }
+        }
+        Ok(Err(e)) => SweepVerdict::KlioError(e),
+        Err(()) => SweepVerdict::Timeout,
+    }
 }
 
 /// Run a specific fully-qualified main class out of `jar`. Used by the bulk
@@ -1449,8 +1724,7 @@ pub fn check(file: &Path) -> Result<ParityReport, ParityError> {
     {
         return Err(ParityError::NoKotlinc);
     }
-    let jar = compile_with_kotlinc(file)?;
-    let (kotlinc_stdout, kotlinc_exit) = run_kotlinc_jar(&jar)?;
+    let (kotlinc_stdout, kotlinc_exit) = kotlinc_output(file)?;
     match run_with_ktc(file) {
         Ok(klio_stdout) => Ok(ParityReport {
             matched: kotlinc_stdout == klio_stdout,
