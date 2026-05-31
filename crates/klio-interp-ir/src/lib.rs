@@ -6528,7 +6528,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let has = entries
                         .borrow()
                         .iter()
-                        .any(|(k, _)| klio_runtime::Value::structural_eq(k, needle));
+                        .any(|(k, _)| klio_runtime::Value::structural_eq_boxed(k, needle));
                     return Ok(klio_runtime::Value::Bool(has));
                 }
                 ("containsValue", 1) => {
@@ -6536,7 +6536,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     let has = entries
                         .borrow()
                         .iter()
-                        .any(|(_, v)| klio_runtime::Value::structural_eq(v, needle));
+                        .any(|(_, v)| klio_runtime::Value::structural_eq_boxed(v, needle));
                     return Ok(klio_runtime::Value::Bool(has));
                 }
                 _ => {}
