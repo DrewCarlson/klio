@@ -4041,29 +4041,58 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     fields.push((p.name.clone(), v));
                 }
             }
+            // Evaluate a supertype ctor-arg expression to a value:
+            // literals via `simple_literal`, else a bare captured
+            // name (a local/param of the enclosing scope, e.g. the
+            // `initial` in `object : ObservableProperty<T>(initial)`),
+            // else a field reached through the captured outer `this`.
+            let eval_super_arg = |expr: &klio_ast::Expr| -> klio_runtime::Value {
+                if let Some(v) = simple_literal(expr) {
+                    return v;
+                }
+                if let klio_ast::Expr::Path { segments, .. } = expr {
+                    if segments.len() == 1 {
+                        let nm = &segments[0].name;
+                        if let Some((_, v)) = capture_pairs.iter().find(|(n, _)| n == nm) {
+                            return v.clone();
+                        }
+                        if let Some((_, klio_runtime::Value::Instance(i))) =
+                            capture_pairs.iter().find(|(n, _)| n == "this")
+                        {
+                            if let Some(v) = i.borrow().get(nm) {
+                                return v;
+                            }
+                        }
+                    }
+                }
+                klio_runtime::Value::Null
+            };
             // Populate parent's primary-param fields from
-            // `object : Named("Anna") { … }` style supertype
-            // ctor args. Best-effort: evaluate literal args via
-            // `simple_literal` so subsequent `name` reads on this
-            // instance see the parent's field.
+            // `object : Named("Anna") { … }` style supertype ctor args.
+            // Also stash each supertype's evaluated ctor args so the
+            // parent body-property initializers (run after the instance
+            // is materialised) see the parent's primary params.
+            let mut super_args_by_class: std::collections::HashMap<
+                String,
+                Vec<klio_runtime::Value>,
+            > = std::collections::HashMap::new();
             for (idx, sup) in supertypes.iter().enumerate() {
                 let arg_exprs = match supertype_args.get(idx) {
                     Some(Some(v)) => v.clone(),
                     _ => continue,
                 };
+                let vals: Vec<klio_runtime::Value> =
+                    arg_exprs.iter().map(|e| eval_super_arg(e)).collect();
                 let parent_def = self.classes.borrow().get(&sup.name.name).cloned();
                 if let Some(pdef) = parent_def {
-                    for (param, arg_expr) in
-                        pdef.primary_params.iter().zip(arg_exprs.iter())
-                    {
+                    for (param, val) in pdef.primary_params.iter().zip(vals.iter()) {
                         if param.property.is_none() {
                             continue;
                         }
-                        let v =
-                            simple_literal(arg_expr).unwrap_or(klio_runtime::Value::Null);
-                        fields.push((param.name.clone(), v));
+                        fields.push((param.name.clone(), val.clone()));
                     }
                 }
+                super_args_by_class.insert(sup.name.name.clone(), vals);
             }
             // Register the anon ClassDef in the runtime class table
             // so the call_member_named walker that resolves inherited
@@ -4087,7 +4116,56 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 identity,
                 native_state: None,
             });
-            return Ok(klio_runtime::Value::Instance(inst));
+            let inst_value = klio_runtime::Value::Instance(inst.clone());
+            // Run the concrete superclass chain's body-property
+            // initializers so inherited `var/val` fields are populated
+            // — an `object : Super(args) { … }` must run the parent
+            // constructor like a named subclass does (new_instance's
+            // chain walk). Without this, e.g. `ObservableProperty.value
+            // = initialValue` never runs and the inherited getValue/
+            // setValue read a missing `value` field. Only runs when a
+            // concrete (non-interface) superclass exists; pure
+            // interface object literals keep the existing fast path.
+            let parent_chain: Vec<Arc<klio_runtime::ClassDef>> = {
+                let mut v = Vec::new();
+                let mut cur = inst.borrow().class.parent.borrow().clone();
+                while let Some(c) = cur {
+                    cur = c.parent.borrow().clone();
+                    v.push(c);
+                }
+                v
+            };
+            // Bottom-up so a parent's field exists before a nearer
+            // ancestor overrides the same name.
+            for cls in parent_chain.iter().rev() {
+                let cls_args: Vec<klio_runtime::Value> =
+                    super_args_by_class.get(&cls.name).cloned().unwrap_or_default();
+                for p in cls.body_properties.iter() {
+                    let Some(fid) = self
+                        .prog
+                        .body_prop_inits
+                        .get(&(cls.name.clone(), p.name.clone()))
+                        .copied()
+                    else {
+                        continue;
+                    };
+                    let Some(func) = self.module.funcs.get(fid.0 as usize).cloned() else {
+                        continue;
+                    };
+                    let module = Arc::clone(&self.module);
+                    let mut all: Vec<klio_runtime::Value> =
+                        Vec::with_capacity(1 + cls_args.len());
+                    all.push(inst_value.clone());
+                    all.extend_from_slice(&cls_args);
+                    let v = klio_ir::eval::eval_with(&module, &func, all, self)?;
+                    // Don't clobber a field the anon body (or a nearer
+                    // class) already set.
+                    if inst.borrow().get(&p.name).is_none() {
+                        inst.borrow_mut().define(&p.name, v);
+                    }
+                }
+            }
+            return Ok(inst_value);
         }
         Err(klio_ir::eval::EvalError::Type(format!(
             "Vm::build_object: not an ObjectExpr AST node"
