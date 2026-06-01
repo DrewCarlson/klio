@@ -1585,6 +1585,29 @@ fn coll_mut_list_sort(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Unit)
 }
 
+/// Dispatch `comparator.compare(a, b)` for a non-intrinsic Comparator
+/// value (an interpreted object / SAM). Returns the `Int` result as an
+/// `i64`. Used by the sorting intrinsics so an interpreted Comparator
+/// (from commonMain sources or user code) works alongside klio's
+/// `Value::Comparator`.
+fn invoke_comparator_compare(
+    host: &mut dyn klio_runtime::IntrinsicHost,
+    comparator: &Value,
+    a: &Value,
+    b: &Value,
+    out: &mut dyn klio_runtime::Output,
+) -> Result<i64, RuntimeError> {
+    let args = [a.clone(), b.clone()];
+    let r = match host.invoke_method(comparator, "compare", &args, out) {
+        Some(r) => r?,
+        // A bare callable (lambda-as-Comparator, `Comparator(::cmp)`)
+        // compares by direct invocation.
+        None => host.invoke_callable(comparator, &args, out)?,
+    };
+    r.as_i64()
+        .ok_or_else(|| RuntimeError::Type("Comparator.compare must return Int".into()))
+}
+
 fn coll_iter_sorted_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() != 2 {
         return Err(RuntimeError::Arity(
@@ -1594,9 +1617,35 @@ fn coll_iter_sorted_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let items = iterable_items(&ctx.args[0], "sortedWith")?;
     let comparator = ctx.args[1].clone();
     let Value::Comparator { steps, descending } = comparator else {
-        return Err(RuntimeError::Type(
-            "sortedWith expects a Comparator argument".into(),
-        ));
+        // Not klio's intrinsic Comparator value — treat the argument as
+        // any object implementing `compare(a, b): Int` (an interpreted
+        // stdlib / user Comparator, e.g. one returned by the commonMain
+        // `Comparator { ... }` SAM or `compareBy` when those bodies run
+        // from source). Sort by dispatching `compare` through the host.
+        let mut items: Vec<Value> = items;
+        let CallCtx { out, host, .. } = ctx;
+        let mut err: Option<RuntimeError> = None;
+        for i in 1..items.len() {
+            let mut j = i;
+            while j > 0 && err.is_none() {
+                let a = items[j - 1].clone();
+                let b = items[j].clone();
+                let ord = match invoke_comparator_compare(*host, &comparator, &a, &b, *out) {
+                    Ok(o) => o,
+                    Err(e) => { err = Some(e); break; }
+                };
+                if ord > 0 {
+                    items.swap(j - 1, j);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+        return Ok(make_list(items, false));
     };
     let CallCtx { out, host, .. } = ctx;
     let mut items: Vec<Value> = items;

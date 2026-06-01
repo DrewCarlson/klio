@@ -2058,6 +2058,15 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             let _ = self.parse_type_params(true);
             self.skip_nl();
         }
+        // A use-site-targeted annotation may prefix the extension
+        // receiver (`val @receiver:AccessibleLateinitPropertyLiteral
+        // KProperty0<*>.isInitialized`, stdlib Lateinit.kt). Annotations
+        // are runtime no-ops here — consume and discard before the
+        // receiver type.
+        if self.peek_kind().is_at() {
+            let _ = self.parse_annotations();
+            self.skip_nl();
+        }
         let receiver_type = if self.looks_like_extension_receiver() {
             let saved_sqp = self.suppress_qualified_path;
             self.suppress_qualified_path = true;
@@ -2873,6 +2882,32 @@ impl<'src, 'tok> Parser<'src, 'tok> {
 
     pub fn parse_expr(&mut self) -> Option<Expr> {
         self.parse_disjunction()
+    }
+
+    /// Consume and discard a leading expression annotation, if present.
+    /// Kotlin allows annotations to prefix an expression
+    /// (`@Suppress("UNCHECKED_CAST") (x as T)`, as in the stdlib's
+    /// `Comparator.reversed()` when-branches); they are runtime no-ops.
+    /// Applied only at control-structure-body / when-branch position so
+    /// it never shadows the label / `this@` / `return@` uses of `@` that
+    /// the unary and primary layers parse.
+    fn skip_leading_expr_annotation(&mut self) {
+        if self.at_expression_annotation() {
+            let _ = self.parse_annotations();
+            self.skip_nl();
+        }
+    }
+
+    /// True when the cursor is at an annotation that prefixes an
+    /// expression — `@Foo`, `@Foo(...)`, `@[Foo Bar]` — as opposed to a
+    /// label (`loop@`), where the `@` follows an identifier and so is not
+    /// in leading position.
+    fn at_expression_annotation(&self) -> bool {
+        self.peek_kind().is_at()
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident | TokenKind::LBracket)
+            )
     }
 
     /// Parse a function expression body (`fun f() = <expr>`). Kotlin
@@ -3764,6 +3799,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     /// `if (c) x = v`.
     fn parse_control_structure_body(&mut self) -> Option<Expr> {
         // Kotlin grammar: `controlStructureBody : block | statement`.
+        // (annotated-expr skip temporarily disabled — isolation test)
         // A leading `{` here is the body *block*, not a lambda — the
         // lambda reading only applies in true expression position
         // (`val f = { … }`), which `parse_primary` handles.
