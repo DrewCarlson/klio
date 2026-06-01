@@ -4596,21 +4596,35 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             // `this@asFlow` is the range, not the FlowCollector), the
             // displaced receiver is the top of the enclosing-`this`
             // stack. Prefer it over the lambda receiver when distinct.
-            if let Some(encl) = enclosing {
-                let same = match (&encl, receiver) {
-                    (
-                        klio_runtime::Value::Instance(a),
-                        klio_runtime::Value::Instance(b),
-                    ) => klio_runtime::ObjRef::ptr_eq(a, b),
-                    _ => false,
-                };
-                if !same
-                    && !matches!(
-                        encl,
-                        klio_runtime::Value::Null | klio_runtime::Value::Unit
-                    )
-                {
-                    return Ok(encl);
+            // Prefer the displaced enclosing receiver only when the
+            // lambda's own `this` (the receiver here) is NOT itself a
+            // bound, usable value — i.e. when the captured `this` is a
+            // builtin/intrinsic value standing in for a real receiver.
+            // When the receiver IS a proper Instance, it is the labeled
+            // extension's own receiver (the inline splice bound it), so
+            // returning the enclosing-stack guess would mis-bind — this
+            // is what broke `this@thenBy.compare` inside the stdlib
+            // `Comparator<T>.thenBy { … }` SAM, where the enclosing
+            // stack held an unrelated instance from the sort driver.
+            let receiver_is_bound_instance =
+                !matches!(receiver, klio_runtime::Value::Null | klio_runtime::Value::Unit);
+            if !receiver_is_bound_instance {
+                if let Some(encl) = enclosing {
+                    let same = match (&encl, receiver) {
+                        (
+                            klio_runtime::Value::Instance(a),
+                            klio_runtime::Value::Instance(b),
+                        ) => klio_runtime::ObjRef::ptr_eq(a, b),
+                        _ => false,
+                    };
+                    if !same
+                        && !matches!(
+                            encl,
+                            klio_runtime::Value::Null | klio_runtime::Value::Unit
+                        )
+                    {
+                        return Ok(encl);
+                    }
                 }
             }
             return Ok(receiver.clone());
