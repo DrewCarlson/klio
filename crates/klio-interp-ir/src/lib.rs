@@ -6236,7 +6236,27 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         ),
                     ));
                 }
-                return self.call_value(&target, args);
+                // The SAM wrapper invokes its lambda for the fun
+                // interface's own method(s) — its single abstract method
+                // (`compare` / `test` / `apply`). A call by a name that is
+                // NOT a declared method of the interface is a top-level
+                // extension on the SAM (`cmp.reversed()`, `cmp.thenBy { }`
+                // — the stdlib `Comparator<T>` extensions): it must
+                // dispatch as an extension with the SAM as receiver, not
+                // splice the lambda with the extension's (wrong-arity)
+                // args. The interface's declared method names live in the
+                // registry's hierarchy map; when it has no entry (a
+                // synthetic wrapper with no method table), keep the legacy
+                // invoke-for-any-name behaviour.
+                let cls_name = inst.borrow().class.name.clone();
+                let declared = self.module.registry.hierarchy_methods.get(&cls_name);
+                let dispatch_lambda = match declared {
+                    Some(methods) if !methods.is_empty() => methods.contains(name),
+                    _ => true,
+                };
+                if dispatch_lambda {
+                    return self.call_value(&target, args);
+                }
             }
         }
         // Bound method/property-reference dispatch: a `recv::member`
