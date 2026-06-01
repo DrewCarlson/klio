@@ -9922,8 +9922,7 @@ fn format_conv(
                 other => format!("{other}"),
             };
             if let Some(p) = precision {
-                let truncated: String = s.chars().take(p).collect();
-                s = truncated;
+                s = char_units_to_string(s.encode_utf16().take(p));
             }
             Ok(if conv == 'S' { s.to_uppercase() } else { s })
         }
