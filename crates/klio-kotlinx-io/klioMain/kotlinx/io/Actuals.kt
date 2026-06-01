@@ -48,6 +48,15 @@ public actual interface RawSink : AutoCloseable {
     override fun close()
 }
 
+// Emptiness predicates over a buffer's readable size. Upstream
+// kotlinx-io spells this `exhausted()`; klio keeps the collection-style
+// `isEmpty()` / `isNotEmpty()` names that shipped programs use. Defined
+// against the `Buffer` receiver so they resolve here rather than to the
+// unrelated internal `Segment.isEmpty()`, and compared against `0L` so
+// the `Long` size is matched without an integer-literal type mismatch.
+public fun Buffer.isEmpty(): Boolean = size == 0L
+public fun Buffer.isNotEmpty(): Boolean = size > 0L
+
 // A counting copy tracker. `removeCopy` reports whether the segment
 // was unshared *before* the call, matching the upstream contract.
 internal class KlioCopyTracker : SegmentCopyTracker() {
