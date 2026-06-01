@@ -527,6 +527,14 @@ pub struct Func {
     /// globals, which collides across nested same-named captures).
     #[serde(default)]
     pub capture_order: Vec<String>,
+    /// For a lambda body, the simple name of the function the lambda
+    /// literal was passed to (`with`, `apply`, a user HOF). This is the
+    /// lambda's implicit label, so `this@with` inside the body resolves
+    /// to the receiver this lambda was invoked with — even when an inner
+    /// receiver lambda has displaced the bare `this`. `None` for ordinary
+    /// functions and for lambdas not in argument position.
+    #[serde(default)]
+    pub implicit_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

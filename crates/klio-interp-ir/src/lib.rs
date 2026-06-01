@@ -1058,6 +1058,15 @@ struct ExecState {
     /// new_instance call so init blocks can read the soon-to-be
     /// `outer` field through the runtime's outer-chain walk.
     inner_outer_hint: RefCell<Vec<klio_runtime::Value>>,
+    /// Active receiver-lambda labels: each entry is the lambda's
+    /// implicit label (the scope-function / HOF simple name like
+    /// `with` / `apply`) paired with the receiver it was invoked with.
+    /// `this@<label>` resolves against this stack (innermost first), so
+    /// an outer `this@with` is reachable even when an inner receiver
+    /// lambda has displaced the bare `this`. Distinct from `outer_this`
+    /// (which is class-keyed and only holds instances) so the existing
+    /// class / member-visibility walks are unaffected.
+    receiver_labels: RefCell<Vec<(String, klio_runtime::Value)>>,
 }
 
 thread_local! {
@@ -1251,6 +1260,26 @@ fn with_inner_outer_hint<R>(
 
 fn with_outer_this<R>(f: impl FnOnce(&RefCell<Vec<klio_runtime::Value>>) -> R) -> R {
     EXEC.with(|e| f(&e.outer_this))
+}
+
+/// Run `f` against this thread's active receiver-lambda label stack.
+fn with_receiver_labels<R>(
+    f: impl FnOnce(&RefCell<Vec<(String, klio_runtime::Value)>>) -> R,
+) -> R {
+    EXEC.with(|e| f(&e.receiver_labels))
+}
+
+/// Look up the receiver bound for the innermost active receiver lambda
+/// whose implicit label matches `qualifier` (`this@with` → the `with`
+/// receiver). `None` when no active lambda carries that label.
+fn receiver_for_label(qualifier: &str) -> Option<klio_runtime::Value> {
+    with_receiver_labels(|s| {
+        s.borrow()
+            .iter()
+            .rev()
+            .find(|(label, _)| label == qualifier)
+            .map(|(_, v)| v.clone())
+    })
 }
 
 #[cfg(test)]

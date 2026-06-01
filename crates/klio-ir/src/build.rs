@@ -151,6 +151,12 @@ pub struct FuncBuilder<'a> {
     /// return from the lambda invocation (its value), not a return
     /// of the caller. (label, result reg, end block).
     inline_lambda_ret: Vec<(String, Reg, BlockId)>,
+    /// Simple name of the call whose arguments are currently being
+    /// lowered, so a lambda literal in argument position can record it
+    /// as its implicit label (`with(n) { … }` → the lambda's body Func
+    /// gets `implicit_label = "with"`). Set per call and re-armed per
+    /// argument by `lower_arg_run`; consumed by `Expr::Lambda` lowering.
+    pub pending_lambda_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +209,7 @@ impl<'a> FuncBuilder<'a> {
             inline_stack: Vec::new(),
             inline_lambda_subst: Vec::new(),
             inline_lambda_ret: Vec::new(),
+            pending_lambda_label: None,
         }
     }
 
@@ -705,6 +712,7 @@ impl<'a> FuncBuilder<'a> {
         is_lambda: false,
         is_inline: self.is_inline,
         capture_order: self.capture_order.clone(),
+        implicit_label: None,
         }
     }
 }

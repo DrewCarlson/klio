@@ -951,7 +951,27 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 if pushed_receiver {
                     with_outer_this(|s| s.borrow_mut().push(this.clone()));
                 }
+                // If this lambda carries an implicit label (the
+                // scope-fn / HOF it was passed to), record `(label,
+                // receiver)` so `this@<label>` in the body — including an
+                // outer label shadowed by a nested receiver lambda —
+                // resolves to this receiver, whatever its type.
+                let pushed_label = self
+                    .module
+                    .funcs
+                    .get(info.body_func.0 as usize)
+                    .and_then(|f| f.implicit_label.clone());
+                if let Some(label) = &pushed_label {
+                    with_receiver_labels(|s| {
+                        s.borrow_mut().push((label.clone(), this.clone()))
+                    });
+                }
                 let result = self.invoke_callable(callable, &all, out);
+                if pushed_label.is_some() {
+                    with_receiver_labels(|s| {
+                        s.borrow_mut().pop();
+                    });
+                }
                 if pushed_receiver {
                     with_outer_this(|s| {
                         s.borrow_mut().pop();

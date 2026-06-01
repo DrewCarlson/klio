@@ -871,6 +871,17 @@ impl<'a> VmHost<'a> {
         }
         let enclosing = enclosing_chain.into_iter().next();
         let known_class = self.classes.borrow().contains_key(qualifier);
+        // An active receiver lambda whose implicit label is the qualifier
+        // binds `this@<label>` to the receiver it was invoked with — the
+        // precise, non-heuristic answer. This is what makes a nested
+        // `with(n) { sb.apply { this@with } }` resolve `this@with` to `n`
+        // rather than the inner `apply` receiver. Only consulted for
+        // non-class qualifiers so `this@ClassName` keeps binding the class.
+        if !known_class {
+            if let Some(v) = receiver_for_label(qualifier) {
+                return Ok(v);
+            }
+        }
         if !known_class && !matches!(receiver, klio_runtime::Value::Null) {
             // `this@<fn-label>` — the qualifier is an extension/fn
             // label, not a class. Inside a receiver lambda whose own

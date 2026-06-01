@@ -213,6 +213,20 @@ pub(crate) fn boxed_cell_reg(b: &mut FuncBuilder, name: &str) -> Reg {
     }
 }
 
+/// Simple name of a call's callee, used as the implicit label of a
+/// lambda literal in its argument list: `with(x) { … }` → `"with"`,
+/// `sb.apply { … }` → `"apply"`. `None` when the callee has no simple
+/// name (a call on an arbitrary value expression).
+pub(crate) fn callee_label(callee: &Expr) -> Option<String> {
+    match callee {
+        Expr::Path { segments, .. } if segments.len() == 1 => {
+            Some(segments[0].name.clone())
+        }
+        Expr::Member { name, .. } => Some(name.name.clone()),
+        _ => None,
+    }
+}
+
 pub(crate) fn lower_arg_run(b: &mut FuncBuilder<'_>, args: &[Expr]) -> (Reg, u8) {
     let n = args.len();
     if n == 0 {
@@ -226,8 +240,15 @@ pub(crate) fn lower_arg_run(b: &mut FuncBuilder<'_>, args: &[Expr]) -> (Reg, u8)
     for _ in 1..n {
         slots.push(b.alloc_reg());
     }
+    // The call's simple name (set by the Call lowering just before this)
+    // is the implicit label of any lambda literal directly in this
+    // argument list. Re-arm it before each argument so a trailing lambda
+    // records it, then clear it so it never leaks past this run.
+    let call_label = b.pending_lambda_label.take();
     for (slot, arg) in slots.iter().zip(args.iter()) {
+        b.pending_lambda_label = call_label.clone();
         let r = lower_expr(b, arg);
+        b.pending_lambda_label = None;
         b.push(Inst::Move { dst: *slot, src: r });
     }
     (first, n as u8)

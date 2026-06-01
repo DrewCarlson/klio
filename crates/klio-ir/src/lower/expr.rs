@@ -30,6 +30,12 @@ pub fn lower_receiver(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
 }
 
 pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
+    // Arm the implicit-label for a call's argument lambdas with the
+    // callee's simple name (`with(n) { … }` → "with"). `lower_arg_run`
+    // consumes and re-arms it per argument; `Expr::Lambda` reads it.
+    if let Expr::Call { callee, .. } = expr {
+        b.pending_lambda_label = callee_label(callee);
+    }
     match expr {
         Expr::IntLit { value, kind, .. } => {
             // Honour the literal's declared kind (`1L`, `1U`, `1uL`)
@@ -2917,6 +2923,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let outer_boxed = b.boxed_vars_snapshot();
             let (body_func, captured_names) =
                 lower_lambda_body_capturing(b.module, params, body, outer_names, &outer_boxed);
+            // Record the implicit label (the enclosing call's simple name,
+            // re-armed by `lower_arg_run`) so `this@<label>` inside the
+            // lambda resolves to the receiver it is invoked with.
+            if let Some(label) = b.pending_lambda_label.take() {
+                if let Some(f) = b.module.funcs.get_mut(body_func.0 as usize) {
+                    f.implicit_label = Some(label);
+                }
+            }
             let captures: Vec<Reg> = captured_names
                 .iter()
                 .map(|n| resolve_capture(b, n))

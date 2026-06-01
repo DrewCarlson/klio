@@ -1079,6 +1079,7 @@ fn build_module_with_overrides(
                 is_lambda: false,
                 is_inline: f.is_inline,
                 capture_order: Vec::new(),
+                implicit_label: None,
             });
             let nm = f.name.name.clone();
             module.func_index.push((nm.clone(), id));
