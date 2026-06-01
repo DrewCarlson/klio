@@ -3799,7 +3799,10 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     /// `if (c) x = v`.
     fn parse_control_structure_body(&mut self) -> Option<Expr> {
         // Kotlin grammar: `controlStructureBody : block | statement`.
-        // (annotated-expr skip temporarily disabled — isolation test)
+        // An annotation may prefix the body expression
+        // (`NaturalOrderComparator -> @Suppress("UNCHECKED_CAST") (x as T)`
+        // in `Comparator.reversed()`); strip it (runtime no-op) first.
+        self.skip_leading_expr_annotation();
         // A leading `{` here is the body *block*, not a lambda — the
         // lambda reading only applies in true expression position
         // (`val f = { … }`), which `parse_primary` handles.

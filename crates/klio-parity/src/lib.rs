@@ -1549,6 +1549,12 @@ fn embedded_stdlib_sources(
 
     let mut parsed: Vec<(String, klio_ast::KotlinFile)> = Vec::new();
     for sf in &bundle.files {
+        // Mirror the production loader's consumption skip-list:
+        // Comparisons.kt parses but its interpreted comparator
+        // combinators conflict with klio's intrinsics until integrated.
+        if sf.rel_path.ends_with("comparisons/Comparisons.kt") {
+            continue;
+        }
         let text = String::from_utf8_lossy(&sf.bytes).into_owned();
         let fid = map.add(std::path::Path::new(&sf.rel_path), text);
         let src = map.get(fid).source.clone();

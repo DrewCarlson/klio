@@ -1021,6 +1021,18 @@ fn load_embedded_stdlib_sources(
     // declares.
     let mut parsed: Vec<(String, klio_ast::KotlinFile)> = Vec::with_capacity(bundle.files.len());
     for sf in &bundle.files {
+        // Consumption skip-list: sources that now PARSE but whose
+        // interpreted bodies would shadow — and currently conflict with —
+        // klio's host intrinsics. `Comparisons.kt` (`compareBy` / `thenBy`
+        // / `reversed` / the `Comparator` SAM) builds comparator values
+        // the source-level combinators expect to chain on; until that
+        // machinery interoperates with klio's `Value::Comparator` +
+        // `sortedWith`, loading these bodies regresses sorting. They are
+        // intentionally not registered yet (the intrinsics serve them);
+        // tracked for the comparator-source integration.
+        if sf.rel_path.ends_with("comparisons/Comparisons.kt") {
+            continue;
+        }
         if std::env::var_os("KLIO_PACK_DIAG").is_some()
             && (sf.rel_path.contains("Maps.kt") || sf.rel_path.contains("Sets.kt"))
         {
@@ -1264,6 +1276,13 @@ fn load_installed_packs(
         if let Ok(Some(payload)) = pack.read_section(section_names::SOURCES) {
             if let Ok(bundle) = decode::<klio_pack::schema::SourceBundle>(&payload) {
                 for sf in &bundle.files {
+                    // See load_embedded_stdlib_sources: Comparisons.kt
+                    // parses but its interpreted comparator combinators
+                    // conflict with klio's intrinsics until they
+                    // interoperate; not consumed yet.
+                    if sf.rel_path.ends_with("comparisons/Comparisons.kt") {
+                        continue;
+                    }
                     let text = String::from_utf8_lossy(&sf.bytes).into_owned();
                     let fid = source_map.add(&sf.rel_path, text);
                     let src = source_map.get(fid).source.clone();
