@@ -2769,20 +2769,39 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             | "generateSequence"
                             | "sequence"
                     );
-                    let bare_func_id: Option<FuncId> = cands
-                        .iter()
-                        .find(|fid| non_ext(fid) && arity_match(fid))
-                        .copied()
-                        .or_else(|| {
-                            cands.iter().find(|fid| !non_ext(fid) && arity_match(fid)).copied()
-                        })
-                        .or_else(|| {
-                            if name_is_alias {
-                                None
-                            } else {
-                                b.module.func_id(&segments[0].name)
-                            }
-                        });
+                    // A handful of alias names carry several consumed-source
+                    // overloads whose parameter shapes overlap by arity with
+                    // the call's argument count (e.g. `compareValuesBy(a, b,
+                    // selector)` vararg vs. `compareValuesBy(a, b, Comparator,
+                    // selector)`). Picking a same-named IR overload by arity
+                    // alone selects the wrong one — the host intrinsic
+                    // dispatches every form correctly, so decline the bind
+                    // for these and let the call route to the intrinsic.
+                    let intrinsic_owns_all = matches!(
+                        segments[0].name.as_str(),
+                        "compareValues" | "compareValuesBy"
+                    );
+                    let bare_func_id: Option<FuncId> = if intrinsic_owns_all {
+                        None
+                    } else {
+                        cands
+                            .iter()
+                            .find(|fid| non_ext(fid) && arity_match(fid))
+                            .copied()
+                            .or_else(|| {
+                                cands
+                                    .iter()
+                                    .find(|fid| !non_ext(fid) && arity_match(fid))
+                                    .copied()
+                            })
+                            .or_else(|| {
+                                if name_is_alias {
+                                    None
+                                } else {
+                                    b.module.func_id(&segments[0].name)
+                                }
+                            })
+                    };
                     if let Some(func_id) =
                         bare_func_id.filter(|_| !shadowed_by_class)
                     {

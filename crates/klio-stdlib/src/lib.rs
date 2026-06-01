@@ -164,7 +164,6 @@ pub fn is_implicitly_imported_package(package_path: &str) -> bool {
 /// - `kotlin/TextH.kt`: declares the `Regex` / text surface whose
 ///   interpreted form shadows klio's `Value::Regex` intrinsics.
 pub const CONSUMPTION_DEFERRED_SOURCES: &[&str] = &[
-    "comparisons/Comparisons.kt",
     "kotlin/TextH.kt",
 ];
 
