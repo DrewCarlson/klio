@@ -3504,12 +3504,12 @@ fn string_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(Value::Null) | None => None,
         Some(v) => Some(v.clone()),
     };
-    let chars: Vec<char> = s.chars().collect();
+    let chars: Vec<u16> = utf16_units(s);
     let mut pieces: Vec<String> = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         let end = (i + size).min(chars.len());
-        pieces.push(chars[i..end].iter().collect());
+        pieces.push(char_units_to_string(chars[i..end].iter().copied()));
         i += size;
     }
     let mut out: Vec<Value> = Vec::with_capacity(pieces.len());
@@ -3560,7 +3560,7 @@ fn string_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             cause: None,
         }));
     }
-    let chars: Vec<char> = s.chars().collect();
+    let chars: Vec<u16> = utf16_units(s);
     let size = *size as usize;
     let step = step as usize;
     let mut out: Vec<Value> = Vec::new();
@@ -3568,10 +3568,10 @@ fn string_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     while i < chars.len() {
         let end = i + size;
         if end <= chars.len() {
-            let win: String = chars[i..end].iter().collect();
+            let win = char_units_to_string(chars[i..end].iter().copied());
             out.push(Value::String(Arc::new(win)));
         } else if partial {
-            let win: String = chars[i..].iter().collect();
+            let win = char_units_to_string(chars[i..].iter().copied());
             out.push(Value::String(Arc::new(win)));
         } else {
             break;
@@ -8841,7 +8841,7 @@ fn compile_regex(pattern: &str) -> Result<Arc<RegexData>, RuntimeError> {
 }
 
 fn byte_to_char(s: &str, byte: usize) -> i64 {
-    s[..byte].chars().count() as i64
+    s[..byte].encode_utf16().count() as i64
 }
 
 fn build_match(re: &Arc<RegexData>, input: &Arc<String>, caps: regex::Captures<'_>) -> MatchData {
@@ -9836,7 +9836,7 @@ fn is_string_like(c: char) -> bool {
 
 fn pad_spec(body: &str, width: Option<usize>, left: bool, zero: bool) -> String {
     let Some(w) = width else { return body.to_string() };
-    let cur = body.chars().count();
+    let cur = body.encode_utf16().count();
     if cur >= w {
         return body.to_string();
     }

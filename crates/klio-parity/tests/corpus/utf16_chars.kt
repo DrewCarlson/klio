@@ -47,4 +47,16 @@ fun main() {
     // Char arithmetic stays within a code unit.
     println(('a' + 1))            // b
     println(('z' - 'a'))          // 25
+
+    // indices / lastIndex are in UTF-16 units.
+    println(s.lastIndex)          // 3
+    println(s.indices.toString()) // 0..3
+
+    // chunked / windowed partition by UTF-16 unit.
+    println("a😀b".chunked(2).joinToString("|") { it.length.toString() }) // 2|2
+    println("abcdef".chunked(2).joinToString("|"))  // ab|cd|ef
+    println("hello".windowed(3, 1).joinToString("|")) // hel|ell|llo
+
+    // Regex match ranges are in UTF-16 units.
+    println(Regex("😀").find("x😀y")?.range?.toString()) // 1..2
 }
