@@ -153,13 +153,42 @@ struct Frame<'a> {
     captures: Vec<Value>,
 }
 
+/// Normalize an `Int` value occupying a non-nullable `Long` slot to a
+/// `Long`. Kotlin types an integer literal by its expected type, so a
+/// bare `0` flowing into a `Long` parameter / return slot is a `Long`,
+/// not an `Int`; without this the value keeps its `Int` tag and later
+/// `Long`-vs-`Int` equality / division on it misbehaves. Only `Int`
+/// values are touched, so a genuine `Int` in an `Int` slot is left
+/// exactly as produced.
+fn coerce_int_to_long_ty(ty: &TypeRef, v: &mut Value) {
+    if let Value::Int(n) = *v {
+        if !ty.nullable && ty.name == "Long" {
+            *v = Value::Long(i64::from(n));
+        }
+    }
+}
+
+/// Apply [`coerce_int_to_long_ty`] to each argument against its
+/// declared parameter type (e.g. `safeMultiply(a: Long, b: Long)`
+/// seeing an `Int` `a` would make `r / b != a` spuriously true).
+/// `vararg` slots are skipped — their bound value is the packed array,
+/// not an element.
+fn coerce_int_args_to_long(func: &Func, params: &mut [Value]) {
+    for (v, p) in params.iter_mut().zip(func.params.iter()) {
+        if !p.is_vararg {
+            coerce_int_to_long_ty(&p.ty, v);
+        }
+    }
+}
+
 impl<'a> Frame<'a> {
     fn new_with_captures(
         module: &'a Module,
         func: &'a Func,
-        params: Vec<Value>,
+        mut params: Vec<Value>,
         captures: Vec<Value>,
     ) -> Self {
+        coerce_int_args_to_long(func, &mut params);
         Self {
             module,
             func,
@@ -231,13 +260,21 @@ pub fn eval_with_captures(
         let func_name = func.name.clone();
         let mut frame = Frame::new_with_captures(module, func, args, captures);
         let cur = func.entry;
-        match run_frame(module, &mut frame, &mut try_stack, cur, 0, host) {
+        let result = match run_frame(module, &mut frame, &mut try_stack, cur, 0, host) {
             // A labeled return whose target is this function exits it as
             // a normal return. Other labels propagate further outward
             // until the matching frame catches them.
             Err(EvalError::LabeledReturn(label, v)) if label == func_name => Ok(v),
             other => other,
-        }
+        };
+        // A bare integer literal returned where the declared return
+        // type is `Long` (`fun f(): Long = 0`) carries an `Int` tag
+        // out of the body; normalize it so the caller's `Long` binding
+        // observes a `Long`.
+        result.map(|mut v| {
+            coerce_int_to_long_ty(&func.return_ty, &mut v);
+            v
+        })
     })
 }
 
@@ -680,6 +717,7 @@ fn run_frame_inner<'a>(
                 for i in 0..n_args {
                     new_params.push(frame.read(Reg(args.0 + i as u32)));
                 }
+                coerce_int_args_to_long(frame.func, &mut new_params);
                 frame.params = new_params;
                 let n = frame.regs.len();
                 frame.regs.clear();
@@ -694,6 +732,7 @@ fn run_frame_inner<'a>(
                     new_params.push(frame.read(Reg(args.0 + i as u32)));
                 }
                 let new_func = &module.funcs[func.0 as usize];
+                coerce_int_args_to_long(new_func, &mut new_params);
                 frame.func = new_func;
                 frame.params = new_params;
                 frame.regs.clear();

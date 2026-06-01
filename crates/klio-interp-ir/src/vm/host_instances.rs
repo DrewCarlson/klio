@@ -553,8 +553,17 @@ impl<'a> VmHost<'a> {
             if let Some(cls_def) = cls_def {
                 for (param, value) in cls_def.primary_params.iter().zip(cls_args.iter()) {
                     if param.property.is_some() {
+                        // Normalize a bare integer-literal argument to a
+                        // `Long` field's declared type, matching Kotlin's
+                        // literal typing (`C(n = 1)` with `n: Long`).
+                        let mut field_value = value.clone();
+                        if param.declared_type.as_deref() == Some("Long") {
+                            if let klio_runtime::Value::Int(n) = field_value {
+                                field_value = klio_runtime::Value::Long(i64::from(n));
+                            }
+                        }
                         fields.retain(|(n, _)| n != &param.name);
-                        fields.push((param.name.clone(), value.clone()));
+                        fields.push((param.name.clone(), field_value));
                     }
                 }
             }

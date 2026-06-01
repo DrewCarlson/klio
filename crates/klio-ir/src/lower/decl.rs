@@ -643,7 +643,16 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
     };
     b.terminate(Terminator::Return(result));
     let fqn = f.name.name.clone();
-    let mut func = b.finish(f.name.name.clone(), fqn, crate::TypeRef::unit());
+    // Carry the declared return type so the evaluator can normalize a
+    // bare integer-literal result to a `Long` return slot (`fun f(): Long
+    // = 0`). Inferred returns (no annotation) stay `Unit` — harmless, as
+    // the coercion only triggers on an explicit `Long`.
+    let return_ty = f.return_type.as_ref().map_or_else(crate::TypeRef::unit, |rt| crate::TypeRef {
+        name: lowered_type_name(rt),
+        nullable: rt.nullable,
+        args: Vec::new(),
+    });
+    let mut func = b.finish(f.name.name.clone(), fqn, return_ty);
     let mut params: Vec<crate::Param> = implicit_params
         .iter()
         .map(|n| crate::Param {

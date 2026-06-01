@@ -1366,6 +1366,7 @@ fn build_module_with_overrides(
                     property: p.property,
                     name: p.name.name.clone(),
                     default: p.default.as_ref().map(|e| std::sync::Arc::new(e.clone())),
+                    declared_type: Some(p.ty.name.name.clone()),
                 })
                 .collect();
             let body_properties: Vec<PropertyDef> = c

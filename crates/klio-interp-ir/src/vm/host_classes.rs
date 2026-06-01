@@ -18,6 +18,7 @@ impl<'a> VmHost<'a> {
                 property: p.property,
                 name: p.name.name.clone(),
                 default: p.default.as_ref().map(|e| Arc::new(e.clone())),
+                declared_type: Some(p.ty.name.name.clone()),
             })
             .collect();
         let body_properties: Vec<klio_runtime::PropertyDef> = class

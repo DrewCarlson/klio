@@ -138,6 +138,11 @@ pub struct ClassParamDef {
     pub property: Option<bool>,
     pub name: String,
     pub default: Option<Arc<klio_ast::Expr>>,
+    /// Declared type's simple name (e.g. `"Long"`). Used to normalize a
+    /// bare integer-literal constructor argument to the field's declared
+    /// primitive type, matching Kotlin's literal typing, so `C(n = 1)`
+    /// with `n: Long` stores a `Long`, not an `Int`.
+    pub declared_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
