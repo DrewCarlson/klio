@@ -11,6 +11,8 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
+mod float_fmt;
+
 use thiserror::Error;
 
 /// Synchronization primitives for [`AdaptiveCell`]. Under `cfg(loom)`
@@ -3237,62 +3239,12 @@ impl Output for SharedOutput {
 ///     capital `E` and a `.0` in the mantissa if it's otherwise integer-valued.
 #[must_use]
 pub fn kotlin_float_to_string(d: f32) -> String {
-    if d.is_nan() {
-        return "NaN".to_string();
-    }
-    if d.is_infinite() {
-        return if d > 0.0 { "Infinity".into() } else { "-Infinity".into() };
-    }
-    let abs = d.abs();
-    let scientific = abs != 0.0 && (abs < 1e-3 || abs >= 1e7);
-    if scientific {
-        let raw = format!("{:e}", d);
-        let (mantissa, exp) = raw
-            .split_once('e')
-            .expect("scientific format produces an `e`");
-        let mantissa = if mantissa.contains('.') {
-            mantissa.to_string()
-        } else {
-            format!("{mantissa}.0")
-        };
-        return format!("{mantissa}E{exp}");
-    }
-    let s = format!("{}", d);
-    if !s.contains('.') {
-        return format!("{s}.0");
-    }
-    s
+    float_fmt::float_to_string(d)
 }
 
 #[must_use]
 pub fn kotlin_double_to_string(d: f64) -> String {
-    if d.is_nan() {
-        return "NaN".to_string();
-    }
-    if d.is_infinite() {
-        return if d > 0.0 { "Infinity".into() } else { "-Infinity".into() };
-    }
-    let abs = d.abs();
-    let scientific = abs != 0.0 && (abs < 1e-3 || abs >= 1e7);
-    if scientific {
-        // Rust's `{:e}` gives lowercase `e` and may emit no `.` (e.g.
-        // `1e10` for 1.0e10). Split, normalize the mantissa, recombine.
-        let raw = format!("{:e}", d);
-        let (mantissa, exp) = raw
-            .split_once('e')
-            .expect("scientific format produces an `e`");
-        let mantissa = if mantissa.contains('.') {
-            mantissa.to_string()
-        } else {
-            format!("{mantissa}.0")
-        };
-        return format!("{mantissa}E{exp}");
-    }
-    let s = format!("{}", d);
-    if !s.contains('.') {
-        return format!("{s}.0");
-    }
-    s
+    float_fmt::double_to_string(d)
 }
 
 #[derive(Debug, Default, Clone)]
