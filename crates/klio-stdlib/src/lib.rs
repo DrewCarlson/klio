@@ -150,6 +150,33 @@ pub fn is_implicitly_imported_package(package_path: &str) -> bool {
     IMPLICITLY_IMPORTED_PACKAGES.iter().any(|p| *p == package_path)
 }
 
+/// Curated stdlib sources that PARSE but are not yet *consumed* (loaded /
+/// registered): their interpreted declarations would shadow — and
+/// currently conflict with — klio's host intrinsics, so the intrinsics
+/// serve these APIs until the source bodies interoperate. The loaders
+/// skip these by `rel_path` suffix. Each entry is a tracked
+/// stdlib-source-integration TODO, not a permanent exclusion.
+///
+/// - `comparisons/Comparisons.kt`: `compareBy`/`thenBy`/`reversed`/the
+///   `Comparator` SAM build comparator values the source combinators
+///   expect to chain on; not yet interoperable with `Value::Comparator`
+///   + `sortedWith`.
+/// - `kotlin/TextH.kt`: declares the `Regex` / text surface whose
+///   interpreted form shadows klio's `Value::Regex` intrinsics.
+pub const CONSUMPTION_DEFERRED_SOURCES: &[&str] = &[
+    "comparisons/Comparisons.kt",
+    "kotlin/TextH.kt",
+];
+
+/// True when `rel_path` names a curated source on the consumption
+/// deferral list (see [`CONSUMPTION_DEFERRED_SOURCES`]).
+#[must_use]
+pub fn is_consumption_deferred_source(rel_path: &str) -> bool {
+    CONSUMPTION_DEFERRED_SOURCES
+        .iter()
+        .any(|suffix| rel_path.ends_with(suffix))
+}
+
 /// Returns true when `package_path` names any package recognised by the
 /// stdlib registry. Wider than [`is_implicitly_imported_package`] — covers
 /// every package that has at least one symbol mined from upstream Kotlin

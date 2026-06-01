@@ -24,10 +24,6 @@ const ALLOWED_UNPARSEABLE: &[(&str, &str)] = &[
     // experimental syntax, not part of the consumed stdlib API surface.
     ("contextParameters/Context.kt", "Kotlin 2.2 context-receiver function types"),
     ("contextParameters/ContextOf.kt", "Kotlin 2.2 context parameters"),
-    // Companion-receiver extension property declaration
-    // (`val String.Companion.CASE_INSENSITIVE_ORDER`). Pending parser
-    // support for a multi-segment `X.Companion.name` receiver.
-    ("kotlin/TextH.kt", "extension property on a Companion receiver"),
     // Surrogate char literals (`'\\uD800'`..`'\\uDFFF'`). klio's Char is
     // a Rust `char`, which cannot hold a lone surrogate; needs the
     // UTF-16-code-unit Char model.

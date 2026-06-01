@@ -1549,10 +1549,11 @@ fn embedded_stdlib_sources(
 
     let mut parsed: Vec<(String, klio_ast::KotlinFile)> = Vec::new();
     for sf in &bundle.files {
-        // Mirror the production loader's consumption skip-list:
-        // Comparisons.kt parses but its interpreted comparator
-        // combinators conflict with klio's intrinsics until integrated.
-        if sf.rel_path.ends_with("comparisons/Comparisons.kt") {
+        // Mirror the production loader's consumption deferral
+        // (klio_stdlib::CONSUMPTION_DEFERRED_SOURCES): these parse but
+        // their interpreted bodies conflict with klio's intrinsics until
+        // integrated.
+        if klio_stdlib::is_consumption_deferred_source(&sf.rel_path) {
             continue;
         }
         let text = String::from_utf8_lossy(&sf.bytes).into_owned();

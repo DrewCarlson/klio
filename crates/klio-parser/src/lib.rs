@@ -2083,6 +2083,22 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             } else {
                 self.expect(&TokenKind::Dot, "`.`")?;
             }
+            // A Companion-qualified receiver (`String.Companion.foo`,
+            // stdlib TextH.kt's `String.Companion.CASE_INSENSITIVE_ORDER`):
+            // the receiver type is `<Class>.Companion`, so consume the
+            // `Companion .` and keep the following ident as the property
+            // name. klio resolves the property against the class's
+            // companion, so the receiver collapses to the class type.
+            if self.peek_ident_text() == Some("Companion")
+                && matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::Dot)
+                )
+            {
+                self.bump(); // `Companion`
+                self.bump(); // `.`
+                self.skip_nl();
+            }
             self.skip_nl();
             ty
         } else {
