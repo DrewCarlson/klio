@@ -578,7 +578,7 @@ pub enum Expr {
     FloatLit { value: f64, kind: FloatLitKind, span: Span },
     BoolLit { value: bool, span: Span },
     NullLit { span: Span },
-    CharLit { value: char, span: Span },
+    CharLit { value: u16, span: Span },
     StringTemplate { parts: Vec<StringPart>, span: Span },
     Path { segments: Vec<Ident>, span: Span },
     Member { receiver: Box<Expr>, name: Ident, safe: bool, span: Span },

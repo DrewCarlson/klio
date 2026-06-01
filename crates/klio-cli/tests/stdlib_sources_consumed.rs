@@ -24,10 +24,6 @@ const ALLOWED_UNPARSEABLE: &[(&str, &str)] = &[
     // experimental syntax, not part of the consumed stdlib API surface.
     ("contextParameters/Context.kt", "Kotlin 2.2 context-receiver function types"),
     ("contextParameters/ContextOf.kt", "Kotlin 2.2 context parameters"),
-    // Surrogate char literals (`'\\uD800'`..`'\\uDFFF'`). klio's Char is
-    // a Rust `char`, which cannot hold a lone surrogate; needs the
-    // UTF-16-code-unit Char model.
-    ("kotlin/Char.kt", "surrogate char literals (Char is a Rust char)"),
 ];
 
 fn allowed(rel_path: &str) -> Option<&'static str> {

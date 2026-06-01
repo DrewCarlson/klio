@@ -2911,7 +2911,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let len_opt: Option<i64> = match receiver {
                 klio_runtime::Value::Array { items, .. } => Some(items.borrow().len() as i64),
                 klio_runtime::Value::List { items, .. } => Some(items.borrow().len() as i64),
-                klio_runtime::Value::String(s) => Some(s.chars().count() as i64),
+                klio_runtime::Value::String(s) => Some(s.encode_utf16().count() as i64),
                 _ => None,
             };
             if let Some(len) = len_opt {
@@ -2922,7 +2922,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let len_opt: Option<i64> = match receiver {
                 klio_runtime::Value::Array { items, .. } => Some(items.borrow().len() as i64),
                 klio_runtime::Value::List { items, .. } => Some(items.borrow().len() as i64),
-                klio_runtime::Value::String(s) => Some(s.chars().count() as i64),
+                klio_runtime::Value::String(s) => Some(s.encode_utf16().count() as i64),
                 _ => None,
             };
             if let Some(len) = len_opt {
@@ -5877,7 +5877,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                 }
                 klio_runtime::Value::String(s) => {
                     let items: Vec<klio_runtime::Value> = s
-                        .chars()
+                        .encode_utf16()
                         .map(klio_runtime::Value::Char)
                         .collect();
                     return Ok(klio_runtime::Value::Iterator {
@@ -6707,13 +6707,12 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                     } else {
                         (0, chars.len())
                     };
-                    let s: String = chars[start..end.max(start)]
-                        .iter()
-                        .filter_map(|v| match v {
+                    let s = klio_runtime::char_units_to_string(
+                        chars[start..end.max(start)].iter().filter_map(|v| match v {
                             klio_runtime::Value::Char(c) => Some(*c),
                             _ => None,
-                        })
-                        .collect();
+                        }),
+                    );
                     return Ok(klio_runtime::Value::String(Arc::new(s)));
                 }
                 _ => {}
@@ -6918,7 +6917,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
                         klio_runtime::RangeKind::Int => klio_runtime::Value::new_int(c),
                         klio_runtime::RangeKind::Long => klio_runtime::Value::Long(c),
                         klio_runtime::RangeKind::Char => {
-                            klio_runtime::Value::Char(c as u8 as char)
+                            klio_runtime::Value::Char(c as u16)
                         }
                     });
                 }
@@ -9979,7 +9978,7 @@ fn materialise_range_items(
             match kind {
                 RangeKind::Int => out.push(Value::new_int(cur)),
                 RangeKind::Long => out.push(Value::Long(cur)),
-                RangeKind::Char => out.push(Value::Char(cur as u8 as char)),
+                RangeKind::Char => out.push(Value::Char(cur as u16)),
             }
             cur = cur.saturating_add(step);
             if cur > end && step > 0 {
@@ -9991,7 +9990,7 @@ fn materialise_range_items(
             match kind {
                 RangeKind::Int => out.push(Value::new_int(cur)),
                 RangeKind::Long => out.push(Value::Long(cur)),
-                RangeKind::Char => out.push(Value::Char(cur as u8 as char)),
+                RangeKind::Char => out.push(Value::Char(cur as u16)),
             }
             cur = cur.saturating_add(step);
             if cur < end {

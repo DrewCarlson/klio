@@ -1056,7 +1056,11 @@ pub enum Value {
     Float(f32),
     Bool(bool),
     String(Arc<String>),
-    Char(char),
+    /// Kotlin `Char` is a single UTF-16 code unit, so it is stored as a
+    /// `u16` (0x0000..=0xFFFF) and may hold a lone surrogate. Astral
+    /// scalars (U+10000..) are NOT a single `Char` — they are a surrogate
+    /// pair across two `Char`s, matching Kotlin's `String` indexing.
+    Char(u16),
     Null,
     /// Inclusive integer progression with a signed step. `1..10` is
     /// `{start:1,end:10,step:1}`; `1..<10` clamps end to 9; `10 downTo 1` is
@@ -2035,7 +2039,7 @@ impl fmt::Debug for Value {
             Self::Float(v) => write!(f, "Float({v})"),
             Self::Bool(v) => write!(f, "Bool({v})"),
             Self::String(v) => write!(f, "String({v:?})"),
-            Self::Char(v) => write!(f, "Char({v:?})"),
+            Self::Char(v) => write!(f, "Char('{}')", char_unit_to_string(*v)),
             Self::Null => write!(f, "Null"),
             Self::Range { start, end, step, kind } => {
                 write!(f, "Range({start}..{end} step {step} kind={kind:?})")
@@ -2127,7 +2131,7 @@ impl fmt::Display for Value {
             Self::Float(v) => write!(f, "{}", kotlin_float_to_string(*v)),
             Self::Bool(v) => write!(f, "{v}"),
             Self::String(v) => write!(f, "{v}"),
-            Self::Char(v) => write!(f, "{v}"),
+            Self::Char(v) => write!(f, "{}", char_unit_to_string(*v)),
             Self::Null => write!(f, "null"),
             Self::Range { start, end, step, .. } => {
                 // Kotlin renders progressions as:
@@ -3245,6 +3249,52 @@ pub fn kotlin_float_to_string(d: f32) -> String {
 #[must_use]
 pub fn kotlin_double_to_string(d: f64) -> String {
     float_fmt::double_to_string(d)
+}
+
+/// Render a single Kotlin `Char` (a UTF-16 code unit) as a `String`. A
+/// BMP scalar renders as itself; a lone surrogate renders as the Unicode
+/// replacement character, since a Rust `String` cannot hold one.
+#[must_use]
+pub fn char_unit_to_string(unit: u16) -> String {
+    String::from_utf16_lossy(&[unit])
+}
+
+/// Append a UTF-16 code unit to a `String`, pairing a pending high
+/// surrogate (`prev`) with a following low surrogate into the astral
+/// scalar. Returns the new pending high surrogate (the just-appended
+/// unit if it is itself an unpaired high surrogate, else `None`). An
+/// unpaired surrogate is flushed lossily as U+FFFD. This lets callers
+/// fold a `Char` sequence (e.g. a `CharArray`) into a UTF-8 `String`
+/// while reconstructing surrogate pairs.
+pub fn push_char_unit(out: &mut String, prev: Option<u16>, unit: u16) -> Option<u16> {
+    if let Some(hi) = prev {
+        if (0xDC00..=0xDFFF).contains(&unit) {
+            let c = 0x10000 + ((u32::from(hi) - 0xD800) << 10) + (u32::from(unit) - 0xDC00);
+            out.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
+            return None;
+        }
+        out.push('\u{FFFD}'); // unpaired high surrogate
+    }
+    if (0xD800..=0xDBFF).contains(&unit) {
+        return Some(unit); // hold as pending high surrogate
+    }
+    out.push(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}'));
+    None
+}
+
+/// Fold a sequence of UTF-16 code units into a `String`, reconstructing
+/// surrogate pairs (and flushing any trailing unpaired high surrogate).
+#[must_use]
+pub fn char_units_to_string<I: IntoIterator<Item = u16>>(units: I) -> String {
+    let mut out = String::new();
+    let mut pending: Option<u16> = None;
+    for u in units {
+        pending = push_char_unit(&mut out, pending, u);
+    }
+    if pending.is_some() {
+        out.push('\u{FFFD}');
+    }
+    out
 }
 
 #[derive(Debug, Default, Clone)]

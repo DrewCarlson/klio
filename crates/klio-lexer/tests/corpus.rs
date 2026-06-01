@@ -48,7 +48,8 @@ fn render_token(t: &Token, src: &str) -> String {
         TokenKind::FloatLiteral { suffix } => format!("FLOAT[{suffix:?}]"),
         TokenKind::BoolLiteral(v) => format!("BOOL[{v}]"),
         TokenKind::NullLiteral => "NULL".to_string(),
-        TokenKind::CharLiteral(c) => format!("CHAR[{:?}]", c),
+        TokenKind::CharLiteral(c) => char::from_u32(u32::from(*c))
+            .map_or_else(|| format!("CHAR[{c}]"), |ch| format!("CHAR[{ch:?}]")),
         TokenKind::StringQuote { triple } => format!("QUOTE[{}]", if *triple { "\"\"\"" } else { "\"" }),
         TokenKind::StringText(s) => format!("STR_TEXT[{:?}]", s),
         TokenKind::InterpStart => "INTERP_START".to_string(),

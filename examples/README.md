@@ -84,6 +84,7 @@ cargo run -p klio-cli -- run examples/<name>.kt
 | `arrays.kt`                | `Array` and primitive arrays.                                  |
 | `string_builder.kt`, `string_ordering.kt` | `StringBuilder`, string comparison.             |
 | `char_unicode.kt`          | `Char` and Unicode handling.                                   |
+| `utf16_surrogates.kt`      | `Char` as a UTF-16 code unit: astral `String` length/indexing/iteration, surrogate pairs, `isHighSurrogate`/`isLowSurrogate`, `Char.MIN/MAX_VALUE`, `Int`→`Char` narrowing. |
 | `numeric_fidelity.kt`      | Integer/float width and rounding fidelity.                     |
 | `numeric_literal_coercion.kt` | Unsuffixed integer literals taking a `Long` binding or parameter-default type, including recursive local `tailrec` accumulators. |
 | `regex.kt`                 | `Regex` basics.                                                |

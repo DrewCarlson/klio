@@ -14,7 +14,9 @@
 use std::io::BufRead;
 use std::sync::Arc;
 
-use klio_runtime::{CallCtx, ObjRef, RuntimeError, StdlibFn, Value};
+use klio_runtime::{
+    char_unit_to_string, char_units_to_string, CallCtx, ObjRef, RuntimeError, StdlibFn, Value,
+};
 
 const TABLE: &[(&str, StdlibFn)] = &[
     // ----- non-scope lambda-driven utilities still on the Rust path -----
@@ -744,9 +746,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // ----- Additional Char -----
     ("kotlin.Char.uppercaseChar", char_uppercase_char),
     ("kotlin.Char.lowercaseChar", char_lowercase_char),
-    ("kotlin.Char.isHighSurrogate", char_false),
-    ("kotlin.Char.isLowSurrogate", char_false),
-    ("kotlin.Char.isSurrogate", char_false),
+    ("kotlin.Char.isHighSurrogate", char_is_high_surrogate),
+    ("kotlin.Char.isLowSurrogate", char_is_low_surrogate),
+    ("kotlin.Char.isSurrogate", char_is_surrogate),
     ("kotlin.Char.digitToIntOrNull", char_digit_to_int_or_null),
 
     // ----- Additional Int -----
@@ -1907,7 +1909,7 @@ fn array_ctor_boolean(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     array_ctor_impl(ctx, "BooleanArray", Some(klio_runtime::PrimitiveArrayKind::Boolean), Value::Bool(false))
 }
 fn array_ctor_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    array_ctor_impl(ctx, "CharArray", Some(klio_runtime::PrimitiveArrayKind::Char), Value::Char('\u{0}'))
+    array_ctor_impl(ctx, "CharArray", Some(klio_runtime::PrimitiveArrayKind::Char), Value::Char(0u16))
 }
 
 fn cmp_compare_values_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -2776,7 +2778,7 @@ fn recv_string<'a>(args: &'a [Value], what: &str) -> Result<&'a Arc<String>, Run
 fn arg_as_string(v: &Value, what: &str) -> Result<String, RuntimeError> {
     match v {
         Value::String(s) => Ok((**s).clone()),
-        Value::Char(c) => Ok(c.to_string()),
+        Value::Char(c) => Ok(char_unit_to_string(*c)),
         Value::Int(n) => Ok(n.to_string()),
         Value::Double(d) => Ok(d.to_string()),
         Value::Bool(b) => Ok(b.to_string()),
@@ -2786,9 +2788,44 @@ fn arg_as_string(v: &Value, what: &str) -> Result<String, RuntimeError> {
     }
 }
 
+/// Number of UTF-16 code units in `s` — Kotlin's `String.length` /
+/// indexing unit (an astral scalar counts as 2).
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// The UTF-16 code unit at index `i` (Kotlin `String` indexing), if any.
+fn utf16_unit_at(s: &str, i: usize) -> Option<u16> {
+    s.encode_utf16().nth(i)
+}
+
+/// The UTF-16 code units of `s`, as Kotlin would iterate/index its chars.
+fn utf16_units(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+/// Case-insensitive equality of two UTF-16 code units (Kotlin's
+/// `equals(ignoreCase=true)` per-char rule). Lone surrogates compare by
+/// raw equality (no case mapping).
+fn char_units_eq_ignore_case(a: u16, b: u16) -> bool {
+    match (char_unit_to_scalar(a), char_unit_to_scalar(b)) {
+        (Some(ca), Some(cb)) => {
+            ca == cb || ca.to_lowercase().eq(cb.to_lowercase()) || ca.to_uppercase().eq(cb.to_uppercase())
+        }
+        _ => a == b,
+    }
+}
+
+/// The substring spanning UTF-16 units `[start, end)`. A surrogate pair
+/// split by a boundary becomes lone surrogate(s), rendered lossily.
+fn utf16_slice(s: &str, start: usize, end: usize) -> String {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    char_units_to_string(units[start..end].iter().copied())
+}
+
 fn string_length(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.length")?;
-    Ok(Value::new_int(s.chars().count()))
+    Ok(Value::new_int(utf16_len(s)))
 }
 
 /// `String.toString()` — the receiver itself.
@@ -2831,19 +2868,18 @@ fn string_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         )));
     }
     let i = *idx as usize;
-    match s.chars().nth(i) {
+    match utf16_unit_at(s, i) {
         Some(c) => Ok(Value::Char(c)),
         None => Err(RuntimeError::Thrown(make_exception(
             "kotlin.IndexOutOfBoundsException",
-            Some(format!("index {idx} out of bounds (length {})", s.chars().count())),
+            Some(format!("index {idx} out of bounds (length {})", utf16_len(s))),
         ))),
     }
 }
 
 fn string_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.substring")?;
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len() as i64;
+    let len = utf16_len(s) as i64;
     let (start, end) = match &ctx.args[1..] {
         [s] if s.is_integral() => (s.as_i64().unwrap(), len),
         [a, b] if a.is_integral() && b.is_integral() => {
@@ -2857,8 +2893,7 @@ fn string_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Some(format!("substring({start},{end}) on length {len}")),
         )));
     }
-    let out: String = chars[start as usize..end as usize].iter().collect();
-    Ok(Value::String(Arc::new(out)))
+    Ok(Value::String(Arc::new(utf16_slice(s, start as usize, end as usize))))
 }
 
 /// `CharSequence.padStart(length, padChar = ' ')` / `padEnd`. Host
@@ -2868,8 +2903,7 @@ fn string_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// and recurses forever, allocating a StringBuilder each level (OOM).
 fn string_pad(ctx: &mut CallCtx, at_start: bool, who: &str) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, who)?;
-    let chars: Vec<char> = s.chars().collect();
-    let cur_len = chars.len() as i64;
+    let cur_len = utf16_len(s) as i64;
     let length = ctx
         .args
         .get(1)
@@ -2881,9 +2915,9 @@ fn string_pad(ctx: &mut CallCtx, at_start: bool, who: &str) -> Result<Value, Run
             Some(format!("Desired length {length} is less than zero.")),
         )));
     }
-    let pad = match ctx.args.get(2) {
+    let pad: u16 = match ctx.args.get(2) {
         Some(Value::Char(c)) => *c,
-        None => ' ',
+        None => u16::from(b' '),
         Some(other) => {
             return Err(RuntimeError::Type(format!(
                 "{who}: padChar must be a Char, got {other}"
@@ -2894,7 +2928,7 @@ fn string_pad(ctx: &mut CallCtx, at_start: bool, who: &str) -> Result<Value, Run
         return Ok(Value::String(Arc::clone(s)));
     }
     let pad_count = (length - cur_len) as usize;
-    let padding: String = std::iter::repeat(pad).take(pad_count).collect();
+    let padding: String = char_units_to_string(std::iter::repeat(pad).take(pad_count));
     let out = if at_start {
         format!("{padding}{s}")
     } else {
@@ -2949,8 +2983,8 @@ fn string_region_matches(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .and_then(Value::as_i64)
         .ok_or_else(|| RuntimeError::Type("regionMatches: length".into()))?;
     let ignore_case = matches!(ctx.args.get(5), Some(Value::Bool(true)));
-    let sc: Vec<char> = s.chars().collect();
-    let oc: Vec<char> = other.chars().collect();
+    let sc = utf16_units(s);
+    let oc = utf16_units(&other);
     if length < 0
         || this_off < 0
         || other_off < 0
@@ -2962,12 +2996,7 @@ fn string_region_matches(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     for i in 0..length as usize {
         let a = sc[this_off as usize + i];
         let b = oc[other_off as usize + i];
-        let eq = if ignore_case {
-            a.eq_ignore_ascii_case(&b)
-                || a.to_lowercase().eq(b.to_lowercase())
-        } else {
-            a == b
-        };
+        let eq = if ignore_case { char_units_eq_ignore_case(a, b) } else { a == b };
         if !eq {
             return Ok(Value::Bool(false));
         }
@@ -2990,7 +3019,7 @@ fn string_skip_while(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .get(2)
         .cloned()
         .ok_or_else(|| RuntimeError::Arity("skipWhile: predicate".into()))?;
-    let chars: Vec<char> = s.chars().collect();
+    let chars = utf16_units(s);
     let CallCtx { out, host, .. } = ctx;
     let mut i = if start < 0 { 0i64 } else { start };
     while (i as usize) < chars.len() {
@@ -3022,25 +3051,25 @@ fn string_filter(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let block = ctx.args[1].clone();
     let CallCtx { out, host, .. } = ctx;
-    let mut result = String::new();
-    for ch in s.chars() {
+    let mut kept: Vec<u16> = Vec::new();
+    for ch in s.encode_utf16() {
         let v = Value::Char(ch);
         if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
-            result.push(ch);
+            kept.push(ch);
         }
     }
-    Ok(Value::String(Arc::new(result)))
+    Ok(Value::String(Arc::new(char_units_to_string(kept))))
 }
 
 fn string_count(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.count")?.clone();
     if ctx.args.len() == 1 {
-        return Ok(Value::new_int(s.chars().count() as i64));
+        return Ok(Value::new_int(utf16_len(&s) as i64));
     }
     let block = ctx.args[1].clone();
     let CallCtx { out, host, .. } = ctx;
     let mut n: i64 = 0;
-    for ch in s.chars() {
+    for ch in s.encode_utf16() {
         let v = Value::Char(ch);
         if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
             n += 1;
@@ -3056,8 +3085,8 @@ fn string_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let block = ctx.args[1].clone();
     let CallCtx { out, host, .. } = ctx;
-    let mut result: Vec<Value> = Vec::with_capacity(s.chars().count());
-    for ch in s.chars() {
+    let mut result: Vec<Value> = Vec::with_capacity(utf16_len(&s));
+    for ch in s.encode_utf16() {
         let v = Value::Char(ch);
         let r = host.invoke_callable(&block, std::slice::from_ref(&v), *out)?;
         result.push(r);
@@ -3072,7 +3101,7 @@ fn string_any(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
     let block = ctx.args[1].clone();
     let CallCtx { out, host, .. } = ctx;
-    for ch in s.chars() {
+    for ch in s.encode_utf16() {
         let v = Value::Char(ch);
         if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
             return Ok(Value::Bool(true));
@@ -3088,7 +3117,7 @@ fn string_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Err(RuntimeError::Arity("all requires a block".into()));
     };
     let CallCtx { out, host, .. } = ctx;
-    for ch in s.chars() {
+    for ch in s.encode_utf16() {
         let v = Value::Char(ch);
         if !matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
             return Ok(Value::Bool(false));
@@ -3137,7 +3166,7 @@ fn string_last_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn byte_to_char_index(s: &str, byte: Option<usize>) -> i64 {
     let Some(b) = byte else { return -1 };
-    s[..b].chars().count() as i64
+    s[..b].encode_utf16().count() as i64
 }
 
 fn string_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -3170,13 +3199,15 @@ fn string_trim_generic(
     trim_end: bool,
     who: &str,
 ) -> Result<Value, RuntimeError> {
-    let cs: Vec<char> = recv_string(ctx.args, who)?.chars().collect();
+    let cs: Vec<u16> = utf16_units(recv_string(ctx.args, who)?);
     let extra: Vec<Value> = ctx.args[1..].to_vec();
     // `keep[i]` = char i is NOT trimmable.
     let keep: Vec<bool> = if extra.is_empty() {
-        cs.iter().map(|c| !c.is_whitespace()).collect()
+        cs.iter()
+            .map(|&c| !char_unit_to_scalar(c).is_some_and(|c| c.is_whitespace()))
+            .collect()
     } else if extra.iter().all(|v| matches!(v, Value::Char(_))) {
-        let set: Vec<char> = extra
+        let set: Vec<u16> = extra
             .iter()
             .map(|v| match v {
                 Value::Char(c) => *c,
@@ -3208,7 +3239,7 @@ fn string_trim_generic(
         cs.len()
     };
     let hi = hi.max(lo);
-    Ok(Value::String(Arc::new(cs[lo..hi].iter().collect::<String>())))
+    Ok(Value::String(Arc::new(char_units_to_string(cs[lo..hi].iter().copied()))))
 }
 fn string_trim(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     string_trim_generic(ctx, true, true, "String.trim")
@@ -3319,7 +3350,7 @@ fn parse_int_radix(s: &str, radix: u32) -> Result<i64, ()> {
 
 fn string_to_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toList")?;
-    let items: Vec<Value> = s.chars().map(Value::Char).collect();
+    let items: Vec<Value> = s.encode_utf16().map(Value::Char).collect();
     Ok(make_list(items, false))
 }
 
@@ -3566,7 +3597,7 @@ fn string_to_double(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 // Char members
 // ============================================================
 
-fn recv_char(args: &[Value], what: &str) -> Result<char, RuntimeError> {
+fn recv_char(args: &[Value], what: &str) -> Result<u16, RuntimeError> {
     match args.first() {
         Some(Value::Char(c)) => Ok(*c),
         Some(other) => Err(RuntimeError::Type(format!(
@@ -3574,6 +3605,13 @@ fn recv_char(args: &[Value], what: &str) -> Result<char, RuntimeError> {
         ))),
         None => Err(RuntimeError::Type(format!("{what} requires a receiver"))),
     }
+}
+
+/// Decode a `Char` code unit to a Unicode scalar for category/case
+/// queries. A lone surrogate has no scalar value (`None`): such chars are
+/// not letters/digits/whitespace and have no case mapping.
+fn char_unit_to_scalar(unit: u16) -> Option<char> {
+    char::from_u32(u32::from(unit))
 }
 
 fn char_code(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -3693,42 +3731,45 @@ fn kt_is_lower_case(c: char) -> bool {
 }
 
 fn char_is_digit(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::Bool(kt_is_digit(recv_char(ctx.args, "Char.isDigit")?)))
+    let s = char_unit_to_scalar(recv_char(ctx.args, "Char.isDigit")?);
+    Ok(Value::Bool(s.is_some_and(kt_is_digit)))
 }
 fn char_is_letter(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::Bool(kt_is_letter(recv_char(ctx.args, "Char.isLetter")?)))
+    let s = char_unit_to_scalar(recv_char(ctx.args, "Char.isLetter")?);
+    Ok(Value::Bool(s.is_some_and(kt_is_letter)))
 }
 fn char_is_letter_or_digit(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let c = recv_char(ctx.args, "Char.isLetterOrDigit")?;
-    Ok(Value::Bool(kt_is_letter(c) || kt_is_digit(c)))
+    let s = char_unit_to_scalar(recv_char(ctx.args, "Char.isLetterOrDigit")?);
+    Ok(Value::Bool(s.is_some_and(|c| kt_is_letter(c) || kt_is_digit(c))))
 }
 fn char_is_whitespace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::Bool(kt_is_whitespace(recv_char(ctx.args, "Char.isWhitespace")?)))
+    let s = char_unit_to_scalar(recv_char(ctx.args, "Char.isWhitespace")?);
+    Ok(Value::Bool(s.is_some_and(kt_is_whitespace)))
 }
 fn char_is_uppercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::Bool(kt_is_upper_case(recv_char(ctx.args, "Char.isUpperCase")?)))
+    let s = char_unit_to_scalar(recv_char(ctx.args, "Char.isUpperCase")?);
+    Ok(Value::Bool(s.is_some_and(kt_is_upper_case)))
 }
 fn char_is_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::Bool(kt_is_lower_case(recv_char(ctx.args, "Char.isLowerCase")?)))
+    let s = char_unit_to_scalar(recv_char(ctx.args, "Char.isLowerCase")?);
+    Ok(Value::Bool(s.is_some_and(kt_is_lower_case)))
 }
 fn char_uppercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let c = recv_char(ctx.args, "Char.uppercase")?;
-    let mut up = c.to_uppercase();
-    Ok(Value::String(Arc::new(up.next().map_or(String::new(), |x| {
-        let rest: String = up.collect();
-        format!("{x}{rest}")
-    }))))
+    let unit = recv_char(ctx.args, "Char.uppercase")?;
+    match char_unit_to_scalar(unit) {
+        Some(c) => Ok(Value::String(Arc::new(c.to_uppercase().collect()))),
+        None => Ok(Value::String(Arc::new(char_unit_to_string(unit)))),
+    }
 }
 fn char_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let c = recv_char(ctx.args, "Char.lowercase")?;
-    let mut lo = c.to_lowercase();
-    Ok(Value::String(Arc::new(lo.next().map_or(String::new(), |x| {
-        let rest: String = lo.collect();
-        format!("{x}{rest}")
-    }))))
+    let unit = recv_char(ctx.args, "Char.lowercase")?;
+    match char_unit_to_scalar(unit) {
+        Some(c) => Ok(Value::String(Arc::new(c.to_lowercase().collect()))),
+        None => Ok(Value::String(Arc::new(char_unit_to_string(unit)))),
+    }
 }
 fn char_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::String(Arc::new(recv_char(ctx.args, "Char.toString")?.to_string())))
+    Ok(Value::String(Arc::new(char_unit_to_string(recv_char(ctx.args, "Char.toString")?))))
 }
 /// The radix argument of `digitToInt(radix)` / `digitToIntOrNull(radix)`,
 /// validated to Kotlin's 2..36 range (default 10). Returns the radix or an
@@ -3745,22 +3786,31 @@ fn char_digit_radix(args: &[Value]) -> Result<u32, RuntimeError> {
 }
 
 fn char_digit_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let c = recv_char(ctx.args, "Char.digitToInt")?;
+    let unit = recv_char(ctx.args, "Char.digitToInt")?;
     let radix = char_digit_radix(ctx.args)?;
-    match c.to_digit(radix) {
+    match char_unit_to_scalar(unit).and_then(|c| c.to_digit(radix)) {
         Some(d) => Ok(Value::new_int(d)),
         None => Err(RuntimeError::Thrown(make_exception(
             "kotlin.IllegalArgumentException",
-            Some(format!("Char {c:?} is not a digit in the given radix={radix}")),
+            Some(format!(
+                "Char {:?} is not a digit in the given radix={radix}",
+                char_unit_to_string(unit)
+            )),
         ))),
     }
 }
 
-/// klio's `Value::Char` is a Rust `char`, which cannot hold a lone UTF-16
-/// surrogate, so a surrogate-ness test is always false for any representable
-/// char. (Used by e.g. commonPrefixWith.)
-fn char_false(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::Bool(false))
+fn char_is_high_surrogate(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let c = recv_char(ctx.args, "Char.isHighSurrogate")?;
+    Ok(Value::Bool((0xD800..=0xDBFF).contains(&c)))
+}
+fn char_is_low_surrogate(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let c = recv_char(ctx.args, "Char.isLowSurrogate")?;
+    Ok(Value::Bool((0xDC00..=0xDFFF).contains(&c)))
+}
+fn char_is_surrogate(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let c = recv_char(ctx.args, "Char.isSurrogate")?;
+    Ok(Value::Bool((0xD800..=0xDFFF).contains(&c)))
 }
 
 // ============================================================
@@ -5108,8 +5158,8 @@ pub fn primitive_companion_const(ty: &str, name: &str) -> Option<Value> {
         ("Float", "NaN") => Some(Value::Float(f32::NAN)),
         ("Float", "SIZE_BITS") => Some(Value::new_int(32)),
         ("Float", "SIZE_BYTES") => Some(Value::new_int(4)),
-        ("Char", "MAX_VALUE") => Some(Value::Char('\u{FFFF}')),
-        ("Char", "MIN_VALUE") => Some(Value::Char('\u{0}')),
+        ("Char", "MAX_VALUE") => Some(Value::Char(0xFFFFu16)),
+        ("Char", "MIN_VALUE") => Some(Value::Char(0u16)),
         ("Char", "SIZE_BITS") => Some(Value::new_int(16)),
         ("Char", "SIZE_BYTES") => Some(Value::new_int(2)),
         _ => None,
@@ -7054,7 +7104,7 @@ fn seq_from_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 fn seq_from_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "asSequence")?;
-    Ok(make_sequence(s.chars().map(Value::Char).collect()))
+    Ok(make_sequence(s.encode_utf16().map(Value::Char).collect()))
 }
 fn seq_from_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(Value::Range { start, end, step, .. }) = ctx.args.first() else {
@@ -7346,9 +7396,7 @@ fn range_endpoint(kind: klio_runtime::RangeKind, v: i64) -> Value {
     match kind {
         klio_runtime::RangeKind::Long => Value::Long(v),
         klio_runtime::RangeKind::Int => Value::Int(v as i32),
-        klio_runtime::RangeKind::Char => char::from_u32(v as u32)
-            .map(Value::Char)
-            .unwrap_or(Value::Char('\0')),
+        klio_runtime::RangeKind::Char => Value::Char(v as u16),
     }
 }
 
@@ -7664,7 +7712,7 @@ fn string_lines(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn string_to_char_array(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toCharArray")?;
-    Ok(make_list(s.chars().map(Value::Char).collect(), false))
+    Ok(make_list(s.encode_utf16().map(Value::Char).collect(), false))
 }
 
 fn string_to_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -7733,17 +7781,26 @@ fn single_case_char(c: char, mut mapping: impl Iterator<Item = char>) -> char {
     }
 }
 fn char_uppercase_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let c = recv_char(ctx.args, "Char.uppercaseChar")?;
-    Ok(Value::Char(single_case_char(c, c.to_uppercase())))
+    let unit = recv_char(ctx.args, "Char.uppercaseChar")?;
+    Ok(Value::Char(match char_unit_to_scalar(unit) {
+        Some(c) => single_case_char(c, c.to_uppercase()) as u16,
+        None => unit,
+    }))
 }
 fn char_lowercase_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let c = recv_char(ctx.args, "Char.lowercaseChar")?;
-    Ok(Value::Char(single_case_char(c, c.to_lowercase())))
+    let unit = recv_char(ctx.args, "Char.lowercaseChar")?;
+    Ok(Value::Char(match char_unit_to_scalar(unit) {
+        Some(c) => single_case_char(c, c.to_lowercase()) as u16,
+        None => unit,
+    }))
 }
 fn char_digit_to_int_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let c = recv_char(ctx.args, "Char.digitToIntOrNull")?;
+    let unit = recv_char(ctx.args, "Char.digitToIntOrNull")?;
     let radix = char_digit_radix(ctx.args)?;
-    Ok(c.to_digit(radix).map(|d| Value::new_int(d)).unwrap_or(Value::Null))
+    Ok(char_unit_to_scalar(unit)
+        .and_then(|c| c.to_digit(radix))
+        .map(Value::new_int)
+        .unwrap_or(Value::Null))
 }
 
 // ============================================================
@@ -7958,14 +8015,10 @@ fn num_coerce_at_most(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn int_to_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    // Kotlin's `Int.toChar()` is a narrowing conversion: it keeps the low
+    // 16 bits (the resulting UTF-16 code unit), never throwing.
     let v = recv_int(ctx.args, "Int.toChar")?;
-    let c = char::from_u32(v as u32).ok_or_else(|| {
-        RuntimeError::Thrown(make_exception(
-            "kotlin.IllegalArgumentException",
-            Some(format!("Invalid Char code: {v}")),
-        ))
-    })?;
-    Ok(Value::Char(c))
+    Ok(Value::Char(v as u16))
 }
 
 // ============================================================
@@ -9074,7 +9127,7 @@ fn perform_regex_replace(
                 let rv = host.invoke_callable(&block, std::slice::from_ref(&mr), *sink)?;
                 match rv {
                     Value::String(rs) => out.push_str(&rs),
-                    Value::Char(c) => out.push(c),
+                    Value::Char(c) => out.push_str(&char_unit_to_string(c)),
                     other => {
                         return Err(RuntimeError::Type(format!(
                             "{who} transform must return a CharSequence, got {other:?}"
@@ -9336,13 +9389,10 @@ fn string_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
                     Some(format!("offset {start}, count {count}, size {}", chars.len())),
                 )));
             }
-            chars[start..end]
-                .iter()
-                .map(|v| match v {
-                    Value::Char(c) => *c,
-                    _ => '\u{0}',
-                })
-                .collect()
+            char_units_to_string(chars[start..end].iter().map(|v| match v {
+                Value::Char(c) => *c,
+                _ => 0u16,
+            }))
         }
         Some(Value::String(s)) => (**s).clone(),
         Some(Value::StringBuilder(sb)) => sb.borrow().clone(),
@@ -9375,7 +9425,7 @@ fn append_value(buf: &mut String, v: &Value) {
     match v {
         Value::Null => buf.push_str("null"),
         Value::String(s) => buf.push_str(s),
-        Value::Char(c) => buf.push(*c),
+        Value::Char(c) => buf.push_str(&char_unit_to_string(*c)),
         other => {
             use std::fmt::Write;
             let _ = write!(buf, "{other}");
@@ -9425,14 +9475,14 @@ fn string_builder_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         )),
     };
     let buf = sb.borrow();
-    let n = buf.chars().count() as i64;
+    let n = utf16_len(&buf) as i64;
     if idx < 0 || idx >= n {
         return Err(RuntimeError::Thrown(make_exception(
             "kotlin.IndexOutOfBoundsException",
             Some(format!("index: {idx}, length: {n}")),
         )));
     }
-    Ok(Value::Char(buf.chars().nth(idx as usize).unwrap()))
+    Ok(Value::Char(utf16_unit_at(&buf, idx as usize).unwrap()))
 }
 
 fn string_builder_is_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -9609,7 +9659,7 @@ fn string_builder_set_char_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
     }
     let byte = sb_char_byte(&buf, idx).unwrap();
     let old = buf[byte..].chars().next().unwrap();
-    buf.replace_range(byte..byte + old.len_utf8(), &ch.to_string());
+    buf.replace_range(byte..byte + old.len_utf8(), &char_unit_to_string(ch));
     drop(buf);
     Ok(Value::Unit)
 }
@@ -9879,7 +9929,7 @@ fn format_conv(
         }
         'c' | 'C' => {
             let s = match arg {
-                Value::Char(c) => c.to_string(),
+                Value::Char(c) => char_unit_to_string(*c),
                 Value::Int(n) => char::from_u32(*n as u32)
                     .ok_or_else(|| {
                         RuntimeError::Type(format!(
@@ -10010,30 +10060,25 @@ fn normalize_scientific(s: &str, upper: bool) -> String {
 // ============================================================
 
 fn char_titlecase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let c = match ctx.args.first() {
-        Some(Value::Char(c)) => *c,
-        _ => return Err(RuntimeError::Type(
-            "Char.titlecase requires a Char receiver".into(),
-        )),
-    };
+    let unit = recv_char(ctx.args, "Char.titlecase")?;
     // Most chars: titlecase == uppercase. Three diacritic ligatures (U+01C5,
     // U+01C8, U+01CB, U+01F2) and a handful of compatibility lowercase chars
     // map to a multi-char title form; we approximate via uppercase().
-    let s: String = c.to_uppercase().collect();
-    Ok(Value::String(Arc::new(s)))
+    match char_unit_to_scalar(unit) {
+        Some(c) => Ok(Value::String(Arc::new(c.to_uppercase().collect()))),
+        None => Ok(Value::String(Arc::new(char_unit_to_string(unit)))),
+    }
 }
 
 fn char_titlecase_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let c = match ctx.args.first() {
-        Some(Value::Char(c)) => *c,
-        _ => return Err(RuntimeError::Type(
-            "Char.titlecaseChar requires a Char receiver".into(),
-        )),
-    };
+    let unit = recv_char(ctx.args, "Char.titlecaseChar")?;
     // Title-case 1:1 mapping — for chars without a specific title form this
     // is the uppercase mapping, and (like uppercaseChar) the original char
     // when the uppercase mapping isn't a single character ('ß' -> 'ß').
-    Ok(Value::Char(single_case_char(c, c.to_uppercase())))
+    Ok(Value::Char(match char_unit_to_scalar(unit) {
+        Some(c) => single_case_char(c, c.to_uppercase()) as u16,
+        None => unit,
+    }))
 }
 
 #[cfg(test)]
@@ -10090,7 +10135,7 @@ mod tests {
     #[test]
     fn string_get_returns_char() {
         let s = Value::String(Arc::new("abc".to_string()));
-        assert!(matches!(call(string_get, &[s, Value::Int(1)]), Ok(Value::Char('b'))));
+        assert!(matches!(call(string_get, &[s, Value::Int(1)]), Ok(Value::Char(c)) if c == u16::from(b'b')));
     }
 
     #[test]
@@ -10118,47 +10163,47 @@ mod tests {
 
     #[test]
     fn char_is_digit_letter_whitespace() {
-        assert!(matches!(call(char_is_digit, &[Value::Char('5')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_letter, &[Value::Char('a')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char(' ')]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_digit, &[Value::Char('5' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_letter, &[Value::Char('a' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_whitespace, &[Value::Char(' ' as u16)]), Ok(Value::Bool(true))));
     }
 
     #[test]
     fn char_unicode_category_predicates() {
         // ASCII baseline.
-        assert!(matches!(call(char_is_letter, &[Value::Char('A')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_letter, &[Value::Char('z')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_digit, &[Value::Char('0')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\t')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\n')]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_letter, &[Value::Char('A' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_letter, &[Value::Char('z' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_digit, &[Value::Char('0' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_whitespace, &[Value::Char('\t' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_whitespace, &[Value::Char('\n' as u16)]), Ok(Value::Bool(true))));
 
         // Non-ASCII letters.
-        assert!(matches!(call(char_is_letter, &[Value::Char('α')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_letter, &[Value::Char('я')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_uppercase, &[Value::Char('Я')]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_letter, &[Value::Char('α' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_letter, &[Value::Char('я' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_uppercase, &[Value::Char('Я' as u16)]), Ok(Value::Bool(true))));
 
         // kotlinc-native treats NBSP-family code points as whitespace
         // (matches its built-in whitespace table; this also happens to match
         // Rust's `char::is_whitespace` here, so no divergence).
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{00A0}')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{202F}')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{2007}')]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{00A0}' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{202F}' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{2007}' as u16)]), Ok(Value::Bool(true))));
         // Divergence: ASCII control 0x1C..=0x1F. Kotlin -> true (in the
         // kotlinc-native whitespace table), Rust -> false.
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{001F}')]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{001C}')]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{001F}' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{001C}' as u16)]), Ok(Value::Bool(true))));
 
         // Divergence: Arabic-Indic digit five (U+0665). Both true under Nd,
         // but it's a non-ASCII digit guarded by the old `is_ascii_digit` call
         // which returned false. New code matches kotlinc.
-        assert!(matches!(call(char_is_digit, &[Value::Char('\u{0665}')]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_digit, &[Value::Char('\u{0665}' as u16)]), Ok(Value::Bool(true))));
 
         // Divergence: Roman numeral V (U+2164). Other_Uppercase contributory
         // property -> Kotlin treats as uppercase; Rust `is_uppercase` -> false.
-        assert!(matches!(call(char_is_uppercase, &[Value::Char('\u{2164}')]), Ok(Value::Bool(true))));
+        assert!(matches!(call(char_is_uppercase, &[Value::Char('\u{2164}' as u16)]), Ok(Value::Bool(true))));
 
         // ZWSP (U+200B): neither Rust nor Kotlin treat as whitespace; sanity.
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{200B}')]), Ok(Value::Bool(false))));
+        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{200B}' as u16)]), Ok(Value::Bool(false))));
     }
 
     #[test]

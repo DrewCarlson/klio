@@ -28,7 +28,7 @@ pub enum TokenKind {
     FloatLiteral { suffix: FloatSuffix },
     BoolLiteral(bool),
     NullLiteral,
-    CharLiteral(char),
+    CharLiteral(u16),
 
     // String tokens (template-aware)
     StringQuote { triple: bool },
@@ -531,23 +531,41 @@ impl<'src> Lexer<'src> {
 
     fn lex_char_literal(&mut self, start: u32) -> Token {
         self.pos += 1; // opening '
-        let ch = match self.peek_byte(0) {
+        let ch: u16 = match self.peek_byte(0) {
             Some(b'\\') => self.lex_escape(start),
             Some(b'\'') | None => {
                 self.diagnostics.emit(
                     Diagnostic::error("empty character literal", self.span(start))
                         .with_code("E0040").with_factory(&kf::EMPTY_CHARACTER_LITERAL),
                 );
-                '\u{FFFD}'
+                0xFFFD
             }
             Some(b'\n') => {
                 self.diagnostics.emit(
                     Diagnostic::error("character literal cannot contain newline", self.span(start))
                         .with_code("E0041").with_factory(&kf::INCORRECT_CHARACTER_LITERAL),
                 );
-                '\u{FFFD}'
+                0xFFFD
             }
-            Some(_) => self.bump_char().unwrap_or('\u{FFFD}'),
+            Some(_) => {
+                let c = self.bump_char().unwrap_or('\u{FFFD}');
+                let cp = c as u32;
+                if cp > 0xFFFF {
+                    // A Kotlin `Char` is one UTF-16 code unit; an astral
+                    // scalar (e.g. an emoji) cannot be a single `Char`
+                    // literal — it would need a surrogate pair.
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            "character literal must be a single UTF-16 code unit",
+                            self.span(start),
+                        )
+                        .with_code("E0041").with_factory(&kf::INCORRECT_CHARACTER_LITERAL),
+                    );
+                    0xFFFD
+                } else {
+                    cp as u16
+                }
+            }
         };
         if self.peek_byte(0) == Some(b'\'') {
             self.pos += 1;
@@ -560,26 +578,55 @@ impl<'src> Lexer<'src> {
         Token { kind: TokenKind::CharLiteral(ch), span: self.span(start) }
     }
 
-    fn lex_escape(&mut self, diag_anchor: u32) -> char {
+    /// Append one UTF-16 code unit produced by a string escape to the
+    /// UTF-8 `text` buffer. A high surrogate immediately followed by a
+    /// `\uXXXX` low-surrogate escape combines into the astral scalar; an
+    /// unpaired surrogate is emitted lossily as U+FFFD, since a Rust
+    /// `String` cannot store a lone surrogate.
+    fn push_string_unit(&mut self, text: &mut String, unit: u16) {
+        if (0xD800..=0xDBFF).contains(&unit) {
+            // High surrogate: try to pair with a following escape.
+            if self.peek_byte(0) == Some(b'\\') {
+                let lo = self.lex_escape(self.pos);
+                if (0xDC00..=0xDFFF).contains(&lo) {
+                    let c = 0x10000
+                        + ((u32::from(unit) - 0xD800) << 10)
+                        + (u32::from(lo) - 0xDC00);
+                    text.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
+                } else {
+                    text.push('\u{FFFD}');
+                    self.push_string_unit(text, lo);
+                }
+            } else {
+                text.push('\u{FFFD}');
+            }
+        } else if (0xDC00..=0xDFFF).contains(&unit) {
+            text.push('\u{FFFD}');
+        } else {
+            text.push(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}'));
+        }
+    }
+
+    fn lex_escape(&mut self, diag_anchor: u32) -> u16 {
         let esc_start = self.pos;
         self.pos += 1; // backslash
         let Some(b) = self.peek_byte(0) else {
             self.diagnostics.emit(
                 Diagnostic::error("trailing backslash", self.span(diag_anchor)).with_code("E0050").with_factory(&kf::ILLEGAL_ESCAPE),
             );
-            return '\u{FFFD}';
+            return 0xFFFD;
         };
         self.pos += 1;
         match b {
-            b'n' => '\n',
-            b't' => '\t',
-            b'r' => '\r',
-            b'b' => '\u{0008}',
-            b'\\' => '\\',
-            b'\'' => '\'',
-            b'"' => '"',
-            b'$' => '$',
-            b'0' => '\0',
+            b'n' => u16::from(b'\n'),
+            b't' => u16::from(b'\t'),
+            b'r' => u16::from(b'\r'),
+            b'b' => 0x0008,
+            b'\\' => u16::from(b'\\'),
+            b'\'' => u16::from(b'\''),
+            b'"' => u16::from(b'"'),
+            b'$' => u16::from(b'$'),
+            b'0' => 0x0000,
             b'u' => self.lex_unicode_escape(esc_start),
             _ => {
                 self.diagnostics.emit(
@@ -589,12 +636,16 @@ impl<'src> Lexer<'src> {
                     )
                     .with_code("E0051").with_factory(&kf::ILLEGAL_ESCAPE),
                 );
-                '\u{FFFD}'
+                0xFFFD
             }
         }
     }
 
-    fn lex_unicode_escape(&mut self, esc_start: u32) -> char {
+    /// `\uXXXX` is exactly four hex digits, so the value is always in
+    /// `0x0000..=0xFFFF` — a single UTF-16 code unit. Surrogates
+    /// (`\uD800`..`\uDFFF`) are valid `Char` literals (a Kotlin `Char` is
+    /// a code unit, not a scalar), so no scalar-validity check is applied.
+    fn lex_unicode_escape(&mut self, esc_start: u32) -> u16 {
         let mut value: u32 = 0;
         let mut count = 0;
         while count < 4 {
@@ -615,18 +666,9 @@ impl<'src> Lexer<'src> {
                 )
                 .with_code("E0052").with_factory(&kf::ILLEGAL_ESCAPE),
             );
-            return '\u{FFFD}';
+            return 0xFFFD;
         }
-        char::from_u32(value).unwrap_or_else(|| {
-            self.diagnostics.emit(
-                Diagnostic::error(
-                    format!("invalid unicode scalar value U+{value:04X}"),
-                    Span::new(self.file, esc_start, self.pos),
-                )
-                .with_code("E0053").with_factory(&kf::ILLEGAL_ESCAPE),
-            );
-            '\u{FFFD}'
-        })
+        value as u16
     }
 
     // ---------- punctuation ----------
@@ -828,7 +870,7 @@ impl<'src> Lexer<'src> {
             // Escapes (regular strings only; raw strings keep `\` verbatim).
             if b == b'\\' && !raw {
                 let ch = self.lex_escape(pos);
-                text.push(ch);
+                self.push_string_unit(&mut text, ch);
                 continue;
             }
 
@@ -998,14 +1040,14 @@ mod tests {
     fn char_literal_with_escape() {
         let r = lex(r"'\n'");
         assert!(!r.diagnostics.has_errors());
-        assert!(matches!(r.tokens[0].kind, TokenKind::CharLiteral('\n')));
+        assert!(matches!(r.tokens[0].kind, TokenKind::CharLiteral(0x000A)));
     }
 
     #[test]
     fn char_literal_unicode_escape() {
         let r = lex(r"'é'"); // é
         assert!(!r.diagnostics.has_errors());
-        assert!(matches!(r.tokens[0].kind, TokenKind::CharLiteral('\u{00e9}')));
+        assert!(matches!(r.tokens[0].kind, TokenKind::CharLiteral(0x00E9)));
     }
 
     #[test]

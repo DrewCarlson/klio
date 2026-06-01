@@ -2420,15 +2420,10 @@ fn apply_unop(op: UnOp, v: &Value) -> Result<Value, EvalError> {
         (UnOp::Dec, Value::Long(l)) => Ok(Value::Long(l.wrapping_sub(1))),
         (UnOp::Dec, Value::Float(f)) => Ok(Value::Float(f - 1.0)),
         (UnOp::Dec, Value::Double(d)) => Ok(Value::Double(d - 1.0)),
-        // Char.inc()/dec() step the code point. klio's Char is a Rust char
-        // (no lone surrogates), so a step that lands in the surrogate gap
-        // keeps the original char rather than panicking.
-        (UnOp::Inc, Value::Char(c)) => {
-            Ok(Value::Char(char::from_u32(*c as u32 + 1).unwrap_or(*c)))
-        }
-        (UnOp::Dec, Value::Char(c)) => {
-            Ok(Value::Char(char::from_u32((*c as u32).wrapping_sub(1)).unwrap_or(*c)))
-        }
+        // Char.inc()/dec() step the UTF-16 code unit, wrapping at the
+        // u16 bounds (MAX_VALUE 0xFFFF -> 0x0000), matching Kotlin.
+        (UnOp::Inc, Value::Char(c)) => Ok(Value::Char(c.wrapping_add(1))),
+        (UnOp::Dec, Value::Char(c)) => Ok(Value::Char(c.wrapping_sub(1))),
         _ => Err(EvalError::Type(format!("UnOp::{op:?} on {v:?}"))),
     }
 }
@@ -2494,7 +2489,7 @@ fn render_value(v: &Value) -> String {
         Value::Float(f) => klio_runtime::kotlin_float_to_string(*f),
         Value::Bool(b) => b.to_string(),
         Value::String(s) => s.as_str().to_string(),
-        Value::Char(c) => c.to_string(),
+        Value::Char(c) => klio_runtime::char_unit_to_string(*c),
         Value::Null => "null".to_string(),
         _ => format!("{v}"),
     }
@@ -2555,21 +2550,20 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::Sub, Value::Char(a), Value::Char(b)) => {
             Ok(Int(*a as i32 - *b as i32))
         }
+        // `Char + Int` / `Char - Int` truncate to the low 16 bits (the
+        // result is a single UTF-16 code unit), matching Kotlin's
+        // `(this.code + n).toChar()`.
         (BinOp::Add, Value::Char(a), Int(b)) => {
-            let cp = (*a as i64).wrapping_add(*b as i64);
-            Ok(Value::Char(char::from_u32(cp as u32).unwrap_or('\u{0}')))
+            Ok(Value::Char((*a as i64).wrapping_add(*b as i64) as u16))
         }
         (BinOp::Sub, Value::Char(a), Int(b)) => {
-            let cp = (*a as i64).wrapping_sub(*b as i64);
-            Ok(Value::Char(char::from_u32(cp as u32).unwrap_or('\u{0}')))
+            Ok(Value::Char((*a as i64).wrapping_sub(*b as i64) as u16))
         }
         (BinOp::Add, Value::Char(a), Long(b)) => {
-            let cp = (*a as i64).wrapping_add(*b);
-            Ok(Value::Char(char::from_u32(cp as u32).unwrap_or('\u{0}')))
+            Ok(Value::Char((*a as i64).wrapping_add(*b) as u16))
         }
         (BinOp::Sub, Value::Char(a), Long(b)) => {
-            let cp = (*a as i64).wrapping_sub(*b);
-            Ok(Value::Char(char::from_u32(cp as u32).unwrap_or('\u{0}')))
+            Ok(Value::Char((*a as i64).wrapping_sub(*b) as u16))
         }
         (BinOp::Mul, Int(a), Int(b)) => Ok(Int(a.wrapping_mul(*b))),
         // (Int Div/Mod handled below, after Long, with ArithmeticException throw.)

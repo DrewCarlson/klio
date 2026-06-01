@@ -728,7 +728,7 @@ pub(crate) fn primitive_zero_for(p: &klio_ast::Property) -> Option<klio_runtime:
         "Float" => Some(klio_runtime::Value::Float(0.0)),
         "Double" => Some(klio_runtime::Value::Double(0.0)),
         "Boolean" => Some(klio_runtime::Value::Bool(false)),
-        "Char" => Some(klio_runtime::Value::Char('\0')),
+        "Char" => Some(klio_runtime::Value::Char(0u16)),
         _ => None,
     }
 }

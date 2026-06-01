@@ -940,7 +940,8 @@ pub enum Const {
     Double(f64),
     Float(f32),
     Bool(bool),
-    Char(char),
+    /// UTF-16 code unit (see `klio_runtime::Value::Char`).
+    Char(u16),
     String(String),
     Null,
 }
