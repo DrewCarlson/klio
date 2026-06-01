@@ -1,0 +1,373 @@
+use super::*;
+
+// ============================================================
+// math
+// ============================================================
+
+pub(crate) fn as_double(v: &Value, what: &str) -> Result<f64, RuntimeError> {
+    match v {
+        Value::Double(d) => Ok(*d),
+        Value::Int(n) => Ok(*n as f64),
+        other => Err(RuntimeError::Type(format!("{what} requires a number, got {other:?}"))),
+    }
+}
+
+pub(crate) fn math_abs(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    match ctx.args {
+        [Value::Int(n)] => Ok(Value::Int(n.wrapping_abs())),
+        [Value::Long(n)] => Ok(Value::Long(n.wrapping_abs())),
+        [Value::Double(n)] => Ok(Value::Double(n.abs())),
+        [Value::Float(n)] => Ok(Value::Float(n.abs())),
+        _ => Err(RuntimeError::Type("abs requires a number".into())),
+    }
+}
+
+/// Numeric `min`/`max` over any Kotlin number pair (Byte/Short/Int/
+/// Long/Float/Double, including mixed). Doubles as the
+/// `kotlin.comparisons.minOf`/`maxOf` and `kotlin.math.min`/`max`
+/// implementation. Integral pairs keep an integral result (widened
+/// to the larger of the two so e.g. `minOf(Long, Int)` is a Long);
+/// any floating operand promotes the result to Double.
+pub(crate) fn num_extreme(args: &[Value], want_min: bool, what: &str) -> Result<Value, RuntimeError> {
+    let [a, b] = args else {
+        return Err(RuntimeError::Arity(format!("{what} expects 2 arguments")));
+    };
+    fn as_f(v: &Value) -> Option<f64> {
+        match v {
+            Value::Int(x) => Some(*x as f64),
+            Value::Long(x) => Some(*x as f64),
+            Value::Short(x) => Some(*x as f64),
+            Value::Byte(x) => Some(*x as f64),
+            Value::Float(x) => Some(*x as f64),
+            Value::Double(x) => Some(*x),
+            _ => None,
+        }
+    }
+    fn as_i(v: &Value) -> Option<i64> {
+        match v {
+            Value::Int(x) => Some(*x as i64),
+            Value::Long(x) => Some(*x),
+            Value::Short(x) => Some(*x as i64),
+            Value::Byte(x) => Some(*x as i64),
+            _ => None,
+        }
+    }
+    let floating = matches!(a, Value::Double(_) | Value::Float(_))
+        || matches!(b, Value::Double(_) | Value::Float(_));
+    if floating {
+        let (x, y) = (
+            as_f(a).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
+            as_f(b).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
+        );
+        // Kotlin's minOf/maxOf use Math.min/max, which propagate NaN — unlike
+        // Rust's f64::min/max which return the non-NaN operand.
+        return Ok(Value::Double(if x.is_nan() || y.is_nan() {
+            f64::NAN
+        } else if want_min {
+            x.min(y)
+        } else {
+            x.max(y)
+        }));
+    }
+    let (x, y) = (
+        as_i(a).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
+        as_i(b).ok_or_else(|| RuntimeError::Type(format!("{what}: non-numeric arg")))?,
+    );
+    let r = if want_min { x.min(y) } else { x.max(y) };
+    // Widen to Long if either operand was Long; otherwise Int.
+    if matches!(a, Value::Long(_)) || matches!(b, Value::Long(_)) {
+        Ok(Value::Long(r))
+    } else {
+        Ok(Value::Int(r as i32))
+    }
+}
+
+pub(crate) fn math_min(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    cmp_extreme(ctx, true, "min")
+}
+
+pub(crate) fn math_max(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    cmp_extreme(ctx, false, "max")
+}
+
+pub(crate) fn cmp_extreme(
+    ctx: &mut CallCtx,
+    want_min: bool,
+    what: &str,
+) -> Result<Value, RuntimeError> {
+    // Instance-aware path: a user receiver implementing Comparable
+    // (`operator fun compareTo`) reaches min/max via call_member,
+    // falling back to the primitive num_extreme for plain numbers.
+    if let [a, b] = ctx.args {
+        if matches!(a, Value::Instance(_)) || matches!(b, Value::Instance(_)) {
+            let CallCtx { out, host, .. } = ctx;
+            let ord = compare_host_aware(a, b, host, *out)?;
+            let pick_first = if want_min {
+                ord != std::cmp::Ordering::Greater
+            } else {
+                ord != std::cmp::Ordering::Less
+            };
+            return Ok(if pick_first { a.clone() } else { b.clone() });
+        }
+        // Numeric operands use `num_extreme` (width widening +
+        // Math.min/max NaN propagation). Any other `Comparable`
+        // (`maxOf("a","b")`, Char) picks by the total comparison
+        // order, mirroring the generic `maxOf<T : Comparable<T>>`.
+        if !(a.is_numeric() && b.is_numeric()) {
+            let ord = compare_values(a, b)?;
+            let pick_first = if want_min {
+                ord != std::cmp::Ordering::Greater
+            } else {
+                ord != std::cmp::Ordering::Less
+            };
+            return Ok(if pick_first { a.clone() } else { b.clone() });
+        }
+    }
+    num_extreme(ctx.args, want_min, what)
+}
+
+pub(crate) fn math_sqrt(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let [v] = ctx.args else {
+        return Err(RuntimeError::Arity("sqrt expects 1 argument".into()));
+    };
+    Ok(Value::Double(as_double(v, "sqrt")?.sqrt()))
+}
+
+/// `Double.pow(Double)` and `Double.pow(Int)` — Kotlin's only `pow` shape.
+/// Receiver is `args[0]`, exponent is `args[1]`.
+pub(crate) fn double_pow(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("Double.pow expects 1 argument".into()));
+    }
+    let base = recv_double(ctx.args, "Double.pow")?;
+    let exp = as_double(&ctx.args[1], "Double.pow")?;
+    Ok(Value::Double(base.powf(exp)))
+}
+
+pub(crate) fn math_sin(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "sin")?, "sin")?.sin()))
+}
+pub(crate) fn math_cos(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "cos")?, "cos")?.cos()))
+}
+pub(crate) fn math_tan(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "tan")?, "tan")?.tan()))
+}
+pub(crate) fn math_ln(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "ln")?, "ln")?.ln()))
+}
+pub(crate) fn math_log(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (x, base) = arg2(ctx, "log")?;
+    Ok(Value::Double(as_double(x, "log")?.log(as_double(base, "log")?)))
+}
+pub(crate) fn math_log10(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "log10")?, "log10")?.log10()))
+}
+pub(crate) fn math_log2(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "log2")?, "log2")?.log2()))
+}
+pub(crate) fn math_exp(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "exp")?, "exp")?.exp()))
+}
+pub(crate) fn math_floor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "floor")?, "floor")?.floor()))
+}
+pub(crate) fn math_ceil(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "ceil")?, "ceil")?.ceil()))
+}
+pub(crate) fn math_round(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    // Kotlin's kotlin.math.round rounds half to even (IEEE rint), unlike
+    // Rust's round() which rounds half away from zero.
+    Ok(Value::Double(as_double(arg1(ctx, "round")?, "round")?.round_ties_even()))
+}
+pub(crate) fn math_truncate(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "truncate")?, "truncate")?.trunc()))
+}
+pub(crate) fn math_hypot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "hypot")?;
+    Ok(Value::Double(as_double(a, "hypot")?.hypot(as_double(b, "hypot")?)))
+}
+pub(crate) fn math_sign(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let v = arg1(ctx, "sign")?;
+    // Kotlin's sign preserves a signed/NaN zero: sign(0.0)=0.0, sign(-0.0)=-0.0,
+    // sign(NaN)=NaN. Rust's signum() returns ±1.0 for zero, so special-case it.
+    fn fsign(n: f64) -> f64 {
+        if n == 0.0 || n.is_nan() {
+            n
+        } else {
+            n.signum()
+        }
+    }
+    match v {
+        Value::Int(n) => Ok(Value::Int(n.signum())),
+        Value::Long(n) => Ok(Value::Int(n.signum() as i32)),
+        Value::Float(n) => Ok(Value::Float(fsign(*n as f64) as f32)),
+        Value::Double(n) => Ok(Value::Double(fsign(*n))),
+        other => Err(RuntimeError::Type(format!("sign requires a number, got {other:?}"))),
+    }
+}
+
+pub(crate) fn math_cbrt(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "cbrt")?, "cbrt")?.cbrt()))
+}
+
+/// `roundToInt()` / `roundToLong()`: round half toward +∞ (Java `Math.round`),
+/// throw on NaN, clamp out-of-range to the type's MIN/MAX.
+pub(crate) fn num_round_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let d = as_double(arg1(ctx, "roundToInt")?, "roundToInt")?;
+    if d.is_nan() {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IllegalArgumentException",
+            Some("Cannot round NaN value.".into()),
+        )));
+    }
+    let r = (d + 0.5).floor();
+    let v = if r >= i32::MAX as f64 {
+        i32::MAX
+    } else if r <= i32::MIN as f64 {
+        i32::MIN
+    } else {
+        r as i32
+    };
+    Ok(Value::Int(v))
+}
+
+pub(crate) fn num_round_to_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let d = as_double(arg1(ctx, "roundToLong")?, "roundToLong")?;
+    if d.is_nan() {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IllegalArgumentException",
+            Some("Cannot round NaN value.".into()),
+        )));
+    }
+    let r = (d + 0.5).floor();
+    let v = if r >= i64::MAX as f64 {
+        i64::MAX
+    } else if r <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        r as i64
+    };
+    Ok(Value::Long(v))
+}
+
+pub(crate) fn num_take_highest_one_bit(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    match arg1(ctx, "takeHighestOneBit")? {
+        Value::Int(n) => {
+            let u = *n as u32;
+            Ok(Value::Int(if u == 0 { 0 } else { (1u32 << (31 - u.leading_zeros())) as i32 }))
+        }
+        Value::Long(n) => {
+            let u = *n as u64;
+            Ok(Value::Long(if u == 0 { 0 } else { (1u64 << (63 - u.leading_zeros())) as i64 }))
+        }
+        other => Err(RuntimeError::Type(format!(
+            "takeHighestOneBit requires an integer, got {other:?}"
+        ))),
+    }
+}
+
+pub(crate) fn num_take_lowest_one_bit(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    match arg1(ctx, "takeLowestOneBit")? {
+        Value::Int(n) => Ok(Value::Int(n & n.wrapping_neg())),
+        Value::Long(n) => Ok(Value::Long(n & n.wrapping_neg())),
+        other => Err(RuntimeError::Type(format!(
+            "takeLowestOneBit requires an integer, got {other:?}"
+        ))),
+    }
+}
+
+pub(crate) fn num_rotate_left(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "rotateLeft")?;
+    let n = b
+        .as_i64()
+        .ok_or_else(|| RuntimeError::Type("rotateLeft bitCount must be Int".into()))?;
+    match a {
+        Value::Int(x) => Ok(Value::Int(x.rotate_left(n.rem_euclid(32) as u32))),
+        Value::Long(x) => Ok(Value::Long(x.rotate_left(n.rem_euclid(64) as u32))),
+        other => Err(RuntimeError::Type(format!(
+            "rotateLeft requires an integer, got {other:?}"
+        ))),
+    }
+}
+
+pub(crate) fn num_rotate_right(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "rotateRight")?;
+    let n = b
+        .as_i64()
+        .ok_or_else(|| RuntimeError::Type("rotateRight bitCount must be Int".into()))?;
+    match a {
+        Value::Int(x) => Ok(Value::Int(x.rotate_right(n.rem_euclid(32) as u32))),
+        Value::Long(x) => Ok(Value::Long(x.rotate_right(n.rem_euclid(64) as u32))),
+        other => Err(RuntimeError::Type(format!(
+            "rotateRight requires an integer, got {other:?}"
+        ))),
+    }
+}
+
+/// `Double.rem(Double)` / `Float.rem` — IEEE remainder (sign of dividend),
+/// same as the `%` operator.
+pub(crate) fn num_float_rem(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "rem")?;
+    let r = as_double(a, "rem")? % as_double(b, "rem")?;
+    Ok(if matches!(a, Value::Float(_)) {
+        Value::Float(r as f32)
+    } else {
+        Value::Double(r)
+    })
+}
+
+/// `Double.mod(Double)` / `Float.mod` — floored modulus (sign of divisor).
+pub(crate) fn num_float_mod(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (a, b) = arg2(ctx, "mod")?;
+    let (x, y) = (as_double(a, "mod")?, as_double(b, "mod")?);
+    let mut r = x % y;
+    if r != 0.0 && (r < 0.0) != (y < 0.0) {
+        r += y;
+    }
+    Ok(if matches!(a, Value::Float(_)) {
+        Value::Float(r as f32)
+    } else {
+        Value::Double(r)
+    })
+}
+
+pub(crate) fn math_pi(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(std::f64::consts::PI))
+}
+pub(crate) fn math_e(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(std::f64::consts::E))
+}
+
+pub(crate) fn arg1<'a>(ctx: &'a CallCtx<'_>, what: &str) -> Result<&'a Value, RuntimeError> {
+    if ctx.args.len() != 1 {
+        return Err(RuntimeError::Arity(format!("{what} expects 1 argument")));
+    }
+    Ok(&ctx.args[0])
+}
+
+pub(crate) fn arg2<'a>(ctx: &'a CallCtx<'_>, what: &str) -> Result<(&'a Value, &'a Value), RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity(format!("{what} expects 2 arguments")));
+    }
+    Ok((&ctx.args[0], &ctx.args[1]))
+}
+
+// ============================================================
+// Additional math
+// ============================================================
+
+pub(crate) fn math_asin(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "asin")?, "asin")?.asin()))
+}
+pub(crate) fn math_acos(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "acos")?, "acos")?.acos()))
+}
+pub(crate) fn math_atan(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "atan")?, "atan")?.atan()))
+}
+pub(crate) fn math_atan2(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (y, x) = arg2(ctx, "atan2")?;
+    Ok(Value::Double(as_double(y, "atan2")?.atan2(as_double(x, "atan2")?)))
+}
+
