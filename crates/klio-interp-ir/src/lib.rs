@@ -8643,6 +8643,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
             let intrinsic_class = matches!(
                 fqn,
                 "kotlin.text.StringBuilder"
+                    | "kotlin.text.Regex"
                     | "kotlin.collections.HashMap"
                     | "kotlin.collections.HashSet"
                     | "kotlin.collections.LinkedHashMap"

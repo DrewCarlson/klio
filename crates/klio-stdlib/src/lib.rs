@@ -161,11 +161,7 @@ pub fn is_implicitly_imported_package(package_path: &str) -> bool {
 ///   `Comparator` SAM build comparator values the source combinators
 ///   expect to chain on; not yet interoperable with `Value::Comparator`
 ///   + `sortedWith`.
-/// - `kotlin/TextH.kt`: declares the `Regex` / text surface whose
-///   interpreted form shadows klio's `Value::Regex` intrinsics.
-pub const CONSUMPTION_DEFERRED_SOURCES: &[&str] = &[
-    "kotlin/TextH.kt",
-];
+pub const CONSUMPTION_DEFERRED_SOURCES: &[&str] = &[];
 
 /// True when `rel_path` names a curated source on the consumption
 /// deferral list (see [`CONSUMPTION_DEFERRED_SOURCES`]).

@@ -1134,17 +1134,22 @@ fn build_module_with_overrides(
             if klio_stdlib::implementation(&fqn).is_some() {
                 return false;
             }
-            // Some upstream array factories ship a second overload in a
-            // different package than the klio intrinsic — e.g. the
-            // internal `kotlin.collections.arrayOfNulls(reference, size)`
-            // beside the public `kotlin.arrayOfNulls(size)`. The
-            // exact-FQN check above only drops the matching-package
-            // expect, leaving the other bodyless overload to shadow the
-            // intrinsic in bare-name resolution (a call binds the empty
-            // body and yields Unit). Drop any bodyless array-factory
-            // expect whose simple name is backed by a `kotlin.<name>`
-            // intrinsic so all overloads route to the host ctor.
-            if matches!(f.name.name.as_str(), "arrayOfNulls" | "emptyArray")
+            // A non-extension factory `expect fun` can live in a
+            // different package than the klio intrinsic that implements
+            // it — e.g. `kotlin.text.String(chars)` /
+            // `kotlin.text.String(chars, offset, length)` are backed by
+            // the `kotlin.String` host ctor, and the internal
+            // `kotlin.collections.arrayOfNulls(reference, size)` /
+            // `kotlin.emptyArray` overloads by `kotlin.<name>`. The
+            // exact-FQN check above misses these, leaving the bodyless
+            // overload to shadow the intrinsic in bare-name resolution
+            // (the call binds the empty body and yields Unit). Drop any
+            // bodyless non-extension expect whose simple name is backed
+            // by a `kotlin.<name>` intrinsic so the bare call routes to
+            // the host ctor. Receiver-qualified expects keep flowing
+            // through member dispatch, which already reaches the
+            // intrinsic, so they are left in place.
+            if f.receiver_type.is_none()
                 && klio_stdlib::implementation(&format!("kotlin.{}", f.name.name)).is_some()
             {
                 return false;
