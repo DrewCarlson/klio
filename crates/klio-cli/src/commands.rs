@@ -1,4 +1,6 @@
-use crate::{PathBuf, DiagFormat, ExitCode, SourceMap, DiagnosticSink, Lexer, Parser, render, Severity};
+use crate::{
+    DiagFormat, DiagnosticSink, ExitCode, Lexer, Parser, PathBuf, Severity, SourceMap, render,
+};
 
 use crate::pack_cache::load_installed_packs;
 
@@ -12,7 +14,9 @@ pub(crate) fn run_check(files: &[PathBuf], format: DiagFormat) -> ExitCode {
     let mut user_asts: Vec<klio_ast::KotlinFile> = Vec::with_capacity(files.len());
     let mut user_file_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for path in files {
-        let Some(id) = load(&mut map, path) else { return ExitCode::from(2) };
+        let Some(id) = load(&mut map, path) else {
+            return ExitCode::from(2);
+        };
         user_file_ids.insert(id.0);
         let src = map.get(id).source.clone();
         let lexed = Lexer::new(id, &src).tokenize();
@@ -60,7 +64,11 @@ pub(crate) fn run_check(files: &[PathBuf], format: DiagFormat) -> ExitCode {
         return ExitCode::from(2);
     }
     let has_errors = diags.iter().any(|d| d.severity == Severity::Error);
-    if has_errors { ExitCode::from(1) } else { ExitCode::SUCCESS }
+    if has_errors {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn load(map: &mut SourceMap, path: &std::path::Path) -> Option<klio_span::FileId> {
@@ -75,19 +83,27 @@ fn load(map: &mut SourceMap, path: &std::path::Path) -> Option<klio_span::FileId
 
 pub(crate) fn run_lex(path: &std::path::Path) -> ExitCode {
     let mut map = SourceMap::new();
-    let Some(id) = load(&mut map, path) else { return ExitCode::FAILURE };
+    let Some(id) = load(&mut map, path) else {
+        return ExitCode::FAILURE;
+    };
     let src = map.get(id).source.clone();
     let result = Lexer::new(id, &src).tokenize();
     for tok in &result.tokens {
         println!("{tok:?}");
     }
     let _ = result.diagnostics.render(&map, std::io::stderr());
-    if result.diagnostics.has_errors() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+    if result.diagnostics.has_errors() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 pub(crate) fn run_parse(path: &std::path::Path) -> ExitCode {
     let mut map = SourceMap::new();
-    let Some(id) = load(&mut map, path) else { return ExitCode::FAILURE };
+    let Some(id) = load(&mut map, path) else {
+        return ExitCode::FAILURE;
+    };
     let src = map.get(id).source.clone();
     let lexed = Lexer::new(id, &src).tokenize();
     let _ = lexed.diagnostics.render(&map, std::io::stderr());
@@ -97,14 +113,20 @@ pub(crate) fn run_parse(path: &std::path::Path) -> ExitCode {
     let (ast, diags) = Parser::new(id, &src, &lexed.tokens).parse_file();
     let _ = diags.render(&map, std::io::stderr());
     println!("{ast:#?}");
-    if diags.has_errors() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+    if diags.has_errors() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 pub(crate) fn run_module_files(paths: &[PathBuf]) -> ExitCode {
     let mut map = SourceMap::new();
     let mut asts: Vec<klio_ast::KotlinFile> = Vec::with_capacity(paths.len());
     for path in paths {
-        let Some(id) = load(&mut map, path) else { return ExitCode::FAILURE };
+        let Some(id) = load(&mut map, path) else {
+            return ExitCode::FAILURE;
+        };
         let src = map.get(id).source.clone();
         let lexed = klio_lexer::Lexer::new(id, &src).tokenize();
         let _ = lexed.diagnostics.render(&map, std::io::stderr());
@@ -121,8 +143,7 @@ pub(crate) fn run_module_files(paths: &[PathBuf]) -> ExitCode {
     let (pack_asts, pack_bindings) = load_installed_packs(&asts, &mut map);
     // Pack ASTs first so the user's main wins when build_module_files
     // picks a `main` declaration.
-    let mut all_asts: Vec<klio_ast::KotlinFile> =
-        Vec::with_capacity(pack_asts.len() + asts.len());
+    let mut all_asts: Vec<klio_ast::KotlinFile> = Vec::with_capacity(pack_asts.len() + asts.len());
     all_asts.extend(pack_asts);
     all_asts.extend(asts);
     let built = klio_interp_ir::build::build_module_files(&all_asts);
@@ -149,7 +170,9 @@ pub(crate) fn run_module_files(paths: &[PathBuf]) -> ExitCode {
 /// Vm owns module construction end-to-end.
 pub(crate) fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
     let mut map = SourceMap::new();
-    let Some(id) = load(&mut map, path) else { return ExitCode::FAILURE };
+    let Some(id) = load(&mut map, path) else {
+        return ExitCode::FAILURE;
+    };
     let src = map.get(id).source.clone();
     let lexed = Lexer::new(id, &src).tokenize();
     let _ = lexed.diagnostics.render(&map, std::io::stderr());
@@ -189,7 +212,6 @@ pub(crate) fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
         }
     }
 }
-
 
 pub(crate) fn run_repl() -> ExitCode {
     use rustyline::error::ReadlineError;

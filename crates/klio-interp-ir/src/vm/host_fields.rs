@@ -1,6 +1,19 @@
-use crate::{VmHost, Arc, active_coro_scope, with_field_resolve_pair, with_outer_this, with_field_outer_guard, AtomicOrdering};
+use crate::{
+    Arc, AtomicOrdering, VmHost, active_coro_scope, with_field_outer_guard,
+    with_field_resolve_pair, with_outer_this,
+};
 
 impl VmHost<'_> {
+    // One long field-resolution dispatch chain; splitting it would fragment
+    // the ordered fallthrough. Casts reinterpret a thread id (i64 as u64),
+    // index a closure table (u64 as usize), and report collection lengths as
+    // the i64 Kotlin `size`/`lastIndex` return.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
     pub(crate) fn get_field(
         &mut self,
         receiver: &klio_runtime::Value,
@@ -12,14 +25,15 @@ impl VmHost<'_> {
         // fields off its fqn. simpleName is the last FQN segment; qualifiedName
         // is the full kotlin.* name.
         if matches!(name, "simpleName" | "qualifiedName")
-            && let klio_runtime::Value::Exception { fqn, .. } = receiver {
-                let v = if name == "simpleName" {
-                    fqn.rsplit('.').next().unwrap_or(fqn).to_string()
-                } else {
-                    (**fqn).clone()
-                };
-                return Ok(klio_runtime::Value::String(Arc::new(v)));
-            }
+            && let klio_runtime::Value::Exception { fqn, .. } = receiver
+        {
+            let v = if name == "simpleName" {
+                fqn.rsplit('.').next().unwrap_or(fqn).to_string()
+            } else {
+                (**fqn).clone()
+            };
+            return Ok(klio_runtime::Value::String(Arc::new(v)));
+        }
         // Suspend-implicit `kotlin.coroutines.coroutineContext`
         // intrinsic: it is the *running* coroutine's context, not a
         // member of whatever `this` a suspend member carries. klio
@@ -28,18 +42,19 @@ impl VmHost<'_> {
         // `coroutineContext` getter (receiver == the active scope)
         // resolves normally — no redirect, no recursion.
         if name == "coroutineContext"
-            && let Some(scope) = active_coro_scope() {
-                let same = matches!(
-                    (&scope, receiver),
-                    (
-                        klio_runtime::Value::Instance(a),
-                        klio_runtime::Value::Instance(b)
-                    ) if klio_runtime::ObjRef::ptr_eq(a, b)
-                );
-                if !same {
-                    return self.get_field(&scope, "coroutineContext");
-                }
+            && let Some(scope) = active_coro_scope()
+        {
+            let same = matches!(
+                (&scope, receiver),
+                (
+                    klio_runtime::Value::Instance(a),
+                    klio_runtime::Value::Instance(b)
+                ) if klio_runtime::ObjRef::ptr_eq(a, b)
+            );
+            if !same {
+                return self.get_field(&scope, "coroutineContext");
             }
+        }
         // A bare class/interface name used as a value resolves to its
         // companion object (Kotlin). Lowering emits this sentinel read
         // on the loaded class; yield the companion singleton when the
@@ -53,9 +68,10 @@ impl VmHost<'_> {
                     .companion_singletons
                     .get(&cls.name)
                     .cloned()
-                    && let Some(s) = self.globals.borrow().lookup(&comp_name) {
-                        return Ok(s);
-                    }
+                    && let Some(s) = self.globals.borrow().lookup(&comp_name)
+                {
+                    return Ok(s);
+                }
                 // A bare `object` name in value position is the
                 // singleton, not the class/`KClass`. The singleton
                 // registers itself as a global on first construction;
@@ -89,39 +105,42 @@ impl VmHost<'_> {
         // Value::Exception). The names are upstream-internal, so an
         // exact-name match is safe.
         if matches!(name, "value" | "holder")
-            && let klio_runtime::Value::Result { payload, .. } = receiver {
-                return Ok((**payload).clone());
-            }
+            && let klio_runtime::Value::Result { payload, .. } = receiver
+        {
+            return Ok((**payload).clone());
+        }
         // Backing-field bypass: getter / setter bodies that reference
         // `field` lower into a member read on this synthetic name.
         // Route straight to the raw instance slot to break recursion.
         if let Some(raw) = name.strip_prefix("__klio_field__")
-            && let klio_runtime::Value::Instance(inst) = receiver {
-                if let Some(v) = inst.borrow().get(raw) {
-                    return Ok(v);
-                }
-                return Ok(klio_runtime::Value::Null);
+            && let klio_runtime::Value::Instance(inst) = receiver
+        {
+            if let Some(v) = inst.borrow().get(raw) {
+                return Ok(v);
             }
+            return Ok(klio_runtime::Value::Null);
+        }
         // `Thread` handle property reads (`t.name`, `t.isAlive`).
         // Mirrors the member-call interception in `call_member`.
-        if let klio_runtime::Value::BoundMethod { fqn, receiver: tid, .. } = receiver
-            && *fqn == "kotlin.concurrent.Thread" {
-                let id = match **tid {
-                    klio_runtime::Value::Long(v) => v as u64,
-                    _ => 0,
-                };
-                match name {
-                    "isAlive" => {
-                        return Ok(klio_runtime::Value::Bool(self.thread_alive(id)))
-                    }
-                    "name" => {
-                        return Ok(klio_runtime::Value::String(Arc::new(format!(
-                            "klio-thread-{id}"
-                        ))))
-                    }
-                    _ => {}
+        if let klio_runtime::Value::BoundMethod {
+            fqn, receiver: tid, ..
+        } = receiver
+            && *fqn == "kotlin.concurrent.Thread"
+        {
+            let id = match **tid {
+                klio_runtime::Value::Long(v) => v as u64,
+                _ => 0,
+            };
+            match name {
+                "isAlive" => return Ok(klio_runtime::Value::Bool(self.thread_alive(id))),
+                "name" => {
+                    return Ok(klio_runtime::Value::String(Arc::new(format!(
+                        "klio-thread-{id}"
+                    ))));
                 }
+                _ => {}
             }
+        }
         // Custom getter — invoke its IR FuncId with the receiver
         // bound as `this`. Wins over the plain field read so a
         // `val full: String get() = "$first $last"` shape evaluates
@@ -131,43 +150,41 @@ impl VmHost<'_> {
         // generated `entries` list / `values()` companion-style
         // accessor.
         if let klio_runtime::Value::Class(cls) = receiver
-            && cls.is_enum {
-                if name == "entries" {
-                    let items: Vec<klio_runtime::Value> = cls
-                        .enum_entries
-                        .borrow()
-                        .iter()
-                        .map(|(_, v)| v.clone())
-                        .collect();
-                    return Ok(klio_runtime::Value::List {
-                        items: klio_runtime::ObjRef::new(items),
-                        mutable: false,
-                        enum_class: Some(Arc::new(cls.name.clone())), backing: None,
-                    });
-                }
-                if let Some((_, v)) = cls
+            && cls.is_enum
+        {
+            if name == "entries" {
+                let items: Vec<klio_runtime::Value> = cls
                     .enum_entries
                     .borrow()
                     .iter()
-                    .find(|(n, _)| n == name)
-                {
-                    return Ok(v.clone());
-                }
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                return Ok(klio_runtime::Value::List {
+                    items: klio_runtime::ObjRef::new(items),
+                    mutable: false,
+                    enum_class: Some(Arc::new(cls.name.clone())),
+                    backing: None,
+                });
             }
+            if let Some((_, v)) = cls.enum_entries.borrow().iter().find(|(n, _)| n == name) {
+                return Ok(v.clone());
+            }
+        }
         // Bound method/property reference field reads:
         // `nameRef.name` / `.simpleName` resolve to the captured
         // method name.
         if let klio_runtime::Value::Instance(inst) = receiver {
             let snap = inst.borrow();
             if snap.get("__bound_receiver__").is_some()
-                && let Some(klio_runtime::Value::String(n)) = snap.get("__bound_name__") {
-                    match name {
-                        "name" | "simpleName" => {
-                            return Ok(klio_runtime::Value::String(Arc::clone(&n)));
-                        }
-                        _ => {}
+                && let Some(klio_runtime::Value::String(n)) = snap.get("__bound_name__")
+            {
+                match name {
+                    "name" | "simpleName" => {
+                        return Ok(klio_runtime::Value::String(Arc::clone(&n)));
                     }
+                    _ => {}
                 }
+            }
         }
         // KFunction reflection: `::main.name`, `::main.parameters`.
         // Top-level fn refs lower as `Value::IrClosure` pointing at
@@ -175,77 +192,79 @@ impl VmHost<'_> {
         // user code can introspect a callable.
         if let klio_runtime::Value::IrClosure { id, .. } = receiver
             && let Some(info) = self.closures.get(*id as usize)
-                && let Some(f) = self.module.funcs.get(info.body_func.0 as usize) {
-                    match name {
-                        "name" => {
-                            return Ok(klio_runtime::Value::String(Arc::new(
-                                f.name.clone(),
-                            )));
-                        }
-                        "parameters" => {
-                            let items: Vec<klio_runtime::Value> = f
-                                .params
-                                .iter()
-                                .map(|p| {
-                                    klio_runtime::Value::String(Arc::new(p.name.clone()))
-                                })
-                                .collect();
-                            return Ok(klio_runtime::Value::List {
-                                items: klio_runtime::ObjRef::new(items),
-                                mutable: false,
-                                enum_class: None, backing: None,
-                            });
-                        }
-                        _ => {}
-                    }
+            && let Some(f) = self.module.funcs.get(info.body_func.0 as usize)
+        {
+            match name {
+                "name" => {
+                    return Ok(klio_runtime::Value::String(Arc::new(f.name.clone())));
                 }
+                "parameters" => {
+                    let items: Vec<klio_runtime::Value> = f
+                        .params
+                        .iter()
+                        .map(|p| klio_runtime::Value::String(Arc::new(p.name.clone())))
+                        .collect();
+                    return Ok(klio_runtime::Value::List {
+                        items: klio_runtime::ObjRef::new(items),
+                        mutable: false,
+                        enum_class: None,
+                        backing: None,
+                    });
+                }
+                _ => {}
+            }
+        }
         // Companion-object forwarding: `Foo.PI` reads `PI` from the
         // companion singleton when the receiver is the user class.
         // Enum entries (`Color.RED`) take precedence above; reaching
         // here means the name isn't an entry.
         if let klio_runtime::Value::Class(cls) = receiver {
-            if let Some(comp_name) = self.module.registry.companion_singletons.get(&cls.name).cloned() {
+            if let Some(comp_name) = self
+                .module
+                .registry
+                .companion_singletons
+                .get(&cls.name)
+                .cloned()
+            {
                 // `Counter.Factory` — the user-declared companion
                 // name resolves to the companion singleton itself.
                 let suffix = format!("$Companion${name}");
                 if comp_name.ends_with(&suffix)
-                    && let Some(s) = self.globals.borrow().lookup(&comp_name) {
-                        return Ok(s);
-                    }
+                    && let Some(s) = self.globals.borrow().lookup(&comp_name)
+                {
+                    return Ok(s);
+                }
                 let singleton = self.globals.borrow().lookup(&comp_name);
                 if let Some(singleton) = singleton
-                    && let klio_runtime::Value::Instance(inst) = &singleton {
-                        if let Some(v) = inst.borrow().get(name) {
-                            return Ok(v);
-                        }
-                        // No plain backing field — the companion
-                        // member may be a `val` with a custom getter
-                        // (`val DISTANT_PAST get() = …`). Run that
-                        // getter directly against the companion
-                        // singleton (mirrors the instance getter
-                        // path; no recursion through get_field).
-                        let comp_cls = inst.borrow().class.name.clone();
-                        let getter = self
-                            .prog
-                            .instance_prop_getters
-                            .get(&(comp_cls, name.to_string()))
-                            .copied();
-                        if let Some(fid) = getter
-                            && let Some(func) = self
-                                .module
-                                .funcs
-                                .get(fid.0 as usize)
-                                .cloned()
-                            {
-                                let module = Arc::clone(&self.module);
-                                return klio_ir::eval::eval_with(
-                                    &module,
-                                    &func,
-                                    vec![singleton.clone()],
-                                    self,
-                                );
-                            }
+                    && let klio_runtime::Value::Instance(inst) = &singleton
+                {
+                    if let Some(v) = inst.borrow().get(name) {
+                        return Ok(v);
                     }
+                    // No plain backing field — the companion
+                    // member may be a `val` with a custom getter
+                    // (`val DISTANT_PAST get() = …`). Run that
+                    // getter directly against the companion
+                    // singleton (mirrors the instance getter
+                    // path; no recursion through get_field).
+                    let comp_cls = inst.borrow().class.name.clone();
+                    let getter = self
+                        .prog
+                        .instance_prop_getters
+                        .get(&(comp_cls, name.to_string()))
+                        .copied();
+                    if let Some(fid) = getter
+                        && let Some(func) = self.module.funcs.get(fid.0 as usize).cloned()
+                    {
+                        let module = Arc::clone(&self.module);
+                        return klio_ir::eval::eval_with(
+                            &module,
+                            &func,
+                            vec![singleton.clone()],
+                            self,
+                        );
+                    }
+                }
             }
             // Nested singleton object: `Outer.Monotonic` /
             // `Sealed.Subclass` is a synthesised object singleton
@@ -253,9 +272,10 @@ impl VmHost<'_> {
             // synthesised class def so `Outer.Obj.member` reaches the
             // singleton rather than a bare KClass.
             if let Some(v) = self.globals.borrow().lookup(name)
-                && matches!(v, klio_runtime::Value::Instance(_)) {
-                    return Ok(v);
-                }
+                && matches!(v, klio_runtime::Value::Instance(_))
+            {
+                return Ok(v);
+            }
             // Nested-class access on a class receiver: `Outer.Inner`
             // and `Sealed.Variant` resolve through the module's
             // global class table.
@@ -273,12 +293,9 @@ impl VmHost<'_> {
         // itself and recurses forever. Skip the extension lookup when
         // the receiver's class hierarchy declares a member getter for
         // this name.
-        let member_getter_shadows = if let klio_runtime::Value::Instance(i) =
-            receiver
-        {
+        let member_getter_shadows = if let klio_runtime::Value::Instance(i) = receiver {
             let mut cur = Some(i.borrow().class.name.clone());
-            let mut seen: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut found = false;
             while let Some(cn) = cur.take() {
                 if !seen.insert(cn.clone()) {
@@ -347,9 +364,7 @@ impl VmHost<'_> {
                             {
                                 return Some(fid);
                             }
-                            if let Some(def) =
-                                self.classes.borrow().get(&sup).cloned()
-                            {
+                            if let Some(def) = self.classes.borrow().get(&sup).cloned() {
                                 for s in &def.supertype_names {
                                     queue.push_back(s.clone());
                                 }
@@ -365,12 +380,17 @@ impl VmHost<'_> {
                         .copied()
                 });
             if let Some(fid) = ext_fid {
-                let func = self.module.funcs.get(fid.0 as usize).cloned().ok_or_else(|| {
-                    klio_ir::eval::EvalError::Type(format!(
-                        "extension prop FuncId {} out of range",
-                        fid.0
-                    ))
-                })?;
+                let func = self
+                    .module
+                    .funcs
+                    .get(fid.0 as usize)
+                    .cloned()
+                    .ok_or_else(|| {
+                        klio_ir::eval::EvalError::Type(format!(
+                            "extension prop FuncId {} out of range",
+                            fid.0
+                        ))
+                    })?;
                 let module = Arc::clone(&self.module);
                 return klio_ir::eval::eval_with(&module, &func, vec![receiver.clone()], self);
             }
@@ -394,7 +414,11 @@ impl VmHost<'_> {
                 }
                 "isCompanion" => {
                     return Ok(klio_runtime::Value::Bool(
-                        self.module.registry.companion_singletons.values().any(|v| v == &cls.name),
+                        self.module
+                            .registry
+                            .companion_singletons
+                            .values()
+                            .any(|v| v == &cls.name),
                     ));
                 }
                 "isInner" => return Ok(klio_runtime::Value::Bool(cls.is_inner)),
@@ -402,13 +426,19 @@ impl VmHost<'_> {
                 "isFun" => return Ok(klio_runtime::Value::Bool(cls.is_fun_interface)),
                 "objectInstance" => {
                     if cls.is_object
-                        && let Some(v) = self.globals.borrow().lookup(&cls.name) {
-                            return Ok(v);
-                        }
+                        && let Some(v) = self.globals.borrow().lookup(&cls.name)
+                    {
+                        return Ok(v);
+                    }
                     return Ok(klio_runtime::Value::Null);
                 }
-                "members" | "declaredMembers" | "functions" | "declaredFunctions"
-                | "memberFunctions" | "memberProperties" | "declaredMemberProperties" => {
+                "members"
+                | "declaredMembers"
+                | "functions"
+                | "declaredFunctions"
+                | "memberFunctions"
+                | "memberProperties"
+                | "declaredMemberProperties" => {
                     let mut items: Vec<klio_runtime::Value> = Vec::new();
                     for fid in self
                         .module
@@ -439,7 +469,8 @@ impl VmHost<'_> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: None, backing: None,
+                        enum_class: None,
+                        backing: None,
                     });
                 }
                 "supertypes" => {
@@ -457,7 +488,8 @@ impl VmHost<'_> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: None, backing: None,
+                        enum_class: None,
+                        backing: None,
                     });
                 }
                 "sealedSubclasses" => {
@@ -471,7 +503,8 @@ impl VmHost<'_> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: None, backing: None,
+                        enum_class: None,
+                        backing: None,
                     });
                 }
                 _ => {}
@@ -500,13 +533,9 @@ impl VmHost<'_> {
                             if !is_lateinit {
                                 continue;
                             }
-                            let initialised = b
-                                .fields
-                                .iter()
-                                .any(|(n, v)| {
-                                    n == &prop_name
-                                        && !matches!(v, klio_runtime::Value::Null)
-                                });
+                            let initialised = b.fields.iter().any(|(n, v)| {
+                                n == &prop_name && !matches!(v, klio_runtime::Value::Null)
+                            });
                             return Ok(klio_runtime::Value::Bool(initialised));
                         }
                     }
@@ -519,8 +548,8 @@ impl VmHost<'_> {
         // `lastIndex` / `indices` on arrays + lists + strings.
         if name == "lastIndex" {
             let len_opt: Option<i64> = match receiver {
-                klio_runtime::Value::Array { items, .. } => Some(items.borrow().len() as i64),
-                klio_runtime::Value::List { items, .. } => Some(items.borrow().len() as i64),
+                klio_runtime::Value::Array { items, .. }
+                | klio_runtime::Value::List { items, .. } => Some(items.borrow().len() as i64),
                 klio_runtime::Value::String(s) => Some(s.encode_utf16().count() as i64),
                 _ => None,
             };
@@ -530,8 +559,8 @@ impl VmHost<'_> {
         }
         if name == "indices" {
             let len_opt: Option<i64> = match receiver {
-                klio_runtime::Value::Array { items, .. } => Some(items.borrow().len() as i64),
-                klio_runtime::Value::List { items, .. } => Some(items.borrow().len() as i64),
+                klio_runtime::Value::Array { items, .. }
+                | klio_runtime::Value::List { items, .. } => Some(items.borrow().len() as i64),
                 klio_runtime::Value::String(s) => Some(s.encode_utf16().count() as i64),
                 _ => None,
             };
@@ -547,13 +576,9 @@ impl VmHost<'_> {
         // `size` on arrays + collections.
         if name == "size" {
             match receiver {
-                klio_runtime::Value::Array { items, .. } => {
-                    return Ok(klio_runtime::Value::new_int(items.borrow().len() as i64));
-                }
-                klio_runtime::Value::List { items, .. } => {
-                    return Ok(klio_runtime::Value::new_int(items.borrow().len() as i64));
-                }
-                klio_runtime::Value::Set { items, .. } => {
+                klio_runtime::Value::Array { items, .. }
+                | klio_runtime::Value::List { items, .. }
+                | klio_runtime::Value::Set { items, .. } => {
                     return Ok(klio_runtime::Value::new_int(items.borrow().len() as i64));
                 }
                 klio_runtime::Value::Map { entries, .. } => {
@@ -573,8 +598,7 @@ impl VmHost<'_> {
             let delegate_owner: Option<String> = {
                 let mut owner: Option<String> = None;
                 let mut cur = Some(class_name.clone());
-                let mut seen: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 while let Some(cn) = cur.take() {
                     if !seen.insert(cn.clone()) {
                         break;
@@ -702,8 +726,7 @@ impl VmHost<'_> {
                         return Err(klio_ir::eval::EvalError::Throw(
                             klio_runtime::Value::Exception {
                                 fqn: Arc::new(
-                                    "kotlin.UninitializedPropertyAccessException"
-                                        .to_string(),
+                                    "kotlin.UninitializedPropertyAccessException".to_string(),
                                 ),
                                 message: Some(Arc::new(format!(
                                     "lateinit property {name} has not been initialized"
@@ -723,9 +746,8 @@ impl VmHost<'_> {
                             if let Some(c) = cached {
                                 return Ok(c);
                             }
-                            let result = <Self as klio_ir::eval::Host>::call_value(
-                                self, &producer, &[],
-                            )?;
+                            let result =
+                                <Self as klio_ir::eval::Host>::call_value(self, &producer, &[])?;
                             if let klio_runtime::DelegateKind::Lazy { cached, .. } =
                                 &mut *d.borrow_mut()
                             {
@@ -741,9 +763,7 @@ impl VmHost<'_> {
                                 Some(x) => Ok(x),
                                 None => Err(klio_ir::eval::EvalError::Throw(
                                     klio_runtime::Value::Exception {
-                                        fqn: Arc::new(
-                                            "kotlin.IllegalStateException".into(),
-                                        ),
+                                        fqn: Arc::new("kotlin.IllegalStateException".into()),
                                         message: Some(Arc::new(format!(
                                             "Property {name} should be initialized before get."
                                         ))),
@@ -761,21 +781,26 @@ impl VmHost<'_> {
             // methods referencing companion members lower as
             // `this.X`, which lands here after the instance's own
             // fields miss.
-            let mut queue: Vec<Arc<klio_runtime::ClassDef>> =
-                vec![inst.borrow().class.clone()];
-            let mut visited: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut queue: Vec<Arc<klio_runtime::ClassDef>> = vec![inst.borrow().class.clone()];
+            let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
             while let Some(c) = queue.pop() {
                 if !visited.insert(c.name.clone()) {
                     continue;
                 }
-                if let Some(comp_name) = self.module.registry.companion_singletons.get(&c.name).cloned() {
+                if let Some(comp_name) = self
+                    .module
+                    .registry
+                    .companion_singletons
+                    .get(&c.name)
+                    .cloned()
+                {
                     let singleton = self.globals.borrow().lookup(&comp_name);
                     if let Some(singleton) = singleton
                         && let klio_runtime::Value::Instance(cinst) = &singleton
-                            && let Some(v) = cinst.borrow().get(name) {
-                                return Ok(v);
-                            }
+                        && let Some(v) = cinst.borrow().get(name)
+                    {
+                        return Ok(v);
+                    }
                 }
                 if let Some(p) = c.parent.borrow().clone() {
                     queue.push(p);
@@ -806,17 +831,14 @@ impl VmHost<'_> {
                         // and only resolves through the outer's
                         // getter — bounded by the identity+name guard
                         // so mutually-forwarding instances cannot loop.
-                        let oid =
-                            klio_runtime::ObjRef::as_ptr(outer_inst) as usize;
-                        if let Some(Ok(v)) = with_field_resolve_pair(
-                            oid,
-                            name,
-                            || self.get_field(&o, name),
-                        )
-                            && !matches!(v, klio_runtime::Value::Unit) {
-                                return Ok(v);
-                            }
-                        cur_outer = outer_inst.borrow().outer.clone();
+                        let oid = klio_runtime::ObjRef::as_ptr(outer_inst) as usize;
+                        if let Some(Ok(v)) =
+                            with_field_resolve_pair(oid, name, || self.get_field(&o, name))
+                            && !matches!(v, klio_runtime::Value::Unit)
+                        {
+                            return Ok(v);
+                        }
+                        cur_outer.clone_from(&outer_inst.borrow().outer);
                     }
                     klio_runtime::Value::Class(cls) => {
                         if let Ok(v) = self.get_field(&o, name) {
@@ -826,7 +848,9 @@ impl VmHost<'_> {
                         // companions chain `Inner` → `Outer` so
                         // bare-name lookups for outer companion
                         // statics resolve.
-                        cur_outer = self.module.registry
+                        cur_outer = self
+                            .module
+                            .registry
                             .enclosing_class
                             .get(&cls.name)
                             .cloned()
@@ -859,7 +883,8 @@ impl VmHost<'_> {
                     return Ok(klio_runtime::Value::List {
                         items: klio_runtime::ObjRef::new(items),
                         mutable: false,
-                        enum_class: Some(Arc::new(class_def.name.clone())), backing: None,
+                        enum_class: Some(Arc::new(class_def.name.clone())),
+                        backing: None,
                     });
                 }
             }
@@ -912,9 +937,10 @@ impl VmHost<'_> {
                 .collect();
             for d in delegates {
                 if let Ok(v) = self.get_field(&d, name)
-                    && !matches!(v, klio_runtime::Value::Unit) {
-                        return Ok(v);
-                    }
+                    && !matches!(v, klio_runtime::Value::Unit)
+                {
+                    return Ok(v);
+                }
             }
         }
         // `Long.MAX_VALUE` / `Int.SIZE_BITS` / `Double.NaN` where the
@@ -938,15 +964,13 @@ impl VmHost<'_> {
         // the normal field/getter path; re-forwarding here would
         // recurse into the same instance.
         if let klio_runtime::Value::Instance(inst) = receiver {
-            let is_companion_recv =
-                inst.borrow().class.name.contains("$Companion$");
+            let is_companion_recv = inst.borrow().class.name.contains("$Companion$");
             let mut cur = if is_companion_recv {
                 None
             } else {
                 Some(inst.borrow().class.name.clone())
             };
-            let mut seen: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             while let Some(cname) = cur.take() {
                 if !seen.insert(cname.clone()) {
                     break;
@@ -959,12 +983,12 @@ impl VmHost<'_> {
                     .cloned();
                 if let Some(comp_name) = comp_name {
                     let singleton = self.globals.borrow().lookup(&comp_name);
-                    if let Some(singleton @ klio_runtime::Value::Instance(_)) =
-                        singleton
+                    if let Some(singleton @ klio_runtime::Value::Instance(_)) = singleton
                         && let Ok(v) = self.get_field(&singleton, name)
-                            && !matches!(v, klio_runtime::Value::Unit) {
-                                return Ok(v);
-                            }
+                        && !matches!(v, klio_runtime::Value::Unit)
+                    {
+                        return Ok(v);
+                    }
                 }
                 let next = self
                     .classes
@@ -1017,17 +1041,15 @@ impl VmHost<'_> {
             );
             if !same && !matches!(outer, klio_runtime::Value::Null | klio_runtime::Value::Unit) {
                 let oid = match &outer {
-                    klio_runtime::Value::Instance(i) => {
-                        klio_runtime::ObjRef::as_ptr(i) as usize
-                    }
+                    klio_runtime::Value::Instance(i) => klio_runtime::ObjRef::as_ptr(i) as usize,
                     _ => 0,
                 };
-                if let Some(Ok(v)) = with_field_resolve_pair(oid, name, || {
-                    self.get_field(&outer, name)
-                })
-                    && !matches!(v, klio_runtime::Value::Unit) {
-                        return Ok(v);
-                    }
+                if let Some(Ok(v)) =
+                    with_field_resolve_pair(oid, name, || self.get_field(&outer, name))
+                    && !matches!(v, klio_runtime::Value::Unit)
+                {
+                    return Ok(v);
+                }
             }
         }
         // Inner-class outer-chain fallback: a bare member property
@@ -1047,9 +1069,10 @@ impl VmHost<'_> {
                     break;
                 }
                 if let Ok(v) = self.get_field(&o, name)
-                    && !matches!(v, klio_runtime::Value::Unit) {
-                        return Some(v);
-                    }
+                    && !matches!(v, klio_runtime::Value::Unit)
+                {
+                    return Some(v);
+                }
                 cur = match &o {
                     klio_runtime::Value::Instance(i) => i.borrow().outer.clone(),
                     _ => None,
@@ -1067,15 +1090,20 @@ impl VmHost<'_> {
         // reading the member from there.
         if let klio_runtime::Value::Instance(inst) = receiver {
             let cls_name = inst.borrow().class.name.clone();
-            if let Some(comp_name) =
-                self.module.registry.companion_singletons.get(&cls_name).cloned()
+            if let Some(comp_name) = self
+                .module
+                .registry
+                .companion_singletons
+                .get(&cls_name)
+                .cloned()
             {
                 let comp = self.globals.borrow().lookup(&comp_name);
                 if let Some(comp) = comp
                     && !matches!(&comp, klio_runtime::Value::Instance(c) if klio_runtime::ObjRef::ptr_eq(c, inst))
-                        && let Ok(v) = self.get_field(&comp, name) {
-                            return Ok(v);
-                        }
+                    && let Ok(v) = self.get_field(&comp, name)
+                {
+                    return Ok(v);
+                }
             }
         }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
@@ -1084,6 +1112,10 @@ impl VmHost<'_> {
         )))
     }
 
+    // One ordered setter-resolution chain (ext setter, delegate, custom
+    // setter, companion/parent walk, raw slot); splitting it would fragment
+    // the fallthrough across the receiver's borrow scopes.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn set_field(
         &mut self,
         receiver: &klio_runtime::Value,
@@ -1093,13 +1125,20 @@ impl VmHost<'_> {
         // Companion forwarding for writes: `Foo.count = 1` routes
         // to the companion singleton instance's field.
         if let klio_runtime::Value::Class(cls) = receiver
-            && let Some(comp_name) = self.module.registry.companion_singletons.get(&cls.name).cloned() {
-                let singleton = self.globals.borrow().lookup(&comp_name);
-                if let Some(singleton) = singleton
-                    && let klio_runtime::Value::Instance(_) = &singleton {
-                        return self.set_field(&singleton, name, value);
-                    }
+            && let Some(comp_name) = self
+                .module
+                .registry
+                .companion_singletons
+                .get(&cls.name)
+                .cloned()
+        {
+            let singleton = self.globals.borrow().lookup(&comp_name);
+            if let Some(singleton) = singleton
+                && let klio_runtime::Value::Instance(_) = &singleton
+            {
+                return self.set_field(&singleton, name, value);
             }
+        }
         let bypass_setter = name.starts_with("__klio_field__");
         let real_name = name.strip_prefix("__klio_field__").unwrap_or(name);
         // Extension-property setter — `var T.x: ... set(value) {…}`
@@ -1112,7 +1151,8 @@ impl VmHost<'_> {
                     f.rsplit('.').next().unwrap_or(f).to_string()
                 }
             };
-            if let Some(fid) = self.prog
+            if let Some(fid) = self
+                .prog
                 .extension_prop_setters
                 .get(&(recv_simple, real_name.to_string()))
                 .copied()
@@ -1129,19 +1169,16 @@ impl VmHost<'_> {
                         ))
                     })?;
                 let module = Arc::clone(&self.module);
-                klio_ir::eval::eval_with(
-                    &module,
-                    &func,
-                    vec![receiver.clone(), value],
-                    self,
-                )?;
+                klio_ir::eval::eval_with(&module, &func, vec![receiver.clone(), value], self)?;
                 return Ok(());
             }
         }
         if let klio_runtime::Value::Instance(inst) = receiver {
             if !bypass_setter {
                 let class_name = inst.borrow().class.name.clone();
-                if self.module.registry
+                if self
+                    .module
+                    .registry
                     .delegated_body_props
                     .contains(&(class_name.clone(), real_name.to_string()))
                 {
@@ -1159,7 +1196,8 @@ impl VmHost<'_> {
                         return Ok(());
                     }
                 }
-                if let Some(fid) = self.prog
+                if let Some(fid) = self
+                    .prog
                     .instance_prop_setters
                     .get(&(class_name, real_name.to_string()))
                     .copied()
@@ -1176,12 +1214,7 @@ impl VmHost<'_> {
                             ))
                         })?;
                     let module = Arc::clone(&self.module);
-                    klio_ir::eval::eval_with(
-                        &module,
-                        &func,
-                        vec![receiver.clone(), value],
-                        self,
-                    )?;
+                    klio_ir::eval::eval_with(&module, &func, vec![receiver.clone(), value], self)?;
                     return Ok(());
                 }
             }
@@ -1210,15 +1243,20 @@ impl VmHost<'_> {
                         if !visited.insert(c.name.clone()) {
                             continue;
                         }
-                        if let Some(comp_name) =
-                            self.module.registry.companion_singletons.get(&c.name).cloned()
+                        if let Some(comp_name) = self
+                            .module
+                            .registry
+                            .companion_singletons
+                            .get(&c.name)
+                            .cloned()
                         {
                             let singleton = self.globals.borrow().lookup(&comp_name);
                             if let Some(singleton) = singleton
                                 && let klio_runtime::Value::Instance(cinst) = &singleton
-                                    && cinst.borrow().get(real_name).is_some() {
-                                        return self.set_field(&singleton, real_name, value);
-                                    }
+                                && cinst.borrow().get(real_name).is_some()
+                            {
+                                return self.set_field(&singleton, real_name, value);
+                            }
                         }
                         if let Some(p) = c.parent.borrow().clone() {
                             queue.push(p);
@@ -1242,6 +1280,9 @@ impl VmHost<'_> {
         )))
     }
 
+    // Result kept for symmetry with the other Host field-resolution methods
+    // and the call sites that `?`-propagate them.
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn member_ref(
         &mut self,
         receiver: &klio_runtime::Value,
@@ -1262,7 +1303,10 @@ impl VmHost<'_> {
         // invoked, dispatches `recv.method(args)`. We synthesise a
         // tiny Instance whose `__bound_receiver__` + `__bound_name__`
         // fields drive the call_value path below.
-        let identity = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        let identity = self
+            .instance_id_counter
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
         let synth_class = Arc::new(klio_runtime::ClassDef {
             name: format!("$bound_ref${name}"),
             fqn: format!("$bound_ref${name}"),

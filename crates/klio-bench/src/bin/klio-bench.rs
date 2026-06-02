@@ -17,14 +17,26 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use klio_bench::schema::{BenchRecord, BenchReport, RegressionLevel, diff};
-use klio_bench::{collect_kt, corpus_root, time_pipeline_stages, Program};
+use klio_bench::{Program, collect_kt, corpus_root, time_pipeline_stages};
 
 #[cfg(feature = "dhat")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+struct Args {
+    full: bool,
+    json_only: bool,
+    diff_path: Option<PathBuf>,
+    out_path: Option<PathBuf>,
+    filter: Option<String>,
+}
+
+enum ParsedArgs {
+    Ok(Args),
+    Exit(ExitCode),
+}
+
+fn parse_args(args: &[String]) -> ParsedArgs {
     let mut full = false;
     let mut json_only = false;
     let mut diff_path: Option<PathBuf> = None;
@@ -48,22 +60,93 @@ fn main() -> ExitCode {
                 filter = args.get(i).cloned();
             }
             "-h" | "--help" => {
-                eprintln!("klio-bench [--full] [--json] [--filter substr] [--out file] [--diff baseline.json]");
-                return ExitCode::SUCCESS;
+                eprintln!(
+                    "klio-bench [--full] [--json] [--filter substr] [--out file] [--diff baseline.json]"
+                );
+                return ParsedArgs::Exit(ExitCode::SUCCESS);
             }
             other => {
                 eprintln!("unknown arg: {other}");
-                return ExitCode::from(2);
+                return ParsedArgs::Exit(ExitCode::from(2));
             }
         }
         i += 1;
     }
+    ParsedArgs::Ok(Args {
+        full,
+        json_only,
+        diff_path,
+        out_path,
+        filter,
+    })
+}
+
+fn report_diff(base_path: &std::path::Path, report: &BenchReport) -> Option<ExitCode> {
+    match fs::read_to_string(base_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<BenchReport>(&s).ok())
+    {
+        None => {
+            eprintln!(
+                "[bench] baseline {} unreadable; skipping diff",
+                base_path.display()
+            );
+        }
+        Some(b) => {
+            let rows = diff(&b, report);
+            let mut red = 0;
+            let mut yellow = 0;
+            for r in &rows {
+                let tag = match r.level {
+                    RegressionLevel::Green => " ok",
+                    RegressionLevel::Yellow => {
+                        yellow += 1;
+                        "yel"
+                    }
+                    RegressionLevel::Red => {
+                        red += 1;
+                        "RED"
+                    }
+                };
+                eprintln!(
+                    "[{tag}] {:>8} {:<40} {:>10} ns  ({:+.1}%)",
+                    r.stage,
+                    r.workload,
+                    r.cur_ns,
+                    (r.ratio - 1.0) * 100.0,
+                );
+            }
+            eprintln!("[bench] {red} red, {yellow} yellow, {} total", rows.len());
+            if red > 0 {
+                return Some(ExitCode::from(1));
+            }
+        }
+    }
+    None
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let Args {
+        full,
+        json_only,
+        diff_path,
+        out_path,
+        filter,
+    } = match parse_args(&args) {
+        ParsedArgs::Ok(a) => a,
+        ParsedArgs::Exit(code) => return code,
+    };
 
     #[cfg(feature = "dhat")]
     let _dhat = dhat::Profiler::new_heap();
 
     let files = collect_kt(&corpus_root());
-    let budget = if full { Duration::from_millis(1500) } else { Duration::from_millis(250) };
+    let budget = if full {
+        Duration::from_millis(1500)
+    } else {
+        Duration::from_millis(250)
+    };
     let mut records = Vec::new();
     for path in files {
         let prog = match Program::load(path.clone()) {
@@ -74,7 +157,9 @@ fn main() -> ExitCode {
             }
         };
         let label = prog.label();
-        if let Some(f) = &filter && !label.contains(f) {
+        if let Some(f) = &filter
+            && !label.contains(f)
+        {
             continue;
         }
         if !json_only {
@@ -130,35 +215,10 @@ fn main() -> ExitCode {
         println!("{json}");
     }
 
-    if let Some(base) = diff_path {
-        match fs::read_to_string(&base).ok().and_then(|s| serde_json::from_str::<BenchReport>(&s).ok()) {
-            None => {
-                eprintln!("[bench] baseline {} unreadable; skipping diff", base.display());
-            }
-            Some(b) => {
-                let rows = diff(&b, &report);
-                let mut red = 0;
-                let mut yellow = 0;
-                for r in &rows {
-                    let tag = match r.level {
-                        RegressionLevel::Green => " ok",
-                        RegressionLevel::Yellow => { yellow += 1; "yel" }
-                        RegressionLevel::Red => { red += 1; "RED" }
-                    };
-                    eprintln!(
-                        "[{tag}] {:>8} {:<40} {:>10} ns  ({:+.1}%)",
-                        r.stage,
-                        r.workload,
-                        r.cur_ns,
-                        (r.ratio - 1.0) * 100.0,
-                    );
-                }
-                eprintln!("[bench] {red} red, {yellow} yellow, {} total", rows.len());
-                if red > 0 {
-                    return ExitCode::from(1);
-                }
-            }
-        }
+    if let Some(base) = diff_path
+        && let Some(code) = report_diff(&base, &report)
+    {
+        return code;
     }
 
     ExitCode::SUCCESS

@@ -264,7 +264,7 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, crate::PackE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{section_names, PackReader, PackWriter};
+    use crate::{PackReader, PackWriter, section_names};
 
     #[test]
     fn manifest_round_trip_through_pack() {
@@ -272,10 +272,7 @@ mod tests {
             library_id: "stdlib".into(),
             library_version: "0.1.0".into(),
             abi_version: 1,
-            implicit_packages: vec![
-                "kotlin".into(),
-                "kotlin.collections".into(),
-            ],
+            implicit_packages: vec!["kotlin".into(), "kotlin.collections".into()],
             dependencies: vec![],
         };
         let bytes = encode(&manifest).unwrap();
@@ -284,7 +281,10 @@ mod tests {
         let pack = w.finish().unwrap();
 
         let reader = PackReader::from_bytes(pack).unwrap();
-        let payload = reader.read_section(section_names::MANIFEST).unwrap().unwrap();
+        let payload = reader
+            .read_section(section_names::MANIFEST)
+            .unwrap()
+            .unwrap();
         let decoded: PackManifest = decode(&payload).unwrap();
         assert_eq!(decoded, manifest);
     }

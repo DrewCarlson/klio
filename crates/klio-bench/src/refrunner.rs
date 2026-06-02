@@ -30,23 +30,32 @@ impl std::fmt::Display for RefError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Install(s) => write!(f, "install: {s}"),
             Self::Compile(s) => write!(f, "compile: {s}"),
-            Self::NoJava => write!(f, "java not found on PATH (required to run JVM kotlinc); set JAVA_HOME or install a JDK"),
+            Self::NoJava => write!(
+                f,
+                "java not found on PATH (required to run JVM kotlinc); set JAVA_HOME or install a JDK"
+            ),
             Self::Disabled(s) => write!(f, "ref runner disabled: {s}"),
         }
     }
 }
 
 impl From<std::io::Error> for RefError {
-    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 
 fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().and_then(|p| p.parent())
-        .map(PathBuf::from).expect("workspace root")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .expect("workspace root")
 }
 
 fn bench_cache_dir() -> PathBuf {
-    let target = env::var_os("CARGO_TARGET_DIR").map_or_else(|| workspace_root().join("target"), PathBuf::from);
+    let target = env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace_root().join("target"), PathBuf::from);
     target.join("bench-cache")
 }
 
@@ -119,14 +128,17 @@ fn kotlinc_jvm_root() -> Result<PathBuf, RefError> {
 }
 
 fn kotlinc_jvm_filename() -> &'static str {
-    if cfg!(windows) { "kotlinc.bat" } else { "kotlinc" }
+    if cfg!(windows) {
+        "kotlinc.bat"
+    } else {
+        "kotlinc"
+    }
 }
 
 fn install_kotlinc_jvm(version: &str, cache: &Path, dest: &Path) -> Result<(), RefError> {
     let archive_name = format!("kotlin-compiler-{version}.zip");
-    let url = format!(
-        "https://github.com/JetBrains/kotlin/releases/download/v{version}/{archive_name}"
-    );
+    let url =
+        format!("https://github.com/JetBrains/kotlin/releases/download/v{version}/{archive_name}");
     let archive_path = cache.join(&archive_name);
     eprintln!("[bench] downloading {url}");
     let tmp = archive_path.with_extension("part");
@@ -185,7 +197,10 @@ fn install_kotlinc_jvm(version: &str, cache: &Path, dest: &Path) -> Result<(), R
 
 fn locate_java() -> Result<PathBuf, RefError> {
     if let Ok(home) = env::var("JAVA_HOME") {
-        let p = PathBuf::from(home).join("bin").join(if cfg!(windows) { "java.exe" } else { "java" });
+        let p =
+            PathBuf::from(home)
+                .join("bin")
+                .join(if cfg!(windows) { "java.exe" } else { "java" });
         if p.is_file() {
             return Ok(p);
         }

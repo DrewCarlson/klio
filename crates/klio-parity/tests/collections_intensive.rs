@@ -34,7 +34,7 @@ fun main() {
 }
 
 #[test]
-fn associate_associateBy_associateWith() {
+fn associate_associate_by_associate_with() {
     let src = r#"
 fun main() {
     val xs = listOf("ant", "bee", "cat")
@@ -73,11 +73,15 @@ fun main() {
     println("$w|$c")
 }
 "#;
-    assert_klio("win_chunked", src, "[[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]]|[[1, 2], [3, 4], [5, 6]]\n");
+    assert_klio(
+        "win_chunked",
+        src,
+        "[[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]]|[[1, 2], [3, 4], [5, 6]]\n",
+    );
 }
 
 #[test]
-fn sortedBy_descending() {
+fn sorted_by_descending() {
     let src = r#"
 fun main() {
     data class P(val name: String, val age: Int)
@@ -115,11 +119,15 @@ fun main() {
     println("$xs|$unique")
 }
 "#;
-    assert_klio("mut_ops", src, "[1, 1, 2, 3, 4, 5, 6, 9]|[1, 2, 3, 4, 5, 6, 9]\n");
+    assert_klio(
+        "mut_ops",
+        src,
+        "[1, 1, 2, 3, 4, 5, 6, 9]|[1, 2, 3, 4, 5, 6, 9]\n",
+    );
 }
 
 #[test]
-fn maxBy_minBy_byKey() {
+fn max_by_min_by_by_key() {
     let src = r#"
 fun main() {
     val xs = listOf("ant", "elephant", "bear", "wolf")

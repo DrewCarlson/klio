@@ -48,7 +48,7 @@ fun main() {
 }
 
 #[test]
-fn nullable_chain_let_and_takeIf() {
+fn nullable_chain_let_and_take_if() {
     let src = r#"
 fun classify(n: Int?): String =
     n?.takeIf { it > 0 }?.let { "+$it" } ?: "n/a"

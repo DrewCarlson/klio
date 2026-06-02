@@ -1,8 +1,11 @@
-use super::{CallCtx, Value, RuntimeError};
+use super::{CallCtx, RuntimeError, Value};
 
 /// Wall-clock time in milliseconds since the Unix epoch. Backs the
 /// `systemClockNow()` / `serializedInstant` klio `actual`s for the
 /// upstream `kotlin.time` commonMain `Clock.System` / `Instant`.
+// Epoch milliseconds is a Kotlin Long; the Result signature matches the
+// builtin handler function-pointer table.
+#[allow(clippy::cast_possible_truncation, clippy::unnecessary_wraps)]
 pub(crate) fn time_system_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -14,6 +17,8 @@ pub(crate) fn time_system_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeErr
 /// differences between readings are meaningful; the upstream
 /// `MonotonicTimeSource` actual fixes a "zero" on first read. Backs
 /// `TimeSource.Monotonic` / `markNow()`.
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn time_monotonic_nanos(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     use std::sync::OnceLock;
     use std::time::Instant;

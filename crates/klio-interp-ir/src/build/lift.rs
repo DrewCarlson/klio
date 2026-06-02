@@ -1,4 +1,4 @@
-use super::{Expr, Ident, Decl};
+use super::{Decl, Expr, Ident};
 
 /// Replace every bare `field` identifier in `expr` with
 /// `this.<prop_name>`. Used by accessor-body lowering so the IR
@@ -14,22 +14,30 @@ pub(crate) fn substitute_field_with_this(prop_name: &str, expr: &Expr) -> Expr {
 pub(crate) fn walk_field(e: &mut Expr, prop: &str, dummy: klio_span::Span) {
     let mut replace = None;
     if let Expr::Path { segments, .. } = e
-        && segments.len() == 1 && segments[0].name == "field" {
-            // Rewrite the raw `field` reference to a synthetic member
-            // access on `this` that names the backing slot. Vm
-            // get_field / set_field detect the `__klio_field__`
-            // prefix and skip the custom-getter/setter dispatch.
-            let backing = format!("__klio_field__{prop}");
-            replace = Some(Expr::Member {
-                receiver: Box::new(Expr::Path {
-                    segments: vec![Ident { name: "this".into(), span: dummy }],
+        && segments.len() == 1
+        && segments[0].name == "field"
+    {
+        // Rewrite the raw `field` reference to a synthetic member
+        // access on `this` that names the backing slot. Vm
+        // get_field / set_field detect the `__klio_field__`
+        // prefix and skip the custom-getter/setter dispatch.
+        let backing = format!("__klio_field__{prop}");
+        replace = Some(Expr::Member {
+            receiver: Box::new(Expr::Path {
+                segments: vec![Ident {
+                    name: "this".into(),
                     span: dummy,
-                }),
-                name: Ident { name: backing, span: dummy },
-                safe: false,
+                }],
                 span: dummy,
-            });
-        }
+            }),
+            name: Ident {
+                name: backing,
+                span: dummy,
+            },
+            safe: false,
+            span: dummy,
+        });
+    }
     if let Some(r) = replace {
         *e = r;
         return;
@@ -46,8 +54,17 @@ pub(crate) fn walk_field(e: &mut Expr, prop: &str, dummy: klio_span::Span) {
             walk_field(lhs, prop, dummy);
             walk_field(rhs, prop, dummy);
         }
-        Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => walk_field(expr, prop, dummy),
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Postfix { expr, .. }
+        | Expr::IsCheck { expr, .. }
+        | Expr::As { expr, .. }
+        | Expr::Spread { expr, .. } => walk_field(expr, prop, dummy),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             walk_field(cond, prop, dummy);
             walk_field(then_branch, prop, dummy);
             if let Some(e) = else_branch.as_deref_mut() {
@@ -85,8 +102,6 @@ pub(crate) fn walk_field(e: &mut Expr, prop: &str, dummy: klio_span::Span) {
             }
         }
         Expr::Throw { value, .. } => walk_field(value, prop, dummy),
-        Expr::IsCheck { expr, .. } | Expr::As { expr, .. } => walk_field(expr, prop, dummy),
-        Expr::Spread { expr, .. } => walk_field(expr, prop, dummy),
         _ => {}
     }
 }
@@ -159,16 +174,16 @@ pub(crate) fn collect_enclosing_member_names(
     s
 }
 
+// Threads several `&mut` accumulators through the recursive lift;
+// bundling them would churn the cross-module caller in build.rs.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn lift_class_recursive(
     c: &klio_ast::Class,
     enclosing_chain: &[klio_ast::Class],
     out_decls: &mut Vec<Decl>,
     object_names: &mut Vec<String>,
     companion_singletons: &mut std::collections::HashMap<String, String>,
-    nested_outer_members: &mut std::collections::HashMap<
-        String,
-        std::collections::HashSet<String>,
-    >,
+    nested_outer_members: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
     enclosing_class: &mut std::collections::HashMap<String, String>,
     nested_object_aliases: &mut std::collections::HashMap<
         String,
@@ -192,8 +207,7 @@ pub(crate) fn lift_class_recursive(
             };
             object_names.push(lifted_name.clone());
             enclosing_class.insert(lifted_name.clone(), c.name.name.clone());
-            let mut extras: std::collections::HashSet<String> =
-                collect_enclosing_member_names(c);
+            let mut extras: std::collections::HashSet<String> = collect_enclosing_member_names(c);
             for outer_c in enclosing_chain.iter().rev() {
                 extras.extend(collect_enclosing_member_names(outer_c));
             }
@@ -214,8 +228,7 @@ pub(crate) fn lift_class_recursive(
             out_decls.push(Decl::Class(synth));
         } else if let Decl::Class(nested) = m {
             if nested.is_companion {
-                let comp_name =
-                    format!("{}$Companion${}", c.name.name, nested.name.name);
+                let comp_name = format!("{}$Companion${}", c.name.name, nested.name.name);
                 let mut renamed = nested.clone();
                 renamed.name = klio_ast::Ident {
                     name: comp_name.clone(),
@@ -289,10 +302,8 @@ pub(crate) fn lift_class_recursive(
                 for outer_c in enclosing_chain.iter().rev() {
                     extras.extend(collect_enclosing_member_names(outer_c));
                 }
-                nested_outer_members
-                    .insert(nested.name.name.clone(), extras);
-                enclosing_class
-                    .insert(nested.name.name.clone(), c.name.name.clone());
+                nested_outer_members.insert(nested.name.name.clone(), extras);
+                enclosing_class.insert(nested.name.name.clone(), c.name.name.clone());
                 let mut next_chain: Vec<klio_ast::Class> = enclosing_chain.to_vec();
                 next_chain.push(c.clone());
                 lift_class_recursive(

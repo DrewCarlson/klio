@@ -11,7 +11,7 @@
 //! Inside `${…}` the lexer returns to the normal mode and tracks brace depth
 //! so nested braces stay balanced.
 
-use klio_diagnostics::{generated::factories as kf, Diagnostic, DiagnosticSink};
+use klio_diagnostics::{Diagnostic, DiagnosticSink, generated::factories as kf};
 use klio_span::{FileId, Span};
 use unicode_xid::UnicodeXID;
 
@@ -42,18 +42,57 @@ pub enum TokenKind {
     Keyword(Keyword),
 
     // Punctuation and operators
-    LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Comma, Semicolon, Colon, ColonColon,
-    AtNoWs, AtPostWs, AtPreWs, AtBothWs,
-    Dot, DotDot, DotDotLess, Arrow, FatArrow,
-    Eq, EqEq, EqEqEq, BangEq, BangEqEq,
-    Lt, Le, Gt, Ge,
-    Plus, Minus, Star, Slash, Percent,
-    PlusEq, MinusEq, StarEq, SlashEq, PercentEq,
-    PlusPlus, MinusMinus,
-    Amp, AmpAmp, Pipe, PipePipe, BangBang,
-    ExclNoWs, ExclWs,
-    QuestNoWs, QuestWs, QuestionDot, QuestionColon,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Comma,
+    Semicolon,
+    Colon,
+    ColonColon,
+    AtNoWs,
+    AtPostWs,
+    AtPreWs,
+    AtBothWs,
+    Dot,
+    DotDot,
+    DotDotLess,
+    Arrow,
+    FatArrow,
+    Eq,
+    EqEq,
+    EqEqEq,
+    BangEq,
+    BangEqEq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    PlusPlus,
+    MinusMinus,
+    Amp,
+    AmpAmp,
+    Pipe,
+    PipePipe,
+    BangBang,
+    ExclNoWs,
+    ExclWs,
+    QuestNoWs,
+    QuestWs,
+    QuestionDot,
+    QuestionColon,
 
     // Reserved / shebang
     Reserved,
@@ -68,7 +107,10 @@ pub enum TokenKind {
 impl TokenKind {
     #[must_use]
     pub fn is_at(&self) -> bool {
-        matches!(self, TokenKind::AtNoWs | TokenKind::AtPostWs | TokenKind::AtPreWs | TokenKind::AtBothWs)
+        matches!(
+            self,
+            TokenKind::AtNoWs | TokenKind::AtPostWs | TokenKind::AtPreWs | TokenKind::AtBothWs
+        )
     }
     #[must_use]
     pub fn is_question(&self) -> bool {
@@ -104,9 +146,32 @@ pub enum FloatSuffix {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyword {
     // Hard keywords (spec §1.4.1)
-    As, Break, Class, Continue, Do, Else, For, Fun, If, In, Interface, Is,
-    Object, Package, Return, Super, This, Throw, Try, Typealias, Typeof,
-    Val, Var, When, While, Import,
+    As,
+    Break,
+    Class,
+    Continue,
+    Do,
+    Else,
+    For,
+    Fun,
+    If,
+    In,
+    Interface,
+    Is,
+    Object,
+    Package,
+    Return,
+    Super,
+    This,
+    Throw,
+    Try,
+    Typealias,
+    Typeof,
+    Val,
+    Var,
+    When,
+    While,
+    Import,
 }
 
 impl Keyword {
@@ -188,34 +253,33 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn tokenize(mut self) -> LexResult {
         let mut tokens = Vec::new();
         loop {
             match self.current_mode() {
                 Mode::Normal | Mode::Interp { .. } => {
-                    if let Some(tok) = self.next_normal_token(&mut tokens) {
-                        match tok.kind {
-                            TokenKind::Whitespace
-                            | TokenKind::LineComment
-                            | TokenKind::BlockComment
-                            | TokenKind::ShebangLine => {
-                                self.ws_before = true;
-                            }
-                            TokenKind::Newline => {
-                                self.ws_before = true;
-                                self.nl_before = true;
-                                tokens.push(tok);
-                            }
-                            TokenKind::Eof => {
-                                tokens.push(tok);
-                                break;
-                            }
-                            _ => {
-                                tokens.push(tok);
-                                self.ws_before = false;
-                                self.nl_before = false;
-                            }
+                    let tok = self.next_normal_token();
+                    match tok.kind {
+                        TokenKind::Whitespace
+                        | TokenKind::LineComment
+                        | TokenKind::BlockComment
+                        | TokenKind::ShebangLine => {
+                            self.ws_before = true;
+                        }
+                        TokenKind::Newline => {
+                            self.ws_before = true;
+                            self.nl_before = true;
+                            tokens.push(tok);
+                        }
+                        TokenKind::Eof => {
+                            tokens.push(tok);
+                            break;
+                        }
+                        _ => {
+                            tokens.push(tok);
+                            self.ws_before = false;
+                            self.nl_before = false;
                         }
                     }
                 }
@@ -231,7 +295,10 @@ impl<'src> Lexer<'src> {
                 }
             }
         }
-        LexResult { tokens, diagnostics: self.diagnostics }
+        LexResult {
+            tokens,
+            diagnostics: self.diagnostics,
+        }
     }
 
     fn current_mode(&self) -> Mode {
@@ -248,7 +315,10 @@ impl<'src> Lexer<'src> {
 
     fn bump_char(&mut self) -> Option<char> {
         let c = self.peek_char()?;
-        self.pos += c.len_utf8() as u32;
+        // `len_utf8()` is 1..=4, always within `u32`.
+        #[allow(clippy::cast_possible_truncation)]
+        let len = c.len_utf8() as u32;
+        self.pos += len;
         Some(c)
     }
 
@@ -262,19 +332,27 @@ impl<'src> Lexer<'src> {
 
     // ---------- normal mode ----------
 
-    fn next_normal_token(&mut self, _tokens: &mut Vec<Token>) -> Option<Token> {
+    fn next_normal_token(&mut self) -> Token {
         let start = self.pos;
         let Some(b) = self.peek_byte(0) else {
-            return Some(Token { kind: TokenKind::Eof, span: self.span(start) });
+            return Token {
+                kind: TokenKind::Eof,
+                span: self.span(start),
+            };
         };
 
         // Shebang line at file position 0.
         if start == 0 && b == b'#' && self.peek_byte(1) == Some(b'!') {
             while let Some(c) = self.peek_byte(0) {
-                if c == b'\n' { break; }
+                if c == b'\n' {
+                    break;
+                }
                 self.pos += 1;
             }
-            return Some(Token { kind: TokenKind::ShebangLine, span: self.span(start) });
+            return Token {
+                kind: TokenKind::ShebangLine,
+                span: self.span(start),
+            };
         }
 
         // Trivia.
@@ -282,27 +360,46 @@ impl<'src> Lexer<'src> {
             while matches!(self.peek_byte(0), Some(b' ' | b'\t' | b'\r')) {
                 self.pos += 1;
             }
-            return Some(Token { kind: TokenKind::Whitespace, span: self.span(start) });
+            return Token {
+                kind: TokenKind::Whitespace,
+                span: self.span(start),
+            };
         }
         if b == b'\n' {
             self.pos += 1;
-            return Some(Token { kind: TokenKind::Newline, span: self.span(start) });
+            return Token {
+                kind: TokenKind::Newline,
+                span: self.span(start),
+            };
         }
         if b == b'/' && self.peek_byte(1) == Some(b'/') {
             while let Some(c) = self.peek_byte(0) {
-                if c == b'\n' { break; }
+                if c == b'\n' {
+                    break;
+                }
                 self.pos += 1;
             }
-            return Some(Token { kind: TokenKind::LineComment, span: self.span(start) });
+            return Token {
+                kind: TokenKind::LineComment,
+                span: self.span(start),
+            };
         }
         if b == b'/' && self.peek_byte(1) == Some(b'*') {
             self.pos += 2;
             let mut depth: u32 = 1;
             while depth > 0 {
                 match (self.peek_byte(0), self.peek_byte(1)) {
-                    (Some(b'/'), Some(b'*')) => { self.pos += 2; depth += 1; }
-                    (Some(b'*'), Some(b'/')) => { self.pos += 2; depth -= 1; }
-                    (Some(_), _) => { self.bump_char(); }
+                    (Some(b'/'), Some(b'*')) => {
+                        self.pos += 2;
+                        depth += 1;
+                    }
+                    (Some(b'*'), Some(b'/')) => {
+                        self.pos += 2;
+                        depth -= 1;
+                    }
+                    (Some(_), _) => {
+                        self.bump_char();
+                    }
                     (None, _) => {
                         self.diagnostics.emit(
                             Diagnostic::error("unterminated block comment", self.span(start))
@@ -312,7 +409,10 @@ impl<'src> Lexer<'src> {
                     }
                 }
             }
-            return Some(Token { kind: TokenKind::BlockComment, span: self.span(start) });
+            return Token {
+                kind: TokenKind::BlockComment,
+                span: self.span(start),
+            };
         }
 
         // Strings.
@@ -321,16 +421,22 @@ impl<'src> Lexer<'src> {
             if self.peek_byte(1) == Some(b'"') && self.peek_byte(2) == Some(b'"') {
                 self.pos += 3;
                 self.modes.push(Mode::StringRaw);
-                return Some(Token { kind: TokenKind::StringQuote { triple: true }, span: self.span(start) });
+                return Token {
+                    kind: TokenKind::StringQuote { triple: true },
+                    span: self.span(start),
+                };
             }
             self.pos += 1;
             self.modes.push(Mode::StringRegular);
-            return Some(Token { kind: TokenKind::StringQuote { triple: false }, span: self.span(start) });
+            return Token {
+                kind: TokenKind::StringQuote { triple: false },
+                span: self.span(start),
+            };
         }
 
         // Char literal.
         if b == b'\'' {
-            return Some(self.lex_char_literal(start));
+            return self.lex_char_literal(start);
         }
 
         // Interp mode: track braces so a closing `}` can leave the template.
@@ -338,7 +444,10 @@ impl<'src> Lexer<'src> {
             if b == b'}' && brace_depth == 0 {
                 self.pos += 1;
                 self.modes.pop();
-                return Some(Token { kind: TokenKind::InterpEnd, span: self.span(start) });
+                return Token {
+                    kind: TokenKind::InterpEnd,
+                    span: self.span(start),
+                };
             }
             if b == b'{' {
                 self.bump_interp_brace(1);
@@ -349,41 +458,47 @@ impl<'src> Lexer<'src> {
 
         // Numbers.
         if b.is_ascii_digit() {
-            return Some(self.lex_number(start));
+            return self.lex_number(start);
         }
 
         // Punctuation / operators.
         if let Some(tok) = self.lex_punct(start) {
-            return Some(tok);
+            return tok;
         }
 
         // Backtick-escaped identifier: `…` admits any character except backtick,
         // newline, CR, or NUL. The identifier carries the backticks in its span;
         // the parser strips them when materializing names.
         if b == b'`' {
-            return Some(self.lex_backtick_ident(start));
+            return self.lex_backtick_ident(start);
         }
 
         // Identifiers / keywords. Unicode XID for the start; ASCII fast path first.
         if is_ident_start_byte(b) || self.peek_char().is_some_and(UnicodeXID::is_xid_start) {
-            return Some(self.lex_ident_or_keyword(start));
+            return self.lex_ident_or_keyword(start);
         }
 
         // Unknown.
         self.bump_char();
         self.diagnostics.emit(
-            Diagnostic::error(format!("unexpected character `{}`", self.slice(start)), self.span(start))
-                .with_code("E0021"),
+            Diagnostic::error(
+                format!("unexpected character `{}`", self.slice(start)),
+                self.span(start),
+            )
+            .with_code("E0021"),
         );
-        Some(Token { kind: TokenKind::Unknown, span: self.span(start) })
+        Token {
+            kind: TokenKind::Unknown,
+            span: self.span(start),
+        }
     }
 
     fn bump_interp_brace(&mut self, delta: i32) {
         if let Some(Mode::Interp { brace_depth }) = self.modes.last_mut() {
             if delta > 0 {
-                *brace_depth = brace_depth.saturating_add(delta as u32);
+                *brace_depth = brace_depth.saturating_add(delta.unsigned_abs());
             } else {
-                *brace_depth = brace_depth.saturating_sub((-delta) as u32);
+                *brace_depth = brace_depth.saturating_sub(delta.unsigned_abs());
             }
         }
     }
@@ -411,7 +526,10 @@ impl<'src> Lexer<'src> {
                 Diagnostic::error("unterminated backtick identifier", span).with_code("E0022"),
             );
         }
-        Token { kind: TokenKind::Ident, span }
+        Token {
+            kind: TokenKind::Ident,
+            span,
+        }
     }
 
     fn lex_ident_or_keyword(&mut self, start: u32) -> Token {
@@ -431,7 +549,10 @@ impl<'src> Lexer<'src> {
             "null" => TokenKind::NullLiteral,
             _ => Keyword::from_ident(text).map_or(TokenKind::Ident, TokenKind::Keyword),
         };
-        Token { kind, span: self.span(start) }
+        Token {
+            kind,
+            span: self.span(start),
+        }
     }
 
     // ---------- numbers ----------
@@ -451,8 +572,7 @@ impl<'src> Lexer<'src> {
 
         let mut is_float = false;
         // Fractional part — only if followed by a digit (so `1.toString()` still works).
-        if self.peek_byte(0) == Some(b'.')
-            && self.peek_byte(1).is_some_and(|b| b.is_ascii_digit())
+        if self.peek_byte(0) == Some(b'.') && self.peek_byte(1).is_some_and(|b| b.is_ascii_digit())
         {
             is_float = true;
             self.pos += 1; // consume `.`
@@ -477,20 +597,36 @@ impl<'src> Lexer<'src> {
 
         if is_float {
             let suffix = match self.peek_byte(0) {
-                Some(b'f' | b'F') => { self.pos += 1; FloatSuffix::Float }
+                Some(b'f' | b'F') => {
+                    self.pos += 1;
+                    FloatSuffix::Float
+                }
                 _ => FloatSuffix::None,
             };
-            Token { kind: TokenKind::FloatLiteral { suffix }, span: self.span(start) }
+            Token {
+                kind: TokenKind::FloatLiteral { suffix },
+                span: self.span(start),
+            }
         } else {
             let suffix = self.lex_int_suffix();
-            Token { kind: TokenKind::IntLiteral { base: NumBase::Decimal, suffix }, span: self.span(start) }
+            Token {
+                kind: TokenKind::IntLiteral {
+                    base: NumBase::Decimal,
+                    suffix,
+                },
+                span: self.span(start),
+            }
         }
     }
 
     fn lex_radix_int(&mut self, start: u32, base: NumBase) -> Token {
         self.pos += 2; // 0x / 0b
         let digits_start = self.pos;
-        let radix = match base { NumBase::Hex => 16, NumBase::Binary => 2, NumBase::Decimal => 10 };
+        let radix = match base {
+            NumBase::Hex => 16,
+            NumBase::Binary => 2,
+            NumBase::Decimal => 10,
+        };
         self.eat_digits_with_underscores(radix);
         if self.pos == digits_start {
             self.diagnostics.emit(
@@ -499,12 +635,18 @@ impl<'src> Lexer<'src> {
             );
         }
         let suffix = self.lex_int_suffix();
-        Token { kind: TokenKind::IntLiteral { base, suffix }, span: self.span(start) }
+        Token {
+            kind: TokenKind::IntLiteral { base, suffix },
+            span: self.span(start),
+        }
     }
 
     fn lex_int_suffix(&mut self) -> IntSuffix {
         match self.peek_byte(0) {
-            Some(b'L') => { self.pos += 1; IntSuffix::Long }
+            Some(b'L') => {
+                self.pos += 1;
+                IntSuffix::Long
+            }
             Some(b'u' | b'U') => {
                 self.pos += 1;
                 if self.peek_byte(0) == Some(b'L') {
@@ -530,6 +672,8 @@ impl<'src> Lexer<'src> {
 
     // ---------- char literal ----------
 
+    // `cp` is range-checked to a single UTF-16 code unit before the cast.
+    #[allow(clippy::cast_possible_truncation)]
     fn lex_char_literal(&mut self, start: u32) -> Token {
         self.pos += 1; // opening '
         let ch: u16 = match self.peek_byte(0) {
@@ -537,14 +681,16 @@ impl<'src> Lexer<'src> {
             Some(b'\'') | None => {
                 self.diagnostics.emit(
                     Diagnostic::error("empty character literal", self.span(start))
-                        .with_code("E0040").with_factory(&kf::EMPTY_CHARACTER_LITERAL),
+                        .with_code("E0040")
+                        .with_factory(&kf::EMPTY_CHARACTER_LITERAL),
                 );
                 0xFFFD
             }
             Some(b'\n') => {
                 self.diagnostics.emit(
                     Diagnostic::error("character literal cannot contain newline", self.span(start))
-                        .with_code("E0041").with_factory(&kf::INCORRECT_CHARACTER_LITERAL),
+                        .with_code("E0041")
+                        .with_factory(&kf::INCORRECT_CHARACTER_LITERAL),
                 );
                 0xFFFD
             }
@@ -560,10 +706,12 @@ impl<'src> Lexer<'src> {
                             "character literal must be a single UTF-16 code unit",
                             self.span(start),
                         )
-                        .with_code("E0041").with_factory(&kf::INCORRECT_CHARACTER_LITERAL),
+                        .with_code("E0041")
+                        .with_factory(&kf::INCORRECT_CHARACTER_LITERAL),
                     );
                     0xFFFD
                 } else {
+                    // `cp <= 0xFFFF` here, so it is a single UTF-16 code unit.
                     cp as u16
                 }
             }
@@ -573,10 +721,14 @@ impl<'src> Lexer<'src> {
         } else {
             self.diagnostics.emit(
                 Diagnostic::error("unterminated character literal", self.span(start))
-                    .with_code("E0042").with_factory(&kf::INCORRECT_CHARACTER_LITERAL),
+                    .with_code("E0042")
+                    .with_factory(&kf::INCORRECT_CHARACTER_LITERAL),
             );
         }
-        Token { kind: TokenKind::CharLiteral(ch), span: self.span(start) }
+        Token {
+            kind: TokenKind::CharLiteral(ch),
+            span: self.span(start),
+        }
     }
 
     /// Append one UTF-16 code unit produced by a string escape to the
@@ -590,9 +742,7 @@ impl<'src> Lexer<'src> {
             if self.peek_byte(0) == Some(b'\\') {
                 let lo = self.lex_escape(self.pos);
                 if (0xDC00..=0xDFFF).contains(&lo) {
-                    let c = 0x10000
-                        + ((u32::from(unit) - 0xD800) << 10)
-                        + (u32::from(lo) - 0xDC00);
+                    let c = 0x10000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(lo) - 0xDC00);
                     text.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
                 } else {
                     text.push('\u{FFFD}');
@@ -613,7 +763,9 @@ impl<'src> Lexer<'src> {
         self.pos += 1; // backslash
         let Some(b) = self.peek_byte(0) else {
             self.diagnostics.emit(
-                Diagnostic::error("trailing backslash", self.span(diag_anchor)).with_code("E0050").with_factory(&kf::ILLEGAL_ESCAPE),
+                Diagnostic::error("trailing backslash", self.span(diag_anchor))
+                    .with_code("E0050")
+                    .with_factory(&kf::ILLEGAL_ESCAPE),
             );
             return 0xFFFD;
         };
@@ -635,7 +787,8 @@ impl<'src> Lexer<'src> {
                         format!("invalid escape sequence `\\{}`", b as char),
                         Span::new(self.file, esc_start, self.pos),
                     )
-                    .with_code("E0051").with_factory(&kf::ILLEGAL_ESCAPE),
+                    .with_code("E0051")
+                    .with_factory(&kf::ILLEGAL_ESCAPE),
                 );
                 0xFFFD
             }
@@ -646,6 +799,8 @@ impl<'src> Lexer<'src> {
     /// `0x0000..=0xFFFF` — a single UTF-16 code unit. Surrogates
     /// (`\uD800`..`\uDFFF`) are valid `Char` literals (a Kotlin `Char` is
     /// a code unit, not a scalar), so no scalar-validity check is applied.
+    // Exactly four hex digits, so `value <= 0xFFFF` before the cast.
+    #[allow(clippy::cast_possible_truncation)]
     fn lex_unicode_escape(&mut self, esc_start: u32) -> u16 {
         let mut value: u32 = 0;
         let mut count = 0;
@@ -665,7 +820,8 @@ impl<'src> Lexer<'src> {
                     "expected 4 hex digits after `\\u`",
                     Span::new(self.file, esc_start, self.pos),
                 )
-                .with_code("E0052").with_factory(&kf::ILLEGAL_ESCAPE),
+                .with_code("E0052")
+                .with_factory(&kf::ILLEGAL_ESCAPE),
             );
             return 0xFFFD;
         }
@@ -689,7 +845,10 @@ impl<'src> Lexer<'src> {
         };
         if let Some(k) = three {
             self.pos += 3;
-            return Some(Token { kind: k, span: self.span(start) });
+            return Some(Token {
+                kind: k,
+                span: self.span(start),
+            });
         }
 
         let two = match (b0, b1) {
@@ -718,7 +877,10 @@ impl<'src> Lexer<'src> {
         };
         if let Some(k) = two {
             self.pos += 2;
-            return Some(Token { kind: k, span: self.span(start) });
+            return Some(Token {
+                kind: k,
+                span: self.span(start),
+            });
         }
 
         // WS-sensitive single-char tokens.
@@ -732,17 +894,34 @@ impl<'src> Lexer<'src> {
                 (true, false) => TokenKind::AtPreWs,
                 (true, true) => TokenKind::AtBothWs,
             };
-            return Some(Token { kind, span: self.span(start) });
+            return Some(Token {
+                kind,
+                span: self.span(start),
+            });
         }
         if b0 == b'?' {
             self.pos += 1;
-            let kind = if self.is_quest_excl_ws_after() { TokenKind::QuestWs } else { TokenKind::QuestNoWs };
-            return Some(Token { kind, span: self.span(start) });
+            let kind = if self.is_quest_excl_ws_after() {
+                TokenKind::QuestWs
+            } else {
+                TokenKind::QuestNoWs
+            };
+            return Some(Token {
+                kind,
+                span: self.span(start),
+            });
         }
         if b0 == b'!' {
             self.pos += 1;
-            let kind = if self.is_quest_excl_ws_after() { TokenKind::ExclWs } else { TokenKind::ExclNoWs };
-            return Some(Token { kind, span: self.span(start) });
+            let kind = if self.is_quest_excl_ws_after() {
+                TokenKind::ExclWs
+            } else {
+                TokenKind::ExclNoWs
+            };
+            return Some(Token {
+                kind,
+                span: self.span(start),
+            });
         }
 
         let one = match b0 {
@@ -770,13 +949,15 @@ impl<'src> Lexer<'src> {
             _ => return None,
         };
         self.pos += 1;
-        Some(Token { kind: one, span: self.span(start) })
+        Some(Token {
+            kind: one,
+            span: self.span(start),
+        })
     }
 
     fn is_at_ws_after(&self) -> bool {
         match self.peek_byte(0) {
-            None => true,
-            Some(b' ' | b'\t' | b'\r' | b'\n') => true,
+            None | Some(b' ' | b'\t' | b'\r' | b'\n') => true,
             Some(b'/') => matches!(self.peek_byte(1), Some(b'/' | b'*')),
             _ => false,
         }
@@ -784,14 +965,22 @@ impl<'src> Lexer<'src> {
 
     fn is_quest_excl_ws_after(&self) -> bool {
         match self.peek_byte(0) {
-            None => true,
-            Some(b' ' | b'\t' | b'\r') => true,
+            None | Some(b' ' | b'\t' | b'\r') => true,
             Some(b'/') => matches!(self.peek_byte(1), Some(b'/' | b'*')),
             _ => false,
         }
     }
 
     // ---------- strings ----------
+
+    fn flush_string_text(&self, tokens: &mut Vec<Token>, text: &mut String, segment_start: u32) {
+        if !text.is_empty() {
+            tokens.push(Token {
+                kind: TokenKind::StringText(std::mem::take(text)),
+                span: Span::new(self.file, segment_start, self.pos),
+            });
+        }
+    }
 
     fn lex_string_body(&mut self, tokens: &mut Vec<Token>, raw: bool) {
         let mut text = String::new();
@@ -800,12 +989,7 @@ impl<'src> Lexer<'src> {
         loop {
             let pos = self.pos;
             let Some(b) = self.peek_byte(0) else {
-                if !text.is_empty() {
-                    tokens.push(Token {
-                        kind: TokenKind::StringText(std::mem::take(&mut text)),
-                        span: Span::new(self.file, segment_start, self.pos),
-                    });
-                }
+                self.flush_string_text(tokens, &mut text, segment_start);
                 self.diagnostics.emit(
                     Diagnostic::error("unterminated string literal", self.span(pos))
                         .with_code("E0060"),
@@ -818,12 +1002,7 @@ impl<'src> Lexer<'src> {
             if b == b'"' {
                 if raw {
                     if self.peek_byte(1) == Some(b'"') && self.peek_byte(2) == Some(b'"') {
-                        if !text.is_empty() {
-                            tokens.push(Token {
-                                kind: TokenKind::StringText(std::mem::take(&mut text)),
-                                span: Span::new(self.file, segment_start, self.pos),
-                            });
-                        }
+                        self.flush_string_text(tokens, &mut text, segment_start);
                         self.pos += 3;
                         tokens.push(Token {
                             kind: TokenKind::StringQuote { triple: true },
@@ -836,12 +1015,7 @@ impl<'src> Lexer<'src> {
                     self.pos += 1;
                     continue;
                 }
-                if !text.is_empty() {
-                    tokens.push(Token {
-                        kind: TokenKind::StringText(std::mem::take(&mut text)),
-                        span: Span::new(self.file, segment_start, self.pos),
-                    });
-                }
+                self.flush_string_text(tokens, &mut text, segment_start);
                 self.pos += 1;
                 tokens.push(Token {
                     kind: TokenKind::StringQuote { triple: false },
@@ -853,12 +1027,7 @@ impl<'src> Lexer<'src> {
 
             // Newline: error in regular strings, allowed in raw.
             if b == b'\n' && !raw {
-                if !text.is_empty() {
-                    tokens.push(Token {
-                        kind: TokenKind::StringText(std::mem::take(&mut text)),
-                        span: Span::new(self.file, segment_start, self.pos),
-                    });
-                }
+                self.flush_string_text(tokens, &mut text, segment_start);
                 self.diagnostics.emit(
                     Diagnostic::error("newline in regular string literal", self.span(pos))
                         .with_code("E0061"),
@@ -878,12 +1047,7 @@ impl<'src> Lexer<'src> {
             if b == b'$' {
                 // `${expr}` form.
                 if self.peek_byte(1) == Some(b'{') {
-                    if !text.is_empty() {
-                        tokens.push(Token {
-                            kind: TokenKind::StringText(std::mem::take(&mut text)),
-                            span: Span::new(self.file, segment_start, self.pos),
-                        });
-                    }
+                    self.flush_string_text(tokens, &mut text, segment_start);
                     let interp_start = self.pos;
                     self.pos += 2;
                     tokens.push(Token {
@@ -894,16 +1058,8 @@ impl<'src> Lexer<'src> {
                     return;
                 }
                 // `$ident` short form.
-                if self
-                    .peek_byte(1)
-                    .is_some_and(is_ident_start_byte)
-                {
-                    if !text.is_empty() {
-                        tokens.push(Token {
-                            kind: TokenKind::StringText(std::mem::take(&mut text)),
-                            span: Span::new(self.file, segment_start, self.pos),
-                        });
-                    }
+                if self.peek_byte(1).is_some_and(is_ident_start_byte) {
+                    self.flush_string_text(tokens, &mut text, segment_start);
                     let short_start = self.pos;
                     self.pos += 1; // consume `$`
                     let ident_start = self.pos;
@@ -958,18 +1114,23 @@ mod tests {
 
     #[test]
     fn fun_main_println_one_plus_one() {
+        use TokenKind::*;
         let r = lex("fun main() { println(1 + 1) }");
         assert!(!r.diagnostics.has_errors());
         let drop_trivia: Vec<_> = r
             .tokens
             .into_iter()
-            .filter(|t| !matches!(
-                t.kind,
-                TokenKind::Whitespace | TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment
-            ))
+            .filter(|t| {
+                !matches!(
+                    t.kind,
+                    TokenKind::Whitespace
+                        | TokenKind::Newline
+                        | TokenKind::LineComment
+                        | TokenKind::BlockComment
+                )
+            })
             .map(|t| t.kind)
             .collect();
-        use TokenKind::*;
         assert!(matches!(drop_trivia[0], Keyword(self::Keyword::Fun)));
         assert!(matches!(drop_trivia[1], Ident));
         assert!(matches!(drop_trivia[7], IntLiteral { .. }));
@@ -981,8 +1142,12 @@ mod tests {
     fn nested_block_comment() {
         let r = lex("/* outer /* inner */ still outer */ 1");
         assert!(!r.diagnostics.has_errors());
-        let last = r.tokens.iter().rev().find(|t| !matches!(t.kind,
-            TokenKind::Whitespace | TokenKind::BlockComment | TokenKind::Eof));
+        let last = r.tokens.iter().rev().find(|t| {
+            !matches!(
+                t.kind,
+                TokenKind::Whitespace | TokenKind::BlockComment | TokenKind::Eof
+            )
+        });
         assert!(matches!(last.unwrap().kind, TokenKind::IntLiteral { .. }));
     }
 
@@ -997,32 +1162,99 @@ mod tests {
         let k = kinds("0xFF 0b1010 1_000 42L 7u 9UL 3.14 1.5e-3 2.0f");
         let intish: Vec<_> = k
             .iter()
-            .filter(|t| matches!(t, TokenKind::IntLiteral { .. } | TokenKind::FloatLiteral { .. }))
+            .filter(|t| {
+                matches!(
+                    t,
+                    TokenKind::IntLiteral { .. } | TokenKind::FloatLiteral { .. }
+                )
+            })
             .collect();
         assert_eq!(intish.len(), 9);
         // Spot-check a few specifics.
-        assert!(matches!(intish[0], TokenKind::IntLiteral { base: NumBase::Hex, suffix: IntSuffix::None }));
-        assert!(matches!(intish[1], TokenKind::IntLiteral { base: NumBase::Binary, suffix: IntSuffix::None }));
-        assert!(matches!(intish[3], TokenKind::IntLiteral { base: NumBase::Decimal, suffix: IntSuffix::Long }));
-        assert!(matches!(intish[4], TokenKind::IntLiteral { base: NumBase::Decimal, suffix: IntSuffix::UInt }));
-        assert!(matches!(intish[5], TokenKind::IntLiteral { base: NumBase::Decimal, suffix: IntSuffix::ULong }));
-        assert!(matches!(intish[6], TokenKind::FloatLiteral { suffix: FloatSuffix::None }));
-        assert!(matches!(intish[7], TokenKind::FloatLiteral { suffix: FloatSuffix::None }));
-        assert!(matches!(intish[8], TokenKind::FloatLiteral { suffix: FloatSuffix::Float }));
+        assert!(matches!(
+            intish[0],
+            TokenKind::IntLiteral {
+                base: NumBase::Hex,
+                suffix: IntSuffix::None
+            }
+        ));
+        assert!(matches!(
+            intish[1],
+            TokenKind::IntLiteral {
+                base: NumBase::Binary,
+                suffix: IntSuffix::None
+            }
+        ));
+        assert!(matches!(
+            intish[3],
+            TokenKind::IntLiteral {
+                base: NumBase::Decimal,
+                suffix: IntSuffix::Long
+            }
+        ));
+        assert!(matches!(
+            intish[4],
+            TokenKind::IntLiteral {
+                base: NumBase::Decimal,
+                suffix: IntSuffix::UInt
+            }
+        ));
+        assert!(matches!(
+            intish[5],
+            TokenKind::IntLiteral {
+                base: NumBase::Decimal,
+                suffix: IntSuffix::ULong
+            }
+        ));
+        assert!(matches!(
+            intish[6],
+            TokenKind::FloatLiteral {
+                suffix: FloatSuffix::None
+            }
+        ));
+        assert!(matches!(
+            intish[7],
+            TokenKind::FloatLiteral {
+                suffix: FloatSuffix::None
+            }
+        ));
+        assert!(matches!(
+            intish[8],
+            TokenKind::FloatLiteral {
+                suffix: FloatSuffix::Float
+            }
+        ));
     }
 
     #[test]
     fn ops_lex_greedily() {
         use TokenKind::*;
         let k: Vec<_> = kinds("== === != !== <= >= && || ++ -- += -> ?. ?: !! .. ..< ::");
-        let non_trivia: Vec<_> = k.into_iter().filter(|t| !matches!(t,
-            Whitespace | Newline | Eof)).collect();
+        let non_trivia: Vec<_> = k
+            .into_iter()
+            .filter(|t| !matches!(t, Whitespace | Newline | Eof))
+            .collect();
         assert_eq!(
             non_trivia,
             vec![
-                EqEq, EqEqEq, BangEq, BangEqEq, Le, Ge, AmpAmp, PipePipe,
-                PlusPlus, MinusMinus, PlusEq, Arrow, QuestionDot, QuestionColon,
-                BangBang, DotDot, DotDotLess, ColonColon,
+                EqEq,
+                EqEqEq,
+                BangEq,
+                BangEqEq,
+                Le,
+                Ge,
+                AmpAmp,
+                PipePipe,
+                PlusPlus,
+                MinusMinus,
+                PlusEq,
+                Arrow,
+                QuestionDot,
+                QuestionColon,
+                BangBang,
+                DotDot,
+                DotDotLess,
+                ColonColon,
             ]
         );
     }
@@ -1031,7 +1263,11 @@ mod tests {
     fn unicode_identifier_lexes() {
         let r = lex("val π = 3");
         assert!(!r.diagnostics.has_errors());
-        let names: Vec<_> = r.tokens.iter().filter(|t| matches!(t.kind, TokenKind::Ident)).collect();
+        let names: Vec<_> = r
+            .tokens
+            .iter()
+            .filter(|t| matches!(t.kind, TokenKind::Ident))
+            .collect();
         assert_eq!(names.len(), 1);
     }
 
@@ -1062,7 +1298,10 @@ mod tests {
         let kinds: Vec<_> = r.tokens.iter().map(|t| &t.kind).collect();
         // expected: " hi  $name , age=  ${  age + 1  }  ! "
         let mut iter = kinds.into_iter();
-        assert!(matches!(iter.next().unwrap(), TokenKind::StringQuote { triple: false }));
+        assert!(matches!(
+            iter.next().unwrap(),
+            TokenKind::StringQuote { triple: false }
+        ));
         assert!(matches!(iter.next().unwrap(), TokenKind::StringText(s) if s == "hi "));
         assert!(matches!(iter.next().unwrap(), TokenKind::ShortInterp(s) if s == "name"));
         assert!(matches!(iter.next().unwrap(), TokenKind::StringText(s) if s == ", age="));
@@ -1072,7 +1311,10 @@ mod tests {
         assert!(matches!(iter.next().unwrap(), TokenKind::IntLiteral { .. }));
         assert!(matches!(iter.next().unwrap(), TokenKind::InterpEnd));
         assert!(matches!(iter.next().unwrap(), TokenKind::StringText(s) if s == "!"));
-        assert!(matches!(iter.next().unwrap(), TokenKind::StringQuote { triple: false }));
+        assert!(matches!(
+            iter.next().unwrap(),
+            TokenKind::StringQuote { triple: false }
+        ));
     }
 
     #[test]
@@ -1080,9 +1322,17 @@ mod tests {
         // Inner `{}` inside `${...}` must not close the template.
         let r = lex(r#""${ if (b) { 1 } else { 2 } }""#);
         assert!(!r.diagnostics.has_errors());
-        let interp_ends = r.tokens.iter().filter(|t| matches!(t.kind, TokenKind::InterpEnd)).count();
+        let interp_ends = r
+            .tokens
+            .iter()
+            .filter(|t| matches!(t.kind, TokenKind::InterpEnd))
+            .count();
         assert_eq!(interp_ends, 1);
-        let starts = r.tokens.iter().filter(|t| matches!(t.kind, TokenKind::InterpStart)).count();
+        let starts = r
+            .tokens
+            .iter()
+            .filter(|t| matches!(t.kind, TokenKind::InterpStart))
+            .count();
         assert_eq!(starts, 1);
     }
 
@@ -1091,13 +1341,21 @@ mod tests {
         let src = "\"\"\"raw \\n\nliteral $x\"\"\"";
         let r = lex(src);
         assert!(!r.diagnostics.has_errors());
-        let texts: Vec<_> = r.tokens.iter().filter_map(|t| match &t.kind {
-            TokenKind::StringText(s) => Some(s.as_str()),
-            _ => None,
-        }).collect();
+        let texts: Vec<_> = r
+            .tokens
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TokenKind::StringText(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
         // Backslash-n stays as two characters; newline literal is preserved.
         assert_eq!(texts, vec!["raw \\n\nliteral "]);
-        assert!(r.tokens.iter().any(|t| matches!(&t.kind, TokenKind::ShortInterp(s) if s == "x")));
+        assert!(
+            r.tokens
+                .iter()
+                .any(|t| matches!(&t.kind, TokenKind::ShortInterp(s) if s == "x"))
+        );
     }
 
     #[test]
@@ -1117,36 +1375,82 @@ mod tests {
         r.tokens
             .into_iter()
             .map(|t| t.kind)
-            .find(|k| !matches!(k, TokenKind::Whitespace | TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment | TokenKind::ShebangLine))
+            .find(|k| {
+                !matches!(
+                    k,
+                    TokenKind::Whitespace
+                        | TokenKind::Newline
+                        | TokenKind::LineComment
+                        | TokenKind::BlockComment
+                        | TokenKind::ShebangLine
+                )
+            })
             .unwrap()
     }
 
     fn find_kind(src: &str, pred: impl Fn(&TokenKind) -> bool) -> TokenKind {
         let r = lex(src);
-        r.tokens.into_iter().map(|t| t.kind).find(|k| pred(k)).unwrap()
+        r.tokens
+            .into_iter()
+            .map(|t| t.kind)
+            .find(|k| pred(k))
+            .unwrap()
     }
 
     #[test]
     fn at_ws_variants() {
-        assert!(matches!(find_kind("@foo", super::TokenKind::is_at), TokenKind::AtNoWs));
-        assert!(matches!(find_kind("@ foo", super::TokenKind::is_at), TokenKind::AtPostWs));
-        assert!(matches!(find_kind("x @foo", super::TokenKind::is_at), TokenKind::AtPreWs));
-        assert!(matches!(find_kind("x @ foo", super::TokenKind::is_at), TokenKind::AtBothWs));
-        assert!(matches!(find_kind("@\nfoo", super::TokenKind::is_at), TokenKind::AtPostWs));
-        assert!(matches!(find_kind("x\n@foo", super::TokenKind::is_at), TokenKind::AtPreWs));
+        assert!(matches!(
+            find_kind("@foo", super::TokenKind::is_at),
+            TokenKind::AtNoWs
+        ));
+        assert!(matches!(
+            find_kind("@ foo", super::TokenKind::is_at),
+            TokenKind::AtPostWs
+        ));
+        assert!(matches!(
+            find_kind("x @foo", super::TokenKind::is_at),
+            TokenKind::AtPreWs
+        ));
+        assert!(matches!(
+            find_kind("x @ foo", super::TokenKind::is_at),
+            TokenKind::AtBothWs
+        ));
+        assert!(matches!(
+            find_kind("@\nfoo", super::TokenKind::is_at),
+            TokenKind::AtPostWs
+        ));
+        assert!(matches!(
+            find_kind("x\n@foo", super::TokenKind::is_at),
+            TokenKind::AtPreWs
+        ));
     }
 
     #[test]
     fn question_ws_variants() {
-        assert!(matches!(find_kind("a?b", super::TokenKind::is_question), TokenKind::QuestNoWs));
-        assert!(matches!(find_kind("a? b", super::TokenKind::is_question), TokenKind::QuestWs));
-        assert!(matches!(find_kind("a?", super::TokenKind::is_question), TokenKind::QuestWs));
+        assert!(matches!(
+            find_kind("a?b", super::TokenKind::is_question),
+            TokenKind::QuestNoWs
+        ));
+        assert!(matches!(
+            find_kind("a? b", super::TokenKind::is_question),
+            TokenKind::QuestWs
+        ));
+        assert!(matches!(
+            find_kind("a?", super::TokenKind::is_question),
+            TokenKind::QuestWs
+        ));
     }
 
     #[test]
     fn excl_ws_variants() {
-        assert!(matches!(find_kind("!a", super::TokenKind::is_bang), TokenKind::ExclNoWs));
-        assert!(matches!(find_kind("! a", super::TokenKind::is_bang), TokenKind::ExclWs));
+        assert!(matches!(
+            find_kind("!a", super::TokenKind::is_bang),
+            TokenKind::ExclNoWs
+        ));
+        assert!(matches!(
+            find_kind("! a", super::TokenKind::is_bang),
+            TokenKind::ExclWs
+        ));
     }
 
     #[test]
@@ -1155,20 +1459,39 @@ mod tests {
         // intervening trivia. Trailing-WS distinguishes QuestNoWs vs QuestWs.
         let r = lex("x as? Int");
         let kinds: Vec<_> = r.tokens.iter().map(|t| t.kind.clone()).collect();
-        let i = kinds.iter().position(|k| matches!(k, TokenKind::Keyword(Keyword::As))).unwrap();
+        let i = kinds
+            .iter()
+            .position(|k| matches!(k, TokenKind::Keyword(Keyword::As)))
+            .unwrap();
         assert!(kinds[i + 1].is_question());
 
         let r = lex("x as?Int");
         let kinds: Vec<_> = r.tokens.iter().map(|t| t.kind.clone()).collect();
-        let i = kinds.iter().position(|k| matches!(k, TokenKind::Keyword(Keyword::As))).unwrap();
+        let i = kinds
+            .iter()
+            .position(|k| matches!(k, TokenKind::Keyword(Keyword::As)))
+            .unwrap();
         assert!(matches!(kinds[i + 1], TokenKind::QuestNoWs));
     }
 
     #[test]
     fn bang_is_emits_excl_no_ws_before_is() {
         let r = lex("x !is Int");
-        let non_trivia: Vec<_> = r.tokens.iter().filter(|t| !matches!(t.kind, TokenKind::Whitespace | TokenKind::Newline | TokenKind::Eof)).map(|t| t.kind.clone()).collect();
-        let i = non_trivia.iter().position(super::TokenKind::is_bang).unwrap();
+        let non_trivia: Vec<_> = r
+            .tokens
+            .iter()
+            .filter(|t| {
+                !matches!(
+                    t.kind,
+                    TokenKind::Whitespace | TokenKind::Newline | TokenKind::Eof
+                )
+            })
+            .map(|t| t.kind.clone())
+            .collect();
+        let i = non_trivia
+            .iter()
+            .position(super::TokenKind::is_bang)
+            .unwrap();
         assert!(matches!(non_trivia[i], TokenKind::ExclNoWs));
         assert!(matches!(non_trivia[i + 1], TokenKind::Keyword(Keyword::Is)));
     }
@@ -1191,7 +1514,20 @@ mod tests {
     #[test]
     fn shebang_consumed_as_trivia_at_file_start() {
         let r = lex("#!/usr/bin/env kotlin\nfun main(){}");
-        let first = r.tokens.iter().find(|t| !matches!(t.kind, TokenKind::Whitespace | TokenKind::Newline | TokenKind::LineComment | TokenKind::BlockComment | TokenKind::ShebangLine)).unwrap();
+        let first = r
+            .tokens
+            .iter()
+            .find(|t| {
+                !matches!(
+                    t.kind,
+                    TokenKind::Whitespace
+                        | TokenKind::Newline
+                        | TokenKind::LineComment
+                        | TokenKind::BlockComment
+                        | TokenKind::ShebangLine
+                )
+            })
+            .unwrap();
         assert!(matches!(first.kind, TokenKind::Keyword(Keyword::Fun)));
     }
 
@@ -1207,7 +1543,10 @@ mod tests {
     fn this_at_label_emits_at_no_ws() {
         let r = lex("this@Outer");
         let kinds: Vec<_> = r.tokens.iter().map(|t| t.kind.clone()).collect();
-        let i = kinds.iter().position(|k| matches!(k, TokenKind::Keyword(Keyword::This))).unwrap();
+        let i = kinds
+            .iter()
+            .position(|k| matches!(k, TokenKind::Keyword(Keyword::This)))
+            .unwrap();
         assert!(matches!(kinds[i + 1], TokenKind::AtNoWs));
         assert!(matches!(kinds[i + 2], TokenKind::Ident));
     }
@@ -1217,9 +1556,18 @@ mod tests {
         assert_eq!(
             kinds("// hi\n1")
                 .into_iter()
-                .filter(|t| !matches!(t, TokenKind::Whitespace | TokenKind::Newline | TokenKind::LineComment))
+                .filter(|t| !matches!(
+                    t,
+                    TokenKind::Whitespace | TokenKind::Newline | TokenKind::LineComment
+                ))
                 .collect::<Vec<_>>(),
-            vec![TokenKind::IntLiteral { base: NumBase::Decimal, suffix: IntSuffix::None }, TokenKind::Eof],
+            vec![
+                TokenKind::IntLiteral {
+                    base: NumBase::Decimal,
+                    suffix: IntSuffix::None
+                },
+                TokenKind::Eof
+            ],
         );
     }
 }

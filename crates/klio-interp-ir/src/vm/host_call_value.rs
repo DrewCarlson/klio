@@ -1,6 +1,11 @@
-use crate::{VmHost, member_is_property, AtomicOrdering, Arc, simple_literal, pad_args_with_defaults, VmIntrinsicHost};
+use crate::{
+    Arc, AtomicOrdering, VmHost, VmIntrinsicHost, member_is_property, pad_args_with_defaults,
+    simple_literal,
+};
 
 impl VmHost<'_> {
+    // Single callable-value dispatch over the value variants.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn call_value(
         &mut self,
         callee: &klio_runtime::Value,
@@ -19,15 +24,10 @@ impl VmHost<'_> {
             let recv = snap.get("__bound_receiver__");
             let name_v = snap.get("__bound_name__");
             drop(snap);
-            if let (Some(recv), Some(klio_runtime::Value::String(name))) =
-                (recv, name_v)
-            {
-                if matches!(&recv, klio_runtime::Value::Class(_))
-                    && !args.is_empty()
-                {
+            if let (Some(recv), Some(klio_runtime::Value::String(name))) = (recv, name_v) {
+                if matches!(&recv, klio_runtime::Value::Class(_)) && !args.is_empty() {
                     let first = args[0].clone();
-                    let rest: Vec<klio_runtime::Value> =
-                        args[1..].to_vec();
+                    let rest: Vec<klio_runtime::Value> = args[1..].to_vec();
                     if rest.is_empty() && member_is_property(&self.classes, &first, &name) {
                         return self.get_field(&first, &name);
                     }
@@ -54,7 +54,10 @@ impl VmHost<'_> {
             // `__sam_target__`; call_member on this instance routes
             // any method call back through the lambda.
             if cls.is_fun_interface && args.len() == 1 {
-                let identity = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                let identity = self
+                    .instance_id_counter
+                    .fetch_add(1, AtomicOrdering::Relaxed)
+                    + 1;
                 let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                     class: Arc::clone(cls),
                     fields: vec![("__sam_target__".to_string(), args[0].clone())],
@@ -77,7 +80,10 @@ impl VmHost<'_> {
             // module index. The runtime ClassDef carries enough to
             // bind primary-param properties; init blocks + custom
             // getters land when local-class lowering grows them.
-            let identity = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            let identity = self
+                .instance_id_counter
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                + 1;
             let mut fields: Vec<(String, klio_runtime::Value)> =
                 Vec::with_capacity(cls.primary_params.len());
             for (param, value) in cls.primary_params.iter().zip(args.iter()) {
@@ -93,15 +99,14 @@ impl VmHost<'_> {
                     let v = simple_literal(init).unwrap_or(klio_runtime::Value::Null);
                     fields.push((p.name.clone(), v));
                 } else if p.getter.is_none() && p.delegate.is_none() {
-                    let v = p.primitive_zero.clone().unwrap_or(klio_runtime::Value::Null);
+                    let v = p
+                        .primitive_zero
+                        .clone()
+                        .unwrap_or(klio_runtime::Value::Null);
                     fields.push((p.name.clone(), v));
                 }
             }
-            let default_outer = self
-                .class_default_outer
-                .borrow()
-                .get(&cls.name)
-                .cloned();
+            let default_outer = self.class_default_outer.borrow().get(&cls.name).cloned();
             let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                 class: Arc::clone(cls),
                 fields,
@@ -114,9 +119,10 @@ impl VmHost<'_> {
         // `propRef(receiver)` — invoking a Value::PropertyRef as a
         // callable reads the named field from the first arg.
         if let klio_runtime::Value::PropertyRef { name } = callee
-            && args.len() == 1 {
-                return self.get_field(&args[0], name);
-            }
+            && args.len() == 1
+        {
+            return self.get_field(&args[0], name);
+        }
         // Bound method/property reference: synthetic instance
         // carrying a receiver + method name. Invocation forwards
         // through the captured receiver (or reads the property on
@@ -126,17 +132,16 @@ impl VmHost<'_> {
             let recv = snap.get("__bound_receiver__");
             let name_v = snap.get("__bound_name__");
             drop(snap);
-            if let (Some(recv), Some(klio_runtime::Value::String(name))) =
-                (recv, name_v)
-            {
-                if matches!(&recv, klio_runtime::Value::Class(_)) && args.len() == 1
-                {
+            if let (Some(recv), Some(klio_runtime::Value::String(name))) = (recv, name_v) {
+                if matches!(&recv, klio_runtime::Value::Class(_)) && args.len() == 1 {
                     return self.get_field(&args[0], &name);
                 }
                 return self.call_member(&recv, &name, args);
             }
         }
         if let klio_runtime::Value::IrClosure { id, captures } = callee {
+            // Closure id indexes the closure table.
+            #[allow(clippy::cast_possible_truncation)]
             let info = self.closures.get(*id as usize).ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
             })?;
@@ -163,15 +168,9 @@ impl VmHost<'_> {
             // invoked with zero args still gets its slot as Null).
             // Pack trailing vararg args into an Array when the
             // target's last param is marked vararg.
-            let defaults =
-                self.prog.func_defaults.get(&info.body_func).cloned();
-            let mut call_args = pad_args_with_defaults(
-                &module,
-                info.n_params,
-                args,
-                defaults.as_ref(),
-                self,
-            )?;
+            let defaults = self.prog.func_defaults.get(&info.body_func).cloned();
+            let mut call_args =
+                pad_args_with_defaults(&module, info.n_params, args, defaults.as_ref(), self)?;
             if let Some(last) = func.params.last() {
                 if last.is_vararg && args.len() > info.n_params {
                     let mut packed: Vec<klio_runtime::Value> = Vec::new();
@@ -242,26 +241,18 @@ impl VmHost<'_> {
                 out_sink: self.out_sink.clone(),
                 threads: Arc::clone(&self.threads),
             };
-            intrinsic.invoke_callable_with_this(
-                callee, args, this_value, &mut sink,
-            )
+            intrinsic.invoke_callable_with_this(callee, args, this_value, &mut sink)
         };
         r.map_err(|e| match e {
-            klio_runtime::RuntimeError::Thrown(v) => {
-                klio_ir::eval::EvalError::Throw(v)
-            }
-            klio_runtime::RuntimeError::Return(v) => {
-                klio_ir::eval::EvalError::NonLocalReturn(v)
-            }
+            klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
+            klio_runtime::RuntimeError::Return(v) => klio_ir::eval::EvalError::NonLocalReturn(v),
             klio_runtime::RuntimeError::Suspend(wake) => {
-                klio_ir::eval::EvalError::Suspended(Box::new(
-                    klio_ir::eval::SuspendState {
-                        token: 0,
-                        frames: Vec::new(),
-                        wake_in_millis: wake,
-                        pending_resume_reg: None,
-                    },
-                ))
+                klio_ir::eval::EvalError::Suspended(Box::new(klio_ir::eval::SuspendState {
+                    token: 0,
+                    frames: Vec::new(),
+                    wake_in_millis: wake,
+                    pending_resume_reg: None,
+                }))
             }
             other => klio_ir::eval::EvalError::Type(format!("{other}")),
         })

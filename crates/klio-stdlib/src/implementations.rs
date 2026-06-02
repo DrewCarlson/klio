@@ -15,7 +15,7 @@ pub(crate) use std::io::BufRead;
 pub(crate) use std::sync::Arc;
 
 pub(crate) use klio_runtime::{
-    char_unit_to_string, char_units_to_string, CallCtx, ObjRef, RuntimeError, StdlibFn, Value,
+    CallCtx, ObjRef, RuntimeError, StdlibFn, Value, char_unit_to_string, char_units_to_string,
 };
 
 const TABLE: &[(&str, StdlibFn)] = &[
@@ -31,25 +31,27 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.buildSet", builders_build_set),
     ("kotlin.collections.buildMap", builders_build_map),
     ("kotlin.text.buildString", builders_build_string),
-
     // ----- threads / monitors (serialized-interpreter semantics) -----
     ("kotlin.synchronized", concurrent_synchronized),
     ("kotlin.concurrent.thread", concurrent_thread),
     ("kotlin.concurrent.Thread.sleep", concurrent_thread_sleep),
-    ("kotlin.concurrent.Thread.currentThread", concurrent_thread_current),
-
+    (
+        "kotlin.concurrent.Thread.currentThread",
+        concurrent_thread_current,
+    ),
     // ----- kotlin.time platform clock bindings -----
     // Backing for the klio `actual`s of kotlin.time's `internal expect`
     // wall/monotonic clock (kotlin-time/Actuals.kt). The rest of
     // kotlin.time is consumed verbatim from upstream commonMain.
     ("kotlin.time.__klio_time_systemMillis", time_system_millis),
-    ("kotlin.time.__klio_time_monotonicNanos", time_monotonic_nanos),
-
+    (
+        "kotlin.time.__klio_time_monotonicNanos",
+        time_monotonic_nanos,
+    ),
     // ----- io -----
     ("kotlin.io.print", io_print),
     ("kotlin.io.println", io_println),
     ("kotlin.io.readLine", io_read_line),
-
     // ----- math (functions) -----
     ("kotlin.math.abs", math_abs),
     ("kotlin.math.absoluteValue", math_abs),
@@ -87,11 +89,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.math.sqrt", math_sqrt),
     ("kotlin.math.tan", math_tan),
     ("kotlin.math.truncate", math_truncate),
-
     // ----- math (constants) -----
     ("kotlin.math.E", math_e),
     ("kotlin.math.PI", math_pi),
-
     // ----- String -----
     ("kotlin.String.compareTo", string_compare_to),
     ("kotlin.String.contains", string_contains),
@@ -134,7 +134,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String.chunked", string_chunked),
     ("kotlin.String.split", string_split),
     ("kotlin.String.splitToSequence", string_split_to_sequence),
-    ("kotlin.CharSequence.splitToSequence", string_split_to_sequence),
+    (
+        "kotlin.CharSequence.splitToSequence",
+        string_split_to_sequence,
+    ),
     ("kotlin.String.toDouble", string_to_double),
     ("kotlin.String.toInt", string_to_int),
     ("kotlin.String.toIntOrNull", string_to_int_or_null),
@@ -144,11 +147,13 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String.trimEnd", string_trim_end),
     ("kotlin.String.trimStart", string_trim_start),
     ("kotlin.String.uppercase", string_uppercase),
-
     // ----- Char -----
     ("kotlin.Char.code", char_code),
     ("kotlin.Char.toInt", char_code),
-    ("kotlin.internal.getProgressionLastElement", internal_get_progression_last_element),
+    (
+        "kotlin.internal.getProgressionLastElement",
+        internal_get_progression_last_element,
+    ),
     ("kotlin.Char.digitToInt", char_digit_to_int),
     ("kotlin.Char.isDigit", char_is_digit),
     ("kotlin.Char.isLetter", char_is_letter),
@@ -159,7 +164,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Char.lowercase", char_lowercase),
     ("kotlin.Char.toString", char_to_string),
     ("kotlin.Char.uppercase", char_uppercase),
-
     // ----- Int -----
     ("kotlin.Int.and", int_and),
     ("kotlin.Int.compareTo", int_compare_to),
@@ -176,7 +180,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Int.toString", int_to_string),
     ("kotlin.Int.ushr", int_ushr),
     ("kotlin.Int.xor", int_xor),
-
     // ----- Long -----
     ("kotlin.Long.and", long_and),
     ("kotlin.Long.compareTo", long_compare_to),
@@ -193,7 +196,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Long.toString", long_to_string),
     ("kotlin.Long.ushr", long_ushr),
     ("kotlin.Long.xor", long_xor),
-
     // ----- Short -----
     ("kotlin.Short.compareTo", int_compare_to),
     ("kotlin.Short.toByte", int_to_byte),
@@ -203,7 +205,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Short.toLong", int_to_long),
     ("kotlin.Short.toShort", int_to_short),
     ("kotlin.Short.toString", int_to_string),
-
     // ----- Byte -----
     ("kotlin.Byte.compareTo", int_compare_to),
     ("kotlin.Byte.toByte", int_to_byte),
@@ -213,7 +214,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Byte.toLong", int_to_long),
     ("kotlin.Byte.toShort", int_to_short),
     ("kotlin.Byte.toString", int_to_string),
-
     // ----- toU* on signed integer receivers (cross-sign conversions) -----
     ("kotlin.Int.toUByte", to_ubyte),
     ("kotlin.Int.toUShort", to_ushort),
@@ -231,7 +231,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Byte.toUShort", to_ushort),
     ("kotlin.Byte.toUInt", to_uint),
     ("kotlin.Byte.toULong", to_ulong),
-
     // ----- UInt -----
     ("kotlin.UInt.toByte", unsigned_to_byte),
     ("kotlin.UInt.toShort", unsigned_to_short),
@@ -244,7 +243,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.UInt.toDouble", unsigned_to_double),
     ("kotlin.UInt.toFloat", unsigned_to_float),
     ("kotlin.UInt.toString", unsigned_to_string),
-
     // ----- ULong -----
     ("kotlin.ULong.toByte", unsigned_to_byte),
     ("kotlin.ULong.toShort", unsigned_to_short),
@@ -257,7 +255,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.ULong.toDouble", unsigned_to_double),
     ("kotlin.ULong.toFloat", unsigned_to_float),
     ("kotlin.ULong.toString", unsigned_to_string),
-
     // ----- UShort -----
     ("kotlin.UShort.toByte", unsigned_to_byte),
     ("kotlin.UShort.toShort", unsigned_to_short),
@@ -270,7 +267,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.UShort.toDouble", unsigned_to_double),
     ("kotlin.UShort.toFloat", unsigned_to_float),
     ("kotlin.UShort.toString", unsigned_to_string),
-
     // ----- UByte -----
     ("kotlin.UByte.toByte", unsigned_to_byte),
     ("kotlin.UByte.toShort", unsigned_to_short),
@@ -283,7 +279,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.UByte.toDouble", unsigned_to_double),
     ("kotlin.UByte.toFloat", unsigned_to_float),
     ("kotlin.UByte.toString", unsigned_to_string),
-
     // ----- Double -----
     ("kotlin.Double.compareTo", double_compare_to),
     ("kotlin.Double.isFinite", double_is_finite),
@@ -301,7 +296,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Double.toBits", double_to_bits),
     ("kotlin.Double.fromBits", double_from_bits),
     ("kotlin.Double.Companion.fromBits", double_from_bits),
-
     // ----- Float -----
     ("kotlin.Float.compareTo", float_compare_to),
     ("kotlin.Float.isFinite", float_is_finite),
@@ -318,10 +312,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Float.toBits", float_to_bits),
     ("kotlin.Float.fromBits", float_from_bits),
     ("kotlin.Float.Companion.fromBits", float_from_bits),
-
     // ----- Boolean -----
     ("kotlin.Boolean.toString", bool_to_string),
-
     // ----- Exception constructors -----
     ("kotlin.ArithmeticException", excn_arithmetic),
     ("kotlin.ClassCastException", excn_class_cast),
@@ -337,17 +329,21 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.UnsupportedOperationException", excn_unsupported),
     ("kotlin.NoWhenBranchMatchedException", excn_no_when),
     ("kotlin.NumberFormatException", excn_number_format),
-    ("kotlin.ConcurrentModificationException", excn_concurrent_mod),
+    (
+        "kotlin.ConcurrentModificationException",
+        excn_concurrent_mod,
+    ),
     ("kotlin.AssertionError", excn_assertion_error),
-
     // ----- Throwable members -----
     ("kotlin.Throwable.message", throwable_message),
     ("kotlin.Throwable.cause", throwable_cause),
     ("kotlin.Throwable.toString", throwable_to_string),
     ("kotlin.Throwable.addSuppressed", throwable_add_suppressed),
     ("kotlin.Throwable.getSuppressed", throwable_suppressed),
-    ("kotlin.Throwable.suppressedExceptions", throwable_suppressed),
-
+    (
+        "kotlin.Throwable.suppressedExceptions",
+        throwable_suppressed,
+    ),
     // ----- Collection constructors -----
     ("kotlin.Pair", coll_pair_ctor),
     ("kotlin.collections.emptyList", coll_empty_list),
@@ -384,8 +380,14 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.sortedMapOf", coll_sorted_map_of),
     ("kotlin.collections.setOfNotNull", coll_set_of_not_null),
     ("kotlin.collections.Set.toTypedArray", coll_to_typed_array),
-    ("kotlin.collections.Collection.toTypedArray", coll_to_typed_array),
-    ("kotlin.collections.Iterable.toTypedArray", coll_to_typed_array),
+    (
+        "kotlin.collections.Collection.toTypedArray",
+        coll_to_typed_array,
+    ),
+    (
+        "kotlin.collections.Iterable.toTypedArray",
+        coll_to_typed_array,
+    ),
     ("kotlin.collections.setOf", coll_set_of),
     ("kotlin.to", coll_to_infix),
     ("kotlin.collections.ArrayList", coll_array_list_ctor),
@@ -394,7 +396,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.HashSet", coll_hash_set_ctor),
     ("kotlin.collections.LinkedHashMap", coll_hash_map_ctor),
     ("kotlin.collections.LinkedHashSet", coll_hash_set_ctor),
-
     // ----- List / Set members -----
     ("kotlin.collections.List.contains", coll_list_contains),
     // first / firstOrNull / last / lastOrNull / single / singleOrNull /
@@ -405,32 +406,68 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // extension-fn fallback's receiver-type scoring).
     ("kotlin.collections.List.get", coll_list_get),
     ("kotlin.collections.List.indexOf", coll_list_index_of),
-    ("kotlin.collections.List.indexOfFirst", coll_iter_index_of_first),
+    (
+        "kotlin.collections.List.indexOfFirst",
+        coll_iter_index_of_first,
+    ),
     ("kotlin.collections.List.foldRight", coll_list_fold_right),
     ("kotlin.collections.Array.foldRight", coll_list_fold_right),
     ("kotlin.Array.foldRight", coll_list_fold_right),
-    ("kotlin.collections.List.reduceRight", coll_list_reduce_right),
-    ("kotlin.collections.Array.reduceRight", coll_list_reduce_right),
+    (
+        "kotlin.collections.List.reduceRight",
+        coll_list_reduce_right,
+    ),
+    (
+        "kotlin.collections.Array.reduceRight",
+        coll_list_reduce_right,
+    ),
     ("kotlin.Array.reduceRight", coll_list_reduce_right),
-    ("kotlin.collections.List.reduceRightOrNull", coll_list_reduce_right_or_null),
-    ("kotlin.Array.reduceRightOrNull", coll_list_reduce_right_or_null),
+    (
+        "kotlin.collections.List.reduceRightOrNull",
+        coll_list_reduce_right_or_null,
+    ),
+    (
+        "kotlin.Array.reduceRightOrNull",
+        coll_list_reduce_right_or_null,
+    ),
     ("kotlin.collections.List.last", coll_list_last),
     ("kotlin.collections.Set.last", coll_list_last),
     ("kotlin.collections.Iterable.last", coll_list_last),
     ("kotlin.Array.last", coll_list_last),
     ("kotlin.collections.List.lastOrNull", coll_list_last_or_null),
     ("kotlin.collections.Set.lastOrNull", coll_list_last_or_null),
-    ("kotlin.collections.Iterable.lastOrNull", coll_list_last_or_null),
+    (
+        "kotlin.collections.Iterable.lastOrNull",
+        coll_list_last_or_null,
+    ),
     ("kotlin.Array.lastOrNull", coll_list_last_or_null),
     ("kotlin.collections.List.findLast", coll_list_last_or_null),
     ("kotlin.collections.Set.findLast", coll_list_last_or_null),
-    ("kotlin.collections.Iterable.findLast", coll_list_last_or_null),
+    (
+        "kotlin.collections.Iterable.findLast",
+        coll_list_last_or_null,
+    ),
     ("kotlin.Array.findLast", coll_list_last_or_null),
-    ("kotlin.collections.List.indexOfLast", coll_iter_index_of_last),
-    ("kotlin.collections.MutableList.indexOfFirst", coll_iter_index_of_first),
-    ("kotlin.collections.MutableList.indexOfLast", coll_iter_index_of_last),
-    ("kotlin.collections.Iterable.indexOfFirst", coll_iter_index_of_first),
-    ("kotlin.collections.Iterable.indexOfLast", coll_iter_index_of_last),
+    (
+        "kotlin.collections.List.indexOfLast",
+        coll_iter_index_of_last,
+    ),
+    (
+        "kotlin.collections.MutableList.indexOfFirst",
+        coll_iter_index_of_first,
+    ),
+    (
+        "kotlin.collections.MutableList.indexOfLast",
+        coll_iter_index_of_last,
+    ),
+    (
+        "kotlin.collections.Iterable.indexOfFirst",
+        coll_iter_index_of_first,
+    ),
+    (
+        "kotlin.collections.Iterable.indexOfLast",
+        coll_iter_index_of_last,
+    ),
     ("kotlin.Array.isEmpty", array_is_empty),
     ("kotlin.Array.isNotEmpty", array_is_not_empty),
     ("kotlin.collections.Array.isEmpty", array_is_empty),
@@ -481,7 +518,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.ShortArray.joinToString", coll_array_join_to_string),
     ("kotlin.ByteArray.joinToString", coll_array_join_to_string),
     ("kotlin.CharArray.joinToString", coll_array_join_to_string),
-    ("kotlin.BooleanArray.joinToString", coll_array_join_to_string),
+    (
+        "kotlin.BooleanArray.joinToString",
+        coll_array_join_to_string,
+    ),
     ("kotlin.LongArray.isEmpty", array_is_empty),
     ("kotlin.LongArray.isNotEmpty", array_is_not_empty),
     ("kotlin.ByteArray.isEmpty", array_is_empty),
@@ -490,11 +530,26 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.CharArray.isNotEmpty", array_is_not_empty),
     ("kotlin.collections.List.isEmpty", coll_list_is_empty),
     ("kotlin.collections.List.isNotEmpty", coll_list_is_not_empty),
-    ("kotlin.collections.List.joinToString", coll_list_join_to_string),
-    ("kotlin.collections.Set.joinToString", coll_list_join_to_string),
-    ("kotlin.collections.MutableSet.joinToString", coll_list_join_to_string),
-    ("kotlin.collections.Iterable.joinToString", coll_list_join_to_string),
-    ("kotlin.collections.Collection.joinToString", coll_list_join_to_string),
+    (
+        "kotlin.collections.List.joinToString",
+        coll_list_join_to_string,
+    ),
+    (
+        "kotlin.collections.Set.joinToString",
+        coll_list_join_to_string,
+    ),
+    (
+        "kotlin.collections.MutableSet.joinToString",
+        coll_list_join_to_string,
+    ),
+    (
+        "kotlin.collections.Iterable.joinToString",
+        coll_list_join_to_string,
+    ),
+    (
+        "kotlin.collections.Collection.joinToString",
+        coll_list_join_to_string,
+    ),
     ("kotlin.collections.List.average", coll_list_average),
     ("kotlin.collections.List.chunked", coll_list_chunked),
     ("kotlin.collections.List.distinct", coll_list_distinct),
@@ -510,59 +565,117 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Set.toMap", coll_list_to_map),
     ("kotlin.Array.toMap", coll_list_to_map),
     ("kotlin.collections.List.dropLast", coll_list_drop_last),
-    ("kotlin.collections.List.lastIndexOf", coll_list_last_index_of),
+    (
+        "kotlin.collections.List.lastIndexOf",
+        coll_list_last_index_of,
+    ),
     ("kotlin.collections.List.minus", coll_list_minus),
     ("kotlin.collections.List.plus", coll_list_plus),
     ("kotlin.collections.List.reversed", coll_list_reversed),
     ("kotlin.collections.List.size", coll_list_size),
     ("kotlin.collections.List.slice", coll_list_slice),
     ("kotlin.collections.List.sorted", coll_list_sorted),
-    ("kotlin.collections.List.sortedDescending", coll_list_sorted_descending),
+    (
+        "kotlin.collections.List.sortedDescending",
+        coll_list_sorted_descending,
+    ),
     ("kotlin.collections.List.subList", coll_list_sublist),
     ("kotlin.collections.List.takeLast", coll_list_take_last),
     ("kotlin.collections.List.windowed", coll_list_windowed),
     ("kotlin.collections.List.zip", coll_list_zip),
     ("kotlin.collections.List.toString", coll_list_to_string),
-
     ("kotlin.collections.MutableList.add", coll_mut_list_add),
     ("kotlin.collections.MutableList.clear", coll_mut_list_clear),
-    ("kotlin.collections.MutableList.contains", coll_list_contains),
+    (
+        "kotlin.collections.MutableList.contains",
+        coll_list_contains,
+    ),
     ("kotlin.collections.MutableList.get", coll_list_get),
     ("kotlin.collections.MutableList.indexOf", coll_list_index_of),
     ("kotlin.collections.MutableList.isEmpty", coll_list_is_empty),
-    ("kotlin.collections.MutableList.isNotEmpty", coll_list_is_not_empty),
-    ("kotlin.collections.MutableList.joinToString", coll_list_join_to_string),
+    (
+        "kotlin.collections.MutableList.isNotEmpty",
+        coll_list_is_not_empty,
+    ),
+    (
+        "kotlin.collections.MutableList.joinToString",
+        coll_list_join_to_string,
+    ),
     ("kotlin.collections.MutableList.average", coll_list_average),
     ("kotlin.collections.MutableList.chunked", coll_list_chunked),
     ("kotlin.collections.MutableList.indices", coll_list_indices),
-    ("kotlin.collections.MutableList.lastIndex", coll_list_last_index),
+    (
+        "kotlin.collections.MutableList.lastIndex",
+        coll_list_last_index,
+    ),
     ("kotlin.collections.MutableList.max", coll_list_max_or_null),
-    ("kotlin.collections.MutableList.maxOrNull", coll_list_max_or_null),
+    (
+        "kotlin.collections.MutableList.maxOrNull",
+        coll_list_max_or_null,
+    ),
     ("kotlin.collections.MutableList.min", coll_list_min_or_null),
-    ("kotlin.collections.MutableList.minOrNull", coll_list_min_or_null),
+    (
+        "kotlin.collections.MutableList.minOrNull",
+        coll_list_min_or_null,
+    ),
     ("kotlin.collections.MutableList.sum", coll_list_sum),
     ("kotlin.collections.MutableList.toMap", coll_list_to_map),
-    ("kotlin.collections.MutableList.distinct", coll_list_distinct),
-    ("kotlin.collections.MutableList.dropLast", coll_list_drop_last),
-    ("kotlin.collections.MutableList.lastIndexOf", coll_list_last_index_of),
+    (
+        "kotlin.collections.MutableList.distinct",
+        coll_list_distinct,
+    ),
+    (
+        "kotlin.collections.MutableList.dropLast",
+        coll_list_drop_last,
+    ),
+    (
+        "kotlin.collections.MutableList.lastIndexOf",
+        coll_list_last_index_of,
+    ),
     ("kotlin.collections.MutableList.minus", coll_list_minus),
     ("kotlin.collections.MutableList.plus", coll_list_plus),
-    ("kotlin.collections.MutableList.removeAt", coll_mut_list_remove_at),
-    ("kotlin.collections.MutableList.addFirst", coll_mut_list_add_first),
+    (
+        "kotlin.collections.MutableList.removeAt",
+        coll_mut_list_remove_at,
+    ),
+    (
+        "kotlin.collections.MutableList.addFirst",
+        coll_mut_list_add_first,
+    ),
     ("kotlin.collections.MutableList.addLast", coll_mut_list_add),
-    ("kotlin.collections.MutableList.removeFirst", coll_mut_list_remove_first),
-    ("kotlin.collections.MutableList.removeLast", coll_mut_list_remove_last),
-    ("kotlin.collections.MutableList.reversed", coll_list_reversed),
+    (
+        "kotlin.collections.MutableList.removeFirst",
+        coll_mut_list_remove_first,
+    ),
+    (
+        "kotlin.collections.MutableList.removeLast",
+        coll_mut_list_remove_last,
+    ),
+    (
+        "kotlin.collections.MutableList.reversed",
+        coll_list_reversed,
+    ),
     ("kotlin.collections.MutableList.size", coll_list_size),
     ("kotlin.collections.MutableList.slice", coll_list_slice),
     ("kotlin.collections.MutableList.sorted", coll_list_sorted),
-    ("kotlin.collections.MutableList.sortedDescending", coll_list_sorted_descending),
+    (
+        "kotlin.collections.MutableList.sortedDescending",
+        coll_list_sorted_descending,
+    ),
     ("kotlin.collections.MutableList.subList", coll_list_sublist),
-    ("kotlin.collections.MutableList.takeLast", coll_list_take_last),
-    ("kotlin.collections.MutableList.windowed", coll_list_windowed),
+    (
+        "kotlin.collections.MutableList.takeLast",
+        coll_list_take_last,
+    ),
+    (
+        "kotlin.collections.MutableList.windowed",
+        coll_list_windowed,
+    ),
     ("kotlin.collections.MutableList.zip", coll_list_zip),
-    ("kotlin.collections.MutableList.toString", coll_list_to_string),
-
+    (
+        "kotlin.collections.MutableList.toString",
+        coll_list_to_string,
+    ),
     ("kotlin.collections.Set.contains", coll_set_contains),
     ("kotlin.collections.Set.isEmpty", coll_set_is_empty),
     ("kotlin.collections.Set.isNotEmpty", coll_set_is_not_empty),
@@ -572,11 +685,20 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Set.plus", coll_set_plus),
     ("kotlin.collections.Map.plus", coll_map_plus),
     ("kotlin.collections.Map.minus", coll_map_minus),
-    ("kotlin.collections.Map.toMutableMap", coll_map_to_mutable_map),
+    (
+        "kotlin.collections.Map.toMutableMap",
+        coll_map_to_mutable_map,
+    ),
     ("kotlin.collections.Map.toMap", coll_map_to_map),
     ("kotlin.collections.Map.toSortedMap", coll_map_to_sorted_map),
-    ("kotlin.collections.MutableMap.toSortedMap", coll_map_to_sorted_map),
-    ("kotlin.collections.MutableMap.toMutableMap", coll_map_to_mutable_map),
+    (
+        "kotlin.collections.MutableMap.toSortedMap",
+        coll_map_to_sorted_map,
+    ),
+    (
+        "kotlin.collections.MutableMap.toMutableMap",
+        coll_map_to_mutable_map,
+    ),
     ("kotlin.collections.MutableMap.toMap", coll_map_to_map),
     ("kotlin.collections.MutableMap.plus", coll_map_plus),
     ("kotlin.collections.MutableMap.minus", coll_map_minus),
@@ -584,21 +706,35 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Set.toString", coll_set_to_string),
     ("kotlin.collections.Set.union", coll_set_union),
     ("kotlin.collections.Set.sorted", coll_set_sorted),
-    ("kotlin.collections.Set.sortedDescending", coll_set_sorted_descending),
+    (
+        "kotlin.collections.Set.sortedDescending",
+        coll_set_sorted_descending,
+    ),
     ("kotlin.collections.MutableSet.add", coll_mut_set_add),
     ("kotlin.collections.MutableSet.clear", coll_mut_set_clear),
     ("kotlin.collections.MutableSet.contains", coll_set_contains),
     ("kotlin.collections.MutableSet.isEmpty", coll_set_is_empty),
-    ("kotlin.collections.MutableSet.isNotEmpty", coll_set_is_not_empty),
+    (
+        "kotlin.collections.MutableSet.isNotEmpty",
+        coll_set_is_not_empty,
+    ),
     ("kotlin.collections.MutableSet.remove", coll_mut_set_remove),
-    ("kotlin.collections.MutableSet.removeAll", coll_mut_set_remove_all),
-    ("kotlin.collections.MutableSet.retainAll", coll_mut_set_retain_all),
+    (
+        "kotlin.collections.MutableSet.removeAll",
+        coll_mut_set_remove_all,
+    ),
+    (
+        "kotlin.collections.MutableSet.retainAll",
+        coll_mut_set_retain_all,
+    ),
     ("kotlin.collections.MutableSet.size", coll_set_size),
     ("kotlin.collections.MutableSet.toString", coll_set_to_string),
-
     // ----- Map members -----
     ("kotlin.collections.Map.containsKey", coll_map_contains_key),
-    ("kotlin.collections.Map.containsValue", coll_map_contains_value),
+    (
+        "kotlin.collections.Map.containsValue",
+        coll_map_contains_value,
+    ),
     ("kotlin.collections.Map.entries", coll_map_entries),
     ("kotlin.collections.Map.get", coll_map_get),
     ("kotlin.collections.Map.isEmpty", coll_map_is_empty),
@@ -608,24 +744,31 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Map.toString", coll_map_to_string),
     ("kotlin.collections.Map.values", coll_map_values),
     ("kotlin.collections.MutableMap.clear", coll_mut_map_clear),
-    ("kotlin.collections.MutableMap.containsKey", coll_map_contains_key),
-    ("kotlin.collections.MutableMap.containsValue", coll_map_contains_value),
+    (
+        "kotlin.collections.MutableMap.containsKey",
+        coll_map_contains_key,
+    ),
+    (
+        "kotlin.collections.MutableMap.containsValue",
+        coll_map_contains_value,
+    ),
     ("kotlin.collections.MutableMap.entries", coll_map_entries),
     ("kotlin.collections.MutableMap.get", coll_map_get),
     ("kotlin.collections.MutableMap.isEmpty", coll_map_is_empty),
-    ("kotlin.collections.MutableMap.isNotEmpty", coll_map_is_not_empty),
+    (
+        "kotlin.collections.MutableMap.isNotEmpty",
+        coll_map_is_not_empty,
+    ),
     ("kotlin.collections.MutableMap.keys", coll_map_keys),
     ("kotlin.collections.MutableMap.put", coll_mut_map_put),
     ("kotlin.collections.MutableMap.remove", coll_mut_map_remove),
     ("kotlin.collections.MutableMap.size", coll_map_size),
     ("kotlin.collections.MutableMap.toString", coll_map_to_string),
     ("kotlin.collections.MutableMap.values", coll_map_values),
-
     // ----- Pair members -----
     ("kotlin.Pair.first", pair_first),
     ("kotlin.Pair.second", pair_second),
     ("kotlin.Pair.toString", pair_to_string),
-
     // ----- Triple -----
     ("kotlin.Triple", coll_triple_ctor),
     ("kotlin.Triple.first", triple_first),
@@ -633,7 +776,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Triple.third", triple_third),
     ("kotlin.Triple.toString", triple_to_string),
     ("kotlin.Triple.toList", triple_to_list),
-
     // ----- Comparator factories -----
     // The conventional call shape `Comparator.naturalOrder<T>()` ends up
     // as a `Path("Comparator").Member("naturalOrder")` FQN at the call
@@ -647,7 +789,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.reverseOrder", comparator_reverse_order),
     ("naturalOrder", comparator_natural_order),
     ("reverseOrder", comparator_reverse_order),
-
     // ----- Sequence -----
     ("kotlin.collections.List.asSequence", seq_from_list),
     ("kotlin.collections.MutableList.asSequence", seq_from_list),
@@ -662,9 +803,15 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.sequences.sequence", seq_builder),
     ("kotlin.sequences.iterator", seq_iterator_builder),
     ("kotlin.sequences.SequenceScope.yield", seq_scope_yield),
-    ("kotlin.sequences.SequenceScope.yieldAll", seq_scope_yield_all),
+    (
+        "kotlin.sequences.SequenceScope.yieldAll",
+        seq_scope_yield_all,
+    ),
     ("kotlin.sequences.Sequence.toList", seq_to_list),
-    ("kotlin.sequences.Sequence.toMutableList", seq_to_mutable_list),
+    (
+        "kotlin.sequences.Sequence.toMutableList",
+        seq_to_mutable_list,
+    ),
     ("kotlin.sequences.Sequence.toSet", seq_to_set),
     ("kotlin.sequences.Sequence.count", seq_count_no_pred),
     ("kotlin.sequences.Sequence.first", seq_first),
@@ -674,12 +821,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.sequences.Sequence.none", seq_none),
     ("kotlin.sequences.Sequence.last", seq_last),
     ("kotlin.sequences.Sequence.toString", seq_to_string),
-
     // ----- Map.Entry members -----
     ("kotlin.collections.Map.Entry.key", map_entry_key),
     ("kotlin.collections.Map.Entry.toString", map_entry_to_string),
     ("kotlin.collections.Map.Entry.value", map_entry_value),
-
     // ----- Range progressions -----
     ("kotlin.ranges.downTo", ranges_down_to),
     ("kotlin.ranges.step", ranges_step),
@@ -720,18 +865,22 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.ranges.LongProgression.count", range_count),
     ("kotlin.ranges.LongRange.sum", range_sum),
     ("kotlin.ranges.LongProgression.sum", range_sum),
-
     // ----- Additional math -----
     ("kotlin.math.asin", math_asin),
     ("kotlin.math.acos", math_acos),
     ("kotlin.math.atan", math_atan),
     ("kotlin.math.atan2", math_atan2),
-
     // ----- Additional String -----
     ("kotlin.String.substringBefore", string_substring_before),
     ("kotlin.String.substringAfter", string_substring_after),
-    ("kotlin.String.substringBeforeLast", string_substring_before_last),
-    ("kotlin.String.substringAfterLast", string_substring_after_last),
+    (
+        "kotlin.String.substringBeforeLast",
+        string_substring_before_last,
+    ),
+    (
+        "kotlin.String.substringAfterLast",
+        string_substring_after_last,
+    ),
     ("kotlin.String.replaceFirst", string_replace_first),
     ("kotlin.String.trimIndent", string_trim_indent),
     ("kotlin.String.trimMargin", string_trim_margin),
@@ -741,8 +890,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String.toLongOrNull", string_to_long_or_null),
     ("kotlin.String.toDoubleOrNull", string_to_double_or_null),
     ("kotlin.String.toBoolean", string_to_boolean),
-    ("kotlin.String.toBooleanStrictOrNull", string_to_boolean_strict_or_null),
-
+    (
+        "kotlin.String.toBooleanStrictOrNull",
+        string_to_boolean_strict_or_null,
+    ),
     // ----- Additional Char -----
     ("kotlin.Char.uppercaseChar", char_uppercase_char),
     ("kotlin.Char.lowercaseChar", char_lowercase_char),
@@ -750,7 +901,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Char.isLowSurrogate", char_is_low_surrogate),
     ("kotlin.Char.isSurrogate", char_is_surrogate),
     ("kotlin.Char.digitToIntOrNull", char_digit_to_int_or_null),
-
     // ----- Additional Int -----
     ("kotlin.Int.coerceIn", int_coerce_in),
     ("kotlin.Int.coerceAtLeast", int_coerce_at_least),
@@ -764,12 +914,30 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Float.coerceIn", num_coerce_in),
     ("kotlin.Float.coerceAtLeast", num_coerce_at_least),
     ("kotlin.Float.coerceAtMost", num_coerce_at_most),
-    ("kotlin.Int.countLeadingZeroBits", num_count_leading_zero_bits),
-    ("kotlin.Long.countLeadingZeroBits", num_count_leading_zero_bits),
-    ("kotlin.Short.countLeadingZeroBits", num_count_leading_zero_bits),
-    ("kotlin.Byte.countLeadingZeroBits", num_count_leading_zero_bits),
-    ("kotlin.Int.countTrailingZeroBits", num_count_trailing_zero_bits),
-    ("kotlin.Long.countTrailingZeroBits", num_count_trailing_zero_bits),
+    (
+        "kotlin.Int.countLeadingZeroBits",
+        num_count_leading_zero_bits,
+    ),
+    (
+        "kotlin.Long.countLeadingZeroBits",
+        num_count_leading_zero_bits,
+    ),
+    (
+        "kotlin.Short.countLeadingZeroBits",
+        num_count_leading_zero_bits,
+    ),
+    (
+        "kotlin.Byte.countLeadingZeroBits",
+        num_count_leading_zero_bits,
+    ),
+    (
+        "kotlin.Int.countTrailingZeroBits",
+        num_count_trailing_zero_bits,
+    ),
+    (
+        "kotlin.Long.countTrailingZeroBits",
+        num_count_trailing_zero_bits,
+    ),
     ("kotlin.Int.countOneBits", num_count_one_bits),
     ("kotlin.Long.countOneBits", num_count_one_bits),
     ("kotlin.Int.floorDiv", num_floor_div),
@@ -781,59 +949,115 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Short.mod", num_mod),
     ("kotlin.Byte.mod", num_mod),
     ("kotlin.Int.toChar", int_to_char),
-
     // ----- Additional List ops -----
     ("kotlin.collections.List.flatten", coll_list_flatten),
     ("kotlin.collections.List.unzip", coll_list_unzip),
-    ("kotlin.collections.List.containsAll", coll_list_contains_all),
+    (
+        "kotlin.collections.List.containsAll",
+        coll_list_contains_all,
+    ),
     ("kotlin.collections.List.toList", coll_list_to_list),
-    ("kotlin.collections.List.toMutableList", coll_list_to_mutable_list),
+    (
+        "kotlin.collections.List.toMutableList",
+        coll_list_to_mutable_list,
+    ),
     ("kotlin.collections.List.toSet", coll_list_to_set),
-    ("kotlin.collections.List.toMutableSet", coll_list_to_mutable_set),
+    (
+        "kotlin.collections.List.toMutableSet",
+        coll_list_to_mutable_set,
+    ),
     ("kotlin.collections.List.withIndex", coll_list_with_index),
     ("kotlin.collections.MutableList.flatten", coll_list_flatten),
     ("kotlin.collections.MutableList.unzip", coll_list_unzip),
-    ("kotlin.collections.MutableList.containsAll", coll_list_contains_all),
+    (
+        "kotlin.collections.MutableList.containsAll",
+        coll_list_contains_all,
+    ),
     ("kotlin.collections.MutableList.toList", coll_list_to_list),
-    ("kotlin.collections.MutableList.toMutableList", coll_list_to_mutable_list),
+    (
+        "kotlin.collections.MutableList.toMutableList",
+        coll_list_to_mutable_list,
+    ),
     ("kotlin.collections.MutableList.toSet", coll_list_to_set),
-    ("kotlin.collections.MutableList.toMutableSet", coll_list_to_mutable_set),
-    ("kotlin.collections.MutableList.withIndex", coll_list_with_index),
-    ("kotlin.collections.MutableList.addAll", coll_mut_list_add_all),
-    ("kotlin.collections.MutableList.remove", coll_mut_list_remove),
-    ("kotlin.collections.MutableList.removeAll", coll_mut_list_remove_all),
-    ("kotlin.collections.MutableList.retainAll", coll_mut_list_retain_all),
+    (
+        "kotlin.collections.MutableList.toMutableSet",
+        coll_list_to_mutable_set,
+    ),
+    (
+        "kotlin.collections.MutableList.withIndex",
+        coll_list_with_index,
+    ),
+    (
+        "kotlin.collections.MutableList.addAll",
+        coll_mut_list_add_all,
+    ),
+    (
+        "kotlin.collections.MutableList.remove",
+        coll_mut_list_remove,
+    ),
+    (
+        "kotlin.collections.MutableList.removeAll",
+        coll_mut_list_remove_all,
+    ),
+    (
+        "kotlin.collections.MutableList.retainAll",
+        coll_mut_list_retain_all,
+    ),
     ("kotlin.collections.MutableList.set", coll_mut_list_set),
-
     // ----- Additional Set ops -----
     ("kotlin.collections.Set.containsAll", coll_set_contains_all),
     ("kotlin.collections.Set.toList", coll_set_to_list),
-    ("kotlin.collections.Set.toMutableList", coll_set_to_mutable_list),
+    (
+        "kotlin.collections.Set.toMutableList",
+        coll_set_to_mutable_list,
+    ),
     ("kotlin.collections.Set.toSet", coll_set_to_set_),
-    ("kotlin.collections.Set.toMutableSet", coll_set_to_mutable_set_),
+    (
+        "kotlin.collections.Set.toMutableSet",
+        coll_set_to_mutable_set_,
+    ),
     ("kotlin.collections.Set.withIndex", coll_set_with_index),
-    ("kotlin.collections.MutableSet.containsAll", coll_set_contains_all),
+    (
+        "kotlin.collections.MutableSet.containsAll",
+        coll_set_contains_all,
+    ),
     ("kotlin.collections.MutableSet.toList", coll_set_to_list),
     ("kotlin.collections.MutableSet.addAll", coll_mut_set_add_all),
-
     // ----- Additional Map ops -----
-    ("kotlin.collections.Map.getOrDefault", coll_map_get_or_default),
+    (
+        "kotlin.collections.Map.getOrDefault",
+        coll_map_get_or_default,
+    ),
     ("kotlin.collections.Map.getValue", coll_map_get_value),
     ("kotlin.collections.Map.toList", coll_map_to_list),
     ("kotlin.collections.Map.count", coll_map_count_no_pred),
-    ("kotlin.collections.MutableMap.getOrDefault", coll_map_get_or_default),
+    (
+        "kotlin.collections.MutableMap.getOrDefault",
+        coll_map_get_or_default,
+    ),
     ("kotlin.collections.MutableMap.getValue", coll_map_get_value),
     ("kotlin.collections.MutableMap.toList", coll_map_to_list),
-    ("kotlin.collections.MutableMap.count", coll_map_count_no_pred),
+    (
+        "kotlin.collections.MutableMap.count",
+        coll_map_count_no_pred,
+    ),
     ("kotlin.collections.MutableMap.putAll", coll_mut_map_put_all),
     ("kotlin.collections.MutableMap.set", coll_mut_map_set),
     ("kotlin.collections.MutableMap.merge", map_merge),
-    ("kotlin.collections.MutableMap.putIfAbsent", map_put_if_absent),
+    (
+        "kotlin.collections.MutableMap.putIfAbsent",
+        map_put_if_absent,
+    ),
     ("kotlin.collections.MutableMap.replace", map_replace),
-    ("kotlin.collections.MutableMap.computeIfAbsent", map_compute_if_absent),
-    ("kotlin.collections.MutableMap.computeIfPresent", map_compute_if_present),
+    (
+        "kotlin.collections.MutableMap.computeIfAbsent",
+        map_compute_if_absent,
+    ),
+    (
+        "kotlin.collections.MutableMap.computeIfPresent",
+        map_compute_if_present,
+    ),
     ("kotlin.collections.MutableMap.compute", map_compute),
-
     // ----- Iterable higher-order (lambda-driven) -----
     // forEach / map / filter / filterNotNull / any / all / none on
     // List / Set / Iterable migrated to common-Kotlin shims in
@@ -848,60 +1072,168 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.MutableSet.sumOf", coll_iter_sum_of),
     ("kotlin.collections.Map.sumOf", coll_iter_sum_of),
     ("kotlin.collections.MutableMap.sumOf", coll_iter_sum_of),
-    ("kotlin.collections.List.maxOfOrNull", coll_iter_max_of_or_null),
-    ("kotlin.collections.MutableList.maxOfOrNull", coll_iter_max_of_or_null),
-    ("kotlin.collections.Set.maxOfOrNull", coll_iter_max_of_or_null),
-    ("kotlin.collections.Iterable.maxOfOrNull", coll_iter_max_of_or_null),
-    ("kotlin.collections.List.minOfOrNull", coll_iter_min_of_or_null),
-    ("kotlin.collections.MutableList.minOfOrNull", coll_iter_min_of_or_null),
-    ("kotlin.collections.Set.minOfOrNull", coll_iter_min_of_or_null),
-    ("kotlin.collections.Iterable.minOfOrNull", coll_iter_min_of_or_null),
+    (
+        "kotlin.collections.List.maxOfOrNull",
+        coll_iter_max_of_or_null,
+    ),
+    (
+        "kotlin.collections.MutableList.maxOfOrNull",
+        coll_iter_max_of_or_null,
+    ),
+    (
+        "kotlin.collections.Set.maxOfOrNull",
+        coll_iter_max_of_or_null,
+    ),
+    (
+        "kotlin.collections.Iterable.maxOfOrNull",
+        coll_iter_max_of_or_null,
+    ),
+    (
+        "kotlin.collections.List.minOfOrNull",
+        coll_iter_min_of_or_null,
+    ),
+    (
+        "kotlin.collections.MutableList.minOfOrNull",
+        coll_iter_min_of_or_null,
+    ),
+    (
+        "kotlin.collections.Set.minOfOrNull",
+        coll_iter_min_of_or_null,
+    ),
+    (
+        "kotlin.collections.Iterable.minOfOrNull",
+        coll_iter_min_of_or_null,
+    ),
     ("kotlin.collections.List.distinctBy", coll_iter_distinct_by),
-    ("kotlin.collections.MutableList.distinctBy", coll_iter_distinct_by),
+    (
+        "kotlin.collections.MutableList.distinctBy",
+        coll_iter_distinct_by,
+    ),
     ("kotlin.collections.Set.distinctBy", coll_iter_distinct_by),
-    ("kotlin.collections.MutableSet.distinctBy", coll_iter_distinct_by),
+    (
+        "kotlin.collections.MutableSet.distinctBy",
+        coll_iter_distinct_by,
+    ),
     ("kotlin.collections.List.groupBy", coll_iter_group_by),
     ("kotlin.collections.MutableList.groupBy", coll_iter_group_by),
     ("kotlin.collections.Set.groupBy", coll_iter_group_by),
     ("kotlin.collections.MutableSet.groupBy", coll_iter_group_by),
     ("kotlin.collections.List.groupingBy", coll_iter_grouping_by),
-    ("kotlin.collections.MutableList.groupingBy", coll_iter_grouping_by),
+    (
+        "kotlin.collections.MutableList.groupingBy",
+        coll_iter_grouping_by,
+    ),
     ("kotlin.collections.Set.groupingBy", coll_iter_grouping_by),
-    ("kotlin.collections.MutableSet.groupingBy", coll_iter_grouping_by),
-    ("kotlin.collections.Grouping.eachCount", coll_grouping_each_count),
+    (
+        "kotlin.collections.MutableSet.groupingBy",
+        coll_iter_grouping_by,
+    ),
+    (
+        "kotlin.collections.Grouping.eachCount",
+        coll_grouping_each_count,
+    ),
     ("kotlin.collections.Grouping.fold", coll_grouping_fold),
     ("kotlin.collections.Grouping.reduce", coll_grouping_reduce),
     ("kotlin.collections.List.associate", coll_iter_associate),
-    ("kotlin.collections.MutableList.associate", coll_iter_associate),
+    (
+        "kotlin.collections.MutableList.associate",
+        coll_iter_associate,
+    ),
     ("kotlin.collections.Set.associate", coll_iter_associate),
-    ("kotlin.collections.MutableSet.associate", coll_iter_associate),
-    ("kotlin.collections.List.associateBy", coll_iter_associate_by),
-    ("kotlin.collections.MutableList.associateBy", coll_iter_associate_by),
+    (
+        "kotlin.collections.MutableSet.associate",
+        coll_iter_associate,
+    ),
+    (
+        "kotlin.collections.List.associateBy",
+        coll_iter_associate_by,
+    ),
+    (
+        "kotlin.collections.MutableList.associateBy",
+        coll_iter_associate_by,
+    ),
     ("kotlin.collections.Set.associateBy", coll_iter_associate_by),
-    ("kotlin.collections.MutableSet.associateBy", coll_iter_associate_by),
-    ("kotlin.collections.List.associateWith", coll_iter_associate_with),
-    ("kotlin.collections.MutableList.associateWith", coll_iter_associate_with),
-    ("kotlin.collections.Set.associateWith", coll_iter_associate_with),
-    ("kotlin.collections.MutableSet.associateWith", coll_iter_associate_with),
+    (
+        "kotlin.collections.MutableSet.associateBy",
+        coll_iter_associate_by,
+    ),
+    (
+        "kotlin.collections.List.associateWith",
+        coll_iter_associate_with,
+    ),
+    (
+        "kotlin.collections.MutableList.associateWith",
+        coll_iter_associate_with,
+    ),
+    (
+        "kotlin.collections.Set.associateWith",
+        coll_iter_associate_with,
+    ),
+    (
+        "kotlin.collections.MutableSet.associateWith",
+        coll_iter_associate_with,
+    ),
     ("kotlin.collections.List.sortedBy", coll_iter_sorted_by),
-    ("kotlin.collections.MutableList.sortedBy", coll_iter_sorted_by),
+    (
+        "kotlin.collections.MutableList.sortedBy",
+        coll_iter_sorted_by,
+    ),
     ("kotlin.collections.Set.sortedBy", coll_iter_sorted_by),
-    ("kotlin.collections.MutableSet.sortedBy", coll_iter_sorted_by),
+    (
+        "kotlin.collections.MutableSet.sortedBy",
+        coll_iter_sorted_by,
+    ),
     ("kotlin.collections.List.sortedWith", coll_iter_sorted_with),
-    ("kotlin.collections.MutableList.sortedWith", coll_iter_sorted_with),
+    (
+        "kotlin.collections.MutableList.sortedWith",
+        coll_iter_sorted_with,
+    ),
     ("kotlin.collections.Set.sortedWith", coll_iter_sorted_with),
-    ("kotlin.collections.MutableSet.sortedWith", coll_iter_sorted_with),
-    ("kotlin.collections.List.sortedByDescending", coll_iter_sorted_by_desc),
-    ("kotlin.collections.List.maxByOrNull", coll_iter_max_by_or_null),
-    ("kotlin.collections.List.minByOrNull", coll_iter_min_by_or_null),
-    ("kotlin.collections.MutableList.maxByOrNull", coll_iter_max_by_or_null),
-    ("kotlin.collections.MutableList.minByOrNull", coll_iter_min_by_or_null),
-    ("kotlin.collections.Iterable.maxByOrNull", coll_iter_max_by_or_null),
-    ("kotlin.collections.Iterable.minByOrNull", coll_iter_min_by_or_null),
+    (
+        "kotlin.collections.MutableSet.sortedWith",
+        coll_iter_sorted_with,
+    ),
+    (
+        "kotlin.collections.List.sortedByDescending",
+        coll_iter_sorted_by_desc,
+    ),
+    (
+        "kotlin.collections.List.maxByOrNull",
+        coll_iter_max_by_or_null,
+    ),
+    (
+        "kotlin.collections.List.minByOrNull",
+        coll_iter_min_by_or_null,
+    ),
+    (
+        "kotlin.collections.MutableList.maxByOrNull",
+        coll_iter_max_by_or_null,
+    ),
+    (
+        "kotlin.collections.MutableList.minByOrNull",
+        coll_iter_min_by_or_null,
+    ),
+    (
+        "kotlin.collections.Iterable.maxByOrNull",
+        coll_iter_max_by_or_null,
+    ),
+    (
+        "kotlin.collections.Iterable.minByOrNull",
+        coll_iter_min_by_or_null,
+    ),
     ("kotlin.collections.MutableList.sort", coll_mut_list_sort),
-    ("kotlin.collections.MutableList.sortedByDescending", coll_iter_sorted_by_desc),
-    ("kotlin.collections.Set.sortedByDescending", coll_iter_sorted_by_desc),
-    ("kotlin.collections.MutableSet.sortedByDescending", coll_iter_sorted_by_desc),
+    (
+        "kotlin.collections.MutableList.sortedByDescending",
+        coll_iter_sorted_by_desc,
+    ),
+    (
+        "kotlin.collections.Set.sortedByDescending",
+        coll_iter_sorted_by_desc,
+    ),
+    (
+        "kotlin.collections.MutableSet.sortedByDescending",
+        coll_iter_sorted_by_desc,
+    ),
     ("kotlin.collections.List.maxOf", coll_iter_max_of),
     ("kotlin.collections.MutableList.maxOf", coll_iter_max_of),
     ("kotlin.collections.Set.maxOf", coll_iter_max_of),
@@ -915,16 +1247,25 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.Set.onEach", coll_iter_on_each),
     ("kotlin.collections.MutableSet.onEach", coll_iter_on_each),
     ("kotlin.collections.List.mapNotNull", coll_iter_map_not_null),
-    ("kotlin.collections.MutableList.mapNotNull", coll_iter_map_not_null),
+    (
+        "kotlin.collections.MutableList.mapNotNull",
+        coll_iter_map_not_null,
+    ),
     ("kotlin.collections.Set.mapNotNull", coll_iter_map_not_null),
-    ("kotlin.collections.MutableSet.mapNotNull", coll_iter_map_not_null),
+    (
+        "kotlin.collections.MutableSet.mapNotNull",
+        coll_iter_map_not_null,
+    ),
     ("kotlin.collections.Map.getOrElse", map_get_or_else),
     ("kotlin.collections.MutableMap.getOrElse", map_get_or_else),
     ("kotlin.collections.MutableMap.getOrPut", map_get_or_put),
     ("kotlin.comparisons.minOf", math_min),
     ("kotlin.comparisons.maxOf", math_max),
     ("kotlin.comparisons.compareBy", cmp_compare_by),
-    ("kotlin.comparisons.compareByDescending", cmp_compare_by_descending),
+    (
+        "kotlin.comparisons.compareByDescending",
+        cmp_compare_by_descending,
+    ),
     ("kotlin.comparisons.compareValues", cmp_compare_values),
     ("kotlin.comparisons.compareValuesBy", cmp_compare_values_by),
     ("kotlin.Comparator", cmp_comparator_sam),
@@ -937,10 +1278,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.ByteArray", array_ctor_byte),
     ("kotlin.BooleanArray", array_ctor_boolean),
     ("kotlin.CharArray", array_ctor_char),
-
     // ----- Pair extras: toList -----
     ("kotlin.Pair.toList", pair_to_list),
-
     // ----- Result -----
     ("kotlin.Result.Companion.success", result_success),
     ("kotlin.Result.Companion.failure", result_failure),
@@ -959,16 +1298,17 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Result.getOrDefault", result_get_or_default),
     ("kotlin.Result.getOrElse", result_get_or_else),
     ("kotlin.Result.toString", result_to_string),
-
     // ----- kotlin.coroutines intrinsics -----
-    ("kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED", coroutine_suspended_sentinel),
+    (
+        "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED",
+        coroutine_suspended_sentinel,
+    ),
     ("kotlin.coroutines.__klio_co_newSlot", coro_new_slot),
     ("kotlin.coroutines.__klio_co_armSlot", coro_arm_slot),
     ("kotlin.coroutines.__klio_co_disarmSlot", coro_disarm_slot),
     ("kotlin.coroutines.__klio_co_park", coro_park),
     ("kotlin.coroutines.__klio_co_resume", coro_resume),
     ("kotlin.coroutines.__klio_co_runRoot", coro_run_root),
-
     // ----- Regex -----
     ("kotlin.text.Regex", regex_ctor),
     ("kotlin.text.Regex.pattern", regex_pattern),
@@ -985,50 +1325,92 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.text.Regex.split", regex_split),
     ("kotlin.text.Regex.escape", regex_static_escape),
     ("kotlin.text.Regex.fromLiteral", regex_from_literal),
-    ("kotlin.text.Regex.escapeReplacement", regex_static_escape_replacement),
+    (
+        "kotlin.text.Regex.escapeReplacement",
+        regex_static_escape_replacement,
+    ),
     ("kotlin.text.Regex.Companion.escape", regex_static_escape),
-    ("kotlin.text.Regex.Companion.fromLiteral", regex_from_literal),
-    ("kotlin.text.Regex.Companion.escapeReplacement", regex_static_escape_replacement),
+    (
+        "kotlin.text.Regex.Companion.fromLiteral",
+        regex_from_literal,
+    ),
+    (
+        "kotlin.text.Regex.Companion.escapeReplacement",
+        regex_static_escape_replacement,
+    ),
     // Bare-name forms produced by `try_qualified_name` for `Regex.escape(...)`
     // style calls in source. Mirrors the Comparator.naturalOrder pattern.
     ("Regex.escape", regex_static_escape),
     ("Regex.fromLiteral", regex_from_literal),
     ("Regex.escapeReplacement", regex_static_escape_replacement),
-
     // ----- MatchResult / MatchGroup -----
     ("kotlin.text.MatchResult.value", match_result_value),
     ("kotlin.text.MatchResult.range", match_result_range),
-    ("kotlin.text.MatchResult.groupValues", match_result_group_values),
+    (
+        "kotlin.text.MatchResult.groupValues",
+        match_result_group_values,
+    ),
     ("kotlin.text.MatchResult.groups", match_result_groups),
     ("kotlin.text.MatchResult.next", match_result_next),
     ("kotlin.text.MatchResult.toString", match_result_to_string),
     ("kotlin.text.MatchGroup.value", match_group_value),
     ("kotlin.text.MatchGroup.range", match_group_range),
-
     // ----- StringBuilder -----
     ("kotlin.String", string_ctor),
     ("kotlin.text.StringBuilder", string_builder_ctor),
     ("kotlin.StringBuilder", string_builder_ctor),
     ("kotlin.text.StringBuilder.append", string_builder_append),
-    ("kotlin.text.StringBuilder.appendLine", string_builder_append_line),
+    (
+        "kotlin.text.StringBuilder.appendLine",
+        string_builder_append_line,
+    ),
     ("kotlin.text.StringBuilder.length", string_builder_length),
-    ("kotlin.text.StringBuilder.toString", string_builder_to_string),
+    (
+        "kotlin.text.StringBuilder.toString",
+        string_builder_to_string,
+    ),
     ("kotlin.text.StringBuilder.get", string_builder_get),
     ("kotlin.text.StringBuilder.isEmpty", string_builder_is_empty),
-    ("kotlin.text.StringBuilder.isNotEmpty", string_builder_is_not_empty),
+    (
+        "kotlin.text.StringBuilder.isNotEmpty",
+        string_builder_is_not_empty,
+    ),
     ("kotlin.text.StringBuilder.clear", string_builder_clear),
     ("kotlin.text.StringBuilder.insert", string_builder_insert),
-    ("kotlin.text.StringBuilder.deleteAt", string_builder_delete_at),
-    ("kotlin.text.StringBuilder.deleteRange", string_builder_delete_range),
-    ("kotlin.text.StringBuilder.setLength", string_builder_set_length),
+    (
+        "kotlin.text.StringBuilder.deleteAt",
+        string_builder_delete_at,
+    ),
+    (
+        "kotlin.text.StringBuilder.deleteRange",
+        string_builder_delete_range,
+    ),
+    (
+        "kotlin.text.StringBuilder.setLength",
+        string_builder_set_length,
+    ),
     ("kotlin.text.StringBuilder.reverse", string_builder_reverse),
-    ("kotlin.text.StringBuilder.substring", string_builder_substring),
-    ("kotlin.text.StringBuilder.subSequence", string_builder_substring),
-    ("kotlin.text.StringBuilder.delete", string_builder_delete_range),
-    ("kotlin.text.StringBuilder.setCharAt", string_builder_set_char_at),
+    (
+        "kotlin.text.StringBuilder.substring",
+        string_builder_substring,
+    ),
+    (
+        "kotlin.text.StringBuilder.subSequence",
+        string_builder_substring,
+    ),
+    (
+        "kotlin.text.StringBuilder.delete",
+        string_builder_delete_range,
+    ),
+    (
+        "kotlin.text.StringBuilder.setCharAt",
+        string_builder_set_char_at,
+    ),
     ("kotlin.text.StringBuilder.replace", string_builder_replace),
-    ("kotlin.text.StringBuilder.lastIndex", string_builder_last_index),
-
+    (
+        "kotlin.text.StringBuilder.lastIndex",
+        string_builder_last_index,
+    ),
     // ----- String.format / kotlin.text.format -----
     ("kotlin.text.String.format", string_format_static),
     ("kotlin.text.format", string_format_static),
@@ -1036,7 +1418,6 @@ const TABLE: &[(&str, StdlibFn)] = &[
     // `String.format("...", x)` resolves through `try_qualified_name` as
     // the bare key "String.format".
     ("String.format", string_format_static),
-
     // ----- Char title-case -----
     ("kotlin.Char.titlecase", char_titlecase),
     ("kotlin.Char.titlecaseChar", char_titlecase_char),
@@ -1055,89 +1436,170 @@ const PARAM_NAMES: &[(&str, &[&str])] = &[
     ("kotlin.collections.List.chunked", &["size", "transform"]),
     ("kotlin.collections.List.drop", &["n"]),
     ("kotlin.collections.List.dropLast", &["n"]),
-    ("kotlin.collections.List.joinToString", &[
-        "separator", "prefix", "postfix", "limit", "truncated", "transform",
-    ]),
+    (
+        "kotlin.collections.List.joinToString",
+        &[
+            "separator",
+            "prefix",
+            "postfix",
+            "limit",
+            "truncated",
+            "transform",
+        ],
+    ),
     ("kotlin.collections.List.slice", &["indices"]),
     ("kotlin.collections.List.subList", &["fromIndex", "toIndex"]),
     ("kotlin.collections.List.take", &["n"]),
     ("kotlin.collections.List.takeLast", &["n"]),
-    ("kotlin.collections.List.windowed", &[
-        "size", "step", "partialWindows", "transform",
-    ]),
-    ("kotlin.collections.MutableList.chunked", &["size", "transform"]),
+    (
+        "kotlin.collections.List.windowed",
+        &["size", "step", "partialWindows", "transform"],
+    ),
+    (
+        "kotlin.collections.MutableList.chunked",
+        &["size", "transform"],
+    ),
     ("kotlin.collections.MutableList.drop", &["n"]),
     ("kotlin.collections.MutableList.dropLast", &["n"]),
-    ("kotlin.collections.MutableList.joinToString", &[
-        "separator", "prefix", "postfix", "limit", "truncated", "transform",
-    ]),
+    (
+        "kotlin.collections.MutableList.joinToString",
+        &[
+            "separator",
+            "prefix",
+            "postfix",
+            "limit",
+            "truncated",
+            "transform",
+        ],
+    ),
     ("kotlin.collections.MutableList.slice", &["indices"]),
-    ("kotlin.collections.MutableList.subList", &["fromIndex", "toIndex"]),
+    (
+        "kotlin.collections.MutableList.subList",
+        &["fromIndex", "toIndex"],
+    ),
     ("kotlin.collections.MutableList.take", &["n"]),
     ("kotlin.collections.MutableList.takeLast", &["n"]),
-    ("kotlin.collections.MutableList.windowed", &[
-        "size", "step", "partialWindows", "transform",
-    ]),
+    (
+        "kotlin.collections.MutableList.windowed",
+        &["size", "step", "partialWindows", "transform"],
+    ),
     ("kotlin.String.chunked", &["size", "transform"]),
     ("kotlin.String.repeat", &["n"]),
-    ("kotlin.String.replace", &["oldValue", "newValue", "ignoreCase"]),
-    ("kotlin.String.split", &["delimiters", "ignoreCase", "limit"]),
+    (
+        "kotlin.String.replace",
+        &["oldValue", "newValue", "ignoreCase"],
+    ),
+    (
+        "kotlin.String.split",
+        &["delimiters", "ignoreCase", "limit"],
+    ),
     ("kotlin.String.substring", &["startIndex", "endIndex"]),
     ("kotlin.String.subSequence", &["startIndex", "endIndex"]),
-    ("kotlin.CharSequence.subSequence", &["startIndex", "endIndex"]),
+    (
+        "kotlin.CharSequence.subSequence",
+        &["startIndex", "endIndex"],
+    ),
     ("kotlin.String.padStart", &["length", "padChar"]),
     ("kotlin.CharSequence.padStart", &["length", "padChar"]),
     ("kotlin.String.padEnd", &["length", "padChar"]),
     ("kotlin.CharSequence.padEnd", &["length", "padChar"]),
-    ("kotlin.String.windowed", &[
-        "size", "step", "partialWindows", "transform",
-    ]),
-    ("kotlin.String.indexOf", &["string", "startIndex", "ignoreCase"]),
-    ("kotlin.String.lastIndexOf", &["string", "startIndex", "ignoreCase"]),
+    (
+        "kotlin.String.windowed",
+        &["size", "step", "partialWindows", "transform"],
+    ),
+    (
+        "kotlin.String.indexOf",
+        &["string", "startIndex", "ignoreCase"],
+    ),
+    (
+        "kotlin.String.lastIndexOf",
+        &["string", "startIndex", "ignoreCase"],
+    ),
     ("kotlin.String.contains", &["other", "ignoreCase"]),
     ("kotlin.String.startsWith", &["prefix", "ignoreCase"]),
     ("kotlin.String.endsWith", &["suffix", "ignoreCase"]),
-    ("kotlin.String.regionMatches", &[
-        "thisOffset", "other", "otherOffset", "length", "ignoreCase",
-    ]),
+    (
+        "kotlin.String.regionMatches",
+        &["thisOffset", "other", "otherOffset", "length", "ignoreCase"],
+    ),
     ("kotlin.String.toInt", &["radix"]),
     ("kotlin.String.toIntOrNull", &["radix"]),
     ("kotlin.String.toLong", &["radix"]),
     ("kotlin.String.toLongOrNull", &["radix"]),
     ("kotlin.Int.toString", &["radix"]),
-
     // Set parallels.
-    ("kotlin.collections.Set.joinToString", &[
-        "separator", "prefix", "postfix", "limit", "truncated", "transform",
-    ]),
-    ("kotlin.collections.MutableSet.joinToString", &[
-        "separator", "prefix", "postfix", "limit", "truncated", "transform",
-    ]),
-
+    (
+        "kotlin.collections.Set.joinToString",
+        &[
+            "separator",
+            "prefix",
+            "postfix",
+            "limit",
+            "truncated",
+            "transform",
+        ],
+    ),
+    (
+        "kotlin.collections.MutableSet.joinToString",
+        &[
+            "separator",
+            "prefix",
+            "postfix",
+            "limit",
+            "truncated",
+            "transform",
+        ],
+    ),
     // Range / IntProgression.
-    ("kotlin.ranges.IntRange.joinToString", &[
-        "separator", "prefix", "postfix", "limit", "truncated", "transform",
-    ]),
-    ("kotlin.ranges.IntProgression.joinToString", &[
-        "separator", "prefix", "postfix", "limit", "truncated", "transform",
-    ]),
-
+    (
+        "kotlin.ranges.IntRange.joinToString",
+        &[
+            "separator",
+            "prefix",
+            "postfix",
+            "limit",
+            "truncated",
+            "transform",
+        ],
+    ),
+    (
+        "kotlin.ranges.IntProgression.joinToString",
+        &[
+            "separator",
+            "prefix",
+            "postfix",
+            "limit",
+            "truncated",
+            "transform",
+        ],
+    ),
     // Map intrinsics where a default arg is meaningful.
-    ("kotlin.collections.Map.getOrDefault", &["key", "defaultValue"]),
-    ("kotlin.collections.MutableMap.getOrDefault", &["key", "defaultValue"]),
-
+    (
+        "kotlin.collections.Map.getOrDefault",
+        &["key", "defaultValue"],
+    ),
+    (
+        "kotlin.collections.MutableMap.getOrDefault",
+        &["key", "defaultValue"],
+    ),
     // Single-arg intrinsics where the named form is occasionally seen.
     ("kotlin.collections.List.sortedWith", &["comparator"]),
     ("kotlin.collections.MutableList.sortedWith", &["comparator"]),
-
     // Result.
     ("kotlin.Result.getOrDefault", &["defaultValue"]),
-
     // Threads / monitors.
     ("kotlin.synchronized", &["lock", "block"]),
-    ("kotlin.concurrent.thread", &[
-        "start", "isDaemon", "contextClassLoader", "name", "priority", "block",
-    ]),
+    (
+        "kotlin.concurrent.thread",
+        &[
+            "start",
+            "isDaemon",
+            "contextClassLoader",
+            "name",
+            "priority",
+            "block",
+        ],
+    ),
     ("kotlin.concurrent.Thread.sleep", &["millis"]),
 ];
 
@@ -1202,7 +1664,11 @@ mod tests {
     fn call(fn_: StdlibFn, args: &[Value]) -> Result<Value, RuntimeError> {
         let mut out = klio_runtime::CaptureOutput::default();
         let mut host = klio_runtime::NoopHost::default();
-        fn_(&mut CallCtx { args, out: &mut out, host: &mut host })
+        fn_(&mut CallCtx {
+            args,
+            out: &mut out,
+            host: &mut host,
+        })
     }
 
     #[test]
@@ -1220,24 +1686,39 @@ mod tests {
 
     #[test]
     fn math_abs_int_and_double() {
-        assert!(matches!(call(math_abs, &[Value::Int(-5)]), Ok(Value::Int(5))));
-        let Ok(Value::Double(d)) = call(math_abs, &[Value::Double(-1.5)]) else { panic!() };
+        assert!(matches!(
+            call(math_abs, &[Value::Int(-5)]),
+            Ok(Value::Int(5))
+        ));
+        let Ok(Value::Double(d)) = call(math_abs, &[Value::Double(-1.5)]) else {
+            panic!()
+        };
         assert!((d - 1.5).abs() < 1e-12);
     }
 
     #[test]
     fn math_sin_cos_identities() {
-        let Ok(Value::Double(s)) = call(math_sin, &[Value::Double(0.0)]) else { panic!() };
-        let Ok(Value::Double(c)) = call(math_cos, &[Value::Double(0.0)]) else { panic!() };
+        let Ok(Value::Double(s)) = call(math_sin, &[Value::Double(0.0)]) else {
+            panic!()
+        };
+        let Ok(Value::Double(c)) = call(math_cos, &[Value::Double(0.0)]) else {
+            panic!()
+        };
         assert!(s.abs() < 1e-12);
         assert!((c - 1.0).abs() < 1e-12);
     }
 
     #[test]
     fn math_floor_ceil_round() {
-        assert!(matches!(call(math_floor, &[Value::Double(1.7)]), Ok(Value::Double(d)) if (d - 1.0).abs() < 1e-12));
-        assert!(matches!(call(math_ceil, &[Value::Double(1.2)]), Ok(Value::Double(d)) if (d - 2.0).abs() < 1e-12));
-        assert!(matches!(call(math_round, &[Value::Double(1.5)]), Ok(Value::Double(d)) if (d - 2.0).abs() < 1e-12));
+        assert!(
+            matches!(call(math_floor, &[Value::Double(1.7)]), Ok(Value::Double(d)) if (d - 1.0).abs() < 1e-12)
+        );
+        assert!(
+            matches!(call(math_ceil, &[Value::Double(1.2)]), Ok(Value::Double(d)) if (d - 2.0).abs() < 1e-12)
+        );
+        assert!(
+            matches!(call(math_round, &[Value::Double(1.5)]), Ok(Value::Double(d)) if (d - 2.0).abs() < 1e-12)
+        );
     }
 
     #[test]
@@ -1249,7 +1730,9 @@ mod tests {
     #[test]
     fn string_get_returns_char() {
         let s = Value::String(Arc::new("abc".to_string()));
-        assert!(matches!(call(string_get, &[s, Value::Int(1)]), Ok(Value::Char(c)) if c == u16::from(b'b')));
+        assert!(
+            matches!(call(string_get, &[s, Value::Int(1)]), Ok(Value::Char(c)) if c == u16::from(b'b'))
+        );
     }
 
     #[test]
@@ -1262,116 +1745,263 @@ mod tests {
     #[test]
     fn string_substring_two_args() {
         let s = Value::String(Arc::new("abcdef".to_string()));
-        let Ok(Value::String(out)) = call(string_substring, &[s, Value::Int(1), Value::Int(4)]) else { panic!() };
+        let Ok(Value::String(out)) = call(string_substring, &[s, Value::Int(1), Value::Int(4)])
+        else {
+            panic!()
+        };
         assert_eq!(*out, "bcd");
     }
 
     #[test]
     fn string_repeat_and_reversed() {
         let s = Value::String(Arc::new("ab".to_string()));
-        let Ok(Value::String(r)) = call(string_repeat, &[s.clone(), Value::Int(3)]) else { panic!() };
+        let Ok(Value::String(r)) = call(string_repeat, &[s.clone(), Value::Int(3)]) else {
+            panic!()
+        };
         assert_eq!(*r, "ababab");
-        let Ok(Value::String(rev)) = call(string_reversed, &[s]) else { panic!() };
+        let Ok(Value::String(rev)) = call(string_reversed, &[s]) else {
+            panic!()
+        };
         assert_eq!(*rev, "ba");
     }
 
     #[test]
     fn char_is_digit_letter_whitespace() {
-        assert!(matches!(call(char_is_digit, &[Value::Char('5' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_letter, &[Value::Char('a' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char(' ' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(
+            call(char_is_digit, &[Value::Char('5' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_letter, &[Value::Char('a' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_whitespace, &[Value::Char(' ' as u16)]),
+            Ok(Value::Bool(true))
+        ));
     }
 
     #[test]
     fn char_unicode_category_predicates() {
         // ASCII baseline.
-        assert!(matches!(call(char_is_letter, &[Value::Char('A' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_letter, &[Value::Char('z' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_digit, &[Value::Char('0' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\t' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\n' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(
+            call(char_is_letter, &[Value::Char('A' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_letter, &[Value::Char('z' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_digit, &[Value::Char('0' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_whitespace, &[Value::Char('\t' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_whitespace, &[Value::Char('\n' as u16)]),
+            Ok(Value::Bool(true))
+        ));
 
         // Non-ASCII letters.
-        assert!(matches!(call(char_is_letter, &[Value::Char('α' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_letter, &[Value::Char('я' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_uppercase, &[Value::Char('Я' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(
+            call(char_is_letter, &[Value::Char('α' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_letter, &[Value::Char('я' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_uppercase, &[Value::Char('Я' as u16)]),
+            Ok(Value::Bool(true))
+        ));
 
         // kotlinc-native treats NBSP-family code points as whitespace
         // (matches its built-in whitespace table; this also happens to match
         // Rust's `char::is_whitespace` here, so no divergence).
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{00A0}' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{202F}' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{2007}' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(
+            call(char_is_whitespace, &[Value::Char('\u{00A0}' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_whitespace, &[Value::Char('\u{202F}' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_whitespace, &[Value::Char('\u{2007}' as u16)]),
+            Ok(Value::Bool(true))
+        ));
         // Divergence: ASCII control 0x1C..=0x1F. Kotlin -> true (in the
         // kotlinc-native whitespace table), Rust -> false.
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{001F}' as u16)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{001C}' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(
+            call(char_is_whitespace, &[Value::Char('\u{001F}' as u16)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(char_is_whitespace, &[Value::Char('\u{001C}' as u16)]),
+            Ok(Value::Bool(true))
+        ));
 
         // Divergence: Arabic-Indic digit five (U+0665). Both true under Nd,
         // but it's a non-ASCII digit guarded by the old `is_ascii_digit` call
         // which returned false. New code matches kotlinc.
-        assert!(matches!(call(char_is_digit, &[Value::Char('\u{0665}' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(
+            call(char_is_digit, &[Value::Char('\u{0665}' as u16)]),
+            Ok(Value::Bool(true))
+        ));
 
         // Divergence: Roman numeral V (U+2164). Other_Uppercase contributory
         // property -> Kotlin treats as uppercase; Rust `is_uppercase` -> false.
-        assert!(matches!(call(char_is_uppercase, &[Value::Char('\u{2164}' as u16)]), Ok(Value::Bool(true))));
+        assert!(matches!(
+            call(char_is_uppercase, &[Value::Char('\u{2164}' as u16)]),
+            Ok(Value::Bool(true))
+        ));
 
         // ZWSP (U+200B): neither Rust nor Kotlin treat as whitespace; sanity.
-        assert!(matches!(call(char_is_whitespace, &[Value::Char('\u{200B}' as u16)]), Ok(Value::Bool(false))));
+        assert!(matches!(
+            call(char_is_whitespace, &[Value::Char('\u{200B}' as u16)]),
+            Ok(Value::Bool(false))
+        ));
     }
 
     #[test]
     fn int_bitwise_ops() {
-        assert!(matches!(call(int_and, &[Value::Int(0b1100), Value::Int(0b1010)]), Ok(Value::Int(0b1000))));
-        assert!(matches!(call(int_or,  &[Value::Int(0b1100), Value::Int(0b1010)]), Ok(Value::Int(0b1110))));
-        assert!(matches!(call(int_xor, &[Value::Int(0b1100), Value::Int(0b1010)]), Ok(Value::Int(0b0110))));
-        assert!(matches!(call(int_shl, &[Value::Int(1), Value::Int(3)]), Ok(Value::Int(8))));
-        assert!(matches!(call(int_shr, &[Value::Int(8), Value::Int(2)]), Ok(Value::Int(2))));
+        assert!(matches!(
+            call(int_and, &[Value::Int(0b1100), Value::Int(0b1010)]),
+            Ok(Value::Int(0b1000))
+        ));
+        assert!(matches!(
+            call(int_or, &[Value::Int(0b1100), Value::Int(0b1010)]),
+            Ok(Value::Int(0b1110))
+        ));
+        assert!(matches!(
+            call(int_xor, &[Value::Int(0b1100), Value::Int(0b1010)]),
+            Ok(Value::Int(0b0110))
+        ));
+        assert!(matches!(
+            call(int_shl, &[Value::Int(1), Value::Int(3)]),
+            Ok(Value::Int(8))
+        ));
+        assert!(matches!(
+            call(int_shr, &[Value::Int(8), Value::Int(2)]),
+            Ok(Value::Int(2))
+        ));
     }
 
     #[test]
     fn double_predicates() {
-        assert!(matches!(call(double_is_nan, &[Value::Double(f64::NAN)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(double_is_infinite, &[Value::Double(f64::INFINITY)]), Ok(Value::Bool(true))));
-        assert!(matches!(call(double_is_finite, &[Value::Double(1.0)]), Ok(Value::Bool(true))));
+        assert!(matches!(
+            call(double_is_nan, &[Value::Double(f64::NAN)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(double_is_infinite, &[Value::Double(f64::INFINITY)]),
+            Ok(Value::Bool(true))
+        ));
+        assert!(matches!(
+            call(double_is_finite, &[Value::Double(1.0)]),
+            Ok(Value::Bool(true))
+        ));
     }
 
     #[test]
     fn string_substring_before_after() {
         let s = Value::String(Arc::new("a.b.c".to_string()));
-        let Ok(Value::String(before)) = call(string_substring_before, &[s.clone(), Value::String(Arc::new(".".into()))]) else { panic!() };
+        let Ok(Value::String(before)) = call(
+            string_substring_before,
+            &[s.clone(), Value::String(Arc::new(".".into()))],
+        ) else {
+            panic!()
+        };
         assert_eq!(*before, "a");
-        let Ok(Value::String(after)) = call(string_substring_after_last, &[s, Value::String(Arc::new(".".into()))]) else { panic!() };
+        let Ok(Value::String(after)) = call(
+            string_substring_after_last,
+            &[s, Value::String(Arc::new(".".into()))],
+        ) else {
+            panic!()
+        };
         assert_eq!(*after, "c");
     }
 
     #[test]
     fn map_get_or_default_falls_back() {
-        let m = make_map(vec![(Value::String(Arc::new("a".into())), Value::Int(1))], false);
-        let Ok(v) = call(coll_map_get_or_default, &[m.clone(), Value::String(Arc::new("a".into())), Value::Int(99)]) else { panic!() };
+        let m = make_map(
+            vec![(Value::String(Arc::new("a".into())), Value::Int(1))],
+            false,
+        );
+        let Ok(v) = call(
+            coll_map_get_or_default,
+            &[
+                m.clone(),
+                Value::String(Arc::new("a".into())),
+                Value::Int(99),
+            ],
+        ) else {
+            panic!()
+        };
         assert!(matches!(v, Value::Int(1)));
-        let Ok(v) = call(coll_map_get_or_default, &[m, Value::String(Arc::new("z".into())), Value::Int(99)]) else { panic!() };
+        let Ok(v) = call(
+            coll_map_get_or_default,
+            &[m, Value::String(Arc::new("z".into())), Value::Int(99)],
+        ) else {
+            panic!()
+        };
         assert!(matches!(v, Value::Int(99)));
     }
 
     #[test]
     fn int_coerce_in_range_and_pair() {
-        assert!(matches!(call(int_coerce_in, &[Value::Int(5), Value::Int(0), Value::Int(3)]), Ok(Value::Int(3))));
-        assert!(matches!(call(int_coerce_in, &[Value::Int(-1), Value::Int(0), Value::Int(3)]), Ok(Value::Int(0))));
-        assert!(matches!(call(int_coerce_in, &[Value::Int(2), Value::Range { start: 0, end: 5, step: 1, kind: klio_runtime::RangeKind::Int }]), Ok(Value::Int(2))));
+        assert!(matches!(
+            call(
+                int_coerce_in,
+                &[Value::Int(5), Value::Int(0), Value::Int(3)]
+            ),
+            Ok(Value::Int(3))
+        ));
+        assert!(matches!(
+            call(
+                int_coerce_in,
+                &[Value::Int(-1), Value::Int(0), Value::Int(3)]
+            ),
+            Ok(Value::Int(0))
+        ));
+        assert!(matches!(
+            call(
+                int_coerce_in,
+                &[
+                    Value::Int(2),
+                    Value::Range {
+                        start: 0,
+                        end: 5,
+                        step: 1,
+                        kind: klio_runtime::RangeKind::Int
+                    }
+                ]
+            ),
+            Ok(Value::Int(2))
+        ));
     }
 
     #[test]
     fn string_lines_splits_on_all_line_separators() {
         let s = Value::String(Arc::new("a\nb\r\nc\rd".to_string()));
-        let Ok(Value::List { items, .. }) = call(string_lines, &[s]) else { panic!() };
+        let Ok(Value::List { items, .. }) = call(string_lines, &[s]) else {
+            panic!()
+        };
         assert_eq!(items.borrow().len(), 4);
     }
 
     #[test]
     fn regex_find_returns_match() {
         let re = call(regex_ctor, &[Value::String(Arc::new(r"\d+".into()))]).unwrap();
-        let v = call(regex_find, &[re, Value::String(Arc::new("abc 123 def".into()))]).unwrap();
+        let v = call(
+            regex_find,
+            &[re, Value::String(Arc::new("abc 123 def".into()))],
+        )
+        .unwrap();
         let Value::Match(m) = v else { panic!() };
         assert_eq!(*m.groups[0].as_ref().unwrap().value, "123");
     }
@@ -1379,11 +2009,19 @@ mod tests {
     #[test]
     fn string_builder_append_and_length() {
         let sb = call(string_builder_ctor, &[]).unwrap();
-        call(string_builder_append, &[sb.clone(), Value::String(Arc::new("ab".into()))]).unwrap();
+        call(
+            string_builder_append,
+            &[sb.clone(), Value::String(Arc::new("ab".into()))],
+        )
+        .unwrap();
         call(string_builder_append, &[sb.clone(), Value::Int(7)]).unwrap();
-        let Value::Int(n) = call(string_builder_length, &[sb.clone()]).unwrap() else { panic!() };
+        let Value::Int(n) = call(string_builder_length, std::slice::from_ref(&sb)).unwrap() else {
+            panic!()
+        };
         assert_eq!(n, 3);
-        let Value::String(s) = call(string_builder_to_string, &[sb]).unwrap() else { panic!() };
+        let Value::String(s) = call(string_builder_to_string, &[sb]).unwrap() else {
+            panic!()
+        };
         assert_eq!(&*s, "ab7");
     }
 
@@ -1393,7 +2031,10 @@ mod tests {
         let Value::String(s) = call(
             string_format_static,
             &[fmt, Value::Int(7), Value::String(Arc::new("x".into()))],
-        ).unwrap() else { panic!() };
+        )
+        .unwrap() else {
+            panic!()
+        };
         assert_eq!(&*s, "7-x");
     }
 
@@ -1402,8 +2043,13 @@ mod tests {
         let Ok(Value::Exception { fqn, message, .. }) = call(
             excn_illegal_argument,
             &[Value::String(Arc::new("bad".into()))],
-        ) else { panic!() };
+        ) else {
+            panic!()
+        };
         assert_eq!(*fqn, "kotlin.IllegalArgumentException");
-        assert_eq!(message.as_deref().map(std::string::String::as_str), Some("bad"));
+        assert_eq!(
+            message.as_deref().map(std::string::String::as_str),
+            Some("bad")
+        );
     }
 }

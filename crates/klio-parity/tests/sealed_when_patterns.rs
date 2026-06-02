@@ -129,8 +129,11 @@ fun main() {
     println(xs.joinToString(",") { render(it) })
 }
 "#;
-    assert_klio("nested_when", src,
-        "null,empty-str,short:hi,long:12,pos:7,neg:-3,zero,?\n");
+    assert_klio(
+        "nested_when",
+        src,
+        "null,empty-str,short:hi,long:12,pos:7,neg:-3,zero,?\n",
+    );
 }
 
 #[test]

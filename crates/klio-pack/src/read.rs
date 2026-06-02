@@ -1,12 +1,13 @@
 //! Pack reader. Validates the header, the pack hash, and decodes the
 //! section directory eagerly; section payloads are decoded on demand.
 
-use crate::format::{
-    Compression, SectionDirectory, SectionEntry, FORMAT_VERSION, HASHED_REGION_OFFSET, HASH_LEN,
-    HASH_OFFSET, MAGIC,
-};
 use crate::PackError;
+use crate::format::{
+    Compression, FORMAT_VERSION, HASH_LEN, HASH_OFFSET, HASHED_REGION_OFFSET, MAGIC,
+    SectionDirectory, SectionEntry,
+};
 use std::borrow::Cow;
+use std::io::Read;
 
 /// Backing storage for a pack reader. Owned bytes survive any
 /// file-handle lifetime; mmap'd bytes are kept alive via the
@@ -91,8 +92,7 @@ impl PackReader {
         if &buf[0..4] != MAGIC {
             return Err(PackError::BadMagic);
         }
-        let version =
-            u32::from_le_bytes(buf[4..8].try_into().expect("4-byte version slice"));
+        let version = u32::from_le_bytes(buf[4..8].try_into().expect("4-byte version slice"));
         if version != FORMAT_VERSION {
             return Err(PackError::VersionMismatch {
                 expected: FORMAT_VERSION,
@@ -113,9 +113,7 @@ impl PackReader {
                 .expect("4-byte dir_len slice"),
         ) as usize;
         let dir_start = HASHED_REGION_OFFSET + 4;
-        let dir_end = dir_start
-            .checked_add(dir_len)
-            .ok_or(PackError::Truncated)?;
+        let dir_end = dir_start.checked_add(dir_len).ok_or(PackError::Truncated)?;
         if dir_end > buf.len() {
             return Err(PackError::Truncated);
         }
@@ -123,12 +121,24 @@ impl PackReader {
             postcard::from_bytes(&buf[dir_start..dir_end]).map_err(PackError::Decode)?;
         let payload_start = dir_end;
         for e in &dir.entries {
-            let end = e.offset.checked_add(e.stored_len).ok_or(PackError::Truncated)?;
-            if (payload_start as u64).checked_add(end).is_none_or(|p| p as usize > buf.len()) {
+            let end = e
+                .offset
+                .checked_add(e.stored_len)
+                .ok_or(PackError::Truncated)?;
+            // u64 offsets index host-platform slices; truncation only on <64-bit targets.
+            #[allow(clippy::cast_possible_truncation)]
+            let over_end = (payload_start as u64)
+                .checked_add(end)
+                .is_none_or(|p| p as usize > buf.len());
+            if over_end {
                 return Err(PackError::Truncated);
             }
         }
-        Ok(Self { bytes, dir, payload_start })
+        Ok(Self {
+            bytes,
+            dir,
+            payload_start,
+        })
     }
 
     /// Pack format version recorded in the header.
@@ -149,6 +159,8 @@ impl PackReader {
     }
 
     /// Read a section by name.
+    // u64 offsets index host-platform slices; truncation only on <64-bit targets.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn read_section(&self, name: &str) -> Result<Option<Cow<'_, [u8]>>, PackError> {
         let Some(entry) = self.dir.entries.iter().find(|e| e.name == name) else {
             return Ok(None);
@@ -183,13 +195,13 @@ impl PackReader {
                         ),
                     ))
                 })?;
-                let mut decoder =
-                    zstd::stream::Decoder::with_dictionary(stored, dict)
-                        .map_err(PackError::Compression)?;
+                let mut decoder = zstd::stream::Decoder::with_dictionary(stored, dict)
+                    .map_err(PackError::Compression)?;
                 let mut out =
                     Vec::with_capacity(usize::try_from(entry.uncompressed_len).unwrap_or(0));
-                use std::io::Read;
-                decoder.read_to_end(&mut out).map_err(PackError::Compression)?;
+                decoder
+                    .read_to_end(&mut out)
+                    .map_err(PackError::Compression)?;
                 if out.len() as u64 != entry.uncompressed_len {
                     return Err(PackError::LengthMismatch {
                         section: entry.name.clone(),
@@ -210,6 +222,8 @@ impl PackReader {
         }
     }
 
+    // u64 offsets index host-platform slices; truncation only on <64-bit targets.
+    #[allow(clippy::cast_possible_truncation)]
     fn read_section_raw(&self, name: &str) -> Result<Option<Cow<'_, [u8]>>, PackError> {
         let Some(entry) = self.dir.entries.iter().find(|e| e.name == name) else {
             return Ok(None);
@@ -229,6 +243,12 @@ impl PackReader {
     }
 
     /// Compute the pack hash as stored in the header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the backing bytes are shorter than the header's hash
+    /// region. A reader returned by the constructors always satisfies this,
+    /// since construction rejects buffers that cannot hold the header.
     #[must_use]
     pub fn pack_hash(&self) -> [u8; HASH_LEN] {
         self.bytes.as_slice()[HASH_OFFSET..HASH_OFFSET + HASH_LEN]

@@ -1,10 +1,11 @@
 //! Pack writer. Builds a `.klio-pack` byte stream deterministically.
 
-use crate::format::{
-    section_names, Compression, SectionDirectory, SectionEntry, FORMAT_VERSION, HASHED_REGION_OFFSET,
-    HASH_LEN, MAGIC,
-};
 use crate::PackError;
+use crate::format::{
+    Compression, FORMAT_VERSION, HASH_LEN, HASHED_REGION_OFFSET, MAGIC, SectionDirectory,
+    SectionEntry, section_names,
+};
+use std::io::Write;
 
 /// Default zstd compression level. Level 3 is the zstd default — fast
 /// to encode and decompresses near memcpy speed; the pack format trades
@@ -92,13 +93,17 @@ impl PackWriter {
         // can resolve it on load. If the user explicitly added a
         // zstd_dict section we honour theirs.
         if let Some(dict) = &self.zstd_dict
-            && !self.sections.iter().any(|s| s.name == section_names::ZSTD_DICT) {
-                self.sections.push(PendingSection {
-                    name: section_names::ZSTD_DICT.to_string(),
-                    payload: dict.clone(),
-                    compression: Compression::None,
-                });
-            }
+            && !self
+                .sections
+                .iter()
+                .any(|s| s.name == section_names::ZSTD_DICT)
+        {
+            self.sections.push(PendingSection {
+                name: section_names::ZSTD_DICT.to_string(),
+                payload: dict.clone(),
+                compression: Compression::None,
+            });
+        }
         // Sort by section name so the encoded directory and payload
         // ordering are stable across builds.
         self.sections.sort_by(|a, b| a.name.cmp(&b.name));
@@ -118,8 +123,10 @@ impl PackWriter {
             let uncompressed_len = s.payload.len() as u64;
             let stored = match s.compression {
                 Compression::None => s.payload,
-                Compression::Zstd => zstd::stream::encode_all(s.payload.as_slice(), DEFAULT_ZSTD_LEVEL)
-                    .map_err(PackError::Compression)?,
+                Compression::Zstd => {
+                    zstd::stream::encode_all(s.payload.as_slice(), DEFAULT_ZSTD_LEVEL)
+                        .map_err(PackError::Compression)?
+                }
                 Compression::ZstdDict => {
                     let dict = dict_for_encode.as_ref().ok_or_else(|| {
                         PackError::Compression(std::io::Error::new(
@@ -127,11 +134,15 @@ impl PackWriter {
                             "ZstdDict section requires set_zstd_dict before finish",
                         ))
                     })?;
-                    let mut encoder =
-                        zstd::stream::Encoder::with_dictionary(Vec::new(), DEFAULT_ZSTD_LEVEL, dict)
-                            .map_err(PackError::Compression)?;
-                    use std::io::Write;
-                    encoder.write_all(&s.payload).map_err(PackError::Compression)?;
+                    let mut encoder = zstd::stream::Encoder::with_dictionary(
+                        Vec::new(),
+                        DEFAULT_ZSTD_LEVEL,
+                        dict,
+                    )
+                    .map_err(PackError::Compression)?;
+                    encoder
+                        .write_all(&s.payload)
+                        .map_err(PackError::Compression)?;
                     encoder.finish().map_err(PackError::Compression)?
                 }
             };
@@ -155,9 +166,8 @@ impl PackWriter {
             .map_err(|_| PackError::DirectoryTooLarge(dir_bytes.len()))?;
 
         // Second pass: assemble the final file. Layout matches `format.rs`.
-        let mut out: Vec<u8> = Vec::with_capacity(
-            HASHED_REGION_OFFSET + 4 + dir_bytes.len() + payloads.len(),
-        );
+        let mut out: Vec<u8> =
+            Vec::with_capacity(HASHED_REGION_OFFSET + 4 + dir_bytes.len() + payloads.len());
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&self.flags.to_le_bytes());

@@ -1,8 +1,10 @@
-use crate::{ObjRef, Value, Env};
+use crate::{Env, ObjRef, Value};
 
 use std::sync::{Arc, Mutex};
 
 /// A declared Kotlin class as the interpreter sees it at runtime.
+// The flags are independent class modifiers read individually across the crate.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct ClassDef {
     pub name: String,
@@ -145,6 +147,8 @@ pub struct ClassParamDef {
     pub declared_type: Option<String>,
 }
 
+// The flags are independent member modifiers read individually across the crate.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct MethodDef {
     pub name: String,
@@ -253,7 +257,7 @@ impl ClassDef {
     /// whose first declared parameter type name matches `arg_type_name` —
     /// used by operator dispatch to pick `plus(Bag)` over `plus(Int)` when
     /// the argument is a `Bag`. Falls back to the unspecific lookup.
-    #[must_use] 
+    #[must_use]
     pub fn find_method_for_arg(
         self: &Arc<Self>,
         name: &str,
@@ -271,7 +275,10 @@ impl ClassDef {
     /// Walk the class chain searching for a body property declaration of the
     /// given name. Returns the property and the class that declared it.
     #[must_use]
-    pub fn find_body_property(self: &Arc<Self>, name: &str) -> Option<(PropertyDef, Arc<ClassDef>)> {
+    pub fn find_body_property(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Option<(PropertyDef, Arc<ClassDef>)> {
         let mut seen: Vec<*const ClassDef> = Vec::new();
         find_body_property_walk(self, name, &mut seen)
     }
@@ -379,15 +386,18 @@ fn find_method_for_arg_walk(
             .first()
             .is_some_and(|p| p.ty.name.name == arg_type_name)
     };
-    if let Some(m) = cls.methods.iter().find(|m| {
-        m.name == name && m.decl.body.is_some() && arg_matches(m)
-    }) {
+    if let Some(m) = cls
+        .methods
+        .iter()
+        .find(|m| m.name == name && m.decl.body.is_some() && arg_matches(m))
+    {
         return Some((m.clone(), Arc::clone(cls)));
     }
     if let Some(parent) = cls.parent.borrow().clone()
-        && let Some(found) = find_method_for_arg_walk(&parent, name, arg_type_name, seen) {
-            return Some(found);
-        }
+        && let Some(found) = find_method_for_arg_walk(&parent, name, arg_type_name, seen)
+    {
+        return Some(found);
+    }
     for iface in cls.interfaces.borrow().iter() {
         if let Some(found) = find_method_for_arg_walk(iface, name, arg_type_name, seen) {
             return Some(found);
@@ -406,32 +416,32 @@ fn find_method_walk(
         return None;
     }
     seen.push(ptr);
-    if let Some(m) = cls
-        .methods
-        .iter()
-        .find(|m| {
-            m.name == name
-                && (m.decl.body.is_some()
-                    || m.sam_lambda.is_some()
-                    || m.delegate_field.is_some())
-        })
-    {
+    if let Some(m) = cls.methods.iter().find(|m| {
+        m.name == name
+            && (m.decl.body.is_some() || m.sam_lambda.is_some() || m.delegate_field.is_some())
+    }) {
         return Some((m.clone(), Arc::clone(cls)));
     }
     // Inheritance-delegation forwarders synthesized at parent-link
     // resolution time. Consulted before the parent chain so a delegated
     // member wins over a default body the same way an explicit override
     // would.
-    if let Some(m) = cls.delegate_forwarders.borrow().iter().find(|m| m.name == name) {
+    if let Some(m) = cls
+        .delegate_forwarders
+        .borrow()
+        .iter()
+        .find(|m| m.name == name)
+    {
         return Some((m.clone(), Arc::clone(cls)));
     }
     // Walk the parent chain (concrete superclass) before interfaces — a
     // concrete-method inherited from a parent class wins over an interface
     // default with the same signature.
     if let Some(parent) = cls.parent.borrow().clone()
-        && let Some(found) = find_method_walk(&parent, name, seen) {
-            return Some(found);
-        }
+        && let Some(found) = find_method_walk(&parent, name, seen)
+    {
+        return Some(found);
+    }
     for iface in cls.interfaces.borrow().iter() {
         if let Some(found) = find_method_walk(iface, name, seen) {
             return Some(found);
@@ -459,9 +469,10 @@ fn find_body_property_walk(
         return Some((p.clone(), Arc::clone(cls)));
     }
     if let Some(parent) = cls.parent.borrow().clone()
-        && let Some(found) = find_body_property_walk(&parent, name, seen) {
-            return Some(found);
-        }
+        && let Some(found) = find_body_property_walk(&parent, name, seen)
+    {
+        return Some(found);
+    }
     for iface in cls.interfaces.borrow().iter() {
         if let Some(found) = find_body_property_walk(iface, name, seen) {
             return Some(found);
@@ -473,7 +484,10 @@ fn find_body_property_walk(
 impl InstanceData {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Value> {
-        self.fields.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        self.fields
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
     }
     pub fn set(&mut self, name: &str, v: Value) -> bool {
         if let Some(slot) = self.fields.iter_mut().find(|(n, _)| n == name) {
@@ -490,9 +504,13 @@ impl InstanceData {
     }
 
     /// Fetch the instance's native-state cell, creating it via `init`
-    /// on first access. Panics when the instance already carries
-    /// native state under a different `kind`, which indicates two
-    /// host bindings are fighting over the same instance.
+    /// on first access.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the instance already carries native state under a
+    /// different `kind`, which indicates two host bindings are
+    /// fighting over the same instance.
     pub fn ensure_native_state<T: std::any::Any + Send + Sync>(
         &mut self,
         kind: &'static str,
@@ -506,9 +524,11 @@ impl InstanceData {
             );
             return Arc::clone(&ns.data);
         }
-        let data: Arc<Mutex<dyn std::any::Any + Send + Sync>> =
-            Arc::new(Mutex::new(init()));
-        self.native_state = Some(NativeState { kind, data: Arc::clone(&data) });
+        let data: Arc<Mutex<dyn std::any::Any + Send + Sync>> = Arc::new(Mutex::new(init()));
+        self.native_state = Some(NativeState {
+            kind,
+            data: Arc::clone(&data),
+        });
         data
     }
 }

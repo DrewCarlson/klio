@@ -876,11 +876,12 @@ pub const ABSTRACT_PROPERTY_IN_NON_ABSTRACT_CLASS: DiagnosticFactory = Diagnosti
     default_severity: Severity::Error,
     message_template: "ABSTRACT_PROPERTY_IN_NON_ABSTRACT_CLASS",
 };
-pub const ABSTRACT_PROPERTY_IN_PRIMARY_CONSTRUCTOR_PARAMETERS: DiagnosticFactory = DiagnosticFactory {
-    name: "ABSTRACT_PROPERTY_IN_PRIMARY_CONSTRUCTOR_PARAMETERS",
-    default_severity: Severity::Error,
-    message_template: "Property in primary constructor cannot be declared as abstract.",
-};
+pub const ABSTRACT_PROPERTY_IN_PRIMARY_CONSTRUCTOR_PARAMETERS: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ABSTRACT_PROPERTY_IN_PRIMARY_CONSTRUCTOR_PARAMETERS",
+        default_severity: Severity::Error,
+        message_template: "Property in primary constructor cannot be declared as abstract.",
+    };
 pub const ABSTRACT_PROPERTY_WITHOUT_TYPE: DiagnosticFactory = DiagnosticFactory {
     name: "ABSTRACT_PROPERTY_WITHOUT_TYPE",
     default_severity: Severity::Error,
@@ -946,11 +947,12 @@ pub const ACTUAL_TYPE_ALIAS_NOT_TO_CLASS: DiagnosticFactory = DiagnosticFactory 
     default_severity: Severity::Error,
     message_template: "Right-hand side of actual type alias must be a class, not another type alias.",
 };
-pub const ACTUAL_TYPE_ALIAS_TO_CLASS_WITH_DECLARATION_SITE_VARIANCE: DiagnosticFactory = DiagnosticFactory {
-    name: "ACTUAL_TYPE_ALIAS_TO_CLASS_WITH_DECLARATION_SITE_VARIANCE",
-    default_severity: Severity::Error,
-    message_template: "ACTUAL_TYPE_ALIAS_TO_CLASS_WITH_DECLARATION_SITE_VARIANCE",
-};
+pub const ACTUAL_TYPE_ALIAS_TO_CLASS_WITH_DECLARATION_SITE_VARIANCE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ACTUAL_TYPE_ALIAS_TO_CLASS_WITH_DECLARATION_SITE_VARIANCE",
+        default_severity: Severity::Error,
+        message_template: "ACTUAL_TYPE_ALIAS_TO_CLASS_WITH_DECLARATION_SITE_VARIANCE",
+    };
 pub const ACTUAL_TYPE_ALIAS_TO_NOTHING: DiagnosticFactory = DiagnosticFactory {
     name: "ACTUAL_TYPE_ALIAS_TO_NOTHING",
     default_severity: Severity::Error,
@@ -976,11 +978,12 @@ pub const ACTUAL_WITHOUT_EXPECT: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "ACTUAL_WITHOUT_EXPECT",
 };
-pub const ADAPTED_CALLABLE_REFERENCE_AGAINST_REFLECTION_TYPE: DiagnosticFactory = DiagnosticFactory {
-    name: "ADAPTED_CALLABLE_REFERENCE_AGAINST_REFLECTION_TYPE",
-    default_severity: Severity::Error,
-    message_template: "ADAPTED_CALLABLE_REFERENCE_AGAINST_REFLECTION_TYPE",
-};
+pub const ADAPTED_CALLABLE_REFERENCE_AGAINST_REFLECTION_TYPE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ADAPTED_CALLABLE_REFERENCE_AGAINST_REFLECTION_TYPE",
+        default_severity: Severity::Error,
+        message_template: "ADAPTED_CALLABLE_REFERENCE_AGAINST_REFLECTION_TYPE",
+    };
 pub const AMBIGUOUS_ALTERED_ASSIGN: DiagnosticFactory = DiagnosticFactory {
     name: "AMBIGUOUS_ALTERED_ASSIGN",
     default_severity: Severity::Error,
@@ -1026,16 +1029,18 @@ pub const AMBIGUOUS_SUPER: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "AMBIGUOUS_SUPER",
 };
-pub const ANNOTATIONS_ON_BLOCK_LEVEL_EXPRESSION_ON_THE_SAME_LINE: DiagnosticFactory = DiagnosticFactory {
-    name: "ANNOTATIONS_ON_BLOCK_LEVEL_EXPRESSION_ON_THE_SAME_LINE",
-    default_severity: Severity::Warning,
-    message_template: "ANNOTATIONS_ON_BLOCK_LEVEL_EXPRESSION_ON_THE_SAME_LINE",
-};
-pub const ANNOTATION_ARGUMENT_KCLASS_LITERAL_OF_TYPE_PARAMETER_ERROR: DiagnosticFactory = DiagnosticFactory {
-    name: "ANNOTATION_ARGUMENT_KCLASS_LITERAL_OF_TYPE_PARAMETER_ERROR",
-    default_severity: Severity::Error,
-    message_template: "ANNOTATION_ARGUMENT_KCLASS_LITERAL_OF_TYPE_PARAMETER_ERROR",
-};
+pub const ANNOTATIONS_ON_BLOCK_LEVEL_EXPRESSION_ON_THE_SAME_LINE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ANNOTATIONS_ON_BLOCK_LEVEL_EXPRESSION_ON_THE_SAME_LINE",
+        default_severity: Severity::Warning,
+        message_template: "ANNOTATIONS_ON_BLOCK_LEVEL_EXPRESSION_ON_THE_SAME_LINE",
+    };
+pub const ANNOTATION_ARGUMENT_KCLASS_LITERAL_OF_TYPE_PARAMETER_ERROR: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ANNOTATION_ARGUMENT_KCLASS_LITERAL_OF_TYPE_PARAMETER_ERROR",
+        default_severity: Severity::Error,
+        message_template: "ANNOTATION_ARGUMENT_KCLASS_LITERAL_OF_TYPE_PARAMETER_ERROR",
+    };
 pub const ANNOTATION_ARGUMENT_MUST_BE_CONST: DiagnosticFactory = DiagnosticFactory {
     name: "ANNOTATION_ARGUMENT_MUST_BE_CONST",
     default_severity: Severity::Error,
@@ -1076,31 +1081,34 @@ pub const ANNOTATION_ON_ANNOTATION_ARGUMENT: DiagnosticFactory = DiagnosticFacto
     default_severity: Severity::Error,
     message_template: "Annotations on annotation arguments are prohibited.",
 };
-pub const ANNOTATION_ON_ILLEGAL_MULTI_FIELD_VALUE_CLASS_TYPED_TARGET: DiagnosticFactory = DiagnosticFactory {
-    name: "ANNOTATION_ON_ILLEGAL_MULTI_FIELD_VALUE_CLASS_TYPED_TARGET",
-    default_severity: Severity::Error,
-    message_template: "ANNOTATION_ON_ILLEGAL_MULTI_FIELD_VALUE_CLASS_TYPED_TARGET",
-};
+pub const ANNOTATION_ON_ILLEGAL_MULTI_FIELD_VALUE_CLASS_TYPED_TARGET: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ANNOTATION_ON_ILLEGAL_MULTI_FIELD_VALUE_CLASS_TYPED_TARGET",
+        default_severity: Severity::Error,
+        message_template: "ANNOTATION_ON_ILLEGAL_MULTI_FIELD_VALUE_CLASS_TYPED_TARGET",
+    };
 pub const ANNOTATION_ON_SUPERCLASS_ERROR: DiagnosticFactory = DiagnosticFactory {
     name: "ANNOTATION_ON_SUPERCLASS_ERROR",
     default_severity: Severity::Error,
     message_template: "Annotations on superclasses are meaningless.",
 };
-pub const ANNOTATION_PARAMETER_DEFAULT_VALUE_MUST_BE_CONSTANT: DiagnosticFactory = DiagnosticFactory {
-    name: "ANNOTATION_PARAMETER_DEFAULT_VALUE_MUST_BE_CONSTANT",
-    default_severity: Severity::Error,
-    message_template: "ANNOTATION_PARAMETER_DEFAULT_VALUE_MUST_BE_CONSTANT",
-};
+pub const ANNOTATION_PARAMETER_DEFAULT_VALUE_MUST_BE_CONSTANT: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ANNOTATION_PARAMETER_DEFAULT_VALUE_MUST_BE_CONSTANT",
+        default_severity: Severity::Error,
+        message_template: "ANNOTATION_PARAMETER_DEFAULT_VALUE_MUST_BE_CONSTANT",
+    };
 pub const ANNOTATION_USED_AS_ANNOTATION_ARGUMENT: DiagnosticFactory = DiagnosticFactory {
     name: "ANNOTATION_USED_AS_ANNOTATION_ARGUMENT",
     default_severity: Severity::Error,
     message_template: "Annotations cannot be used as annotation arguments.",
 };
-pub const ANNOTATION_WILL_BE_APPLIED_ALSO_TO_PROPERTY_OR_FIELD: DiagnosticFactory = DiagnosticFactory {
-    name: "ANNOTATION_WILL_BE_APPLIED_ALSO_TO_PROPERTY_OR_FIELD",
-    default_severity: Severity::Warning,
-    message_template: "ANNOTATION_WILL_BE_APPLIED_ALSO_TO_PROPERTY_OR_FIELD",
-};
+pub const ANNOTATION_WILL_BE_APPLIED_ALSO_TO_PROPERTY_OR_FIELD: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ANNOTATION_WILL_BE_APPLIED_ALSO_TO_PROPERTY_OR_FIELD",
+        default_severity: Severity::Warning,
+        message_template: "ANNOTATION_WILL_BE_APPLIED_ALSO_TO_PROPERTY_OR_FIELD",
+    };
 pub const ANONYMOUS_FUNCTION_PARAMETER_WITH_DEFAULT_VALUE: DiagnosticFactory = DiagnosticFactory {
     name: "ANONYMOUS_FUNCTION_PARAMETER_WITH_DEFAULT_VALUE",
     default_severity: Severity::Error,
@@ -1136,11 +1144,12 @@ pub const ARGUMENT_TYPE_MISMATCH: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "ARGUMENT_TYPE_MISMATCH",
 };
-pub const ARRAY_EQUALITY_OPERATOR_CAN_BE_REPLACED_WITH_CONTENT_EQUALS: DiagnosticFactory = DiagnosticFactory {
-    name: "ARRAY_EQUALITY_OPERATOR_CAN_BE_REPLACED_WITH_CONTENT_EQUALS",
-    default_severity: Severity::Warning,
-    message_template: "'==' on arrays compares only references. Replace '==' with 'contentEquals' to compare the arrays' contents or use `===` to remove the warning.",
-};
+pub const ARRAY_EQUALITY_OPERATOR_CAN_BE_REPLACED_WITH_CONTENT_EQUALS: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ARRAY_EQUALITY_OPERATOR_CAN_BE_REPLACED_WITH_CONTENT_EQUALS",
+        default_severity: Severity::Warning,
+        message_template: "'==' on arrays compares only references. Replace '==' with 'contentEquals' to compare the arrays' contents or use `===` to remove the warning.",
+    };
 pub const ASSIGNED_VALUE_IS_NEVER_READ: DiagnosticFactory = DiagnosticFactory {
     name: "ASSIGNED_VALUE_IS_NEVER_READ",
     default_severity: Severity::Warning,
@@ -1166,11 +1175,12 @@ pub const ASSIGN_OPERATOR_AMBIGUITY: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "ASSIGN_OPERATOR_AMBIGUITY",
 };
-pub const ATOMIC_REF_CALL_ARGUMENT_WITHOUT_CONSISTENT_IDENTITY: DiagnosticFactory = DiagnosticFactory {
-    name: "ATOMIC_REF_CALL_ARGUMENT_WITHOUT_CONSISTENT_IDENTITY",
-    default_severity: Severity::Warning,
-    message_template: "ATOMIC_REF_CALL_ARGUMENT_WITHOUT_CONSISTENT_IDENTITY",
-};
+pub const ATOMIC_REF_CALL_ARGUMENT_WITHOUT_CONSISTENT_IDENTITY: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ATOMIC_REF_CALL_ARGUMENT_WITHOUT_CONSISTENT_IDENTITY",
+        default_severity: Severity::Warning,
+        message_template: "ATOMIC_REF_CALL_ARGUMENT_WITHOUT_CONSISTENT_IDENTITY",
+    };
 pub const ATOMIC_REF_WITHOUT_CONSISTENT_IDENTITY: DiagnosticFactory = DiagnosticFactory {
     name: "ATOMIC_REF_WITHOUT_CONSISTENT_IDENTITY",
     default_severity: Severity::Warning,
@@ -1541,16 +1551,18 @@ pub const CYCLIC_INHERITANCE_HIERARCHY: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "Cycle in supertypes and/or containing declarations detected.",
 };
-pub const DATA_CLASS_CONSISTENT_COPY_AND_EXPOSED_COPY_ARE_INCOMPATIBLE_ANNOTATIONS: DiagnosticFactory = DiagnosticFactory {
+pub const DATA_CLASS_CONSISTENT_COPY_AND_EXPOSED_COPY_ARE_INCOMPATIBLE_ANNOTATIONS:
+    DiagnosticFactory = DiagnosticFactory {
     name: "DATA_CLASS_CONSISTENT_COPY_AND_EXPOSED_COPY_ARE_INCOMPATIBLE_ANNOTATIONS",
     default_severity: Severity::Error,
     message_template: "DATA_CLASS_CONSISTENT_COPY_AND_EXPOSED_COPY_ARE_INCOMPATIBLE_ANNOTATIONS",
 };
-pub const DATA_CLASS_CONSISTENT_COPY_WRONG_ANNOTATION_TARGET: DiagnosticFactory = DiagnosticFactory {
-    name: "DATA_CLASS_CONSISTENT_COPY_WRONG_ANNOTATION_TARGET",
-    default_severity: Severity::Error,
-    message_template: "DATA_CLASS_CONSISTENT_COPY_WRONG_ANNOTATION_TARGET",
-};
+pub const DATA_CLASS_CONSISTENT_COPY_WRONG_ANNOTATION_TARGET: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "DATA_CLASS_CONSISTENT_COPY_WRONG_ANNOTATION_TARGET",
+        default_severity: Severity::Error,
+        message_template: "DATA_CLASS_CONSISTENT_COPY_WRONG_ANNOTATION_TARGET",
+    };
 pub const DATA_CLASS_NOT_PROPERTY_PARAMETER: DiagnosticFactory = DiagnosticFactory {
     name: "DATA_CLASS_NOT_PROPERTY_PARAMETER",
     default_severity: Severity::Error,
@@ -1586,16 +1598,18 @@ pub const DECLARATION_CANT_BE_INLINED: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "DECLARATION_CANT_BE_INLINED",
 };
-pub const DEFAULT_ARGUMENTS_IN_EXPECT_ACTUALIZED_BY_FAKE_OVERRIDE: DiagnosticFactory = DiagnosticFactory {
-    name: "DEFAULT_ARGUMENTS_IN_EXPECT_ACTUALIZED_BY_FAKE_OVERRIDE",
-    default_severity: Severity::Error,
-    message_template: "DEFAULT_ARGUMENTS_IN_EXPECT_ACTUALIZED_BY_FAKE_OVERRIDE",
-};
-pub const DEFAULT_ARGUMENTS_IN_EXPECT_WITH_ACTUAL_TYPEALIAS: DiagnosticFactory = DiagnosticFactory {
-    name: "DEFAULT_ARGUMENTS_IN_EXPECT_WITH_ACTUAL_TYPEALIAS",
-    default_severity: Severity::Error,
-    message_template: "DEFAULT_ARGUMENTS_IN_EXPECT_WITH_ACTUAL_TYPEALIAS",
-};
+pub const DEFAULT_ARGUMENTS_IN_EXPECT_ACTUALIZED_BY_FAKE_OVERRIDE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "DEFAULT_ARGUMENTS_IN_EXPECT_ACTUALIZED_BY_FAKE_OVERRIDE",
+        default_severity: Severity::Error,
+        message_template: "DEFAULT_ARGUMENTS_IN_EXPECT_ACTUALIZED_BY_FAKE_OVERRIDE",
+    };
+pub const DEFAULT_ARGUMENTS_IN_EXPECT_WITH_ACTUAL_TYPEALIAS: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "DEFAULT_ARGUMENTS_IN_EXPECT_WITH_ACTUAL_TYPEALIAS",
+        default_severity: Severity::Error,
+        message_template: "DEFAULT_ARGUMENTS_IN_EXPECT_WITH_ACTUAL_TYPEALIAS",
+    };
 pub const DEFAULT_VALUE_NOT_ALLOWED_IN_OVERRIDE: DiagnosticFactory = DiagnosticFactory {
     name: "DEFAULT_VALUE_NOT_ALLOWED_IN_OVERRIDE",
     default_severity: Severity::Error,
@@ -1641,11 +1655,12 @@ pub const DELEGATE_SPECIAL_FUNCTION_RETURN_TYPE_MISMATCH: DiagnosticFactory = Di
     default_severity: Severity::Error,
     message_template: "DELEGATE_SPECIAL_FUNCTION_RETURN_TYPE_MISMATCH",
 };
-pub const DELEGATE_USES_EXTENSION_PROPERTY_TYPE_PARAMETER_ERROR: DiagnosticFactory = DiagnosticFactory {
-    name: "DELEGATE_USES_EXTENSION_PROPERTY_TYPE_PARAMETER_ERROR",
-    default_severity: Severity::Error,
-    message_template: "DELEGATE_USES_EXTENSION_PROPERTY_TYPE_PARAMETER_ERROR",
-};
+pub const DELEGATE_USES_EXTENSION_PROPERTY_TYPE_PARAMETER_ERROR: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "DELEGATE_USES_EXTENSION_PROPERTY_TYPE_PARAMETER_ERROR",
+        default_severity: Severity::Error,
+        message_template: "DELEGATE_USES_EXTENSION_PROPERTY_TYPE_PARAMETER_ERROR",
+    };
 pub const DELEGATION_IN_INTERFACE: DiagnosticFactory = DiagnosticFactory {
     name: "DELEGATION_IN_INTERFACE",
     default_severity: Severity::Error,
@@ -1676,16 +1691,18 @@ pub const DEPRECATED_ACCESS_TO_ENTRY_PROPERTY_FROM_ENUM: DiagnosticFactory = Dia
     default_severity: Severity::Warning,
     message_template: "DEPRECATED_ACCESS_TO_ENTRY_PROPERTY_FROM_ENUM",
 };
-pub const DEPRECATED_ACCESS_TO_ENUM_ENTRY_COMPANION_PROPERTY: DiagnosticFactory = DiagnosticFactory {
-    name: "DEPRECATED_ACCESS_TO_ENUM_ENTRY_COMPANION_PROPERTY",
-    default_severity: Severity::Warning,
-    message_template: "DEPRECATED_ACCESS_TO_ENUM_ENTRY_COMPANION_PROPERTY",
-};
-pub const DEPRECATED_ACCESS_TO_ENUM_ENTRY_PROPERTY_AS_REFERENCE: DiagnosticFactory = DiagnosticFactory {
-    name: "DEPRECATED_ACCESS_TO_ENUM_ENTRY_PROPERTY_AS_REFERENCE",
-    default_severity: Severity::Warning,
-    message_template: "DEPRECATED_ACCESS_TO_ENUM_ENTRY_PROPERTY_AS_REFERENCE",
-};
+pub const DEPRECATED_ACCESS_TO_ENUM_ENTRY_COMPANION_PROPERTY: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "DEPRECATED_ACCESS_TO_ENUM_ENTRY_COMPANION_PROPERTY",
+        default_severity: Severity::Warning,
+        message_template: "DEPRECATED_ACCESS_TO_ENUM_ENTRY_COMPANION_PROPERTY",
+    };
+pub const DEPRECATED_ACCESS_TO_ENUM_ENTRY_PROPERTY_AS_REFERENCE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "DEPRECATED_ACCESS_TO_ENUM_ENTRY_PROPERTY_AS_REFERENCE",
+        default_severity: Severity::Warning,
+        message_template: "DEPRECATED_ACCESS_TO_ENUM_ENTRY_PROPERTY_AS_REFERENCE",
+    };
 pub const DEPRECATED_IDENTITY_EQUALS: DiagnosticFactory = DiagnosticFactory {
     name: "DEPRECATED_IDENTITY_EQUALS",
     default_severity: Severity::Warning,
@@ -1711,11 +1728,12 @@ pub const DEPRECATED_MODIFIER_PAIR: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Warning,
     message_template: "Modifier ''{0}'' is deprecated in presence of ''{1}''.",
 };
-pub const DEPRECATED_SINCE_KOTLIN_OUTSIDE_KOTLIN_SUBPACKAGE: DiagnosticFactory = DiagnosticFactory {
-    name: "DEPRECATED_SINCE_KOTLIN_OUTSIDE_KOTLIN_SUBPACKAGE",
-    default_severity: Severity::Error,
-    message_template: "DEPRECATED_SINCE_KOTLIN_OUTSIDE_KOTLIN_SUBPACKAGE",
-};
+pub const DEPRECATED_SINCE_KOTLIN_OUTSIDE_KOTLIN_SUBPACKAGE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "DEPRECATED_SINCE_KOTLIN_OUTSIDE_KOTLIN_SUBPACKAGE",
+        default_severity: Severity::Error,
+        message_template: "DEPRECATED_SINCE_KOTLIN_OUTSIDE_KOTLIN_SUBPACKAGE",
+    };
 pub const DEPRECATED_SINCE_KOTLIN_WITHOUT_ARGUMENTS: DiagnosticFactory = DiagnosticFactory {
     name: "DEPRECATED_SINCE_KOTLIN_WITHOUT_ARGUMENTS",
     default_severity: Severity::Error,
@@ -1776,11 +1794,12 @@ pub const DESTRUCTURING_SHORT_FORM_UNDERSCORE: DiagnosticFactory = DiagnosticFac
     default_severity: Severity::Warning,
     message_template: "DESTRUCTURING_SHORT_FORM_UNDERSCORE",
 };
-pub const DIFFERENT_NAMES_FOR_THE_SAME_PARAMETER_IN_SUPERTYPES: DiagnosticFactory = DiagnosticFactory {
-    name: "DIFFERENT_NAMES_FOR_THE_SAME_PARAMETER_IN_SUPERTYPES",
-    default_severity: Severity::Warning,
-    message_template: "DIFFERENT_NAMES_FOR_THE_SAME_PARAMETER_IN_SUPERTYPES",
-};
+pub const DIFFERENT_NAMES_FOR_THE_SAME_PARAMETER_IN_SUPERTYPES: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "DIFFERENT_NAMES_FOR_THE_SAME_PARAMETER_IN_SUPERTYPES",
+        default_severity: Severity::Warning,
+        message_template: "DIFFERENT_NAMES_FOR_THE_SAME_PARAMETER_IN_SUPERTYPES",
+    };
 pub const DIVISION_BY_ZERO: DiagnosticFactory = DiagnosticFactory {
     name: "DIVISION_BY_ZERO",
     default_severity: Severity::Warning,
@@ -1936,11 +1955,12 @@ pub const EXPECTED_EXTERNAL_DECLARATION: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "Expected declaration cannot be external.",
 };
-pub const EXPECTED_FUNCTION_SOURCE_WITH_DEFAULT_ARGUMENTS_NOT_FOUND: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECTED_FUNCTION_SOURCE_WITH_DEFAULT_ARGUMENTS_NOT_FOUND",
-    default_severity: Severity::Error,
-    message_template: "EXPECTED_FUNCTION_SOURCE_WITH_DEFAULT_ARGUMENTS_NOT_FOUND",
-};
+pub const EXPECTED_FUNCTION_SOURCE_WITH_DEFAULT_ARGUMENTS_NOT_FOUND: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECTED_FUNCTION_SOURCE_WITH_DEFAULT_ARGUMENTS_NOT_FOUND",
+        default_severity: Severity::Error,
+        message_template: "EXPECTED_FUNCTION_SOURCE_WITH_DEFAULT_ARGUMENTS_NOT_FOUND",
+    };
 pub const EXPECTED_LATEINIT_PROPERTY: DiagnosticFactory = DiagnosticFactory {
     name: "EXPECTED_LATEINIT_PROPERTY",
     default_severity: Severity::Error,
@@ -1981,46 +2001,53 @@ pub const EXPECT_ACTUAL_INCOMPATIBLE_CLASS_SCOPE: DiagnosticFactory = Diagnostic
     default_severity: Severity::Error,
     message_template: "EXPECT_ACTUAL_INCOMPATIBLE_CLASS_SCOPE",
 };
-pub const EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_COUNT: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_COUNT",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_COUNT",
-};
-pub const EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_UPPER_BOUNDS: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_UPPER_BOUNDS",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_UPPER_BOUNDS",
-};
-pub const EXPECT_ACTUAL_INCOMPATIBLE_CONTEXT_PARAMETER_NAMES: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_CONTEXT_PARAMETER_NAMES",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_CONTEXT_PARAMETER_NAMES",
-};
+pub const EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_COUNT: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_COUNT",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_COUNT",
+    };
+pub const EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_UPPER_BOUNDS: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_UPPER_BOUNDS",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_CLASS_TYPE_PARAMETER_UPPER_BOUNDS",
+    };
+pub const EXPECT_ACTUAL_INCOMPATIBLE_CONTEXT_PARAMETER_NAMES: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_CONTEXT_PARAMETER_NAMES",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_CONTEXT_PARAMETER_NAMES",
+    };
 pub const EXPECT_ACTUAL_INCOMPATIBLE_ENUM_ENTRIES: DiagnosticFactory = DiagnosticFactory {
     name: "EXPECT_ACTUAL_INCOMPATIBLE_ENUM_ENTRIES",
     default_severity: Severity::Error,
     message_template: "EXPECT_ACTUAL_INCOMPATIBLE_ENUM_ENTRIES",
 };
-pub const EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT",
-};
-pub const EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET",
-};
-pub const EXPECT_ACTUAL_INCOMPATIBLE_FUN_INTERFACE_MODIFIER: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_FUN_INTERFACE_MODIFIER",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_FUN_INTERFACE_MODIFIER",
-};
-pub const EXPECT_ACTUAL_INCOMPATIBLE_ILLEGAL_REQUIRES_OPT_IN: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_ILLEGAL_REQUIRES_OPT_IN",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_ILLEGAL_REQUIRES_OPT_IN",
-};
+pub const EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT",
+    };
+pub const EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET",
+    };
+pub const EXPECT_ACTUAL_INCOMPATIBLE_FUN_INTERFACE_MODIFIER: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_FUN_INTERFACE_MODIFIER",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_FUN_INTERFACE_MODIFIER",
+    };
+pub const EXPECT_ACTUAL_INCOMPATIBLE_ILLEGAL_REQUIRES_OPT_IN: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_ILLEGAL_REQUIRES_OPT_IN",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_ILLEGAL_REQUIRES_OPT_IN",
+    };
 pub const EXPECT_ACTUAL_INCOMPATIBLE_MODALITY: DiagnosticFactory = DiagnosticFactory {
     name: "EXPECT_ACTUAL_INCOMPATIBLE_MODALITY",
     default_severity: Severity::Error,
@@ -2041,26 +2068,29 @@ pub const EXPECT_ACTUAL_INCOMPATIBLE_PARAMETER_NAMES: DiagnosticFactory = Diagno
     default_severity: Severity::Error,
     message_template: "EXPECT_ACTUAL_INCOMPATIBLE_PARAMETER_NAMES",
 };
-pub const EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_CONST_MODIFIER: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_CONST_MODIFIER",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_CONST_MODIFIER",
-};
+pub const EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_CONST_MODIFIER: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_CONST_MODIFIER",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_CONST_MODIFIER",
+    };
 pub const EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_KIND: DiagnosticFactory = DiagnosticFactory {
     name: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_KIND",
     default_severity: Severity::Error,
     message_template: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_KIND",
 };
-pub const EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_LATEINIT_MODIFIER: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_LATEINIT_MODIFIER",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_LATEINIT_MODIFIER",
-};
-pub const EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_SETTER_VISIBILITY: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_SETTER_VISIBILITY",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_SETTER_VISIBILITY",
-};
+pub const EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_LATEINIT_MODIFIER: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_LATEINIT_MODIFIER",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_LATEINIT_MODIFIER",
+    };
+pub const EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_SETTER_VISIBILITY: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_SETTER_VISIBILITY",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_PROPERTY_SETTER_VISIBILITY",
+    };
 pub const EXPECT_ACTUAL_INCOMPATIBLE_RETURN_TYPE: DiagnosticFactory = DiagnosticFactory {
     name: "EXPECT_ACTUAL_INCOMPATIBLE_RETURN_TYPE",
     default_severity: Severity::Error,
@@ -2076,31 +2106,36 @@ pub const EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_NAMES: DiagnosticFactory = D
     default_severity: Severity::Error,
     message_template: "EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_NAMES",
 };
-pub const EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_REIFIED: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_REIFIED",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_REIFIED",
-};
-pub const EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_VARIANCE: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_VARIANCE",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_VARIANCE",
-};
-pub const EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_CROSSINLINE: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_CROSSINLINE",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_CROSSINLINE",
-};
-pub const EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_NOINLINE: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_NOINLINE",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_NOINLINE",
-};
-pub const EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_VARARG: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_VARARG",
-    default_severity: Severity::Error,
-    message_template: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_VARARG",
-};
+pub const EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_REIFIED: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_REIFIED",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_REIFIED",
+    };
+pub const EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_VARIANCE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_VARIANCE",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_TYPE_PARAMETER_VARIANCE",
+    };
+pub const EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_CROSSINLINE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_CROSSINLINE",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_CROSSINLINE",
+    };
+pub const EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_NOINLINE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_NOINLINE",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_NOINLINE",
+    };
+pub const EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_VARARG: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_VARARG",
+        default_severity: Severity::Error,
+        message_template: "EXPECT_ACTUAL_INCOMPATIBLE_VALUE_PARAMETER_VARARG",
+    };
 pub const EXPECT_ACTUAL_INCOMPATIBLE_VISIBILITY: DiagnosticFactory = DiagnosticFactory {
     name: "EXPECT_ACTUAL_INCOMPATIBLE_VISIBILITY",
     default_severity: Severity::Error,
@@ -2161,11 +2196,12 @@ pub const EXPLICIT_FIELD_MUST_BE_INITIALIZED: DiagnosticFactory = DiagnosticFact
     default_severity: Severity::Error,
     message_template: "EXPLICIT_FIELD_MUST_BE_INITIALIZED",
 };
-pub const EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE",
-    default_severity: Severity::Error,
-    message_template: "EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE",
-};
+pub const EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE",
+        default_severity: Severity::Error,
+        message_template: "EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE",
+    };
 pub const EXPLICIT_TYPE_ARGUMENTS_IN_PROPERTY_ACCESS: DiagnosticFactory = DiagnosticFactory {
     name: "EXPLICIT_TYPE_ARGUMENTS_IN_PROPERTY_ACCESS",
     default_severity: Severity::Error,
@@ -2176,11 +2212,12 @@ pub const EXPOSED_FUNCTION_RETURN_TYPE: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "EXPOSED_FUNCTION_RETURN_TYPE",
 };
-pub const EXPOSED_PACKAGE_PRIVATE_TYPE_FROM_INTERNAL_WARNING: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPOSED_PACKAGE_PRIVATE_TYPE_FROM_INTERNAL_WARNING",
-    default_severity: Severity::Warning,
-    message_template: "EXPOSED_PACKAGE_PRIVATE_TYPE_FROM_INTERNAL_WARNING",
-};
+pub const EXPOSED_PACKAGE_PRIVATE_TYPE_FROM_INTERNAL_WARNING: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPOSED_PACKAGE_PRIVATE_TYPE_FROM_INTERNAL_WARNING",
+        default_severity: Severity::Warning,
+        message_template: "EXPOSED_PACKAGE_PRIVATE_TYPE_FROM_INTERNAL_WARNING",
+    };
 pub const EXPOSED_PARAMETER_TYPE: DiagnosticFactory = DiagnosticFactory {
     name: "EXPOSED_PARAMETER_TYPE",
     default_severity: Severity::Error,
@@ -2241,26 +2278,29 @@ pub const EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS: DiagnosticFactory = 
     default_severity: Severity::Error,
     message_template: "EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS",
 };
-pub const EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS_WARNING: DiagnosticFactory = DiagnosticFactory {
-    name: "EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS_WARNING",
-    default_severity: Severity::Warning,
-    message_template: "EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS_WARNING",
-};
-pub const EXTENSION_FUNCTION_SHADOWED_BY_MEMBER_PROPERTY_WITH_INVOKE: DiagnosticFactory = DiagnosticFactory {
-    name: "EXTENSION_FUNCTION_SHADOWED_BY_MEMBER_PROPERTY_WITH_INVOKE",
-    default_severity: Severity::Warning,
-    message_template: "EXTENSION_FUNCTION_SHADOWED_BY_MEMBER_PROPERTY_WITH_INVOKE",
-};
+pub const EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS_WARNING: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS_WARNING",
+        default_severity: Severity::Warning,
+        message_template: "EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS_WARNING",
+    };
+pub const EXTENSION_FUNCTION_SHADOWED_BY_MEMBER_PROPERTY_WITH_INVOKE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXTENSION_FUNCTION_SHADOWED_BY_MEMBER_PROPERTY_WITH_INVOKE",
+        default_severity: Severity::Warning,
+        message_template: "EXTENSION_FUNCTION_SHADOWED_BY_MEMBER_PROPERTY_WITH_INVOKE",
+    };
 pub const EXTENSION_IN_CLASS_REFERENCE_NOT_ALLOWED: DiagnosticFactory = DiagnosticFactory {
     name: "EXTENSION_IN_CLASS_REFERENCE_NOT_ALLOWED",
     default_severity: Severity::Error,
     message_template: "EXTENSION_IN_CLASS_REFERENCE_NOT_ALLOWED",
 };
-pub const EXTENSION_PROPERTY_MUST_HAVE_ACCESSORS_OR_BE_ABSTRACT: DiagnosticFactory = DiagnosticFactory {
-    name: "EXTENSION_PROPERTY_MUST_HAVE_ACCESSORS_OR_BE_ABSTRACT",
-    default_severity: Severity::Error,
-    message_template: "Extension property must have accessors or be abstract.",
-};
+pub const EXTENSION_PROPERTY_MUST_HAVE_ACCESSORS_OR_BE_ABSTRACT: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "EXTENSION_PROPERTY_MUST_HAVE_ACCESSORS_OR_BE_ABSTRACT",
+        default_severity: Severity::Error,
+        message_template: "Extension property must have accessors or be abstract.",
+    };
 pub const EXTENSION_PROPERTY_WITH_BACKING_FIELD: DiagnosticFactory = DiagnosticFactory {
     name: "EXTENSION_PROPERTY_WITH_BACKING_FIELD",
     default_severity: Severity::Error,
@@ -2341,11 +2381,12 @@ pub const FUN_INTERFACE_ABSTRACT_METHOD_WITH_DEFAULT_VALUE: DiagnosticFactory = 
     default_severity: Severity::Error,
     message_template: "Functional interface abstract method cannot have a default value.",
 };
-pub const FUN_INTERFACE_ABSTRACT_METHOD_WITH_TYPE_PARAMETERS: DiagnosticFactory = DiagnosticFactory {
-    name: "FUN_INTERFACE_ABSTRACT_METHOD_WITH_TYPE_PARAMETERS",
-    default_severity: Severity::Error,
-    message_template: "Functional interface cannot have an abstract method with type parameters.",
-};
+pub const FUN_INTERFACE_ABSTRACT_METHOD_WITH_TYPE_PARAMETERS: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "FUN_INTERFACE_ABSTRACT_METHOD_WITH_TYPE_PARAMETERS",
+        default_severity: Severity::Error,
+        message_template: "Functional interface cannot have an abstract method with type parameters.",
+    };
 pub const FUN_INTERFACE_CANNOT_HAVE_ABSTRACT_PROPERTIES: DiagnosticFactory = DiagnosticFactory {
     name: "FUN_INTERFACE_CANNOT_HAVE_ABSTRACT_PROPERTIES",
     default_severity: Severity::Error,
@@ -2366,11 +2407,12 @@ pub const GENERIC_THROWABLE_SUBCLASS: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "GENERIC_THROWABLE_SUBCLASS",
 };
-pub const GETTER_VISIBILITY_DIFFERS_FROM_PROPERTY_VISIBILITY: DiagnosticFactory = DiagnosticFactory {
-    name: "GETTER_VISIBILITY_DIFFERS_FROM_PROPERTY_VISIBILITY",
-    default_severity: Severity::Error,
-    message_template: "Getter visibility must be the same as property visibility.",
-};
+pub const GETTER_VISIBILITY_DIFFERS_FROM_PROPERTY_VISIBILITY: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "GETTER_VISIBILITY_DIFFERS_FROM_PROPERTY_VISIBILITY",
+        default_severity: Severity::Error,
+        message_template: "Getter visibility must be the same as property visibility.",
+    };
 pub const HAS_NEXT_FUNCTION_AMBIGUITY: DiagnosticFactory = DiagnosticFactory {
     name: "HAS_NEXT_FUNCTION_AMBIGUITY",
     default_severity: Severity::Error,
@@ -2446,11 +2488,12 @@ pub const ILLEGAL_SUSPEND_PROPERTY_ACCESS: DiagnosticFactory = DiagnosticFactory
     default_severity: Severity::Error,
     message_template: "ILLEGAL_SUSPEND_PROPERTY_ACCESS",
 };
-pub const ILLEGAL_TYPE_ARGUMENT_FOR_VARARG_PARAMETER_WARNING: DiagnosticFactory = DiagnosticFactory {
-    name: "ILLEGAL_TYPE_ARGUMENT_FOR_VARARG_PARAMETER_WARNING",
-    default_severity: Severity::Warning,
-    message_template: "ILLEGAL_TYPE_ARGUMENT_FOR_VARARG_PARAMETER_WARNING",
-};
+pub const ILLEGAL_TYPE_ARGUMENT_FOR_VARARG_PARAMETER_WARNING: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "ILLEGAL_TYPE_ARGUMENT_FOR_VARARG_PARAMETER_WARNING",
+        default_severity: Severity::Warning,
+        message_template: "ILLEGAL_TYPE_ARGUMENT_FOR_VARARG_PARAMETER_WARNING",
+    };
 pub const ILLEGAL_UNDERSCORE: DiagnosticFactory = DiagnosticFactory {
     name: "ILLEGAL_UNDERSCORE",
     default_severity: Severity::Error,
@@ -2476,16 +2519,18 @@ pub const IMPLICIT_NOTHING_RETURN_TYPE: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "Return type 'Nothing' needs to be specified explicitly.",
 };
-pub const IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT: DiagnosticFactory = DiagnosticFactory {
-    name: "IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT",
-    default_severity: Severity::Warning,
-    message_template: "IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT",
-};
-pub const IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT_ERROR: DiagnosticFactory = DiagnosticFactory {
-    name: "IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT_ERROR",
-    default_severity: Severity::Error,
-    message_template: "IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT_ERROR",
-};
+pub const IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT",
+        default_severity: Severity::Warning,
+        message_template: "IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT",
+    };
+pub const IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT_ERROR: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT_ERROR",
+        default_severity: Severity::Error,
+        message_template: "IMPLICIT_PROPERTY_TYPE_MAKES_BEHAVIOR_ORDER_DEPENDANT_ERROR",
+    };
 pub const INACCESSIBLE_OUTER_CLASS_RECEIVER: DiagnosticFactory = DiagnosticFactory {
     name: "INACCESSIBLE_OUTER_CLASS_RECEIVER",
     default_severity: Severity::Error,
@@ -2546,11 +2591,12 @@ pub const INAPPLICABLE_TARGET_ON_PROPERTY_WARNING: DiagnosticFactory = Diagnosti
     default_severity: Severity::Warning,
     message_template: "INAPPLICABLE_TARGET_ON_PROPERTY_WARNING",
 };
-pub const INAPPLICABLE_TARGET_PROPERTY_HAS_NO_BACKING_FIELD: DiagnosticFactory = DiagnosticFactory {
-    name: "INAPPLICABLE_TARGET_PROPERTY_HAS_NO_BACKING_FIELD",
-    default_severity: Severity::Error,
-    message_template: "INAPPLICABLE_TARGET_PROPERTY_HAS_NO_BACKING_FIELD",
-};
+pub const INAPPLICABLE_TARGET_PROPERTY_HAS_NO_BACKING_FIELD: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "INAPPLICABLE_TARGET_PROPERTY_HAS_NO_BACKING_FIELD",
+        default_severity: Severity::Error,
+        message_template: "INAPPLICABLE_TARGET_PROPERTY_HAS_NO_BACKING_FIELD",
+    };
 pub const INAPPLICABLE_TARGET_PROPERTY_HAS_NO_DELEGATE: DiagnosticFactory = DiagnosticFactory {
     name: "INAPPLICABLE_TARGET_PROPERTY_HAS_NO_DELEGATE",
     default_severity: Severity::Error,
@@ -2666,11 +2712,12 @@ pub const INFERENCE_ERROR: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "Inference error.",
 };
-pub const INFERRED_TYPE_VARIABLE_INTO_POSSIBLE_EMPTY_INTERSECTION: DiagnosticFactory = DiagnosticFactory {
-    name: "INFERRED_TYPE_VARIABLE_INTO_POSSIBLE_EMPTY_INTERSECTION",
-    default_severity: Severity::Warning,
-    message_template: "INFERRED_TYPE_VARIABLE_INTO_POSSIBLE_EMPTY_INTERSECTION",
-};
+pub const INFERRED_TYPE_VARIABLE_INTO_POSSIBLE_EMPTY_INTERSECTION: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "INFERRED_TYPE_VARIABLE_INTO_POSSIBLE_EMPTY_INTERSECTION",
+        default_severity: Severity::Warning,
+        message_template: "INFERRED_TYPE_VARIABLE_INTO_POSSIBLE_EMPTY_INTERSECTION",
+    };
 pub const INFIX_MODIFIER_REQUIRED: DiagnosticFactory = DiagnosticFactory {
     name: "INFIX_MODIFIER_REQUIRED",
     default_severity: Severity::Error,
@@ -2686,11 +2733,12 @@ pub const INITIALIZATION_BEFORE_DECLARATION_WARNING: DiagnosticFactory = Diagnos
     default_severity: Severity::Warning,
     message_template: "INITIALIZATION_BEFORE_DECLARATION_WARNING",
 };
-pub const INITIALIZER_REQUIRED_FOR_DESTRUCTURING_DECLARATION: DiagnosticFactory = DiagnosticFactory {
-    name: "INITIALIZER_REQUIRED_FOR_DESTRUCTURING_DECLARATION",
-    default_severity: Severity::Error,
-    message_template: "INITIALIZER_REQUIRED_FOR_DESTRUCTURING_DECLARATION",
-};
+pub const INITIALIZER_REQUIRED_FOR_DESTRUCTURING_DECLARATION: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "INITIALIZER_REQUIRED_FOR_DESTRUCTURING_DECLARATION",
+        default_severity: Severity::Error,
+        message_template: "INITIALIZER_REQUIRED_FOR_DESTRUCTURING_DECLARATION",
+    };
 pub const INITIALIZER_TYPE_MISMATCH: DiagnosticFactory = DiagnosticFactory {
     name: "INITIALIZER_TYPE_MISMATCH",
     default_severity: Severity::Error,
@@ -2811,11 +2859,12 @@ pub const INVALID_VERSIONING_ON_NON_OPTIONAL: DiagnosticFactory = DiagnosticFact
     default_severity: Severity::Error,
     message_template: "INVALID_VERSIONING_ON_NON_OPTIONAL",
 };
-pub const INVALID_VERSIONING_ON_RECEIVER_OR_CONTEXT_PARAMETER_POSITION: DiagnosticFactory = DiagnosticFactory {
-    name: "INVALID_VERSIONING_ON_RECEIVER_OR_CONTEXT_PARAMETER_POSITION",
-    default_severity: Severity::Error,
-    message_template: "INVALID_VERSIONING_ON_RECEIVER_OR_CONTEXT_PARAMETER_POSITION",
-};
+pub const INVALID_VERSIONING_ON_RECEIVER_OR_CONTEXT_PARAMETER_POSITION: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "INVALID_VERSIONING_ON_RECEIVER_OR_CONTEXT_PARAMETER_POSITION",
+        default_severity: Severity::Error,
+        message_template: "INVALID_VERSIONING_ON_RECEIVER_OR_CONTEXT_PARAMETER_POSITION",
+    };
 pub const INVALID_VERSIONING_ON_VALUE_CLASS_PARAMETER: DiagnosticFactory = DiagnosticFactory {
     name: "INVALID_VERSIONING_ON_VALUE_CLASS_PARAMETER",
     default_severity: Severity::Error,
@@ -2881,11 +2930,12 @@ pub const KOTLIN_ACTUAL_ANNOTATION_HAS_NO_EFFECT_IN_KOTLIN: DiagnosticFactory = 
     default_severity: Severity::Error,
     message_template: "KOTLIN_ACTUAL_ANNOTATION_HAS_NO_EFFECT_IN_KOTLIN",
 };
-pub const K_SUSPEND_FUNCTION_TYPE_OF_DANGEROUSLY_LARGE_ARITY: DiagnosticFactory = DiagnosticFactory {
-    name: "K_SUSPEND_FUNCTION_TYPE_OF_DANGEROUSLY_LARGE_ARITY",
-    default_severity: Severity::Warning,
-    message_template: "K_SUSPEND_FUNCTION_TYPE_OF_DANGEROUSLY_LARGE_ARITY",
-};
+pub const K_SUSPEND_FUNCTION_TYPE_OF_DANGEROUSLY_LARGE_ARITY: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "K_SUSPEND_FUNCTION_TYPE_OF_DANGEROUSLY_LARGE_ARITY",
+        default_severity: Severity::Warning,
+        message_template: "K_SUSPEND_FUNCTION_TYPE_OF_DANGEROUSLY_LARGE_ARITY",
+    };
 pub const LABEL_NAME_CLASH: DiagnosticFactory = DiagnosticFactory {
     name: "LABEL_NAME_CLASH",
     default_severity: Severity::Warning,
@@ -2901,11 +2951,12 @@ pub const LATEINIT_INTRINSIC_CALL_IN_INLINE_FUNCTION: DiagnosticFactory = Diagno
     default_severity: Severity::Error,
     message_template: "This declaration cannot be used inside an inline function.",
 };
-pub const LATEINIT_INTRINSIC_CALL_ON_NON_ACCESSIBLE_PROPERTY: DiagnosticFactory = DiagnosticFactory {
-    name: "LATEINIT_INTRINSIC_CALL_ON_NON_ACCESSIBLE_PROPERTY",
-    default_severity: Severity::Error,
-    message_template: "Backing field of ''{0}'' is not accessible at this point.",
-};
+pub const LATEINIT_INTRINSIC_CALL_ON_NON_ACCESSIBLE_PROPERTY: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "LATEINIT_INTRINSIC_CALL_ON_NON_ACCESSIBLE_PROPERTY",
+        default_severity: Severity::Error,
+        message_template: "Backing field of ''{0}'' is not accessible at this point.",
+    };
 pub const LATEINIT_INTRINSIC_CALL_ON_NON_LATEINIT: DiagnosticFactory = DiagnosticFactory {
     name: "LATEINIT_INTRINSIC_CALL_ON_NON_LATEINIT",
     default_severity: Severity::Error,
@@ -2921,11 +2972,12 @@ pub const LATEINIT_NULLABLE_BACKING_FIELD: DiagnosticFactory = DiagnosticFactory
     default_severity: Severity::Error,
     message_template: "LATEINIT_NULLABLE_BACKING_FIELD",
 };
-pub const LATEINIT_PROPERTY_FIELD_DECLARATION_WITH_INITIALIZER: DiagnosticFactory = DiagnosticFactory {
-    name: "LATEINIT_PROPERTY_FIELD_DECLARATION_WITH_INITIALIZER",
-    default_severity: Severity::Error,
-    message_template: "LATEINIT_PROPERTY_FIELD_DECLARATION_WITH_INITIALIZER",
-};
+pub const LATEINIT_PROPERTY_FIELD_DECLARATION_WITH_INITIALIZER: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "LATEINIT_PROPERTY_FIELD_DECLARATION_WITH_INITIALIZER",
+        default_severity: Severity::Error,
+        message_template: "LATEINIT_PROPERTY_FIELD_DECLARATION_WITH_INITIALIZER",
+    };
 pub const LATEINIT_PROPERTY_WITHOUT_TYPE: DiagnosticFactory = DiagnosticFactory {
     name: "LATEINIT_PROPERTY_WITHOUT_TYPE",
     default_severity: Severity::Error,
@@ -3096,11 +3148,12 @@ pub const MULTIPLE_DEFAULTS_INHERITED_FROM_SUPERTYPES: DiagnosticFactory = Diagn
     default_severity: Severity::Error,
     message_template: "MULTIPLE_DEFAULTS_INHERITED_FROM_SUPERTYPES",
 };
-pub const MULTIPLE_DEFAULTS_INHERITED_FROM_SUPERTYPES_WHEN_NO_EXPLICIT_OVERRIDE: DiagnosticFactory = DiagnosticFactory {
-    name: "MULTIPLE_DEFAULTS_INHERITED_FROM_SUPERTYPES_WHEN_NO_EXPLICIT_OVERRIDE",
-    default_severity: Severity::Error,
-    message_template: "MULTIPLE_DEFAULTS_INHERITED_FROM_SUPERTYPES_WHEN_NO_EXPLICIT_OVERRIDE",
-};
+pub const MULTIPLE_DEFAULTS_INHERITED_FROM_SUPERTYPES_WHEN_NO_EXPLICIT_OVERRIDE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "MULTIPLE_DEFAULTS_INHERITED_FROM_SUPERTYPES_WHEN_NO_EXPLICIT_OVERRIDE",
+        default_severity: Severity::Error,
+        message_template: "MULTIPLE_DEFAULTS_INHERITED_FROM_SUPERTYPES_WHEN_NO_EXPLICIT_OVERRIDE",
+    };
 pub const MULTIPLE_LABELS_ARE_FORBIDDEN: DiagnosticFactory = DiagnosticFactory {
     name: "MULTIPLE_LABELS_ARE_FORBIDDEN",
     default_severity: Severity::Error,
@@ -3116,11 +3169,12 @@ pub const MULTIPLE_VARARG_PARAMETERS: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "Multiple vararg parameters are prohibited.",
 };
-pub const MULTI_FIELD_VALUE_CLASS_PRIMARY_CONSTRUCTOR_DEFAULT_PARAMETER: DiagnosticFactory = DiagnosticFactory {
-    name: "MULTI_FIELD_VALUE_CLASS_PRIMARY_CONSTRUCTOR_DEFAULT_PARAMETER",
-    default_severity: Severity::Error,
-    message_template: "MULTI_FIELD_VALUE_CLASS_PRIMARY_CONSTRUCTOR_DEFAULT_PARAMETER",
-};
+pub const MULTI_FIELD_VALUE_CLASS_PRIMARY_CONSTRUCTOR_DEFAULT_PARAMETER: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "MULTI_FIELD_VALUE_CLASS_PRIMARY_CONSTRUCTOR_DEFAULT_PARAMETER",
+        default_severity: Severity::Error,
+        message_template: "MULTI_FIELD_VALUE_CLASS_PRIMARY_CONSTRUCTOR_DEFAULT_PARAMETER",
+    };
 pub const MUST_BE_INITIALIZED: DiagnosticFactory = DiagnosticFactory {
     name: "MUST_BE_INITIALIZED",
     default_severity: Severity::Error,
@@ -3181,11 +3235,12 @@ pub const NAMED_PARAMETER_NOT_FOUND: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "No parameter with name ''{0}'' found.",
 };
-pub const NAME_BASED_DESTRUCTURING_UNDERSCORE_WITHOUT_RENAMING: DiagnosticFactory = DiagnosticFactory {
-    name: "NAME_BASED_DESTRUCTURING_UNDERSCORE_WITHOUT_RENAMING",
-    default_severity: Severity::Error,
-    message_template: "Underscore in name-based destructuring without renaming is forbidden.",
-};
+pub const NAME_BASED_DESTRUCTURING_UNDERSCORE_WITHOUT_RENAMING: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "NAME_BASED_DESTRUCTURING_UNDERSCORE_WITHOUT_RENAMING",
+        default_severity: Severity::Error,
+        message_template: "Underscore in name-based destructuring without renaming is forbidden.",
+    };
 pub const NAME_FOR_AMBIGUOUS_PARAMETER: DiagnosticFactory = DiagnosticFactory {
     name: "NAME_FOR_AMBIGUOUS_PARAMETER",
     default_severity: Severity::Error,
@@ -3321,11 +3376,12 @@ pub const NON_PUBLIC_INLINE_CALL_FROM_PUBLIC_INLINE: DiagnosticFactory = Diagnos
     default_severity: Severity::Error,
     message_template: "NON_PUBLIC_INLINE_CALL_FROM_PUBLIC_INLINE",
 };
-pub const NON_SOURCE_ANNOTATION_ON_INLINED_LAMBDA_EXPRESSION: DiagnosticFactory = DiagnosticFactory {
-    name: "NON_SOURCE_ANNOTATION_ON_INLINED_LAMBDA_EXPRESSION",
-    default_severity: Severity::Error,
-    message_template: "NON_SOURCE_ANNOTATION_ON_INLINED_LAMBDA_EXPRESSION",
-};
+pub const NON_SOURCE_ANNOTATION_ON_INLINED_LAMBDA_EXPRESSION: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "NON_SOURCE_ANNOTATION_ON_INLINED_LAMBDA_EXPRESSION",
+        default_severity: Severity::Error,
+        message_template: "NON_SOURCE_ANNOTATION_ON_INLINED_LAMBDA_EXPRESSION",
+    };
 pub const NON_SUSPEND_OVERRIDDEN_BY_SUSPEND: DiagnosticFactory = DiagnosticFactory {
     name: "NON_SUSPEND_OVERRIDDEN_BY_SUSPEND",
     default_severity: Severity::Error,
@@ -3396,11 +3452,12 @@ pub const NOT_NULL_ASSERTION_ON_LAMBDA_EXPRESSION: DiagnosticFactory = Diagnosti
     default_severity: Severity::Warning,
     message_template: "Non-null assertion (!!) called on a lambda expression.",
 };
-pub const NOT_SUPPORTED_INLINE_PARAMETER_IN_INLINE_PARAMETER_DEFAULT_VALUE: DiagnosticFactory = DiagnosticFactory {
-    name: "NOT_SUPPORTED_INLINE_PARAMETER_IN_INLINE_PARAMETER_DEFAULT_VALUE",
-    default_severity: Severity::Error,
-    message_template: "NOT_SUPPORTED_INLINE_PARAMETER_IN_INLINE_PARAMETER_DEFAULT_VALUE",
-};
+pub const NOT_SUPPORTED_INLINE_PARAMETER_IN_INLINE_PARAMETER_DEFAULT_VALUE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "NOT_SUPPORTED_INLINE_PARAMETER_IN_INLINE_PARAMETER_DEFAULT_VALUE",
+        default_severity: Severity::Error,
+        message_template: "NOT_SUPPORTED_INLINE_PARAMETER_IN_INLINE_PARAMETER_DEFAULT_VALUE",
+    };
 pub const NOT_YET_SUPPORTED_IN_INLINE: DiagnosticFactory = DiagnosticFactory {
     name: "NOT_YET_SUPPORTED_IN_INLINE",
     default_severity: Severity::Error,
@@ -3586,11 +3643,12 @@ pub const OPT_IN_CAN_ONLY_BE_USED_AS_ANNOTATION: DiagnosticFactory = DiagnosticF
     default_severity: Severity::Error,
     message_template: "This class can only be used as an annotation.",
 };
-pub const OPT_IN_MARKER_CAN_ONLY_BE_USED_AS_ANNOTATION_OR_ARGUMENT_IN_OPT_IN: DiagnosticFactory = DiagnosticFactory {
-    name: "OPT_IN_MARKER_CAN_ONLY_BE_USED_AS_ANNOTATION_OR_ARGUMENT_IN_OPT_IN",
-    default_severity: Severity::Error,
-    message_template: "OPT_IN_MARKER_CAN_ONLY_BE_USED_AS_ANNOTATION_OR_ARGUMENT_IN_OPT_IN",
-};
+pub const OPT_IN_MARKER_CAN_ONLY_BE_USED_AS_ANNOTATION_OR_ARGUMENT_IN_OPT_IN: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "OPT_IN_MARKER_CAN_ONLY_BE_USED_AS_ANNOTATION_OR_ARGUMENT_IN_OPT_IN",
+        default_severity: Severity::Error,
+        message_template: "OPT_IN_MARKER_CAN_ONLY_BE_USED_AS_ANNOTATION_OR_ARGUMENT_IN_OPT_IN",
+    };
 pub const OPT_IN_MARKER_ON_OVERRIDE: DiagnosticFactory = DiagnosticFactory {
     name: "OPT_IN_MARKER_ON_OVERRIDE",
     default_severity: Severity::Error,
@@ -3796,11 +3854,12 @@ pub const PROPERTY_INITIALIZER_NO_BACKING_FIELD: DiagnosticFactory = DiagnosticF
     default_severity: Severity::Error,
     message_template: "Initializer is prohibited here because this property has no backing field.",
 };
-pub const PROPERTY_INITIALIZER_WITH_EXPLICIT_FIELD_DECLARATION: DiagnosticFactory = DiagnosticFactory {
-    name: "PROPERTY_INITIALIZER_WITH_EXPLICIT_FIELD_DECLARATION",
-    default_severity: Severity::Error,
-    message_template: "PROPERTY_INITIALIZER_WITH_EXPLICIT_FIELD_DECLARATION",
-};
+pub const PROPERTY_INITIALIZER_WITH_EXPLICIT_FIELD_DECLARATION: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "PROPERTY_INITIALIZER_WITH_EXPLICIT_FIELD_DECLARATION",
+        default_severity: Severity::Error,
+        message_template: "PROPERTY_INITIALIZER_WITH_EXPLICIT_FIELD_DECLARATION",
+    };
 pub const PROPERTY_TYPE_MISMATCH_BY_DELEGATION: DiagnosticFactory = DiagnosticFactory {
     name: "PROPERTY_TYPE_MISMATCH_BY_DELEGATION",
     default_severity: Severity::Error,
@@ -3956,16 +4015,18 @@ pub const REDUNDANT_SINGLE_EXPRESSION_STRING_TEMPLATE: DiagnosticFactory = Diagn
     default_severity: Severity::Warning,
     message_template: "Redundant string template.",
 };
-pub const REDUNDANT_SPREAD_OPERATOR_IN_NAMED_FORM_IN_ANNOTATION: DiagnosticFactory = DiagnosticFactory {
-    name: "REDUNDANT_SPREAD_OPERATOR_IN_NAMED_FORM_IN_ANNOTATION",
-    default_severity: Severity::Warning,
-    message_template: "Redundant spread (*) operator.",
-};
-pub const REDUNDANT_SPREAD_OPERATOR_IN_NAMED_FORM_IN_FUNCTION: DiagnosticFactory = DiagnosticFactory {
-    name: "REDUNDANT_SPREAD_OPERATOR_IN_NAMED_FORM_IN_FUNCTION",
-    default_severity: Severity::Warning,
-    message_template: "Redundant spread (*) operator.",
-};
+pub const REDUNDANT_SPREAD_OPERATOR_IN_NAMED_FORM_IN_ANNOTATION: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "REDUNDANT_SPREAD_OPERATOR_IN_NAMED_FORM_IN_ANNOTATION",
+        default_severity: Severity::Warning,
+        message_template: "Redundant spread (*) operator.",
+    };
+pub const REDUNDANT_SPREAD_OPERATOR_IN_NAMED_FORM_IN_FUNCTION: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "REDUNDANT_SPREAD_OPERATOR_IN_NAMED_FORM_IN_FUNCTION",
+        default_severity: Severity::Warning,
+        message_template: "Redundant spread (*) operator.",
+    };
 pub const REDUNDANT_VISIBILITY_MODIFIER: DiagnosticFactory = DiagnosticFactory {
     name: "REDUNDANT_VISIBILITY_MODIFIER",
     default_severity: Severity::Warning,
@@ -4006,11 +4067,12 @@ pub const REPEATED_MODIFIER: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "Repeated ''{0}''.",
 };
-pub const RESERVED_MEMBER_FROM_INTERFACE_INSIDE_VALUE_CLASS: DiagnosticFactory = DiagnosticFactory {
-    name: "RESERVED_MEMBER_FROM_INTERFACE_INSIDE_VALUE_CLASS",
-    default_severity: Severity::Error,
-    message_template: "RESERVED_MEMBER_FROM_INTERFACE_INSIDE_VALUE_CLASS",
-};
+pub const RESERVED_MEMBER_FROM_INTERFACE_INSIDE_VALUE_CLASS: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "RESERVED_MEMBER_FROM_INTERFACE_INSIDE_VALUE_CLASS",
+        default_severity: Severity::Error,
+        message_template: "RESERVED_MEMBER_FROM_INTERFACE_INSIDE_VALUE_CLASS",
+    };
 pub const RESERVED_MEMBER_INSIDE_VALUE_CLASS: DiagnosticFactory = DiagnosticFactory {
     name: "RESERVED_MEMBER_INSIDE_VALUE_CLASS",
     default_severity: Severity::Error,
@@ -4026,11 +4088,12 @@ pub const RESOLVED_TO_UNDERSCORE_NAMED_CATCH_PARAMETER: DiagnosticFactory = Diag
     default_severity: Severity::Warning,
     message_template: "RESOLVED_TO_UNDERSCORE_NAMED_CATCH_PARAMETER",
 };
-pub const RESTRICTED_RETENTION_FOR_EXPRESSION_ANNOTATION_ERROR: DiagnosticFactory = DiagnosticFactory {
-    name: "RESTRICTED_RETENTION_FOR_EXPRESSION_ANNOTATION_ERROR",
-    default_severity: Severity::Error,
-    message_template: "Expression annotations with retention other than SOURCE are prohibited.",
-};
+pub const RESTRICTED_RETENTION_FOR_EXPRESSION_ANNOTATION_ERROR: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "RESTRICTED_RETENTION_FOR_EXPRESSION_ANNOTATION_ERROR",
+        default_severity: Severity::Error,
+        message_template: "Expression annotations with retention other than SOURCE are prohibited.",
+    };
 pub const RESULT_TYPE_MISMATCH: DiagnosticFactory = DiagnosticFactory {
     name: "RESULT_TYPE_MISMATCH",
     default_severity: Severity::Error,
@@ -4046,11 +4109,12 @@ pub const RETURN_IN_FUNCTION_WITH_EXPRESSION_BODY: DiagnosticFactory = Diagnosti
     default_severity: Severity::Error,
     message_template: "RETURN_IN_FUNCTION_WITH_EXPRESSION_BODY",
 };
-pub const RETURN_IN_FUNCTION_WITH_EXPRESSION_BODY_AND_IMPLICIT_TYPE: DiagnosticFactory = DiagnosticFactory {
-    name: "RETURN_IN_FUNCTION_WITH_EXPRESSION_BODY_AND_IMPLICIT_TYPE",
-    default_severity: Severity::Error,
-    message_template: "RETURN_IN_FUNCTION_WITH_EXPRESSION_BODY_AND_IMPLICIT_TYPE",
-};
+pub const RETURN_IN_FUNCTION_WITH_EXPRESSION_BODY_AND_IMPLICIT_TYPE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "RETURN_IN_FUNCTION_WITH_EXPRESSION_BODY_AND_IMPLICIT_TYPE",
+        default_severity: Severity::Error,
+        message_template: "RETURN_IN_FUNCTION_WITH_EXPRESSION_BODY_AND_IMPLICIT_TYPE",
+    };
 pub const RETURN_IN_FUNCTION_WITH_EXPRESSION_BODY_WARNING: DiagnosticFactory = DiagnosticFactory {
     name: "RETURN_IN_FUNCTION_WITH_EXPRESSION_BODY_WARNING",
     default_severity: Severity::Warning,
@@ -4131,11 +4195,12 @@ pub const SEALED_SUPERTYPE_IN_LOCAL_CLASS: DiagnosticFactory = DiagnosticFactory
     default_severity: Severity::Error,
     message_template: "{0} cannot extend a sealed {1}.",
 };
-pub const SECONDARY_CONSTRUCTOR_WITH_BODY_INSIDE_VALUE_CLASS: DiagnosticFactory = DiagnosticFactory {
-    name: "SECONDARY_CONSTRUCTOR_WITH_BODY_INSIDE_VALUE_CLASS",
-    default_severity: Severity::Error,
-    message_template: "SECONDARY_CONSTRUCTOR_WITH_BODY_INSIDE_VALUE_CLASS",
-};
+pub const SECONDARY_CONSTRUCTOR_WITH_BODY_INSIDE_VALUE_CLASS: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "SECONDARY_CONSTRUCTOR_WITH_BODY_INSIDE_VALUE_CLASS",
+        default_severity: Severity::Error,
+        message_template: "SECONDARY_CONSTRUCTOR_WITH_BODY_INSIDE_VALUE_CLASS",
+    };
 pub const SELF_CALL_IN_NESTED_OBJECT_CONSTRUCTOR_ERROR: DiagnosticFactory = DiagnosticFactory {
     name: "SELF_CALL_IN_NESTED_OBJECT_CONSTRUCTOR_ERROR",
     default_severity: Severity::Error,
@@ -4156,11 +4221,12 @@ pub const SETTER_PROJECTED_OUT: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "SETTER_PROJECTED_OUT",
 };
-pub const SETTER_VISIBILITY_INCONSISTENT_WITH_PROPERTY_VISIBILITY: DiagnosticFactory = DiagnosticFactory {
-    name: "SETTER_VISIBILITY_INCONSISTENT_WITH_PROPERTY_VISIBILITY",
-    default_severity: Severity::Error,
-    message_template: "SETTER_VISIBILITY_INCONSISTENT_WITH_PROPERTY_VISIBILITY",
-};
+pub const SETTER_VISIBILITY_INCONSISTENT_WITH_PROPERTY_VISIBILITY: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "SETTER_VISIBILITY_INCONSISTENT_WITH_PROPERTY_VISIBILITY",
+        default_severity: Severity::Error,
+        message_template: "SETTER_VISIBILITY_INCONSISTENT_WITH_PROPERTY_VISIBILITY",
+    };
 pub const SINGLETON_IN_SUPERTYPE: DiagnosticFactory = DiagnosticFactory {
     name: "SINGLETON_IN_SUPERTYPE",
     default_severity: Severity::Error,
@@ -4221,11 +4287,12 @@ pub const SUPERTYPE_INITIALIZED_IN_INTERFACE: DiagnosticFactory = DiagnosticFact
     default_severity: Severity::Error,
     message_template: "Interfaces cannot initialize supertypes.",
 };
-pub const SUPERTYPE_INITIALIZED_WITHOUT_PRIMARY_CONSTRUCTOR: DiagnosticFactory = DiagnosticFactory {
-    name: "SUPERTYPE_INITIALIZED_WITHOUT_PRIMARY_CONSTRUCTOR",
-    default_severity: Severity::Error,
-    message_template: "Supertype initialization is impossible without a primary constructor.",
-};
+pub const SUPERTYPE_INITIALIZED_WITHOUT_PRIMARY_CONSTRUCTOR: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "SUPERTYPE_INITIALIZED_WITHOUT_PRIMARY_CONSTRUCTOR",
+        default_severity: Severity::Error,
+        message_template: "Supertype initialization is impossible without a primary constructor.",
+    };
 pub const SUPERTYPE_IS_EXTENSION_OR_CONTEXT_FUNCTION_TYPE: DiagnosticFactory = DiagnosticFactory {
     name: "SUPERTYPE_IS_EXTENSION_OR_CONTEXT_FUNCTION_TYPE",
     default_severity: Severity::Error,
@@ -4301,11 +4368,12 @@ pub const TYPEALIAS_EXPANDS_TO_ARRAY_OF_NOTHINGS: DiagnosticFactory = Diagnostic
     default_severity: Severity::Error,
     message_template: "Type alias expanded to malformed type ''{0}''.",
 };
-pub const TYPEALIAS_EXPANSION_CAPTURES_OUTER_TYPE_PARAMETERS: DiagnosticFactory = DiagnosticFactory {
-    name: "TYPEALIAS_EXPANSION_CAPTURES_OUTER_TYPE_PARAMETERS",
-    default_severity: Severity::Error,
-    message_template: "TYPEALIAS_EXPANSION_CAPTURES_OUTER_TYPE_PARAMETERS",
-};
+pub const TYPEALIAS_EXPANSION_CAPTURES_OUTER_TYPE_PARAMETERS: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "TYPEALIAS_EXPANSION_CAPTURES_OUTER_TYPE_PARAMETERS",
+        default_severity: Severity::Error,
+        message_template: "TYPEALIAS_EXPANSION_CAPTURES_OUTER_TYPE_PARAMETERS",
+    };
 pub const TYPEALIAS_EXPANSION_DEPRECATION: DiagnosticFactory = DiagnosticFactory {
     name: "TYPEALIAS_EXPANSION_DEPRECATION",
     default_severity: Severity::Warning,
@@ -4326,11 +4394,12 @@ pub const TYPECHECKER_HAS_RUN_INTO_RECURSIVE_PROBLEM: DiagnosticFactory = Diagno
     default_severity: Severity::Error,
     message_template: "Type checking has run into a recursive problem. Easiest workaround: specify the types of your declarations explicitly.",
 };
-pub const TYPE_ARGUMENTS_FOR_OUTER_CLASS_WHEN_NESTED_REFERENCED: DiagnosticFactory = DiagnosticFactory {
-    name: "TYPE_ARGUMENTS_FOR_OUTER_CLASS_WHEN_NESTED_REFERENCED",
-    default_severity: Severity::Error,
-    message_template: "Type arguments for outer class are redundant when nested class is referenced.",
-};
+pub const TYPE_ARGUMENTS_FOR_OUTER_CLASS_WHEN_NESTED_REFERENCED: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "TYPE_ARGUMENTS_FOR_OUTER_CLASS_WHEN_NESTED_REFERENCED",
+        default_severity: Severity::Error,
+        message_template: "Type arguments for outer class are redundant when nested class is referenced.",
+    };
 pub const TYPE_ARGUMENTS_NOT_ALLOWED: DiagnosticFactory = DiagnosticFactory {
     name: "TYPE_ARGUMENTS_NOT_ALLOWED",
     default_severity: Severity::Error,
@@ -4536,11 +4605,12 @@ pub const UNSAFE_OPERATOR_CALL: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "UNSAFE_OPERATOR_CALL",
 };
-pub const UNSIGNED_LITERAL_WITHOUT_DECLARATIONS_ON_CLASSPATH: DiagnosticFactory = DiagnosticFactory {
-    name: "UNSIGNED_LITERAL_WITHOUT_DECLARATIONS_ON_CLASSPATH",
-    default_severity: Severity::Error,
-    message_template: "UNSIGNED_LITERAL_WITHOUT_DECLARATIONS_ON_CLASSPATH",
-};
+pub const UNSIGNED_LITERAL_WITHOUT_DECLARATIONS_ON_CLASSPATH: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "UNSIGNED_LITERAL_WITHOUT_DECLARATIONS_ON_CLASSPATH",
+        default_severity: Severity::Error,
+        message_template: "UNSIGNED_LITERAL_WITHOUT_DECLARATIONS_ON_CLASSPATH",
+    };
 pub const UNSUPPORTED: DiagnosticFactory = DiagnosticFactory {
     name: "UNSUPPORTED",
     default_severity: Severity::Error,
@@ -4566,11 +4636,12 @@ pub const UNSUPPORTED_FEATURE: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Error,
     message_template: "{0}",
 };
-pub const UNSUPPORTED_INHERITANCE_FROM_JAVA_MEMBER_REFERENCING_KOTLIN_FUNCTION: DiagnosticFactory = DiagnosticFactory {
-    name: "UNSUPPORTED_INHERITANCE_FROM_JAVA_MEMBER_REFERENCING_KOTLIN_FUNCTION",
-    default_severity: Severity::Error,
-    message_template: "UNSUPPORTED_INHERITANCE_FROM_JAVA_MEMBER_REFERENCING_KOTLIN_FUNCTION",
-};
+pub const UNSUPPORTED_INHERITANCE_FROM_JAVA_MEMBER_REFERENCING_KOTLIN_FUNCTION: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "UNSUPPORTED_INHERITANCE_FROM_JAVA_MEMBER_REFERENCING_KOTLIN_FUNCTION",
+        default_severity: Severity::Error,
+        message_template: "UNSUPPORTED_INHERITANCE_FROM_JAVA_MEMBER_REFERENCING_KOTLIN_FUNCTION",
+    };
 pub const UNSUPPORTED_SEALED_FUN_INTERFACE: DiagnosticFactory = DiagnosticFactory {
     name: "UNSUPPORTED_SEALED_FUN_INTERFACE",
     default_severity: Severity::Error,
@@ -4601,11 +4672,12 @@ pub const UNUSED_VARIABLE: DiagnosticFactory = DiagnosticFactory {
     default_severity: Severity::Warning,
     message_template: "Variable is unused.",
 };
-pub const UPPER_BOUND_IS_EXTENSION_OR_CONTEXT_FUNCTION_TYPE: DiagnosticFactory = DiagnosticFactory {
-    name: "UPPER_BOUND_IS_EXTENSION_OR_CONTEXT_FUNCTION_TYPE",
-    default_severity: Severity::Error,
-    message_template: "UPPER_BOUND_IS_EXTENSION_OR_CONTEXT_FUNCTION_TYPE",
-};
+pub const UPPER_BOUND_IS_EXTENSION_OR_CONTEXT_FUNCTION_TYPE: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "UPPER_BOUND_IS_EXTENSION_OR_CONTEXT_FUNCTION_TYPE",
+        default_severity: Severity::Error,
+        message_template: "UPPER_BOUND_IS_EXTENSION_OR_CONTEXT_FUNCTION_TYPE",
+    };
 pub const UPPER_BOUND_VIOLATED: DiagnosticFactory = DiagnosticFactory {
     name: "UPPER_BOUND_VIOLATED",
     default_severity: Severity::Error,
@@ -4621,11 +4693,12 @@ pub const UPPER_BOUND_VIOLATED_IN_TYPEALIAS_EXPANSION: DiagnosticFactory = Diagn
     default_severity: Severity::Error,
     message_template: "UPPER_BOUND_VIOLATED_IN_TYPEALIAS_EXPANSION",
 };
-pub const UPPER_BOUND_VIOLATED_IN_TYPEALIAS_EXPANSION_DEPRECATION_WARNING: DiagnosticFactory = DiagnosticFactory {
-    name: "UPPER_BOUND_VIOLATED_IN_TYPEALIAS_EXPANSION_DEPRECATION_WARNING",
-    default_severity: Severity::Warning,
-    message_template: "UPPER_BOUND_VIOLATED_IN_TYPEALIAS_EXPANSION_DEPRECATION_WARNING",
-};
+pub const UPPER_BOUND_VIOLATED_IN_TYPEALIAS_EXPANSION_DEPRECATION_WARNING: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "UPPER_BOUND_VIOLATED_IN_TYPEALIAS_EXPANSION_DEPRECATION_WARNING",
+        default_severity: Severity::Warning,
+        message_template: "UPPER_BOUND_VIOLATED_IN_TYPEALIAS_EXPANSION_DEPRECATION_WARNING",
+    };
 pub const USAGE_IS_NOT_INLINABLE: DiagnosticFactory = DiagnosticFactory {
     name: "USAGE_IS_NOT_INLINABLE",
     default_severity: Severity::Error,
@@ -4686,16 +4759,18 @@ pub const VALUE_CLASS_CANNOT_HAVE_CONTEXT_RECEIVERS: DiagnosticFactory = Diagnos
     default_severity: Severity::Error,
     message_template: "Value classes cannot have context receivers.",
 };
-pub const VALUE_CLASS_CANNOT_IMPLEMENT_INTERFACE_BY_DELEGATION: DiagnosticFactory = DiagnosticFactory {
-    name: "VALUE_CLASS_CANNOT_IMPLEMENT_INTERFACE_BY_DELEGATION",
-    default_severity: Severity::Error,
-    message_template: "Value class cannot implement an interface by delegation.",
-};
-pub const VALUE_CLASS_CONSTRUCTOR_NOT_FINAL_READ_ONLY_PARAMETER: DiagnosticFactory = DiagnosticFactory {
-    name: "VALUE_CLASS_CONSTRUCTOR_NOT_FINAL_READ_ONLY_PARAMETER",
-    default_severity: Severity::Error,
-    message_template: "VALUE_CLASS_CONSTRUCTOR_NOT_FINAL_READ_ONLY_PARAMETER",
-};
+pub const VALUE_CLASS_CANNOT_IMPLEMENT_INTERFACE_BY_DELEGATION: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "VALUE_CLASS_CANNOT_IMPLEMENT_INTERFACE_BY_DELEGATION",
+        default_severity: Severity::Error,
+        message_template: "Value class cannot implement an interface by delegation.",
+    };
+pub const VALUE_CLASS_CONSTRUCTOR_NOT_FINAL_READ_ONLY_PARAMETER: DiagnosticFactory =
+    DiagnosticFactory {
+        name: "VALUE_CLASS_CONSTRUCTOR_NOT_FINAL_READ_ONLY_PARAMETER",
+        default_severity: Severity::Error,
+        message_template: "VALUE_CLASS_CONSTRUCTOR_NOT_FINAL_READ_ONLY_PARAMETER",
+    };
 pub const VALUE_CLASS_EMPTY_CONSTRUCTOR: DiagnosticFactory = DiagnosticFactory {
     name: "VALUE_CLASS_EMPTY_CONSTRUCTOR",
     default_severity: Severity::Error,

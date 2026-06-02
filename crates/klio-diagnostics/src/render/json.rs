@@ -3,6 +3,7 @@
 
 use crate::{Diagnostic, Severity};
 use klio_span::SourceMap;
+use std::fmt::Write;
 
 pub fn render(
     diagnostics: &[Diagnostic],
@@ -15,20 +16,30 @@ pub fn render(
         let (el, ec) = file.line_col(d.primary.span.end);
         let mut s = String::new();
         s.push('{');
-        push_field(&mut s, "factory", json_string(d.factory.map_or("", |f| f.name)));
-        push_field(&mut s, "legacy_code", json_string(d.legacy_code.unwrap_or("")));
-        push_field(&mut s, "severity", json_string(severity_str(d.severity)));
-        push_field(&mut s, "file", json_string(&file.path.to_string_lossy()));
-        push_field(&mut s, "message", json_string(&d.message));
+        push_field(
+            &mut s,
+            "factory",
+            &json_string(d.factory.map_or("", |f| f.name)),
+        );
+        push_field(
+            &mut s,
+            "legacy_code",
+            &json_string(d.legacy_code.unwrap_or("")),
+        );
+        push_field(&mut s, "severity", &json_string(severity_str(d.severity)));
+        push_field(&mut s, "file", &json_string(&file.path.to_string_lossy()));
+        push_field(&mut s, "message", &json_string(&d.message));
         s.push_str(",\"range\":{\"start\":{");
-        s.push_str(&format!("\"line\":{sl},\"col\":{sc}"));
+        write!(s, "\"line\":{sl},\"col\":{sc}").unwrap();
         s.push_str("},\"end\":{");
-        s.push_str(&format!("\"line\":{el},\"col\":{ec}"));
+        write!(s, "\"line\":{el},\"col\":{ec}").unwrap();
         s.push_str("}}");
         if !d.notes.is_empty() {
             s.push_str(",\"notes\":[");
             for (i, n) in d.notes.iter().enumerate() {
-                if i > 0 { s.push(','); }
+                if i > 0 {
+                    s.push(',');
+                }
                 s.push_str(&json_string(n));
             }
             s.push(']');
@@ -36,8 +47,10 @@ pub fn render(
         if !d.fixits.is_empty() {
             s.push_str(",\"fixits\":[");
             for (i, fx) in d.fixits.iter().enumerate() {
-                if i > 0 { s.push(','); }
-                s.push_str(&format!("{{\"title\":{}}}", json_string(&fx.title)));
+                if i > 0 {
+                    s.push(',');
+                }
+                write!(s, "{{\"title\":{}}}", json_string(&fx.title)).unwrap();
             }
             s.push(']');
         }
@@ -55,11 +68,11 @@ pub fn to_string(diagnostics: &[Diagnostic], sources: &SourceMap) -> String {
     String::from_utf8(buf).unwrap_or_default()
 }
 
-fn push_field(buf: &mut String, key: &str, value: String) {
+fn push_field(buf: &mut String, key: &str, value: &str) {
     if !buf.ends_with('{') {
         buf.push(',');
     }
-    buf.push_str(&format!("\"{key}\":{value}"));
+    write!(buf, "\"{key}\":{value}").unwrap();
 }
 
 fn json_string(s: &str) -> String {
@@ -72,7 +85,7 @@ fn json_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32).unwrap(),
             c => out.push(c),
         }
     }

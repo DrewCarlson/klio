@@ -30,10 +30,8 @@ fn expected_stdout(file: &Path) -> String {
         if let Some(rest) = t.strip_prefix("//>") {
             out.push_str(rest.strip_prefix(' ').unwrap_or(rest));
             out.push('\n');
-        } else if t.starts_with("//") {
-            continue;
-        } else if out.is_empty() {
-            continue;
+        } else if t.starts_with("//") || out.is_empty() {
+            // Skip leading comments and blank lead-in.
         } else {
             break;
         }
@@ -82,17 +80,50 @@ const GATED: &[(&str, &str)] = &[];
 // Each runnable rule is its own `#[test]` so the cargo test harness
 // parallelises them — the previous single test serialised 11 long
 // `run_with_packs` calls and dominated this binary's wall-clock.
-#[test] fn mm1_no_tearing()         { check("mm1_no_tearing"); }
-#[test] fn mm2_drf_sc()             { check("mm2_drf_sc"); }
-#[test] fn mm3_no_oota()             { check("mm3_no_oota"); }
-#[test] fn mm4_safe_publication()    { check("mm4_safe_publication"); }
-#[test] fn mm5_volatile()            { check("mm5_volatile"); }
-#[test] fn mm6_monitor()             { check("mm6_monitor"); }
-#[test] fn mm7_atomics()             { check("mm7_atomics"); }
-#[test] fn mm8_thread_join()         { check("mm8_thread_join"); }
-#[test] fn mm9_coroutine_hb()        { check("mm9_coroutine_hb"); }
-#[test] fn mm10_channel_flow()       { check("mm10_channel_flow"); }
-#[test] fn mm11_no_lost_tearing()    { check("mm11_no_lost_tearing"); }
+#[test]
+fn mm1_no_tearing() {
+    check("mm1_no_tearing");
+}
+#[test]
+fn mm2_drf_sc() {
+    check("mm2_drf_sc");
+}
+#[test]
+fn mm3_no_oota() {
+    check("mm3_no_oota");
+}
+#[test]
+fn mm4_safe_publication() {
+    check("mm4_safe_publication");
+}
+#[test]
+fn mm5_volatile() {
+    check("mm5_volatile");
+}
+#[test]
+fn mm6_monitor() {
+    check("mm6_monitor");
+}
+#[test]
+fn mm7_atomics() {
+    check("mm7_atomics");
+}
+#[test]
+fn mm8_thread_join() {
+    check("mm8_thread_join");
+}
+#[test]
+fn mm9_coroutine_hb() {
+    check("mm9_coroutine_hb");
+}
+#[test]
+fn mm10_channel_flow() {
+    check("mm10_channel_flow");
+}
+#[test]
+fn mm11_no_lost_tearing() {
+    check("mm11_no_lost_tearing");
+}
 
 #[test]
 #[ignore = "gated litmus: un-ignore as each owning stage lands"]

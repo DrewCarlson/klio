@@ -127,8 +127,11 @@ class C : B() {
 }
 fun main() { val c = C(); println("done:${c.x}${c.y}${c.z}") }
 "#;
-    assert_klio("deep_init_order", src,
-        "A.init\nA.x\nB.init\nB.y\nC.init\nC.z\ndone:A.xB.yC.z\n");
+    assert_klio(
+        "deep_init_order",
+        src,
+        "A.init\nA.x\nB.init\nB.y\nC.init\nC.z\ndone:A.xB.yC.z\n",
+    );
 }
 
 #[test]

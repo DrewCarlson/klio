@@ -1,6 +1,8 @@
-use super::{Parser, Expr, TokenKind, Ident, Keyword, StringPart};
+use super::{Expr, Ident, Keyword, Parser, StringPart, TokenKind};
 
 impl Parser<'_, '_> {
+    // Single match-dispatch over primary tokens; splitting would fragment it.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn parse_primary(&mut self) -> Option<Expr> {
         self.skip_nl();
         let kind = self.peek_kind().clone();
@@ -9,7 +11,10 @@ impl Parser<'_, '_> {
             TokenKind::FloatLiteral { suffix: _ } => Some(self.parse_float_literal()),
             TokenKind::BoolLiteral(v) => {
                 let tok = self.bump();
-                Some(Expr::BoolLit { value: v, span: tok.span })
+                Some(Expr::BoolLit {
+                    value: v,
+                    span: tok.span,
+                })
             }
             TokenKind::NullLiteral => {
                 let tok = self.bump();
@@ -17,7 +22,10 @@ impl Parser<'_, '_> {
             }
             TokenKind::CharLiteral(c) => {
                 let tok = self.bump();
-                Some(Expr::CharLit { value: c, span: tok.span })
+                Some(Expr::CharLit {
+                    value: c,
+                    span: tok.span,
+                })
             }
             // Collection-literal `[a, b, ...]`. Kotlin permits this
             // only as an annotation argument
@@ -44,7 +52,10 @@ impl Parser<'_, '_> {
                 let span = lb.span.join(rb.span);
                 let n = elems.len();
                 let callee = Expr::Path {
-                    segments: vec![Ident { name: "listOf".into(), span: lb.span }],
+                    segments: vec![Ident {
+                        name: "listOf".into(),
+                        span: lb.span,
+                    }],
                     span: lb.span,
                 };
                 Some(Expr::Call {
@@ -62,8 +73,14 @@ impl Parser<'_, '_> {
                     return Some(label_expr);
                 }
                 let tok = self.bump();
-                let ident = Ident { name: self.ident_name(tok.span), span: tok.span };
-                Some(Expr::Path { segments: vec![ident], span: tok.span })
+                let ident = Ident {
+                    name: self.ident_name(tok.span),
+                    span: tok.span,
+                };
+                Some(Expr::Path {
+                    segments: vec![ident],
+                    span: tok.span,
+                })
             }
             TokenKind::LParen => {
                 self.bump();
@@ -81,9 +98,7 @@ impl Parser<'_, '_> {
                 // `{ it + 1 }` assigned to a function-typed val is a
                 // lambda, not a block. `parse_lambda_literal` handles
                 // the no-`->` (implicit `it` / zero-arg) form.
-                {
-                    self.parse_lambda_literal()
-                }
+                { self.parse_lambda_literal() }
             }
             TokenKind::Keyword(Keyword::Fun) => self.parse_anon_fun(),
             TokenKind::Keyword(Keyword::If) => self.parse_if(),
@@ -105,7 +120,10 @@ impl Parser<'_, '_> {
                         qualifier = Some(n);
                     }
                 }
-                Some(Expr::This { qualifier, span: tok.span.join(end) })
+                Some(Expr::This {
+                    qualifier,
+                    span: tok.span.join(end),
+                })
             }
             TokenKind::ColonColon => {
                 let start = self.bump().span;
@@ -151,7 +169,11 @@ impl Parser<'_, '_> {
                 if let Some(l) = &label {
                     end = end.join(l.span);
                 }
-                Some(Expr::Super { qualifier, label, span: tok.span.join(end) })
+                Some(Expr::Super {
+                    qualifier,
+                    label,
+                    span: tok.span.join(end),
+                })
             }
             TokenKind::Keyword(Keyword::Break) => {
                 let tok = self.bump();
@@ -183,12 +205,16 @@ impl Parser<'_, '_> {
         let (digits, radix): (&str, u32) = match base {
             klio_lexer::NumBase::Decimal => (raw_text.trim_end_matches(['L', 'u', 'U']), 10),
             klio_lexer::NumBase::Hex => (
-                raw_text.trim_start_matches("0x").trim_start_matches("0X")
+                raw_text
+                    .trim_start_matches("0x")
+                    .trim_start_matches("0X")
                     .trim_end_matches(['L', 'u', 'U']),
                 16,
             ),
             klio_lexer::NumBase::Binary => (
-                raw_text.trim_start_matches("0b").trim_start_matches("0B")
+                raw_text
+                    .trim_start_matches("0b")
+                    .trim_start_matches("0B")
                     .trim_end_matches(['L', 'u', 'U']),
                 2,
             ),
@@ -204,14 +230,21 @@ impl Parser<'_, '_> {
             klio_lexer::IntSuffix::ULong => klio_ast::IntLitKind::ULong,
             klio_lexer::IntSuffix::None => klio_ast::IntLitKind::Int,
         };
-        Expr::IntLit { value, kind, span: tok.span }
+        Expr::IntLit {
+            value,
+            kind,
+            span: tok.span,
+        }
     }
 
     pub(crate) fn parse_float_literal(&mut self) -> Expr {
         let tok = self.bump();
         let raw_text = self.text(tok.span);
         let has_f_suffix = raw_text.ends_with('f') || raw_text.ends_with('F');
-        let cleaned: String = raw_text.chars().filter(|c| *c != '_' && !matches!(c, 'f' | 'F')).collect();
+        let cleaned: String = raw_text
+            .chars()
+            .filter(|c| *c != '_' && !matches!(c, 'f' | 'F'))
+            .collect();
         let span = tok.span;
         let value: f64 = cleaned.parse().unwrap_or_else(|_| {
             self.error("E0012", "invalid float literal", span);
@@ -222,7 +255,11 @@ impl Parser<'_, '_> {
         } else {
             klio_ast::FloatLitKind::Double
         };
-        Expr::FloatLit { value, kind, span: tok.span }
+        Expr::FloatLit {
+            value,
+            kind,
+            span: tok.span,
+        }
     }
 
     pub(crate) fn parse_string_template(&mut self) -> Option<Expr> {
@@ -234,7 +271,10 @@ impl Parser<'_, '_> {
             match kind {
                 TokenKind::StringQuote { triple: t } if t == triple => {
                     let close = self.bump();
-                    return Some(Expr::StringTemplate { parts, span: open.span.join(close.span) });
+                    return Some(Expr::StringTemplate {
+                        parts,
+                        span: open.span.join(close.span),
+                    });
                 }
                 TokenKind::StringText(s) => {
                     self.bump();
@@ -242,7 +282,10 @@ impl Parser<'_, '_> {
                 }
                 TokenKind::ShortInterp(name) => {
                     let tok = self.bump();
-                    parts.push(StringPart::ShortInterp(Ident { name, span: tok.span }));
+                    parts.push(StringPart::ShortInterp(Ident {
+                        name,
+                        span: tok.span,
+                    }));
                 }
                 TokenKind::InterpStart => {
                     self.bump();
@@ -253,7 +296,10 @@ impl Parser<'_, '_> {
                 }
                 TokenKind::Eof => {
                     self.error("E0013", "unterminated string template", open.span);
-                    return Some(Expr::StringTemplate { parts, span: open.span });
+                    return Some(Expr::StringTemplate {
+                        parts,
+                        span: open.span,
+                    });
                 }
                 _ => {
                     let span = self.current_span();
@@ -263,5 +309,4 @@ impl Parser<'_, '_> {
             }
         }
     }
-
 }

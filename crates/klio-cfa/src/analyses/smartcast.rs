@@ -40,7 +40,7 @@ pub enum Nullability {
 }
 
 impl SmartCastFact {
-    #[must_use] 
+    #[must_use]
     pub fn unknown() -> Self {
         Self {
             narrowed: None,
@@ -96,13 +96,12 @@ impl Lattice for SmartCastFact {
     }
     fn join(&mut self, other: &Self) -> bool {
         let mut changed = false;
-        let new_narrow = match (self.narrowed.clone(), other.narrowed.clone()) {
+        let new_narrow = match (&self.narrowed, &other.narrowed) {
             (Some(a), Some(b)) => {
                 let merged = union_of(a, b);
                 Some(merged)
             }
-            (Some(_), None) | (None, Some(_)) => None,
-            (None, None) => None,
+            (Some(_), None) | (None, Some(_) | None) => None,
         };
         if new_narrow != self.narrowed {
             self.narrowed = new_narrow;
@@ -170,7 +169,12 @@ fn intersect_facts(a: &SmartCastFact, b: &SmartCastFact) -> SmartCastFact {
             not_types.push(t.clone());
         }
     }
-    SmartCastFact { narrowed, narrowed_class, not_types, null }
+    SmartCastFact {
+        narrowed,
+        narrowed_class,
+        not_types,
+        null,
+    }
 }
 
 /// Intersection of two types, materialised as `Type::Intersection`
@@ -187,12 +191,8 @@ fn intersect(a: Type, b: Type) -> Type {
 /// for refinement and no explicit union variant, we conservatively
 /// drop the narrowing when the two branches disagree — same as the
 /// current typechecker behavior.
-fn union_of(a: Type, b: Type) -> Type {
-    if a == b {
-        a
-    } else {
-        Type::Any
-    }
+fn union_of(a: &Type, b: &Type) -> Type {
+    if a == b { a.clone() } else { Type::Any }
 }
 
 pub type SmartCastLattice = MapLattice<Place, SmartCastFact>;
@@ -214,12 +214,13 @@ impl SmartCastTransfer<'_> {
             .unwrap_or_else(SmartCastFact::unknown);
         if fact.narrowed.is_none()
             && let Some(decl_map) = self.declared_types
-                && let Some(t) = decl_map.get(place) {
-                    fact.narrowed = Some(t.clone());
-                    // Nullable declared types get no automatic
-                    // nullability axis — the explicit AssumeNull
-                    // nodes carry that signal.
-                }
+            && let Some(t) = decl_map.get(place)
+        {
+            fact.narrowed = Some(t.clone());
+            // Nullable declared types get no automatic
+            // nullability axis — the explicit AssumeNull
+            // nodes carry that signal.
+        }
         fact
     }
 }
@@ -227,9 +228,19 @@ impl SmartCastTransfer<'_> {
 impl ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'_> {
     fn transfer_node(&mut self, node: &Node, state: &mut SmartCastLattice) {
         match node {
-            Node::AssumeIs { reg, ty, class_name, polarity, .. } => {
+            Node::AssumeIs {
+                reg,
+                ty,
+                class_name,
+                polarity,
+                ..
+            } => {
                 if let Some(place) = self.reg_to_place.get(reg) {
-                    let mut fact = state.map.get(place).cloned().unwrap_or_else(SmartCastFact::unknown);
+                    let mut fact = state
+                        .map
+                        .get(place)
+                        .cloned()
+                        .unwrap_or_else(SmartCastFact::unknown);
                     if *polarity {
                         fact.assume_is(ty.clone(), class_name.clone());
                     } else {
@@ -240,7 +251,11 @@ impl ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'_> {
             }
             Node::AssumeNull { reg, eq_null, .. } => {
                 if let Some(place) = self.reg_to_place.get(reg) {
-                    let mut fact = state.map.get(place).cloned().unwrap_or_else(SmartCastFact::unknown);
+                    let mut fact = state
+                        .map
+                        .get(place)
+                        .cloned()
+                        .unwrap_or_else(SmartCastFact::unknown);
                     if *eq_null {
                         fact.assume_null();
                     } else {
@@ -249,7 +264,12 @@ impl ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'_> {
                     state.put(place.clone(), fact);
                 }
             }
-            Node::AssumeRefEq { reg_a, reg_b, polarity, .. } => {
+            Node::AssumeRefEq {
+                reg_a,
+                reg_b,
+                polarity,
+                ..
+            } => {
                 if !*polarity {
                     return;
                 }
@@ -281,7 +301,9 @@ impl ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'_> {
 /// Run the smart-cast analysis to fixpoint. Returns per-block in-
 /// states; the caller queries facts at the entry of the block
 /// containing a given AST span.
-#[must_use] 
+#[must_use]
+// transfer struct holds default-hasher map refs; generifying would cascade through it
+#[allow(clippy::implicit_hasher)]
 pub fn solve(cfg: &Cfg, reg_to_place: &HashMap<Reg, Place>) -> Vec<SmartCastLattice> {
     solve_with_declared(cfg, reg_to_place, None)
 }
@@ -289,7 +311,9 @@ pub fn solve(cfg: &Cfg, reg_to_place: &HashMap<Reg, Place>) -> Vec<SmartCastLatt
 /// Like `solve`, but also seeded with a per-place declared-type map
 /// that `AssumeRefEq` consults to bridge cross-variable narrowings
 /// when neither side has a prior fact.
-#[must_use] 
+#[must_use]
+// transfer struct holds default-hasher map refs; generifying would cascade through it
+#[allow(clippy::implicit_hasher)]
 pub fn solve_with_declared(
     cfg: &Cfg,
     reg_to_place: &HashMap<Reg, Place>,
@@ -298,13 +322,18 @@ pub fn solve_with_declared(
     solve_forward(
         cfg,
         SmartCastLattice::new(),
-        SmartCastTransfer { reg_to_place, declared_types },
+        SmartCastTransfer {
+            reg_to_place,
+            declared_types,
+        },
     )
 }
 
 /// Reproduce the per-node in-state walk inside a block. Mirrors
 /// `analyses::via::states_within_block` for ad-hoc lookups.
-#[must_use] 
+#[must_use]
+// transfer struct holds default-hasher map refs; generifying would cascade through it
+#[allow(clippy::implicit_hasher)]
 pub fn states_within_block(
     cfg: &Cfg,
     block: crate::ir::BlockId,
@@ -314,7 +343,9 @@ pub fn states_within_block(
     states_within_block_with_declared(cfg, block, entry, reg_to_place, None)
 }
 
-#[must_use] 
+#[must_use]
+// transfer struct holds default-hasher map refs; generifying would cascade through it
+#[allow(clippy::implicit_hasher)]
 pub fn states_within_block_with_declared(
     cfg: &Cfg,
     block: crate::ir::BlockId,
@@ -325,7 +356,10 @@ pub fn states_within_block_with_declared(
     let mut out: Vec<SmartCastLattice> = Vec::with_capacity(cfg.block(block).nodes.len() + 1);
     let mut s = entry;
     out.push(s.clone());
-    let mut t = SmartCastTransfer { reg_to_place, declared_types };
+    let mut t = SmartCastTransfer {
+        reg_to_place,
+        declared_types,
+    };
     for node in &cfg.block(block).nodes {
         t.transfer_node(node, &mut s);
         out.push(s.clone());

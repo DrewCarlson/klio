@@ -1,4 +1,4 @@
-use crate::{SourceMap, PathBuf};
+use crate::{PathBuf, SourceMap};
 
 /// Build a single `HostBindings` table that the loader passes to
 /// every pack: starts with `klio-stdlib`'s defaults and unions in
@@ -30,20 +30,17 @@ fn load_embedded_stdlib_sources(
     out_bindings: &mut klio_stdlib::HostBindings,
 ) {
     use klio_pack::schema::decode;
-    use klio_pack::{section_names, PackReader};
+    use klio_pack::{PackReader, section_names};
 
     let bytes = klio_stdlib_pack::stdlib_pack_bytes();
-    let pack = match PackReader::from_bytes(bytes.into_owned()) {
-        Ok(p) => p,
-        Err(_) => return,
+    let Ok(pack) = PackReader::from_bytes(bytes.into_owned()) else {
+        return;
     };
-    let payload = match pack.read_section(section_names::SOURCES) {
-        Ok(Some(p)) => p,
-        _ => return,
+    let Ok(Some(payload)) = pack.read_section(section_names::SOURCES) else {
+        return;
     };
-    let bundle: klio_pack::schema::SourceBundle = match decode(&payload) {
-        Ok(b) => b,
-        Err(_) => return,
+    let Ok(bundle) = decode::<klio_pack::schema::SourceBundle>(&payload) else {
+        return;
     };
     if bundle.files.is_empty() {
         return;
@@ -75,8 +72,11 @@ fn load_embedded_stdlib_sources(
         let lexed = klio_lexer::Lexer::new(fid, &src).tokenize();
         if lexed.diagnostics.has_errors() {
             if std::env::var_os("KLIO_PACK_DIAG").is_some() {
-                eprintln!("[embed lex err] {}: {} diags", sf.rel_path,
-                    lexed.diagnostics.diagnostics().len());
+                eprintln!(
+                    "[embed lex err] {}: {} diags",
+                    sf.rel_path,
+                    lexed.diagnostics.diagnostics().len()
+                );
             }
             continue;
         }
@@ -84,8 +84,10 @@ fn load_embedded_stdlib_sources(
         if diags.has_errors() {
             if std::env::var_os("KLIO_PACK_DIAG").is_some() {
                 for d in diags.diagnostics() {
-                    eprintln!("[embed parse err] {}:{:?}: {}", sf.rel_path,
-                        d.primary.span, d.message);
+                    eprintln!(
+                        "[embed parse err] {}:{:?}: {}",
+                        sf.rel_path, d.primary.span, d.message
+                    );
                 }
             }
             continue;
@@ -124,8 +126,7 @@ fn load_embedded_stdlib_sources(
     let load_gated = imported_match || !any_non_implicit;
 
     for (pkg, ast) in parsed {
-        let is_implicit = !pkg.is_empty()
-            && klio_stdlib::is_implicitly_imported_package(&pkg);
+        let is_implicit = !pkg.is_empty() && klio_stdlib::is_implicitly_imported_package(&pkg);
         if !is_implicit && !load_gated {
             continue;
         }
@@ -158,6 +159,188 @@ fn load_embedded_stdlib_sources(
     }
 }
 
+struct PackCandidate {
+    pack: klio_pack::PackReader,
+    manifest: klio_pack::schema::PackManifest,
+}
+
+/// Load one resolved pack candidate: register its packages, parse its
+/// sources (or fall back to the frozen AST bundle), and wire up its
+/// bindings. Imports discovered in the pack's files are appended to
+/// `new_imports` so the fixpoint loop can pull in transitive packs.
+fn load_pack_candidate(
+    c: &PackCandidate,
+    lib_id: &str,
+    merged: &klio_stdlib::HostBindings,
+    source_map: &mut SourceMap,
+    out_asts: &mut Vec<klio_ast::KotlinFile>,
+    out_bindings: &mut klio_stdlib::HostBindings,
+    new_imports: &mut Vec<String>,
+) {
+    use klio_pack::schema::{AstBundle, BindingManifest, decode};
+    use klio_pack::section_names;
+
+    let manifest = &c.manifest;
+    let pack = &c.pack;
+    // Teach the resolver every package this pack ships +
+    // declares implicit, so user `import kotlinx.*` lines
+    // resolve instead of tripping the "only kotlin.* is known"
+    // gate. Pack manifests carry implicit packages; each AST
+    // file's `package` header covers the rest.
+    klio_stdlib::register_known_package(manifest.library_id.clone());
+    for p in &manifest.implicit_packages {
+        klio_stdlib::register_known_package(p.clone());
+    }
+    // Re-parse the pack's Kotlin sources through the shared
+    // SourceMap rather than decoding the frozen `ast` section.
+    // Re-parsing (a) assigns every pack file a fresh, unique
+    // FileId so its spans never collide with user files and the
+    // diagnostic renderer can show pack source, and (b) is
+    // immune to AST-schema drift — a pack built against an older
+    // klio still loads because we parse with the current
+    // grammar. Falls back to the frozen `ast` bundle only when
+    // the `sources` section is absent.
+    let mut loaded_from_sources = false;
+    if let Ok(Some(payload)) = pack.read_section(section_names::SOURCES)
+        && let Ok(bundle) = decode::<klio_pack::schema::SourceBundle>(&payload)
+    {
+        for sf in &bundle.files {
+            // See load_embedded_stdlib_sources / klio_stdlib::
+            // CONSUMPTION_DEFERRED_SOURCES: these parse but their
+            // interpreted bodies conflict with klio's intrinsics
+            // until integrated; not consumed yet.
+            if klio_stdlib::is_consumption_deferred_source(&sf.rel_path) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&sf.bytes).into_owned();
+            let fid = source_map.add(&sf.rel_path, text);
+            let src = source_map.get(fid).source.clone();
+            let lexed = klio_lexer::Lexer::new(fid, &src).tokenize();
+            if lexed.diagnostics.has_errors() {
+                continue;
+            }
+            let (ast, diags) = klio_parser::Parser::new(fid, &src, &lexed.tokens).parse_file();
+            if diags.has_errors() {
+                continue;
+            }
+            if let Some(pkg) = &ast.package {
+                let path = pkg
+                    .path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if !path.is_empty() {
+                    klio_stdlib::register_known_package(path);
+                }
+            }
+            for imp in &ast.imports {
+                new_imports.push(
+                    imp.path
+                        .iter()
+                        .map(|i| i.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                );
+            }
+            out_asts.push(ast);
+            loaded_from_sources = true;
+        }
+    }
+    if !loaded_from_sources
+        && let Ok(Some(payload)) = pack.read_section(section_names::AST)
+        && let Ok(ast_bundle) = decode::<AstBundle>(&payload)
+    {
+        for f in ast_bundle.files {
+            if let Some(pkg) = &f.kotlin_file.package {
+                let path = pkg
+                    .path
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if !path.is_empty() {
+                    klio_stdlib::register_known_package(path);
+                }
+            }
+            for imp in &f.kotlin_file.imports {
+                new_imports.push(
+                    imp.path
+                        .iter()
+                        .map(|i| i.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                );
+            }
+            out_asts.push(f.kotlin_file);
+        }
+    }
+    if let Ok(Some(payload)) = pack.read_section(section_names::BINDINGS)
+        && let Ok(bm) = decode::<BindingManifest>(&payload)
+    {
+        for b in bm.bindings {
+            if let Some(f) = merged.resolve(&b.host_symbol) {
+                // HostBindings keys are `'static`; leak the
+                // FQN string so the entry lives for the rest
+                // of the process. Pack-load is a one-shot at
+                // startup, so this is bounded and small.
+                let leaked: &'static str = Box::leak(b.fqn.clone().into_boxed_str());
+                out_bindings.register(leaked, f);
+            }
+        }
+    }
+    // Also bring in any merged binding whose FQN sits under the
+    // loaded pack's library_id but isn't explicitly listed in
+    // the pack manifest. Newer Rust-side bindings (e.g. host
+    // entries added after the pack was last built) take effect
+    // without forcing a pack rebuild.
+    let lib_prefix = format!("{lib_id}.");
+    for (fqn, f) in merged.entries() {
+        if fqn.starts_with(&lib_prefix) {
+            out_bindings.register(fqn, f);
+        }
+    }
+}
+
+/// Read every `.klio-pack` file in the cache directory (skipping the
+/// embedded stdlib) and decode its manifest, yielding the set of
+/// candidate packs the fixpoint loader picks from.
+fn collect_pack_candidates(entries: std::fs::ReadDir) -> Vec<PackCandidate> {
+    use klio_pack::schema::{PackManifest, decode};
+    use klio_pack::{PackReader, section_names};
+    let mut candidates: Vec<PackCandidate> = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "klio-pack") {
+            continue;
+        }
+        if p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("stdlib"))
+        {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&p) else {
+            continue;
+        };
+        let Ok(pack) = PackReader::from_bytes(bytes) else {
+            continue;
+        };
+        let manifest: PackManifest = match pack
+            .read_section(section_names::MANIFEST)
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(|payload| decode(payload).ok())
+        {
+            Some(m) => m,
+            None => continue,
+        };
+        candidates.push(PackCandidate { pack, manifest });
+    }
+    candidates
+}
+
 /// Walk the local pack cache, parse each pack's AST bundle, and
 /// build a `HostBindings` populated with the Rust-side bindings each
 /// pack declares. The caller prepends `pack_asts` to the user's AST
@@ -170,8 +353,6 @@ pub(crate) fn load_installed_packs(
     user_asts: &[klio_ast::KotlinFile],
     source_map: &mut SourceMap,
 ) -> (Vec<klio_ast::KotlinFile>, klio_stdlib::HostBindings) {
-    use klio_pack::schema::{decode, AstBundle, BindingManifest, PackManifest};
-    use klio_pack::{section_names, PackReader};
     let mut out_asts: Vec<klio_ast::KotlinFile> = Vec::new();
     let mut out_bindings = klio_stdlib::HostBindings::new();
     let user_import_prefixes: std::collections::HashSet<String> = user_asts
@@ -192,7 +373,7 @@ pub(crate) fn load_installed_packs(
     // `kotlinx.datetime.Instant` is a typealias to
     // `kotlin.time.Instant`) also triggers the load — gating on the
     // user program's imports alone would miss it.
-    let cache = if let Ok(c) = klio_cache_dir() { c } else {
+    let Ok(cache) = klio_cache_dir() else {
         load_embedded_stdlib_sources(
             &user_import_prefixes,
             source_map,
@@ -201,7 +382,7 @@ pub(crate) fn load_installed_packs(
         );
         return (out_asts, out_bindings);
     };
-    let entries = if let Ok(e) = std::fs::read_dir(&cache) { e } else {
+    let Ok(entries) = std::fs::read_dir(&cache) else {
         load_embedded_stdlib_sources(
             &user_import_prefixes,
             source_map,
@@ -219,42 +400,7 @@ pub(crate) fn load_installed_packs(
     // transitively depends on another pack (e.g. coroutines on
     // atomicfu) pull its dependency in even when the user program
     // imports only the outer library.
-    struct PackCandidate {
-        pack: klio_pack::PackReader,
-        manifest: klio_pack::schema::PackManifest,
-    }
-    let mut candidates: Vec<PackCandidate> = Vec::new();
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().is_none_or(|x| x != "klio-pack") {
-            continue;
-        }
-        if p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("stdlib"))
-        {
-            continue;
-        }
-        let bytes = match std::fs::read(&p) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let pack = match PackReader::from_bytes(bytes) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let manifest: PackManifest = match pack
-            .read_section(section_names::MANIFEST)
-            .ok()
-            .flatten()
-            .as_deref()
-            .and_then(|payload| decode(payload).ok())
-        {
-            Some(m) => m,
-            None => continue,
-        };
-        candidates.push(PackCandidate { pack, manifest });
-    }
+    let candidates = collect_pack_candidates(entries);
     let mut known_prefixes = user_import_prefixes.clone();
     let mut loaded_lib_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
@@ -275,126 +421,15 @@ pub(crate) fn load_installed_packs(
             }
             loaded_lib_ids.insert(lib_id.clone());
             progressed = true;
-            let manifest = &c.manifest;
-            let pack = &c.pack;
-            let lib_id = lib_id.clone();
-        // Teach the resolver every package this pack ships +
-        // declares implicit, so user `import kotlinx.*` lines
-        // resolve instead of tripping the "only kotlin.* is known"
-        // gate. Pack manifests carry implicit packages; each AST
-        // file's `package` header covers the rest.
-        klio_stdlib::register_known_package(manifest.library_id.clone());
-        for p in &manifest.implicit_packages {
-            klio_stdlib::register_known_package(p.clone());
-        }
-        // Re-parse the pack's Kotlin sources through the shared
-        // SourceMap rather than decoding the frozen `ast` section.
-        // Re-parsing (a) assigns every pack file a fresh, unique
-        // FileId so its spans never collide with user files and the
-        // diagnostic renderer can show pack source, and (b) is
-        // immune to AST-schema drift — a pack built against an older
-        // klio still loads because we parse with the current
-        // grammar. Falls back to the frozen `ast` bundle only when
-        // the `sources` section is absent.
-        let mut loaded_from_sources = false;
-        if let Ok(Some(payload)) = pack.read_section(section_names::SOURCES)
-            && let Ok(bundle) = decode::<klio_pack::schema::SourceBundle>(&payload) {
-                for sf in &bundle.files {
-                    // See load_embedded_stdlib_sources / klio_stdlib::
-                    // CONSUMPTION_DEFERRED_SOURCES: these parse but their
-                    // interpreted bodies conflict with klio's intrinsics
-                    // until integrated; not consumed yet.
-                    if klio_stdlib::is_consumption_deferred_source(&sf.rel_path) {
-                        continue;
-                    }
-                    let text = String::from_utf8_lossy(&sf.bytes).into_owned();
-                    let fid = source_map.add(&sf.rel_path, text);
-                    let src = source_map.get(fid).source.clone();
-                    let lexed = klio_lexer::Lexer::new(fid, &src).tokenize();
-                    if lexed.diagnostics.has_errors() {
-                        continue;
-                    }
-                    let (ast, diags) =
-                        klio_parser::Parser::new(fid, &src, &lexed.tokens).parse_file();
-                    if diags.has_errors() {
-                        continue;
-                    }
-                    if let Some(pkg) = &ast.package {
-                        let path = pkg
-                            .path
-                            .iter()
-                            .map(|i| i.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(".");
-                        if !path.is_empty() {
-                            klio_stdlib::register_known_package(path);
-                        }
-                    }
-                    for imp in &ast.imports {
-                        new_imports.push(
-                            imp.path
-                                .iter()
-                                .map(|i| i.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join("."),
-                        );
-                    }
-                    out_asts.push(ast);
-                    loaded_from_sources = true;
-                }
-            }
-        if !loaded_from_sources
-            && let Ok(Some(payload)) = pack.read_section(section_names::AST)
-                && let Ok(ast_bundle) = decode::<AstBundle>(&payload) {
-                    for f in ast_bundle.files {
-                        if let Some(pkg) = &f.kotlin_file.package {
-                            let path = pkg
-                                .path
-                                .iter()
-                                .map(|i| i.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(".");
-                            if !path.is_empty() {
-                                klio_stdlib::register_known_package(path);
-                            }
-                        }
-                        for imp in &f.kotlin_file.imports {
-                            new_imports.push(
-                                imp.path
-                                    .iter()
-                                    .map(|i| i.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("."),
-                            );
-                        }
-                        out_asts.push(f.kotlin_file);
-                    }
-                }
-        if let Ok(Some(payload)) = pack.read_section(section_names::BINDINGS)
-            && let Ok(bm) = decode::<BindingManifest>(&payload) {
-                for b in bm.bindings {
-                    if let Some(f) = merged.resolve(&b.host_symbol) {
-                        // HostBindings keys are `'static`; leak the
-                        // FQN string so the entry lives for the rest
-                        // of the process. Pack-load is a one-shot at
-                        // startup, so this is bounded and small.
-                        let leaked: &'static str =
-                            Box::leak(b.fqn.clone().into_boxed_str());
-                        out_bindings.register(leaked, f);
-                    }
-                }
-            }
-        // Also bring in any merged binding whose FQN sits under the
-        // loaded pack's library_id but isn't explicitly listed in
-        // the pack manifest. Newer Rust-side bindings (e.g. host
-        // entries added after the pack was last built) take effect
-        // without forcing a pack rebuild.
-        let lib_prefix = format!("{lib_id}.");
-        for (fqn, f) in merged.entries() {
-            if fqn.starts_with(&lib_prefix) {
-                out_bindings.register(fqn, f);
-            }
-        }
+            load_pack_candidate(
+                c,
+                lib_id,
+                &merged,
+                source_map,
+                &mut out_asts,
+                &mut out_bindings,
+                &mut new_imports,
+            );
         }
         if !progressed {
             break;
@@ -416,19 +451,19 @@ pub(crate) fn load_installed_packs(
 
 pub(crate) fn merged_host_bindings() -> klio_stdlib::HostBindings {
     let mut out = klio_stdlib::HostBindings::with_stdlib_defaults();
-    merge_into(&mut out, klio_kotlinx_atomicfu::host_bindings());
-    merge_into(&mut out, klio_kotlinx_io::host_bindings());
-    merge_into(&mut out, klio_kotlinx_datetime::host_bindings());
-    merge_into(&mut out, klio_kotlinx_coroutines::host_bindings());
-    merge_into(&mut out, klio_kotlinx_serialization::host_bindings());
+    merge_into(&mut out, &klio_kotlinx_atomicfu::host_bindings());
+    merge_into(&mut out, &klio_kotlinx_io::host_bindings());
+    merge_into(&mut out, &klio_kotlinx_datetime::host_bindings());
+    merge_into(&mut out, &klio_kotlinx_coroutines::host_bindings());
+    merge_into(&mut out, &klio_kotlinx_serialization::host_bindings());
     // ktor-client is opt-in (pack must be installed to take effect)
     // but its host functions are always available in the registry so
     // the pack's bindings resolve when installed.
-    merge_into(&mut out, klio_ktor_client::host_bindings());
+    merge_into(&mut out, &klio_ktor_client::host_bindings());
     out
 }
 
-fn merge_into(dst: &mut klio_stdlib::HostBindings, src: klio_stdlib::HostBindings) {
+fn merge_into(dst: &mut klio_stdlib::HostBindings, src: &klio_stdlib::HostBindings) {
     for (k, f) in src.entries() {
         dst.register(k, f);
     }
@@ -439,9 +474,11 @@ fn klio_cache_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".klio").join("packs"))
 }
 
-pub(crate) fn read_pack_manifest(path: &std::path::Path) -> Result<klio_pack::schema::PackManifest, String> {
-    use klio_pack::schema::{decode, PackManifest};
-    use klio_pack::{section_names, PackReader};
+pub(crate) fn read_pack_manifest(
+    path: &std::path::Path,
+) -> Result<klio_pack::schema::PackManifest, String> {
+    use klio_pack::schema::{PackManifest, decode};
+    use klio_pack::{PackReader, section_names};
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let pack = PackReader::from_bytes(bytes).map_err(|e| e.to_string())?;
     let payload = pack
@@ -481,9 +518,8 @@ const CACHE_INDEX_NAME: &str = "index.json";
 /// header read. Best-effort: failures here are logged but do not
 /// break the install flow.
 fn rebuild_cache_index(cache: &std::path::Path) -> Result<(), String> {
-    let entries = match std::fs::read_dir(cache) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
+    let Ok(entries) = std::fs::read_dir(cache) else {
+        return Ok(());
     };
     let mut out: Vec<CacheIndexEntry> = Vec::new();
     for e in entries.flatten() {
@@ -491,13 +527,19 @@ fn rebuild_cache_index(cache: &std::path::Path) -> Result<(), String> {
         if p.extension().is_none_or(|x| x != "klio-pack") {
             continue;
         }
-        let Ok(m) = read_pack_manifest(&p) else { continue };
+        let Ok(m) = read_pack_manifest(&p) else {
+            continue;
+        };
         out.push(CacheIndexEntry {
             library_id: m.library_id,
             version: m.library_version,
             abi_version: m.abi_version,
             path: p.to_string_lossy().into_owned(),
-            dependencies: m.dependencies.iter().map(|d| d.library_id.clone()).collect(),
+            dependencies: m
+                .dependencies
+                .iter()
+                .map(|d| d.library_id.clone())
+                .collect(),
         });
     }
     out.sort_by(|a, b| a.library_id.cmp(&b.library_id));
@@ -552,22 +594,25 @@ fn format_min(min: &str) -> String {
     }
 }
 
-pub(crate) fn remove_cache_pack(library_id: &str, version: Option<&str>) -> Result<PathBuf, String> {
+pub(crate) fn remove_cache_pack(
+    library_id: &str,
+    version: Option<&str>,
+) -> Result<PathBuf, String> {
     let cache = klio_cache_dir()?;
     let entries = std::fs::read_dir(&cache).map_err(|e| e.to_string())?;
     for e in entries.flatten() {
         let p = e.path();
-        let manifest = match read_pack_manifest(&p) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Ok(manifest) = read_pack_manifest(&p) else {
+            continue;
         };
         if manifest.library_id != library_id {
             continue;
         }
         if let Some(v) = version
-            && manifest.library_version != v {
-                continue;
-            }
+            && manifest.library_version != v
+        {
+            continue;
+        }
         std::fs::remove_file(&p).map_err(|e| e.to_string())?;
         let _ = rebuild_cache_index(&cache);
         return Ok(p);
@@ -576,8 +621,8 @@ pub(crate) fn remove_cache_pack(library_id: &str, version: Option<&str>) -> Resu
 }
 
 pub(crate) fn inspect_pack(path: &std::path::Path) -> Result<(), String> {
-    use klio_pack::schema::{decode, BindingManifest, PackManifest, SymbolIndex};
-    use klio_pack::{section_names, PackReader};
+    use klio_pack::schema::{BindingManifest, PackManifest, SymbolIndex, decode};
+    use klio_pack::{PackReader, section_names};
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let reader = PackReader::from_bytes(bytes).map_err(|e| e.to_string())?;
     println!("file:    {}", path.display());
@@ -622,13 +667,20 @@ pub(crate) fn inspect_pack(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn verify_pack(path: &std::path::Path, smoke: Option<&std::path::Path>) -> Result<(), String> {
-    use klio_pack::schema::{decode, BindingManifest, PackManifest, SymbolIndex};
-    use klio_pack::{section_names, PackReader};
+pub(crate) fn verify_pack(
+    path: &std::path::Path,
+    smoke: Option<&std::path::Path>,
+) -> Result<(), String> {
+    use klio_pack::schema::{BindingManifest, PackManifest, SymbolIndex, decode};
+    use klio_pack::{PackReader, section_names};
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let reader = PackReader::from_bytes(bytes).map_err(|e| e.to_string())?;
     // Required sections.
-    for name in [section_names::MANIFEST, section_names::SYMBOLS, section_names::BINDINGS] {
+    for name in [
+        section_names::MANIFEST,
+        section_names::SYMBOLS,
+        section_names::BINDINGS,
+    ] {
         let payload = reader
             .read_section(name)
             .map_err(|e| e.to_string())?

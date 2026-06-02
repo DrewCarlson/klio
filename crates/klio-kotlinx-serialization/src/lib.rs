@@ -75,9 +75,10 @@ fn prop_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         _ => return Err(RuntimeError::Type("__klsx_get: name must be String".into())),
     };
     if let Value::Instance(inst) = &obj
-        && let Some(v) = inst.borrow().get(&name) {
-            return Ok(v);
-        }
+        && let Some(v) = inst.borrow().get(&name)
+    {
+        return Ok(v);
+    }
     // Defer to a getter via the host (data-class / custom accessor).
     let out: &mut dyn klio_runtime::Output = ctx.out;
     match ctx.host.invoke_method(&obj, &name, &[], out) {
@@ -100,9 +101,7 @@ fn construct(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let cls = class_of(&cls_val)
         .ok_or_else(|| RuntimeError::Type("__klsx_construct: expected a class".into()))?;
     let args: Vec<Value> = match ctx.args.get(1) {
-        Some(Value::List { items, .. } | Value::Array { items, .. }) => {
-            items.borrow().clone()
-        }
+        Some(Value::List { items, .. } | Value::Array { items, .. }) => items.borrow().clone(),
         Some(other) => vec![other.clone()],
         None => Vec::new(),
     };

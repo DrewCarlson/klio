@@ -1,10 +1,17 @@
-use super::{Value, Arc, RuntimeError, char_unit_to_string, char_unit_to_scalar, char_units_to_string, CallCtx, make_exception, make_list, perform_regex_replace, recv_int_radix, make_sequence, BufRead, char};
+use super::{
+    Arc, CallCtx, RuntimeError, Value, char, char_unit_to_scalar, char_unit_to_string,
+    char_units_to_string, make_exception, make_list, make_sequence, perform_regex_replace,
+    recv_int_radix,
+};
 
 // ============================================================
 // String members (receiver in args[0])
 // ============================================================
 
-pub(crate) fn recv_string<'a>(args: &'a [Value], what: &str) -> Result<&'a Arc<String>, RuntimeError> {
+pub(crate) fn recv_string<'a>(
+    args: &'a [Value],
+    what: &str,
+) -> Result<&'a Arc<String>, RuntimeError> {
     match args.first() {
         Some(Value::String(s)) => Ok(s),
         Some(other) => Err(RuntimeError::Type(format!(
@@ -49,7 +56,9 @@ pub(crate) fn utf16_units(s: &str) -> Vec<u16> {
 pub(crate) fn char_units_eq_ignore_case(a: u16, b: u16) -> bool {
     match (char_unit_to_scalar(a), char_unit_to_scalar(b)) {
         (Some(ca), Some(cb)) => {
-            ca == cb || ca.to_lowercase().eq(cb.to_lowercase()) || ca.to_uppercase().eq(cb.to_uppercase())
+            ca == cb
+                || ca.to_lowercase().eq(cb.to_lowercase())
+                || ca.to_uppercase().eq(cb.to_uppercase())
         }
         _ => a == b,
     }
@@ -84,6 +93,7 @@ pub(crate) fn string_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
 }
 
 pub(crate) fn string_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    use std::fmt::Write;
     let s = recv_string(ctx.args, "String.plus")?;
     let other = ctx
         .args
@@ -91,14 +101,18 @@ pub(crate) fn string_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .ok_or_else(|| RuntimeError::Arity("String.plus requires one argument".into()))?;
     let mut joined = String::with_capacity(s.len());
     joined.push_str(s);
-    joined.push_str(&format!("{other}"));
+    write!(joined, "{other}").unwrap();
     Ok(Value::String(Arc::new(joined)))
 }
 
+// Kotlin String index is a non-negative Int reinterpreted as a usize offset.
+#[allow(clippy::cast_sign_loss)]
 pub(crate) fn string_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.get")?;
     let Some(Value::Int(idx)) = ctx.args.get(1) else {
-        return Err(RuntimeError::Type("String.get requires an Int index".into()));
+        return Err(RuntimeError::Type(
+            "String.get requires an Int index".into(),
+        ));
     };
     if *idx < 0 {
         return Err(RuntimeError::Thrown(make_exception(
@@ -111,20 +125,32 @@ pub(crate) fn string_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Some(c) => Ok(Value::Char(c)),
         None => Err(RuntimeError::Thrown(make_exception(
             "kotlin.IndexOutOfBoundsException",
-            Some(format!("index {idx} out of bounds (length {})", utf16_len(s))),
+            Some(format!(
+                "index {idx} out of bounds (length {})",
+                utf16_len(s)
+            )),
         ))),
     }
 }
 
+// Kotlin String.substring works in Int code-unit indices; the length and the
+// bounds-checked start/end convert between usize and i64.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub(crate) fn string_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.substring")?;
     let len = utf16_len(s) as i64;
     let (start, end) = match &ctx.args[1..] {
         [s] if s.is_integral() => (s.as_i64().unwrap(), len),
-        [a, b] if a.is_integral() && b.is_integral() => {
-            (a.as_i64().unwrap(), b.as_i64().unwrap())
+        [a, b] if a.is_integral() && b.is_integral() => (a.as_i64().unwrap(), b.as_i64().unwrap()),
+        _ => {
+            return Err(RuntimeError::Arity(
+                "substring requires 1 or 2 Int args".into(),
+            ));
         }
-        _ => return Err(RuntimeError::Arity("substring requires 1 or 2 Int args".into())),
     };
     if start < 0 || end > len || start > end {
         return Err(RuntimeError::Thrown(make_exception(
@@ -132,7 +158,11 @@ pub(crate) fn string_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
             Some(format!("substring({start},{end}) on length {len}")),
         )));
     }
-    Ok(Value::String(Arc::new(utf16_slice(s, start as usize, end as usize))))
+    Ok(Value::String(Arc::new(utf16_slice(
+        s,
+        start as usize,
+        end as usize,
+    ))))
 }
 
 /// `CharSequence.padStart(length, padChar = ' ')` / `padEnd`. Host
@@ -140,7 +170,18 @@ pub(crate) fn string_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
 /// (this as CharSequence).padStart(...)`, whose explicit upcast klio
 /// ignores in overload selection — it re-dispatches to `String.padStart`
 /// and recurses forever, allocating a `StringBuilder` each level (OOM).
-pub(crate) fn string_pad(ctx: &mut CallCtx, at_start: bool, who: &str) -> Result<Value, RuntimeError> {
+// Kotlin pad length is an Int; the current code-unit count and the
+// non-negative pad delta convert between usize and i64.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn string_pad(
+    ctx: &mut CallCtx,
+    at_start: bool,
+    who: &str,
+) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, who)?;
     let cur_len = utf16_len(s) as i64;
     let length = ctx
@@ -160,7 +201,7 @@ pub(crate) fn string_pad(ctx: &mut CallCtx, at_start: bool, who: &str) -> Result
         Some(other) => {
             return Err(RuntimeError::Type(format!(
                 "{who}: padChar must be a Char, got {other}"
-            )))
+            )));
         }
     };
     if length <= cur_len {
@@ -198,6 +239,13 @@ pub(crate) fn string_starts_with(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 /// `String.regionMatches(thisOffset, other, otherOffset, length,
 /// ignoreCase = false)` — true when the `length`-char regions match.
 /// Out-of-range offsets/lengths yield `false` (Kotlin semantics).
+// Kotlin offsets/length are Ints; the bounds-checked values convert between
+// usize and i64 against the code-unit counts.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub(crate) fn string_region_matches(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.regionMatches")?;
     let this_off = ctx
@@ -235,7 +283,11 @@ pub(crate) fn string_region_matches(ctx: &mut CallCtx) -> Result<Value, RuntimeE
     for i in 0..length as usize {
         let a = sc[this_off as usize + i];
         let b = oc[other_off as usize + i];
-        let eq = if ignore_case { char_units_eq_ignore_case(a, b) } else { a == b };
+        let eq = if ignore_case {
+            char_units_eq_ignore_case(a, b)
+        } else {
+            a == b
+        };
         if !eq {
             return Ok(Value::Bool(false));
         }
@@ -246,6 +298,8 @@ pub(crate) fn string_region_matches(ctx: &mut CallCtx) -> Result<Value, RuntimeE
 /// `internal inline fun String.skipWhile(startIndex, predicate)` —
 /// kotlin.text helper used by Duration's parser. Returns the first
 /// index >= startIndex whose char fails `predicate` (or `length`).
+// Kotlin startIndex is an Int; the non-negative cursor indexes the code units.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn string_skip_while(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.skipWhile")?;
     let start = ctx
@@ -293,7 +347,10 @@ pub(crate) fn string_filter(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut kept: Vec<u16> = Vec::new();
     for ch in s.encode_utf16() {
         let v = Value::Char(ch);
-        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+        if matches!(
+            host.invoke_callable(&block, std::slice::from_ref(&v), *out)?,
+            Value::Bool(true)
+        ) {
             kept.push(ch);
         }
     }
@@ -303,6 +360,8 @@ pub(crate) fn string_filter(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 pub(crate) fn string_count(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.count")?.clone();
     if ctx.args.len() == 1 {
+        // Kotlin String.count() returns the Int code-unit count.
+        #[allow(clippy::cast_possible_wrap)]
         return Ok(Value::new_int(utf16_len(&s) as i64));
     }
     let block = ctx.args[1].clone();
@@ -310,7 +369,10 @@ pub(crate) fn string_count(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut n: i64 = 0;
     for ch in s.encode_utf16() {
         let v = Value::Char(ch);
-        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+        if matches!(
+            host.invoke_callable(&block, std::slice::from_ref(&v), *out)?,
+            Value::Bool(true)
+        ) {
             n += 1;
         }
     }
@@ -342,7 +404,10 @@ pub(crate) fn string_any(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let CallCtx { out, host, .. } = ctx;
     for ch in s.encode_utf16() {
         let v = Value::Char(ch);
-        if matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+        if matches!(
+            host.invoke_callable(&block, std::slice::from_ref(&v), *out)?,
+            Value::Bool(true)
+        ) {
             return Ok(Value::Bool(true));
         }
     }
@@ -358,7 +423,10 @@ pub(crate) fn string_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let CallCtx { out, host, .. } = ctx;
     for ch in s.encode_utf16() {
         let v = Value::Char(ch);
-        if !matches!(host.invoke_callable(&block, std::slice::from_ref(&v), *out)?, Value::Bool(true)) {
+        if !matches!(
+            host.invoke_callable(&block, std::slice::from_ref(&v), *out)?,
+            Value::Bool(true)
+        ) {
             return Ok(Value::Bool(false));
         }
     }
@@ -403,6 +471,8 @@ pub(crate) fn string_last_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeEr
     Ok(Value::new_int(byte_to_char_index(s, s.rfind(&needle))))
 }
 
+// Kotlin indexOf/lastIndexOf return an Int code-unit index (or -1).
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn byte_to_char_index(s: &str, byte: Option<usize>) -> i64 {
     let Some(b) = byte else { return -1 };
     s[..b].encode_utf16().count() as i64
@@ -478,7 +548,9 @@ pub(crate) fn string_trim_generic(
         cs.len()
     };
     let hi = hi.max(lo);
-    Ok(Value::String(Arc::new(char_units_to_string(cs[lo..hi].iter().copied()))))
+    Ok(Value::String(Arc::new(char_units_to_string(
+        cs[lo..hi].iter().copied(),
+    ))))
 }
 pub(crate) fn string_trim(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     string_trim_generic(ctx, true, true, "String.trim")
@@ -490,6 +562,8 @@ pub(crate) fn string_trim_end(ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
     string_trim_generic(ctx, false, true, "String.trimEnd")
 }
 
+// Kotlin repeat count is a non-negative Int used as a usize multiplier.
+#[allow(clippy::cast_sign_loss)]
 pub(crate) fn string_repeat(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.repeat")?;
     let Some(Value::Int(n)) = ctx.args.get(1) else {
@@ -523,6 +597,8 @@ pub(crate) fn string_compare_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError
     }))
 }
 
+// radix is validated to 2..=36 before the conversion to u32.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn string_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toInt")?;
     let radix = recv_int_radix(ctx.args.get(1), "String.toInt")?;
@@ -544,11 +620,12 @@ pub(crate) fn string_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         })
 }
 
+// radix is validated to 2..=36 before the conversion to u32.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn string_to_int_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toIntOrNull")?;
-    let radix = match recv_int_radix(ctx.args.get(1), "String.toIntOrNull") {
-        Ok(r) => r,
-        Err(_) => return Ok(Value::Null),
+    let Ok(radix) = recv_int_radix(ctx.args.get(1), "String.toIntOrNull") else {
+        return Ok(Value::Null);
     };
     if !(2..=36).contains(&radix) {
         return Ok(Value::Null);
@@ -582,7 +659,9 @@ pub(crate) fn parse_int_radix(s: &str, radix: u32) -> Result<i64, ()> {
         acc = acc.checked_mul(i64::from(radix)).ok_or(())?;
         acc = acc.checked_add(i64::from(d)).ok_or(())?;
     }
-    if negative { acc = acc.checked_neg().ok_or(())?; }
+    if negative {
+        acc = acc.checked_neg().ok_or(())?;
+    }
     Ok(acc)
 }
 
@@ -601,7 +680,10 @@ pub(crate) fn string_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// eagerly and wraps the result (faithful for finite inputs, which is
 /// every `String`).
 pub(crate) fn string_split_to_sequence(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(make_sequence(string_split_items(ctx, "String.splitToSequence")?))
+    Ok(make_sequence(string_split_items(
+        ctx,
+        "String.splitToSequence",
+    )?))
 }
 
 pub(crate) fn string_split_items(ctx: &mut CallCtx, who: &str) -> Result<Vec<Value>, RuntimeError> {
@@ -615,6 +697,8 @@ pub(crate) fn string_split_items(ctx: &mut CallCtx, who: &str) -> Result<Vec<Val
         let parts: Vec<&str> = if limit <= 0 {
             r.re.split(s).collect()
         } else {
+            // limit is positive here; Kotlin's split limit is a usize bound.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             r.re.splitn(s, limit as usize).collect()
         };
         return Ok(parts
@@ -666,7 +750,7 @@ pub(crate) fn string_split_items(ctx: &mut CallCtx, who: &str) -> Result<Vec<Val
             _ => {
                 return Err(RuntimeError::Type(
                     "String.split requires String, Char, or Regex delimiters".into(),
-                ))
+                ));
             }
         }
     }
@@ -681,8 +765,19 @@ pub(crate) fn string_split_items(ctx: &mut CallCtx, who: &str) -> Result<Vec<Val
 /// Split `s` on any of `delims` (left-to-right, non-overlapping), honoring a
 /// positive `limit` (max substrings) and ASCII `ignore_case`. An empty
 /// delimiter is skipped.
-pub(crate) fn split_on_any(s: &str, delims: &[String], ignore_case: bool, limit: i64) -> Vec<Value> {
-    let nonempty: Vec<&str> = delims.iter().map(String::as_str).filter(|d| !d.is_empty()).collect();
+// The Kotlin split limit is an Int; the produced-segment count compares against it.
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) fn split_on_any(
+    s: &str,
+    delims: &[String],
+    ignore_case: bool,
+    limit: i64,
+) -> Vec<Value> {
+    let nonempty: Vec<&str> = delims
+        .iter()
+        .map(String::as_str)
+        .filter(|d| !d.is_empty())
+        .collect();
     if nonempty.is_empty() {
         return vec![Value::String(Arc::new(s.to_string()))];
     }
@@ -725,6 +820,8 @@ pub(crate) fn split_on_any(s: &str, delims: &[String], ignore_case: bool, limit:
     out
 }
 
+// chunked size is validated positive before being used as a usize chunk width.
+#[allow(clippy::cast_sign_loss)]
 pub(crate) fn string_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.chunked")?;
     let Some(Value::Int(size)) = ctx.args.get(1) else {
@@ -758,7 +855,9 @@ pub(crate) fn string_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             }
         }
         Some(block) => {
-            let CallCtx { out: sink, host, .. } = ctx;
+            let CallCtx {
+                out: sink, host, ..
+            } = ctx;
             for p in pieces {
                 let arg = Value::String(Arc::new(p));
                 let r = host.invoke_callable(&block, std::slice::from_ref(&arg), *sink)?;
@@ -769,6 +868,8 @@ pub(crate) fn string_chunked(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_list(out, false))
 }
 
+// windowed size and step are validated positive before use as usize widths.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn string_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.windowed")?;
     let Some(Value::Int(size)) = ctx.args.get(1) else {
@@ -789,7 +890,11 @@ pub(crate) fn string_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
     let partial = match ctx.args.get(3) {
         None => false,
         Some(Value::Bool(b)) => *b,
-        _ => return Err(RuntimeError::Type("windowed partialWindows must be Bool".into())),
+        _ => {
+            return Err(RuntimeError::Type(
+                "windowed partialWindows must be Bool".into(),
+            ));
+        }
     };
     if step <= 0 {
         return Err(RuntimeError::Thrown(Value::Exception {
@@ -821,14 +926,12 @@ pub(crate) fn string_windowed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
 
 pub(crate) fn string_to_double(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toDouble")?;
-    s.parse::<f64>()
-        .map(Value::Double)
-        .map_err(|_| {
-            RuntimeError::Thrown(make_exception(
-                "kotlin.NumberFormatException",
-                Some(format!("For input string: \"{s}\"")),
-            ))
-        })
+    s.parse::<f64>().map(Value::Double).map_err(|_| {
+        RuntimeError::Thrown(make_exception(
+            "kotlin.NumberFormatException",
+            Some(format!("For input string: \"{s}\"")),
+        ))
+    })
 }
 
 // ============================================================
@@ -838,7 +941,9 @@ pub(crate) fn string_to_double(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
 pub(crate) fn string_substring_before(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.substringBefore")?;
     let delim = arg_as_string(
-        ctx.args.get(1).ok_or_else(|| RuntimeError::Arity("substringBefore requires a delimiter".into()))?,
+        ctx.args
+            .get(1)
+            .ok_or_else(|| RuntimeError::Arity("substringBefore requires a delimiter".into()))?,
         "substringBefore",
     )?;
     let missing = match ctx.args.get(2) {
@@ -856,7 +961,9 @@ pub(crate) fn string_substring_before(ctx: &mut CallCtx) -> Result<Value, Runtim
 pub(crate) fn string_substring_after(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.substringAfter")?;
     let delim = arg_as_string(
-        ctx.args.get(1).ok_or_else(|| RuntimeError::Arity("substringAfter requires a delimiter".into()))?,
+        ctx.args
+            .get(1)
+            .ok_or_else(|| RuntimeError::Arity("substringAfter requires a delimiter".into()))?,
         "substringAfter",
     )?;
     let missing = match ctx.args.get(2) {
@@ -874,7 +981,9 @@ pub(crate) fn string_substring_after(ctx: &mut CallCtx) -> Result<Value, Runtime
 pub(crate) fn string_substring_before_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.substringBeforeLast")?;
     let delim = arg_as_string(
-        ctx.args.get(1).ok_or_else(|| RuntimeError::Arity("substringBeforeLast requires a delimiter".into()))?,
+        ctx.args.get(1).ok_or_else(|| {
+            RuntimeError::Arity("substringBeforeLast requires a delimiter".into())
+        })?,
         "substringBeforeLast",
     )?;
     let missing = match ctx.args.get(2) {
@@ -892,7 +1001,9 @@ pub(crate) fn string_substring_before_last(ctx: &mut CallCtx) -> Result<Value, R
 pub(crate) fn string_substring_after_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.substringAfterLast")?;
     let delim = arg_as_string(
-        ctx.args.get(1).ok_or_else(|| RuntimeError::Arity("substringAfterLast requires a delimiter".into()))?,
+        ctx.args
+            .get(1)
+            .ok_or_else(|| RuntimeError::Arity("substringAfterLast requires a delimiter".into()))?,
         "substringAfterLast",
     )?;
     let missing = match ctx.args.get(2) {
@@ -915,11 +1026,15 @@ pub(crate) fn string_replace_first(ctx: &mut CallCtx) -> Result<Value, RuntimeEr
         return perform_regex_replace(ctx, &r, &s, repl, true, "replaceFirst");
     }
     let old = arg_as_string(
-        ctx.args.get(1).ok_or_else(|| RuntimeError::Arity("replaceFirst requires old".into()))?,
+        ctx.args
+            .get(1)
+            .ok_or_else(|| RuntimeError::Arity("replaceFirst requires old".into()))?,
         "replaceFirst",
     )?;
     let new = arg_as_string(
-        ctx.args.get(2).ok_or_else(|| RuntimeError::Arity("replaceFirst requires new".into()))?,
+        ctx.args
+            .get(2)
+            .ok_or_else(|| RuntimeError::Arity("replaceFirst requires new".into()))?,
         "replaceFirst",
     )?;
     Ok(Value::String(Arc::new(s.replacen(&old, &new, 1))))
@@ -974,10 +1089,16 @@ pub(crate) fn string_trim_margin(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
         }
     }
     // Trim a single leading/trailing blank line (matching Kotlin behavior).
-    if out_lines.first().is_some_and(|l| l.chars().all(char::is_whitespace) && l.is_empty()) {
+    if out_lines
+        .first()
+        .is_some_and(|l| l.chars().all(char::is_whitespace) && l.is_empty())
+    {
         out_lines.remove(0);
     }
-    if out_lines.last().is_some_and(|l| l.chars().all(char::is_whitespace) && l.is_empty()) {
+    if out_lines
+        .last()
+        .is_some_and(|l| l.chars().all(char::is_whitespace) && l.is_empty())
+    {
         out_lines.pop();
     }
     Ok(Value::String(Arc::new(out_lines.join("\n"))))
@@ -996,9 +1117,14 @@ pub(crate) fn string_lines(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 pub(crate) fn string_to_char_array(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toCharArray")?;
-    Ok(make_list(s.encode_utf16().map(Value::Char).collect(), false))
+    Ok(make_list(
+        s.encode_utf16().map(Value::Char).collect(),
+        false,
+    ))
 }
 
+// radix is validated to 2..=36 before the conversion to u32.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn string_to_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toLong")?;
     let radix = recv_int_radix(ctx.args.get(1), "String.toLong")?;
@@ -1008,19 +1134,22 @@ pub(crate) fn string_to_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Some(format!("radix {radix} was not in valid range 2..36")),
         )));
     }
-    parse_int_radix(s, radix as u32).map(Value::Long).map_err(|()| {
-        RuntimeError::Thrown(make_exception(
-            "kotlin.NumberFormatException",
-            Some(format!("For input string: \"{s}\"")),
-        ))
-    })
+    parse_int_radix(s, radix as u32)
+        .map(Value::Long)
+        .map_err(|()| {
+            RuntimeError::Thrown(make_exception(
+                "kotlin.NumberFormatException",
+                Some(format!("For input string: \"{s}\"")),
+            ))
+        })
 }
 
+// radix is validated to 2..=36 before the conversion to u32.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn string_to_long_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toLongOrNull")?;
-    let radix = match recv_int_radix(ctx.args.get(1), "String.toLongOrNull") {
-        Ok(r) => r,
-        Err(_) => return Ok(Value::Null),
+    let Ok(radix) = recv_int_radix(ctx.args.get(1), "String.toLongOrNull") else {
+        return Ok(Value::Null);
     };
     if !(2..=36).contains(&radix) {
         return Ok(Value::Null);
@@ -1129,7 +1258,13 @@ pub(crate) fn format_kotlin(fmt: &str, args: &[Value]) -> Result<String, Runtime
             i += 1;
         }
         if i > wstart {
-            width = Some(bytes[wstart..i].iter().collect::<String>().parse().unwrap_or(0));
+            width = Some(
+                bytes[wstart..i]
+                    .iter()
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0),
+            );
         }
         // Precision.
         let mut precision: Option<usize> = None;
@@ -1140,8 +1275,13 @@ pub(crate) fn format_kotlin(fmt: &str, args: &[Value]) -> Result<String, Runtime
                 i += 1;
             }
             if i > pstart {
-                precision =
-                    Some(bytes[pstart..i].iter().collect::<String>().parse().unwrap_or(0));
+                precision = Some(
+                    bytes[pstart..i]
+                        .iter()
+                        .collect::<String>()
+                        .parse()
+                        .unwrap_or(0),
+                );
             }
         }
         if i >= bytes.len() {
@@ -1179,7 +1319,9 @@ pub(crate) fn is_string_like(c: char) -> bool {
 }
 
 pub(crate) fn pad_spec(body: &str, width: Option<usize>, left: bool, zero: bool) -> String {
-    let Some(w) = width else { return body.to_string() };
+    let Some(w) = width else {
+        return body.to_string();
+    };
     let cur = body.encode_utf16().count();
     if cur >= w {
         return body.to_string();
@@ -1203,7 +1345,18 @@ pub(crate) fn pad_spec(body: &str, width: Option<usize>, left: bool, zero: bool)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+// Single match dispatch over the printf conversion char; the flag bools mirror
+// the printf flag set and the body stays one cohesive match for correctness.
+// %x/%X/%o reinterpret the integer bits unsigned, %c maps an Int code point, and
+// %g truncates the base-10 exponent, matching Java's Formatter.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::fn_params_excessive_bools,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 pub(crate) fn format_conv(
     conv: char,
     arg: &Value,
@@ -1239,7 +1392,11 @@ pub(crate) fn format_conv(
                 format!("{:x}", n as u64)
             };
             let prefixed = if hash {
-                if conv == 'X' { format!("0X{raw}") } else { format!("0x{raw}") }
+                if conv == 'X' {
+                    format!("0X{raw}")
+                } else {
+                    format!("0x{raw}")
+                }
             } else {
                 raw
             };
@@ -1274,15 +1431,13 @@ pub(crate) fn format_conv(
             let s = match arg {
                 Value::Char(c) => char_unit_to_string(*c),
                 Value::Int(n) => char::from_u32(*n as u32)
-                    .ok_or_else(|| {
-                        RuntimeError::Type(format!(
-                            "%c: invalid code point {n}"
-                        ))
-                    })?
+                    .ok_or_else(|| RuntimeError::Type(format!("%c: invalid code point {n}")))?
                     .to_string(),
-                _ => return Err(RuntimeError::Type(
-                    "%c requires Char or Int code point".into(),
-                )),
+                _ => {
+                    return Err(RuntimeError::Type(
+                        "%c requires Char or Int code point".into(),
+                    ));
+                }
             };
             Ok(if conv == 'C' { s.to_uppercase() } else { s })
         }
@@ -1290,7 +1445,11 @@ pub(crate) fn format_conv(
             let d = as_double_for_format(arg)?;
             let p = precision.unwrap_or(6);
             let raw = format!("{:.*}", p, d.abs());
-            let mut s = if comma { insert_commas_decimal(&raw) } else { raw };
+            let mut s = if comma {
+                insert_commas_decimal(&raw)
+            } else {
+                raw
+            };
             if d.is_sign_negative() && !d.is_nan() {
                 s = format!("-{s}");
             } else if plus {
@@ -1319,10 +1478,23 @@ pub(crate) fn format_conv(
         'g' | 'G' => {
             let d = as_double_for_format(arg)?;
             let p = precision.unwrap_or(6).max(1);
-            let exp = if d == 0.0 { 0 } else { d.abs().log10().floor() as i32 };
+            let exp = if d == 0.0 {
+                0
+            } else {
+                d.abs().log10().floor() as i32
+            };
             let use_scientific = exp < -4 || exp >= p as i32;
             if use_scientific {
-                format_conv(if conv == 'G' { 'E' } else { 'e' }, arg, plus, space, hash, false, comma, Some(p - 1))
+                format_conv(
+                    if conv == 'G' { 'E' } else { 'e' },
+                    arg,
+                    plus,
+                    space,
+                    hash,
+                    false,
+                    comma,
+                    Some(p - 1),
+                )
             } else {
                 let prec = (p as i32 - 1 - exp).max(0) as usize;
                 format_conv('f', arg, plus, space, hash, false, comma, Some(prec))
@@ -1397,4 +1569,3 @@ pub(crate) fn normalize_scientific(s: &str, upper: bool) -> String {
     let e_letter = if upper { 'E' } else { 'e' };
     format!("{mantissa}{e_letter}{exp_sign}{exp_n:02}")
 }
-

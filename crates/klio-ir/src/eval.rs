@@ -25,7 +25,11 @@ fn display_throw(v: &Value) -> String {
             let name = b.class.name.clone();
             let msg = b.fields.iter().find_map(|(k, v)| {
                 if k == "message" {
-                    if let Value::String(s) = v { Some(s.to_string()) } else { None }
+                    if let Value::String(s) = v {
+                        Some(s.to_string())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -162,9 +166,11 @@ struct Frame<'a> {
 /// exactly as produced.
 fn coerce_int_to_long_ty(ty: &TypeRef, v: &mut Value) {
     if let Value::Int(n) = *v
-        && !ty.nullable && ty.name == "Long" {
-            *v = Value::Long(i64::from(n));
-        }
+        && !ty.nullable
+        && ty.name == "Long"
+    {
+        *v = Value::Long(i64::from(n));
+    }
 }
 
 /// Apply [`coerce_int_to_long_ty`] to each argument against its
@@ -291,19 +297,14 @@ pub fn resume_continuation(
     // `frames` is innermost-first (the deepest activation snapshots
     // itself first as `Suspended` unwinds). Resume the innermost,
     // then feed its return value to the next-outer frame, and so on.
-    let mut frames: std::collections::VecDeque<FrameSnapshot> =
-        state.frames.into();
+    let mut frames: std::collections::VecDeque<FrameSnapshot> = state.frames.into();
     let mut first = true;
     let mut pending_throw_from_inner: Option<Value> = None;
     while let Some(snap) = frames.pop_front() {
         let func = &module.funcs[snap.func.0 as usize];
-        let mut frame = Frame::new_with_captures(
-            module,
-            func,
-            snap.params.clone(),
-            snap.captures.clone(),
-        );
-        frame.regs = snap.regs.clone();
+        let mut frame =
+            Frame::new_with_captures(module, func, snap.params.clone(), snap.captures.clone());
+        frame.regs.clone_from(&snap.regs);
         // Kotlin `Continuation.resumeWith(Result.failure(e))` means
         // "resume by throwing `e` at the suspension point". Only the
         // innermost (suspending) frame sees the raw failure Result;
@@ -317,9 +318,7 @@ pub fn resume_continuation(
             Some(exc)
         } else if first {
             match &carry {
-                Value::Result { ok: false, payload } => {
-                    Some((**payload).clone())
-                }
+                Value::Result { ok: false, payload } => Some((**payload).clone()),
                 _ => None,
             }
         } else {
@@ -327,9 +326,10 @@ pub fn resume_continuation(
         };
         first = false;
         if resume_throw.is_none()
-            && let Some(r) = snap.resume_reg {
-                frame.write(r, carry.clone());
-            }
+            && let Some(r) = snap.resume_reg
+        {
+            frame.write(r, carry.clone());
+        }
         let mut try_stack = snap.try_stack.clone();
         match run_frame_inner(
             module,
@@ -386,6 +386,8 @@ fn run_frame<'a>(
 /// routed through this frame's restored try-stack instead of being
 /// delivered as the suspending call's value. This makes a
 /// cancellation actually preempt a parked `delay` / acquire.
+// Core frame execution loop; one tightly-coupled control-flow state.
+#[allow(clippy::too_many_lines)]
 fn run_frame_inner<'a>(
     module: &'a Module,
     frame: &mut Frame<'a>,
@@ -433,7 +435,10 @@ fn run_frame_inner<'a>(
             }
             match exec_inst(frame, inst, host) {
                 Ok(()) => {}
-                Err(EvalError::Throw(v)) => { thrown = Some(v); break; }
+                Err(EvalError::Throw(v)) => {
+                    thrown = Some(v);
+                    break;
+                }
                 Err(EvalError::NonLocalReturn(v)) => {
                     // A non-local return unwinds through the lambda
                     // frame *and* through any inline-function frames
@@ -451,8 +456,7 @@ fn run_frame_inner<'a>(
                     // resume value lands in the suspending call's
                     // destination register (or one a binding set
                     // explicitly via `pending_resume_reg`).
-                    let resume_reg =
-                        state.pending_resume_reg.take().or_else(|| inst_dst(inst));
+                    let resume_reg = state.pending_resume_reg.take().or_else(|| inst_dst(inst));
                     state.frames.push(FrameSnapshot {
                         func: frame.func.id,
                         block: cur,
@@ -473,14 +477,16 @@ fn run_frame_inner<'a>(
             // Mid-block throw — same try-stack walk as Terminator::Throw.
             let mut routed = false;
             while let Some(tf) = try_stack.pop() {
-                if let Some(h) = tf.catches.iter().find(|h| host.instance_of(
-                    &exc,
-                    &TypeRef {
-                        name: h.type_name.clone(),
-                        nullable: false,
-                        args: Vec::new(),
-                    },
-                )) {
+                if let Some(h) = tf.catches.iter().find(|h| {
+                    host.instance_of(
+                        &exc,
+                        &TypeRef {
+                            name: h.type_name.clone(),
+                            nullable: false,
+                            args: Vec::new(),
+                        },
+                    )
+                }) {
                     frame.write(h.exception_reg, exc.clone());
                     cur = h.handler;
                     routed = true;
@@ -578,14 +584,16 @@ fn run_frame_inner<'a>(
                 let (_, exc) = pending_rethrow.take().unwrap();
                 let mut routed = false;
                 while let Some(tf) = try_stack.pop() {
-                    if let Some(h) = tf.catches.iter().find(|h| host.instance_of(
-                        &exc,
-                        &TypeRef {
-                            name: h.type_name.clone(),
-                            nullable: false,
-                            args: Vec::new(),
-                        },
-                    )) {
+                    if let Some(h) = tf.catches.iter().find(|h| {
+                        host.instance_of(
+                            &exc,
+                            &TypeRef {
+                                name: h.type_name.clone(),
+                                nullable: false,
+                                args: Vec::new(),
+                            },
+                        )
+                    }) {
                         frame.write(h.exception_reg, exc.clone());
                         cur = h.handler;
                         routed = true;
@@ -677,14 +685,16 @@ fn run_frame_inner<'a>(
                 while let Some(tf) = try_stack.pop() {
                     let hcatches = &tf.catches;
                     let hfinally = tf.finally_entry;
-                    if let Some(h) = hcatches.iter().find(|h| host.instance_of(
-                        &exc,
-                        &TypeRef {
-                            name: h.type_name.clone(),
-                            nullable: false,
-                            args: Vec::new(),
-                        },
-                    )) {
+                    if let Some(h) = hcatches.iter().find(|h| {
+                        host.instance_of(
+                            &exc,
+                            &TypeRef {
+                                name: h.type_name.clone(),
+                                nullable: false,
+                                args: Vec::new(),
+                            },
+                        )
+                    }) {
                         // Bind exception, jump to handler.
                         frame.write(h.exception_reg, exc.clone());
                         cur = h.handler;
@@ -722,7 +732,6 @@ fn run_frame_inner<'a>(
                 frame.regs.resize(n, Value::Unit);
                 try_stack.clear();
                 cur = frame.func.entry;
-                continue;
             }
             Terminator::TailCallFunc { func, args, n_args } => {
                 let mut new_params: Vec<Value> = Vec::with_capacity(n_args as usize);
@@ -737,13 +746,18 @@ fn run_frame_inner<'a>(
                 frame.regs.resize(new_func.n_locals as usize, Value::Unit);
                 try_stack.clear();
                 cur = new_func.entry;
-                continue;
             }
             Terminator::Switch { reg, arms, default } => {
                 let v = frame.read(reg);
                 let next = arms
                     .iter()
-                    .find_map(|(c, b)| if const_matches(frame.module, *c, &v) { Some(*b) } else { None })
+                    .find_map(|(c, b)| {
+                        if const_matches(frame.module, *c, &v) {
+                            Some(*b)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(default);
                 cur = next;
             }
@@ -769,12 +783,13 @@ fn inst_dst(inst: &Inst) -> Option<Reg> {
     }
 }
 
-fn exec_inst(
-    frame: &mut Frame<'_>,
-    inst: &Inst,
-    host: &mut dyn Host,
-) -> Result<(), EvalError> {
+// Single instruction-dispatch match; splitting fragments one match.
+#[allow(clippy::too_many_lines)]
+fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<(), EvalError> {
     match inst {
+        // Distinct no-op instruction; kept separate from other empty
+        // arms for clarity of the dispatch table.
+        #[allow(clippy::match_same_arms)]
         Inst::SuspendResumePoint { .. } => {
             // No runtime effect on its own. Lowered state-machine
             // dispatch interprets these markers at the function
@@ -900,13 +915,14 @@ fn exec_inst(
             if matches!(*op, BinOp::Add | BinOp::Sub)
                 && matches!(
                     l,
-                    Value::Map { .. }
-                        | Value::List { .. }
-                        | Value::Set { .. }
-                        | Value::Sequence(_)
+                    Value::Map { .. } | Value::List { .. } | Value::Set { .. } | Value::Sequence(_)
                 )
             {
-                let method = if matches!(*op, BinOp::Add) { "plus" } else { "minus" };
+                let method = if matches!(*op, BinOp::Add) {
+                    "plus"
+                } else {
+                    "minus"
+                };
                 let result = host.call_member(&l, method, std::slice::from_ref(&r))?;
                 frame.write(*dst, result);
                 return Ok(());
@@ -917,7 +933,11 @@ fn exec_inst(
             // override (e.g. `CombinedContext`) does not recurse.
             if matches!(*op, BinOp::IdentEq | BinOp::IdentNeq) {
                 let same = Value::reference_eq(&l, &r);
-                let b = if matches!(*op, BinOp::IdentNeq) { !same } else { same };
+                let b = if matches!(*op, BinOp::IdentNeq) {
+                    !same
+                } else {
+                    same
+                };
                 frame.write(*dst, Value::Bool(b));
                 return Ok(());
             }
@@ -942,20 +962,21 @@ fn exec_inst(
                 return Ok(());
             }
             if let Some(method) = operator_method(*op)
-                && (matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_))) {
-                    let result = host.call_member(&l, method, std::slice::from_ref(&r))?;
-                    // compareTo wrappers (Less/LessEq/Greater/GreaterEq)
-                    // need to be reduced to a Bool.
-                    let final_val = match *op {
-                        BinOp::Less => Value::Bool(value_to_i64(&result).is_some_and(|i| i < 0)),
-                        BinOp::LessEq => Value::Bool(value_to_i64(&result).is_some_and(|i| i <= 0)),
-                        BinOp::Greater => Value::Bool(value_to_i64(&result).is_some_and(|i| i > 0)),
-                        BinOp::GreaterEq => Value::Bool(value_to_i64(&result).is_some_and(|i| i >= 0)),
-                        _ => result,
-                    };
-                    frame.write(*dst, final_val);
-                    return Ok(());
-                }
+                && (matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)))
+            {
+                let result = host.call_member(&l, method, std::slice::from_ref(&r))?;
+                // compareTo wrappers (Less/LessEq/Greater/GreaterEq)
+                // need to be reduced to a Bool.
+                let final_val = match *op {
+                    BinOp::Less => Value::Bool(value_to_i64(&result).is_some_and(|i| i < 0)),
+                    BinOp::LessEq => Value::Bool(value_to_i64(&result).is_some_and(|i| i <= 0)),
+                    BinOp::Greater => Value::Bool(value_to_i64(&result).is_some_and(|i| i > 0)),
+                    BinOp::GreaterEq => Value::Bool(value_to_i64(&result).is_some_and(|i| i >= 0)),
+                    _ => result,
+                };
+                frame.write(*dst, final_val);
+                return Ok(());
+            }
             let out = apply_binop(*op, &l, &r)?;
             frame.write(*dst, out);
         }
@@ -980,7 +1001,11 @@ fn exec_inst(
             }
             frame.write(*dst, v);
         }
-        Inst::GetField { dst, receiver, field } => {
+        Inst::GetField {
+            dst,
+            receiver,
+            field,
+        } => {
             let r = frame.read(*receiver);
             let name = match &frame.module.consts[field.0 as usize] {
                 Const::String(s) => s.clone(),
@@ -997,7 +1022,8 @@ fn exec_inst(
             // nested-`this` rule); other cases are unaffected.
             let pushed_enclosing = match frame.params.first() {
                 Some(p @ Value::Instance(pi)) => {
-                    let same = matches!(&r, Value::Instance(ri) if klio_runtime::ObjRef::ptr_eq(pi, ri));
+                    let same =
+                        matches!(&r, Value::Instance(ri) if klio_runtime::ObjRef::ptr_eq(pi, ri));
                     if same {
                         false
                     } else {
@@ -1014,7 +1040,11 @@ fn exec_inst(
             let v = got?;
             frame.write(*dst, v);
         }
-        Inst::SetField { receiver, field, value } => {
+        Inst::SetField {
+            receiver,
+            field,
+            value,
+        } => {
             let r = frame.read(*receiver);
             let v = frame.read(*value);
             let name = match &frame.module.consts[field.0 as usize] {
@@ -1023,7 +1053,14 @@ fn exec_inst(
             };
             host.set_field(&r, &name, v)?;
         }
-        Inst::Call { dst, func, args, n_args, arg_names, type_args } => {
+        Inst::Call {
+            dst,
+            func,
+            args,
+            n_args,
+            arg_names,
+            type_args,
+        } => {
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
             let ta: Vec<String> = type_args
@@ -1079,7 +1116,13 @@ fn exec_inst(
             let result = res?;
             frame.write(*dst, result);
         }
-        Inst::CallValue { dst, callee, args, n_args, arg_names } => {
+        Inst::CallValue {
+            dst,
+            callee,
+            args,
+            n_args,
+            arg_names,
+        } => {
             let callee_v = frame.read(*callee);
             let mut arg_values = read_arg_run(frame, *args, *n_args);
             let mut names = resolve_arg_names(frame.module, arg_names);
@@ -1097,39 +1140,39 @@ fn exec_inst(
                 .position(|p| p.name == "this")
                 .and_then(|i| frame.params.get(i).cloned())
                 .filter(|v| matches!(v, Value::Instance(_)));
-            if let Some((n_params, first_is_this)) =
-                host.callable_receiver_shape(&callee_v)
-                && first_is_this && arg_values.len() + 1 == n_params
-                    && let Some(ct) = &caller_this {
-                        arg_values.insert(0, ct.clone());
-                        names.insert(0, None);
-                    }
+            if let Some((n_params, first_is_this)) = host.callable_receiver_shape(&callee_v)
+                && first_is_this
+                && arg_values.len() + 1 == n_params
+                && let Some(ct) = &caller_this
+            {
+                arg_values.insert(0, ct.clone());
+                names.insert(0, None);
+            }
             // Receiver lambda whose `this` arrives via a captured
             // slot (not a leading param). `body()` from inside a
             // method body needs the method's `this` substituted in.
             if host.closure_needs_this_capture(&callee_v)
-                && let Some(ct) = &caller_this {
-                    host.override_closure_this(&callee_v, ct);
-                }
+                && let Some(ct) = &caller_this
+            {
+                host.override_closure_this(&callee_v, ct);
+            }
             // Receiver-lambda fallback for bare names lowered as
             // LoadGlobal: push the calling frame's `this` so the
             // global-miss path in LoadGlobal can fall back to a
             // member of the receiver. Only fires when invoking a
             // lambda value bare from inside a method — same scope
             // as the `body()` style invocation.
-            let pushed_caller_this = if matches!(
-                callee_v,
-                Value::IrClosure { .. } | Value::Lambda { .. }
-            ) {
-                if let Some(ct) = &caller_this {
-                    host.push_access_enclosing(ct);
-                    true
+            let pushed_caller_this =
+                if matches!(callee_v, Value::IrClosure { .. } | Value::Lambda { .. }) {
+                    if let Some(ct) = &caller_this {
+                        host.push_access_enclosing(ct);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
-                }
-            } else {
-                false
-            };
+                };
             let result = host.call_value_named(&callee_v, &arg_values, &names);
             if pushed_caller_this {
                 host.pop_access_enclosing();
@@ -1137,7 +1180,14 @@ fn exec_inst(
             let result = result?;
             frame.write(*dst, result);
         }
-        Inst::CallValueWithThis { dst, callee, receiver, args, n_args, arg_names } => {
+        Inst::CallValueWithThis {
+            dst,
+            callee,
+            receiver,
+            args,
+            n_args,
+            arg_names,
+        } => {
             let callee_v = frame.read(*callee);
             let recv = frame.read(*receiver);
             let arg_values = read_arg_run(frame, *args, *n_args);
@@ -1145,7 +1195,12 @@ fn exec_inst(
             let result = host.call_value_with_this(&callee_v, &recv, &arg_values, &names)?;
             frame.write(*dst, result);
         }
-        Inst::CallSpread { dst, callee, parts, arg_names } => {
+        Inst::CallSpread {
+            dst,
+            callee,
+            parts,
+            arg_names,
+        } => {
             let callee_v = frame.read(*callee);
             let mut arg_values: Vec<Value> = Vec::with_capacity(parts.len());
             let mut effective_names: Vec<Option<String>> = Vec::new();
@@ -1167,31 +1222,61 @@ fn exec_inst(
             let result = host.call_value_named(&callee_v, &arg_values, &effective_names)?;
             frame.write(*dst, result);
         }
-        Inst::CallSuper { dst, receiver, owner_class, qualifier, name, args, n_args, arg_names } => {
+        Inst::CallSuper {
+            dst,
+            receiver,
+            owner_class,
+            qualifier,
+            name,
+            args,
+            n_args,
+            arg_names,
+        } => {
             let recv = frame.read(*receiver);
             let owner_str = match &frame.module.consts[owner_class.0 as usize] {
                 Const::String(s) => s.clone(),
-                _ => return Err(EvalError::Type("CallSuper: owner not a string const".into())),
+                _ => {
+                    return Err(EvalError::Type(
+                        "CallSuper: owner not a string const".into(),
+                    ));
+                }
             };
-            let qual_str: Option<String> = qualifier.and_then(|id| match &frame.module.consts[id.0 as usize] {
-                Const::String(s) => Some(s.clone()),
-                _ => None,
-            });
+            let qual_str: Option<String> =
+                qualifier.and_then(|id| match &frame.module.consts[id.0 as usize] {
+                    Const::String(s) => Some(s.clone()),
+                    _ => None,
+                });
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
                 _ => return Err(EvalError::Type("CallSuper: name not a string const".into())),
             };
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
-            let result = host.call_super(&recv, &owner_str, qual_str.as_deref(), &name_str, &arg_values, &names)?;
+            let result = host.call_super(
+                &recv,
+                &owner_str,
+                qual_str.as_deref(),
+                &name_str,
+                &arg_values,
+                &names,
+            )?;
             frame.write(*dst, result);
         }
-        Inst::CallMemberOrGlobal { dst, this_idx, name, args, n_args, arg_names } => {
+        Inst::CallMemberOrGlobal {
+            dst,
+            this_idx,
+            name,
+            args,
+            n_args,
+            arg_names,
+        } => {
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
-                _ => return Err(EvalError::Type(
-                    "CallMemberOrGlobal: name not a string const".into(),
-                )),
+                _ => {
+                    return Err(EvalError::Type(
+                        "CallMemberOrGlobal: name not a string const".into(),
+                    ));
+                }
             };
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
@@ -1207,11 +1292,11 @@ fn exec_inst(
             // call (`sorted()`, `toInt()`) dispatches on the
             // receiver instead of escaping to a global.
             if matches!(this_val, Value::Null | Value::Unit)
-                && let Some(idx) =
-                    frame.func.params.iter().position(|p| p.name == "this")
-                    && let Some(v) = frame.params.get(idx) {
-                        this_val = v.clone();
-                    }
+                && let Some(idx) = frame.func.params.iter().position(|p| p.name == "this")
+                && let Some(v) = frame.params.get(idx)
+            {
+                this_val = v.clone();
+            }
             // A bare callee whose name starts uppercase is a
             // constructor / type (`UnsupportedOperationException(msg)`,
             // `Foo(...)`), never an instance member (Kotlin members are
@@ -1220,10 +1305,7 @@ fn exec_inst(
             // is misread as `(message, cause)`. Skip the member probe
             // for such names and let the constructor / global path
             // (below) build it with the real arguments.
-            let is_ctor_name = name_str
-                .chars()
-                .next()
-                .is_some_and(char::is_uppercase);
+            let is_ctor_name = name_str.chars().next().is_some_and(char::is_uppercase);
             let mut resolved: Option<Value> = None;
             // A probe that *found* the member but whose body failed
             // (any error that is not the `Unimplemented`
@@ -1247,8 +1329,8 @@ fn exec_inst(
             // binding is the receiver's member. Only shadow when the
             // receiver does not actually carry the member.
             let shadow_capture = host.is_shadowing_capture(&name_str)
-                && !(!matches!(this_val, Value::Null | Value::Unit)
-                    && host.host_has_member(&this_val, &name_str));
+                && (matches!(this_val, Value::Null | Value::Unit)
+                    || !host.host_has_member(&this_val, &name_str));
             // Implicit-receiver search, Kotlin order: a *member* of
             // the lambda's own `this` or of any lexically enclosing
             // `this@…` outranks a same-named top-level extension.
@@ -1268,16 +1350,12 @@ fn exec_inst(
                     if matches!(recv, Value::Null | Value::Unit) {
                         continue;
                     }
-                    match host.call_member_only(
-                        &recv, &name_str, &arg_values, &names,
-                    ) {
+                    match host.call_member_only(&recv, &name_str, &arg_values, &names) {
                         Ok(v) => {
                             resolved = Some(v);
                             break;
                         }
-                        Err(e @ EvalError::Suspended(_)) => {
-                            return Err(e)
-                        }
+                        Err(e @ EvalError::Suspended(_)) => return Err(e),
                         // `Unimplemented` is klio's "no such member"
                         // sentinel — keep probing the next receiver.
                         // A different error means the member *was*
@@ -1298,9 +1376,7 @@ fn exec_inst(
                 && !shadow_capture
                 && !matches!(this_val, Value::Null | Value::Unit)
             {
-                match host.call_member_named(
-                    &this_val, &name_str, &arg_values, &names,
-                ) {
+                match host.call_member_named(&this_val, &name_str, &arg_values, &names) {
                     Ok(v) => resolved = Some(v),
                     // A suspension is not a "member not found": the
                     // target *was* dispatched and parked. Propagate it
@@ -1320,24 +1396,22 @@ fn exec_inst(
             // (`buildString { … }` in a member) a bare call may be a
             // member of the lexically enclosing `this@Outer` rather
             // than the lambda receiver.
-            if resolved.is_none() && !shadow_capture
+            if resolved.is_none()
+                && !shadow_capture
                 && let Some(outer) = host.enclosing_this()
-                    && !matches!(outer, Value::Null | Value::Unit) {
-                        match host.call_member_named(
-                            &outer, &name_str, &arg_values, &names,
-                        ) {
-                            Ok(v) => resolved = Some(v),
-                            Err(e @ EvalError::Suspended(_)) => {
-                                return Err(e)
-                            }
-                            Err(EvalError::Unimplemented(_)) => {}
-                            Err(e) => {
-                                if first_real_err.is_none() {
-                                    first_real_err = Some(e);
-                                }
-                            }
+                && !matches!(outer, Value::Null | Value::Unit)
+            {
+                match host.call_member_named(&outer, &name_str, &arg_values, &names) {
+                    Ok(v) => resolved = Some(v),
+                    Err(e @ EvalError::Suspended(_)) => return Err(e),
+                    Err(EvalError::Unimplemented(_)) => {}
+                    Err(e) => {
+                        if first_real_err.is_none() {
+                            first_real_err = Some(e);
                         }
                     }
+                }
+            }
             // Inner-class outer-chain fallback: a bare call inside an
             // `inner class` method may target an enclosing-class
             // member. The enclosing instance is the receiver's
@@ -1352,9 +1426,7 @@ fn exec_inst(
                     if matches!(o, Value::Null | Value::Unit) {
                         break;
                     }
-                    match host.call_member_named(
-                        &o, &name_str, &arg_values, &names,
-                    ) {
+                    match host.call_member_named(&o, &name_str, &arg_values, &names) {
                         Ok(v) => {
                             resolved = Some(v);
                             break;
@@ -1384,9 +1456,7 @@ fn exec_inst(
                 && !matches!(this_val, Value::Null | Value::Unit)
                 && host.host_has_member(&this_val, &name_str)
             {
-                match host.call_member_named(
-                    &this_val, &name_str, &arg_values, &names,
-                ) {
+                match host.call_member_named(&this_val, &name_str, &arg_values, &names) {
                     Ok(v) => resolved = Some(v),
                     Err(e @ EvalError::Suspended(_)) => return Err(e),
                     Err(EvalError::Unimplemented(_)) => {}
@@ -1421,9 +1491,7 @@ fn exec_inst(
                     if matches!(recv, Value::Null | Value::Unit) {
                         continue;
                     }
-                    match host.call_member_named(
-                        recv, &name_str, &arg_values, &names,
-                    ) {
+                    match host.call_member_named(recv, &name_str, &arg_values, &names) {
                         Ok(v) => {
                             resolved = Some(v);
                             break;
@@ -1444,13 +1512,13 @@ fn exec_inst(
                     // Overloaded top-level function: select by runtime
                     // arg types before falling back to the single
                     // global value baked in at lower time.
-                    if let Some(v) = host.call_named_overload(
-                        frame.module, &name_str, &arg_values, &names,
-                    )? {
+                    if let Some(v) =
+                        host.call_named_overload(frame.module, &name_str, &arg_values, &names)?
+                    {
                         v
-                    } else if let Some(callee) = host.lookup_global_throwing(&name_str)? { host.call_value_named(
-                        &callee, &arg_values, &names,
-                    )? } else {
+                    } else if let Some(callee) = host.lookup_global_throwing(&name_str)? {
+                        host.call_value_named(&callee, &arg_values, &names)?
+                    } else {
                         // Last resort: a bare call that is a
                         // The frame's bound `this` param (the
                         // method / extension body) — or, when
@@ -1466,39 +1534,21 @@ fn exec_inst(
                             .position(|p| p.name == "this")
                             .and_then(|i| frame.params.get(i))
                             .cloned()
-                            .filter(|v| {
-                                matches!(v, Value::Instance(_))
-                            })
+                            .filter(|v| matches!(v, Value::Instance(_)))
                             .or_else(|| {
-                                host.enclosing_this_chain()
-                                    .into_iter()
-                                    .find(|v| {
-                                        matches!(
-                                            v,
-                                            Value::Instance(_)
-                                        ) && host.host_has_member(
-                                            v, &name_str,
-                                        )
-                                    })
+                                host.enclosing_this_chain().into_iter().find(|v| {
+                                    matches!(v, Value::Instance(_))
+                                        && host.host_has_member(v, &name_str)
+                                })
                             });
-                        if let Some(t @ Value::Instance(_)) =
-                            own_this
-                        {
-                            match host.call_member_named(
-                                &t, &name_str, &arg_values,
-                                &names,
-                            ) {
+                        if let Some(t @ Value::Instance(_)) = own_this {
+                            match host.call_member_named(&t, &name_str, &arg_values, &names) {
                                 Ok(v) => v,
-                                Err(
-                                    e @ EvalError::Suspended(_),
-                                ) => return Err(e),
+                                Err(e @ EvalError::Suspended(_)) => return Err(e),
                                 Err(_) => {
-                                    return Err(first_real_err
-                                        .unwrap_or(
-                                        EvalError::Unbound(
-                                            format!("unresolved global `{name_str}`"),
-                                        ),
-                                    ))
+                                    return Err(first_real_err.unwrap_or(EvalError::Unbound(
+                                        format!("unresolved global `{name_str}`"),
+                                    )));
                                 }
                             }
                         } else {
@@ -1507,22 +1557,31 @@ fn exec_inst(
                             // body failed, surface that real
                             // error instead of the misleading
                             // `unresolved global`.
-                            return Err(first_real_err.unwrap_or(
-                                EvalError::Unbound(format!(
-                                    "unresolved global `{name_str}`"
-                                )),
-                            ));
+                            return Err(first_real_err.unwrap_or(EvalError::Unbound(format!(
+                                "unresolved global `{name_str}`"
+                            ))));
                         }
                     }
                 }
             };
             frame.write(*dst, result);
         }
-        Inst::CallMember { dst, receiver, name, args, n_args, arg_names } => {
+        Inst::CallMember {
+            dst,
+            receiver,
+            name,
+            args,
+            n_args,
+            arg_names,
+        } => {
             let recv = frame.read(*receiver);
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
-                _ => return Err(EvalError::Type("CallMember: name not a string const".into())),
+                _ => {
+                    return Err(EvalError::Type(
+                        "CallMember: name not a string const".into(),
+                    ));
+                }
             };
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
@@ -1569,7 +1628,7 @@ fn exec_inst(
                 _ => {
                     return Err(EvalError::Type(
                         "CallMemberOrValue: name not a string const".into(),
-                    ))
+                    ));
                 }
             };
             let result = if host.host_has_member(&recv, &name_str) {
@@ -1626,14 +1685,20 @@ fn exec_inst(
                     _ => {
                         return Err(EvalError::Type(
                             "CallValueOrMember: name not a string const".into(),
-                        ))
+                        ));
                     }
                 };
                 host.call_member_named(&recv, &name_str, &arg_values, &names)?
             };
             frame.write(*dst, result);
         }
-        Inst::NewInstance { dst, class, args, n_args, arg_names } => {
+        Inst::NewInstance {
+            dst,
+            class,
+            args,
+            n_args,
+            arg_names,
+        } => {
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
             // A bare `Inner(args)` inside a member of the enclosing
@@ -1662,10 +1727,9 @@ fn exec_inst(
                     let b = inst.borrow();
                     b.class.is_inner && b.outer.is_none()
                 };
-                if needs_outer
-                    && let Some(h) = outer_hint {
-                        inst.borrow_mut().outer = Some(h);
-                    }
+                if needs_outer && let Some(h) = outer_hint {
+                    inst.borrow_mut().outer = Some(h);
+                }
             }
             frame.write(*dst, result);
         }
@@ -1685,21 +1749,30 @@ fn exec_inst(
                 // so user `catch (e: ClassCastException)` arms fire.
                 let exc = Value::Exception {
                     fqn: std::sync::Arc::new("kotlin.ClassCastException".into()),
-                    message: Some(std::sync::Arc::new(format!(
-                        "cast to `{}` failed",
-                        ty.name
-                    ))),
+                    message: Some(std::sync::Arc::new(format!("cast to `{}` failed", ty.name))),
                     cause: None,
                 };
                 return Err(EvalError::Throw(exc));
             }
         }
-        Inst::Lambda { dst, body_func, captures } => {
+        Inst::Lambda {
+            dst,
+            body_func,
+            captures,
+        } => {
             let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
             let v = host.build_closure(frame.module, *body_func, cap_values)?;
             frame.write(*dst, v);
         }
-        Inst::AstLambda { dst, params, body_ast, captures, captured_names, absorb_return, body_func } => {
+        Inst::AstLambda {
+            dst,
+            params,
+            body_ast,
+            captures,
+            captured_names,
+            absorb_return,
+            body_func,
+        } => {
             let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
             let v = host.build_ast_lambda_with_flag_funcid(
                 params,
@@ -1711,11 +1784,20 @@ fn exec_inst(
             )?;
             frame.write(*dst, v);
         }
-        Inst::RegisterClass { class, captured_names, captures } => {
+        Inst::RegisterClass {
+            class,
+            captured_names,
+            captures,
+        } => {
             let cap_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
             host.register_class_captured(class, captured_names, cap_values)?;
         }
-        Inst::BuildObject { dst, ast, captured_names, captures } => {
+        Inst::BuildObject {
+            dst,
+            ast,
+            captured_names,
+            captures,
+        } => {
             let captured_values: Vec<Value> = captures.iter().map(|r| frame.read(*r)).collect();
             let v = host.build_object(ast, captured_names, captured_values)?;
             frame.write(*dst, v);
@@ -1723,17 +1805,27 @@ fn exec_inst(
         Inst::StoreGlobal { name, value } => {
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
-                _ => return Err(EvalError::Type("StoreGlobal: name not a string const".into())),
+                _ => {
+                    return Err(EvalError::Type(
+                        "StoreGlobal: name not a string const".into(),
+                    ));
+                }
             };
             let v = frame.read(*value);
             host.store_global(&name_str, v)?;
         }
-        Inst::StoreToThisOrGlobal { this_idx, name, value } => {
+        Inst::StoreToThisOrGlobal {
+            this_idx,
+            name,
+            value,
+        } => {
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
-                _ => return Err(EvalError::Type(
-                    "StoreToThisOrGlobal: name not a string const".into(),
-                )),
+                _ => {
+                    return Err(EvalError::Type(
+                        "StoreToThisOrGlobal: name not a string const".into(),
+                    ));
+                }
             };
             let v = frame.read(*value);
             let this_val = frame
@@ -1760,9 +1852,15 @@ fn exec_inst(
         Inst::LoadGlobal { dst, name } => {
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
-                _ => return Err(EvalError::Type("LoadGlobal: name not a string const".into())),
+                _ => {
+                    return Err(EvalError::Type(
+                        "LoadGlobal: name not a string const".into(),
+                    ));
+                }
             };
-            let v = if let Some(v) = host.lookup_global_throwing(&name_str)? { v } else {
+            let v = if let Some(v) = host.lookup_global_throwing(&name_str)? {
+                v
+            } else {
                 // Receiver-lambda fallback: a lambda body whose
                 // bare reference was lowered as LoadGlobal (the
                 // lower had no type info and assumed top-level)
@@ -1777,16 +1875,14 @@ fn exec_inst(
                         continue;
                     }
                     if let Ok(v) = host.get_field(&outer, &name_str)
-                        && !matches!(v, Value::Unit) {
-                            resolved = Some(v);
-                            break;
-                        }
+                        && !matches!(v, Value::Unit)
+                    {
+                        resolved = Some(v);
+                        break;
+                    }
                 }
-                resolved.ok_or_else(|| {
-                    EvalError::Unbound(format!(
-                        "unresolved global `{name_str}`"
-                    ))
-                })?
+                resolved
+                    .ok_or_else(|| EvalError::Unbound(format!("unresolved global `{name_str}`")))?
             };
             frame.write(*dst, v);
         }
@@ -1801,12 +1897,18 @@ fn exec_inst(
                 .unwrap_or(Value::Unit);
             frame.write(*dst, v);
         }
-        Inst::LoadFromThisOrGlobal { dst, this_idx, name } => {
+        Inst::LoadFromThisOrGlobal {
+            dst,
+            this_idx,
+            name,
+        } => {
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
-                _ => return Err(EvalError::Type(
-                    "LoadFromThisOrGlobal: name not a string const".into(),
-                )),
+                _ => {
+                    return Err(EvalError::Type(
+                        "LoadFromThisOrGlobal: name not a string const".into(),
+                    ));
+                }
             };
             let this_val = frame
                 .captures
@@ -1818,36 +1920,44 @@ fn exec_inst(
             let mut resolved: Option<Value> = None;
             if !matches!(this_val, Value::Null | Value::Unit)
                 && let Ok(v) = host.get_field(&this_val, &name_str)
-                    && !matches!(v, Value::Unit) {
-                        resolved = Some(v);
-                    }
+                && !matches!(v, Value::Unit)
+            {
+                resolved = Some(v);
+            }
             // Enclosing-receiver fallback: a bare property read inside
             // a receiver lambda may name a member of the lexically
             // enclosing `this@Outer`.
             if resolved.is_none()
                 && let Some(outer) = host.enclosing_this()
-                    && !matches!(outer, Value::Null | Value::Unit)
-                        && let Ok(v) = host.get_field(&outer, &name_str)
-                            && !matches!(v, Value::Unit) {
-                                resolved = Some(v);
-                            }
+                && !matches!(outer, Value::Null | Value::Unit)
+                && let Ok(v) = host.get_field(&outer, &name_str)
+                && !matches!(v, Value::Unit)
+            {
+                resolved = Some(v);
+            }
             let v = match resolved {
                 Some(v) => v,
                 None => host
                     .lookup_global_throwing(&name_str)?
-                    .ok_or_else(|| EvalError::Unbound(
-                        format!("unresolved global `{name_str}`"),
-                    ))?,
+                    .ok_or_else(|| EvalError::Unbound(format!("unresolved global `{name_str}`")))?,
             };
             frame.write(*dst, v);
         }
-        Inst::Index { dst, receiver, index } => {
+        Inst::Index {
+            dst,
+            receiver,
+            index,
+        } => {
             let r = frame.read(*receiver);
             let i = frame.read(*index);
             let result = host.call_member(&r, "get", &[i])?;
             frame.write(*dst, result);
         }
-        Inst::IndexSet { receiver, index, value } => {
+        Inst::IndexSet {
+            receiver,
+            index,
+            value,
+        } => {
             let r = frame.read(*receiver);
             let i = frame.read(*index);
             let v = frame.read(*value);
@@ -1865,24 +1975,38 @@ fn exec_inst(
                 },
             );
         }
-        Inst::WritebackCaptures { lambda, names, dsts } => {
+        Inst::WritebackCaptures {
+            lambda,
+            names,
+            dsts,
+        } => {
             let lam = frame.read(*lambda);
             for (name_id, dst) in names.iter().zip(dsts.iter()) {
                 let name_str = match &frame.module.consts[name_id.0 as usize] {
                     Const::String(s) => s.clone(),
-                    _ => return Err(EvalError::Type(
-                        "WritebackCaptures: name not a string const".into(),
-                    )),
+                    _ => {
+                        return Err(EvalError::Type(
+                            "WritebackCaptures: name not a string const".into(),
+                        ));
+                    }
                 };
                 let v = host.read_lambda_capture(&lam, &name_str)?;
                 frame.write(*dst, v);
             }
         }
-        Inst::QualifiedThis { dst, receiver, qualifier } => {
+        Inst::QualifiedThis {
+            dst,
+            receiver,
+            qualifier,
+        } => {
             let recv = frame.read(*receiver);
             let qual_str = match &frame.module.consts[qualifier.0 as usize] {
                 Const::String(s) => s.clone(),
-                _ => return Err(EvalError::Type("QualifiedThis: qualifier not a string const".into())),
+                _ => {
+                    return Err(EvalError::Type(
+                        "QualifiedThis: qualifier not a string const".into(),
+                    ));
+                }
             };
             let v = host.qualified_this(&recv, &qual_str)?;
             frame.write(*dst, v);
@@ -1890,14 +2014,24 @@ fn exec_inst(
         Inst::PropertyRef { dst, name } => {
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
-                _ => return Err(EvalError::Type("PropertyRef: name not a string const".into())),
+                _ => {
+                    return Err(EvalError::Type(
+                        "PropertyRef: name not a string const".into(),
+                    ));
+                }
             };
             frame.write(
                 *dst,
-                Value::PropertyRef { name: std::sync::Arc::new(name_str) },
+                Value::PropertyRef {
+                    name: std::sync::Arc::new(name_str),
+                },
             );
         }
-        Inst::MemberRef { dst, receiver, name } => {
+        Inst::MemberRef {
+            dst,
+            receiver,
+            name,
+        } => {
             let recv = frame.read(*receiver);
             let name_str = match &frame.module.consts[name.0 as usize] {
                 Const::String(s) => s.clone(),
@@ -1919,9 +2053,7 @@ fn exec_inst(
 fn spread_items(v: &Value) -> Result<Vec<Value>, EvalError> {
     use Value::{Array, List, Set};
     match v {
-        Array { items, .. } => Ok(items.borrow().clone()),
-        List { items, .. } => Ok(items.borrow().clone()),
-        Set { items, .. } => Ok(items.borrow().clone()),
+        Array { items, .. } | List { items, .. } | Set { items, .. } => Ok(items.borrow().clone()),
         _ => Err(EvalError::Type(format!(
             "spread argument: expected an array/list, got `{}`",
             v.type_fqn()
@@ -2079,17 +2211,17 @@ fn render_value(v: &Value) -> String {
 /// `String.compareTo`. Surrogates above the BMP encode as two u16
 /// units and sort accordingly — `<` on `"😀"` vs `""` differs
 /// from a UTF-8 byte compare.
-fn utf16_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let mut ai = a.encode_utf16();
-    let mut bi = b.encode_utf16();
+fn utf16_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_units = left.encode_utf16();
+    let mut right_units = right.encode_utf16();
     loop {
-        match (ai.next(), bi.next()) {
+        match (left_units.next(), right_units.next()) {
             (None, None) => return std::cmp::Ordering::Equal,
             (None, Some(_)) => return std::cmp::Ordering::Less,
             (Some(_), None) => return std::cmp::Ordering::Greater,
-            (Some(x), Some(y)) => match x.cmp(&y) {
-                std::cmp::Ordering::Equal => continue,
-                o => return o,
+            (Some(lu), Some(ru)) => match lu.cmp(&ru) {
+                std::cmp::Ordering::Equal => {}
+                ord => return ord,
             },
         }
     }
@@ -2103,6 +2235,19 @@ fn arith_exc(msg: &str) -> EvalError {
     })
 }
 
+// Casts here implement Kotlin's defined numeric conversions: Char
+// arithmetic truncates to a UTF-16 code unit, Long/Int widen to
+// Double/Float with the language's defined precision loss. Same-body
+// comparison arms bind differently-typed operands (`Int` vs `Char`
+// vs `Long`), so they cannot be combined into one pattern.
+#[allow(
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::match_same_arms,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
     use Value::{Bool, Double, Int, Long};
     // Kotlin promotes `Byte`/`Short` to `Int` in arithmetic and
@@ -2115,9 +2260,7 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
             _ => None,
         }
     };
-    if (promote(l).is_some() || promote(r).is_some())
-        && !matches!(op, BinOp::StringConcat)
-    {
+    if (promote(l).is_some() || promote(r).is_some()) && !matches!(op, BinOp::StringConcat) {
         let nl = promote(l).unwrap_or_else(|| l.clone());
         let nr = promote(r).unwrap_or_else(|| r.clone());
         return apply_binop(op, &nl, &nr);
@@ -2127,9 +2270,7 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::Sub, Int(a), Int(b)) => Ok(Int(a.wrapping_sub(*b))),
         // Kotlin Char arithmetic: `Char - Char` → Int (code-point
         // distance); `Char + Int` / `Char - Int` → Char.
-        (BinOp::Sub, Value::Char(a), Value::Char(b)) => {
-            Ok(Int(i32::from(*a) - i32::from(*b)))
-        }
+        (BinOp::Sub, Value::Char(a), Value::Char(b)) => Ok(Int(i32::from(*a) - i32::from(*b))),
         // `Char + Int` / `Char - Int` truncate to the low 16 bits (the
         // result is a single UTF-16 code unit), matching Kotlin's
         // `(this.code + n).toChar()`.
@@ -2151,19 +2292,27 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::Sub, Long(a), Long(b)) => Ok(Long(a.wrapping_sub(*b))),
         (BinOp::Mul, Long(a), Long(b)) => Ok(Long(a.wrapping_mul(*b))),
         (BinOp::Div, Long(a), Long(b)) => {
-            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            if *b == 0 {
+                return Err(arith_exc("/ by zero"));
+            }
             Ok(Long(a.wrapping_div(*b)))
         }
         (BinOp::Mod, Long(a), Long(b)) => {
-            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            if *b == 0 {
+                return Err(arith_exc("/ by zero"));
+            }
             Ok(Long(a.wrapping_rem(*b)))
         }
         (BinOp::Div, Int(a), Int(b)) => {
-            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            if *b == 0 {
+                return Err(arith_exc("/ by zero"));
+            }
             Ok(Int(a.wrapping_div(*b)))
         }
         (BinOp::Mod, Int(a), Int(b)) => {
-            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            if *b == 0 {
+                return Err(arith_exc("/ by zero"));
+            }
             Ok(Int(a.wrapping_rem(*b)))
         }
         // Mixed Int/Long arithmetic — widen the Int operand to Long
@@ -2202,31 +2351,51 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::Sub, Value::UInt(a), Value::UInt(b)) => Ok(Value::UInt(a.wrapping_sub(*b))),
         (BinOp::Mul, Value::UInt(a), Value::UInt(b)) => Ok(Value::UInt(a.wrapping_mul(*b))),
         (BinOp::Div, Value::UInt(a), Value::UInt(b)) => {
-            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            if *b == 0 {
+                return Err(arith_exc("/ by zero"));
+            }
             Ok(Value::UInt(a / b))
         }
         (BinOp::Mod, Value::UInt(a), Value::UInt(b)) => {
-            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            if *b == 0 {
+                return Err(arith_exc("/ by zero"));
+            }
             Ok(Value::UInt(a % b))
         }
         (BinOp::Add, Value::ULong(a), Value::ULong(b)) => Ok(Value::ULong(a.wrapping_add(*b))),
         (BinOp::Sub, Value::ULong(a), Value::ULong(b)) => Ok(Value::ULong(a.wrapping_sub(*b))),
         (BinOp::Mul, Value::ULong(a), Value::ULong(b)) => Ok(Value::ULong(a.wrapping_mul(*b))),
         (BinOp::Div, Value::ULong(a), Value::ULong(b)) => {
-            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            if *b == 0 {
+                return Err(arith_exc("/ by zero"));
+            }
             Ok(Value::ULong(a / b))
         }
         (BinOp::Mod, Value::ULong(a), Value::ULong(b)) => {
-            if *b == 0 { return Err(arith_exc("/ by zero")); }
+            if *b == 0 {
+                return Err(arith_exc("/ by zero"));
+            }
             Ok(Value::ULong(a % b))
         }
         // Mixed unsigned widening.
-        (BinOp::Add, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_add(u64::from(*b)))),
-        (BinOp::Add, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong(u64::from(*a).wrapping_add(*b))),
-        (BinOp::Mul, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_mul(u64::from(*b)))),
-        (BinOp::Mul, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong(u64::from(*a).wrapping_mul(*b))),
-        (BinOp::Sub, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_sub(u64::from(*b)))),
-        (BinOp::Sub, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong(u64::from(*a).wrapping_sub(*b))),
+        (BinOp::Add, Value::ULong(a), Value::UInt(b)) => {
+            Ok(Value::ULong(a.wrapping_add(u64::from(*b))))
+        }
+        (BinOp::Add, Value::UInt(a), Value::ULong(b)) => {
+            Ok(Value::ULong(u64::from(*a).wrapping_add(*b)))
+        }
+        (BinOp::Mul, Value::ULong(a), Value::UInt(b)) => {
+            Ok(Value::ULong(a.wrapping_mul(u64::from(*b))))
+        }
+        (BinOp::Mul, Value::UInt(a), Value::ULong(b)) => {
+            Ok(Value::ULong(u64::from(*a).wrapping_mul(*b)))
+        }
+        (BinOp::Sub, Value::ULong(a), Value::UInt(b)) => {
+            Ok(Value::ULong(a.wrapping_sub(u64::from(*b))))
+        }
+        (BinOp::Sub, Value::UInt(a), Value::ULong(b)) => {
+            Ok(Value::ULong(u64::from(*a).wrapping_sub(*b)))
+        }
         // Float arithmetic + mixed Float/Double promotion.
         (BinOp::Add, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
         (BinOp::Sub, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
@@ -2367,7 +2536,10 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
             kind: klio_runtime::RangeKind::Char,
         }),
         (BinOp::RangeTo, Long(a), Long(b)) => Ok(Value::Range {
-            start: *a, end: *b, step: 1, kind: klio_runtime::RangeKind::Long,
+            start: *a,
+            end: *b,
+            step: 1,
+            kind: klio_runtime::RangeKind::Long,
         }),
         (BinOp::StringConcat, a, b) => {
             let mut s = render_value(a);
@@ -2384,9 +2556,7 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
             s.push_str(b.as_str());
             Ok(Value::String(std::sync::Arc::new(s)))
         }
-        _ => Err(EvalError::Type(format!(
-            "BinOp::{op:?} on {l:?} and {r:?}"
-        ))),
+        _ => Err(EvalError::Type(format!("BinOp::{op:?} on {l:?} and {r:?}"))),
     }
 }
 
@@ -2413,16 +2583,21 @@ mod tests {
 
     #[test]
     fn eval_int_add() {
-        let mut m = Module::default();
-        let mut b = FuncBuilder::new(&mut m);
-        let l = lit(&mut b, 2);
-        let r = lit(&mut b, 40);
-        let dst = b.alloc_reg();
-        b.push(Inst::BinOp { dst, op: BinOp::Add, lhs: l, rhs: r });
-        b.terminate(Terminator::Return(Some(dst)));
-        let func = b.finish("f", "test.f", TypeRef::int());
-        let v = eval(&m, &func, Vec::new()).unwrap();
-        assert!(matches!(v, Value::Int(42)));
+        let mut module = Module::default();
+        let mut builder = FuncBuilder::new(&mut module);
+        let lhs = lit(&mut builder, 2);
+        let rhs = lit(&mut builder, 40);
+        let dst = builder.alloc_reg();
+        builder.push(Inst::BinOp {
+            dst,
+            op: BinOp::Add,
+            lhs,
+            rhs,
+        });
+        builder.terminate(Terminator::Return(Some(dst)));
+        let func = builder.finish("f", "test.f", TypeRef::int());
+        let result = eval(&module, &func, Vec::new()).unwrap();
+        assert!(matches!(result, Value::Int(42)));
     }
 
     #[test]
@@ -2444,7 +2619,11 @@ mod tests {
         let cond = b.emit_const(Const::Bool(true));
         let t_blk = b.alloc_block();
         let f_blk = b.alloc_block();
-        b.terminate(Terminator::Branch { cond, t: t_blk, f: f_blk });
+        b.terminate(Terminator::Branch {
+            cond,
+            t: t_blk,
+            f: f_blk,
+        });
 
         b.switch_to(t_blk);
         let t_val = lit(&mut b, 1);

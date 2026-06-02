@@ -1,13 +1,19 @@
-use super::{Checker, Decl, class_name_from_typeref, ExtensionSig, Type, convert_type_ref_lossy, ExtensionPropSig, Binding, ClassInfo, TypeAliasInfo, TypeParam, WhereBound, FnSig, describe_params, Function, convert_type_ref_with_tparams, Class, MemberSig, HashMap, substitute_type_params, MemberFlags, Property, Diagnostic, codes, TypeRef, Span, Visibility, FunctionBody, Block, Stmt, stmt_span, CtorDelegation, is_builtin_overridable, EnumEntry, Expr, is_primitive_type_name, type_display, Accessor, SecondaryCtor, ObjectDecl};
+use super::{
+    Accessor, Binding, Block, Checker, Class, ClassInfo, CtorDelegation, Decl, Diagnostic,
+    EnumEntry, Expr, ExtensionPropSig, ExtensionSig, FnSig, Function, FunctionBody, HashMap,
+    MemberFlags, MemberSig, ObjectDecl, Property, SecondaryCtor, Span, Stmt, Type, TypeAliasInfo,
+    TypeParam, TypeRef, Visibility, WhereBound, class_name_from_typeref, codes,
+    convert_type_ref_lossy, convert_type_ref_with_tparams, describe_params, is_builtin_overridable,
+    is_primitive_type_name, stmt_span, substitute_type_params, type_display,
+};
 
 impl Checker<'_> {
-
     // ---- top-level declaration intake -----------------------------------
 
     pub(crate) fn declare_top_level(&mut self, decl: &Decl) {
         match decl {
             Decl::Function(f) => {
-                let sig = self.signature_of(f);
+                let sig = Self::signature_of(f);
                 if let Some(recv) = &f.receiver_type {
                     let return_class = f.return_type.as_ref().and_then(class_name_from_typeref);
                     self.extensions
@@ -32,10 +38,9 @@ impl Checker<'_> {
                 }
             }
             Decl::Property(p) => {
-                let ty = p
-                    .ty
-                    .as_ref()
-                    .map_or(Type::Unresolved, convert_type_ref_lossy);
+                let ty =
+                    p.ty.as_ref()
+                        .map_or(Type::Unresolved, convert_type_ref_lossy);
                 let cn = p.ty.as_ref().and_then(class_name_from_typeref);
                 if let Some(recv) = &p.receiver_type {
                     self.extension_properties
@@ -50,7 +55,13 @@ impl Checker<'_> {
                 } else {
                     self.frames[0].bindings.insert(
                         p.name.name.clone(),
-                        Binding { ty, mutable: p.mutable, decl_span: Some(p.name.span), class_name: cn, decl_type_name: None },
+                        Binding {
+                            ty,
+                            mutable: p.mutable,
+                            decl_span: Some(p.name.span),
+                            class_name: cn,
+                            decl_type_name: None,
+                        },
                     );
                     self.prop_visibility
                         .insert(p.name.name.clone(), (p.visibility, p.name.span.file));
@@ -58,10 +69,11 @@ impl Checker<'_> {
                         self.setter_visibility
                             .insert(p.name.name.clone(), (sv, p.name.span.file));
                     } else if let Some(setter) = &p.setter
-                        && let Some(sv) = setter.visibility {
-                            self.setter_visibility
-                                .insert(p.name.name.clone(), (sv, p.name.span.file));
-                        }
+                        && let Some(sv) = setter.visibility
+                    {
+                        self.setter_visibility
+                            .insert(p.name.name.clone(), (sv, p.name.span.file));
+                    }
                     self.prop_annotations
                         .insert(p.name.name.clone(), p.annotations.clone());
                 }
@@ -72,9 +84,11 @@ impl Checker<'_> {
             }
             Decl::Object(o) => {
                 // Treat object singleton like a class with no ctor.
-                let mut info = ClassInfo::default();
-                info.is_object = true;
-                info.decl_file = Some(o.name.span.file);
+                let mut info = ClassInfo {
+                    is_object: true,
+                    decl_file: Some(o.name.span.file),
+                    ..ClassInfo::default()
+                };
                 self.collect_members(&o.members, &mut info);
                 for s in &o.supertypes {
                     info.supertypes.push(s.name.name.clone());
@@ -87,7 +101,9 @@ impl Checker<'_> {
                         ty: Type::Unresolved,
                         mutable: false,
                         decl_span: Some(o.name.span),
-                        class_name: Some(o.name.name.clone()), decl_type_name: None },
+                        class_name: Some(o.name.name.clone()),
+                        decl_type_name: None,
+                    },
                 );
             }
             Decl::TypeAlias(a) => {
@@ -160,9 +176,12 @@ impl Checker<'_> {
         entry.push(sig);
     }
 
-    pub(crate) fn signature_of(&self, f: &Function) -> FnSig {
-        let tparams: std::collections::HashSet<String> =
-            f.type_params.iter().map(|tp| tp.name.name.clone()).collect();
+    pub(crate) fn signature_of(f: &Function) -> FnSig {
+        let tparams: std::collections::HashSet<String> = f
+            .type_params
+            .iter()
+            .map(|tp| tp.name.name.clone())
+            .collect();
         let mut params = Vec::with_capacity(f.params.len());
         let mut has_default = Vec::with_capacity(f.params.len());
         let mut names = Vec::with_capacity(f.params.len());
@@ -177,8 +196,11 @@ impl Checker<'_> {
             .return_type
             .as_ref()
             .map_or(Type::Unit, |rt| convert_type_ref_with_tparams(rt, &tparams));
-        let param_class_names: Vec<Option<String>> =
-            f.params.iter().map(|p| class_name_from_typeref(&p.ty)).collect();
+        let param_class_names: Vec<Option<String>> = f
+            .params
+            .iter()
+            .map(|p| class_name_from_typeref(&p.ty))
+            .collect();
         let (type_param_names, type_param_bounds) =
             Self::collect_type_param_bounds(&f.type_params, &f.where_bounds);
         let is_crossinline_param: Vec<bool> = if f.is_inline {
@@ -226,10 +248,15 @@ impl Checker<'_> {
                 if let Some(cn) = class_name_from_typeref(&p.ty) {
                     info.member_class.insert(p.name.name.clone(), cn);
                 }
-                info.member_visibility.insert(p.name.name.clone(), p.visibility);
+                info.member_visibility
+                    .insert(p.name.name.clone(), p.visibility);
                 info.member_sigs.insert(
                     p.name.name.clone(),
-                    MemberSig::Property { ty: ty.clone(), mutable, visibility: p.visibility },
+                    MemberSig::Property {
+                        ty: ty.clone(),
+                        mutable,
+                        visibility: p.visibility,
+                    },
                 );
             }
         }
@@ -241,8 +268,16 @@ impl Checker<'_> {
                 .iter()
                 .map(|p| convert_type_ref_lossy(&p.ty))
                 .collect(),
-            has_default: c.primary_params.iter().map(|p| p.default.is_some()).collect(),
-            param_names: c.primary_params.iter().map(|p| p.name.name.clone()).collect(),
+            has_default: c
+                .primary_params
+                .iter()
+                .map(|p| p.default.is_some())
+                .collect(),
+            param_names: c
+                .primary_params
+                .iter()
+                .map(|p| p.name.name.clone())
+                .collect(),
             is_vararg: c.primary_params.iter().map(|_| false).collect(),
             return_ty: Type::Unresolved,
             is_infix: false,
@@ -262,7 +297,11 @@ impl Checker<'_> {
             info.ctor = Some(ctor_sig);
         }
         self.collect_members(&c.members, &mut info);
-        info.type_param_names = c.type_params.iter().map(|tp| tp.name.name.clone()).collect();
+        info.type_param_names = c
+            .type_params
+            .iter()
+            .map(|tp| tp.name.name.clone())
+            .collect();
         for s in &c.supertypes {
             info.supertypes.push(s.name.name.clone());
             let type_args: Vec<Type> = s
@@ -320,11 +359,13 @@ impl Checker<'_> {
         None
     }
 
+    // Kept as a method for call-site symmetry with the other `self.collect_*` passes.
+    #[allow(clippy::unused_self)]
     pub(crate) fn collect_members(&self, members: &[Decl], info: &mut ClassInfo) {
         for m in members {
             match m {
                 Decl::Function(f) => {
-                    let sig = self.signature_of(f);
+                    let sig = Self::signature_of(f);
                     info.member_sigs.insert(
                         f.name.name.clone(),
                         MemberSig::Function {
@@ -346,8 +387,7 @@ impl Checker<'_> {
                     // Interface members and abstract members are implicitly
                     // `open` in Kotlin — record that here so subclass override
                     // diagnostics line up with kotlinc behavior.
-                    let implicit_open =
-                        info.is_interface || info.is_abstract || f.is_abstract;
+                    let implicit_open = info.is_interface || info.is_abstract || f.is_abstract;
                     info.member_flags.insert(
                         f.name.name.clone(),
                         MemberFlags {
@@ -364,13 +404,13 @@ impl Checker<'_> {
                     } else {
                         info.concrete_members.push(f.name.name.clone());
                     }
-                    info.member_visibility.insert(f.name.name.clone(), f.visibility);
+                    info.member_visibility
+                        .insert(f.name.name.clone(), f.visibility);
                 }
                 Decl::Property(p) => {
-                    let ty = p
-                        .ty
-                        .as_ref()
-                        .map_or(Type::Unresolved, convert_type_ref_lossy);
+                    let ty =
+                        p.ty.as_ref()
+                            .map_or(Type::Unresolved, convert_type_ref_lossy);
                     info.member_sigs.insert(
                         p.name.name.clone(),
                         MemberSig::Property {
@@ -402,7 +442,8 @@ impl Checker<'_> {
                     } else {
                         info.concrete_members.push(p.name.name.clone());
                     }
-                    info.member_visibility.insert(p.name.name.clone(), p.visibility);
+                    info.member_visibility
+                        .insert(p.name.name.clone(), p.visibility);
                 }
                 Decl::Class(_) | Decl::Object(_) | Decl::TypeAlias(_) => {}
             }
@@ -430,9 +471,10 @@ impl Checker<'_> {
             } else {
                 // Infer from initializer.
                 if let Some(b) = self.frames[0].bindings.get_mut(&p.name.name)
-                    && matches!(b.ty, Type::Unresolved) {
-                        b.ty = init_ty;
-                    }
+                    && matches!(b.ty, Type::Unresolved)
+                {
+                    b.ty = init_ty;
+                }
             }
         }
         if let Some(d) = &p.delegate {
@@ -461,38 +503,29 @@ impl Checker<'_> {
         {
             self.diagnostics.emit(
                 Diagnostic::error(
-                    format!(
-                        "delegation operator `{}` cannot be `suspend`",
-                        f.name.name
-                    ),
+                    format!("delegation operator `{}` cannot be `suspend`", f.name.name),
                     f.name.span,
                 )
                 .with_code(codes::TYPE_SUSPEND_NOT_ALLOWED),
             );
         }
-        let is_extension = f.receiver_type.is_some();
-        let extra_receiver: usize = if is_extension { 0 } else { 0 };
-        let _ = extra_receiver;
         let n = f.params.len();
         let name = f.name.name.as_str();
         // For each name, the expected user-param count is what a member
         // form would declare. Extensions match the same shape; the
         // receiver is the LHS.
         let (expected, returns_bool, returns_int): (Option<&str>, bool, bool) = match name {
-            "inc" | "dec" => (Some("0 args"), false, false),
-            "unaryPlus" | "unaryMinus" | "not" => (Some("0 args"), false, false),
+            "inc" | "dec" | "unaryPlus" | "unaryMinus" | "not" => (Some("0 args"), false, false),
             "iterator" | "hasNext" | "next" => {
                 let rb = name == "hasNext";
                 (Some("0 args"), rb, false)
             }
-            "plus" | "minus" | "times" | "div" | "rem"
-            | "rangeTo" | "rangeUntil" => (Some("1 arg"), false, false),
-            "plusAssign" | "minusAssign" | "timesAssign" | "divAssign" | "remAssign" => {
+            "plus" | "minus" | "times" | "div" | "rem" | "rangeTo" | "rangeUntil"
+            | "plusAssign" | "minusAssign" | "timesAssign" | "divAssign" | "remAssign" => {
                 (Some("1 arg"), false, false)
             }
             "compareTo" => (Some("1 arg"), false, true),
-            "contains" => (Some("1 arg"), true, false),
-            "equals" => (Some("1 arg"), true, false),
+            "contains" | "equals" => (Some("1 arg"), true, false),
             "get" => {
                 // ≥1 user arg.
                 if n < 1 {
@@ -503,22 +536,25 @@ impl Checker<'_> {
             "set" => {
                 // ≥2 user args.
                 if n < 2 {
-                    self.emit_op_sig(f, "`set` operator requires at least 2 arguments (last is the value)");
+                    self.emit_op_sig(
+                        f,
+                        "`set` operator requires at least 2 arguments (last is the value)",
+                    );
                 }
                 (None, false, false)
             }
-            "invoke" => (None, false, false),
-            "componentN" => (None, false, false),
-            "provideDelegate" => (Some("2 args"), false, false),
-            "getValue" => (Some("2 args"), false, false),
+            "invoke" | "componentN" => (None, false, false),
+            "provideDelegate" | "getValue" => (Some("2 args"), false, false),
             "setValue" => (Some("3 args"), false, false),
             _ => {
                 // componentN: digits after "component"
                 if let Some(rest) = name.strip_prefix("component")
-                    && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
-                        && n != 0 {
-                            self.emit_op_sig(f, &format!("`{name}` operator must take no arguments"));
-                        }
+                    && !rest.is_empty()
+                    && rest.chars().all(|c| c.is_ascii_digit())
+                    && n != 0
+                {
+                    self.emit_op_sig(f, &format!("`{name}` operator must take no arguments"));
+                }
                 (None, false, false)
             }
         };
@@ -537,20 +573,18 @@ impl Checker<'_> {
                 );
             }
         }
-        if returns_bool
-            && let Some(rt) = &f.return_type {
-                let ty = convert_type_ref_lossy(rt);
-                if !matches!(ty.non_null(), Type::Boolean | Type::Unresolved) {
-                    self.emit_op_sig(f, &format!("`{name}` operator must return Boolean"));
-                }
+        if returns_bool && let Some(rt) = &f.return_type {
+            let ty = convert_type_ref_lossy(rt);
+            if !matches!(ty.non_null(), Type::Boolean | Type::Unresolved) {
+                self.emit_op_sig(f, &format!("`{name}` operator must return Boolean"));
             }
-        if returns_int
-            && let Some(rt) = &f.return_type {
-                let ty = convert_type_ref_lossy(rt);
-                if !matches!(ty.non_null(), Type::Int | Type::Unresolved) {
-                    self.emit_op_sig(f, &format!("`{name}` operator must return Int"));
-                }
+        }
+        if returns_int && let Some(rt) = &f.return_type {
+            let ty = convert_type_ref_lossy(rt);
+            if !matches!(ty.non_null(), Type::Int | Type::Unresolved) {
+                self.emit_op_sig(f, &format!("`{name}` operator must return Int"));
             }
+        }
     }
 
     /// Head name of a type reference — i.e. the top-level classifier name,
@@ -605,21 +639,16 @@ impl Checker<'_> {
             }
         }
         // Tarjan-lite: DFS, mark gray/black, any back-edge to gray is a cycle.
-        let mut color: std::collections::HashMap<String, u8> =
-            std::collections::HashMap::new();
+        let mut color: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
         for tp in type_params {
             if color.get(&tp.name.name).copied().unwrap_or(0) != 0 {
                 continue;
             }
-            if let Some(start) =
-                Self::find_cycle_dfs(&tp.name.name, &graph, &mut color)
-            {
+            if let Some(start) = Self::find_cycle_dfs(&tp.name.name, &graph, &mut color) {
                 let sp = spans.get(&start).copied().unwrap_or(tp.name.span);
                 self.diagnostics.emit(
                     Diagnostic::error(
-                        format!(
-                            "type parameter `{start}` has a circular bound",
-                        ),
+                        format!("type parameter `{start}` has a circular bound",),
                         sp,
                     )
                     .with_code(codes::TYPE_CIRCULAR_TYPE_BOUND),
@@ -662,10 +691,8 @@ impl Checker<'_> {
         if type_args.len() != sig.type_param_count || sig.type_param_bounds.is_empty() {
             return;
         }
-        let supplied: Vec<Type> =
-            type_args.iter().map(convert_type_ref_lossy).collect();
-        let mut subst: std::collections::HashMap<String, Type> =
-            std::collections::HashMap::new();
+        let supplied: Vec<Type> = type_args.iter().map(convert_type_ref_lossy).collect();
+        let mut subst: std::collections::HashMap<String, Type> = std::collections::HashMap::new();
         for (i, name) in sig.type_param_names.iter().enumerate() {
             if let Some(ty) = supplied.get(i) {
                 subst.insert(name.clone(), ty.clone());
@@ -675,9 +702,8 @@ impl Checker<'_> {
             if bounds.is_empty() {
                 continue;
             }
-            let arg_ty = match supplied.get(i) {
-                Some(t) => t,
-                None => continue,
+            let Some(arg_ty) = supplied.get(i) else {
+                continue;
             };
             for b in bounds {
                 let bound = substitute_type_params(b, &subst);
@@ -723,9 +749,16 @@ impl Checker<'_> {
             } else {
                 None
             };
-            self.current_frame()
-                .bindings
-                .insert(p.name.name.clone(), Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, decl_type_name });
+            self.current_frame().bindings.insert(
+                p.name.name.clone(),
+                Binding {
+                    ty,
+                    mutable: false,
+                    decl_span: Some(p.name.span),
+                    class_name: cn,
+                    decl_type_name,
+                },
+            );
             if let Some(default) = &p.default {
                 let dty = self.check_expr(default, Some(&convert_type_ref_lossy(&p.ty)));
                 self.check_assignable(&dty, &convert_type_ref_lossy(&p.ty), default.span());
@@ -754,73 +787,7 @@ impl Checker<'_> {
             .collect::<std::collections::HashSet<_>>();
         self.type_params_in_scope.push(all_tps);
         if let Some(body) = &f.body {
-            // Build a CFG for the body alongside type checking. The
-            // lowering's side tables (span_to_pos, aliases) feed the
-            // smart-cast read sites once they switch over.
-            let body_block = match body {
-                FunctionBody::Block(b) => b.clone(),
-                FunctionBody::Expr(e) => Block { stmts: vec![Stmt::Expr(e.clone())], span: e.span() },
-            };
-            let mut lowered = klio_cfa::lower::lower_function(&body_block, f.span);
-            klio_cfa::dataflow::infer_kill_data_flow(&mut lowered.cfg);
-            self.cfgs.insert(f.span, lowered.cfg.clone());
-            self.lowerings
-                .insert(f.span, std::rc::Rc::new(lowered));
-            self.cfg_fn_stack.push(f.span);
-            match body {
-                FunctionBody::Block(b) => {
-                    let body_ty = self.check_block(b, Some(&declared_return));
-                    // Block-body functions with a declared non-`Unit` /
-                    // non-`Nothing` return require every path to
-                    // terminate in `return` / `throw` / divergence.
-                    // Defer to the CFG: if the normal-completion block
-                    // is unreachable (the body always throws, calls a
-                    // `Nothing`-returning function such as `error(..)`
-                    // or atomicfu's `loop`, or loops forever) no
-                    // `return` is required — Kotlin's post-control-
-                    // flow rule. `check_block` has now populated the
-                    // expression types the type-aware pass consults.
-                    let normal_exit_reachable = {
-                        let type_map: std::collections::HashMap<(u32, u32), Type> = self
-                            .types
-                            .iter()
-                            .map(|(s, t)| ((s.start, s.end), t.clone()))
-                            .collect();
-                        match self.lowerings.get(&f.span) {
-                            Some(low) => {
-                                let r = klio_cfa::analyses::reachable::analyse_with_types(
-                                    &low.cfg,
-                                    Some(&type_map),
-                                );
-                                low.cfg.exits.is_empty()
-                                    || low.cfg.exits.iter().any(|e| r.is_reachable(*e))
-                            }
-                            None => true,
-                        }
-                    };
-                    if !f.is_abstract
-                        && f.return_type.is_some()
-                        && !matches!(declared_return, Type::Unit | Type::Nothing | Type::Unresolved)
-                        && !matches!(body_ty, Type::Nothing)
-                        && normal_exit_reachable
-                    {
-                        let span = b.stmts.last().map_or(f.name.span, stmt_span);
-                        self.diagnostics.emit(
-                            Diagnostic::error(
-                                "a 'return' expression is required in a function with a block body and a non-`Unit` return type".to_string(),
-                                span,
-                            )
-                            .with_code(codes::TYPE_MISSING_RETURN),
-                        );
-                    }
-                }
-                FunctionBody::Expr(e) => {
-                    let ety = self.check_expr(e, Some(&declared_return));
-                    if f.return_type.is_some() && !matches!(declared_return, Type::Unit) {
-                        self.check_assignable(&ety, &declared_return, e.span());
-                    }
-                }
-            }
+            self.check_function_body(f, body, &declared_return);
         }
         self.fn_return_stack.pop();
         self.label_stack.pop();
@@ -834,6 +801,84 @@ impl Checker<'_> {
         }
     }
 
+    fn check_function_body(&mut self, f: &Function, body: &FunctionBody, declared_return: &Type) {
+        // Build a CFG for the body alongside type checking. The
+        // lowering's side tables (span_to_pos, aliases) feed the
+        // smart-cast read sites once they switch over.
+        let body_block = match body {
+            FunctionBody::Block(b) => b.clone(),
+            FunctionBody::Expr(e) => Block {
+                stmts: vec![Stmt::Expr(e.clone())],
+                span: e.span(),
+            },
+        };
+        let mut lowered = klio_cfa::lower::lower_function(&body_block, f.span);
+        klio_cfa::dataflow::infer_kill_data_flow(&mut lowered.cfg);
+        self.cfgs.insert(f.span, lowered.cfg.clone());
+        self.lowerings.insert(f.span, std::rc::Rc::new(lowered));
+        self.cfg_fn_stack.push(f.span);
+        match body {
+            FunctionBody::Block(b) => {
+                let body_ty = self.check_block(b, Some(declared_return));
+                // Block-body functions with a declared non-`Unit` /
+                // non-`Nothing` return require every path to
+                // terminate in `return` / `throw` / divergence.
+                // Defer to the CFG: if the normal-completion block
+                // is unreachable (the body always throws, calls a
+                // `Nothing`-returning function such as `error(..)`
+                // or atomicfu's `loop`, or loops forever) no
+                // `return` is required — Kotlin's post-control-
+                // flow rule. `check_block` has now populated the
+                // expression types the type-aware pass consults.
+                let normal_exit_reachable = {
+                    let type_map: std::collections::HashMap<(u32, u32), Type> = self
+                        .types
+                        .iter()
+                        .map(|(s, t)| ((s.start, s.end), t.clone()))
+                        .collect();
+                    match self.lowerings.get(&f.span) {
+                        Some(low) => {
+                            let r = klio_cfa::analyses::reachable::analyse_with_types(
+                                &low.cfg,
+                                Some(&type_map),
+                            );
+                            low.cfg.exits.is_empty()
+                                || low.cfg.exits.iter().any(|e| r.is_reachable(*e))
+                        }
+                        None => true,
+                    }
+                };
+                if !f.is_abstract
+                    && f.return_type.is_some()
+                    && !matches!(
+                        declared_return,
+                        Type::Unit | Type::Nothing | Type::Unresolved
+                    )
+                    && !matches!(body_ty, Type::Nothing)
+                    && normal_exit_reachable
+                {
+                    let span = b.stmts.last().map_or(f.name.span, stmt_span);
+                    self.diagnostics.emit(
+                        Diagnostic::error(
+                            "a 'return' expression is required in a function with a block body and a non-`Unit` return type".to_string(),
+                            span,
+                        )
+                        .with_code(codes::TYPE_MISSING_RETURN),
+                    );
+                }
+            }
+            FunctionBody::Expr(e) => {
+                let ety = self.check_expr(e, Some(declared_return));
+                if f.return_type.is_some() && !matches!(declared_return, Type::Unit) {
+                    self.check_assignable(&ety, declared_return, e.span());
+                }
+            }
+        }
+    }
+
+    // Sequential class validation passes share balanced scope-stack
+    // push/pop discipline, so they stay in one function.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn check_class(&mut self, c: &Class) {
         self.class_stack.push(c.name.name.clone());
         // Track class type parameters in the same scope as function type
@@ -847,7 +892,8 @@ impl Checker<'_> {
             .map(|tp| tp.name.name.clone())
             .collect::<std::collections::HashSet<_>>();
         self.type_params_in_scope.push(class_tps);
-        self.reified_type_params.push(std::collections::HashSet::new());
+        self.reified_type_params
+            .push(std::collections::HashSet::new());
         self.check_circular_bounds(&c.type_params, &c.where_bounds);
         // Spec §5.1: data, enum, and annotation classes are always closed
         // and cannot be declared `open`, `abstract`, or `sealed`.
@@ -931,7 +977,11 @@ impl Checker<'_> {
         // Spec §4.1.2: `data class` shape — must have ≥1 property param,
         // and no vararg property param.
         if c.is_data {
-            let n_props = c.primary_params.iter().filter(|p| p.property.is_some()).count();
+            let n_props = c
+                .primary_params
+                .iter()
+                .filter(|p| p.property.is_some())
+                .count();
             if n_props == 0 {
                 self.diagnostics.emit(
                     Diagnostic::error(
@@ -962,7 +1012,11 @@ impl Checker<'_> {
         }
         // Spec §4.1.2: `data class` cannot explicify `copy` or `componentN`.
         if c.is_data {
-            let n_props = c.primary_params.iter().filter(|p| p.property.is_some()).count();
+            let n_props = c
+                .primary_params
+                .iter()
+                .filter(|p| p.property.is_some())
+                .count();
             for m in &c.members {
                 if let Decl::Function(f) = m {
                     let n = f.name.name.as_str();
@@ -980,21 +1034,22 @@ impl Checker<'_> {
                         );
                     } else if let Some(rest) = n.strip_prefix("component")
                         && let Ok(idx) = rest.parse::<usize>()
-                            && idx >= 1 && idx <= n_props && f.params.is_empty() {
-                                self.diagnostics.emit(
-                                    Diagnostic::error(
-                                        format!(
-                                            "`{}` is auto-generated for data class `{}` and cannot \
+                        && idx >= 1
+                        && idx <= n_props
+                        && f.params.is_empty()
+                    {
+                        self.diagnostics.emit(
+                            Diagnostic::error(
+                                format!(
+                                    "`{}` is auto-generated for data class `{}` and cannot \
                                              be explicified",
-                                            n, c.name.name
-                                        ),
-                                        f.name.span,
-                                    )
-                                    .with_code(
-                                        codes::TYPE_DATA_CLASS_FORBIDS_COMPONENT_OVERRIDE,
-                                    ),
-                                );
-                            }
+                                    n, c.name.name
+                                ),
+                                f.name.span,
+                            )
+                            .with_code(codes::TYPE_DATA_CLASS_FORBIDS_COMPONENT_OVERRIDE),
+                        );
+                    }
                 }
             }
         }
@@ -1005,8 +1060,7 @@ impl Checker<'_> {
             for m in &c.members {
                 if let Decl::Function(f) = m {
                     let n = f.name.name.as_str();
-                    if (n == "equals" || n == "hashCode" || n == "compareTo") && f.is_override
-                    {
+                    if (n == "equals" || n == "hashCode" || n == "compareTo") && f.is_override {
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 format!(
@@ -1082,7 +1136,7 @@ impl Checker<'_> {
         // override-walk accepts `override fun invoke(...)`.
         {
             let mut sigs_tmp: HashMap<String, MemberSig> = HashMap::new();
-            self.inject_function_type_supertypes(c, &mut inherited, &mut sigs_tmp);
+            Self::inject_function_type_supertypes(c, &mut inherited, &mut sigs_tmp);
         }
         // A supertype whose declaration is not visible to this
         // type-check unit (e.g. an interface from the embedded stdlib
@@ -1090,10 +1144,10 @@ impl Checker<'_> {
         // declare the overridden member. Don't false-positive
         // "overrides nothing" when such an opaque supertype is
         // present.
-        let has_opaque_supertype = c.supertypes.iter().any(|s| {
-            s.function.is_none()
-                && !self.classes.contains_key(&s.name.name)
-        });
+        let has_opaque_supertype = c
+            .supertypes
+            .iter()
+            .any(|s| s.function.is_none() && !self.classes.contains_key(&s.name.name));
         for m in &c.members {
             let (mname, mspan, mflags) = match m {
                 Decl::Function(f) => (
@@ -1133,7 +1187,8 @@ impl Checker<'_> {
                         // declared there as an implicitly-open interface
                         // member (upstream `Deferred.await`), which this
                         // unit cannot see.
-                        if !(parent_flags.is_open || parent_flags.is_abstract)
+                        if !parent_flags.is_open
+                            && !parent_flags.is_abstract
                             && !has_opaque_supertype
                         {
                             self.diagnostics.emit(
@@ -1163,9 +1218,7 @@ impl Checker<'_> {
                     }
                 }
                 None => {
-                    if mflags.is_override
-                        && !is_builtin_overridable(mname)
-                        && !has_opaque_supertype
+                    if mflags.is_override && !is_builtin_overridable(mname) && !has_opaque_supertype
                     {
                         self.diagnostics.emit(
                             Diagnostic::error(
@@ -1184,7 +1237,7 @@ impl Checker<'_> {
         // with `override`, locate the matching base member by name and
         // verify return-type / property-type / mutability / visibility.
         let mut inherited_sigs = self.collect_inherited_member_sigs(c);
-        self.inject_function_type_supertypes(c, &mut inherited, &mut inherited_sigs);
+        Self::inject_function_type_supertypes(c, &mut inherited, &mut inherited_sigs);
         for m in &c.members {
             match m {
                 Decl::Function(f) if f.is_override => {
@@ -1249,10 +1302,9 @@ impl Checker<'_> {
                         visibility: base_vis,
                     }) = inherited_sigs.get(&p.name.name)
                     {
-                        let derived_ty = p
-                            .ty
-                            .as_ref()
-                            .map_or(Type::Unresolved, convert_type_ref_lossy);
+                        let derived_ty =
+                            p.ty.as_ref()
+                                .map_or(Type::Unresolved, convert_type_ref_lossy);
                         // T0066: mutability cannot strengthen. var base + val
                         // override is forbidden (val is stronger than var).
                         if *base_mut && !p.mutable {
@@ -1319,17 +1371,19 @@ impl Checker<'_> {
                     continue;
                 }
                 if let Some(parent) = self.classes.get(&s.name.name)
-                    && (parent.is_abstract || parent.is_interface) {
-                        for am in &parent.abstract_members {
-                            required.push(am.clone());
-                        }
+                    && (parent.is_abstract || parent.is_interface)
+                {
+                    for am in &parent.abstract_members {
+                        required.push(am.clone());
                     }
+                }
             }
             if !required.is_empty() {
                 let info = self.classes.get(&c.name.name).cloned().unwrap_or_default();
                 let provided: std::collections::HashSet<&String> =
                     info.concrete_members.iter().collect();
-                let missing: Vec<&String> = required.iter().filter(|n| !provided.contains(n)).collect();
+                let missing: Vec<&String> =
+                    required.iter().filter(|n| !provided.contains(n)).collect();
                 if !missing.is_empty() {
                     let names: Vec<String> = missing.iter().map(|s| (*s).clone()).collect();
                     self.diagnostics.emit(
@@ -1434,7 +1488,13 @@ impl Checker<'_> {
             let cn = class_name_from_typeref(&p.ty);
             self.current_frame().bindings.insert(
                 p.name.name.clone(),
-                Binding { ty, mutable: p.property == Some(true), decl_span: Some(p.name.span), class_name: cn, decl_type_name: None },
+                Binding {
+                    ty,
+                    mutable: p.property == Some(true),
+                    decl_span: Some(p.name.span),
+                    class_name: cn,
+                    decl_type_name: None,
+                },
             );
             if let Some(default) = &p.default {
                 let dty = self.check_expr(default, Some(&convert_type_ref_lossy(&p.ty)));
@@ -1463,7 +1523,9 @@ impl Checker<'_> {
                     || c.is_interface
                     || c.is_abstract;
                 if !has_init {
-                    let pty = p.ty.as_ref().map_or(Type::Unresolved, convert_type_ref_lossy);
+                    let pty =
+                        p.ty.as_ref()
+                            .map_or(Type::Unresolved, convert_type_ref_lossy);
                     self.current_frame().bindings.insert(
                         p.name.name.clone(),
                         Binding {
@@ -1471,11 +1533,16 @@ impl Checker<'_> {
                             mutable: p.mutable,
                             decl_span: Some(p.name.span),
                             class_name: p.ty.as_ref().and_then(class_name_from_typeref),
-                            
-                decl_type_name: None,
+
+                            decl_type_name: None,
                         },
                     );
-                    uninitialized_properties.push((p.name.name.clone(), p.name.span, p.mutable, p.name.span));
+                    uninitialized_properties.push((
+                        p.name.name.clone(),
+                        p.name.span,
+                        p.mutable,
+                        p.name.span,
+                    ));
                 }
                 let () = self.handle_accessors(p);
             }
@@ -1484,7 +1551,9 @@ impl Checker<'_> {
         // entry — target must be an interface, delegate expression must be
         // a subtype of the named interface.
         for (i, s) in c.supertypes.iter().enumerate() {
-            let Some(Some(delegate_expr)) = c.supertype_delegates.get(i) else { continue };
+            let Some(Some(delegate_expr)) = c.supertype_delegates.get(i) else {
+                continue;
+            };
             let target_name = &s.name.name;
             let target_is_interface = self
                 .classes
@@ -1505,8 +1574,10 @@ impl Checker<'_> {
             let delegate_class = self.expr_class.get(&delegate_expr.span()).cloned();
             if target_is_interface
                 && let Some(dcn) = delegate_class
-                    && &dcn != target_name && !self.is_subtype_of(&dcn, target_name) {
-                        self.diagnostics.emit(
+                && &dcn != target_name
+                && !self.is_subtype_of(&dcn, target_name)
+            {
+                self.diagnostics.emit(
                             Diagnostic::error(
                                 format!(
                                     "Delegate expression of type `{dcn}` is not a subtype of `{target_name}`"
@@ -1515,7 +1586,7 @@ impl Checker<'_> {
                             )
                             .with_code(codes::TYPE_DELEGATION_TYPE_MISMATCH),
                         );
-                    }
+            }
         }
         // Build the synthetic class-init CFG before walking the
         // init blocks so check_block can consult it for
@@ -1551,11 +1622,8 @@ impl Checker<'_> {
                     .unwrap_or(true);
                 if cfg_says_unassigned {
                     self.diagnostics.emit(
-                        Diagnostic::error(
-                            format!("Property `{name}` must be initialized"),
-                            *span,
-                        )
-                        .with_code(codes::TYPE_VAR_NOT_DEFINITELY_ASSIGNED),
+                        Diagnostic::error(format!("Property `{name}` must be initialized"), *span)
+                            .with_code(codes::TYPE_VAR_NOT_DEFINITELY_ASSIGNED),
                     );
                 }
             }
@@ -1644,9 +1712,7 @@ impl Checker<'_> {
         if let Some(modifier) = modifier {
             self.diagnostics.emit(
                 Diagnostic::error(
-                    format!(
-                        "`{name}` cannot be both `private` and `{modifier}`"
-                    ),
+                    format!("`{name}` cannot be both `private` and `{modifier}`"),
                     span,
                 )
                 .with_code(codes::TYPE_PRIVATE_AND_OPEN_OR_ABSTRACT_OR_OVERRIDE),
@@ -1665,7 +1731,9 @@ impl Checker<'_> {
             .is_some_and(|i| i.is_local_or_anonymous);
         for s in supertypes {
             let name = &s.name.name;
-            let Some(parent) = self.classes.get(name) else { continue };
+            let Some(parent) = self.classes.get(name) else {
+                continue;
+            };
             if parent.is_sealed && derived_local {
                 self.diagnostics.emit(
                     Diagnostic::error(
@@ -1718,13 +1786,14 @@ impl Checker<'_> {
     /// may name a Throwable supertype and a stricter check would require
     /// bound tracking we don't yet wire through `check_expr`.
     pub(crate) fn type_is_throwable_subtype(&self, ty: &Type) -> bool {
+        // The `Nullable` arm is kept explicit to document that a nullable
+        // type is never a throwable subtype, even though it shares `_`'s body.
+        #[allow(clippy::match_same_arms)]
         match ty {
             Type::Nothing | Type::Unresolved | Type::TypeParam(_) => true,
             Type::Nullable(_) => false,
             Type::Generic { name, .. } => self.name_is_throwable_subtype(name),
-            Type::Intersection(parts) => {
-                parts.iter().any(|p| self.type_is_throwable_subtype(p))
-            }
+            Type::Intersection(parts) => parts.iter().any(|p| self.type_is_throwable_subtype(p)),
             _ => false,
         }
     }
@@ -1790,8 +1859,7 @@ impl Checker<'_> {
             "UninitializedPropertyAccessException",
         ];
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut stack: Vec<String> =
-            c.supertypes.iter().map(|s| s.name.name.clone()).collect();
+        let mut stack: Vec<String> = c.supertypes.iter().map(|s| s.name.name.clone()).collect();
         while let Some(name) = stack.pop() {
             if !seen.insert(name.clone()) {
                 continue;
@@ -1812,35 +1880,31 @@ impl Checker<'_> {
     /// `class C : () -> Int { override fun invoke(): Int = ... }` resolves
     /// correctly. Spec §5.1.3: function types are treated as interfaces.
     pub(crate) fn inject_function_type_supertypes(
-        &self,
         c: &Class,
         flags: &mut HashMap<String, MemberFlags>,
         sigs: &mut HashMap<String, MemberSig>,
     ) {
         for s in &c.supertypes {
-            let Some(fnref) = s.function.as_ref() else { continue };
-            flags
-                .entry("invoke".to_string())
-                .or_insert(MemberFlags {
-                    is_open: true,
-                    is_override: false,
-                    is_abstract: true,
-                    is_operator: true,
-                    is_infix: false,
-                    has_default_body: false,
-                });
-            let param_types: Vec<Type> = fnref
-                .params
-                .iter()
-                .map(convert_type_ref_lossy)
-                .collect();
-            let return_ty = convert_type_ref_lossy(&fnref.ret);
-            sigs.entry("invoke".to_string()).or_insert(MemberSig::Function {
-                param_types,
-                return_ty,
-                visibility: Visibility::Public,
-                is_suspend: fnref.is_suspend,
+            let Some(fnref) = s.function.as_ref() else {
+                continue;
+            };
+            flags.entry("invoke".to_string()).or_insert(MemberFlags {
+                is_open: true,
+                is_override: false,
+                is_abstract: true,
+                is_operator: true,
+                is_infix: false,
+                has_default_body: false,
             });
+            let param_types: Vec<Type> = fnref.params.iter().map(convert_type_ref_lossy).collect();
+            let return_ty = convert_type_ref_lossy(&fnref.ret);
+            sigs.entry("invoke".to_string())
+                .or_insert(MemberSig::Function {
+                    param_types,
+                    return_ty,
+                    visibility: Visibility::Public,
+                    is_suspend: fnref.is_suspend,
+                });
         }
     }
 
@@ -1850,8 +1914,7 @@ impl Checker<'_> {
     /// matching the inheritance-order rule.
     pub(crate) fn collect_inherited_member_sigs(&self, c: &Class) -> HashMap<String, MemberSig> {
         let mut out: HashMap<String, MemberSig> = HashMap::new();
-        let mut frontier: Vec<String> =
-            c.supertypes.iter().map(|s| s.name.name.clone()).collect();
+        let mut frontier: Vec<String> = c.supertypes.iter().map(|s| s.name.name.clone()).collect();
         let mut seen: Vec<String> = vec![c.name.name.clone()];
         let mut steps = 0;
         while let Some(parent_name) = frontier.pop() {
@@ -1863,7 +1926,9 @@ impl Checker<'_> {
                 continue;
             }
             seen.push(parent_name.clone());
-            let Some(parent) = self.classes.get(&parent_name) else { continue };
+            let Some(parent) = self.classes.get(&parent_name) else {
+                continue;
+            };
             for (n, sig) in &parent.member_sigs {
                 out.entry(n.clone()).or_insert_with(|| sig.clone());
             }
@@ -1874,13 +1939,9 @@ impl Checker<'_> {
         out
     }
 
-    pub(crate) fn collect_inherited_member_flags(
-        &self,
-        c: &Class,
-    ) -> HashMap<String, MemberFlags> {
+    pub(crate) fn collect_inherited_member_flags(&self, c: &Class) -> HashMap<String, MemberFlags> {
         let mut out: HashMap<String, MemberFlags> = HashMap::new();
-        let mut frontier: Vec<String> =
-            c.supertypes.iter().map(|s| s.name.name.clone()).collect();
+        let mut frontier: Vec<String> = c.supertypes.iter().map(|s| s.name.name.clone()).collect();
         let mut seen: Vec<String> = vec![c.name.name.clone()];
         let mut steps = 0;
         while let Some(parent_name) = frontier.pop() {
@@ -1892,7 +1953,9 @@ impl Checker<'_> {
                 continue;
             }
             seen.push(parent_name.clone());
-            let Some(parent) = self.classes.get(&parent_name) else { continue };
+            let Some(parent) = self.classes.get(&parent_name) else {
+                continue;
+            };
             for (n, flags) in &parent.member_flags {
                 let mut effective = *flags;
                 // An override member without explicit `final` is itself
@@ -1945,14 +2008,18 @@ impl Checker<'_> {
             _ => None,
         };
         let Some(class_name) = class_name else { return };
-        let Some(info) = self.classes.get(&class_name) else { return };
+        let Some(info) = self.classes.get(&class_name) else {
+            return;
+        };
         let needed: &[&str] = if p.mutable {
             &["getValue", "setValue"]
         } else {
             &["getValue"]
         };
         for member in needed {
-            let Some(flags) = info.member_flags.get(*member) else { continue };
+            let Some(flags) = info.member_flags.get(*member) else {
+                continue;
+            };
             if !flags.is_operator {
                 self.diagnostics.emit(
                     Diagnostic::warning(
@@ -1976,7 +2043,10 @@ impl Checker<'_> {
         if !p.mutable {
             self.diagnostics.emit(
                 Diagnostic::error(
-                    format!("`lateinit` modifier is not allowed on `val` (use `lateinit var` for `{}`)", p.name.name),
+                    format!(
+                        "`lateinit` modifier is not allowed on `val` (use `lateinit var` for `{}`)",
+                        p.name.name
+                    ),
                     p.name.span,
                 )
                 .with_code(codes::TYPE_LATEINIT_VAL),
@@ -1985,7 +2055,10 @@ impl Checker<'_> {
         if let Some(init) = &p.init {
             self.diagnostics.emit(
                 Diagnostic::error(
-                    format!("`lateinit` property `{}` cannot have an initializer", p.name.name),
+                    format!(
+                        "`lateinit` property `{}` cannot have an initializer",
+                        p.name.name
+                    ),
                     init.span(),
                 )
                 .with_code(codes::TYPE_LATEINIT_WITH_INITIALIZER),
@@ -2022,16 +2095,17 @@ impl Checker<'_> {
     /// Enforce that an accessor's explicit return-type annotation matches
     /// the property's declared type.
     pub(crate) fn check_accessor_return_types(&mut self, p: &Property) {
-        let Some(prop_ty_ref) = p.ty.as_ref() else { return };
+        let Some(prop_ty_ref) = p.ty.as_ref() else {
+            return;
+        };
         let prop_ty = convert_type_ref_lossy(prop_ty_ref);
-        for (a, label) in [
-            (p.getter.as_ref(), "getter"),
-            (p.setter.as_ref(), "setter"),
-        ] {
+        for (a, label) in [(p.getter.as_ref(), "getter"), (p.setter.as_ref(), "setter")] {
             let Some(a) = a else { continue };
-            let Some(rt) = a.return_type.as_ref() else { continue };
+            let Some(rt) = a.return_type.as_ref() else {
+                continue;
+            };
             let rty = convert_type_ref_lossy(rt);
-            if !self.types_match_for_accessor(&rty, &prop_ty) {
+            if !Self::types_match_for_accessor(&rty, &prop_ty) {
                 self.diagnostics.emit(
                     Diagnostic::error(
                         format!(
@@ -2047,7 +2121,7 @@ impl Checker<'_> {
         }
     }
 
-    pub(crate) fn types_match_for_accessor(&self, a: &Type, b: &Type) -> bool {
+    pub(crate) fn types_match_for_accessor(a: &Type, b: &Type) -> bool {
         // Skip the check entirely if either side lowered to Unresolved
         // (user types, generics, etc.) to avoid false positives.
         if matches!(a, Type::Unresolved) || matches!(b, Type::Unresolved) {
@@ -2073,7 +2147,9 @@ impl Checker<'_> {
                 continue;
             }
             seen.push(name.clone());
-            let Some(info) = self.classes.get(&name) else { continue };
+            let Some(info) = self.classes.get(&name) else {
+                continue;
+            };
             for s in &info.supertypes {
                 if s == sup {
                     return true;
@@ -2094,8 +2170,7 @@ impl Checker<'_> {
         c: &Class,
     ) -> HashMap<String, Vec<(String, bool)>> {
         let mut out: HashMap<String, Vec<(String, bool)>> = HashMap::new();
-        let mut frontier: Vec<String> =
-            c.supertypes.iter().map(|s| s.name.name.clone()).collect();
+        let mut frontier: Vec<String> = c.supertypes.iter().map(|s| s.name.name.clone()).collect();
         let mut seen: Vec<String> = vec![c.name.name.clone()];
         let mut steps = 0;
         while let Some(parent_name) = frontier.pop() {
@@ -2107,15 +2182,17 @@ impl Checker<'_> {
                 continue;
             }
             seen.push(parent_name.clone());
-            let Some(parent) = self.classes.get(&parent_name) else { continue };
+            let Some(parent) = self.classes.get(&parent_name) else {
+                continue;
+            };
             for (n, flags) in &parent.member_flags {
                 // A supplier is either concrete (has_default_body) or
                 // abstract. Body-less interface methods don't carry an
                 // explicit `abstract` modifier but are abstract slots for
                 // inheritance purposes; the same goes for body-less
                 // interface / abstract-class properties.
-                let is_abstract_slot = flags.is_abstract
-                    || (parent.is_interface && !flags.has_default_body);
+                let is_abstract_slot =
+                    flags.is_abstract || (parent.is_interface && !flags.has_default_body);
                 if flags.has_default_body || is_abstract_slot {
                     let entry = out.entry(n.clone()).or_default();
                     if !entry.iter().any(|(s, _)| s == &parent_name) {
@@ -2135,7 +2212,13 @@ impl Checker<'_> {
         for p in &a.params {
             self.current_frame().bindings.insert(
                 p.name.clone(),
-                Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(p.span), class_name: None, decl_type_name: None },
+                Binding {
+                    ty: Type::Unresolved,
+                    mutable: false,
+                    decl_span: Some(p.span),
+                    class_name: None,
+                    decl_type_name: None,
+                },
             );
         }
         match &a.body {
@@ -2156,7 +2239,13 @@ impl Checker<'_> {
             let cn = class_name_from_typeref(&p.ty);
             self.current_frame().bindings.insert(
                 p.name.name.clone(),
-                Binding { ty, mutable: false, decl_span: Some(p.name.span), class_name: cn, decl_type_name: None },
+                Binding {
+                    ty,
+                    mutable: false,
+                    decl_span: Some(p.name.span),
+                    class_name: cn,
+                    decl_type_name: None,
+                },
             );
         }
         match &sc.delegation {

@@ -2,8 +2,8 @@
 //! against a `SourceMap`; choose the renderer that matches your downstream
 //! consumer (terminal, JSON-consuming tooling, SARIF aggregator).
 
-pub mod plain;
 pub mod json;
+pub mod plain;
 pub mod sarif;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,14 +13,15 @@ pub enum Format {
     Sarif,
 }
 
-impl Format {
-    #[must_use] 
-    pub fn from_str(s: &str) -> Option<Self> {
-        Some(match s {
+impl std::str::FromStr for Format {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "plain" => Self::Plain,
             "json" => Self::Json,
             "sarif" => Self::Sarif,
-            _ => return None,
+            _ => return Err(()),
         })
     }
 }

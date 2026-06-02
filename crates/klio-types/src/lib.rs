@@ -15,7 +15,9 @@ use thiserror::Error;
 pub mod constraints;
 
 /// Variance marker on a generic instantiation argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum Variance {
     #[default]
     Invariant,
@@ -117,7 +119,11 @@ impl fmt::Display for Type {
             Self::Any => f.write_str("Any"),
             Self::Nothing => f.write_str("Nothing"),
             Self::Nullable(inner) => write!(f, "{inner}?"),
-            Self::Function { params, return_type, is_suspend } => {
+            Self::Function {
+                params,
+                return_type,
+                is_suspend,
+            } => {
                 if *is_suspend {
                     f.write_str("suspend ")?;
                 }
@@ -198,6 +204,11 @@ impl Type {
     /// supertype is already present. A single-component result collapses
     /// to that component; an empty intersection collapses to `Any` (the
     /// degenerate identity element).
+    ///
+    /// # Panics
+    ///
+    /// Does not panic: the single-component case is only reached when
+    /// `keep` holds exactly one element.
     #[must_use]
     pub fn intersect(parts: Vec<Type>) -> Type {
         let mut flat: Vec<Type> = Vec::with_capacity(parts.len());
@@ -268,8 +279,16 @@ impl Type {
             (Self::Nullable(_), _) => false,
             (_, Self::Any) => !self.is_nullable(),
             (
-                Self::Function { params: lp, return_type: lr, is_suspend: ls },
-                Self::Function { params: rp, return_type: rr, is_suspend: rs },
+                Self::Function {
+                    params: lp,
+                    return_type: lr,
+                    is_suspend: ls,
+                },
+                Self::Function {
+                    params: rp,
+                    return_type: rr,
+                    is_suspend: rs,
+                },
             ) => {
                 // Spec §18.1: suspending and non-suspending function
                 // types are distinct; neither is a subtype of the
@@ -378,13 +397,8 @@ pub fn convert_type_ref_lossy(t: &TypeRef) -> Type {
         Some(ty) => ty,
         None => Type::Unresolved,
     };
-    if t.nullable {
-        base.as_nullable()
-    } else {
-        base
-    }
+    if t.nullable { base.as_nullable() } else { base }
 }
-
 
 /// Unify two concrete types. With no generics, unification is structural
 /// equality with `Unresolved` acting as a wildcard.
@@ -399,18 +413,33 @@ pub fn unify(lhs: &Type, rhs: &Type) -> Result<Type, TypeError> {
         (a, b) if a == b => Ok(a.clone()),
         (Type::Nullable(a), Type::Nullable(b)) => Ok(Type::Nullable(Box::new(unify(a, b)?))),
         (
-            Type::Function { params: lp, return_type: lr, is_suspend: ls },
-            Type::Function { params: rp, return_type: rr, is_suspend: rs },
+            Type::Function {
+                params: lp,
+                return_type: lr,
+                is_suspend: ls,
+            },
+            Type::Function {
+                params: rp,
+                return_type: rr,
+                is_suspend: rs,
+            },
         ) if lp.len() == rp.len() && ls == rs => {
             let mut params = Vec::with_capacity(lp.len());
             for (a, b) in lp.iter().zip(rp.iter()) {
                 params.push(unify(a, b)?);
             }
             let return_type = Box::new(unify(lr, rr)?);
-            Ok(Type::Function { params, return_type, is_suspend: *ls })
+            Ok(Type::Function {
+                params,
+                return_type,
+                is_suspend: *ls,
+            })
         }
         (Type::Range(a), Type::Range(b)) => Ok(Type::Range(Box::new(unify(a, b)?))),
-        (a, b) => Err(TypeError::Mismatch { lhs: a.clone(), rhs: b.clone() }),
+        (a, b) => Err(TypeError::Mismatch {
+            lhs: a.clone(),
+            rhs: b.clone(),
+        }),
     }
 }
 
@@ -420,8 +449,13 @@ mod tests {
     use klio_ast::Ident;
     use klio_span::{FileId, Span};
 
+    // Test names are short literals, so the span length always fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
     fn ident(name: &str) -> Ident {
-        Ident { name: name.into(), span: Span::new(FileId(0), 0, name.len() as u32) }
+        Ident {
+            name: name.into(),
+            span: Span::new(FileId(0), 0, name.len() as u32),
+        }
     }
 
     fn type_ref(name: &str, nullable: bool) -> TypeRef {
@@ -505,8 +539,9 @@ mod tests {
         assert!(Type::Int.is_subtype_of(&Type::Any));
         assert!(Type::String.is_subtype_of(&Type::Any));
         assert!(!Type::Nullable(Box::new(Type::Int)).is_subtype_of(&Type::Any));
-        assert!(Type::Nullable(Box::new(Type::Int))
-            .is_subtype_of(&Type::Nullable(Box::new(Type::Any))));
+        assert!(
+            Type::Nullable(Box::new(Type::Int)).is_subtype_of(&Type::Nullable(Box::new(Type::Any)))
+        );
     }
 
     #[test]
@@ -603,7 +638,10 @@ mod tests {
 
     #[test]
     fn convert_type_ref_lossy_falls_back_to_unresolved() {
-        assert_eq!(convert_type_ref_lossy(&type_ref("Widget", false)), Type::Unresolved);
+        assert_eq!(
+            convert_type_ref_lossy(&type_ref("Widget", false)),
+            Type::Unresolved
+        );
         assert_eq!(
             convert_type_ref_lossy(&type_ref("Int", true)),
             Type::Nullable(Box::new(Type::Int))

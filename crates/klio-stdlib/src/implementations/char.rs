@@ -1,4 +1,4 @@
-use super::{Value, RuntimeError, char, CallCtx, Arc, char_unit_to_string, make_exception};
+use super::{Arc, CallCtx, RuntimeError, Value, char, char_unit_to_string, make_exception};
 
 // ============================================================
 // Char members
@@ -25,16 +25,21 @@ pub(crate) fn char_code(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::new_int(u32::from(recv_char(ctx.args, "Char.code")?)))
 }
 
-pub(crate) fn internal_get_progression_last_element(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+fn imod(a: i64, b: i64) -> i64 {
+    let m = a.rem_euclid(b);
+    if m >= 0 { m } else { m + b }
+}
+
+// Result narrows back to a Kotlin Int when the progression was Int-typed.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn internal_get_progression_last_element(
+    ctx: &mut CallCtx,
+) -> Result<Value, RuntimeError> {
     let args = ctx.args;
     if args.len() != 3 {
         return Err(RuntimeError::Type(
             "getProgressionLastElement expects (start, end, step)".into(),
         ));
-    }
-    fn imod(a: i64, b: i64) -> i64 {
-        let m = a.rem_euclid(b);
-        if m >= 0 { m } else { m + b }
     }
     let (start, end, step, is_long) = match (&args[0], &args[1], &args[2]) {
         (Value::Long(s), Value::Long(e), Value::Long(p)) => (*s, *e, *p, true),
@@ -47,23 +52,27 @@ pub(crate) fn internal_get_progression_last_element(ctx: &mut CallCtx) -> Result
             ));
         }
     };
-    let last = if step > 0 {
-        if start >= end {
-            end
-        } else {
-            let diff = imod(imod(end, step) - imod(start, step), step);
-            end - diff
+    let last = match step.cmp(&0) {
+        std::cmp::Ordering::Greater => {
+            if start >= end {
+                end
+            } else {
+                let diff = imod(imod(end, step) - imod(start, step), step);
+                end - diff
+            }
         }
-    } else if step < 0 {
-        if start <= end {
-            end
-        } else {
-            let neg = -step;
-            let diff = imod(imod(start, neg) - imod(end, neg), neg);
-            end + diff
+        std::cmp::Ordering::Less => {
+            if start <= end {
+                end
+            } else {
+                let neg = -step;
+                let diff = imod(imod(start, neg) - imod(end, neg), neg);
+                end + diff
+            }
         }
-    } else {
-        return Err(RuntimeError::Type("Step is zero.".into()));
+        std::cmp::Ordering::Equal => {
+            return Err(RuntimeError::Type("Step is zero.".into()));
+        }
     };
     if is_long {
         Ok(Value::Long(last))
@@ -79,7 +88,11 @@ pub(crate) fn kt_is_letter(c: char) -> bool {
     use unicode_general_category::GeneralCategory as G;
     matches!(
         unicode_general_category::get_general_category(c),
-        G::UppercaseLetter | G::LowercaseLetter | G::TitlecaseLetter | G::ModifierLetter | G::OtherLetter
+        G::UppercaseLetter
+            | G::LowercaseLetter
+            | G::TitlecaseLetter
+            | G::ModifierLetter
+            | G::OtherLetter
     )
 }
 
@@ -116,11 +129,26 @@ pub(crate) fn is_other_uppercase(code: u32) -> bool {
 // Other_Lowercase contributory property (Unicode 15.x snapshot used by kotlinc-native 2.3.21).
 pub(crate) fn is_other_lowercase(code: u32) -> bool {
     const RANGES: &[(u32, u32)] = &[
-        (0x00AA, 0x00AA), (0x00BA, 0x00BA), (0x02B0, 0x02B8), (0x02C0, 0x02C1),
-        (0x02E0, 0x02E4), (0x0345, 0x0345), (0x037A, 0x037A), (0x1D2C, 0x1D6A),
-        (0x1D78, 0x1D78), (0x1D9B, 0x1DBF), (0x2071, 0x2071), (0x207F, 0x207F),
-        (0x2090, 0x209C), (0x2170, 0x217F), (0x24D0, 0x24E9), (0x2C7C, 0x2C7D),
-        (0xA69C, 0xA69D), (0xA770, 0xA770), (0xA7F8, 0xA7F9), (0xAB5C, 0xAB5F),
+        (0x00AA, 0x00AA),
+        (0x00BA, 0x00BA),
+        (0x02B0, 0x02B8),
+        (0x02C0, 0x02C1),
+        (0x02E0, 0x02E4),
+        (0x0345, 0x0345),
+        (0x037A, 0x037A),
+        (0x1D2C, 0x1D6A),
+        (0x1D78, 0x1D78),
+        (0x1D9B, 0x1DBF),
+        (0x2071, 0x2071),
+        (0x207F, 0x207F),
+        (0x2090, 0x209C),
+        (0x2170, 0x217F),
+        (0x24D0, 0x24E9),
+        (0x2C7C, 0x2C7D),
+        (0xA69C, 0xA69D),
+        (0xA770, 0xA770),
+        (0xA7F8, 0xA7F9),
+        (0xAB5C, 0xAB5F),
     ];
     RANGES.iter().any(|&(lo, hi)| code >= lo && code <= hi)
 }
@@ -147,7 +175,9 @@ pub(crate) fn char_is_letter(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 pub(crate) fn char_is_letter_or_digit(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = char_unit_to_scalar(recv_char(ctx.args, "Char.isLetterOrDigit")?);
-    Ok(Value::Bool(s.is_some_and(|c| kt_is_letter(c) || kt_is_digit(c))))
+    Ok(Value::Bool(
+        s.is_some_and(|c| kt_is_letter(c) || kt_is_digit(c)),
+    ))
 }
 pub(crate) fn char_is_whitespace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = char_unit_to_scalar(recv_char(ctx.args, "Char.isWhitespace")?);
@@ -176,11 +206,16 @@ pub(crate) fn char_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     }
 }
 pub(crate) fn char_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::String(Arc::new(char_unit_to_string(recv_char(ctx.args, "Char.toString")?))))
+    Ok(Value::String(Arc::new(char_unit_to_string(recv_char(
+        ctx.args,
+        "Char.toString",
+    )?))))
 }
 /// The radix argument of `digitToInt(radix)` / `digitToIntOrNull(radix)`,
 /// validated to Kotlin's 2..36 range (default 10). Returns the radix or an
 /// `IllegalArgumentException`.
+// `radix` is already validated to 2..=36, so the narrowing cast is exact.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn char_digit_radix(args: &[Value]) -> Result<u32, RuntimeError> {
     let radix = args.get(1).and_then(Value::as_i64).unwrap_or(10);
     if !(2..=36).contains(&radix) {
@@ -230,11 +265,7 @@ pub(crate) fn char_is_surrogate(ctx: &mut CallCtx) -> Result<Value, RuntimeError
 /// `uppercase()` yields "SS").
 pub(crate) fn single_case_char(c: char, mut mapping: impl Iterator<Item = char>) -> char {
     let first = mapping.next().unwrap_or(c);
-    if mapping.next().is_some() {
-        c
-    } else {
-        first
-    }
+    if mapping.next().is_some() { c } else { first }
 }
 pub(crate) fn char_uppercase_char(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let unit = recv_char(ctx.args, "Char.uppercaseChar")?;
@@ -283,4 +314,3 @@ pub(crate) fn char_titlecase_char(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
         None => unit,
     }))
 }
-

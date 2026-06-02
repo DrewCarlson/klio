@@ -1,4 +1,4 @@
-use super::{Parser, FileId, Token, TokenKind, DiagnosticSink, Span, Diagnostic, Ident, Keyword};
+use super::{Diagnostic, DiagnosticSink, FileId, Ident, Keyword, Parser, Span, Token, TokenKind};
 
 impl<'src, 'tok> Parser<'src, 'tok> {
     #[must_use]
@@ -143,7 +143,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     }
 
     pub(crate) fn error(&mut self, code: &'static str, msg: impl Into<String>, span: Span) {
-        self.diagnostics.emit(Diagnostic::error(msg, span).with_code(code));
+        self.diagnostics
+            .emit(Diagnostic::error(msg, span).with_code(code));
     }
 
     pub(crate) fn expect(&mut self, kind: &TokenKind, what: &str) -> Option<Token> {
@@ -163,7 +164,10 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         self.skip_nl();
         if matches!(self.peek_kind(), TokenKind::Ident) {
             let tok = self.bump();
-            Some(Ident { name: self.ident_name(tok.span), span: tok.span })
+            Some(Ident {
+                name: self.ident_name(tok.span),
+                span: tok.span,
+            })
         } else {
             let span = self.current_span();
             self.error("E0003", format!("expected {what}"), span);
@@ -176,9 +180,17 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     pub(crate) fn recover_to_top_level(&mut self) {
         while !matches!(
             self.peek_kind(),
-            TokenKind::Eof |
-TokenKind::Keyword(Keyword::Fun | Keyword::Val | Keyword::Var | Keyword::Class
-| Keyword::Object | Keyword::Interface | Keyword::Package | Keyword::Import)
+            TokenKind::Eof
+                | TokenKind::Keyword(
+                    Keyword::Fun
+                        | Keyword::Val
+                        | Keyword::Var
+                        | Keyword::Class
+                        | Keyword::Object
+                        | Keyword::Interface
+                        | Keyword::Package
+                        | Keyword::Import
+                )
         ) {
             self.bump();
         }
@@ -187,10 +199,7 @@ TokenKind::Keyword(Keyword::Fun | Keyword::Val | Keyword::Var | Keyword::Class
     pub(crate) fn recover_to_stmt_end(&mut self) {
         while !matches!(
             self.peek_kind(),
-            TokenKind::Newline
-                | TokenKind::Semicolon
-                | TokenKind::RBrace
-                | TokenKind::Eof
+            TokenKind::Newline | TokenKind::Semicolon | TokenKind::RBrace | TokenKind::Eof
         ) {
             self.bump();
         }
@@ -224,10 +233,12 @@ TokenKind::Keyword(Keyword::Fun | Keyword::Val | Keyword::Var | Keyword::Class
             return false;
         }
         let mut i = self.pos;
-        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+        while matches!(
+            self.tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Newline)
+        ) {
             i += 1;
         }
         self.tokens.get(i).map(|t| &t.kind) == Some(kind)
     }
-
 }

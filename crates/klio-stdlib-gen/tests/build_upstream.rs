@@ -18,17 +18,31 @@ fn mines_upstream_stdlib() {
     let root = workspace_root();
     let stdlib = root.join("kotlin/libraries/stdlib");
     if !stdlib.is_dir() {
-        eprintln!("skipping: upstream kotlin checkout missing at {}", stdlib.display());
+        eprintln!(
+            "skipping: upstream kotlin checkout missing at {}",
+            stdlib.display()
+        );
         return;
     }
     let (files, stats) = collect_decls(&stdlib);
-    assert!(stats.files_parsed > 100, "expected to parse many files, got {}", stats.files_parsed);
-    assert!(stats.total_decls > 500, "expected > 500 decls, got {}", stats.total_decls);
+    assert!(
+        stats.files_parsed > 100,
+        "expected to parse many files, got {}",
+        stats.files_parsed
+    );
+    assert!(
+        stats.total_decls > 500,
+        "expected > 500 decls, got {}",
+        stats.total_decls
+    );
 
     let tmp = env::temp_dir().join("klio-stdlib-gen-test");
     let _ = std::fs::remove_dir_all(&tmp);
     let written = emit_generated(&tmp, &files).expect("emit failed");
-    assert!(written > 500, "expected > 500 symbols written, got {written}");
+    assert!(
+        written > 500,
+        "expected > 500 symbols written, got {written}"
+    );
 
     // The generated artefact is now a postcard byte stream. Round-trip
     // it through klio_pack::schema to verify the encoded shape matches

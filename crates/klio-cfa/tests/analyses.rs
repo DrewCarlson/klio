@@ -32,6 +32,8 @@ fn parse_lower(src: &str) -> klio_cfa::Cfg {
 }
 
 #[test]
+// block count fits in u32
+#[allow(clippy::cast_possible_truncation)]
 fn via_marks_declared_var_unassigned_then_assigned() {
     let cfg = parse_lower(
         "fun main() {
@@ -86,9 +88,10 @@ fn reachability_after_return_is_dead() {
     // The block holding `val y = 2` must end up unreachable.
     let mut found_dead = false;
     for blk in &cfg.blocks {
-        let has_y = blk.nodes.iter().any(|n| {
-            matches!(n, klio_cfa::Node::DeclLocal { place, .. } if place.0 == "y")
-        });
+        let has_y = blk
+            .nodes
+            .iter()
+            .any(|n| matches!(n, klio_cfa::Node::DeclLocal { place, .. } if place.0 == "y"));
         if has_y {
             found_dead = !r.is_reachable(blk.id);
         }
@@ -115,5 +118,8 @@ fn finally_pruning_is_a_noop_on_normal_finally() {
         }",
     );
     let pruned = finally::prune_divergent_finally(&mut cfg);
-    assert_eq!(pruned, 0, "finally with no divergent terminator should not prune");
+    assert_eq!(
+        pruned, 0,
+        "finally with no divergent terminator should not prune"
+    );
 }

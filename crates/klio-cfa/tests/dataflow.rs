@@ -51,9 +51,10 @@ fn parse_lower(src: &str) -> klio_cfa::Cfg {
         .unwrap();
     let body = match func.body.as_ref().unwrap() {
         klio_ast::FunctionBody::Block(b) => b.clone(),
-        klio_ast::FunctionBody::Expr(e) => {
-            klio_ast::Block { stmts: vec![klio_ast::Stmt::Expr(e.clone())], span: e.span() }
-        }
+        klio_ast::FunctionBody::Expr(e) => klio_ast::Block {
+            stmts: vec![klio_ast::Stmt::Expr(e.clone())],
+            span: e.span(),
+        },
     };
     lower_function(&body, func.span).cfg
 }

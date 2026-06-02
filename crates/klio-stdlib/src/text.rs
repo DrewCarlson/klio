@@ -17,7 +17,7 @@ pub fn compare_utf16(a: &str, b: &str) -> Ordering {
     loop {
         match (ai.next(), bi.next()) {
             (Some(x), Some(y)) => match x.cmp(&y) {
-                Ordering::Equal => continue,
+                Ordering::Equal => {}
                 non_eq => return non_eq,
             },
             (Some(_), None) => return Ordering::Greater,

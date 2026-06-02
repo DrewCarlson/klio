@@ -50,7 +50,7 @@ pub struct UnassignedRead {
 /// Per-block in-state at fixpoint.
 pub type ViaBlockStates = Vec<ViaLattice>;
 
-#[must_use] 
+#[must_use]
 pub fn solve_via(cfg: &Cfg) -> ViaBlockStates {
     let mut entry: ViaLattice = MapLattice::new();
     // Function parameters land as "assigned" before we enter the
@@ -63,7 +63,7 @@ pub fn solve_via(cfg: &Cfg) -> ViaBlockStates {
 /// Returns the in-state at every node in `block` by re-running the
 /// transfer from the block's start. Useful for a downstream
 /// "check at this AST span" query without a full per-node array.
-#[must_use] 
+#[must_use]
 pub fn states_within_block(cfg: &Cfg, block: BlockId, entry: ViaLattice) -> Vec<ViaLattice> {
     let mut out: Vec<ViaLattice> = Vec::with_capacity(cfg.block(block).nodes.len() + 1);
     let mut s = entry;
@@ -83,7 +83,7 @@ pub fn states_within_block(cfg: &Cfg, block: BlockId, entry: ViaLattice) -> Vec<
 /// can query "is this place assigned at this span?" by
 /// indexing the state map with the place at the eval's preceding
 /// program point.
-#[must_use] 
+#[must_use]
 pub fn place_state_at_block_entry(
     states: &ViaBlockStates,
     block: BlockId,
@@ -96,13 +96,17 @@ pub fn place_state_at_block_entry(
 /// (i.e. "assigned on some paths, not all") at any block entry.
 /// These are candidates for a "variable might be uninitialised"
 /// diagnostic.
-#[must_use] 
+#[must_use]
+// block count fits in u32
+#[allow(clippy::cast_possible_truncation)]
 pub fn maybe_unassigned_places(states: &ViaBlockStates) -> BTreeMap<Place, Vec<BlockId>> {
     let mut out: BTreeMap<Place, Vec<BlockId>> = BTreeMap::new();
     for (i, st) in states.iter().enumerate() {
         for (place, flat) in &st.map {
             if matches!(flat, Flat::Top | Flat::Value(AssignState::Unassigned)) {
-                out.entry(place.clone()).or_default().push(BlockId(i as u32));
+                out.entry(place.clone())
+                    .or_default()
+                    .push(BlockId(i as u32));
             }
         }
     }

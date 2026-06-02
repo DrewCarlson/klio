@@ -154,11 +154,7 @@ fun main() {
     // First install: state="active" -> branch sets state="claimed:X" and returns "ok:X".
     // Second install: state="claimed:X" -> arm "claimed:$handler" is "claimed:Y" (handler="Y")
     //   which does NOT equal "claimed:X" -> falls to `else` -> "other:Y".
-    assert_klio(
-        "member_invoked_inline_ext_capture",
-        src,
-        "ok:X|other:Y\n",
-    );
+    assert_klio("member_invoked_inline_ext_capture", src, "ok:X|other:Y\n");
 }
 
 // 6. Multiple inline frames live simultaneously: outer inline fn

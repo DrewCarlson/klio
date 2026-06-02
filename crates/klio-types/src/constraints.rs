@@ -26,14 +26,12 @@ pub struct InferenceVar(pub u32);
 /// Pull-up (largest, LUB of lower bounds) or push-down (smallest, GLB of
 /// upper bounds) preference attached to an inference variable. Spec
 /// §13.2.2. Variables default to pull-up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SolutionPreference {
     #[default]
     PullUp,
     PushDown,
 }
-
 
 /// A variable that cannot be fixed in the active stage because its
 /// resolution depends on something else (a lambda body that has not
@@ -88,7 +86,7 @@ impl BoundSet {
 
     /// `true` once the postponed gating has been cleared and this
     /// variable is eligible for fixation in the next stage.
-    #[must_use] 
+    #[must_use]
     pub fn is_postponed(&self) -> bool {
         self.postponed.is_some()
     }
@@ -250,7 +248,7 @@ impl ConstraintSystem {
     }
 
     /// Returns the postponed kind for `v`, if any.
-    #[must_use] 
+    #[must_use]
     pub fn postponed_kind(&self, v: InferenceVar) -> Option<&PostponedKind> {
         self.bounds.get(&v).and_then(|b| b.postponed.as_ref())
     }
@@ -269,7 +267,12 @@ impl ConstraintSystem {
     /// point preserved for callers that don't yet have a source span
     /// to attribute the failure to.
     pub fn add_constraint(&mut self, lhs: Type, rhs: Type) {
-        self.add_constraint_with(lhs, rhs, ConstraintKind::Subtype, Provenance::Derived("legacy"));
+        self.add_constraint_with(
+            lhs,
+            rhs,
+            ConstraintKind::Subtype,
+            Provenance::Derived("legacy"),
+        );
     }
 
     /// Equality constraint. Records `S ≡ T` and reduces to `S <: T`
@@ -302,7 +305,12 @@ impl ConstraintSystem {
         if self.seen.contains(&key) {
             return;
         }
-        self.pending.push(Constraint { lhs, rhs, kind, provenance });
+        self.pending.push(Constraint {
+            lhs,
+            rhs,
+            kind,
+            provenance,
+        });
     }
 
     /// Look up an interned id for `t`, allocating a fresh one if
@@ -356,14 +364,14 @@ impl ConstraintSystem {
     /// Returns the canonical representative of an inference variable's
     /// equivalence class. Callers use this to rewrite bounds through
     /// the union-find before consulting them.
-    #[must_use] 
+    #[must_use]
     pub fn canonical(&self, v: InferenceVar) -> InferenceVar {
         self.find_root(v)
     }
 
     /// The last unsatisfied constraint together with its provenance,
     /// for diagnostics. Resets when the caller clears it.
-    #[must_use] 
+    #[must_use]
     pub fn last_error(&self) -> Option<&(InferenceError, Provenance)> {
         self.last_error.as_ref()
     }
@@ -383,6 +391,9 @@ impl ConstraintSystem {
         Ok(())
     }
 
+    // Single dispatch match over resolved type pairs; kept whole so the
+    // reduction arms stay together.
+    #[allow(clippy::too_many_lines)]
     fn reduce_one(
         &mut self,
         lhs: Type,
@@ -414,12 +425,7 @@ impl ConstraintSystem {
             // types are compatible; the second arm carries the
             // nullability-compatible case.
             (Type::Nullable(a), Type::Nullable(b)) => {
-                self.add_constraint_with(
-                    (**a).clone(),
-                    (**b).clone(),
-                    kind,
-                    provenance.clone(),
-                );
+                self.add_constraint_with((**a).clone(), (**b).clone(), kind, provenance.clone());
                 self.add_constraint_with(
                     a.non_null().clone(),
                     (**b).clone(),
@@ -431,7 +437,10 @@ impl ConstraintSystem {
             // Nullable lhs into a non-nullable resolved rhs is a hard
             // fail.
             (Type::Nullable(_), _) if !rhs.is_nullable() => {
-                Err(InferenceError::NullableIntoNonNullable { lhs: lhs.clone(), rhs: rhs.clone() })
+                Err(InferenceError::NullableIntoNonNullable {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                })
             }
             // Intersection on the right: reduce per-component.
             (_, Type::Intersection(parts)) => {
@@ -447,7 +456,10 @@ impl ConstraintSystem {
                 if parts.iter().any(|p| p.is_subtype_of(&rhs)) {
                     Ok(())
                 } else {
-                    Err(InferenceError::UnsatisfiableConcrete { lhs: lhs.clone(), rhs: rhs.clone() })
+                    Err(InferenceError::UnsatisfiableConcrete {
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                    })
                 }
             }
             // Function on both sides: decompose structurally so an
@@ -456,8 +468,16 @@ impl ConstraintSystem {
             // type covariant. A non-suspend function satisfies a
             // `suspend` expectation but not the reverse.
             (
-                Type::Function { params: lp, return_type: lr, is_suspend: ls },
-                Type::Function { params: rp, return_type: rr, is_suspend: rs },
+                Type::Function {
+                    params: lp,
+                    return_type: lr,
+                    is_suspend: ls,
+                },
+                Type::Function {
+                    params: rp,
+                    return_type: rr,
+                    is_suspend: rs,
+                },
             ) if lp.len() == rp.len() => {
                 if *ls && !*rs {
                     Err(InferenceError::UnsatisfiableConcrete {
@@ -486,10 +506,9 @@ impl ConstraintSystem {
             // Parameterised generic on both sides with the same head:
             // reduce per-argument with variance-aware containment
             // (spec §13.2.1, the `Q ⪯ F` table).
-            (
-                Type::Generic { name: an, args: aa },
-                Type::Generic { name: bn, args: ba },
-            ) if an == bn && aa.len() == ba.len() => {
+            (Type::Generic { name: an, args: aa }, Type::Generic { name: bn, args: ba })
+                if an == bn && aa.len() == ba.len() =>
+            {
                 for (l, r) in aa.iter().zip(ba.iter()) {
                     if l.is_star || r.is_star {
                         continue;
@@ -519,11 +538,7 @@ impl ConstraintSystem {
                         Variance::Invariant => {
                             // Both directions — i.e. equality on the
                             // type argument.
-                            self.add_equality(
-                                l.ty.clone(),
-                                r.ty.clone(),
-                                provenance.clone(),
-                            );
+                            self.add_equality(l.ty.clone(), r.ty.clone(), provenance.clone());
                         }
                     }
                 }
@@ -561,6 +576,11 @@ impl ConstraintSystem {
     /// 3. Cycles `α <: β <: α` collapse both vars through union-find.
     ///
     /// Repeats until no fresh constraints / bounds are produced.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internal invariant is violated: a variable id
+    /// collected from `self.bounds` is missing when re-read.
     pub fn incorporate(&mut self) -> Result<(), InferenceError> {
         let mut iterations = 0u32;
         loop {
@@ -591,7 +611,7 @@ impl ConstraintSystem {
                 for s in &bs.lower {
                     if !is_inference_var_type(s) && bs.upper.iter().any(|t| t == s) {
                         new_constraints.push((
-                            Type::TypeParam(self.encode(v)),
+                            Type::TypeParam(self.encode(*v)),
                             s.clone(),
                             ConstraintKind::Equality,
                             Provenance::Derived("equality-same-bound"),
@@ -606,8 +626,8 @@ impl ConstraintSystem {
             let var_ids: Vec<InferenceVar> = self.bounds.keys().copied().collect();
             for v in &var_ids {
                 let bs = self.bounds.get(v).unwrap().clone();
-                self.paired_generic_args(&bs.upper, &mut new_constraints);
-                self.paired_generic_args(&bs.lower, &mut new_constraints);
+                Self::paired_generic_args(&bs.upper, &mut new_constraints);
+                Self::paired_generic_args(&bs.lower, &mut new_constraints);
             }
 
             // (3) Cycle detection: α <: β AND β <: α (both vars).
@@ -632,9 +652,9 @@ impl ConstraintSystem {
         Ok(())
     }
 
-    fn encode(&self, v: &InferenceVar) -> String {
+    fn encode(&self, v: InferenceVar) -> String {
         for (name, id) in &self.var_names {
-            if id == v {
+            if *id == v {
                 return name.clone();
             }
         }
@@ -642,7 +662,6 @@ impl ConstraintSystem {
     }
 
     fn paired_generic_args(
-        &self,
         bounds: &[Type],
         out: &mut Vec<(Type, Type, ConstraintKind, Provenance)>,
     ) {
@@ -660,6 +679,9 @@ impl ConstraintSystem {
                         if l.is_star || r.is_star {
                             continue;
                         }
+                        // The Out/Out arm is a documented deliberate no-op, kept
+                        // separate from the catch-all.
+                        #[allow(clippy::match_same_arms)]
                         match (l.variance, r.variance) {
                             (Variance::Invariant, Variance::Invariant) => {
                                 out.push((
@@ -689,13 +711,13 @@ impl ConstraintSystem {
             for t in &bs_a.upper {
                 if let Some(bv) = self.is_inference_var(t)
                     && let Some(bs_b) = self.bounds.get(&bv)
-                        && bs_b
-                            .upper
-                            .iter()
-                            .any(|s| self.is_inference_var(s) == Some(*av))
-                        {
-                            out.push((*av, bv));
-                        }
+                    && bs_b
+                        .upper
+                        .iter()
+                        .any(|s| self.is_inference_var(s) == Some(*av))
+                {
+                    out.push((*av, bv));
+                }
             }
         }
         out
@@ -722,7 +744,12 @@ impl ConstraintSystem {
     /// order-independent batches are fixed in parallel inside a
     /// stage, and an SCC of mutually-dependent vars is resolved
     /// together by repeated substitution until the fix points.
-    #[must_use] 
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internal invariant is violated: a variable id
+    /// taken from `self.bounds` is missing when re-read.
+    #[must_use]
     pub fn solve_staged(&self) -> HashMap<InferenceVar, Type> {
         let vars: Vec<InferenceVar> = self.bounds.keys().copied().collect();
         let mut deps: HashMap<InferenceVar, Vec<InferenceVar>> = HashMap::new();
@@ -751,7 +778,12 @@ impl ConstraintSystem {
                     // Postponed variables are skipped — the
                     // typechecker will re-feed constraints once the
                     // gating event clears.
-                    if self.bounds.get(v).and_then(|b| b.postponed.as_ref()).is_some() {
+                    if self
+                        .bounds
+                        .get(v)
+                        .and_then(|b| b.postponed.as_ref())
+                        .is_some()
+                    {
                         continue;
                     }
                     let pick = self.fix_var(*v, &resolved);
@@ -769,18 +801,12 @@ impl ConstraintSystem {
         resolved
     }
 
-    fn fix_var(
-        &self,
-        v: InferenceVar,
-        already_resolved: &HashMap<InferenceVar, Type>,
-    ) -> Type {
-        let bs = match self.bounds.get(&v) {
-            Some(bs) => bs,
-            None => return Type::Nothing,
+    fn fix_var(&self, v: InferenceVar, already_resolved: &HashMap<InferenceVar, Type>) -> Type {
+        let Some(bs) = self.bounds.get(&v) else {
+            return Type::Nothing;
         };
-        let substitute = |t: &Type| -> Type {
-            substitute_vars(t, already_resolved, &self.var_names)
-        };
+        let substitute =
+            |t: &Type| -> Type { substitute_vars(t, already_resolved, &self.var_names) };
         match bs.preference {
             SolutionPreference::PushDown => {
                 let uppers: Vec<Type> = bs
@@ -816,7 +842,7 @@ impl ConstraintSystem {
     /// Picks a concrete substitution for every inference variable using
     /// the spec §13.2.2 rule: push-down → GLB of upper bounds (= their
     /// intersection); pull-up (and default) → LUB of lower bounds.
-    #[must_use] 
+    #[must_use]
     pub fn solve(&self) -> HashMap<InferenceVar, Type> {
         let mut out = HashMap::new();
         for (v, bs) in &self.bounds {
@@ -825,7 +851,9 @@ impl ConstraintSystem {
                     let uppers: Vec<Type> = bs
                         .upper
                         .iter()
-                        .filter(|t| !matches!(t, Type::Nullable(inner) if matches!(**inner, Type::Any)))
+                        .filter(
+                            |t| !matches!(t, Type::Nullable(inner) if matches!(**inner, Type::Any)),
+                        )
                         .cloned()
                         .collect();
                     if uppers.is_empty() {
@@ -835,8 +863,12 @@ impl ConstraintSystem {
                     }
                 }
                 SolutionPreference::PullUp => {
-                    let lowers: Vec<Type> =
-                        bs.lower.iter().filter(|t| !matches!(t, Type::Nothing)).cloned().collect();
+                    let lowers: Vec<Type> = bs
+                        .lower
+                        .iter()
+                        .filter(|t| !matches!(t, Type::Nothing))
+                        .cloned()
+                        .collect();
                     if lowers.is_empty() {
                         Type::Nothing
                     } else {
@@ -855,6 +887,11 @@ impl ConstraintSystem {
 /// promotes to a common builtin via the spec's normalization rules, and
 /// falls back to `Any` / `Any?` for unrelated class types. Lifted into
 /// the constraint system via [`ConstraintSystem::solve`].
+///
+/// # Panics
+///
+/// Does not panic: the empty-slice case returns `Nothing` before the
+/// first element is read.
 #[must_use]
 pub fn lub_many(types: &[Type]) -> Type {
     if types.is_empty() {
@@ -867,11 +904,7 @@ pub fn lub_many(types: &[Type]) -> Type {
     for t in iter {
         acc = lub_pair(&acc, &t);
     }
-    if any_nullable {
-        acc.as_nullable()
-    } else {
-        acc
-    }
+    if any_nullable { acc.as_nullable() } else { acc }
 }
 
 fn is_inference_var_type(t: &Type) -> bool {
@@ -879,20 +912,19 @@ fn is_inference_var_type(t: &Type) -> bool {
 }
 
 /// Collects all inference variables appearing inside `t`.
-fn collect_vars(
-    t: &Type,
-    var_names: &HashMap<String, InferenceVar>,
-    out: &mut Vec<InferenceVar>,
-) {
+fn collect_vars(t: &Type, var_names: &HashMap<String, InferenceVar>, out: &mut Vec<InferenceVar>) {
     match t {
         Type::TypeParam(name) => {
             if let Some(id) = var_names.get(name) {
                 out.push(*id);
             }
         }
-        Type::Nullable(inner) => collect_vars(inner, var_names, out),
-        Type::Range(inner) => collect_vars(inner, var_names, out),
-        Type::Function { params, return_type, .. } => {
+        Type::Nullable(inner) | Type::Range(inner) => collect_vars(inner, var_names, out),
+        Type::Function {
+            params,
+            return_type,
+            ..
+        } => {
             for p in params {
                 collect_vars(p, var_names, out);
             }
@@ -931,8 +963,15 @@ fn substitute_vars(
             Type::Nullable(Box::new(substitute_vars(inner, resolved, var_names)))
         }
         Type::Range(inner) => Type::Range(Box::new(substitute_vars(inner, resolved, var_names))),
-        Type::Function { params, return_type, is_suspend } => Type::Function {
-            params: params.iter().map(|p| substitute_vars(p, resolved, var_names)).collect(),
+        Type::Function {
+            params,
+            return_type,
+            is_suspend,
+        } => Type::Function {
+            params: params
+                .iter()
+                .map(|p| substitute_vars(p, resolved, var_names))
+                .collect(),
             return_type: Box::new(substitute_vars(return_type, resolved, var_names)),
             is_suspend: *is_suspend,
         },
@@ -954,9 +993,58 @@ fn substitute_vars(
                 .collect(),
         },
         Type::Intersection(parts) => Type::Intersection(
-            parts.iter().map(|p| substitute_vars(p, resolved, var_names)).collect(),
+            parts
+                .iter()
+                .map(|p| substitute_vars(p, resolved, var_names))
+                .collect(),
         ),
         _ => t.clone(),
+    }
+}
+
+/// Mutable working set for [`tarjan_scc`]'s depth-first traversal.
+#[derive(Default)]
+struct TarjanState {
+    idx_of: HashMap<InferenceVar, usize>,
+    lowlink: HashMap<InferenceVar, usize>,
+    on_stack: HashMap<InferenceVar, bool>,
+    stack: Vec<InferenceVar>,
+    counter: usize,
+    sccs: Vec<Vec<InferenceVar>>,
+}
+
+impl TarjanState {
+    fn strong_connect(&mut self, v: InferenceVar, deps: &HashMap<InferenceVar, Vec<InferenceVar>>) {
+        self.idx_of.insert(v, self.counter);
+        self.lowlink.insert(v, self.counter);
+        self.counter += 1;
+        self.stack.push(v);
+        self.on_stack.insert(v, true);
+        if let Some(ns) = deps.get(&v) {
+            for w in ns {
+                if !self.idx_of.contains_key(w) {
+                    self.strong_connect(*w, deps);
+                    let lw = *self.lowlink.get(w).unwrap();
+                    let lv = *self.lowlink.get(&v).unwrap();
+                    self.lowlink.insert(v, lv.min(lw));
+                } else if *self.on_stack.get(w).unwrap_or(&false) {
+                    let iw = *self.idx_of.get(w).unwrap();
+                    let lv = *self.lowlink.get(&v).unwrap();
+                    self.lowlink.insert(v, lv.min(iw));
+                }
+            }
+        }
+        if self.lowlink.get(&v) == self.idx_of.get(&v) {
+            let mut scc: Vec<InferenceVar> = Vec::new();
+            while let Some(w) = self.stack.pop() {
+                self.on_stack.insert(w, false);
+                scc.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            self.sccs.push(scc);
+        }
     }
 }
 
@@ -968,70 +1056,13 @@ fn tarjan_scc(
     vars: &[InferenceVar],
     deps: &HashMap<InferenceVar, Vec<InferenceVar>>,
 ) -> Vec<Vec<InferenceVar>> {
-    let mut idx_of: HashMap<InferenceVar, usize> = HashMap::new();
-    let mut lowlink: HashMap<InferenceVar, usize> = HashMap::new();
-    let mut on_stack: HashMap<InferenceVar, bool> = HashMap::new();
-    let mut stack: Vec<InferenceVar> = Vec::new();
-    let mut counter = 0usize;
-    let mut sccs: Vec<Vec<InferenceVar>> = Vec::new();
-
-    fn strong_connect(
-        v: InferenceVar,
-        deps: &HashMap<InferenceVar, Vec<InferenceVar>>,
-        idx_of: &mut HashMap<InferenceVar, usize>,
-        lowlink: &mut HashMap<InferenceVar, usize>,
-        on_stack: &mut HashMap<InferenceVar, bool>,
-        stack: &mut Vec<InferenceVar>,
-        counter: &mut usize,
-        sccs: &mut Vec<Vec<InferenceVar>>,
-    ) {
-        idx_of.insert(v, *counter);
-        lowlink.insert(v, *counter);
-        *counter += 1;
-        stack.push(v);
-        on_stack.insert(v, true);
-        if let Some(ns) = deps.get(&v) {
-            for w in ns {
-                if !idx_of.contains_key(w) {
-                    strong_connect(*w, deps, idx_of, lowlink, on_stack, stack, counter, sccs);
-                    let lw = *lowlink.get(w).unwrap();
-                    let lv = *lowlink.get(&v).unwrap();
-                    lowlink.insert(v, lv.min(lw));
-                } else if *on_stack.get(w).unwrap_or(&false) {
-                    let iw = *idx_of.get(w).unwrap();
-                    let lv = *lowlink.get(&v).unwrap();
-                    lowlink.insert(v, lv.min(iw));
-                }
-            }
-        }
-        if lowlink.get(&v) == idx_of.get(&v) {
-            let mut scc: Vec<InferenceVar> = Vec::new();
-            while let Some(w) = stack.pop() {
-                on_stack.insert(w, false);
-                scc.push(w);
-                if w == v {
-                    break;
-                }
-            }
-            sccs.push(scc);
-        }
-    }
-
+    let mut state = TarjanState::default();
     for v in vars {
-        if !idx_of.contains_key(v) {
-            strong_connect(
-                *v,
-                deps,
-                &mut idx_of,
-                &mut lowlink,
-                &mut on_stack,
-                &mut stack,
-                &mut counter,
-                &mut sccs,
-            );
+        if !state.idx_of.contains_key(v) {
+            state.strong_connect(*v, deps);
         }
     }
-    sccs
+    state.sccs
 }
 
 fn lub_pair(a: &Type, b: &Type) -> Type {
@@ -1115,10 +1146,7 @@ mod tests {
     #[test]
     fn reduce_intersection_rhs_fans_out() {
         let mut cs = ConstraintSystem::new();
-        cs.add_constraint(
-            Type::Int,
-            Type::Intersection(vec![Type::Int, Type::Any]),
-        );
+        cs.add_constraint(Type::Int, Type::Intersection(vec![Type::Int, Type::Any]));
         cs.reduce().unwrap();
     }
 
@@ -1207,16 +1235,25 @@ mod tests {
         let bs = cs.bounds.get(&av).unwrap();
         assert!(
             bs.lower.iter().any(|t| matches!(t, Type::Int)),
-            "expected Int <: A lower bound, got {:?}", bs.lower
+            "expected Int <: A lower bound, got {:?}",
+            bs.lower
         );
     }
 
     fn invariant(t: Type) -> GenericArg {
-        GenericArg { variance: Variance::Invariant, is_star: false, ty: t }
+        GenericArg {
+            variance: Variance::Invariant,
+            is_star: false,
+            ty: t,
+        }
     }
 
     fn out(t: Type) -> GenericArg {
-        GenericArg { variance: Variance::Out, is_star: false, ty: t }
+        GenericArg {
+            variance: Variance::Out,
+            is_star: false,
+            ty: t,
+        }
     }
 
     #[test]
@@ -1225,8 +1262,14 @@ mod tests {
         let (av, a) = cs.fresh("A");
         // List<A> <: List<Int> — invariant arg implies A ≡ Int.
         cs.add_constraint(
-            Type::Generic { name: "List".into(), args: vec![invariant(a)] },
-            Type::Generic { name: "List".into(), args: vec![invariant(Type::Int)] },
+            Type::Generic {
+                name: "List".into(),
+                args: vec![invariant(a)],
+            },
+            Type::Generic {
+                name: "List".into(),
+                args: vec![invariant(Type::Int)],
+            },
         );
         cs.reduce().unwrap();
         let bs = cs.bounds.get(&av).unwrap();
@@ -1240,8 +1283,14 @@ mod tests {
         let (av, a) = cs.fresh("A");
         // List<out A> <: List<out Int> — covariant arg implies A <: Int.
         cs.add_constraint(
-            Type::Generic { name: "List".into(), args: vec![out(a)] },
-            Type::Generic { name: "List".into(), args: vec![out(Type::Int)] },
+            Type::Generic {
+                name: "List".into(),
+                args: vec![out(a)],
+            },
+            Type::Generic {
+                name: "List".into(),
+                args: vec![out(Type::Int)],
+            },
         );
         cs.reduce().unwrap();
         let bs = cs.bounds.get(&av).unwrap();
@@ -1257,11 +1306,17 @@ mod tests {
         // α <: List<T> and α <: List<Int> — invariant arg implies T ≡ Int.
         cs.add_constraint(
             a.clone(),
-            Type::Generic { name: "List".into(), args: vec![invariant(t)] },
+            Type::Generic {
+                name: "List".into(),
+                args: vec![invariant(t)],
+            },
         );
         cs.add_constraint(
             a,
-            Type::Generic { name: "List".into(), args: vec![invariant(Type::Int)] },
+            Type::Generic {
+                name: "List".into(),
+                args: vec![invariant(Type::Int)],
+            },
         );
         cs.solve_to_fixpoint().unwrap();
         let _ = av;
@@ -1269,7 +1324,8 @@ mod tests {
         assert!(
             bs.lower.contains(&Type::Int) && bs.upper.contains(&Type::Int),
             "T should be equated with Int via incorporation; bounds: lower={:?} upper={:?}",
-            bs.lower, bs.upper
+            bs.lower,
+            bs.upper
         );
     }
 
@@ -1321,7 +1377,7 @@ mod tests {
         let sol = cs.solve_staged();
         // The postponed var was not fixed — it does not appear in
         // the solution map.
-        assert!(sol.get(&av).is_none());
+        assert!(!sol.contains_key(&av));
         // Clearing the postponement and re-running fixes it.
         cs.clear_postponed(av);
         let sol2 = cs.solve_staged();
@@ -1335,7 +1391,10 @@ mod tests {
             Type::Int,
             Type::String,
             ConstraintKind::Subtype,
-            Provenance::CallSite { span: klio_span::Span::new(klio_span::FileId(0), 1, 2), arg_idx: 7 },
+            Provenance::CallSite {
+                span: klio_span::Span::new(klio_span::FileId(0), 1, 2),
+                arg_idx: 7,
+            },
         );
         let _ = cs.reduce();
         let (err, prov) = cs.last_error().expect("expected an error");

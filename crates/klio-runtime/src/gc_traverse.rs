@@ -1,4 +1,4 @@
-use crate::{ObjRef, Env, ClassDef, InstanceData, DelegateKind, Value, SequenceSource, SeqOp};
+use crate::{ClassDef, DelegateKind, Env, InstanceData, ObjRef, SeqOp, SequenceSource, Value};
 
 use std::sync::Arc;
 
@@ -16,9 +16,10 @@ pub(crate) fn publish_env(env: &Env, seen: &mut std::collections::HashSet<usize>
         publish_value(v, seen);
     }
     if let Some(parent) = &env.parent
-        && mark_cell(parent, seen) {
-            publish_env(&parent.borrow(), seen);
-        }
+        && mark_cell(parent, seen)
+    {
+        publish_env(&parent.borrow(), seen);
+    }
 }
 
 fn publish_classdef(cls: &Arc<ClassDef>, seen: &mut std::collections::HashSet<usize>) {
@@ -29,9 +30,10 @@ fn publish_classdef(cls: &Arc<ClassDef>, seen: &mut std::collections::HashSet<us
         return;
     }
     if mark_cell(&cls.parent, seen)
-        && let Some(p) = cls.parent.borrow().as_ref() {
-            publish_classdef(p, seen);
-        }
+        && let Some(p) = cls.parent.borrow().as_ref()
+    {
+        publish_classdef(p, seen);
+    }
     if mark_cell(&cls.interfaces, seen) {
         for iface in cls.interfaces.borrow().iter() {
             publish_classdef(iface, seen);
@@ -44,13 +46,15 @@ fn publish_classdef(cls: &Arc<ClassDef>, seen: &mut std::collections::HashSet<us
     }
     if mark_cell(&cls.companion, seen)
         && let Some(c) = cls.companion.borrow().as_ref()
-            && mark_cell(c, seen) {
-                publish_instance(&c.borrow(), seen);
-            }
+        && mark_cell(c, seen)
+    {
+        publish_instance(&c.borrow(), seen);
+    }
     if mark_cell(&cls.enclosing_class, seen)
-        && let Some(e) = cls.enclosing_class.borrow().as_ref() {
-            publish_classdef(e, seen);
-        }
+        && let Some(e) = cls.enclosing_class.borrow().as_ref()
+    {
+        publish_classdef(e, seen);
+    }
     if mark_cell(&cls.nested_classes, seen) {
         for (_, nested) in cls.nested_classes.borrow().iter() {
             publish_classdef(nested, seen);
@@ -77,9 +81,10 @@ fn publish_classdef(cls: &Arc<ClassDef>, seen: &mut std::collections::HashSet<us
     }
     if mark_cell(&cls.object_singleton, seen)
         && let Some(s) = cls.object_singleton.borrow().as_ref()
-            && mark_cell(s, seen) {
-                publish_instance(&s.borrow(), seen);
-            }
+        && mark_cell(s, seen)
+    {
+        publish_instance(&s.borrow(), seen);
+    }
     // Methods can carry SAM-converted lambda values that close over
     // the graph; publish those too.
     for m in &cls.methods {
@@ -119,9 +124,12 @@ fn publish_delegate(kind: &DelegateKind, seen: &mut std::collections::HashSet<us
     }
 }
 
+// One match over every Value variant; splitting would fragment the dispatch.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usize>) {
     match v {
-        // Scalars / immutable Arc leaves: no ObjRef, nothing to publish.
+        // Scalars / immutable Arc leaves and the coroutine sentinel:
+        // no ObjRef, nothing to publish.
         Value::Unit
         | Value::Int(_)
         | Value::Long(_)
@@ -143,7 +151,8 @@ pub(crate) fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usiz
         | Value::PropertyRef { .. }
         | Value::Regex(_)
         | Value::Match(_)
-        | Value::MatchGroup { .. } => {}
+        | Value::MatchGroup { .. }
+        | Value::CoroutineSuspended => {}
 
         Value::List { items, backing, .. } | Value::Set { items, backing, .. } => {
             if mark_cell(items, seen) {
@@ -152,12 +161,13 @@ pub(crate) fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usiz
                 }
             }
             if let Some(b) = backing
-                && mark_cell(&b.entries, seen) {
-                    for (k, v) in b.entries.borrow().iter() {
-                        publish_value(k, seen);
-                        publish_value(v, seen);
-                    }
+                && mark_cell(&b.entries, seen)
+            {
+                for (k, v) in b.entries.borrow().iter() {
+                    publish_value(k, seen);
+                    publish_value(v, seen);
                 }
+            }
         }
         Value::Array { items, .. } => {
             if mark_cell(items, seen) {
@@ -227,7 +237,6 @@ pub(crate) fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usiz
                 publish_env(&env.borrow(), seen);
             }
         }
-        Value::CoroutineSuspended => {}
 
         Value::Pair(a, b) => {
             publish_value(a, seen);
@@ -238,16 +247,21 @@ pub(crate) fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usiz
             publish_value(b, seen);
             publish_value(c, seen);
         }
-        Value::MapEntry { key, value, backing } => {
+        Value::MapEntry {
+            key,
+            value,
+            backing,
+        } => {
             publish_value(key, seen);
             publish_value(value, seen);
             if let Some(b) = backing
-                && mark_cell(b, seen) {
-                    for (k, v) in b.borrow().iter() {
-                        publish_value(k, seen);
-                        publish_value(v, seen);
-                    }
+                && mark_cell(b, seen)
+            {
+                for (k, v) in b.borrow().iter() {
+                    publish_value(k, seen);
+                    publish_value(v, seen);
                 }
+            }
         }
         Value::Result { payload, .. } => publish_value(payload, seen),
         Value::Exception { cause, .. } => {
@@ -294,10 +308,7 @@ pub(crate) fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usiz
                     | SeqOp::DistinctBy(v)
                     | SeqOp::SortedBy(v, _)
                     | SeqOp::SortedWith(v) => publish_value(v, seen),
-                    SeqOp::Take(_)
-                    | SeqOp::Drop(_)
-                    | SeqOp::Distinct
-                    | SeqOp::Sorted(_) => {}
+                    SeqOp::Take(_) | SeqOp::Drop(_) | SeqOp::Distinct | SeqOp::Sorted(_) => {}
                 }
             }
         }
@@ -473,9 +484,7 @@ pub(crate) fn gc_mark_value(v: &Value, seen: &mut std::collections::HashSet<usiz
         | Value::Match(_)
         | Value::MatchGroup { .. } => {}
 
-        Value::List { items, .. }
-        | Value::Array { items, .. }
-        | Value::Set { items, .. } => {
+        Value::List { items, .. } | Value::Array { items, .. } | Value::Set { items, .. } => {
             if gc_mark_cell(items, seen) {
                 for elem in items.borrow().iter() {
                     gc_mark_value(elem, seen);
@@ -547,7 +556,11 @@ pub(crate) fn gc_mark_value(v: &Value, seen: &mut std::collections::HashSet<usiz
             gc_mark_value(b, seen);
             gc_mark_value(c, seen);
         }
-        Value::MapEntry { key, value, backing: None } => {
+        Value::MapEntry {
+            key,
+            value,
+            backing: None,
+        } => {
             gc_mark_value(key, seen);
             gc_mark_value(value, seen);
         }
@@ -593,10 +606,7 @@ pub(crate) fn gc_mark_value(v: &Value, seen: &mut std::collections::HashSet<usiz
                     | SeqOp::DistinctBy(v)
                     | SeqOp::SortedBy(v, _)
                     | SeqOp::SortedWith(v) => gc_mark_value(v, seen),
-                    SeqOp::Take(_)
-                    | SeqOp::Drop(_)
-                    | SeqOp::Distinct
-                    | SeqOp::Sorted(_) => {}
+                    SeqOp::Take(_) | SeqOp::Drop(_) | SeqOp::Distinct | SeqOp::Sorted(_) => {}
                 }
             }
         }

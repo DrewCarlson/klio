@@ -1,4 +1,4 @@
-use super::{Value, EvalError, TypeRef, Module, FuncId, eval};
+use super::{EvalError, FuncId, Module, TypeRef, Value, eval};
 
 /// Pluggable callbacks the evaluator delegates non-trivial dispatch
 /// through. The IR is intentionally agnostic about how user
@@ -51,7 +51,11 @@ pub trait Host {
     /// Construct an instance of a class referenced by ID. The
     /// implementation looks up the corresponding `ClassDef` and
     /// invokes the primary constructor with the supplied args.
-    fn new_instance(&mut self, _class: crate::ClassId, _args: &[Value]) -> Result<Value, EvalError> {
+    fn new_instance(
+        &mut self,
+        _class: crate::ClassId,
+        _args: &[Value],
+    ) -> Result<Value, EvalError> {
         Err(EvalError::Unsupported("Host::new_instance"))
     }
     fn new_instance_named(
@@ -67,11 +71,7 @@ pub trait Host {
     /// hosts route through the tree walker's
     /// `eval_property_access` so getters / delegates / extension
     /// properties fire.
-    fn get_field(
-        &mut self,
-        receiver: &Value,
-        name: &str,
-    ) -> Result<Value, EvalError> {
+    fn get_field(&mut self, receiver: &Value, name: &str) -> Result<Value, EvalError> {
         match receiver {
             Value::Instance(inst) => Ok(inst.borrow().get(name).unwrap_or(Value::Null)),
             _ => Err(EvalError::Type(format!(
@@ -84,12 +84,7 @@ pub trait Host {
     /// the instance backing store; concrete hosts route through the
     /// tree walker's assignment path so extension-property setters
     /// fire.
-    fn set_field(
-        &mut self,
-        receiver: &Value,
-        name: &str,
-        value: Value,
-    ) -> Result<(), EvalError> {
+    fn set_field(&mut self, receiver: &Value, name: &str, value: Value) -> Result<(), EvalError> {
         match receiver {
             Value::Instance(inst) => {
                 inst.borrow_mut().define(name, value);
@@ -210,33 +205,21 @@ pub trait Host {
     /// instance chain looking for one whose class matches
     /// `qualifier`. Returns the receiver itself when the
     /// qualifier matches the leaf class.
-    fn qualified_this(
-        &mut self,
-        _receiver: &Value,
-        _qualifier: &str,
-    ) -> Result<Value, EvalError> {
+    fn qualified_this(&mut self, _receiver: &Value, _qualifier: &str) -> Result<Value, EvalError> {
         Err(EvalError::Unsupported("Host::qualified_this"))
     }
 
     /// Read a captured variable's current value out of a
     /// `Value::Lambda`'s env. Used after closure-mutating calls
     /// to sync writes back into the caller's regs.
-    fn read_lambda_capture(
-        &mut self,
-        _lambda: &Value,
-        _name: &str,
-    ) -> Result<Value, EvalError> {
+    fn read_lambda_capture(&mut self, _lambda: &Value, _name: &str) -> Result<Value, EvalError> {
         Err(EvalError::Unsupported("Host::read_lambda_capture"))
     }
 
     /// Resolve `receiver::name` to a callable reference value.
     /// Concrete hosts dispatch through the receiver's class table
     /// to produce a `BoundMethod` / intrinsic / property-ref shape.
-    fn member_ref(
-        &mut self,
-        _receiver: &Value,
-        _name: &str,
-    ) -> Result<Value, EvalError> {
+    fn member_ref(&mut self, _receiver: &Value, _name: &str) -> Result<Value, EvalError> {
         Err(EvalError::Unsupported("Host::member_ref"))
     }
 

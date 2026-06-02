@@ -168,11 +168,7 @@ fun main() {
 "#;
     // Kotlin: a member of the receiver outranks a same-named ext on the
     // same type — both calls go to the member.
-    assert_klio(
-        "overload_member_vs_extension",
-        src,
-        "A.member B.member\n",
-    );
+    assert_klio("overload_member_vs_extension", src, "A.member B.member\n");
 }
 
 // 6. Companion object member referenced bare from a class method
@@ -228,11 +224,7 @@ fun main() {
     println("${render(S.A(7), "x")}|${render(S.B("k"), "y")}|${render(S.Z, "z")}")
 }
 "#;
-    assert_klio(
-        "smart_cast_when_arms_capture",
-        src,
-        "A(x,7)|B(y,k)|Z(z)\n",
-    );
+    assert_klio("smart_cast_when_arms_capture", src, "A(x,7)|B(y,k)|Z(z)\n");
 }
 
 #[test]
@@ -250,8 +242,11 @@ fun main() {
     println(cs.max())
 }
 "#;
-    assert_klio("comparable_sort", src,
-        "(1,2),(2,5),(3,0),(3,1)\n(1,2)\n(3,1)\n");
+    assert_klio(
+        "comparable_sort",
+        src,
+        "(1,2),(2,5),(3,0),(3,1)\n(1,2)\n(3,1)\n",
+    );
 }
 
 #[test]
@@ -382,8 +377,11 @@ fun main() {
     for (s in shapes) println(s.describe())
 }
 "#;
-    assert_klio("override_getter_chain", src,
-        "total=13.0\nRect(3.0x4.0, area=12.0)\nRect(1.0x1.0, area=1.0)\n");
+    assert_klio(
+        "override_getter_chain",
+        src,
+        "total=13.0\nRect(3.0x4.0, area=12.0)\nRect(1.0x1.0, area=1.0)\n",
+    );
 }
 
 #[test]
@@ -453,8 +451,11 @@ fun main() {
     println(t.visit(RenderV<Int>()))
 }
 "#;
-    assert_klio("sealed_tree_visitor", src,
-        "15\n((_<-3->_)<-5->(_<-7->_))\n");
+    assert_klio(
+        "sealed_tree_visitor",
+        src,
+        "15\n((_<-3->_)<-5->(_<-7->_))\n",
+    );
 }
 
 #[test]
@@ -481,8 +482,11 @@ fun main() {
     println(a.seen.joinToString(","))
 }
 "#;
-    assert_klio("lifecycle_subscribe", src,
-        "A:starting,A:running,A:stopping,A:stopped\n");
+    assert_klio(
+        "lifecycle_subscribe",
+        src,
+        "A:starting,A:running,A:stopping,A:stopped\n",
+    );
 }
 
 #[test]
@@ -515,6 +519,5 @@ fun main() {
     println((a * b).render())
 }
 "#;
-    assert_klio("matrix_ops", src,
-        "11,22|33,44\n70,100|150,220\n");
+    assert_klio("matrix_ops", src, "11,22|33,44\n70,100|150,220\n");
 }

@@ -22,7 +22,10 @@ pub(super) fn lower_for_labeled(
     let recv = lower_expr(b, iter);
     let it_reg = b.alloc_reg();
     let zero = b.alloc_reg();
-    b.push(Inst::Move { dst: zero, src: recv });
+    b.push(Inst::Move {
+        dst: zero,
+        src: recv,
+    });
     let name = b.module.intern_const(Const::String("iterator".into()));
     let args_start = b.alloc_reg();
     b.push(Inst::CallMember {

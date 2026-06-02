@@ -14,8 +14,19 @@ pub(super) fn is_package_head(name: &str) -> bool {
     }
     matches!(
         name,
-        "Int" | "Long" | "Short" | "Byte" | "UInt" | "ULong" | "UShort" | "UByte"
-            | "Float" | "Double" | "Char" | "Boolean" | "String"
+        "Int"
+            | "Long"
+            | "Short"
+            | "Byte"
+            | "UInt"
+            | "ULong"
+            | "UShort"
+            | "UByte"
+            | "Float"
+            | "Double"
+            | "Char"
+            | "Boolean"
+            | "String"
     )
 }
 
@@ -42,7 +53,7 @@ pub(super) fn is_pkg_root(name: &str) -> bool {
 /// implicit in Kotlin (`val d: Double = 1` is a type error there),
 /// and `Byte`/`Short` slots promote to `Int` in arithmetic anyway,
 /// so neither needs a rewrite.
-#[must_use] 
+#[must_use]
 pub fn widen_numeric_literal(e: &Expr, ty: &klio_ast::TypeRef) -> Option<Expr> {
     if ty.nullable || ty.name.name != "Long" {
         return None;

@@ -1,4 +1,4 @@
-use super::{Value, Arc, CallCtx, RuntimeError, make_list};
+use super::{Arc, CallCtx, RuntimeError, Value, make_list};
 
 // ============================================================
 // Exceptions
@@ -42,12 +42,12 @@ pub(crate) fn build_exception(ctx: &CallCtx<'_>, fqn: &str) -> Result<Value, Run
                 // A builtin exception is `Value::Exception`; a user /
                 // pack exception subclass is a `Value::Instance` of a
                 // Throwable-derived class. Both are valid causes.
-                Value::Exception { .. } | Value::Instance(_) => {
-                    Some(Box::new(c.clone()))
+                Value::Exception { .. } | Value::Instance(_) => Some(Box::new(c.clone())),
+                _ => {
+                    return Err(RuntimeError::Type(
+                        "Throwable cause must be a Throwable or null".into(),
+                    ));
                 }
-                _ => return Err(RuntimeError::Type(
-                    "Throwable cause must be a Throwable or null".into(),
-                )),
             };
             (msg, cause)
         }
@@ -110,7 +110,9 @@ pub(crate) fn excn_assertion_error(ctx: &mut CallCtx) -> Result<Value, RuntimeEr
 
 pub(crate) fn throwable_message(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(Value::Exception { message, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("message requires a Throwable receiver".into()));
+        return Err(RuntimeError::Type(
+            "message requires a Throwable receiver".into(),
+        ));
     };
     Ok(message
         .as_ref()
@@ -119,7 +121,9 @@ pub(crate) fn throwable_message(ctx: &mut CallCtx) -> Result<Value, RuntimeError
 
 pub(crate) fn throwable_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(v @ Value::Exception { .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("toString requires a Throwable receiver".into()));
+        return Err(RuntimeError::Type(
+            "toString requires a Throwable receiver".into(),
+        ));
     };
     Ok(Value::String(Arc::new(format!("{v}"))))
 }
@@ -127,20 +131,25 @@ pub(crate) fn throwable_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
 /// `Throwable.addSuppressed(other)` — klio is single-threaded and
 /// does not surface suppressed-exception chains in diagnostics, so
 /// this records nothing. Accepts any throwable-shaped receiver.
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn throwable_add_suppressed(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Unit)
 }
 
 /// `Throwable.suppressedExceptions` / `getSuppressed()` — always
 /// empty (see [`throwable_add_suppressed`]).
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn throwable_suppressed(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_list(Vec::new(), false))
 }
 
 pub(crate) fn throwable_cause(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(Value::Exception { cause, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("cause requires a Throwable receiver".into()));
+        return Err(RuntimeError::Type(
+            "cause requires a Throwable receiver".into(),
+        ));
     };
     Ok(cause.as_ref().map_or(Value::Null, |c| (**c).clone()))
 }
-

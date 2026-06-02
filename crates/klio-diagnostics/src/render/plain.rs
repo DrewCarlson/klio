@@ -30,7 +30,11 @@ pub fn to_string(diagnostics: &[Diagnostic], sources: &SourceMap) -> String {
     String::from_utf8(buf).unwrap_or_default()
 }
 
-fn render_one<W: std::io::Write>(d: &Diagnostic, sources: &SourceMap, out: &mut W) -> std::io::Result<()> {
+fn render_one<W: std::io::Write>(
+    d: &Diagnostic,
+    sources: &SourceMap,
+    out: &mut W,
+) -> std::io::Result<()> {
     let file = sources.get(d.primary.span.file);
     let (line, col) = file.line_col(d.primary.span.start);
     let sev_label = severity_word(d.severity);
@@ -72,7 +76,8 @@ fn severity_word(sev: Severity) -> &'static str {
 fn source_line(file: &SourceFile, span: Span) -> Option<String> {
     let (line, _) = file.line_col(span.start);
     let mut iter = file.source.split('\n');
-    iter.nth((line - 1) as usize).map(std::string::ToString::to_string)
+    iter.nth((line - 1) as usize)
+        .map(std::string::ToString::to_string)
 }
 
 fn caret_underline(file: &SourceFile, span: Span) -> String {

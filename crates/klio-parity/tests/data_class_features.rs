@@ -32,8 +32,11 @@ fun main() {
     println("$a|$b|$c")
 }
 "#;
-    assert_klio("copy_partial", src,
-        "P(name=Ann, age=30, role=user)|P(name=Ann, age=31, role=user)|P(name=Ann, age=40, role=admin)\n");
+    assert_klio(
+        "copy_partial",
+        src,
+        "P(name=Ann, age=30, role=user)|P(name=Ann, age=31, role=user)|P(name=Ann, age=40, role=admin)\n",
+    );
 }
 
 #[test]
@@ -66,7 +69,7 @@ fun main() {
 }
 
 #[test]
-fn data_class_componentN_destructure() {
+fn data_class_component_n_destructure() {
     let src = r#"
 data class Triple3(val a: Int, val b: String, val c: Double)
 fun main() {

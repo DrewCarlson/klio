@@ -1,10 +1,12 @@
-use crate::{PackCmd, ExitCode, PathBuf, SourceMap};
+use crate::{ExitCode, PackCmd, PathBuf, SourceMap};
 
 use crate::pack_cache::{
-    install_pack_into_cache, inspect_pack, list_cache_packs, merged_host_bindings,
+    inspect_pack, install_pack_into_cache, list_cache_packs, merged_host_bindings,
     read_pack_manifest, remove_cache_pack, verify_pack,
 };
 
+// single dispatch over every PackCmd subcommand; each arm wires one command
+#[allow(clippy::too_many_lines)]
 pub(crate) fn run_pack(cmd: PackCmd) -> ExitCode {
     match cmd {
         PackCmd::Build { dir, out } => match build_library_pack(&dir, out.as_deref()) {
@@ -17,7 +19,11 @@ pub(crate) fn run_pack(cmd: PackCmd) -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        PackCmd::Stdlib { out, bindings_only, compress_symbols } => {
+        PackCmd::Stdlib {
+            out,
+            bindings_only,
+            compress_symbols,
+        } => {
             if !bindings_only {
                 eprintln!("--bindings-only is the only supported mode in the MVP");
                 return ExitCode::from(2);
@@ -56,18 +62,19 @@ pub(crate) fn run_pack(cmd: PackCmd) -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        PackCmd::Remove { library_id, version } => {
-            match remove_cache_pack(&library_id, version.as_deref()) {
-                Ok(p) => {
-                    eprintln!("removed {}", p.display());
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::from(2)
-                }
+        PackCmd::Remove {
+            library_id,
+            version,
+        } => match remove_cache_pack(&library_id, version.as_deref()) {
+            Ok(p) => {
+                eprintln!("removed {}", p.display());
+                ExitCode::SUCCESS
             }
-        }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
         PackCmd::Inspect { pack } => match inspect_pack(&pack) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -95,27 +102,10 @@ pub(crate) fn run_pack(cmd: PackCmd) -> ExitCode {
                 }
             }
         }
-        PackCmd::Publish { pack, registry } => match publish_to_registry(&pack, registry.as_deref()) {
-            Ok(dest) => {
-                eprintln!("published {}", dest.display());
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(2)
-            }
-        },
-        PackCmd::Search { query, registry } => match search_registry(&query, registry.as_deref()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(2)
-            }
-        },
-        PackCmd::Fetch { library_id, version, registry } => {
-            match fetch_from_registry(&library_id, version.as_deref(), registry.as_deref()) {
+        PackCmd::Publish { pack, registry } => {
+            match publish_to_registry(&pack, registry.as_deref()) {
                 Ok(dest) => {
-                    eprintln!("fetched {}", dest.display());
+                    eprintln!("published {}", dest.display());
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -124,7 +114,32 @@ pub(crate) fn run_pack(cmd: PackCmd) -> ExitCode {
                 }
             }
         }
-        PackCmd::TrainDict { inputs, out, max_size } => match train_zstd_dict(&inputs, &out, max_size) {
+        PackCmd::Search { query, registry } => match search_registry(&query, registry.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        PackCmd::Fetch {
+            library_id,
+            version,
+            registry,
+        } => match fetch_from_registry(&library_id, version.as_deref(), registry.as_deref()) {
+            Ok(dest) => {
+                eprintln!("fetched {}", dest.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        PackCmd::TrainDict {
+            inputs,
+            out,
+            max_size,
+        } => match train_zstd_dict(&inputs, &out, max_size) {
             Ok(()) => {
                 eprintln!("trained dict {}", out.display());
                 ExitCode::SUCCESS
@@ -163,14 +178,13 @@ fn migrate_pack(input: &std::path::Path, output: &std::path::Path) -> Result<(),
             .read_section(&entry.name)
             .map_err(|e| e.to_string())?
             .expect("section listed in directory must decode");
+        // Dictionary-compressed sections are decoded by the reader
+        // using the inline zstd_dict section, and re-emitted as plain
+        // Zstd by the migrate path — re-training a dictionary is the
+        // user's call.
         let comp = match entry.compression {
             Compression::None => Compression::None,
-            Compression::Zstd => Compression::Zstd,
-            // Dictionary-compressed sections are decoded by the
-            // reader using the inline zstd_dict section, and
-            // re-emitted as plain Zstd by the migrate path —
-            // re-training a dictionary is the user's call.
-            Compression::ZstdDict => Compression::Zstd,
+            Compression::Zstd | Compression::ZstdDict => Compression::Zstd,
         };
         writer.add_section(entry.name.clone(), payload.into_owned(), comp);
     }
@@ -225,7 +239,9 @@ fn publish_to_registry(
 ) -> Result<PathBuf, String> {
     let manifest = read_pack_manifest(pack)?;
     let root = registry_dir(registry_override)?;
-    let lib_dir = root.join(&manifest.library_id).join(&manifest.library_version);
+    let lib_dir = root
+        .join(&manifest.library_id)
+        .join(&manifest.library_version);
     std::fs::create_dir_all(&lib_dir).map_err(|e| e.to_string())?;
     let dest = lib_dir.join(format!(
         "{}-{}.klio-pack",
@@ -233,17 +249,24 @@ fn publish_to_registry(
     ));
     std::fs::copy(pack, &dest).map_err(|e| format!("copy: {e}"))?;
 
-    let relative = dest
-        .strip_prefix(&root).map_or_else(|_| dest.to_string_lossy().into_owned(), |p| p.to_string_lossy().into_owned());
+    let relative = dest.strip_prefix(&root).map_or_else(
+        |_| dest.to_string_lossy().into_owned(),
+        |p| p.to_string_lossy().into_owned(),
+    );
     let mut index = read_registry_index(&root)?;
-    index.retain(|e| !(e.library_id == manifest.library_id && e.version == manifest.library_version));
+    index.retain(|e| {
+        !(e.library_id == manifest.library_id && e.version == manifest.library_version)
+    });
     index.push(RegistryEntry {
         library_id: manifest.library_id,
         version: manifest.library_version,
         abi_version: manifest.abi_version,
         relative_path: relative,
     });
-    index.sort_by(|a, b| (a.library_id.as_str(), a.version.as_str()).cmp(&(b.library_id.as_str(), b.version.as_str())));
+    index.sort_by(|a, b| {
+        (a.library_id.as_str(), a.version.as_str())
+            .cmp(&(b.library_id.as_str(), b.version.as_str()))
+    });
     write_registry_index(&root, &index)?;
     Ok(dest)
 }
@@ -284,7 +307,10 @@ fn fetch_from_registry(
         .ok_or_else(|| format!("no registry entry for `{library_id}`"))?;
     let src = root.join(&candidate.relative_path);
     if !src.exists() {
-        return Err(format!("registry entry points at missing file {}", src.display()));
+        return Err(format!(
+            "registry entry points at missing file {}",
+            src.display()
+        ));
     }
     install_pack_into_cache(&src)
 }
@@ -358,7 +384,13 @@ fn scaffold_library(dir: &std::path::Path, id_override: Option<&str>) -> Result<
 
 fn sanitize_package(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -386,7 +418,10 @@ fn build_ast_bundle(files: &[klio_pack::schema::SourceFile]) -> klio_pack::schem
         if diags.has_errors() {
             continue;
         }
-        out.files.push(AstFile { rel_path: f.rel_path.clone(), kotlin_file: ast });
+        out.files.push(AstFile {
+            rel_path: f.rel_path.clone(),
+            kotlin_file: ast,
+        });
     }
     out
 }
@@ -509,8 +544,8 @@ pub(crate) fn collect_pack_sources(
                 .unwrap_or(p)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let included = sr.include.is_empty()
-                || sr.include.iter().any(|pat| pat_match(&rel_to_root, pat));
+            let included =
+                sr.include.is_empty() || sr.include.iter().any(|pat| pat_match(&rel_to_root, pat));
             if !included {
                 continue;
             }
@@ -526,7 +561,10 @@ pub(crate) fn collect_pack_sources(
                 continue;
             }
             let bytes = std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
-            files.push(SourceFile { rel_path: rel, bytes });
+            files.push(SourceFile {
+                rel_path: rel,
+                bytes,
+            });
         }
     }
     files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -588,58 +626,17 @@ fn default_true() -> bool {
     true
 }
 
-fn build_library_pack(
-    dir: &std::path::Path,
-    out: Option<&std::path::Path>,
-) -> Result<PathBuf, String> {
-    use klio_pack::schema::{
-        encode, Binding, BindingKind, BindingManifest, PackDependency, PackManifest, Purity,
-        SourceBundle,
-    };
-    use klio_pack::{section_names, Compression, PackWriter};
+/// Build the sorted binding list for a pack: the explicit `[bindings]`
+/// entries from `klio.toml` plus, when `auto_bindings` is set, every
+/// `merged_host_bindings` entry whose FQN matches a configured prefix.
+fn collect_pack_bindings(
+    binding_cfg: std::collections::BTreeMap<String, BindingValue>,
+    library: &LibraryHeader,
+) -> Vec<klio_pack::schema::Binding> {
+    use klio_pack::schema::{Binding, BindingKind, Purity};
 
-    let toml_path = dir.join("klio.toml");
-    let toml_str = std::fs::read_to_string(&toml_path)
-        .map_err(|e| format!("read {}: {e}", toml_path.display()))?;
-    let mut cfg: LibraryToml = toml::from_str(&toml_str)
-        .map_err(|e| format!("parse {}: {e}", toml_path.display()))?;
-
-    // Source files. The plain `source_roots` strings become
-    // unfiltered roots; the `[[source]]` tables follow with their
-    // include/exclude rules. The walk itself is shared so the
-    // no-filter path collects exactly the files it did before.
-    let plain_roots = if cfg.library.source_roots.is_empty() && cfg.source.is_empty() {
-        vec!["src".to_string()]
-    } else {
-        cfg.library.source_roots.clone()
-    };
-    let mut effective: Vec<SourceRoot> = plain_roots
-        .into_iter()
-        .map(|root| SourceRoot { root, include: Vec::new(), exclude: Vec::new() })
-        .collect();
-    for s in cfg.source.drain(..) {
-        effective.push(s);
-    }
-
-    let files = collect_pack_sources(dir, &effective)?;
-
-    // Manifest.
-    let manifest = PackManifest {
-        library_id: cfg.library.id.clone(),
-        library_version: cfg.library.version.clone(),
-        abi_version: cfg.library.abi,
-        implicit_packages: cfg.library.implicit_packages.clone(),
-        dependencies: cfg
-            .deps
-            .into_iter()
-            .map(|d| PackDependency { library_id: d.id, min_version: d.min_version })
-            .collect(),
-    };
-    let manifest_bytes = encode(&manifest).map_err(|e| e.to_string())?;
-
-    // Bindings.
     let mut bindings: Vec<Binding> = Vec::new();
-    for (fqn, value) in cfg.bindings {
+    for (fqn, value) in binding_cfg {
         let (host_symbol, overrides_interpreter, _kind, platform_actual) = match value {
             BindingValue::Symbol(s) => (s, true, None, false),
             BindingValue::Detailed {
@@ -664,14 +661,20 @@ fn build_library_pack(
     // whose FQN matches a configured prefix. Drops the klio.toml
     // [bindings] duplication for the common case where the host
     // crate already lists every binding.
-    if cfg.library.auto_bindings {
-        let prefixes: Vec<String> = if cfg.library.binding_auto_prefixes.is_empty() {
-            vec![format!("{}.", cfg.library.id)]
+    if library.auto_bindings {
+        let prefixes: Vec<String> = if library.binding_auto_prefixes.is_empty() {
+            vec![format!("{}.", library.id)]
         } else {
-            cfg.library
+            library
                 .binding_auto_prefixes
                 .iter()
-                .map(|p| if p.ends_with('.') { p.clone() } else { format!("{p}.") })
+                .map(|p| {
+                    if p.ends_with('.') {
+                        p.clone()
+                    } else {
+                        format!("{p}.")
+                    }
+                })
                 .collect()
         };
         let host = merged_host_bindings();
@@ -697,10 +700,71 @@ fn build_library_pack(
         }
     }
     bindings.sort_by(|a, b| a.fqn.cmp(&b.fqn));
+    bindings
+}
+
+fn build_library_pack(
+    dir: &std::path::Path,
+    out: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    use klio_pack::schema::{BindingManifest, PackDependency, PackManifest, SourceBundle, encode};
+    use klio_pack::{Compression, PackWriter, section_names};
+
+    let toml_path = dir.join("klio.toml");
+    let toml_str = std::fs::read_to_string(&toml_path)
+        .map_err(|e| format!("read {}: {e}", toml_path.display()))?;
+    let mut cfg: LibraryToml =
+        toml::from_str(&toml_str).map_err(|e| format!("parse {}: {e}", toml_path.display()))?;
+
+    // Source files. The plain `source_roots` strings become
+    // unfiltered roots; the `[[source]]` tables follow with their
+    // include/exclude rules. The walk itself is shared so the
+    // no-filter path collects exactly the files it did before.
+    let plain_roots = if cfg.library.source_roots.is_empty() && cfg.source.is_empty() {
+        vec!["src".to_string()]
+    } else {
+        cfg.library.source_roots.clone()
+    };
+    let mut effective: Vec<SourceRoot> = plain_roots
+        .into_iter()
+        .map(|root| SourceRoot {
+            root,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        })
+        .collect();
+    for s in cfg.source.drain(..) {
+        effective.push(s);
+    }
+
+    let files = collect_pack_sources(dir, &effective)?;
+
+    // Manifest.
+    let manifest = PackManifest {
+        library_id: cfg.library.id.clone(),
+        library_version: cfg.library.version.clone(),
+        abi_version: cfg.library.abi,
+        implicit_packages: cfg.library.implicit_packages.clone(),
+        dependencies: cfg
+            .deps
+            .into_iter()
+            .map(|d| PackDependency {
+                library_id: d.id,
+                min_version: d.min_version,
+            })
+            .collect(),
+    };
+    let manifest_bytes = encode(&manifest).map_err(|e| e.to_string())?;
+
+    // Bindings.
+    let bindings = collect_pack_bindings(cfg.bindings, &cfg.library);
     let bindings_bytes = encode(&BindingManifest { bindings }).map_err(|e| e.to_string())?;
 
     // Sources (zstd-compressed; common case is many KB of Kotlin text).
-    let sources_bytes = encode(&SourceBundle { files: files.clone() }).map_err(|e| e.to_string())?;
+    let sources_bytes = encode(&SourceBundle {
+        files: files.clone(),
+    })
+    .map_err(|e| e.to_string())?;
 
     // Frozen AST: try to parse every source file at pack-build time
     // and ship the resulting `KotlinFile` tree alongside the raw
@@ -712,8 +776,11 @@ fn build_library_pack(
     // Frozen typeck: typecheck the bundle and ship the per-Span
     // type map. Empty when typecheck reports errors; the loader
     // re-typechecks at install time in that case.
-    let asts: Vec<klio_ast::KotlinFile> =
-        ast_bundle.files.iter().map(|f| f.kotlin_file.clone()).collect();
+    let asts: Vec<klio_ast::KotlinFile> = ast_bundle
+        .files
+        .iter()
+        .map(|f| f.kotlin_file.clone())
+        .collect();
     let typeck_bundle = build_typeck_bundle(&asts);
     let typeck_bytes = encode(&typeck_bundle).map_err(|e| e.to_string())?;
 

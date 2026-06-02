@@ -24,4 +24,4 @@
 
 pub mod check;
 
-pub use check::{typecheck, typecheck_module, TypeCheck};
+pub use check::{TypeCheck, typecheck, typecheck_module};

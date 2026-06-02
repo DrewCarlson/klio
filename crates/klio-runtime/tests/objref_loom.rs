@@ -58,7 +58,10 @@ fn publish_then_cross_thread_borrow_is_race_free() {
             let obj = rx.recv().unwrap();
             {
                 let g = obj.borrow();
-                assert_eq!(*g, 42, "B must observe the pre-publish write, never a torn value");
+                assert_eq!(
+                    *g, 42,
+                    "B must observe the pre-publish write, never a torn value"
+                );
             }
             {
                 let mut g = obj.borrow_mut();
@@ -101,7 +104,11 @@ fn two_post_publish_writers_serialize_via_lock() {
         a.join().unwrap();
         b.join().unwrap();
 
-        assert_eq!(*obj.borrow(), 2, "lock-serialized increments must not lose an update");
+        assert_eq!(
+            *obj.borrow(),
+            2,
+            "lock-serialized increments must not lose an update"
+        );
     });
 }
 

@@ -9,12 +9,12 @@
 use std::path::{Path, PathBuf};
 
 use klio_pack::schema::{
-    encode, Binding, BindingKind, BindingManifest, ModifierBits, PackManifest, Purity, SourceBundle,
-    SourceFile, SourceLoc, SymbolIndex, SymbolKind, SymbolRecord,
+    Binding, BindingKind, BindingManifest, ModifierBits, PackManifest, Purity, SourceBundle,
+    SourceFile, SourceLoc, SymbolIndex, SymbolKind, SymbolRecord, encode,
 };
-use klio_pack::{section_names, Compression, PackError, PackWriter};
+use klio_pack::{Compression, PackError, PackWriter, section_names};
 
-use crate::{generated, implementation, param_names, IMPLICITLY_IMPORTED_PACKAGES};
+use crate::{IMPLICITLY_IMPORTED_PACKAGES, generated, implementation, param_names};
 
 /// Curated set of upstream stdlib commonMain `.kt` files the embedded
 /// stdlib pack ships verbatim as a `SOURCES` section, so the
@@ -316,7 +316,9 @@ pub fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, PackError> {
         .map(symbol_entry_to_record)
         .collect();
     sym_entries.sort_by(|a, b| a.fqn.cmp(&b.fqn));
-    let symbol_bytes = encode(&SymbolIndex { entries: sym_entries })?;
+    let symbol_bytes = encode(&SymbolIndex {
+        entries: sym_entries,
+    })?;
 
     let mut bindings: Vec<Binding> = Vec::new();
     let mut seen = std::collections::BTreeSet::<String>::new();
@@ -355,7 +357,11 @@ pub fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, PackError> {
     writer.add_section(
         section_names::SYMBOLS,
         symbol_bytes,
-        if compress_symbols { Compression::Zstd } else { Compression::None },
+        if compress_symbols {
+            Compression::Zstd
+        } else {
+            Compression::None
+        },
     );
     writer.add_raw(section_names::BINDINGS, binding_bytes);
     writer.add_section(section_names::SOURCES, sources_bytes, Compression::Zstd);

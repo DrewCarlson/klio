@@ -33,7 +33,7 @@ fun main() { println("${describe("hi", 5)}|${describe(null, 5)}|${describe("a", 
 }
 
 #[test]
-fn any_toString_default_and_override() {
+fn any_to_string_default_and_override() {
     let src = r#"
 class Default
 class Custom { override fun toString(): String = "custom!" }

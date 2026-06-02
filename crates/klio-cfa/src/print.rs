@@ -55,17 +55,26 @@ fn format_edge(e: &Edge) -> String {
 
 fn format_node(n: &Node) -> String {
     match n {
-        Node::Eval { reg, expr } => format!("r{} = eval @{}..{} :: {:?}", reg.0, expr.span.start, expr.span.end, expr.ty),
+        Node::Eval { reg, expr } => format!(
+            "r{} = eval @{}..{} :: {:?}",
+            reg.0, expr.span.start, expr.span.end, expr.ty
+        ),
         Node::Assign { lhs, rhs, .. } => format!("assign {} = r{}", format_place(lhs), rhs.0),
-        Node::DeclLocal { place, declared_ty, .. } => {
+        Node::DeclLocal {
+            place, declared_ty, ..
+        } => {
             format!("decl {} : {:?}", place.0, declared_ty)
         }
-        Node::Assume { reg, polarity } => format!(
-            "assume {}r{}",
-            if *polarity { "" } else { "!" },
-            reg.0
-        ),
-        Node::AssumeIs { reg, ty, class_name, polarity, .. } => {
+        Node::Assume { reg, polarity } => {
+            format!("assume {}r{}", if *polarity { "" } else { "!" }, reg.0)
+        }
+        Node::AssumeIs {
+            reg,
+            ty,
+            class_name,
+            polarity,
+            ..
+        } => {
             let cn = class_name
                 .as_ref()
                 .map(|s| format!(" [{s}]"))
@@ -82,7 +91,12 @@ fn format_node(n: &Node) -> String {
             reg.0,
             if *eq_null { "==" } else { "!=" }
         ),
-        Node::AssumeRefEq { reg_a, reg_b, polarity, .. } => format!(
+        Node::AssumeRefEq {
+            reg_a,
+            reg_b,
+            polarity,
+            ..
+        } => format!(
             "assume r{} {} r{}",
             reg_a.0,
             if *polarity { "===" } else { "!==" },
@@ -107,7 +121,11 @@ fn format_place(p: &Place) -> String {
 fn format_term(t: &Terminator) -> String {
     match t {
         Terminator::Goto(b) => format!("goto b{}", b.0),
-        Terminator::Branch { cond, then_blk, else_blk } => {
+        Terminator::Branch {
+            cond,
+            then_blk,
+            else_blk,
+        } => {
             format!("branch r{} -> b{} else b{}", cond.0, then_blk.0, else_blk.0)
         }
         Terminator::Switch { reg, arms, default } => {
@@ -128,11 +146,9 @@ fn format_term(t: &Terminator) -> String {
 fn format_pattern(p: &Pattern) -> String {
     match p {
         Pattern::Equal(r) => format!("== r{}", r.0),
-        Pattern::Is { ty, polarity } => format!(
-            "{} {:?}",
-            if *polarity { "is" } else { "!is" },
-            ty
-        ),
+        Pattern::Is { ty, polarity } => {
+            format!("{} {:?}", if *polarity { "is" } else { "!is" }, ty)
+        }
         Pattern::Wildcard => "_".to_string(),
     }
 }

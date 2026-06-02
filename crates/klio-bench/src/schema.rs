@@ -49,6 +49,8 @@ impl RegressionLevel {
 /// Diff the `median_ns` of `cur` vs. `base`. Returns one row per workload
 /// present in `cur` (missing baselines emit ratio 1.0 + Green).
 #[must_use]
+// timing ratio is approximate; f64 precision loss on large ns counts is fine
+#[allow(clippy::cast_precision_loss)]
 pub fn diff(base: &BenchReport, cur: &BenchReport) -> Vec<DiffRow> {
     let mut rows = Vec::new();
     for r in &cur.records {

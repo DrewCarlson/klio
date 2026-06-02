@@ -9,19 +9,26 @@
 
 use std::path::PathBuf;
 
-use klio_pack::schema::{encode, ModifierBits, SourceLoc, SymbolIndex, SymbolKind, SymbolRecord};
-use klio_stdlib::{generated, SymbolEntry};
+use klio_pack::schema::{ModifierBits, SourceLoc, SymbolIndex, SymbolKind, SymbolRecord, encode};
+use klio_stdlib::{SymbolEntry, generated};
 
 fn main() {
-    let mut entries: Vec<SymbolRecord> =
-        generated::stdlib_symbols().iter().map(entry_to_record).collect();
+    let mut entries: Vec<SymbolRecord> = generated::stdlib_symbols()
+        .iter()
+        .map(entry_to_record)
+        .collect();
     entries.sort_by(|a, b| a.fqn.cmp(&b.fqn));
     let index = SymbolIndex { entries };
     let bytes = encode(&index).expect("encode SymbolIndex");
 
-    let out: PathBuf = if let Some(p) = std::env::args().nth(1) { PathBuf::from(p) } else {
+    let out: PathBuf = if let Some(p) = std::env::args().nth(1) {
+        PathBuf::from(p)
+    } else {
         let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        crate_root.join("src").join("generated").join("symbols.postcard")
+        crate_root
+            .join("src")
+            .join("generated")
+            .join("symbols.postcard")
     };
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).expect("create generated dir");

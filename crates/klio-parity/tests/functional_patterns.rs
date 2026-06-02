@@ -21,7 +21,7 @@ fn assert_klio(name: &str, src: &str, expected: &str) {
 }
 
 #[test]
-fn result_runCatching_chain() {
+fn result_run_catching_chain() {
     let src = r#"
 fun parse(s: String): Result<Int> = runCatching { s.toInt() }
 fun main() {

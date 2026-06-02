@@ -1,4 +1,13 @@
-use super::{FuncBuilder, Expr, Reg, Const, Inst, callee_label, AstBinOp, is_boxed_to_any_form, is_any_typed_path, BinOp, Terminator, ast_binop, AstUnOp, UnOp, boxed_cell_reg, is_package_head, is_pkg_root, collect_dotted_fqn, lower_arg_run, inline_fn_ast, try_inline_call_with_type_args, intern_arg_names, lambda_writes_outer_var, lambda_mutated_outer_vars, intern_type_args, splice_inline_lambda, arg_lambda_has_nonlocal_return, resolve_capture, FuncId, Func, expr_span, is_lower_anon_capture, lower_when, BlockId, lower_lambda_body_capturing, lower_for, lower_for_labeled, lower_lambda_body_capturing_kind, AstBlock, Stmt, collect_path_idents_stmt, collect_path_idents, lower_stmt};
+use super::{
+    AstBinOp, AstBlock, AstUnOp, BinOp, BlockId, Const, Expr, Func, FuncBuilder, FuncId, Inst, Reg,
+    Stmt, Terminator, UnOp, arg_lambda_has_nonlocal_return, ast_binop, boxed_cell_reg,
+    callee_label, collect_dotted_fqn, collect_path_idents, collect_path_idents_stmt, expr_span,
+    inline_fn_ast, intern_arg_names, intern_type_args, is_any_typed_path, is_boxed_to_any_form,
+    is_lower_anon_capture, is_package_head, is_pkg_root, lambda_mutated_outer_vars,
+    lambda_writes_outer_var, lower_arg_run, lower_for, lower_for_labeled,
+    lower_lambda_body_capturing, lower_lambda_body_capturing_kind, lower_stmt, lower_when,
+    resolve_capture, splice_inline_lambda, try_inline_call_with_type_args,
+};
 
 /// Lower one expression into the current block. Returns the
 /// register holding the result. Statements that do not produce a
@@ -13,21 +22,38 @@ use super::{FuncBuilder, Expr, Reg, Const, Inst, callee_label, AstBinOp, is_boxe
 /// companion object. Everything else defers to `lower_expr`.
 pub fn lower_receiver(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
     if let Expr::Path { segments, .. } = expr
-        && segments.len() == 1 {
-            let n = &segments[0].name;
-            if b.resolve(n).is_none()
-                && !b.knows_outer(n)
-                && b.module.class_id(n).is_some()
-            {
-                let dst = b.alloc_reg();
-                let nm = b.module.intern_const(Const::String(n.clone()));
-                b.push(Inst::LoadGlobal { dst, name: nm });
-                return dst;
-            }
+        && segments.len() == 1
+    {
+        let n = &segments[0].name;
+        if b.resolve(n).is_none() && !b.knows_outer(n) && b.module.class_id(n).is_some() {
+            let dst = b.alloc_reg();
+            let nm = b.module.intern_const(Const::String(n.clone()));
+            b.push(Inst::LoadGlobal { dst, name: nm });
+            return dst;
         }
+    }
     lower_expr(b, expr)
 }
 
+/// Lower one expression into the current block, returning the register
+/// holding its value. Value-less forms (assignments, declarations)
+/// return a synthetic `Unit` register so downstream code stays uniform.
+///
+/// # Panics
+/// Panics if the AST violates a shape invariant established earlier in
+/// lowering: a matched callee or argument node has an unexpected form,
+/// or a `this`/binding the surrounding context guarantees is in scope
+/// is not resolvable.
+// Single dispatch match over every expression form; splitting would
+// fragment one match and risk correctness. The numeric-literal casts
+// implement Kotlin's defined conversions (UInt/ULong/Int/Float literal
+// lowering) and the usize->u8/u32 casts pack argument counts and
+// register indices into the IR's fixed-width slots.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
     // Arm the implicit-label for a call's argument lambdas with the
     // callee's simple name (`with(n) { … }` → "with"). `lower_arg_run`
@@ -81,7 +107,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 AstBinOp::Neq => BinOp::BoxedNotEq,
                 _ => unreachable!(),
             };
-            b.push(Inst::BinOp { dst, op: ir_op, lhs: l, rhs: r });
+            b.push(Inst::BinOp {
+                dst,
+                op: ir_op,
+                lhs: l,
+                rhs: r,
+            });
             dst
         }
         Expr::Binary { op, lhs, rhs, .. } => {
@@ -92,7 +123,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let recv = lower_expr(b, rhs);
                 let arg_slot = b.alloc_reg();
                 let l = lower_expr(b, lhs);
-                b.push(Inst::Move { dst: arg_slot, src: l });
+                b.push(Inst::Move {
+                    dst: arg_slot,
+                    src: l,
+                });
                 let contains = b.alloc_reg();
                 let nm = b.module.intern_const(Const::String("contains".into()));
                 b.push(Inst::CallMember {
@@ -117,12 +151,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let l = lower_expr(b, lhs);
                 let null_r = b.emit_const(Const::Null);
                 let is_null = b.alloc_reg();
-                b.push(Inst::BinOp { dst: is_null, op: BinOp::Eq, lhs: l, rhs: null_r });
+                b.push(Inst::BinOp {
+                    dst: is_null,
+                    op: BinOp::Eq,
+                    lhs: l,
+                    rhs: null_r,
+                });
                 let then_b = b.alloc_block();
                 let else_b = b.alloc_block();
                 let join = b.alloc_block();
                 let dst = b.alloc_reg();
-                b.terminate(Terminator::Branch { cond: is_null, t: then_b, f: else_b });
+                b.terminate(Terminator::Branch {
+                    cond: is_null,
+                    t: then_b,
+                    f: else_b,
+                });
                 b.switch_to(then_b);
                 let rv = lower_expr(b, rhs);
                 b.push(Inst::Move { dst, src: rv });
@@ -140,7 +183,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let else_b = b.alloc_block();
                 let join = b.alloc_block();
                 let dst = b.alloc_reg();
-                b.terminate(Terminator::Branch { cond: l, t: then_b, f: else_b });
+                b.terminate(Terminator::Branch {
+                    cond: l,
+                    t: then_b,
+                    f: else_b,
+                });
                 let is_and = matches!(op, AstBinOp::And);
                 // `&&`: if l is true → evaluate rhs; else → false.
                 // `||`: if l is true → true; else → evaluate rhs.
@@ -181,13 +228,18 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             && b.is_generic_typed_param(&segments[0].name)
                 )
             };
-            if matches!(op, AstBinOp::Lt | AstBinOp::Le | AstBinOp::Gt | AstBinOp::Ge)
-                && (is_generic_operand(lhs) || is_generic_operand(rhs))
+            if matches!(
+                op,
+                AstBinOp::Lt | AstBinOp::Le | AstBinOp::Gt | AstBinOp::Ge
+            ) && (is_generic_operand(lhs) || is_generic_operand(rhs))
             {
                 let recv = lower_expr(b, lhs);
                 let arg_slot = b.alloc_reg();
                 let r = lower_expr(b, rhs);
-                b.push(Inst::Move { dst: arg_slot, src: r });
+                b.push(Inst::Move {
+                    dst: arg_slot,
+                    src: r,
+                });
                 let cmp = b.alloc_reg();
                 let nm = b.module.intern_const(Const::String("compareTo".into()));
                 b.push(Inst::CallMember {
@@ -200,13 +252,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 });
                 let zero = b.emit_const(Const::Int(0));
                 let dst = b.alloc_reg();
-                b.push(Inst::BinOp { dst, op: ast_binop(*op), lhs: cmp, rhs: zero });
+                b.push(Inst::BinOp {
+                    dst,
+                    op: ast_binop(*op),
+                    lhs: cmp,
+                    rhs: zero,
+                });
                 return dst;
             }
             let l = lower_expr(b, lhs);
             let r = lower_expr(b, rhs);
             let dst = b.alloc_reg();
-            b.push(Inst::BinOp { dst, op: ast_binop(*op), lhs: l, rhs: r });
+            b.push(Inst::BinOp {
+                dst,
+                op: ast_binop(*op),
+                lhs: l,
+                rhs: r,
+            });
             dst
         }
         Expr::Unary { op, expr, .. }
@@ -233,32 +295,59 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             if matches!(op, AstUnOp::PreInc | AstUnOp::PreDec) {
                 let operand = lower_expr(b, expr);
                 let dst = b.alloc_reg();
-                let u = if matches!(op, AstUnOp::PreInc) { UnOp::Inc } else { UnOp::Dec };
-                b.push(Inst::UnOp { dst, op: u, operand });
+                let u = if matches!(op, AstUnOp::PreInc) {
+                    UnOp::Inc
+                } else {
+                    UnOp::Dec
+                };
+                b.push(Inst::UnOp {
+                    dst,
+                    op: u,
+                    operand,
+                });
                 match expr.as_ref() {
                     Expr::Path { segments, .. } if segments.len() == 1 => {
                         if b.is_boxed(&segments[0].name) {
                             let cell = boxed_cell_reg(b, &segments[0].name);
                             b.push(Inst::CellSet { cell, value: dst });
                         } else if let Some(home) = b.mutable_home(&segments[0].name) {
-                            b.push(Inst::Move { dst: home, src: dst });
+                            b.push(Inst::Move {
+                                dst: home,
+                                src: dst,
+                            });
                         } else if b.knows_outer(&segments[0].name) {
                             let _ = b.record_capture(&segments[0].name);
                             let n = b
                                 .module
                                 .intern_const(Const::String(segments[0].name.clone()));
-                            b.push(Inst::StoreGlobal { name: n, value: dst });
+                            b.push(Inst::StoreGlobal {
+                                name: n,
+                                value: dst,
+                            });
                             b.rebind(&segments[0].name, dst);
                         } else {
                             b.rebind(&segments[0].name, dst);
                         }
                     }
-                    Expr::Member { receiver, name, safe: false, .. } => {
+                    Expr::Member {
+                        receiver,
+                        name,
+                        safe: false,
+                        ..
+                    } => {
                         let recv = lower_receiver(b, receiver);
                         let field = b.module.intern_const(Const::String(name.name.clone()));
-                        b.push(Inst::SetField { receiver: recv, field, value: dst });
+                        b.push(Inst::SetField {
+                            receiver: recv,
+                            field,
+                            value: dst,
+                        });
                     }
-                    Expr::Index { receiver, args: idx_args, .. } => {
+                    Expr::Index {
+                        receiver,
+                        args: idx_args,
+                        ..
+                    } => {
                         let recv = lower_receiver(b, receiver);
                         let n_keys = idx_args.len();
                         let key_start = b.alloc_reg();
@@ -271,7 +360,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             let r = lower_expr(b, arg);
                             b.push(Inst::Move { dst: *slot, src: r });
                         }
-                        b.push(Inst::Move { dst: val_slot, src: dst });
+                        b.push(Inst::Move {
+                            dst: val_slot,
+                            src: dst,
+                        });
                         let ret = b.alloc_reg();
                         let nm = b.module.intern_const(Const::String("set".into()));
                         b.push(Inst::CallMember {
@@ -291,13 +383,26 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let dst = b.alloc_reg();
             match op {
                 AstUnOp::Not => b.push(Inst::Not { dst, src: operand }),
-                AstUnOp::Neg => b.push(Inst::UnOp { dst, op: UnOp::Neg, operand }),
-                AstUnOp::Pos => b.push(Inst::UnOp { dst, op: UnOp::Plus, operand }),
+                AstUnOp::Neg => b.push(Inst::UnOp {
+                    dst,
+                    op: UnOp::Neg,
+                    operand,
+                }),
+                AstUnOp::Pos => b.push(Inst::UnOp {
+                    dst,
+                    op: UnOp::Plus,
+                    operand,
+                }),
                 AstUnOp::PreInc | AstUnOp::PreDec => unreachable!(),
             }
             dst
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             // Use a single destination register that both arms
             // write into via Move before jumping to the join.
             // Equivalent to a phi-node-driven SSA result without
@@ -308,7 +413,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let f_block = b.alloc_block();
             let join = b.alloc_block();
             let dst = b.alloc_reg();
-            b.terminate(Terminator::Branch { cond: cond_r, t: t_block, f: f_block });
+            b.terminate(Terminator::Branch {
+                cond: cond_r,
+                t: t_block,
+                f: f_block,
+            });
             // Then arm.
             b.switch_to(t_block);
             let t_val = lower_expr(b, then_branch);
@@ -336,12 +445,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // companion const before the Default singleton is ready).
             if segments.len() == 1
                 && let Some(owner) = b.owner_class().map(str::to_string)
-                    && b.resolve(&segments[0].name).is_none() {
-                        let key = (owner, segments[0].name.clone());
-                        if let Some(c) = b.module.registry.class_const_inits.get(&key).cloned() {
-                            return b.emit_const(c);
-                        }
-                    }
+                && b.resolve(&segments[0].name).is_none()
+            {
+                let key = (owner, segments[0].name.clone());
+                if let Some(c) = b.module.registry.class_const_inits.get(&key).cloned() {
+                    return b.emit_const(c);
+                }
+            }
             // Nested-object alias rewrite: when inside an outer class
             // whose lift renamed a `private object Inner` to
             // `Outer$Inner` (to avoid colliding with a same-named user
@@ -356,15 +466,19 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     .and_then(|m| m.get(&segments[0].name))
                     .cloned();
                 if let Some(renamed) = renamed
-                    && b.resolve(&segments[0].name).is_none() {
-                        let mut new_segs = segments.clone();
-                        new_segs[0] = klio_ast::Ident {
-                            name: renamed,
-                            span: segments[0].span,
-                        };
-                        let rewritten = Expr::Path { segments: new_segs, span: *span };
-                        return lower_expr(b, &rewritten);
-                    }
+                    && b.resolve(&segments[0].name).is_none()
+                {
+                    let mut new_segs = segments.clone();
+                    new_segs[0] = klio_ast::Ident {
+                        name: renamed,
+                        span: segments[0].span,
+                    };
+                    let rewritten = Expr::Path {
+                        segments: new_segs,
+                        span: *span,
+                    };
+                    return lower_expr(b, &rewritten);
+                }
             }
             if segments.len() == 1 {
                 // Bare `Unit` is the Unit singleton value (`fun
@@ -414,7 +528,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 if b.has_own_member(&segments[0].name) {
                     if let Some(this_reg) = b.resolve("this") {
                         let dst = b.alloc_reg();
-                        let nm = b.module.intern_const(Const::String(segments[0].name.clone()));
+                        let nm = b
+                            .module
+                            .intern_const(Const::String(segments[0].name.clone()));
                         b.push(Inst::GetField {
                             dst,
                             receiver: this_reg,
@@ -433,22 +549,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // a `companion object Key` vs `CoroutineContext.Key`)
                     // does not shadow the class's own companion.
                     if b.is_param_thunk()
-                        && let Some(owner) = b.owner_class().map(str::to_string) {
-                            let cls = b.alloc_reg();
-                            let on =
-                                b.module.intern_const(Const::String(owner));
-                            b.push(Inst::LoadGlobal { dst: cls, name: on });
-                            let dst = b.alloc_reg();
-                            let nm = b.module.intern_const(Const::String(
-                                segments[0].name.clone(),
-                            ));
-                            b.push(Inst::GetField {
-                                dst,
-                                receiver: cls,
-                                field: nm,
-                            });
-                            return dst;
-                        }
+                        && let Some(owner) = b.owner_class().map(str::to_string)
+                    {
+                        let cls = b.alloc_reg();
+                        let on = b.module.intern_const(Const::String(owner));
+                        b.push(Inst::LoadGlobal { dst: cls, name: on });
+                        let dst = b.alloc_reg();
+                        let nm = b
+                            .module
+                            .intern_const(Const::String(segments[0].name.clone()));
+                        b.push(Inst::GetField {
+                            dst,
+                            receiver: cls,
+                            field: nm,
+                        });
+                        return dst;
+                    }
                 }
                 // A bare name that is a known class is a class
                 // reference (`Segment.SIZE`, `Segment.new()`), not an
@@ -475,10 +591,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // unchanged (objects / no-companion classes are
                     // untouched).
                     let dst = b.alloc_reg();
-                    let sentinel = b.module.intern_const(Const::String(
-                        "<class-companion-or-self>".to_string(),
-                    ));
-                    b.push(Inst::GetField { dst, receiver: cls, field: sentinel });
+                    let sentinel = b
+                        .module
+                        .intern_const(Const::String("<class-companion-or-self>".to_string()));
+                    b.push(Inst::GetField {
+                        dst,
+                        receiver: cls,
+                        field: sentinel,
+                    });
                     return dst;
                 }
                 // A bare builtin type name used as a qualifier
@@ -489,16 +609,30 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // does at top level (the primitive-companion table).
                 if matches!(
                     segments[0].name.as_str(),
-                    "Int" | "Long" | "Short" | "Byte" | "Double" | "Float"
-                        | "Char" | "Boolean" | "String" | "UInt" | "ULong"
-                        | "UShort" | "UByte"
+                    "Int"
+                        | "Long"
+                        | "Short"
+                        | "Byte"
+                        | "Double"
+                        | "Float"
+                        | "Char"
+                        | "Boolean"
+                        | "String"
+                        | "UInt"
+                        | "ULong"
+                        | "UShort"
+                        | "UByte"
                 ) {
                     let this_idx = b.record_capture("this");
                     let dst = b.alloc_reg();
                     let name = b
                         .module
                         .intern_const(Const::String(segments[0].name.clone()));
-                    b.push(Inst::LoadFromThisOrGlobal { dst, this_idx, name });
+                    b.push(Inst::LoadFromThisOrGlobal {
+                        dst,
+                        this_idx,
+                        name,
+                    });
                     return dst;
                 }
                 // Not a local and not a known capture. Inside a
@@ -527,26 +661,31 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         .import_aliases
                         .get(&segments[0].name)
                         .and_then(|segs| {
-                            let cls_idx = segs
-                                .iter()
-                                .rposition(|s| b.module.class_id(s).is_some())?;
-                            (cls_idx + 1 < segs.len()).then(|| {
-                                (segs[cls_idx].clone(), segs[segs.len() - 1].clone())
-                            })
+                            let cls_idx =
+                                segs.iter().rposition(|s| b.module.class_id(s).is_some())?;
+                            (cls_idx + 1 < segs.len())
+                                .then(|| (segs[cls_idx].clone(), segs[segs.len() - 1].clone()))
                         })
-                    {
-                        let sp = segments[0].span;
-                        let qualified = Expr::Path {
-                            segments: vec![
-                                klio_ast::Ident { name: rewrite.0, span: sp },
-                                klio_ast::Ident { name: rewrite.1, span: sp },
-                            ],
-                            span: sp,
-                        };
-                        return lower_expr(b, &qualified);
-                    }
+                {
+                    let sp = segments[0].span;
+                    let qualified = Expr::Path {
+                        segments: vec![
+                            klio_ast::Ident {
+                                name: rewrite.0,
+                                span: sp,
+                            },
+                            klio_ast::Ident {
+                                name: rewrite.1,
+                                span: sp,
+                            },
+                        ],
+                        span: sp,
+                    };
+                    return lower_expr(b, &qualified);
+                }
                 if !b.is_param_thunk()
-                && let Some(this_reg) = b.resolve("this") {
+                    && let Some(this_reg) = b.resolve("this")
+                {
                     // A bare name that resolves to a known top-level
                     // function is a value-position function reference,
                     // not an implicit `this.<name>` field read. Skip
@@ -555,10 +694,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // Map, Array …) can synthesise misleading values
                     // for unknown field names that downstream calls
                     // then invoke as the callable.
-                    let is_known_global = b
-                        .module
-                        .func_id(&segments[0].name)
-                        .is_some();
+                    let is_known_global = b.module.func_id(&segments[0].name).is_some();
                     if !is_known_global {
                         let dst = b.alloc_reg();
                         let nm = b
@@ -574,8 +710,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 }
                 let this_idx = b.record_capture("this");
                 let dst = b.alloc_reg();
-                let name = b.module.intern_const(Const::String(segments[0].name.clone()));
-                b.push(Inst::LoadFromThisOrGlobal { dst, this_idx, name });
+                let name = b
+                    .module
+                    .intern_const(Const::String(segments[0].name.clone()));
+                b.push(Inst::LoadFromThisOrGlobal {
+                    dst,
+                    this_idx,
+                    name,
+                });
                 return dst;
             }
             // Multi-segment paths (`a.b.c`) lower as a chain of
@@ -629,7 +771,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             for seg in iter {
                 let next = b.alloc_reg();
                 let field = b.module.intern_const(Const::String(seg.name.clone()));
-                b.push(Inst::GetField { dst: next, receiver: cur, field });
+                b.push(Inst::GetField {
+                    dst: next,
+                    receiver: cur,
+                    field,
+                });
                 cur = next;
             }
             cur
@@ -648,15 +794,17 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             b.push(Inst::LoadCapture { dst, idx });
                             b.bind(ident.name.clone(), dst);
                             dst
-                        } else if b.has_own_member(&ident.name)
-                            && b.resolve("this").is_some()
-                        {
+                        } else if b.has_own_member(&ident.name) && b.resolve("this").is_some() {
                             // Inside a method body, unqualified
                             // `$name` resolves through `this.name`.
                             let this_reg = b.resolve("this").unwrap();
                             let dst = b.alloc_reg();
                             let nm = b.module.intern_const(Const::String(ident.name.clone()));
-                            b.push(Inst::GetField { dst, receiver: this_reg, field: nm });
+                            b.push(Inst::GetField {
+                                dst,
+                                receiver: this_reg,
+                                field: nm,
+                            });
                             dst
                         } else if let Some(this_reg) = b.resolve("this") {
                             // `$name` inside an extension fn /
@@ -666,8 +814,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             // falls through to globals when the
                             // field isn't on the instance.
                             let dst = b.alloc_reg();
-                            let n =
-                                b.module.intern_const(Const::String(ident.name.clone()));
+                            let n = b.module.intern_const(Const::String(ident.name.clone()));
                             b.push(Inst::GetField {
                                 dst,
                                 receiver: this_reg,
@@ -694,7 +841,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     klio_ast::StringPart::Interp(e) => lower_expr(b, e),
                 };
                 let dst = b.alloc_reg();
-                b.push(Inst::BinOp { dst, op: BinOp::StringConcat, lhs: cur, rhs: piece });
+                b.push(Inst::BinOp {
+                    dst,
+                    op: BinOp::StringConcat,
+                    lhs: cur,
+                    rhs: piece,
+                });
                 cur = dst;
             }
             cur
@@ -707,7 +859,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
 
             b.switch_to(header);
             let c = lower_expr(b, cond);
-            b.terminate(Terminator::Branch { cond: c, t: body_blk, f: exit });
+            b.terminate(Terminator::Branch {
+                cond: c,
+                t: body_blk,
+                f: exit,
+            });
 
             b.switch_to(body_blk);
             b.push_loop(None, header, exit);
@@ -718,18 +874,32 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.switch_to(exit);
             b.emit_const(Const::Unit)
         }
-        Expr::Member { receiver, name, safe, .. } if *safe => {
+        Expr::Member {
+            receiver,
+            name,
+            safe,
+            ..
+        } if *safe => {
             // `recv?.x` — null-guard: if recv is null, the whole
             // expression is null; otherwise read the field.
             let recv = lower_receiver(b, receiver);
             let null_r = b.emit_const(Const::Null);
             let is_null = b.alloc_reg();
-            b.push(Inst::BinOp { dst: is_null, op: BinOp::Eq, lhs: recv, rhs: null_r });
+            b.push(Inst::BinOp {
+                dst: is_null,
+                op: BinOp::Eq,
+                lhs: recv,
+                rhs: null_r,
+            });
             let then_b = b.alloc_block();
             let else_b = b.alloc_block();
             let join = b.alloc_block();
             let dst = b.alloc_reg();
-            b.terminate(Terminator::Branch { cond: is_null, t: then_b, f: else_b });
+            b.terminate(Terminator::Branch {
+                cond: is_null,
+                t: then_b,
+                f: else_b,
+            });
             // null branch: dst = null
             b.switch_to(then_b);
             let n = b.emit_const(Const::Null);
@@ -739,7 +909,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.switch_to(else_b);
             let field = b.module.intern_const(Const::String(name.name.clone()));
             let v = b.alloc_reg();
-            b.push(Inst::GetField { dst: v, receiver: recv, field });
+            b.push(Inst::GetField {
+                dst: v,
+                receiver: recv,
+                field,
+            });
             b.push(Inst::Move { dst, src: v });
             b.terminate(Terminator::Goto(join));
             b.switch_to(join);
@@ -752,33 +926,36 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // an overriding getter, e.g. `override val isActive get()
             // = super.isActive`, and recurse forever). Mirrors the
             // `super.method(...)` CallSuper path.
-            if let Expr::Super { qualifier, label, .. } = receiver.as_ref()
+            if let Expr::Super {
+                qualifier, label, ..
+            } = receiver.as_ref()
                 && let Some(this_reg) = b.resolve("this")
-                    && let Some(owner) = b.owner_class().map(std::string::ToString::to_string) {
-                        let dst = b.alloc_reg();
-                        let nm = b.module.intern_const(Const::String(name.name.clone()));
-                        let oc = b.module.intern_const(Const::String(owner));
-                        let qual_const = qualifier
+                && let Some(owner) = b.owner_class().map(std::string::ToString::to_string)
+            {
+                let dst = b.alloc_reg();
+                let nm = b.module.intern_const(Const::String(name.name.clone()));
+                let oc = b.module.intern_const(Const::String(owner));
+                let qual_const = qualifier
+                    .as_ref()
+                    .map(|t| b.module.intern_const(Const::String(t.name.name.clone())))
+                    .or_else(|| {
+                        label
                             .as_ref()
-                            .map(|t| b.module.intern_const(Const::String(t.name.name.clone())))
-                            .or_else(|| {
-                                label.as_ref().map(|id| {
-                                    b.module.intern_const(Const::String(id.name.clone()))
-                                })
-                            });
-                        let args_start = b.alloc_reg();
-                        b.push(Inst::CallSuper {
-                            dst,
-                            receiver: this_reg,
-                            owner_class: oc,
-                            qualifier: qual_const,
-                            name: nm,
-                            args: args_start,
-                            n_args: 0,
-                            arg_names: Vec::new(),
-                        });
-                        return dst;
-                    }
+                            .map(|id| b.module.intern_const(Const::String(id.name.clone())))
+                    });
+                let args_start = b.alloc_reg();
+                b.push(Inst::CallSuper {
+                    dst,
+                    receiver: this_reg,
+                    owner_class: oc,
+                    qualifier: qual_const,
+                    name: nm,
+                    args: args_start,
+                    n_args: 0,
+                    arg_names: Vec::new(),
+                });
+                return dst;
+            }
             // Flatten chains like `kotlin.math.PI` into a single FQN
             // lookup against the host when the head is an unresolved
             // identifier (i.e. not a local). Stdlib package roots
@@ -804,16 +981,20 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         // head could be `this.<head>`; don't
                         // shortcut to a global FQN.
                         && b.resolve("this").is_none()
-                    {
-                        let dst = b.alloc_reg();
-                        let n = b.module.intern_const(Const::String(fqn));
-                        b.push(Inst::LoadGlobal { dst, name: n });
-                        return dst;
-                    }
+            {
+                let dst = b.alloc_reg();
+                let n = b.module.intern_const(Const::String(fqn));
+                b.push(Inst::LoadGlobal { dst, name: n });
+                return dst;
+            }
             let recv = lower_receiver(b, receiver);
             let dst = b.alloc_reg();
             let field = b.module.intern_const(Const::String(name.name.clone()));
-            b.push(Inst::GetField { dst, receiver: recv, field });
+            b.push(Inst::GetField {
+                dst,
+                receiver: recv,
+                field,
+            });
             dst
         }
         Expr::Index { receiver, args, .. } => {
@@ -844,19 +1025,24 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         // normal dispatch so the splice graph stays bounded. (A member
         // function can never be `reified`, so a reified inline target
         // resolved by name is always the intended extension.)
-        Expr::Call { callee, args, arg_names: ast_arg_names, type_args: ast_type_args, is_infix, .. }
-            if !*is_infix
-                && !ast_type_args.is_empty()
-                && matches!(callee.as_ref(), Expr::Member { safe: false, .. })
-                && match callee.as_ref() {
-                    Expr::Member { name, .. } => inline_fn_ast(&name.name)
-                        .is_some_and(|f| {
-                            f.receiver_type.is_some()
-                                && f.type_params.iter().any(|tp| tp.is_reified)
-                        })
-                        && !b.inline_in_progress(&name.name),
-                    _ => false,
-                } =>
+        Expr::Call {
+            callee,
+            args,
+            arg_names: ast_arg_names,
+            type_args: ast_type_args,
+            is_infix,
+            ..
+        } if !*is_infix
+            && !ast_type_args.is_empty()
+            && matches!(callee.as_ref(), Expr::Member { safe: false, .. })
+            && match callee.as_ref() {
+                Expr::Member { name, .. } => {
+                    inline_fn_ast(&name.name).is_some_and(|f| {
+                        f.receiver_type.is_some() && f.type_params.iter().any(|tp| tp.is_reified)
+                    }) && !b.inline_in_progress(&name.name)
+                }
+                _ => false,
+            } =>
         {
             let Expr::Member { receiver, name, .. } = callee.as_ref() else {
                 unreachable!()
@@ -895,9 +1081,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         // stdlib-dispatch arm, because dispatching `repeat` to its
         // Rust binding would run a suspending body in a
         // non-resumable Rust frame.
-        Expr::Call { callee, args, arg_names: ast_arg_names, .. }
-            if matches!(callee.as_ref(), Expr::Member { safe: true, .. }) =>
-        {
+        Expr::Call {
+            callee,
+            args,
+            arg_names: ast_arg_names,
+            ..
+        } if matches!(callee.as_ref(), Expr::Member { safe: true, .. }) => {
             // `recv?.m(args)` — null-guard the whole call: if the
             // receiver is null the call expression is null, otherwise
             // dispatch the member. Mirrors the safe-field path.
@@ -907,12 +1096,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let recv = lower_receiver(b, receiver);
             let null_r = b.emit_const(Const::Null);
             let is_null = b.alloc_reg();
-            b.push(Inst::BinOp { dst: is_null, op: BinOp::Eq, lhs: recv, rhs: null_r });
+            b.push(Inst::BinOp {
+                dst: is_null,
+                op: BinOp::Eq,
+                lhs: recv,
+                rhs: null_r,
+            });
             let then_b = b.alloc_block();
             let else_b = b.alloc_block();
             let join = b.alloc_block();
             let dst = b.alloc_reg();
-            b.terminate(Terminator::Branch { cond: is_null, t: then_b, f: else_b });
+            b.terminate(Terminator::Branch {
+                cond: is_null,
+                t: then_b,
+                f: else_b,
+            });
             b.switch_to(then_b);
             let n = b.emit_const(Const::Null);
             b.push(Inst::Move { dst, src: n });
@@ -935,33 +1133,52 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.switch_to(join);
             dst
         }
-        Expr::Call { callee, args, is_infix, .. }
-            if !*is_infix
-                && args.len() == 2
-                && matches!(&args[1], Expr::Lambda { .. })
-                && matches!(callee.as_ref(), Expr::Path { segments, .. }
+        Expr::Call {
+            callee,
+            args,
+            is_infix,
+            ..
+        } if !*is_infix
+            && args.len() == 2
+            && matches!(&args[1], Expr::Lambda { .. })
+            && matches!(callee.as_ref(), Expr::Path { segments, .. }
                     if segments.len() == 1
                         && segments[0].name == "repeat"
                         && b.resolve("repeat").is_none()
                         && b.module.func_id("repeat").is_none()) =>
         {
-            let Expr::Lambda { params, body, .. } = &args[1] else { unreachable!() };
+            let Expr::Lambda { params, body, .. } = &args[1] else {
+                unreachable!()
+            };
             let n_reg = lower_expr(b, &args[0]);
             let i_reg = b.alloc_reg();
             let zero = b.emit_const(Const::Int(0));
-            b.push(Inst::Move { dst: i_reg, src: zero });
+            b.push(Inst::Move {
+                dst: i_reg,
+                src: zero,
+            });
             let header = b.alloc_block();
             let body_blk = b.alloc_block();
             let exit = b.alloc_block();
             b.terminate(Terminator::Goto(header));
             b.switch_to(header);
             let cond = b.alloc_reg();
-            b.push(Inst::BinOp { dst: cond, op: BinOp::Less, lhs: i_reg, rhs: n_reg });
-            b.terminate(Terminator::Branch { cond, t: body_blk, f: exit });
+            b.push(Inst::BinOp {
+                dst: cond,
+                op: BinOp::Less,
+                lhs: i_reg,
+                rhs: n_reg,
+            });
+            b.terminate(Terminator::Branch {
+                cond,
+                t: body_blk,
+                f: exit,
+            });
             b.switch_to(body_blk);
             b.push_scope();
             let pname = params
-                .first().map_or_else(|| "it".to_string(), |p| p.name.clone());
+                .first()
+                .map_or_else(|| "it".to_string(), |p| p.name.clone());
             b.bind(pname, i_reg);
             b.push_loop(None, header, exit);
             let _ = lower_block(b, body);
@@ -969,23 +1186,38 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.pop_scope();
             let one = b.emit_const(Const::Int(1));
             let nexti = b.alloc_reg();
-            b.push(Inst::BinOp { dst: nexti, op: BinOp::Add, lhs: i_reg, rhs: one });
-            b.push(Inst::Move { dst: i_reg, src: nexti });
+            b.push(Inst::BinOp {
+                dst: nexti,
+                op: BinOp::Add,
+                lhs: i_reg,
+                rhs: one,
+            });
+            b.push(Inst::Move {
+                dst: i_reg,
+                src: nexti,
+            });
             b.terminate(Terminator::Goto(header));
             b.switch_to(exit);
             b.emit_const(Const::Unit)
         }
-        Expr::Call { callee, args, arg_names: ast_arg_names, is_infix, .. }
-            if args.iter().any(|a| lambda_writes_outer_var(b, a))
-                && matches!(callee.as_ref(), Expr::Member { .. })
-                && !*is_infix =>
+        Expr::Call {
+            callee,
+            args,
+            arg_names: ast_arg_names,
+            is_infix,
+            ..
+        } if args.iter().any(|a| lambda_writes_outer_var(b, a))
+            && matches!(callee.as_ref(), Expr::Member { .. })
+            && !*is_infix =>
         {
             // Call passing a lambda that assigns to an outer-scope
             // variable. Emit a normal CallMember and a
             // WritebackCaptures Inst for each closure-mutating
             // lambda so the env's mutations are synced back to
             // the caller's regs after the call returns.
-            let Expr::Member { receiver, name, .. } = callee.as_ref() else { unreachable!() };
+            let Expr::Member { receiver, name, .. } = callee.as_ref() else {
+                unreachable!()
+            };
             let recv = lower_receiver(b, receiver);
             // Lower args individually so we can remember each
             // lambda's reg for writeback.
@@ -1000,7 +1232,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 Reg(0)
             } else {
                 let start = b.alloc_reg();
-                b.push(Inst::Move { dst: start, src: arg_regs[0] });
+                b.push(Inst::Move {
+                    dst: start,
+                    src: arg_regs[0],
+                });
                 for r in &arg_regs[1..] {
                     let slot = b.alloc_reg();
                     b.push(Inst::Move { dst: slot, src: *r });
@@ -1037,14 +1272,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                 }
                 if !names.is_empty() {
-                    b.push(Inst::WritebackCaptures { lambda: lambda_reg, names, dsts });
+                    b.push(Inst::WritebackCaptures {
+                        lambda: lambda_reg,
+                        names,
+                        dsts,
+                    });
                 }
             }
             dst
         }
-        Expr::Call { callee, args, arg_names: ast_arg_names, type_args: ast_type_args, .. }
-            if args.iter().any(|a| lambda_writes_outer_var(b, a))
-                && matches!(callee.as_ref(), Expr::Path { .. }) =>
+        Expr::Call {
+            callee,
+            args,
+            arg_names: ast_arg_names,
+            type_args: ast_type_args,
+            ..
+        } if args.iter().any(|a| lambda_writes_outer_var(b, a))
+            && matches!(callee.as_ref(), Expr::Path { .. }) =>
         {
             // Top-level fn call passing a closure-mutating lambda.
             // Lower as Call{func}/CallValue against the resolved
@@ -1063,38 +1307,40 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // lands in a value parameter.
             let mut run_regs: Vec<Reg> = Vec::with_capacity(arg_regs.len() + 1);
             if let Expr::Path { segments, .. } = callee.as_ref()
-                && segments.len() == 1 {
-                    let needs_this = b
-                        .module
-                        .func_id(&segments[0].name)
-                        .and_then(|fid| b.module.funcs.get(fid.0 as usize))
-                        .is_some_and(|f| {
-                            f.params.first().is_some_and(|p| p.name == "this")
-                        });
-                    if needs_this {
-                        let this_reg = b.resolve("this").or_else(|| {
-                            if b.knows_outer("this") || b.is_lambda_body() {
-                                let idx = b.record_capture("this");
-                                let d = b.alloc_reg();
-                                b.push(Inst::LoadCapture { dst: d, idx });
-                                b.bind("this".to_string(), d);
-                                Some(d)
-                            } else {
-                                None
-                            }
-                        });
-                        if let Some(tr) = this_reg {
-                            run_regs.push(tr);
+                && segments.len() == 1
+            {
+                let needs_this = b
+                    .module
+                    .func_id(&segments[0].name)
+                    .and_then(|fid| b.module.funcs.get(fid.0 as usize))
+                    .is_some_and(|f| f.params.first().is_some_and(|p| p.name == "this"));
+                if needs_this {
+                    let this_reg = b.resolve("this").or_else(|| {
+                        if b.knows_outer("this") || b.is_lambda_body() {
+                            let idx = b.record_capture("this");
+                            let d = b.alloc_reg();
+                            b.push(Inst::LoadCapture { dst: d, idx });
+                            b.bind("this".to_string(), d);
+                            Some(d)
+                        } else {
+                            None
                         }
+                    });
+                    if let Some(tr) = this_reg {
+                        run_regs.push(tr);
                     }
                 }
+            }
             run_regs.extend_from_slice(&arg_regs);
             let n_args = run_regs.len() as u8;
             let args_start = if run_regs.is_empty() {
                 Reg(0)
             } else {
                 let start = b.alloc_reg();
-                b.push(Inst::Move { dst: start, src: run_regs[0] });
+                b.push(Inst::Move {
+                    dst: start,
+                    src: run_regs[0],
+                });
                 for r in &run_regs[1..] {
                     let slot = b.alloc_reg();
                     b.push(Inst::Move { dst: slot, src: *r });
@@ -1108,7 +1354,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 arg_names.insert(0, None);
             }
             let dst = b.alloc_reg();
-            let Expr::Path { segments, .. } = callee.as_ref() else { unreachable!() };
+            let Expr::Path { segments, .. } = callee.as_ref() else {
+                unreachable!()
+            };
             if segments.len() == 1 {
                 if let Some(func_id) = b.module.func_id(&segments[0].name) {
                     let type_args = intern_type_args(b.module, ast_type_args);
@@ -1129,14 +1377,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // implicit `this.` inside a method body, turning
                     // `run { … }` into `this.run` and invoking the
                     // receiver instance.
-                    let callee_r = if b.resolve(&segments[0].name).is_some()
-                    {
+                    let callee_r = if b.resolve(&segments[0].name).is_some() {
                         lower_expr(b, callee)
                     } else {
                         let r = b.alloc_reg();
-                        let n = b.module.intern_const(Const::String(
-                            segments[0].name.clone(),
-                        ));
+                        let n = b
+                            .module
+                            .intern_const(Const::String(segments[0].name.clone()));
                         b.push(Inst::LoadGlobal { dst: r, name: n });
                         r
                     };
@@ -1174,14 +1421,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                 }
                 if !names.is_empty() {
-                    b.push(Inst::WritebackCaptures { lambda: lambda_reg, names, dsts });
+                    b.push(Inst::WritebackCaptures {
+                        lambda: lambda_reg,
+                        names,
+                        dsts,
+                    });
                 }
             }
             dst
         }
-        Expr::Call { callee, args, arg_names: ast_arg_names, .. }
-            if args.iter().any(|a| matches!(a, Expr::Spread { .. })) =>
-        {
+        Expr::Call {
+            callee,
+            args,
+            arg_names: ast_arg_names,
+            ..
+        } if args.iter().any(|a| matches!(a, Expr::Spread { .. })) => {
             // Calls containing a `*spread` argument: emit a
             // `CallSpread` Inst whose `parts` list flags each arg
             // as positional or spread. The evaluator flattens the
@@ -1191,10 +1445,16 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             for a in args {
                 if let Expr::Spread { expr: inner, .. } = a {
                     let r = lower_expr(b, inner);
-                    parts.push(crate::SpreadPart { reg: r, is_spread: true });
+                    parts.push(crate::SpreadPart {
+                        reg: r,
+                        is_spread: true,
+                    });
                 } else {
                     let r = lower_expr(b, a);
-                    parts.push(crate::SpreadPart { reg: r, is_spread: false });
+                    parts.push(crate::SpreadPart {
+                        reg: r,
+                        is_spread: false,
+                    });
                 }
             }
             let arg_names = intern_arg_names(b.module, ast_arg_names);
@@ -1207,7 +1467,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             });
             dst
         }
-        Expr::Call { callee, args, arg_names: ast_arg_names, type_args: ast_type_args, is_infix, .. } => {
+        Expr::Call {
+            callee,
+            args,
+            arg_names: ast_arg_names,
+            type_args: ast_type_args,
+            is_infix,
+            ..
+        } => {
             // Inline expansion (suspend-inline only). A bare `Path`
             // callee that names a lambda parameter of the enclosing
             // inline frame is spliced; one that names a registered
@@ -1217,105 +1484,110 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // normal call via `None`.
             if !*is_infix
                 && let Expr::Path { segments, .. } = callee.as_ref()
-                    && segments.len() == 1 {
-                        let nm = &segments[0].name;
-                        if let Some(lam) = b.inline_lambda_for(nm) {
-                            return splice_inline_lambda(b, &lam, args);
-                        }
-                        if let Some(f) = inline_fn_ast(nm) {
-                            // Inline a suspending builder (continuation
-                            // capture), an inline fn whose lambda arg
-                            // does a non-local `return` (must target
-                            // the caller's frame), or any `inline fun
-                            // <reified T>` (`T::class` / `is T` reads
-                            // in the body need the call-site type
-                            // argument substituted at splice time —
-                            // the non-splice path has no `Inst` to
-                            // bind a runtime type-parameter value).
-                            // Other inline calls keep the normal call
-                            // path so the splice graph cannot expand
-                            // combinatorially through Flow / Channel
-                            // operator chains.
-                            let has_reified =
-                                f.type_params.iter().any(|tp| tp.is_reified);
-                            let needs_inline = f.is_suspend
-                                || arg_lambda_has_nonlocal_return(args)
-                                || has_reified;
-                            if needs_inline
-                                && let Some(r) = try_inline_call_with_type_args(
-                                    b,
-                                    nm,
-                                    args,
-                                    ast_arg_names,
-                                    None,
-                                    ast_type_args,
-                                ) {
-                                    return r;
-                                }
-                        }
+                && segments.len() == 1
+            {
+                let nm = &segments[0].name;
+                if let Some(lam) = b.inline_lambda_for(nm) {
+                    return splice_inline_lambda(b, &lam, args);
+                }
+                if let Some(f) = inline_fn_ast(nm) {
+                    // Inline a suspending builder (continuation
+                    // capture), an inline fn whose lambda arg
+                    // does a non-local `return` (must target
+                    // the caller's frame), or any `inline fun
+                    // <reified T>` (`T::class` / `is T` reads
+                    // in the body need the call-site type
+                    // argument substituted at splice time —
+                    // the non-splice path has no `Inst` to
+                    // bind a runtime type-parameter value).
+                    // Other inline calls keep the normal call
+                    // path so the splice graph cannot expand
+                    // combinatorially through Flow / Channel
+                    // operator chains.
+                    let has_reified = f.type_params.iter().any(|tp| tp.is_reified);
+                    let needs_inline =
+                        f.is_suspend || arg_lambda_has_nonlocal_return(args) || has_reified;
+                    if needs_inline
+                        && let Some(r) = try_inline_call_with_type_args(
+                            b,
+                            nm,
+                            args,
+                            ast_arg_names,
+                            None,
+                            ast_type_args,
+                        )
+                    {
+                        return r;
                     }
+                }
+            }
             // Infix call `a fn b` lowers as `a.fn(b)` — the
             // dispatch site is a member call on the receiver
             // even when `fn` is a top-level extension.
-            if *is_infix && args.len() == 2
+            if *is_infix
+                && args.len() == 2
                 && let Expr::Path { segments, .. } = callee.as_ref()
-                    && segments.len() == 1 {
-                        let recv = lower_expr(b, &args[0]);
-                        let (args_start, count) = lower_arg_run(b, &args[1..]);
-                        let arg_names = intern_arg_names(b.module, ast_arg_names);
-                        let dst = b.alloc_reg();
-                        let nm = b
-                            .module
-                            .intern_const(Const::String(segments[0].name.clone()));
-                        b.push(Inst::CallMember {
-                            dst,
-                            receiver: recv,
-                            name: nm,
-                            args: args_start,
-                            n_args: count,
-                            arg_names,
-                        });
-                        return dst;
-                    }
+                && segments.len() == 1
+            {
+                let recv = lower_expr(b, &args[0]);
+                let (args_start, count) = lower_arg_run(b, &args[1..]);
+                let arg_names = intern_arg_names(b.module, ast_arg_names);
+                let dst = b.alloc_reg();
+                let nm = b
+                    .module
+                    .intern_const(Const::String(segments[0].name.clone()));
+                b.push(Inst::CallMember {
+                    dst,
+                    receiver: recv,
+                    name: nm,
+                    args: args_start,
+                    n_args: count,
+                    arg_names,
+                });
+                return dst;
+            }
             // `suspend { … }` builder — the `suspend` keyword in
             // expression position is just a marker that the lambda
             // is suspending. Lower the lambda as-is; the IR's
             // existing lambda evaluator handles suspend bodies.
             if let Expr::Path { segments, .. } = callee.as_ref()
                 && segments.len() == 1
-                    && segments[0].name == "suspend"
-                    && args.len() == 1
-                    && matches!(args[0], Expr::Lambda { .. })
-                {
-                    return lower_expr(b, &args[0]);
-                }
+                && segments[0].name == "suspend"
+                && args.len() == 1
+                && matches!(args[0], Expr::Lambda { .. })
+            {
+                return lower_expr(b, &args[0]);
+            }
             // `contract { … }` (kotlin.contracts) is a compile-time
             // marker with no runtime effect. Its lambda is a DSL of
             // `returns()/implies(...)` calls that must NOT execute, so
             // drop the whole call and yield Unit.
             if let Expr::Path { segments, .. } = callee.as_ref()
                 && segments.len() == 1
-                    && segments[0].name == "contract"
-                    && args.len() == 1
-                    && matches!(args[0], Expr::Lambda { .. })
-                {
-                    return b.emit_const(Const::Unit);
-                }
+                && segments[0].name == "contract"
+                && args.len() == 1
+                && matches!(args[0], Expr::Lambda { .. })
+            {
+                return b.emit_const(Const::Unit);
+            }
             // Self-call inside a tailrec fn → TailJump terminator
             // instead of a regular Call. Re-binds params and
             // restarts the function's entry block.
             if let Expr::Path { segments, .. } = callee.as_ref()
                 && segments.len() == 1
-                    && b.tailrec_self().is_some_and(|n| n == segments[0].name)
-                {
-                    let (args_start, count) = lower_arg_run(b, args);
-                    b.terminate(Terminator::TailJump { args: args_start, n_args: count });
-                    // Start a dead block so subsequent lowering
-                    // has a valid current block (unreachable).
-                    let dead = b.alloc_block();
-                    b.switch_to(dead);
-                    return b.emit_const(Const::Unit);
-                }
+                && b.tailrec_self().is_some_and(|n| n == segments[0].name)
+            {
+                let (args_start, count) = lower_arg_run(b, args);
+                b.terminate(Terminator::TailJump {
+                    args: args_start,
+                    n_args: count,
+                });
+                // Start a dead block so subsequent lowering
+                // has a valid current block (unreachable).
+                let dead = b.alloc_block();
+                b.switch_to(dead);
+                return b.emit_const(Const::Unit);
+            }
             // A single-name callee that resolves to a local binding
             // or parameter is a value invocation — the local
             // shadows any same-named top-level function — a lambda
@@ -1323,693 +1595,310 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // must bind to the parameter at the call site, not to the
             // global function.
             if let Expr::Path { segments, .. } = callee.as_ref()
-                && segments.len() == 1 {
-                    // Kotlin keeps the function and property namespaces
-                    // separate: in call position `name(args)` resolves
-                    // to a member function of the enclosing class (own
-                    // or inherited) even when a same-named value/param
-                    // is in scope (`init { if (flag) flag(x) }` where
-                    // `flag` is both a ctor param and a method). Only a
-                    // genuine local function shadows; a same-named
-                    // member function outranks the value, so skip the
-                    // value-invocation path and fall through to member
-                    // dispatch. A bare param that is not a hierarchy
-                    // member still invokes the value.
-                    let redirect_to_member = {
-                        let n = &segments[0].name;
-                        let is_hierarchy_method = b
-                            .owner_class()
-                            .and_then(|oc| {
-                                b.module.registry.hierarchy_methods.get(oc)
-                            })
-                            .is_some_and(|s| s.contains(n));
-                        // Only intervene when a value/param actually
-                        // shadows the method name — otherwise the
-                        // normal member/function dispatch below is
-                        // already correct and must not be rerouted.
-                        is_hierarchy_method
-                            && b.resolve(n).is_some()
-                            && !b.is_local_fn(n)
-                            && !b.is_local_ext_fn(n)
-                            && b.resolve("this").is_some()
-                    };
-                    if redirect_to_member {
-                        // `name(args)` where `name` names both a
-                        // hierarchy member function and an in-scope
-                        // value. Kotlin's choice depends on whether
-                        // the value is invocable — known only at
-                        // runtime — so emit `CallValueOrMember`: the
-                        // value is invoked if invocable (a function
-                        // type / `operator fun invoke`, the closer
-                        // scope), otherwise the member function runs.
-                        let this_reg = b.resolve("this").expect("this bound");
-                        let callee_reg =
-                            b.resolve(&segments[0].name).expect("shadowing value");
-                        let callee_reg = if b.is_boxed(&segments[0].name) {
-                            let c = b.alloc_reg();
-                            b.push(Inst::CellGet { dst: c, cell: callee_reg });
-                            c
-                        } else {
-                            callee_reg
-                        };
-                        let (args_start, count) = lower_arg_run(b, args);
-                        let arg_names = intern_arg_names(b.module, ast_arg_names);
-                        let dst = b.alloc_reg();
-                        let nm = b
-                            .module
-                            .intern_const(Const::String(segments[0].name.clone()));
-                        b.push(Inst::CallValueOrMember {
-                            dst,
-                            callee: callee_reg,
-                            this_recv: this_reg,
-                            name: nm,
-                            args: args_start,
-                            n_args: count,
-                            arg_names,
+                && segments.len() == 1
+            {
+                // Kotlin keeps the function and property namespaces
+                // separate: in call position `name(args)` resolves
+                // to a member function of the enclosing class (own
+                // or inherited) even when a same-named value/param
+                // is in scope (`init { if (flag) flag(x) }` where
+                // `flag` is both a ctor param and a method). Only a
+                // genuine local function shadows; a same-named
+                // member function outranks the value, so skip the
+                // value-invocation path and fall through to member
+                // dispatch. A bare param that is not a hierarchy
+                // member still invokes the value.
+                let redirect_to_member = {
+                    let n = &segments[0].name;
+                    let is_hierarchy_method = b
+                        .owner_class()
+                        .and_then(|oc| b.module.registry.hierarchy_methods.get(oc))
+                        .is_some_and(|s| s.contains(n));
+                    // Only intervene when a value/param actually
+                    // shadows the method name — otherwise the
+                    // normal member/function dispatch below is
+                    // already correct and must not be rerouted.
+                    is_hierarchy_method
+                        && b.resolve(n).is_some()
+                        && !b.is_local_fn(n)
+                        && !b.is_local_ext_fn(n)
+                        && b.resolve("this").is_some()
+                };
+                if redirect_to_member {
+                    // `name(args)` where `name` names both a
+                    // hierarchy member function and an in-scope
+                    // value. Kotlin's choice depends on whether
+                    // the value is invocable — known only at
+                    // runtime — so emit `CallValueOrMember`: the
+                    // value is invoked if invocable (a function
+                    // type / `operator fun invoke`, the closer
+                    // scope), otherwise the member function runs.
+                    let this_reg = b.resolve("this").expect("this bound");
+                    let callee_reg = b.resolve(&segments[0].name).expect("shadowing value");
+                    let callee_reg = if b.is_boxed(&segments[0].name) {
+                        let c = b.alloc_reg();
+                        b.push(Inst::CellGet {
+                            dst: c,
+                            cell: callee_reg,
                         });
-                        return dst;
-                    }
-                    if let Some(reg) = b.resolve(&segments[0].name) {
-                        // A boxed `var` (captured + reassigned, e.g. a
-                        // recursive `lateinit var f = { … f(…) … }`)
-                        // holds a shared Cell; unwrap it to the
-                        // current callable before invoking.
-                        let callee_reg = if b.is_boxed(&segments[0].name) {
-                            let c = b.alloc_reg();
-                            b.push(Inst::CellGet { dst: c, cell: reg });
-                            c
-                        } else {
-                            reg
-                        };
-                        // A bare call to a parameter whose declared
-                        // type is a receiver-typed function
-                        // (`block: T.() -> R`) dispatches with the
-                        // enclosing `this` as the receiver — matching
-                        // kotlinc's rewrite of `block()` to
-                        // `this.block()` inside such a fn.
-                        if b.is_receiver_lambda_param(&segments[0].name) {
-                            let this_reg = b.resolve("this").or_else(|| {
-                                if b.knows_outer("this") || b.is_lambda_body() {
-                                    let idx = b.record_capture("this");
-                                    let d = b.alloc_reg();
-                                    b.push(Inst::LoadCapture { dst: d, idx });
-                                    Some(d)
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(this_reg) = this_reg {
-                                let (args_start, count) = lower_arg_run(b, args);
-                                let arg_names =
-                                    intern_arg_names(b.module, ast_arg_names);
-                                let dst = b.alloc_reg();
-                                b.push(Inst::CallValueWithThis {
-                                    dst,
-                                    callee: callee_reg,
-                                    receiver: this_reg,
-                                    args: args_start,
-                                    n_args: count,
-                                    arg_names,
-                                });
-                                return dst;
-                            }
-                        }
-                        // A bare call to a *local extension* function
-                        // (`fun Appendable.two(x)` declared in this
-                        // scope, called `two(n)`) takes the enclosing
-                        // implicit receiver as its first `this` param;
-                        // prepend it so the user args don't slot into
-                        // the receiver position.
-                        if b.is_local_ext_fn(&segments[0].name) {
-                            let this_reg = b.resolve("this").or_else(|| {
-                                if b.knows_outer("this") || b.is_lambda_body() {
-                                    let idx = b.record_capture("this");
-                                    let d = b.alloc_reg();
-                                    b.push(Inst::LoadCapture { dst: d, idx });
-                                    Some(d)
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(this_reg) = this_reg {
-                                let recv = b.alloc_reg();
-                                b.push(Inst::Move { dst: recv, src: this_reg });
-                                let mut vals: Vec<Reg> =
-                                    Vec::with_capacity(args.len() + 1);
-                                vals.push(recv);
-                                for a in args {
-                                    vals.push(lower_expr(b, a));
-                                }
-                                let args_start = b.alloc_reg();
-                                b.push(Inst::Move { dst: args_start, src: vals[0] });
-                                for v in &vals[1..] {
-                                    let slot = b.alloc_reg();
-                                    b.push(Inst::Move { dst: slot, src: *v });
-                                }
-                                let arg_names =
-                                    intern_arg_names(b.module, ast_arg_names);
-                                let dst = b.alloc_reg();
-                                b.push(Inst::CallValue {
-                                    dst,
-                                    callee: callee_reg,
-                                    args: args_start,
-                                    n_args: (vals.len()) as u8,
-                                    arg_names,
-                                });
-                                return dst;
-                            }
-                        }
-                        let (args_start, count) = lower_arg_run(b, args);
-                        let arg_names = intern_arg_names(b.module, ast_arg_names);
-                        let dst = b.alloc_reg();
-                        b.push(Inst::CallValue {
-                            dst,
-                            callee: callee_reg,
-                            args: args_start,
-                            n_args: count,
-                            arg_names,
-                        });
-                        return dst;
-                    }
-                }
-            // Path-callee with a registered top-level fn → Call{func}.
-            if let Expr::Path { segments, .. } = callee.as_ref()
-                && segments.len() == 1 {
-                    // When a class and a top-level function share
-                    // this name (a class plus a same-named factory
-                    // function), the call is a constructor
-                    // invocation whenever the function isn't
-                    // applicable to the supplied argument count.
-                    // Defer to the NewInstance path below so the
-                    // Vm's ctor overload resolution picks the right
-                    // (possibly private/secondary) constructor.
-                    // Only kicks in on the class+function name
-                    // clash, so ordinary default/vararg calls are
-                    // unaffected.
-                    // The factory function is applicable whenever it
-                    // can accept the supplied positional count —
-                    // fewer args than params is fine (trailing params
-                    // are defaulted, e.g. the all-default
-                    // `fun DateTimePeriod(years=0, months=0, …)`
-                    // factory beside `sealed class DateTimePeriod`).
-                    // Only treat the call as a constructor when the
-                    // function genuinely cannot take that many args.
-                    let shadowed_by_class = b
-                        .module
-                        .class_id(&segments[0].name)
-                        .is_some()
-                        && b
-                            .module
-                            .func_id(&segments[0].name)
-                            .and_then(|fid| b.module.funcs.get(fid.0 as usize))
-                            .is_some_and(|f| {
-                                let last_vararg = f
-                                    .params
-                                    .last()
-                                    .is_some_and(|p| p.is_vararg);
-                                !last_vararg && args.len() > f.params.len()
-                            });
-                    // A bound local / parameter / captured outer of
-                    // this name shadows a same-named top-level function
-                    // (Kotlin scoping). e.g. a Flow operator's
-                    // `crossinline transform` parameter shadows the
-                    // top-level `Flow.transform` operator: a bare
-                    // `transform(v)` inside the operator's lambda must
-                    // invoke the parameter, not recurse into the
-                    // operator. Route it through the captured value.
-                    // Only the captured-outer gap: a name captured
-                    // from an enclosing scope but not locally bound.
-                    // Bound locals already route correctly through the
-                    // resolved-callee path below, and forcing those
-                    // through `CallValue` mis-invokes a non-callable
-                    // local of the same name as a top-level fn.
-                    // Fire only on a genuine shadowing conflict: the
-                    // name is a captured outer *and* also a registered
-                    // top-level function. Without the top-level fn the
-                    // existing capture/global handling is already
-                    // correct (ordinary captured local funs/lambdas
-                    // like a recursive `fib`); intercepting those
-                    // mis-invokes a not-yet-initialised capture.
-                    let name0 = &segments[0].name;
-                    let shadowed_by_local = b.knows_outer(name0)
-                        && b.resolve(name0).is_none()
-                        && b.module.func_id(name0).is_some();
-                    if shadowed_by_local {
-                        // Bind the lexically-enclosing `flow { }`
-                        // collector as the receiver so a captured
-                        // receiver-function lambda (Flow `map`'s
-                        // `{ v -> emit(transform(v)) }`) targets the
-                        // right downstream collector. A non-receiver
-                        // value lambda (`{ it * 10 }`) ignores the
-                        // bound receiver — `invoke_callable_with_this`
-                        // only delivers it through a `this` capture or
-                        // a zero-param positional, never displacing a
-                        // declared value parameter.
-                        let callee_r = resolve_capture(b, name0);
-                        let this_reg = if b.knows_outer("this")
-                            || b.is_lambda_body()
-                        {
-                            Some(resolve_capture(b, "this"))
-                        } else {
-                            b.resolve("this")
-                        };
-                        let (args_start, count) = lower_arg_run(b, args);
-                        let arg_names =
-                            intern_arg_names(b.module, ast_arg_names);
-                        let dst = b.alloc_reg();
-                        if let Some(recv) = this_reg {
-                            b.push(Inst::CallValueWithThis {
-                                dst,
-                                callee: callee_r,
-                                receiver: recv,
-                                args: args_start,
-                                n_args: count,
-                                arg_names,
-                            });
-                        } else {
-                            b.push(Inst::CallValue {
-                                dst,
-                                callee: callee_r,
-                                args: args_start,
-                                n_args: count,
-                                arg_names,
-                            });
-                        }
-                        return dst;
-                    }
-                    // FQN-precedence for the bare call: when this
-                    // module declares multiple functions sharing the
-                    // simple name (i.e. cross-package collision), an
-                    // explicit `import a.b.foo` routes `foo()` to
-                    // `a.b.foo` instead of whichever candidate landed
-                    // first in `func_index`. Matches Kotlin's
-                    // resolver where an explicit import beats any
-                    // wildcard / default candidate. Limited to the
-                    // collision case so single-candidate lookups stay
-                    // on their existing path (pack-internal calls
-                    // would otherwise be diverted by stray imports
-                    // they neither own nor expect to honour).
-                    let collision = b
-                        .module
-                        .funcs_by_simple_name(&segments[0].name)
-                        .len()
-                        > 1;
-                    let imported_func_id = if collision {
-                        b.module
-                            .registry
-                            .import_aliases
-                            .get(&segments[0].name)
-                            .filter(|segs| segs.len() >= 2)
-                            .and_then(|segs| {
-                                b.module.func_id_by_fqn(&segs.join("."))
-                            })
+                        c
                     } else {
-                        None
+                        callee_reg
                     };
-                    if let Some(func_id) = imported_func_id.filter(|_| !shadowed_by_class) {
-                        // Skip the redirect when the resolved
-                        // candidate is itself an extension whose
-                        // dispatch the regular func_id path
-                        // (this-prepended) handles correctly — the
-                        // bare-call branch would lose the receiver.
-                        let needs_this = b
-                            .module
-                            .funcs
-                            .get(func_id.0 as usize)
-                            .is_some_and(|f| f.params.first().is_some_and(|p| p.name == "this"));
-                        if !needs_this {
+                    let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
+                    let dst = b.alloc_reg();
+                    let nm = b
+                        .module
+                        .intern_const(Const::String(segments[0].name.clone()));
+                    b.push(Inst::CallValueOrMember {
+                        dst,
+                        callee: callee_reg,
+                        this_recv: this_reg,
+                        name: nm,
+                        args: args_start,
+                        n_args: count,
+                        arg_names,
+                    });
+                    return dst;
+                }
+                if let Some(reg) = b.resolve(&segments[0].name) {
+                    // A boxed `var` (captured + reassigned, e.g. a
+                    // recursive `lateinit var f = { … f(…) … }`)
+                    // holds a shared Cell; unwrap it to the
+                    // current callable before invoking.
+                    let callee_reg = if b.is_boxed(&segments[0].name) {
+                        let c = b.alloc_reg();
+                        b.push(Inst::CellGet { dst: c, cell: reg });
+                        c
+                    } else {
+                        reg
+                    };
+                    // A bare call to a parameter whose declared
+                    // type is a receiver-typed function
+                    // (`block: T.() -> R`) dispatches with the
+                    // enclosing `this` as the receiver — matching
+                    // kotlinc's rewrite of `block()` to
+                    // `this.block()` inside such a fn.
+                    if b.is_receiver_lambda_param(&segments[0].name) {
+                        let this_reg = b.resolve("this").or_else(|| {
+                            if b.knows_outer("this") || b.is_lambda_body() {
+                                let idx = b.record_capture("this");
+                                let d = b.alloc_reg();
+                                b.push(Inst::LoadCapture { dst: d, idx });
+                                Some(d)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(this_reg) = this_reg {
                             let (args_start, count) = lower_arg_run(b, args);
                             let arg_names = intern_arg_names(b.module, ast_arg_names);
-                            let type_args = intern_type_args(b.module, ast_type_args);
                             let dst = b.alloc_reg();
-                            b.push(Inst::Call {
+                            b.push(Inst::CallValueWithThis {
                                 dst,
-                                func: func_id,
+                                callee: callee_reg,
+                                receiver: this_reg,
                                 args: args_start,
                                 n_args: count,
                                 arg_names,
-                                type_args,
                             });
                             return dst;
                         }
                     }
-                    // Arity-aware bare-call lookup. The legacy
-                    // `Module::func_id` returns the first user-FQN or
-                    // first overall — when multiple same-named
-                    // overloads exist (e.g. `CharSequence.maxOf(selector)`
-                    // and the top-level `kotlin.comparisons.maxOf(a, b)`)
-                    // it can return one whose arity doesn't fit the
-                    // call. Prefer a candidate that matches arity.
-                    let want = args.len();
-                    let cands: Vec<FuncId> = b
-                        .module
-                        .funcs_by_simple_name(&segments[0].name)
-                        .to_vec();
-                    let user_params = |f: &Func| {
-                        if f.params.first().is_some_and(|p| p.name == "this") {
-                            f.params.len() - 1
-                        } else {
-                            f.params.len()
-                        }
-                    };
-                    let arity_match = |fid: &FuncId| -> bool {
-                        b.module
-                            .funcs
-                            .get(fid.0 as usize)
-                            .is_some_and(|f| {
-                                // A bodyless `expect` decl can't be
-                                // called directly — its actual lives
-                                // in the host's intrinsic table.
-                                // Skip it so the binding falls through
-                                // to the implicit-alias / global
-                                // path that resolves the actual.
-                                !f.blocks.is_empty() && user_params(f) == want
-                            })
-                    };
-                    let non_ext = |fid: &FuncId| {
-                        b.module
-                            .funcs
-                            .get(fid.0 as usize)
-                            .is_some_and(|f| {
-                                f.params
-                                    .first()
-                                    .is_none_or(|p| p.name != "this")
-                            })
-                    };
-                    // Names known to be backed by an intrinsic /
-                    // implicit-alias (kotlin.* top-level). When no
-                    // arity-matching IR func exists for these, decline
-                    // the bind so the call routes through the global
-                    // intrinsic path that the interp host populates.
-                    // Mirrors a subset of `klio_stdlib::IMPLICIT_ALIASES`;
-                    // klio-ir can't depend on klio-stdlib so the list
-                    // is duplicated here.
-                    let name_is_alias = matches!(
-                        segments[0].name.as_str(),
-                        "maxOf"
-                            | "minOf"
-                            | "max"
-                            | "min"
-                            | "print"
-                            | "println"
-                            | "listOf"
-                            | "mutableListOf"
-                            | "arrayListOf"
-                            | "setOf"
-                            | "mutableSetOf"
-                            | "hashSetOf"
-                            | "linkedSetOf"
-                            | "mapOf"
-                            | "mutableMapOf"
-                            | "hashMapOf"
-                            | "linkedMapOf"
-                            | "arrayOf"
-                            | "arrayOfNulls"
-                            | "emptyArray"
-                            | "emptyList"
-                            | "emptySet"
-                            | "emptyMap"
-                            | "listOfNotNull"
-                            | "setOfNotNull"
-                            | "buildList"
-                            | "buildSet"
-                            | "buildMap"
-                            | "buildString"
-                            | "TODO"
-                            | "error"
-                            | "compareValues"
-                            | "compareValuesBy"
-                            | "compareBy"
-                            | "compareByDescending"
-                            | "naturalOrder"
-                            | "reverseOrder"
-                            | "sequenceOf"
-                            | "emptySequence"
-                            | "generateSequence"
-                            | "sequence"
-                    );
-                    // A handful of alias names carry several consumed-source
-                    // overloads whose parameter shapes overlap by arity with
-                    // the call's argument count (e.g. `compareValuesBy(a, b,
-                    // selector)` vararg vs. `compareValuesBy(a, b, Comparator,
-                    // selector)`). Picking a same-named IR overload by arity
-                    // alone selects the wrong one — the host intrinsic
-                    // dispatches every form correctly, so decline the bind
-                    // for these and let the call route to the intrinsic.
-                    let intrinsic_owns_all = matches!(
-                        segments[0].name.as_str(),
-                        "compareValues" | "compareValuesBy"
-                    );
-                    let bare_func_id: Option<FuncId> = if intrinsic_owns_all {
-                        None
-                    } else {
-                        cands
-                            .iter()
-                            .find(|fid| non_ext(fid) && arity_match(fid))
-                            .copied()
-                            .or_else(|| {
-                                cands
-                                    .iter()
-                                    .find(|fid| !non_ext(fid) && arity_match(fid))
-                                    .copied()
-                            })
-                            .or_else(|| {
-                                if name_is_alias {
-                                    None
-                                } else {
-                                    b.module.func_id(&segments[0].name)
-                                }
-                            })
-                    };
-                    if let Some(func_id) =
-                        bare_func_id.filter(|_| !shadowed_by_class)
-                    {
-                        // Extension fn called by its bare name from inside
-                        // a receiver-typed scope: prepend the active
-                        // `this` reg so `this.launch(block)` flows through
-                        // the same Call inst the qualified form would
-                        // emit. Detected by the resolved func declaring
-                        // `this` as its first param.
-                        let needs_this = b
-                            .module
-                            .funcs
-                            .get(func_id.0 as usize)
-                            .is_some_and(|f| f.params.first().is_some_and(|p| p.name == "this"));
-                        if needs_this {
-                            // Resolve a `this` reg even from a lambda
-                            // body that hasn't bound it locally — fall
-                            // back to a capture so the eval frame
-                            // loads the receiver value populated by
-                            // `invoke_callable_with_this`.
-                            let this_reg_opt: Option<Reg> = b
-                                .resolve("this")
-                                .or_else(|| {
-                                    if b.knows_outer("this") || b.is_lambda_body() {
-                                        let idx = b.record_capture("this");
-                                        let dst = b.alloc_reg();
-                                        b.push(Inst::LoadCapture { dst, idx });
-                                        b.bind("this".to_string(), dst);
-                                        Some(dst)
-                                    } else {
-                                        None
-                                    }
-                                });
-                            if let Some(this_reg) = this_reg_opt {
-                                let mut all: Vec<Expr> =
-                                    Vec::with_capacity(args.len() + 1);
-                                // Synthesise a Path("this") arg expr; the
-                                // existing arg-run path resolves it back
-                                // to the bound reg.
-                                let synth = Expr::Path {
-                                    segments: vec![klio_ast::Ident {
-                                        name: "this".to_string(),
-                                        span: expr_span(callee.as_ref()),
-                                    }],
-                                    span: expr_span(callee.as_ref()),
-                                };
-                                all.push(synth);
-                                all.extend(args.iter().cloned());
-                                let (args_start, count) = lower_arg_run(b, &all);
-                                // Trailing-lambda routing for extension
-                                // fns with default-valued middle params
-                                // (`fun T.launch(context = …, block)` —
-                                // `obj.launch { … }` skips the default
-                                // context, assigns the lambda to `block`).
-                                // Build per-arg names by aligning user-
-                                // supplied args with the func's tail
-                                // params and emitting an explicit
-                                // arg-name for the last user-supplied
-                                // arg so call_func_named slots it
-                                // correctly.
-                                let mut arg_names = intern_arg_names(b.module, ast_arg_names);
-                                let target_params: Vec<String> = b
-                                    .module
-                                    .funcs
-                                    .get(func_id.0 as usize)
-                                    .map(|f| {
-                                        f.params.iter().map(|p| p.name.clone()).collect()
-                                    })
-                                    .unwrap_or_default();
-                                let user_arg_count = all.len() - 1;
-                                // Only the trailing-LAMBDA case routes the
-                                // last user arg to the target's last param
-                                // (`obj.launch(ctx=default) { block }`). A
-                                // non-lambda last arg with fewer args than
-                                // params is ordinary positional/vararg/
-                                // default filling — e.g. `split(" ")` where
-                                // `" "` is a vararg delimiter, NOT the
-                                // trailing `limit` param. Re-tagging it as
-                                // the last param mis-binds it.
-                                let trailing_lambda_call =
-                                    matches!(args.last(), Some(Expr::Lambda { .. }));
-                                if !target_params.is_empty()
-                                    && user_arg_count >= 1
-                                    && (1 + user_arg_count) < target_params.len()
-                                    && ast_arg_names.iter().all(std::option::Option::is_none)
-                                    && trailing_lambda_call
-                                {
-                                    // Synthesise arg_names: positional for
-                                    // injected `this` + each user arg,
-                                    // then re-tag the last user arg with
-                                    // the last param's name so it routes
-                                    // to that slot.
-                                    let mut names: Vec<Option<crate::ConstId>> =
-                                        vec![None; all.len()];
-                                    let last_param = target_params.last().cloned();
-                                    if let Some(p_name) = last_param {
-                                        let cid = b.module.intern_const(Const::String(p_name));
-                                        let last_idx = names.len() - 1;
-                                        names[last_idx] = Some(cid);
-                                    }
-                                    arg_names = names;
-                                }
-                                let type_args = intern_type_args(b.module, ast_type_args);
-                                // Unqualified call inside a receiver
-                                // scope: a member of the (possibly
-                                // smart-cast) implicit receiver outranks
-                                // a same-named top-level extension. Route
-                                // through `call_member` on `this` so the
-                                // full precedence applies: receiver
-                                // member (using the runtime subtype),
-                                // then the builtin/stdlib intrinsic,
-                                // then the best-by-receiver extension
-                                // fallback.
-                                // A direct `Call` to one resolved
-                                // `func_id` bypassed all of that and
-                                // could recurse (`resumeCancellableWith`)
-                                // or mis-bind on a builtin receiver. The
-                                // defaulted-middle-param trailing-lambda
-                                // arg-name synthesis is extension-fn
-                                // specific, so keep the direct `Call`
-                                // there.
-                                let synth_names_needed = !target_params
-                                    .is_empty()
-                                    && user_arg_count >= 1
-                                    && (1 + user_arg_count)
-                                        < target_params.len()
-                                    && ast_arg_names
-                                        .iter()
-                                        .all(std::option::Option::is_none)
-                                    && trailing_lambda_call;
-                                if !synth_names_needed {
-                                    // Kotlin: a member of the
-                                    // (smart-cast) implicit receiver
-                                    // outranks a same-named top-level
-                                    // extension. Route through
-                                    // `call_member` on `this` so the
-                                    // full precedence applies —
-                                    // receiver member (incl. a runtime
-                                    // subtype's), then builtin/stdlib
-                                    // intrinsic, then the
-                                    // best-by-receiver extension-fn
-                                    // fallback. A direct `Call` to one
-                                    // by-name `func_id` bypassed this
-                                    // (recursed for
-                                    // `resumeCancellableWith`,
-                                    // mis-bound on `Result`).
-                                    let (uargs_start, ucount) =
-                                        lower_arg_run(b, args);
-                                    let uarg_names = intern_arg_names(
-                                        b.module,
-                                        ast_arg_names,
-                                    );
-                                    let nmc = b.module.intern_const(
-                                        Const::String(
-                                            segments[0].name.clone(),
-                                        ),
-                                    );
-                                    let dst = b.alloc_reg();
-                                    // In a receiver-lambda body the
-                                    // implicit `this` is a capture that
-                                    // a `this`-binding invoke may have
-                                    // displaced (e.g. `flow { forEach {
-                                    // emit(it) } }` inside
-                                    // `List.asFlow()`: `this` is the
-                                    // FlowCollector, but `forEach`
-                                    // targets the enclosing `this@asFlow`
-                                    // receiver). CallMemberOrGlobal adds
-                                    // the enclosing-`this` and global /
-                                    // extension fallbacks that plain
-                                    // CallMember lacks, so the call
-                                    // resolves against the lexically
-                                    // enclosing receiver when the lambda
-                                    // receiver has no such member.
-                                    if b.is_lambda_body() {
-                                        let this_idx =
-                                            b.record_capture("this");
-                                        b.push(Inst::CallMemberOrGlobal {
-                                            dst,
-                                            this_idx,
-                                            name: nmc,
-                                            args: uargs_start,
-                                            n_args: ucount,
-                                            arg_names: uarg_names,
-                                        });
-                                        return dst;
-                                    }
-                                    b.push(Inst::CallMember {
-                                        dst,
-                                        receiver: this_reg,
-                                        name: nmc,
-                                        args: uargs_start,
-                                        n_args: ucount,
-                                        arg_names: uarg_names,
-                                    });
-                                    return dst;
-                                }
-                                let dst = b.alloc_reg();
-                                let _ = this_reg;
-                                b.push(Inst::Call {
-                                    dst,
-                                    func: func_id,
-                                    args: args_start,
-                                    n_args: count,
-                                    arg_names,
-                                    type_args,
-                                });
-                                return dst;
+                    // A bare call to a *local extension* function
+                    // (`fun Appendable.two(x)` declared in this
+                    // scope, called `two(n)`) takes the enclosing
+                    // implicit receiver as its first `this` param;
+                    // prepend it so the user args don't slot into
+                    // the receiver position.
+                    if b.is_local_ext_fn(&segments[0].name) {
+                        let this_reg = b.resolve("this").or_else(|| {
+                            if b.knows_outer("this") || b.is_lambda_body() {
+                                let idx = b.record_capture("this");
+                                let d = b.alloc_reg();
+                                b.push(Inst::LoadCapture { dst: d, idx });
+                                Some(d)
+                            } else {
+                                None
                             }
-                            // No `this` in scope — fall through to the
-                            // unmodified Call below; runtime will error
-                            // with a clearer "missing receiver" diag.
-                        }
-                        let callee_is_tailrec = b
-                            .module
-                            .funcs
-                            .get(func_id.0 as usize)
-                            .is_some_and(|f| f.is_tailrec)
-                            || b.module.tailrec_fn_names.iter().any(|n| n == &segments[0].name);
-                        if b.tailrec_self().is_some() && callee_is_tailrec && ast_arg_names.iter().all(std::option::Option::is_none) {
-                            let (args_start, count) = lower_arg_run(b, args);
-                            b.terminate(Terminator::TailCallFunc {
-                                func: func_id,
-                                args: args_start,
-                                n_args: count,
+                        });
+                        if let Some(this_reg) = this_reg {
+                            let recv = b.alloc_reg();
+                            b.push(Inst::Move {
+                                dst: recv,
+                                src: this_reg,
                             });
-                            let dead = b.alloc_block();
-                            b.switch_to(dead);
-                            return b.emit_const(Const::Unit);
+                            let mut vals: Vec<Reg> = Vec::with_capacity(args.len() + 1);
+                            vals.push(recv);
+                            for a in args {
+                                vals.push(lower_expr(b, a));
+                            }
+                            let args_start = b.alloc_reg();
+                            b.push(Inst::Move {
+                                dst: args_start,
+                                src: vals[0],
+                            });
+                            for v in &vals[1..] {
+                                let slot = b.alloc_reg();
+                                b.push(Inst::Move { dst: slot, src: *v });
+                            }
+                            let arg_names = intern_arg_names(b.module, ast_arg_names);
+                            let dst = b.alloc_reg();
+                            b.push(Inst::CallValue {
+                                dst,
+                                callee: callee_reg,
+                                args: args_start,
+                                n_args: (vals.len()) as u8,
+                                arg_names,
+                            });
+                            return dst;
                         }
+                    }
+                    let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
+                    let dst = b.alloc_reg();
+                    b.push(Inst::CallValue {
+                        dst,
+                        callee: callee_reg,
+                        args: args_start,
+                        n_args: count,
+                        arg_names,
+                    });
+                    return dst;
+                }
+            }
+            // Path-callee with a registered top-level fn → Call{func}.
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1
+            {
+                // When a class and a top-level function share
+                // this name (a class plus a same-named factory
+                // function), the call is a constructor
+                // invocation whenever the function isn't
+                // applicable to the supplied argument count.
+                // Defer to the NewInstance path below so the
+                // Vm's ctor overload resolution picks the right
+                // (possibly private/secondary) constructor.
+                // Only kicks in on the class+function name
+                // clash, so ordinary default/vararg calls are
+                // unaffected.
+                // The factory function is applicable whenever it
+                // can accept the supplied positional count —
+                // fewer args than params is fine (trailing params
+                // are defaulted, e.g. the all-default
+                // `fun DateTimePeriod(years=0, months=0, …)`
+                // factory beside `sealed class DateTimePeriod`).
+                // Only treat the call as a constructor when the
+                // function genuinely cannot take that many args.
+                let shadowed_by_class = b.module.class_id(&segments[0].name).is_some()
+                    && b.module
+                        .func_id(&segments[0].name)
+                        .and_then(|fid| b.module.funcs.get(fid.0 as usize))
+                        .is_some_and(|f| {
+                            let last_vararg = f.params.last().is_some_and(|p| p.is_vararg);
+                            !last_vararg && args.len() > f.params.len()
+                        });
+                // A bound local / parameter / captured outer of
+                // this name shadows a same-named top-level function
+                // (Kotlin scoping). e.g. a Flow operator's
+                // `crossinline transform` parameter shadows the
+                // top-level `Flow.transform` operator: a bare
+                // `transform(v)` inside the operator's lambda must
+                // invoke the parameter, not recurse into the
+                // operator. Route it through the captured value.
+                // Only the captured-outer gap: a name captured
+                // from an enclosing scope but not locally bound.
+                // Bound locals already route correctly through the
+                // resolved-callee path below, and forcing those
+                // through `CallValue` mis-invokes a non-callable
+                // local of the same name as a top-level fn.
+                // Fire only on a genuine shadowing conflict: the
+                // name is a captured outer *and* also a registered
+                // top-level function. Without the top-level fn the
+                // existing capture/global handling is already
+                // correct (ordinary captured local funs/lambdas
+                // like a recursive `fib`); intercepting those
+                // mis-invokes a not-yet-initialised capture.
+                let name0 = &segments[0].name;
+                let shadowed_by_local = b.knows_outer(name0)
+                    && b.resolve(name0).is_none()
+                    && b.module.func_id(name0).is_some();
+                if shadowed_by_local {
+                    // Bind the lexically-enclosing `flow { }`
+                    // collector as the receiver so a captured
+                    // receiver-function lambda (Flow `map`'s
+                    // `{ v -> emit(transform(v)) }`) targets the
+                    // right downstream collector. A non-receiver
+                    // value lambda (`{ it * 10 }`) ignores the
+                    // bound receiver — `invoke_callable_with_this`
+                    // only delivers it through a `this` capture or
+                    // a zero-param positional, never displacing a
+                    // declared value parameter.
+                    let callee_r = resolve_capture(b, name0);
+                    let this_reg = if b.knows_outer("this") || b.is_lambda_body() {
+                        Some(resolve_capture(b, "this"))
+                    } else {
+                        b.resolve("this")
+                    };
+                    let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
+                    let dst = b.alloc_reg();
+                    if let Some(recv) = this_reg {
+                        b.push(Inst::CallValueWithThis {
+                            dst,
+                            callee: callee_r,
+                            receiver: recv,
+                            args: args_start,
+                            n_args: count,
+                            arg_names,
+                        });
+                    } else {
+                        b.push(Inst::CallValue {
+                            dst,
+                            callee: callee_r,
+                            args: args_start,
+                            n_args: count,
+                            arg_names,
+                        });
+                    }
+                    return dst;
+                }
+                // FQN-precedence for the bare call: when this
+                // module declares multiple functions sharing the
+                // simple name (i.e. cross-package collision), an
+                // explicit `import a.b.foo` routes `foo()` to
+                // `a.b.foo` instead of whichever candidate landed
+                // first in `func_index`. Matches Kotlin's
+                // resolver where an explicit import beats any
+                // wildcard / default candidate. Limited to the
+                // collision case so single-candidate lookups stay
+                // on their existing path (pack-internal calls
+                // would otherwise be diverted by stray imports
+                // they neither own nor expect to honour).
+                let collision = b.module.funcs_by_simple_name(&segments[0].name).len() > 1;
+                let imported_func_id = if collision {
+                    b.module
+                        .registry
+                        .import_aliases
+                        .get(&segments[0].name)
+                        .filter(|segs| segs.len() >= 2)
+                        .and_then(|segs| b.module.func_id_by_fqn(&segs.join(".")))
+                } else {
+                    None
+                };
+                if let Some(func_id) = imported_func_id.filter(|_| !shadowed_by_class) {
+                    // Skip the redirect when the resolved
+                    // candidate is itself an extension whose
+                    // dispatch the regular func_id path
+                    // (this-prepended) handles correctly — the
+                    // bare-call branch would lose the receiver.
+                    let needs_this = b
+                        .module
+                        .funcs
+                        .get(func_id.0 as usize)
+                        .is_some_and(|f| f.params.first().is_some_and(|p| p.name == "this"));
+                    if !needs_this {
                         let (args_start, count) = lower_arg_run(b, args);
                         let arg_names = intern_arg_names(b.module, ast_arg_names);
                         let type_args = intern_type_args(b.module, ast_type_args);
@@ -2025,22 +1914,373 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         return dst;
                     }
                 }
+                // Arity-aware bare-call lookup. The legacy
+                // `Module::func_id` returns the first user-FQN or
+                // first overall — when multiple same-named
+                // overloads exist (e.g. `CharSequence.maxOf(selector)`
+                // and the top-level `kotlin.comparisons.maxOf(a, b)`)
+                // it can return one whose arity doesn't fit the
+                // call. Prefer a candidate that matches arity.
+                let want = args.len();
+                let cands: Vec<FuncId> = b.module.funcs_by_simple_name(&segments[0].name).to_vec();
+                let user_params = |f: &Func| {
+                    if f.params.first().is_some_and(|p| p.name == "this") {
+                        f.params.len() - 1
+                    } else {
+                        f.params.len()
+                    }
+                };
+                let arity_match = |fid: &FuncId| -> bool {
+                    b.module.funcs.get(fid.0 as usize).is_some_and(|f| {
+                        // A bodyless `expect` decl can't be
+                        // called directly — its actual lives
+                        // in the host's intrinsic table.
+                        // Skip it so the binding falls through
+                        // to the implicit-alias / global
+                        // path that resolves the actual.
+                        !f.blocks.is_empty() && user_params(f) == want
+                    })
+                };
+                let non_ext = |fid: &FuncId| {
+                    b.module
+                        .funcs
+                        .get(fid.0 as usize)
+                        .is_some_and(|f| f.params.first().is_none_or(|p| p.name != "this"))
+                };
+                // Names known to be backed by an intrinsic /
+                // implicit-alias (kotlin.* top-level). When no
+                // arity-matching IR func exists for these, decline
+                // the bind so the call routes through the global
+                // intrinsic path that the interp host populates.
+                // Mirrors a subset of `klio_stdlib::IMPLICIT_ALIASES`;
+                // klio-ir can't depend on klio-stdlib so the list
+                // is duplicated here.
+                let name_is_alias = matches!(
+                    segments[0].name.as_str(),
+                    "maxOf"
+                        | "minOf"
+                        | "max"
+                        | "min"
+                        | "print"
+                        | "println"
+                        | "listOf"
+                        | "mutableListOf"
+                        | "arrayListOf"
+                        | "setOf"
+                        | "mutableSetOf"
+                        | "hashSetOf"
+                        | "linkedSetOf"
+                        | "mapOf"
+                        | "mutableMapOf"
+                        | "hashMapOf"
+                        | "linkedMapOf"
+                        | "arrayOf"
+                        | "arrayOfNulls"
+                        | "emptyArray"
+                        | "emptyList"
+                        | "emptySet"
+                        | "emptyMap"
+                        | "listOfNotNull"
+                        | "setOfNotNull"
+                        | "buildList"
+                        | "buildSet"
+                        | "buildMap"
+                        | "buildString"
+                        | "TODO"
+                        | "error"
+                        | "compareValues"
+                        | "compareValuesBy"
+                        | "compareBy"
+                        | "compareByDescending"
+                        | "naturalOrder"
+                        | "reverseOrder"
+                        | "sequenceOf"
+                        | "emptySequence"
+                        | "generateSequence"
+                        | "sequence"
+                );
+                // A handful of alias names carry several consumed-source
+                // overloads whose parameter shapes overlap by arity with
+                // the call's argument count (e.g. `compareValuesBy(a, b,
+                // selector)` vararg vs. `compareValuesBy(a, b, Comparator,
+                // selector)`). Picking a same-named IR overload by arity
+                // alone selects the wrong one — the host intrinsic
+                // dispatches every form correctly, so decline the bind
+                // for these and let the call route to the intrinsic.
+                let intrinsic_owns_all = matches!(
+                    segments[0].name.as_str(),
+                    "compareValues" | "compareValuesBy"
+                );
+                let bare_func_id: Option<FuncId> = if intrinsic_owns_all {
+                    None
+                } else {
+                    cands
+                        .iter()
+                        .find(|fid| non_ext(fid) && arity_match(fid))
+                        .copied()
+                        .or_else(|| {
+                            cands
+                                .iter()
+                                .find(|fid| !non_ext(fid) && arity_match(fid))
+                                .copied()
+                        })
+                        .or_else(|| {
+                            if name_is_alias {
+                                None
+                            } else {
+                                b.module.func_id(&segments[0].name)
+                            }
+                        })
+                };
+                if let Some(func_id) = bare_func_id.filter(|_| !shadowed_by_class) {
+                    // Extension fn called by its bare name from inside
+                    // a receiver-typed scope: prepend the active
+                    // `this` reg so `this.launch(block)` flows through
+                    // the same Call inst the qualified form would
+                    // emit. Detected by the resolved func declaring
+                    // `this` as its first param.
+                    let needs_this = b
+                        .module
+                        .funcs
+                        .get(func_id.0 as usize)
+                        .is_some_and(|f| f.params.first().is_some_and(|p| p.name == "this"));
+                    if needs_this {
+                        // Resolve a `this` reg even from a lambda
+                        // body that hasn't bound it locally — fall
+                        // back to a capture so the eval frame
+                        // loads the receiver value populated by
+                        // `invoke_callable_with_this`.
+                        let this_reg_opt: Option<Reg> = b.resolve("this").or_else(|| {
+                            if b.knows_outer("this") || b.is_lambda_body() {
+                                let idx = b.record_capture("this");
+                                let dst = b.alloc_reg();
+                                b.push(Inst::LoadCapture { dst, idx });
+                                b.bind("this".to_string(), dst);
+                                Some(dst)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(this_reg) = this_reg_opt {
+                            let mut all: Vec<Expr> = Vec::with_capacity(args.len() + 1);
+                            // Synthesise a Path("this") arg expr; the
+                            // existing arg-run path resolves it back
+                            // to the bound reg.
+                            let synth = Expr::Path {
+                                segments: vec![klio_ast::Ident {
+                                    name: "this".to_string(),
+                                    span: expr_span(callee.as_ref()),
+                                }],
+                                span: expr_span(callee.as_ref()),
+                            };
+                            all.push(synth);
+                            all.extend(args.iter().cloned());
+                            let (args_start, count) = lower_arg_run(b, &all);
+                            // Trailing-lambda routing for extension
+                            // fns with default-valued middle params
+                            // (`fun T.launch(context = …, block)` —
+                            // `obj.launch { … }` skips the default
+                            // context, assigns the lambda to `block`).
+                            // Build per-arg names by aligning user-
+                            // supplied args with the func's tail
+                            // params and emitting an explicit
+                            // arg-name for the last user-supplied
+                            // arg so call_func_named slots it
+                            // correctly.
+                            let mut arg_names = intern_arg_names(b.module, ast_arg_names);
+                            let target_params: Vec<String> = b
+                                .module
+                                .funcs
+                                .get(func_id.0 as usize)
+                                .map(|f| f.params.iter().map(|p| p.name.clone()).collect())
+                                .unwrap_or_default();
+                            let user_arg_count = all.len() - 1;
+                            // Only the trailing-LAMBDA case routes the
+                            // last user arg to the target's last param
+                            // (`obj.launch(ctx=default) { block }`). A
+                            // non-lambda last arg with fewer args than
+                            // params is ordinary positional/vararg/
+                            // default filling — e.g. `split(" ")` where
+                            // `" "` is a vararg delimiter, NOT the
+                            // trailing `limit` param. Re-tagging it as
+                            // the last param mis-binds it.
+                            let trailing_lambda_call =
+                                matches!(args.last(), Some(Expr::Lambda { .. }));
+                            if !target_params.is_empty()
+                                && user_arg_count >= 1
+                                && (1 + user_arg_count) < target_params.len()
+                                && ast_arg_names.iter().all(std::option::Option::is_none)
+                                && trailing_lambda_call
+                            {
+                                // Synthesise arg_names: positional for
+                                // injected `this` + each user arg,
+                                // then re-tag the last user arg with
+                                // the last param's name so it routes
+                                // to that slot.
+                                let mut tagged_slots: Vec<Option<crate::ConstId>> =
+                                    vec![None; all.len()];
+                                let last_param = target_params.last().cloned();
+                                if let Some(p_name) = last_param {
+                                    let cid = b.module.intern_const(Const::String(p_name));
+                                    let last_idx = tagged_slots.len() - 1;
+                                    tagged_slots[last_idx] = Some(cid);
+                                }
+                                arg_names = tagged_slots;
+                            }
+                            let type_args = intern_type_args(b.module, ast_type_args);
+                            // Unqualified call inside a receiver
+                            // scope: a member of the (possibly
+                            // smart-cast) implicit receiver outranks
+                            // a same-named top-level extension. Route
+                            // through `call_member` on `this` so the
+                            // full precedence applies: receiver
+                            // member (using the runtime subtype),
+                            // then the builtin/stdlib intrinsic,
+                            // then the best-by-receiver extension
+                            // fallback.
+                            // A direct `Call` to one resolved
+                            // `func_id` bypassed all of that and
+                            // could recurse (`resumeCancellableWith`)
+                            // or mis-bind on a builtin receiver. The
+                            // defaulted-middle-param trailing-lambda
+                            // arg-name synthesis is extension-fn
+                            // specific, so keep the direct `Call`
+                            // there.
+                            let synth_names_needed = !target_params.is_empty()
+                                && user_arg_count >= 1
+                                && (1 + user_arg_count) < target_params.len()
+                                && ast_arg_names.iter().all(std::option::Option::is_none)
+                                && trailing_lambda_call;
+                            if !synth_names_needed {
+                                // Kotlin: a member of the
+                                // (smart-cast) implicit receiver
+                                // outranks a same-named top-level
+                                // extension. Route through
+                                // `call_member` on `this` so the
+                                // full precedence applies —
+                                // receiver member (incl. a runtime
+                                // subtype's), then builtin/stdlib
+                                // intrinsic, then the
+                                // best-by-receiver extension-fn
+                                // fallback. A direct `Call` to one
+                                // by-name `func_id` bypassed this
+                                // (recursed for
+                                // `resumeCancellableWith`,
+                                // mis-bound on `Result`).
+                                let (uargs_start, ucount) = lower_arg_run(b, args);
+                                let uarg_names = intern_arg_names(b.module, ast_arg_names);
+                                let nmc = b
+                                    .module
+                                    .intern_const(Const::String(segments[0].name.clone()));
+                                let dst = b.alloc_reg();
+                                // In a receiver-lambda body the
+                                // implicit `this` is a capture that
+                                // a `this`-binding invoke may have
+                                // displaced (e.g. `flow { forEach {
+                                // emit(it) } }` inside
+                                // `List.asFlow()`: `this` is the
+                                // FlowCollector, but `forEach`
+                                // targets the enclosing `this@asFlow`
+                                // receiver). CallMemberOrGlobal adds
+                                // the enclosing-`this` and global /
+                                // extension fallbacks that plain
+                                // CallMember lacks, so the call
+                                // resolves against the lexically
+                                // enclosing receiver when the lambda
+                                // receiver has no such member.
+                                if b.is_lambda_body() {
+                                    let this_idx = b.record_capture("this");
+                                    b.push(Inst::CallMemberOrGlobal {
+                                        dst,
+                                        this_idx,
+                                        name: nmc,
+                                        args: uargs_start,
+                                        n_args: ucount,
+                                        arg_names: uarg_names,
+                                    });
+                                    return dst;
+                                }
+                                b.push(Inst::CallMember {
+                                    dst,
+                                    receiver: this_reg,
+                                    name: nmc,
+                                    args: uargs_start,
+                                    n_args: ucount,
+                                    arg_names: uarg_names,
+                                });
+                                return dst;
+                            }
+                            let dst = b.alloc_reg();
+                            let _ = this_reg;
+                            b.push(Inst::Call {
+                                dst,
+                                func: func_id,
+                                args: args_start,
+                                n_args: count,
+                                arg_names,
+                                type_args,
+                            });
+                            return dst;
+                        }
+                        // No `this` in scope — fall through to the
+                        // unmodified Call below; runtime will error
+                        // with a clearer "missing receiver" diag.
+                    }
+                    let callee_is_tailrec = b
+                        .module
+                        .funcs
+                        .get(func_id.0 as usize)
+                        .is_some_and(|f| f.is_tailrec)
+                        || b.module
+                            .tailrec_fn_names
+                            .iter()
+                            .any(|n| n == &segments[0].name);
+                    if b.tailrec_self().is_some()
+                        && callee_is_tailrec
+                        && ast_arg_names.iter().all(std::option::Option::is_none)
+                    {
+                        let (args_start, count) = lower_arg_run(b, args);
+                        b.terminate(Terminator::TailCallFunc {
+                            func: func_id,
+                            args: args_start,
+                            n_args: count,
+                        });
+                        let dead = b.alloc_block();
+                        b.switch_to(dead);
+                        return b.emit_const(Const::Unit);
+                    }
+                    let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
+                    let type_args = intern_type_args(b.module, ast_type_args);
+                    let dst = b.alloc_reg();
+                    b.push(Inst::Call {
+                        dst,
+                        func: func_id,
+                        args: args_start,
+                        n_args: count,
+                        arg_names,
+                        type_args,
+                    });
+                    return dst;
+                }
+            }
             // Path-callee with a registered class name → NewInstance.
             if let Expr::Path { segments, .. } = callee.as_ref()
                 && segments.len() == 1
-                    && let Some(class_id) = b.module.class_id(&segments[0].name) {
-                        let (args_start, count) = lower_arg_run(b, args);
-                        let arg_names = intern_arg_names(b.module, ast_arg_names);
-                        let dst = b.alloc_reg();
-                        b.push(Inst::NewInstance {
-                            dst,
-                            class: class_id,
-                            args: args_start,
-                            n_args: count,
-                            arg_names,
-                        });
-                        return dst;
-                    }
+                && let Some(class_id) = b.module.class_id(&segments[0].name)
+            {
+                let (args_start, count) = lower_arg_run(b, args);
+                let arg_names = intern_arg_names(b.module, ast_arg_names);
+                let dst = b.alloc_reg();
+                b.push(Inst::NewInstance {
+                    dst,
+                    class: class_id,
+                    args: args_start,
+                    n_args: count,
+                    arg_names,
+                });
+                return dst;
+            }
             // Inside a method/extension body: unqualified `name(...)`
             // that didn't match a local / top-level fn / class is
             // most likely a method call on `this`. Emit
@@ -2069,66 +2309,64 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // property); otherwise it's a global call
                     // and the normal CallValue path should fire.
                     && b.has_own_member(&segments[0].name)
-                    && let Some(this_reg) = b.resolve("this") {
-                        // Private own-class methods bind statically:
-                        // a `private fun` is invisible to subclasses,
-                        // so a bare call to one must reach the
-                        // declaring-class implementation rather than
-                        // a same-named override in a subclass that
-                        // happens to be the runtime receiver.
-                        if let Some(fid) =
-                            b.private_method_fid(&segments[0].name)
-                        {
-                            // Prepend `this` as the first positional
-                            // argument; the static call's param[0] is
-                            // the implicit receiver. The arg-names
-                            // vector also gets a leading None so a
-                            // named-arg call (`pick(b = 5)`) doesn't
-                            // mis-bind the `this` slot to the user's
-                            // first named parameter.
-                            let args_start = b.alloc_reg();
+                    && let Some(this_reg) = b.resolve("this")
+                {
+                    // Private own-class methods bind statically:
+                    // a `private fun` is invisible to subclasses,
+                    // so a bare call to one must reach the
+                    // declaring-class implementation rather than
+                    // a same-named override in a subclass that
+                    // happens to be the runtime receiver.
+                    if let Some(fid) = b.private_method_fid(&segments[0].name) {
+                        // Prepend `this` as the first positional
+                        // argument; the static call's param[0] is
+                        // the implicit receiver. The arg-names
+                        // vector also gets a leading None so a
+                        // named-arg call (`pick(b = 5)`) doesn't
+                        // mis-bind the `this` slot to the user's
+                        // first named parameter.
+                        let args_start = b.alloc_reg();
+                        b.push(Inst::Move {
+                            dst: args_start,
+                            src: this_reg,
+                        });
+                        for (i, a) in args.iter().enumerate() {
+                            let r = lower_expr(b, a);
                             b.push(Inst::Move {
-                                dst: args_start,
-                                src: this_reg,
+                                dst: Reg(args_start.0 + i as u32 + 1),
+                                src: r,
                             });
-                            for (i, a) in args.iter().enumerate() {
-                                let r = lower_expr(b, a);
-                                b.push(Inst::Move {
-                                    dst: Reg(args_start.0 + i as u32 + 1),
-                                    src: r,
-                                });
-                            }
-                            let mut user_arg_names: Vec<Option<String>> =
-                                vec![None];
-                            user_arg_names.extend(ast_arg_names.iter().cloned());
-                            let arg_names = intern_arg_names(b.module, &user_arg_names);
-                            let dst = b.alloc_reg();
-                            b.push(Inst::Call {
-                                dst,
-                                func: fid,
-                                args: args_start,
-                                n_args: args.len() as u8 + 1,
-                                arg_names,
-                                type_args: Vec::new(),
-                            });
-                            return dst;
                         }
-                        let (args_start, count) = lower_arg_run(b, args);
-                        let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let mut user_arg_names: Vec<Option<String>> = vec![None];
+                        user_arg_names.extend(ast_arg_names.iter().cloned());
+                        let arg_names = intern_arg_names(b.module, &user_arg_names);
                         let dst = b.alloc_reg();
-                        let nm = b
-                            .module
-                            .intern_const(Const::String(segments[0].name.clone()));
-                        b.push(Inst::CallMember {
+                        b.push(Inst::Call {
                             dst,
-                            receiver: this_reg,
-                            name: nm,
+                            func: fid,
                             args: args_start,
-                            n_args: count,
+                            n_args: args.len() as u8 + 1,
                             arg_names,
+                            type_args: Vec::new(),
                         });
                         return dst;
                     }
+                    let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
+                    let dst = b.alloc_reg();
+                    let nm = b
+                        .module
+                        .intern_const(Const::String(segments[0].name.clone()));
+                    b.push(Inst::CallMember {
+                        dst,
+                        receiver: this_reg,
+                        name: nm,
+                        args: args_start,
+                        n_args: count,
+                        arg_names,
+                    });
+                    return dst;
+                }
             }
             // Unresolved bare-name call. Inside a lambda body that
             // may be invoked with a this-binding, dispatch through
@@ -2139,86 +2377,69 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // call.
             if let Expr::Path { segments, .. } = callee.as_ref()
                 && segments.len() == 1
-                    && b.resolve(&segments[0].name).is_none()
-                    && !b.knows_outer(&segments[0].name)
-                    && b.module.class_id(&segments[0].name).is_none()
-                    && b.module.func_id(&segments[0].name).is_none()
-                {
-                    // Inside a method / extension body `this` is a
-                    // bound param (not a capture). A bare primitive
-                    // conversion call — `toInt()` in `fun Byte.and(o)
-                    // = toInt() and o` — is a member call on the
-                    // receiver. The receiver is a primitive with no
-                    // class member table, and CallMemberOrGlobal only
-                    // sees a *captured* `this` (Null for a param), so
-                    // dispatch straight on the `this` reg. Limited to
-                    // the fixed set of stdlib conversion names, none
-                    // of which is ever a top-level function, so
-                    // ordinary global calls are unaffected.
-                    // A bare call to a name the enclosing anon object
-                    // closes over invokes that lexically-captured
-                    // value. Read it via `LoadCapture` (this instance's
-                    // snapshot) and `CallValue` so a captured closure
-                    // keeps its own captures and cannot recurse onto a
-                    // same-named capture of an enclosing anon method.
-                    if is_lower_anon_capture(&segments[0].name) {
-                        let idx = b.record_capture(&segments[0].name);
-                        let callee_r = b.alloc_reg();
-                        b.push(Inst::LoadCapture { dst: callee_r, idx });
-                        let (args_start, count) = lower_arg_run(b, args);
-                        let arg_names =
-                            intern_arg_names(b.module, ast_arg_names);
-                        let dst = b.alloc_reg();
-                        b.push(Inst::CallValue {
-                            dst,
-                            callee: callee_r,
-                            args: args_start,
-                            n_args: count,
-                            arg_names,
-                        });
-                        return dst;
-                    }
-                    let is_primitive_conv = matches!(
-                        segments[0].name.as_str(),
-                        "toInt"
-                            | "toLong"
-                            | "toByte"
-                            | "toShort"
-                            | "toDouble"
-                            | "toFloat"
-                            | "toChar"
-                            | "toBoolean"
-                            | "toUInt"
-                            | "toULong"
-                            | "toUByte"
-                            | "toUShort"
-                    );
-                    if is_primitive_conv
-                        && let Some(this_reg) = b.resolve("this") {
-                            let (args_start, count) = lower_arg_run(b, args);
-                            let arg_names = intern_arg_names(b.module, ast_arg_names);
-                            let dst = b.alloc_reg();
-                            let nm = b
-                                .module
-                                .intern_const(Const::String(segments[0].name.clone()));
-                            b.push(Inst::CallMember {
-                                dst,
-                                receiver: this_reg,
-                                name: nm,
-                                args: args_start,
-                                n_args: count,
-                                arg_names,
-                            });
-                            return dst;
-                        }
-                    let this_idx = b.record_capture("this");
+                && b.resolve(&segments[0].name).is_none()
+                && !b.knows_outer(&segments[0].name)
+                && b.module.class_id(&segments[0].name).is_none()
+                && b.module.func_id(&segments[0].name).is_none()
+            {
+                // Inside a method / extension body `this` is a
+                // bound param (not a capture). A bare primitive
+                // conversion call — `toInt()` in `fun Byte.and(o)
+                // = toInt() and o` — is a member call on the
+                // receiver. The receiver is a primitive with no
+                // class member table, and CallMemberOrGlobal only
+                // sees a *captured* `this` (Null for a param), so
+                // dispatch straight on the `this` reg. Limited to
+                // the fixed set of stdlib conversion names, none
+                // of which is ever a top-level function, so
+                // ordinary global calls are unaffected.
+                // A bare call to a name the enclosing anon object
+                // closes over invokes that lexically-captured
+                // value. Read it via `LoadCapture` (this instance's
+                // snapshot) and `CallValue` so a captured closure
+                // keeps its own captures and cannot recurse onto a
+                // same-named capture of an enclosing anon method.
+                if is_lower_anon_capture(&segments[0].name) {
+                    let idx = b.record_capture(&segments[0].name);
+                    let callee_r = b.alloc_reg();
+                    b.push(Inst::LoadCapture { dst: callee_r, idx });
                     let (args_start, count) = lower_arg_run(b, args);
                     let arg_names = intern_arg_names(b.module, ast_arg_names);
                     let dst = b.alloc_reg();
-                    let nm = b.module.intern_const(Const::String(segments[0].name.clone()));
-                    b.push(Inst::CallMemberOrGlobal {
+                    b.push(Inst::CallValue {
                         dst,
-                        this_idx,
+                        callee: callee_r,
+                        args: args_start,
+                        n_args: count,
+                        arg_names,
+                    });
+                    return dst;
+                }
+                let is_primitive_conv = matches!(
+                    segments[0].name.as_str(),
+                    "toInt"
+                        | "toLong"
+                        | "toByte"
+                        | "toShort"
+                        | "toDouble"
+                        | "toFloat"
+                        | "toChar"
+                        | "toBoolean"
+                        | "toUInt"
+                        | "toULong"
+                        | "toUByte"
+                        | "toUShort"
+                );
+                if is_primitive_conv && let Some(this_reg) = b.resolve("this") {
+                    let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
+                    let dst = b.alloc_reg();
+                    let nm = b
+                        .module
+                        .intern_const(Const::String(segments[0].name.clone()));
+                    b.push(Inst::CallMember {
+                        dst,
+                        receiver: this_reg,
                         name: nm,
                         args: args_start,
                         n_args: count,
@@ -2226,6 +2447,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     });
                     return dst;
                 }
+                let this_idx = b.record_capture("this");
+                let (args_start, count) = lower_arg_run(b, args);
+                let arg_names = intern_arg_names(b.module, ast_arg_names);
+                let dst = b.alloc_reg();
+                let nm = b
+                    .module
+                    .intern_const(Const::String(segments[0].name.clone()));
+                b.push(Inst::CallMemberOrGlobal {
+                    dst,
+                    this_idx,
+                    name: nm,
+                    args: args_start,
+                    n_args: count,
+                    arg_names,
+                });
+                return dst;
+            }
             // Built-in stdlib companion shortcuts: `Result.success(x)`,
             // `Result.failure(e)`, etc. The callee parses as
             // Member { Path("Result"), "success" }; rewrite to a
@@ -2236,36 +2474,43 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // would otherwise be skipped, causing the call to fall
             // through to a member-dispatch path that doesn't know
             // about the Companion.
-            if let Expr::Member { receiver: recv_box, name: mname, .. } = callee.as_ref()
+            if let Expr::Member {
+                receiver: recv_box,
+                name: mname,
+                ..
+            } = callee.as_ref()
                 && let Expr::Path { segments, .. } = recv_box.as_ref()
-                    && segments.len() == 1
-                        && b.resolve(&segments[0].name).is_none()
-                        && !b.knows_outer(&segments[0].name)
-                    {
-                        let head = &segments[0].name;
-                        let companion_fqns: &[(&str, &str, &str)] = &[
-                            ("Result", "success", "kotlin.Result.Companion.success"),
-                            ("Result", "failure", "kotlin.Result.Companion.failure"),
-                        ];
-                        for (cls, method, fqn) in companion_fqns {
-                            if head == cls && mname.name == *method {
-                                let callee_r = b.alloc_reg();
-                                let n = b.module.intern_const(Const::String((*fqn).to_string()));
-                                b.push(Inst::LoadGlobal { dst: callee_r, name: n });
-                                let (args_start, count) = lower_arg_run(b, args);
-                                let arg_names = intern_arg_names(b.module, ast_arg_names);
-                                let dst = b.alloc_reg();
-                                b.push(Inst::CallValue {
-                                    dst,
-                                    callee: callee_r,
-                                    args: args_start,
-                                    n_args: count,
-                                    arg_names,
-                                });
-                                return dst;
-                            }
-                        }
+                && segments.len() == 1
+                && b.resolve(&segments[0].name).is_none()
+                && !b.knows_outer(&segments[0].name)
+            {
+                let head = &segments[0].name;
+                let companion_fqns: &[(&str, &str, &str)] = &[
+                    ("Result", "success", "kotlin.Result.Companion.success"),
+                    ("Result", "failure", "kotlin.Result.Companion.failure"),
+                ];
+                for (cls, method, fqn) in companion_fqns {
+                    if head == cls && mname.name == *method {
+                        let callee_r = b.alloc_reg();
+                        let n = b.module.intern_const(Const::String((*fqn).to_string()));
+                        b.push(Inst::LoadGlobal {
+                            dst: callee_r,
+                            name: n,
+                        });
+                        let (args_start, count) = lower_arg_run(b, args);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let dst = b.alloc_reg();
+                        b.push(Inst::CallValue {
+                            dst,
+                            callee: callee_r,
+                            args: args_start,
+                            n_args: count,
+                            arg_names,
+                        });
+                        return dst;
                     }
+                }
+            }
             // Package-qualified call to a user / pack top-level
             // function. `func_index` is keyed by simple name (the
             // package prefix lives on the decl's `fqn`), so resolve
@@ -2276,99 +2521,82 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // intrinsic FQNs still take the LoadGlobal path below.
             if let Expr::Member { .. } = callee.as_ref()
                 && let Some(fqn) = collect_dotted_fqn(callee)
-                    && let (Some(head), Some(tail)) =
-                        (fqn.split('.').next(), fqn.rsplit('.').next())
-                    {
-                        // A real package root (`kotlin.…`, `kotlinx.…`,
-                        // …) is never a member of an enclosing
-                        // receiver, even when `this` is bound — Kotlin
-                        // resolves the qualified call against the
-                        // package, not the receiver. Allow the FQN
-                        // flattening through in that case so a
-                        // `kotlin.synchronized(this, block)` call
-                        // inside an extension function body doesn't
-                        // get misread as `this.kotlin.synchronized`.
-                        let head_is_real_pkg = is_pkg_root(head);
-                        if tail != fqn
-                            && is_package_head(head)
-                            && (head_is_real_pkg || !b.is_lambda_body())
-                            && b.resolve(head).is_none()
-                            && !b.knows_outer(head)
-                            && b.module.class_id(head).is_none()
-                            && (head_is_real_pkg || b.resolve("this").is_none())
-                        {
-                            // Arity-aware lookup for FQN-flatten calls:
-                            // `kotlin.math.max(3, 9)` must bind to the
-                            // 2-arg `max` (`kotlin.comparisons.max` /
-                            // `kotlin.math.max`), not the 1-param
-                            // `CharSequence.max()` from `_Strings.kt`.
-                            // Prefer an FQN match, then arity-matched
-                            // non-extension, then any FQN match.
-                            let want = args.len();
-                            let prefix = &fqn;
-                            let cands: Vec<FuncId> = b
-                                .module
-                                .funcs_by_simple_name(tail)
-                                .to_vec();
-                            let pick = cands
-                                .iter()
-                                .find(|fid| {
-                                    let f = match b
-                                        .module
-                                        .funcs
-                                        .get(fid.0 as usize)
-                                    {
-                                        Some(f) => f,
-                                        None => return false,
-                                    };
-                                    f.fqn == *prefix && f.params.len() == want
-                                })
-                                .or_else(|| {
-                                    cands.iter().find(|fid| {
-                                        let f = match b
-                                            .module
-                                            .funcs
-                                            .get(fid.0 as usize)
-                                        {
-                                            Some(f) => f,
-                                            None => return false,
-                                        };
-                                        let first_is_this = f
-                                            .params
-                                            .first()
-                                            .is_some_and(|p| p.name == "this");
-                                        !first_is_this && f.params.len() == want
-                                    })
-                                })
-                                .copied();
-                            if let Some(func_id) = pick {
-                                let (args_start, n_args) = lower_arg_run(b, args);
-                                let arg_names =
-                                    intern_arg_names(b.module, ast_arg_names);
-                                let type_args =
-                                    intern_type_args(b.module, ast_type_args);
-                                let dst = b.alloc_reg();
-                                b.push(Inst::Call {
-                                    dst,
-                                    func: func_id,
-                                    args: args_start,
-                                    n_args,
-                                    arg_names,
-                                    type_args,
-                                });
-                                return dst;
-                            }
-                        }
+                && let (Some(head), Some(tail)) = (fqn.split('.').next(), fqn.rsplit('.').next())
+            {
+                // A real package root (`kotlin.…`, `kotlinx.…`,
+                // …) is never a member of an enclosing
+                // receiver, even when `this` is bound — Kotlin
+                // resolves the qualified call against the
+                // package, not the receiver. Allow the FQN
+                // flattening through in that case so a
+                // `kotlin.synchronized(this, block)` call
+                // inside an extension function body doesn't
+                // get misread as `this.kotlin.synchronized`.
+                let head_is_real_pkg = is_pkg_root(head);
+                if tail != fqn
+                    && is_package_head(head)
+                    && (head_is_real_pkg || !b.is_lambda_body())
+                    && b.resolve(head).is_none()
+                    && !b.knows_outer(head)
+                    && b.module.class_id(head).is_none()
+                    && (head_is_real_pkg || b.resolve("this").is_none())
+                {
+                    // Arity-aware lookup for FQN-flatten calls:
+                    // `kotlin.math.max(3, 9)` must bind to the
+                    // 2-arg `max` (`kotlin.comparisons.max` /
+                    // `kotlin.math.max`), not the 1-param
+                    // `CharSequence.max()` from `_Strings.kt`.
+                    // Prefer an FQN match, then arity-matched
+                    // non-extension, then any FQN match.
+                    let want = args.len();
+                    let prefix = &fqn;
+                    let cands: Vec<FuncId> = b.module.funcs_by_simple_name(tail).to_vec();
+                    let pick = cands
+                        .iter()
+                        .find(|fid| {
+                            let Some(f) = b.module.funcs.get(fid.0 as usize) else {
+                                return false;
+                            };
+                            f.fqn == *prefix && f.params.len() == want
+                        })
+                        .or_else(|| {
+                            cands.iter().find(|fid| {
+                                let Some(f) = b.module.funcs.get(fid.0 as usize) else {
+                                    return false;
+                                };
+                                let first_is_this =
+                                    f.params.first().is_some_and(|p| p.name == "this");
+                                !first_is_this && f.params.len() == want
+                            })
+                        })
+                        .copied();
+                    if let Some(func_id) = pick {
+                        let (args_start, n_args) = lower_arg_run(b, args);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let type_args = intern_type_args(b.module, ast_type_args);
+                        let dst = b.alloc_reg();
+                        b.push(Inst::Call {
+                            dst,
+                            func: func_id,
+                            args: args_start,
+                            n_args,
+                            arg_names,
+                            type_args,
+                        });
+                        return dst;
                     }
+                }
+            }
             // Fully-qualified callee like `kotlin.math.abs(x)` →
             // resolve the FQN as a global and CallValue against the
             // resulting intrinsic / function value. Avoids the
             // chained-GetField that would fail at `kotlin` itself.
             if let Expr::Member { .. } = callee.as_ref()
                 && let Some(fqn) = collect_dotted_fqn(callee)
-                    && let Some(head) = fqn.split('.').next() {
-                        let head_is_real_pkg = is_pkg_root(head);
-                        if is_package_head(head)
+                && let Some(head) = fqn.split('.').next()
+            {
+                let head_is_real_pkg = is_pkg_root(head);
+                if is_package_head(head)
                             && (head_is_real_pkg || !b.is_lambda_body())
                             && b.resolve(head).is_none()
                             && !b.knows_outer(head)
@@ -2382,23 +2610,26 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             // is never a member of `this`, so allow
                             // it through unconditionally.
                             && (head_is_real_pkg || b.resolve("this").is_none())
-                        {
-                            let callee_r = b.alloc_reg();
-                            let n = b.module.intern_const(Const::String(fqn));
-                            b.push(Inst::LoadGlobal { dst: callee_r, name: n });
-                            let (args_start, count) = lower_arg_run(b, args);
-                            let arg_names = intern_arg_names(b.module, ast_arg_names);
-                            let dst = b.alloc_reg();
-                            b.push(Inst::CallValue {
-                                dst,
-                                callee: callee_r,
-                                args: args_start,
-                                n_args: count,
-                                arg_names,
-                            });
-                            return dst;
-                        }
-                    }
+                {
+                    let callee_r = b.alloc_reg();
+                    let n = b.module.intern_const(Const::String(fqn));
+                    b.push(Inst::LoadGlobal {
+                        dst: callee_r,
+                        name: n,
+                    });
+                    let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
+                    let dst = b.alloc_reg();
+                    b.push(Inst::CallValue {
+                        dst,
+                        callee: callee_r,
+                        args: args_start,
+                        n_args: count,
+                        arg_names,
+                    });
+                    return dst;
+                }
+            }
             // Lower the callee's receiver / value separately so the
             // dispatcher knows whether to emit CallMember or
             // CallValue.
@@ -2475,8 +2706,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     let recv = lower_receiver(b, receiver);
                     let (args_start, count) = lower_arg_run(b, args);
                     let arg_names = intern_arg_names(b.module, ast_arg_names);
-                    let nm =
-                        b.module.intern_const(Const::String(name.name.clone()));
+                    let nm = b.module.intern_const(Const::String(name.name.clone()));
                     let dst = b.alloc_reg();
                     b.push(Inst::CallMemberOrValue {
                         dst,
@@ -2495,40 +2725,40 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // `super<Klazz>.method()` passes Klazz so the
                 // host dispatches against that specific
                 // supertype.
-                if let Expr::Super { qualifier, label, .. } = receiver.as_ref()
+                if let Expr::Super {
+                    qualifier, label, ..
+                } = receiver.as_ref()
                     && let Some(this_reg) = b.resolve("this")
-                        && let Some(owner) = b.owner_class().map(std::string::ToString::to_string) {
-                            let (args_start, count) = lower_arg_run(b, args);
-                            let arg_names = intern_arg_names(b.module, ast_arg_names);
-                            let dst = b.alloc_reg();
-                            let nm = b.module.intern_const(Const::String(name.name.clone()));
-                            let oc = b.module.intern_const(Const::String(owner));
-                            // `super<Q>` uses `qualifier` (type
-                            // ref); `super@Q` uses `label` (an
-                            // identifier).
-                            let qual_const = qualifier
+                    && let Some(owner) = b.owner_class().map(std::string::ToString::to_string)
+                {
+                    let (args_start, count) = lower_arg_run(b, args);
+                    let arg_names = intern_arg_names(b.module, ast_arg_names);
+                    let dst = b.alloc_reg();
+                    let nm = b.module.intern_const(Const::String(name.name.clone()));
+                    let oc = b.module.intern_const(Const::String(owner));
+                    // `super<Q>` uses `qualifier` (type
+                    // ref); `super@Q` uses `label` (an
+                    // identifier).
+                    let qual_const = qualifier
+                        .as_ref()
+                        .map(|t| b.module.intern_const(Const::String(t.name.name.clone())))
+                        .or_else(|| {
+                            label
                                 .as_ref()
-                                .map(|t| {
-                                    b.module.intern_const(Const::String(t.name.name.clone()))
-                                })
-                                .or_else(|| {
-                                    label.as_ref().map(|id| {
-                                        b.module
-                                            .intern_const(Const::String(id.name.clone()))
-                                    })
-                                });
-                            b.push(Inst::CallSuper {
-                                dst,
-                                receiver: this_reg,
-                                owner_class: oc,
-                                qualifier: qual_const,
-                                name: nm,
-                                args: args_start,
-                                n_args: count,
-                                arg_names,
-                            });
-                            return dst;
-                        }
+                                .map(|id| b.module.intern_const(Const::String(id.name.clone())))
+                        });
+                    b.push(Inst::CallSuper {
+                        dst,
+                        receiver: this_reg,
+                        owner_class: oc,
+                        qualifier: qual_const,
+                        name: nm,
+                        args: args_start,
+                        n_args: count,
+                        arg_names,
+                    });
+                    return dst;
+                }
                 // Statically rebind `(e as T).f(args)` to the `f`
                 // overload whose first-param type is `T`. Upstream
                 // bodies (`String.padStart` → `(this as CharSequence).
@@ -2538,15 +2768,18 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // call rebinds to the `String` overload and
                 // recurses. Only fires for non-safe `as`-casts —
                 // safe `as?` semantics need a null branch.
-                if let Expr::As { ty: cast_ty, safe: false, .. } =
-                    receiver.as_ref()
+                if let Expr::As {
+                    ty: cast_ty,
+                    safe: false,
+                    ..
+                } = receiver.as_ref()
                 {
                     let want_user = args.len();
                     let chosen = b
                         .module
                         .funcs_by_simple_name(&name.name)
                         .iter()
-                        .filter_map(|fid| {
+                        .find_map(|fid| {
                             let f = b.module.funcs.get(fid.0 as usize)?;
                             if f.blocks.is_empty() {
                                 return None;
@@ -2562,12 +2795,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                         .iter()
                                         .all(|p| p.default.is_some() || p.is_vararg))
                                 || (want_user > user
-                                    && f.params
-                                        .last()
-                                        .is_some_and(|p| p.is_vararg));
+                                    && f.params.last().is_some_and(|p| p.is_vararg));
                             if arity_ok { Some(*fid) } else { None }
-                        })
-                        .next();
+                        });
                     if let Some(func_id) = chosen {
                         // Build a contiguous arg run: receiver at
                         // slot 0, user args following. lower the
@@ -2576,23 +2806,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         // emitted `Inst::Cast` keeps the schema
                         // honest), then lower each user arg.
                         let recv_reg = lower_receiver(b, receiver);
-                        let mut arg_regs: Vec<Reg> =
-                            Vec::with_capacity(args.len() + 1);
+                        let mut arg_regs: Vec<Reg> = Vec::with_capacity(args.len() + 1);
                         arg_regs.push(recv_reg);
                         for a in args {
                             arg_regs.push(lower_expr(b, a));
                         }
                         let n = arg_regs.len() as u8;
                         let start = b.alloc_reg();
-                        b.push(Inst::Move { dst: start, src: arg_regs[0] });
+                        b.push(Inst::Move {
+                            dst: start,
+                            src: arg_regs[0],
+                        });
                         for r in &arg_regs[1..] {
                             let slot = b.alloc_reg();
                             b.push(Inst::Move { dst: slot, src: *r });
                         }
-                        let arg_names =
-                            intern_arg_names(b.module, ast_arg_names);
-                        let type_args =
-                            intern_type_args(b.module, ast_type_args);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let type_args = intern_type_args(b.module, ast_type_args);
                         let dst = b.alloc_reg();
                         b.push(Inst::Call {
                             dst,
@@ -2646,7 +2876,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             }
             b.pop_loop();
             let c = lower_expr(b, cond);
-            b.terminate(Terminator::Branch { cond: c, t: body_blk, f: exit });
+            b.terminate(Terminator::Branch {
+                cond: c,
+                t: body_blk,
+                f: exit,
+            });
 
             b.switch_to(exit);
             b.emit_const(Const::Unit)
@@ -2659,46 +2893,48 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // target, so their non-local `return` falls through to
             // the caller path below (Kotlin non-local semantics).
             if label.is_none()
-                && let Some((res, join)) = b.inline_active_return() {
-                    if let Some(rr) = r {
-                        b.push(Inst::Move { dst: res, src: rr });
-                    }
-                    // Replay every active `finally { … }` block
-                    // inline before exiting, matching JVM `try-
-                    // finally` bytecode shape: each non-fallthrough
-                    // exit from the try body copies the finally body
-                    // at the exit point. Lower top-down (innermost
-                    // first); each replay's own statements run with
-                    // the remaining (outer) finallys still active so
-                    // a `return` inside a finally body skips its own
-                    // finally but still threads any further outers.
-                    let pending = b.active_finallys();
-                    if !pending.is_empty() {
-                        let prior = b.swap_finally_stack(Vec::new());
-                        for (idx, blk) in pending.iter().rev().enumerate() {
-                            let outer = prior[..prior.len() - (idx + 1)].to_vec();
-                            b.swap_finally_stack(outer);
-                            let _ = lower_block(b, blk);
-                        }
-                        b.swap_finally_stack(prior);
-                    }
-                    b.terminate(Terminator::Goto(join));
-                    let dead = b.alloc_block();
-                    b.switch_to(dead);
-                    return b.emit_const(Const::Unit);
+                && let Some((res, join)) = b.inline_active_return()
+            {
+                if let Some(rr) = r {
+                    b.push(Inst::Move { dst: res, src: rr });
                 }
+                // Replay every active `finally { … }` block
+                // inline before exiting, matching JVM `try-
+                // finally` bytecode shape: each non-fallthrough
+                // exit from the try body copies the finally body
+                // at the exit point. Lower top-down (innermost
+                // first); each replay's own statements run with
+                // the remaining (outer) finallys still active so
+                // a `return` inside a finally body skips its own
+                // finally but still threads any further outers.
+                let pending = b.active_finallys();
+                if !pending.is_empty() {
+                    let prior = b.swap_finally_stack(Vec::new());
+                    for (idx, blk) in pending.iter().rev().enumerate() {
+                        let outer = prior[..prior.len() - (idx + 1)].to_vec();
+                        b.swap_finally_stack(outer);
+                        let _ = lower_block(b, blk);
+                    }
+                    b.swap_finally_stack(prior);
+                }
+                b.terminate(Terminator::Goto(join));
+                let dead = b.alloc_block();
+                b.switch_to(dead);
+                return b.emit_const(Const::Unit);
+            }
             // `return@<inlineFnName>` inside a spliced inline-argument
             // lambda is a local return from that lambda invocation.
             if let Some(lbl) = label.as_ref()
-                && let Some((res, end)) = b.inline_lambda_ret_for(&lbl.name) {
-                    if let Some(rr) = r {
-                        b.push(Inst::Move { dst: res, src: rr });
-                    }
-                    b.terminate(Terminator::Goto(end));
-                    let dead = b.alloc_block();
-                    b.switch_to(dead);
-                    return b.emit_const(Const::Unit);
+                && let Some((res, end)) = b.inline_lambda_ret_for(&lbl.name)
+            {
+                if let Some(rr) = r {
+                    b.push(Inst::Move { dst: res, src: rr });
                 }
+                b.terminate(Terminator::Goto(end));
+                let dead = b.alloc_block();
+                b.switch_to(dead);
+                return b.emit_const(Const::Unit);
+            }
             if let Some(lbl) = label.as_ref() {
                 if b.current_inline_fn().is_some() {
                     // Inside a spliced inline body: a plain `Return`
@@ -2730,7 +2966,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.switch_to(dead);
             b.emit_const(Const::Unit)
         }
-        Expr::When { subject, subject_binding, branches, .. } => {
+        Expr::When {
+            subject,
+            subject_binding,
+            branches,
+            ..
+        } => {
             // `when (val v = subject) { ... }` binds `v` to the
             // subject's value so pattern arms can refer to it. Push
             // a scope so the binding pops after the when.
@@ -2745,7 +2986,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 lower_when(b, subject.as_deref(), branches, expr_span(expr))
             }
         }
-        Expr::Try { body, catches, finally, .. } => {
+        Expr::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
             // Exception-edge model: the body block carries a list
             // of CatchHandlers (one per catch arm) and an optional
             // finally block. The evaluator's Throw terminator walks
@@ -2790,7 +3036,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.push_finally(blk.clone());
             }
             let body_val = lower_block(b, body);
-            b.push(Inst::Move { dst: result, src: body_val });
+            b.push(Inst::Move {
+                dst: result,
+                src: body_val,
+            });
             if let Some(fin) = finally_entry {
                 b.terminate(Terminator::Goto(fin));
             } else {
@@ -2804,7 +3053,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.push_scope();
                 b.bind(c.binding.name.clone(), *exc);
                 let v = lower_block(b, &c.body);
-                b.push(Inst::Move { dst: result, src: v });
+                b.push(Inst::Move {
+                    dst: result,
+                    src: v,
+                });
                 b.pop_scope();
                 if let Some(fin) = finally_entry {
                     b.terminate(Terminator::Goto(fin));
@@ -2870,15 +3122,15 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // re-armed by `lower_arg_run`) so `this@<label>` inside the
             // lambda resolves to the receiver it is invoked with.
             if let Some(label) = b.pending_lambda_label.take()
-                && let Some(f) = b.module.funcs.get_mut(body_func.0 as usize) {
-                    f.implicit_label = Some(label);
-                }
+                && let Some(f) = b.module.funcs.get_mut(body_func.0 as usize)
+            {
+                f.implicit_label = Some(label);
+            }
             let captures: Vec<Reg> = captured_names
                 .iter()
                 .map(|n| resolve_capture(b, n))
                 .collect();
-            let mut param_names: Vec<String> =
-                params.iter().map(|p| p.name.clone()).collect();
+            let mut param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
             if param_names.is_empty() {
                 param_names.push("it".to_string());
             }
@@ -2900,7 +3152,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let dead = b.alloc_block();
                 b.switch_to(dead);
             } else {
-                b.push(Inst::Trace { span: expr_span(expr) });
+                b.push(Inst::Trace {
+                    span: expr_span(expr),
+                });
             }
             b.emit_const(Const::Unit)
         }
@@ -2910,12 +3164,21 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let dead = b.alloc_block();
                 b.switch_to(dead);
             } else {
-                b.push(Inst::Trace { span: expr_span(expr) });
+                b.push(Inst::Trace {
+                    span: expr_span(expr),
+                });
             }
             b.emit_const(Const::Unit)
         }
-        Expr::For { vars, iter, body, .. } => lower_for(b, vars, iter, body),
-        Expr::IsCheck { expr: inner, ty, negated, .. } => {
+        Expr::For {
+            vars, iter, body, ..
+        } => lower_for(b, vars, iter, body),
+        Expr::IsCheck {
+            expr: inner,
+            ty,
+            negated,
+            ..
+        } => {
             let s = lower_expr(b, inner);
             let dst = b.alloc_reg();
             b.push(Inst::InstanceOf {
@@ -2935,7 +3198,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 dst
             }
         }
-        Expr::As { expr: inner, ty, safe, .. } => {
+        Expr::As {
+            expr: inner,
+            ty,
+            safe,
+            ..
+        } => {
             let s = lower_expr(b, inner);
             let dst = b.alloc_reg();
             b.push(Inst::Cast {
@@ -2950,7 +3218,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             });
             dst
         }
-        Expr::Postfix { op, expr: inner, .. } => match op {
+        Expr::Postfix {
+            op, expr: inner, ..
+        } => match op {
             klio_ast::PostfixOp::NotNull => {
                 let s = lower_expr(b, inner);
                 let dst = b.alloc_reg();
@@ -2961,14 +3231,19 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let op = match op {
                     klio_ast::PostfixOp::Inc => UnOp::Inc,
                     klio_ast::PostfixOp::Dec => UnOp::Dec,
-                    _ => unreachable!(),
+                    klio_ast::PostfixOp::NotNull => unreachable!(),
                 };
                 // For Index targets, evaluate receiver + keys ONCE,
                 // read via get(...), inc/dec, write via set(...),
                 // returning the snapshot. Otherwise fall through to
                 // the generic "evaluate inner once, write back via
                 // Path / Member" path.
-                if let Expr::Index { receiver, args: idx_args, .. } = inner.as_ref() {
+                if let Expr::Index {
+                    receiver,
+                    args: idx_args,
+                    ..
+                } = inner.as_ref()
+                {
                     let recv = lower_receiver(b, receiver);
                     let n_keys = idx_args.len();
                     let key_start = b.alloc_reg();
@@ -2995,8 +3270,15 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     });
                     // new = unop(old)
                     let new = b.alloc_reg();
-                    b.push(Inst::UnOp { dst: new, op, operand: old });
-                    b.push(Inst::Move { dst: val_slot, src: new });
+                    b.push(Inst::UnOp {
+                        dst: new,
+                        op,
+                        operand: old,
+                    });
+                    b.push(Inst::Move {
+                        dst: val_slot,
+                        src: new,
+                    });
                     // Write back: set(key…, new). Reuses the SAME
                     // key slots so idx() isn't called twice.
                     let set_dst = b.alloc_reg();
@@ -3020,23 +3302,35 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let old = b.alloc_reg();
                 b.push(Inst::Move { dst: old, src: s });
                 let new = b.alloc_reg();
-                b.push(Inst::UnOp { dst: new, op, operand: old });
+                b.push(Inst::UnOp {
+                    dst: new,
+                    op,
+                    operand: old,
+                });
                 match inner.as_ref() {
                     Expr::Path { segments, .. } if segments.len() == 1 => {
                         if b.is_boxed(&segments[0].name) {
                             let cell = boxed_cell_reg(b, &segments[0].name);
                             b.push(Inst::CellSet { cell, value: new });
                         } else if let Some(home) = b.mutable_home(&segments[0].name) {
-                            b.push(Inst::Move { dst: home, src: new });
-                        } else if b.has_own_member(&segments[0].name)
-                            && b.resolve("this").is_some()
+                            b.push(Inst::Move {
+                                dst: home,
+                                src: new,
+                            });
+                        } else if b.has_own_member(&segments[0].name) && b.resolve("this").is_some()
                         {
                             // Method-body `field++` write — route
                             // through SetField on this so the
                             // mutation reaches the instance.
                             let this_reg = b.resolve("this").unwrap();
-                            let field = b.module.intern_const(Const::String(segments[0].name.clone()));
-                            b.push(Inst::SetField { receiver: this_reg, field, value: new });
+                            let field = b
+                                .module
+                                .intern_const(Const::String(segments[0].name.clone()));
+                            b.push(Inst::SetField {
+                                receiver: this_reg,
+                                field,
+                                value: new,
+                            });
                         } else if b.knows_outer(&segments[0].name) {
                             // Lambda-body postfix inc/dec on a
                             // captured outer var: rebind locally
@@ -3047,21 +3341,37 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             let n = b
                                 .module
                                 .intern_const(Const::String(segments[0].name.clone()));
-                            b.push(Inst::StoreGlobal { name: n, value: new });
+                            b.push(Inst::StoreGlobal {
+                                name: n,
+                                value: new,
+                            });
                             b.rebind(&segments[0].name, new);
                         } else {
                             b.rebind(&segments[0].name, new);
                         }
                     }
-                    Expr::Member { receiver, name, safe: false, .. } => {
+                    Expr::Member {
+                        receiver,
+                        name,
+                        safe: false,
+                        ..
+                    } => {
                         // `obj.field++` — write the incremented value
                         // back through the same SetField path the
                         // host's set_field uses for class setters.
                         let recv = lower_receiver(b, receiver);
                         let field = b.module.intern_const(Const::String(name.name.clone()));
-                        b.push(Inst::SetField { receiver: recv, field, value: new });
+                        b.push(Inst::SetField {
+                            receiver: recv,
+                            field,
+                            value: new,
+                        });
                     }
-                    Expr::Index { receiver, args: idx_args, .. } => {
+                    Expr::Index {
+                        receiver,
+                        args: idx_args,
+                        ..
+                    } => {
                         // `xs[i]++` — read above, write back via .set(i, new).
                         let recv = lower_receiver(b, receiver);
                         let n_keys = idx_args.len();
@@ -3075,7 +3385,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             let r = lower_expr(b, arg);
                             b.push(Inst::Move { dst: *slot, src: r });
                         }
-                        b.push(Inst::Move { dst: val_slot, src: new });
+                        b.push(Inst::Move {
+                            dst: val_slot,
+                            src: new,
+                        });
                         let dst = b.alloc_reg();
                         let nm = b.module.intern_const(Const::String("set".into()));
                         b.push(Inst::CallMember {
@@ -3092,7 +3405,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 old
             }
         },
-        Expr::Labeled { label, expr: inner, .. } => match inner.as_ref() {
+        Expr::Labeled {
+            label, expr: inner, ..
+        } => match inner.as_ref() {
             Expr::While { cond, body, .. } => {
                 let header = b.alloc_block();
                 let body_blk = b.alloc_block();
@@ -3100,7 +3415,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.terminate(Terminator::Goto(header));
                 b.switch_to(header);
                 let c = lower_expr(b, cond);
-                b.terminate(Terminator::Branch { cond: c, t: body_blk, f: exit });
+                b.terminate(Terminator::Branch {
+                    cond: c,
+                    t: body_blk,
+                    f: exit,
+                });
                 b.switch_to(body_blk);
                 b.push_loop(Some(label.name.clone()), header, exit);
                 let _ = lower_expr(b, body);
@@ -3109,9 +3428,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.switch_to(exit);
                 b.emit_const(Const::Unit)
             }
-            Expr::For { vars, iter, body, .. } => {
-                lower_for_labeled(b, vars, iter, body, Some(label.name.clone()))
-            }
+            Expr::For {
+                vars, iter, body, ..
+            } => lower_for_labeled(b, vars, iter, body, Some(label.name.clone())),
             Expr::DoWhile { body, cond, .. } => {
                 let body_blk = b.alloc_block();
                 let exit = b.alloc_block();
@@ -3123,7 +3442,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 }
                 b.pop_loop();
                 let c = lower_expr(b, cond);
-                b.terminate(Terminator::Branch { cond: c, t: body_blk, f: exit });
+                b.terminate(Terminator::Branch {
+                    cond: c,
+                    t: body_blk,
+                    f: exit,
+                });
                 b.switch_to(exit);
                 b.emit_const(Const::Unit)
             }
@@ -3136,9 +3459,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // PropertyRef metadata value.
             let dst = b.alloc_reg();
             let nm = b.module.intern_const(Const::String(name.name.clone()));
-            if b.module.func_id(&name.name).is_some()
-                || b.module.class_id(&name.name).is_some()
-            {
+            if b.module.func_id(&name.name).is_some() || b.module.class_id(&name.name).is_some() {
                 b.push(Inst::LoadGlobal { dst, name: nm });
             } else {
                 b.push(Inst::PropertyRef { dst, name: nm });
@@ -3163,7 +3484,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let recv = lower_receiver(b, receiver);
             let dst = b.alloc_reg();
             let nm = b.module.intern_const(Const::String(name.name.clone()));
-            b.push(Inst::MemberRef { dst, receiver: recv, name: nm });
+            b.push(Inst::MemberRef {
+                dst,
+                receiver: recv,
+                name: nm,
+            });
             dst
         }
         Expr::ObjectExpr { .. } => {
@@ -3200,16 +3525,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     stmts: vec![klio_ast::Stmt::Expr(e.clone())],
                     span: expr_span(expr),
                 },
-                None => klio_ast::Block { stmts: Vec::new(), span: expr_span(expr) },
+                None => klio_ast::Block {
+                    stmts: Vec::new(),
+                    span: expr_span(expr),
+                },
             };
-            let param_names: Vec<String> =
-                params.iter().map(|p| p.name.name.clone()).collect();
+            let param_names: Vec<String> = params.iter().map(|p| p.name.name.clone()).collect();
             let param_idents: Vec<klio_ast::Ident> =
                 params.iter().map(|p| p.name.clone()).collect();
             let outer_names: std::collections::HashSet<String> = b.visible_names();
             let outer_boxed = b.boxed_vars_snapshot();
             let (body_func, captured_names) = lower_lambda_body_capturing_kind(
-                b.module, &param_idents, &body_block, outer_names, false, &outer_boxed,
+                b.module,
+                &param_idents,
+                &body_block,
+                outer_names,
+                false,
+                &outer_boxed,
                 None,
             );
             let captures: Vec<Reg> = captured_names
@@ -3266,7 +3598,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     this_reg
                 }
             } else {
-                b.push(Inst::Trace { span: expr_span(expr) });
+                b.push(Inst::Trace {
+                    span: expr_span(expr),
+                });
                 b.emit_const(Const::Unit)
             }
         }
@@ -3282,35 +3616,24 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             if let Some(this_reg) = b.resolve("this") {
                 this_reg
             } else {
-                b.push(Inst::Trace { span: expr_span(expr) });
+                b.push(Inst::Trace {
+                    span: expr_span(expr),
+                });
                 b.emit_const(Const::Unit)
             }
         }
-        _ => {
-            // Remaining expression forms not yet lowered. Emit a
-            // placeholder Trace so the gap is visible in printouts
-            // and tests can assert which forms still need work.
-            b.push(Inst::Trace { span: expr_span(expr) });
+        Expr::Spread { .. } => {
+            // A bare spread outside a call argument list has no
+            // lowering yet. Emit a placeholder Trace so the gap is
+            // visible in printouts and tests can assert which forms
+            // still need work.
+            b.push(Inst::Trace {
+                span: expr_span(expr),
+            });
             b.emit_const(Const::Unit)
         }
     }
 }
-
-/// Materialise a register holding the value captured by a child
-/// lambda. If `name` resolves locally we use its reg directly. Else
-/// when the enclosing scope knows it as an outer capture, record it
-/// on the current builder + emit a `LoadCapture` so the value flows
-/// through the chain (the outer scope's lambda already captured it
-/// or will need to, via the same mechanism, when its own enclosing
-/// lambda lowers).
-
-
-/// Try to lower a `when (subject)` as a Switch terminator. Returns
-/// the (case-arms, optional default body block, per-branch body
-/// blocks) tuple when every non-else branch carries a single
-/// literal pattern. Returns None for the general Branch-chain
-/// fallback. Each branch index in the input maps 1:1 to the
-
 
 pub(super) fn lower_block(b: &mut FuncBuilder<'_>, block: &AstBlock) -> Reg {
     b.push_scope();
@@ -3364,7 +3687,10 @@ pub(super) fn lower_block(b: &mut FuncBuilder<'_>, block: &AstBlock) -> Reg {
         if needs_hoist && b.mutable_home(&k_fn.name.name).is_none() {
             let null_v = b.emit_const(Const::Null);
             let home = b.alloc_reg();
-            b.push(Inst::MakeCell { dst: home, src: null_v });
+            b.push(Inst::MakeCell {
+                dst: home,
+                src: null_v,
+            });
             b.set_mutable_home(&k_fn.name.name, home);
             b.mark_mutable(&k_fn.name.name);
             b.mark_boxed(&k_fn.name.name);

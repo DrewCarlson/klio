@@ -168,6 +168,9 @@ klio_stdlib::host_bindings! {
 /// Returns a synthesised `Value::Instance` whose `identity` keys a
 /// `ChannelState` in this thread's registry; every channel member
 /// binding finds the state by that key.
+// Host binding stored behind a `fn(&mut CallCtx) -> Result<..>` pointer,
+// so the Result wrapper is fixed by the dispatch-table signature.
+#[allow(clippy::unnecessary_wraps)]
 fn channel_create(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // First arg is the capacity (Int / Long). Defaults / overloads
     // ship `0` (RENDEZVOUS) and `-1` (UNLIMITED) as sentinel ints.
@@ -177,22 +180,20 @@ fn channel_create(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Value::Long(n) => n,
         _ => 0,
     };
-    let effective_cap = if capacity < 0 {
-        usize::MAX // UNLIMITED / BUFFERED
-    } else if capacity == 0 {
-        1 // rendezvous degenerate: one-slot buffer in our model
-    } else {
-        capacity as usize
+    let effective_cap = match capacity.cmp(&0) {
+        std::cmp::Ordering::Less => usize::MAX, // UNLIMITED / BUFFERED
+        std::cmp::Ordering::Equal => 1, // rendezvous degenerate: one-slot buffer in our model
+        // capacity is positive here; narrowing the Kotlin Int/Long to a buffer size.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        std::cmp::Ordering::Greater => capacity as usize,
     };
     let id = ctx.host.alloc_instance_id();
     with_reg(|r| {
         r.channels.insert(id, ChannelState::new(effective_cap));
     });
-    let inst = ctx.host.new_synth_instance(
-        "kotlinx.coroutines.channels.KlioChannel",
-        id,
-        Vec::new(),
-    );
+    let inst =
+        ctx.host
+            .new_synth_instance("kotlinx.coroutines.channels.KlioChannel", id, Vec::new());
     Ok(inst)
 }
 
@@ -205,29 +206,29 @@ fn channel_id(arg0: &Value) -> Option<u64> {
 }
 
 fn channel_send(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("Channel.send expects a receiver".into())
-    })?;
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("Channel.send expects a receiver".into()))?;
     let value = ctx.args.get(1).cloned().unwrap_or(Value::Unit);
-    let id = channel_id(&recv).ok_or_else(|| {
-        RuntimeError::Type("Channel.send: bad receiver".into())
-    })?;
+    let id =
+        channel_id(&recv).ok_or_else(|| RuntimeError::Type("Channel.send: bad receiver".into()))?;
     // Direct rendezvous: if a receiver is parked, hand the value
     // straight to it without buffering. Else if buffer has room,
     // push and return. Else park this sender and suspend.
     let outcome = with_reg(|r| -> Result<ChannelSendOutcome, RuntimeError> {
         let action = {
-            let state = r.channels.get_mut(&id).ok_or_else(|| {
-                RuntimeError::Type("Channel.send: missing state".into())
-            })?;
+            let state = r
+                .channels
+                .get_mut(&id)
+                .ok_or_else(|| RuntimeError::Type("Channel.send: missing state".into()))?;
             if state.closed {
                 return Err(RuntimeError::Thrown(closed_send_exc()));
             }
             // Iterator waiters take priority — write the value into
             // the iter's `__pending__` field and resume with Bool(true).
-            if let Some((slot, iter_inst)) =
-                state.receive_iter_waiters.pop_front()
-            {
+            if let Some((slot, iter_inst)) = state.receive_iter_waiters.pop_front() {
                 ChannelSendDispatch::HandToIter(slot, iter_inst, value.clone())
             } else if let Some(slot) = state.receive_waiters.pop_front() {
                 ChannelSendDispatch::HandToReceiver(slot, value.clone())
@@ -290,17 +291,19 @@ enum ChannelSendDispatch {
 }
 
 fn channel_try_send(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("Channel.trySend expects a receiver".into())
-    })?;
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("Channel.trySend expects a receiver".into()))?;
     let value = ctx.args.get(1).cloned().unwrap_or(Value::Unit);
-    let id = channel_id(&recv).ok_or_else(|| {
-        RuntimeError::Type("Channel.trySend: bad receiver".into())
-    })?;
+    let id = channel_id(&recv)
+        .ok_or_else(|| RuntimeError::Type("Channel.trySend: bad receiver".into()))?;
     let outcome = with_reg(|r| -> Result<ChannelTrySendOutcome, RuntimeError> {
-        let state = r.channels.get_mut(&id).ok_or_else(|| {
-            RuntimeError::Type("Channel.trySend: missing state".into())
-        })?;
+        let state = r
+            .channels
+            .get_mut(&id)
+            .ok_or_else(|| RuntimeError::Type("Channel.trySend: missing state".into()))?;
         if state.closed {
             return Ok(ChannelTrySendOutcome::Closed);
         }
@@ -319,9 +322,7 @@ fn channel_try_send(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Value::Bool(true)
         }
         ChannelTrySendOutcome::Success => Value::Bool(true),
-        ChannelTrySendOutcome::Full | ChannelTrySendOutcome::Closed => {
-            Value::Bool(false)
-        }
+        ChannelTrySendOutcome::Full | ChannelTrySendOutcome::Closed => Value::Bool(false),
     };
     Ok(result)
 }
@@ -334,17 +335,19 @@ enum ChannelTrySendOutcome {
 }
 
 fn channel_receive(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("Channel.receive expects a receiver".into())
-    })?;
-    let id = channel_id(&recv).ok_or_else(|| {
-        RuntimeError::Type("Channel.receive: bad receiver".into())
-    })?;
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("Channel.receive expects a receiver".into()))?;
+    let id = channel_id(&recv)
+        .ok_or_else(|| RuntimeError::Type("Channel.receive: bad receiver".into()))?;
     let outcome = with_reg(|r| -> Result<ChannelReceiveOutcome, RuntimeError> {
         let (got, closed) = {
-            let state = r.channels.get_mut(&id).ok_or_else(|| {
-                RuntimeError::Type("Channel.receive: missing state".into())
-            })?;
+            let state = r
+                .channels
+                .get_mut(&id)
+                .ok_or_else(|| RuntimeError::Type("Channel.receive: missing state".into()))?;
             if let Some(v) = state.buffer.pop_front() {
                 let resumed_sender = state.send_waiters.pop_front();
                 if let Some((_, pending)) = &resumed_sender {
@@ -387,12 +390,13 @@ enum ChannelReceiveOutcome {
 }
 
 fn channel_try_receive(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("Channel.tryReceive expects a receiver".into())
-    })?;
-    let id = channel_id(&recv).ok_or_else(|| {
-        RuntimeError::Type("Channel.tryReceive: bad receiver".into())
-    })?;
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("Channel.tryReceive expects a receiver".into()))?;
+    let id = channel_id(&recv)
+        .ok_or_else(|| RuntimeError::Type("Channel.tryReceive: bad receiver".into()))?;
     let outcome = with_reg(|r| {
         let state = r.channels.get_mut(&id)?;
         if let Some(v) = state.buffer.pop_front() {
@@ -419,22 +423,20 @@ fn channel_try_receive(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn channel_close(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("Channel.close expects a receiver".into())
-    })?;
-    let id = channel_id(&recv).ok_or_else(|| {
-        RuntimeError::Type("Channel.close: bad receiver".into())
-    })?;
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("Channel.close expects a receiver".into()))?;
+    let id = channel_id(&recv)
+        .ok_or_else(|| RuntimeError::Type("Channel.close: bad receiver".into()))?;
     let waiters = with_reg(|r| {
         let state = r.channels.get_mut(&id)?;
         state.closed = true;
         let recvs: Vec<i64> = state.receive_waiters.drain(..).collect();
-        let iters: Vec<(
-            i64,
-            klio_runtime::ObjRef<klio_runtime::InstanceData>,
-        )> = state.receive_iter_waiters.drain(..).collect();
-        let sends: Vec<(i64, Value)> =
-            state.send_waiters.drain(..).collect();
+        let iters: Vec<(i64, klio_runtime::ObjRef<klio_runtime::InstanceData>)> =
+            state.receive_iter_waiters.drain(..).collect();
+        let sends: Vec<(i64, Value)> = state.send_waiters.drain(..).collect();
         Some((recvs, iters, sends))
     });
     if let Some((recvs, iters, sends)) = waiters {
@@ -465,25 +467,25 @@ fn channel_close(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn channel_is_closed_for_send(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("isClosedForSend expects a receiver".into())
-    })?;
-    let id = channel_id(&recv).ok_or_else(|| {
-        RuntimeError::Type("isClosedForSend: bad receiver".into())
-    })?;
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("isClosedForSend expects a receiver".into()))?;
+    let id = channel_id(&recv)
+        .ok_or_else(|| RuntimeError::Type("isClosedForSend: bad receiver".into()))?;
     let closed = with_reg(|r| r.channels.get(&id).is_none_or(|s| s.closed));
     Ok(Value::Bool(closed))
 }
 
-fn channel_is_closed_for_receive(
-    ctx: &mut CallCtx,
-) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("isClosedForReceive expects a receiver".into())
-    })?;
-    let id = channel_id(&recv).ok_or_else(|| {
-        RuntimeError::Type("isClosedForReceive: bad receiver".into())
-    })?;
+fn channel_is_closed_for_receive(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("isClosedForReceive expects a receiver".into()))?;
+    let id = channel_id(&recv)
+        .ok_or_else(|| RuntimeError::Type("isClosedForReceive: bad receiver".into()))?;
     let drained_closed = with_reg(|r| {
         r.channels
             .get(&id)
@@ -493,36 +495,38 @@ fn channel_is_closed_for_receive(
 }
 
 fn channel_iterator(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("Channel.iterator expects a receiver".into())
-    })?;
-    let ch_id = channel_id(&recv).ok_or_else(|| {
-        RuntimeError::Type("Channel.iterator: bad receiver".into())
-    })?;
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("Channel.iterator expects a receiver".into()))?;
+    let ch_id = channel_id(&recv)
+        .ok_or_else(|| RuntimeError::Type("Channel.iterator: bad receiver".into()))?;
     let id = ctx.host.alloc_instance_id();
+    // The channel id is an opaque u64 stored bit-for-bit in a Long slot.
+    #[allow(clippy::cast_possible_wrap)]
     let inst = ctx.host.new_synth_instance(
         "kotlinx.coroutines.channels.KlioChannelIterator",
         id,
         vec![
-            (
-                "__channel_id__".to_string(),
-                Value::Long(ch_id as i64),
-            ),
+            ("__channel_id__".to_string(), Value::Long(ch_id as i64)),
             ("__pending__".to_string(), Value::Null),
         ],
     );
     Ok(inst)
 }
 
-fn channel_iter_has_next(
-    ctx: &mut CallCtx,
-) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("hasNext expects a receiver".into())
-    })?;
+fn channel_iter_has_next(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("hasNext expects a receiver".into()))?;
     let (iter_inst, ch_id) = match &recv {
         Value::Instance(i) => {
             let b = i.borrow();
+            // The channel id was stored bit-for-bit; recover the opaque u64.
+            #[allow(clippy::cast_sign_loss)]
             let ch_id = b
                 .get("__channel_id__")
                 .and_then(|v| match v {
@@ -530,9 +534,7 @@ fn channel_iter_has_next(
                     Value::Int(n) => Some(n as u64),
                     _ => None,
                 })
-                .ok_or_else(|| {
-                    RuntimeError::Type("hasNext: missing channel id".into())
-                })?;
+                .ok_or_else(|| RuntimeError::Type("hasNext: missing channel id".into()))?;
             (i.clone(), ch_id)
         }
         _ => return Err(RuntimeError::Type("hasNext: bad receiver".into())),
@@ -541,9 +543,10 @@ fn channel_iter_has_next(
     // touching the channel.
     let pending = iter_inst.borrow().get("__pending__");
     if let Some(c) = pending
-        && !matches!(c, Value::Null) {
-            return Ok(Value::Bool(true));
-        }
+        && !matches!(c, Value::Null)
+    {
+        return Ok(Value::Bool(true));
+    }
     // Try a synchronous pull. If the buffer holds a value, cache it
     // and return true; if the channel is drained-and-closed, return
     // false; otherwise queue an iterator-style waiter and suspend.
@@ -582,24 +585,24 @@ fn channel_iter_has_next(
 }
 
 fn channel_iter_next(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("next expects a receiver".into())
-    })?;
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("next expects a receiver".into()))?;
     let inst = match &recv {
         Value::Instance(i) => i.clone(),
         _ => return Err(RuntimeError::Type("next: bad receiver".into())),
     };
     let pending = inst.borrow().get("__pending__");
     if let Some(v) = pending
-        && !matches!(v, Value::Null) {
-            inst.borrow_mut()
-                .define("__pending__", Value::Null);
-            return Ok(v);
-        }
+        && !matches!(v, Value::Null)
+    {
+        inst.borrow_mut().define("__pending__", Value::Null);
+        return Ok(v);
+    }
     Err(RuntimeError::Thrown(Value::Exception {
-        fqn: std::sync::Arc::new(
-            "kotlin.NoSuchElementException".into(),
-        ),
+        fqn: std::sync::Arc::new("kotlin.NoSuchElementException".into()),
         message: Some(std::sync::Arc::new(
             "ChannelIterator.next called before hasNext".into(),
         )),
@@ -608,17 +611,13 @@ fn channel_iter_next(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 
 fn channel_is_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let recv = ctx.args.first().cloned().ok_or_else(|| {
-        RuntimeError::Arity("isEmpty expects a receiver".into())
-    })?;
-    let id = channel_id(&recv).ok_or_else(|| {
-        RuntimeError::Type("isEmpty: bad receiver".into())
-    })?;
-    let empty = with_reg(|r| {
-        r.channels
-            .get(&id)
-            .is_none_or(|s| s.buffer.is_empty())
-    });
+    let recv = ctx
+        .args
+        .first()
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("isEmpty expects a receiver".into()))?;
+    let id = channel_id(&recv).ok_or_else(|| RuntimeError::Type("isEmpty: bad receiver".into()))?;
+    let empty = with_reg(|r| r.channels.get(&id).is_none_or(|s| s.buffer.is_empty()));
     Ok(Value::Bool(empty))
 }
 
@@ -634,15 +633,14 @@ fn closed_receive_exc() -> Value {
 
 fn closed_send_exc() -> Value {
     Value::Exception {
-        fqn: std::sync::Arc::new(
-            "kotlinx.coroutines.channels.ClosedSendChannelException".into(),
-        ),
+        fqn: std::sync::Arc::new("kotlinx.coroutines.channels.ClosedSendChannelException".into()),
         message: Some(std::sync::Arc::new("Channel was closed".into())),
         cause: None,
     }
 }
 
-
+// Host binding behind a fixed `fn(&mut CallCtx) -> Result<..>` pointer.
+#[allow(clippy::unnecessary_wraps)]
 fn job_cancel(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // args[0] is the Job receiver. args[1], if present, is the
     // CancellationException cause supplied by the caller (e.g.
@@ -650,14 +648,10 @@ fn job_cancel(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // Surface that exception to the parked activations so a catch
     // arm typed on the cause's concrete class (TimeoutCancellationException
     // for withTimeoutOrNull) fires correctly.
-    let cause = ctx
-        .args
-        .iter()
-        .skip(1)
-        .find_map(|v| match v {
-            Value::Exception { .. } | Value::Instance(_) => Some(v.clone()),
-            _ => None,
-        });
+    let cause = ctx.args.iter().skip(1).find_map(|v| match v {
+        Value::Exception { .. } | Value::Instance(_) => Some(v.clone()),
+        _ => None,
+    });
     ctx.host.coroutine_cancel_timed_parks_with(cause);
     Ok(Value::Bool(true))
 }
@@ -682,10 +676,7 @@ fn run_blocking(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // the block dispatches the shim extension. GlobalScope is the
     // singleton the shim publishes; fall back to Null if the pack
     // hasn't been registered yet (e.g. unit tests with NoopHost).
-    let scope = ctx
-        .host
-        .lookup_global("GlobalScope")
-        .unwrap_or(Value::Null);
+    let scope = ctx.host.lookup_global("GlobalScope").unwrap_or(Value::Null);
     ctx.host.run_blocking(&block, &scope, ctx.out)
 }
 
@@ -706,12 +697,15 @@ fn delay_millis(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         _ => {
             return Err(RuntimeError::Type(
                 "kotlinx.coroutines.delay: argument must be Long".into(),
-            ))
+            ));
         }
     };
     Err(RuntimeError::Suspend(ms.max(0)))
 }
 
+// Host binding behind a fixed `fn(&mut CallCtx) -> Result<..>` pointer;
+// the epoch-millis value narrows to Kotlin Long (currentTimeMillis).
+#[allow(clippy::unnecessary_wraps, clippy::cast_possible_truncation)]
 fn current_time_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -719,6 +713,8 @@ fn current_time_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Long(t))
 }
 
+// Host binding behind a fixed `fn(&mut CallCtx) -> Result<..>` pointer.
+#[allow(clippy::unnecessary_wraps)]
 fn token_create(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let id = with_reg(|r| {
         let id = r.next_token;
@@ -732,12 +728,18 @@ fn token_cancel(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let id = match ctx.args.first() {
         Some(Value::Long(l)) => *l,
         Some(Value::Int(i)) => i64::from(*i),
-        _ => return Err(RuntimeError::Type("tokenCancel: argument must be Long".into())),
+        _ => {
+            return Err(RuntimeError::Type(
+                "tokenCancel: argument must be Long".into(),
+            ));
+        }
     };
     with_reg(|r| r.cancelled_tokens.insert(id));
     Ok(Value::Unit)
 }
 
+// Host binding behind a fixed `fn(&mut CallCtx) -> Result<..>` pointer.
+#[allow(clippy::unnecessary_wraps)]
 fn token_is_cancelled(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let id = match ctx.args.first() {
         Some(Value::Long(l)) => *l,
@@ -755,7 +757,11 @@ fn scheduler_enqueue(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let h = match ctx.args.first() {
         Some(Value::Long(l)) => *l,
         Some(Value::Int(i)) => i64::from(*i),
-        _ => return Err(RuntimeError::Type("schedulerEnqueue: argument must be Long".into())),
+        _ => {
+            return Err(RuntimeError::Type(
+                "schedulerEnqueue: argument must be Long".into(),
+            ));
+        }
     };
     with_reg(|r| r.sched_queue.push(h));
     Ok(Value::Unit)
@@ -770,6 +776,8 @@ fn scheduler_enqueue(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// `kotlinx.coroutines.*` knobs JVM callers spell via
 /// `System.getProperty`. Probes the env for the exact property
 /// name first, then a `.` → `_` alias.
+// Host binding behind a fixed `fn(&mut CallCtx) -> Result<..>` pointer.
+#[allow(clippy::unnecessary_wraps)]
 fn kxco_system_prop(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let key = match ctx.args.first() {
         Some(Value::String(s)) => s.as_ref().clone(),
@@ -778,11 +786,15 @@ fn kxco_system_prop(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if let Ok(v) = std::env::var(&key) {
         return Ok(Value::String(std::sync::Arc::new(v)));
     }
-    let alias: String = key.chars().map(|c| if c == '.' { '_' } else { c }).collect();
+    let alias: String = key
+        .chars()
+        .map(|c| if c == '.' { '_' } else { c })
+        .collect();
     if alias != key
-        && let Ok(v) = std::env::var(&alias) {
-            return Ok(Value::String(std::sync::Arc::new(v)));
-        }
+        && let Ok(v) = std::env::var(&alias)
+    {
+        return Ok(Value::String(std::sync::Arc::new(v)));
+    }
     Ok(Value::Null)
 }
 
@@ -821,6 +833,8 @@ fn dispatch_coroutine(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         ));
     };
     let id = ctx.host.dispatch_coroutine(&block, false, ctx.out)?;
+    // Opaque u64 job id handed back bit-for-bit in a Long slot.
+    #[allow(clippy::cast_possible_wrap)]
     Ok(Value::Long(id as i64))
 }
 
@@ -833,6 +847,8 @@ fn dispatch_coroutine_io(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         ));
     };
     let id = ctx.host.dispatch_coroutine(&block, true, ctx.out)?;
+    // Opaque u64 job id handed back bit-for-bit in a Long slot.
+    #[allow(clippy::cast_possible_wrap)]
     Ok(Value::Long(id as i64))
 }
 
@@ -846,10 +862,13 @@ fn join_dispatched(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         _ => {
             return Err(RuntimeError::Type(
                 "__kxco_joinDispatched: argument must be Long".into(),
-            ))
+            ));
         }
     };
-    ctx.host.join_dispatched(id as u64)?;
+    // The job id was stored bit-for-bit; recover the opaque u64.
+    #[allow(clippy::cast_sign_loss)]
+    let job = id as u64;
+    ctx.host.join_dispatched(job)?;
     Ok(Value::Unit)
 }
 
@@ -875,13 +894,14 @@ fn schedule_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 /// driver mailbox) cannot alias an id minted on another OS thread.
 /// Offset above the `kotlin.coroutines` layer's range so the two
 /// suspension surfaces never alias in the global slot-owner table.
-static KXCO_NEXT_SLOT: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(1 << 48);
+static KXCO_NEXT_SLOT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1 << 48);
 
 fn alloc_kxco_slot() -> i64 {
     KXCO_NEXT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+// Host binding behind a fixed `fn(&mut CallCtx) -> Result<..>` pointer.
+#[allow(clippy::unnecessary_wraps)]
 fn new_slot(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Long(alloc_kxco_slot()))
 }
@@ -898,7 +918,7 @@ fn park_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         _ => {
             return Err(RuntimeError::Type(
                 "__kxco_parkSlot: argument must be Long".into(),
-            ))
+            ));
         }
     };
     ctx.host.coroutine_park_slot(slot);
@@ -916,13 +936,20 @@ fn resume_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         _ => {
             return Err(RuntimeError::Type(
                 "__kxco_resumeSlot: argument must be Long".into(),
-            ))
+            ));
         }
     };
     ctx.host.coroutine_resume_slot(slot);
     Ok(Value::Unit)
 }
 
+// Host binding behind a fixed `fn(&mut CallCtx) -> Result<..>` pointer;
+// the queue length narrows to a Kotlin Int count.
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn scheduler_drain_count(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let count = with_reg(|r| {
         let n = r.sched_queue.len() as i32;

@@ -1,4 +1,7 @@
-use super::{Parser, Expr, TokenKind, AssignOp, Stmt, Block, Keyword, Ident, Catch, WhenBinding, WhenBranch, WhenPattern, WhenPatternKind, Span};
+use super::{
+    AssignOp, Block, Catch, Expr, Ident, Keyword, Parser, Span, Stmt, TokenKind, WhenBinding,
+    WhenBranch, WhenPattern, WhenPatternKind,
+};
 
 impl Parser<'_, '_> {
     /// Parses a `controlStructureBody` per the spec: a statement (which
@@ -46,8 +49,16 @@ impl Parser<'_, '_> {
             self.skip_nl();
             let rhs = self.parse_expr()?;
             let span = expr.span().join(rhs.span());
-            let stmt = Stmt::Assign { target: expr, op, value: rhs, span };
-            return Some(Expr::Block(Block { stmts: vec![stmt], span }));
+            let stmt = Stmt::Assign {
+                target: expr,
+                op,
+                value: rhs,
+                span,
+            };
+            return Some(Expr::Block(Block {
+                stmts: vec![stmt],
+                span,
+            }));
         }
         let _ = save;
         Some(expr)
@@ -70,11 +81,15 @@ impl Parser<'_, '_> {
         let then_branch = match self.peek_kind() {
             TokenKind::Semicolon => {
                 let semi = self.bump();
-                Expr::Block(Block { stmts: Vec::new(), span: semi.span })
+                Expr::Block(Block {
+                    stmts: Vec::new(),
+                    span: semi.span,
+                })
             }
-            TokenKind::Keyword(Keyword::Else) => {
-                Expr::Block(Block { stmts: Vec::new(), span: cond_span })
-            }
+            TokenKind::Keyword(Keyword::Else) => Expr::Block(Block {
+                stmts: Vec::new(),
+                span: cond_span,
+            }),
             _ => self.parse_control_structure_body()?,
         };
         // `else` may follow on the next line.
@@ -83,10 +98,7 @@ impl Parser<'_, '_> {
         // A following `else ->` is a `when`-arm else, not this `if`'s
         // else branch — do not consume it (upstream kotlinx-coroutines
         // `when { ... cond -> if (c) return X; else -> ... }`).
-        let else_is_when_arm = matches!(
-            self.peek_kind(),
-            TokenKind::Keyword(Keyword::Else)
-        ) && {
+        let else_is_when_arm = matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Else)) && {
             let mut j = self.pos + 1;
             while matches!(
                 self.tokens.get(j).map(|t| &t.kind),
@@ -96,21 +108,26 @@ impl Parser<'_, '_> {
             }
             matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Arrow))
         };
-        let else_branch = if !else_is_when_arm
-            && matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Else)) {
-            self.bump();
-            self.skip_nl();
-            if matches!(self.peek_kind(), TokenKind::Semicolon) {
-                let semi = self.bump();
-                Some(Box::new(Expr::Block(Block { stmts: Vec::new(), span: semi.span })))
+        let else_branch =
+            if !else_is_when_arm && matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Else)) {
+                self.bump();
+                self.skip_nl();
+                if matches!(self.peek_kind(), TokenKind::Semicolon) {
+                    let semi = self.bump();
+                    Some(Box::new(Expr::Block(Block {
+                        stmts: Vec::new(),
+                        span: semi.span,
+                    })))
+                } else {
+                    self.parse_control_structure_body().map(Box::new)
+                }
             } else {
-                self.parse_control_structure_body().map(Box::new)
-            }
-        } else {
-            self.pos = save;
-            None
-        };
-        let end = else_branch.as_ref().map_or(then_branch.span(), |e| e.span());
+                self.pos = save;
+                None
+            };
+        let end = else_branch
+            .as_ref()
+            .map_or(then_branch.span(), |e| e.span());
         Some(Expr::If {
             cond: Box::new(cond),
             then_branch: Box::new(then_branch),
@@ -236,11 +253,19 @@ impl Parser<'_, '_> {
         let label = self.consume_jump_label();
         if self.at_newline_or_semi_or_close() {
             let span = label.as_ref().map_or(kw.span, |l| kw.span.join(l.span));
-            return Some(Expr::Return { value: None, label, span });
+            return Some(Expr::Return {
+                value: None,
+                label,
+                span,
+            });
         }
         let value = self.parse_expr()?;
         let span = kw.span.join(value.span());
-        Some(Expr::Return { value: Some(Box::new(value)), label, span })
+        Some(Expr::Return {
+            value: Some(Box::new(value)),
+            label,
+            span,
+        })
     }
 
     /// `label@ <expr>` at expression position. The label name is a bare
@@ -257,13 +282,20 @@ impl Parser<'_, '_> {
             return None;
         }
         let name_span = self.current_span();
-        let label = Ident { name: self.ident_name(name_span), span: name_span };
+        let label = Ident {
+            name: self.ident_name(name_span),
+            span: name_span,
+        };
         self.bump();
         self.bump();
         self.skip_nl();
         let inner = self.parse_unary_for_label()?;
         let span = label.span.join(inner.span());
-        Some(Expr::Labeled { label, expr: Box::new(inner), span })
+        Some(Expr::Labeled {
+            label,
+            expr: Box::new(inner),
+            span,
+        })
     }
 
     /// Parse the body of a `label@ <body>` binding. We re-enter the prefix
@@ -289,7 +321,10 @@ impl Parser<'_, '_> {
         self.skip_nl();
         let value = self.parse_expr()?;
         let span = kw.span.join(value.span());
-        Some(Expr::Throw { value: Box::new(value), span })
+        Some(Expr::Throw {
+            value: Box::new(value),
+            span,
+        })
     }
 
     pub(crate) fn parse_try(&mut self) -> Option<Expr> {
@@ -315,7 +350,12 @@ impl Parser<'_, '_> {
             self.skip_nl();
             let catch_body = self.parse_block()?;
             let span = binding.span.join(catch_body.span);
-            catches.push(Catch { binding, ty, body: catch_body, span });
+            catches.push(Catch {
+                binding,
+                ty,
+                body: catch_body,
+                span,
+            });
         }
         let finally = {
             let save = self.pos;
@@ -399,7 +439,10 @@ impl Parser<'_, '_> {
         }
         // Peek further: val NAME (':' …)? '='
         let mut i = self.pos + 1;
-        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+        while matches!(
+            self.tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Newline)
+        ) {
             i += 1;
         }
         if !matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Ident)) {
@@ -408,7 +451,10 @@ impl Parser<'_, '_> {
         }
         // Skip past the name and optional `: Type` to look for `=`.
         let mut j = i + 1;
-        while matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Newline)) {
+        while matches!(
+            self.tokens.get(j).map(|t| &t.kind),
+            Some(TokenKind::Newline)
+        ) {
             j += 1;
         }
         if matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Colon)) {
@@ -468,7 +514,11 @@ impl Parser<'_, '_> {
         // statement (`sum += item`) is allowed alongside expressions.
         let body = self.parse_control_structure_body()?;
         let span = start.join(body.span());
-        Some(WhenBranch { patterns, body, span })
+        Some(WhenBranch {
+            patterns,
+            body,
+            span,
+        })
     }
 
     pub(crate) fn parse_when_pattern(&mut self, has_subject: bool) -> Option<WhenPattern> {
@@ -476,7 +526,10 @@ impl Parser<'_, '_> {
         // `else` — always valid as a pattern.
         if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Else)) {
             let tok = self.bump();
-            return Some(WhenPattern { kind: WhenPatternKind::Else, span: tok.span });
+            return Some(WhenPattern {
+                kind: WhenPatternKind::Else,
+                span: tok.span,
+            });
         }
         // Subject-bound patterns can use `is Type`, `!is Type`, `in expr`,
         // `!in expr`. Subject-free `when` only accepts Boolean conditions
@@ -488,14 +541,20 @@ impl Parser<'_, '_> {
                     self.bump();
                     let ty = self.parse_qualified_type()?;
                     let span = start.join(ty.span);
-                    return Some(WhenPattern { kind: WhenPatternKind::IsType(ty), span });
+                    return Some(WhenPattern {
+                        kind: WhenPatternKind::IsType(ty),
+                        span,
+                    });
                 }
                 TokenKind::Keyword(Keyword::In) => {
                     self.bump();
                     self.skip_nl();
                     let e = self.parse_expr()?;
                     let span = start.join(e.span());
-                    return Some(WhenPattern { kind: WhenPatternKind::InRange(e), span });
+                    return Some(WhenPattern {
+                        kind: WhenPatternKind::InRange(e),
+                        span,
+                    });
                 }
                 k if k.is_bang() => {
                     let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
@@ -505,7 +564,10 @@ impl Parser<'_, '_> {
                             self.bump();
                             let ty = self.parse_qualified_type()?;
                             let span = start.join(ty.span);
-                            return Some(WhenPattern { kind: WhenPatternKind::NotIsType(ty), span });
+                            return Some(WhenPattern {
+                                kind: WhenPatternKind::NotIsType(ty),
+                                span,
+                            });
                         }
                         Some(TokenKind::Keyword(Keyword::In)) => {
                             self.bump();
@@ -513,7 +575,10 @@ impl Parser<'_, '_> {
                             self.skip_nl();
                             let e = self.parse_expr()?;
                             let span = start.join(e.span());
-                            return Some(WhenPattern { kind: WhenPatternKind::NotInRange(e), span });
+                            return Some(WhenPattern {
+                                kind: WhenPatternKind::NotInRange(e),
+                                span,
+                            });
                         }
                         _ => {}
                     }
@@ -523,7 +588,10 @@ impl Parser<'_, '_> {
         }
         let e = self.parse_expr()?;
         let span = start.join(e.span());
-        Some(WhenPattern { kind: WhenPatternKind::Value(e), span })
+        Some(WhenPattern {
+            kind: WhenPatternKind::Value(e),
+            span,
+        })
     }
 
     pub(crate) fn parse_lambda_literal(&mut self) -> Option<Expr> {
@@ -562,7 +630,10 @@ impl Parser<'_, '_> {
         let lbrace = self.bump();
         let (mut params, dest_stmts) = self.parse_lambda_header();
         if params.is_empty() {
-            params.push(Ident { name: "it".into(), span: lbrace.span });
+            params.push(Ident {
+                name: "it".into(),
+                span: lbrace.span,
+            });
         }
         let mut stmts = dest_stmts;
         loop {
@@ -652,7 +723,10 @@ impl Parser<'_, '_> {
                 match self.peek_kind() {
                     TokenKind::Ident => {
                         let tok = self.bump();
-                        local.push(Ident { name: self.ident_name(tok.span), span: tok.span });
+                        local.push(Ident {
+                            name: self.ident_name(tok.span),
+                            span: tok.span,
+                        });
                         self.skip_nl();
                         if matches!(self.peek_kind(), TokenKind::Colon) {
                             self.bump();
@@ -670,9 +744,13 @@ impl Parser<'_, '_> {
                             }
                             let id_span = self.current_span();
                             let text = self.text(id_span);
-                            let id = if text == "_" && matches!(self.peek_kind(), TokenKind::Ident) {
+                            let id = if text == "_" && matches!(self.peek_kind(), TokenKind::Ident)
+                            {
                                 self.bump();
-                                Ident { name: "_".into(), span: id_span }
+                                Ident {
+                                    name: "_".into(),
+                                    span: id_span,
+                                }
                             } else if let Some(id) = self.parse_ident("destructured lambda param") {
                                 id
                             } else {
@@ -719,7 +797,12 @@ impl Parser<'_, '_> {
                         segments: vec![local[idx].clone()],
                         span,
                     };
-                    dest_stmts.push(Stmt::DestructuringDecl { mutable: false, names, init, span });
+                    dest_stmts.push(Stmt::DestructuringDecl {
+                        mutable: false,
+                        names,
+                        init,
+                        span,
+                    });
                 }
                 params = local;
                 return (params, dest_stmts);

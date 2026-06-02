@@ -33,10 +33,8 @@ fn expected_stdout(file: &Path) -> String {
         if let Some(rest) = t.strip_prefix("//>") {
             out.push_str(rest.strip_prefix(' ').unwrap_or(rest));
             out.push('\n');
-        } else if t.starts_with("//") {
-            continue;
-        } else if out.is_empty() {
-            continue;
+        } else if t.starts_with("//") || out.is_empty() {
+            // Skip leading comments and blank lead-in.
         } else {
             break;
         }
@@ -82,14 +80,38 @@ const PENDING: &[(&str, &str)] = &[
 // Each litmus stem is its own `#[test]` so cargo runs them in
 // parallel — the previous single test serialised 8 heavy
 // `run_with_packs` invocations.
-#[test] fn tl_smoke()                { check("tl_smoke"); }
-#[test] fn tl_thread_join()          { check("tl_thread_join"); }
-#[test] fn tl_sync_counter()         { check("tl_sync_counter"); }
-#[test] fn tl_parallel_partition()   { check("tl_parallel_partition"); }
-#[test] fn tl_async_parallel()       { check("tl_async_parallel"); }
-#[test] fn tl_withcontext_io()       { check("tl_withcontext_io"); }
-#[test] fn tl_dispatch_many()        { check("tl_dispatch_many"); }
-#[test] fn tl_thread_sleep()         { check("tl_thread_sleep"); }
+#[test]
+fn tl_smoke() {
+    check("tl_smoke");
+}
+#[test]
+fn tl_thread_join() {
+    check("tl_thread_join");
+}
+#[test]
+fn tl_sync_counter() {
+    check("tl_sync_counter");
+}
+#[test]
+fn tl_parallel_partition() {
+    check("tl_parallel_partition");
+}
+#[test]
+fn tl_async_parallel() {
+    check("tl_async_parallel");
+}
+#[test]
+fn tl_withcontext_io() {
+    check("tl_withcontext_io");
+}
+#[test]
+fn tl_dispatch_many() {
+    check("tl_dispatch_many");
+}
+#[test]
+fn tl_thread_sleep() {
+    check("tl_thread_sleep");
+}
 
 #[test]
 #[ignore = "pending litmus: un-ignore as real thread spawn lands"]

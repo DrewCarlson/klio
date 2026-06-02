@@ -24,10 +24,10 @@ pub mod schema;
 pub mod write;
 
 pub use format::{
-    section_names, Compression, SectionDirectory, SectionEntry, FORMAT_VERSION, MAGIC,
+    Compression, FORMAT_VERSION, MAGIC, SectionDirectory, SectionEntry, section_names,
 };
 pub use read::PackReader;
-pub use write::{PackWriter, DEFAULT_ZSTD_LEVEL};
+pub use write::{DEFAULT_ZSTD_LEVEL, PackWriter};
 
 /// Highest ABI version this build of klio supports. Pack manifests
 /// declare an `abi_version`; the loader rejects packs whose ABI is
@@ -107,11 +107,27 @@ mod tests {
 
         let reader = PackReader::from_bytes(bytes).expect("decode multi-section pack");
         let names: Vec<_> = reader.section_names().collect();
-        assert_eq!(names, [section_names::BINDINGS, section_names::MANIFEST, section_names::SYMBOLS]);
+        assert_eq!(
+            names,
+            [
+                section_names::BINDINGS,
+                section_names::MANIFEST,
+                section_names::SYMBOLS
+            ]
+        );
 
-        let got_manifest = reader.read_section(section_names::MANIFEST).unwrap().unwrap();
-        let got_symbols = reader.read_section(section_names::SYMBOLS).unwrap().unwrap();
-        let got_bindings = reader.read_section(section_names::BINDINGS).unwrap().unwrap();
+        let got_manifest = reader
+            .read_section(section_names::MANIFEST)
+            .unwrap()
+            .unwrap();
+        let got_symbols = reader
+            .read_section(section_names::SYMBOLS)
+            .unwrap()
+            .unwrap();
+        let got_bindings = reader
+            .read_section(section_names::BINDINGS)
+            .unwrap()
+            .unwrap();
         assert_eq!(&*got_manifest, &manifest[..]);
         assert_eq!(&*got_symbols, &symbols[..]);
         assert_eq!(&*got_bindings, &bindings[..]);
@@ -131,7 +147,11 @@ mod tests {
             w.add_raw("a", payload_a.clone());
             w.finish().expect("encode pack")
         };
-        assert_eq!(build(), build(), "two builds of identical input must produce identical bytes");
+        assert_eq!(
+            build(),
+            build(),
+            "two builds of identical input must produce identical bytes"
+        );
     }
 
     #[test]
@@ -194,17 +214,14 @@ mod tests {
         let bytes = w.finish().expect("encode dict pack");
 
         let reader = PackReader::from_bytes(bytes).expect("decode dict pack");
-        assert_eq!(
-            &*reader.read_section("a").unwrap().unwrap(),
-            &payload[..]
-        );
-        assert_eq!(
-            &*reader.read_section("b").unwrap().unwrap(),
-            &payload[..]
-        );
+        assert_eq!(&*reader.read_section("a").unwrap().unwrap(), &payload[..]);
+        assert_eq!(&*reader.read_section("b").unwrap().unwrap(), &payload[..]);
         // The dictionary itself is reachable.
         assert_eq!(
-            &*reader.read_section(section_names::ZSTD_DICT).unwrap().unwrap(),
+            &*reader
+                .read_section(section_names::ZSTD_DICT)
+                .unwrap()
+                .unwrap(),
             &dict[..]
         );
     }

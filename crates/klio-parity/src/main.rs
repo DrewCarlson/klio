@@ -59,7 +59,11 @@ fn main() -> ExitCode {
         }
     }
     let _ = file; // suppress unused-var warning in case args was empty
-    if any_mismatch { ExitCode::from(1) } else { ExitCode::SUCCESS }
+    if any_mismatch {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// `klio-parity --sweep [corpus|examples|all]` — the fast inner loop. Compares
@@ -78,10 +82,16 @@ fn run_sweep_cmd(which: &str) -> ExitCode {
     let timeout = Duration::from_mins(1);
     let mut groups: Vec<(&str, Vec<PathBuf>)> = Vec::new();
     if which == "corpus" || which == "all" {
-        groups.push(("corpus", klio_parity::collect_kt(&klio_parity::corpus_dir())));
+        groups.push((
+            "corpus",
+            klio_parity::collect_kt(&klio_parity::corpus_dir()),
+        ));
     }
     if which == "examples" || which == "all" {
-        groups.push(("examples", klio_parity::collect_kt(&klio_parity::examples_dir())));
+        groups.push((
+            "examples",
+            klio_parity::collect_kt(&klio_parity::examples_dir()),
+        ));
     }
     if groups.is_empty() {
         eprintln!("[sweep] unknown target {which:?}; use corpus | examples | all");
@@ -131,5 +141,9 @@ fn run_sweep_cmd(which: &str) -> ExitCode {
         "=== sweep: {total_pass}/{total} passed in {:.1}s ===",
         start.elapsed().as_secs_f64()
     );
-    if any_fail { ExitCode::from(1) } else { ExitCode::SUCCESS }
+    if any_fail {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }

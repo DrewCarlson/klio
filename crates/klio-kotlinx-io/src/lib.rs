@@ -7,6 +7,7 @@
 //! `expect fun` on the Kotlin side. This keeps the pack faithful to
 //! upstream's "common code + thin platform actuals" structure.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use klio_runtime::{CallCtx, PrimitiveArrayKind, RuntimeError, Value};
@@ -30,6 +31,9 @@ fn arg_string(ctx: &CallCtx, idx: usize) -> Result<String, RuntimeError> {
     }
 }
 
+// Kotlin Byte is a signed i8; raw bytes reinterpret it as u8, and an
+// Int/Long element narrows via toByte() before that reinterpret.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn arg_bytes(ctx: &CallCtx, idx: usize) -> Result<Vec<u8>, RuntimeError> {
     match ctx.args.get(idx) {
         Some(Value::String(s)) => Ok(s.as_bytes().to_vec()),
@@ -62,10 +66,10 @@ fn base64_decode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(s.as_bytes())
         .map_err(|e| RuntimeError::Type(format!("base64 decode: {e}")))?;
+    // Raw u8 reinterpreted as Kotlin's signed Byte.
+    #[allow(clippy::cast_possible_wrap)]
     Ok(Value::Array {
-        items: klio_runtime::ObjRef::new(
-            bytes.into_iter().map(|b| Value::Byte(b as i8)).collect(),
-        ),
+        items: klio_runtime::ObjRef::new(bytes.into_iter().map(|b| Value::Byte(b as i8)).collect()),
         prim: Some(PrimitiveArrayKind::Byte),
     })
 }
@@ -74,11 +78,14 @@ fn hex_encode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let data = arg_bytes(ctx, 0)?;
     let mut out = String::with_capacity(data.len() * 2);
     for b in data {
-        out.push_str(&format!("{b:02x}"));
+        write!(out, "{b:02x}").unwrap();
     }
     Ok(Value::String(Arc::new(out)))
 }
 
+// Each nibble is a 4-bit hex digit, so the packed byte fits u8; the raw
+// u8 then reinterprets as Kotlin's signed Byte.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn hex_decode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = arg_string(ctx, 0)?;
     if s.len() % 2 != 0 {
@@ -96,9 +103,7 @@ fn hex_decode(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         bytes.push(((hi << 4) | lo) as u8);
     }
     Ok(Value::Array {
-        items: klio_runtime::ObjRef::new(
-            bytes.into_iter().map(|b| Value::Byte(b as i8)).collect(),
-        ),
+        items: klio_runtime::ObjRef::new(bytes.into_iter().map(|b| Value::Byte(b as i8)).collect()),
         prim: Some(PrimitiveArrayKind::Byte),
     })
 }

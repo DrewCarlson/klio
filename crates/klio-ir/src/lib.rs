@@ -100,14 +100,26 @@ pub enum Inst {
     /// shared `Rc` so every holder observes the write.
     CellSet { cell: Reg, value: Reg },
     /// Read a local property of a class instance.
-    GetField { dst: Reg, receiver: Reg, field: ConstId },
+    GetField {
+        dst: Reg,
+        receiver: Reg,
+        field: ConstId,
+    },
     /// Write a local property of a class instance.
-    SetField { receiver: Reg, field: ConstId, value: Reg },
+    SetField {
+        receiver: Reg,
+        field: ConstId,
+        value: Reg,
+    },
     /// Index a `List`, `Map`, or `Array`. Range checks happen in
     /// the evaluator.
     Index { dst: Reg, receiver: Reg, index: Reg },
     /// Store at an indexed slot.
-    IndexSet { receiver: Reg, index: Reg, value: Reg },
+    IndexSet {
+        receiver: Reg,
+        index: Reg,
+        value: Reg,
+    },
     /// Call a static function by id, with the args pulled from a
     /// run of registers starting at `args`. `arg_names` carries an
     /// optional `Option<ConstId>` per slot — `Some(name)` for
@@ -263,10 +275,19 @@ pub enum Inst {
     /// receiver value. The host resolves the right shape
     /// (`BoundMethod`, intrinsic, `PropertyRef`) from the receiver's
     /// class table.
-    MemberRef { dst: Reg, receiver: Reg, name: ConstId },
+    MemberRef {
+        dst: Reg,
+        receiver: Reg,
+        name: ConstId,
+    },
     /// Binary primitive operation. Operands are guaranteed to be
     /// the right type by typeck.
-    BinOp { dst: Reg, op: BinOp, lhs: Reg, rhs: Reg },
+    BinOp {
+        dst: Reg,
+        op: BinOp,
+        lhs: Reg,
+        rhs: Reg,
+    },
     /// Unary primitive operation.
     UnOp { dst: Reg, op: UnOp, operand: Reg },
     /// Boolean negation.
@@ -274,7 +295,12 @@ pub enum Inst {
     /// Type-cast (`as T`) or safe-cast (`as? T`). The evaluator
     /// resolves the type by name; smart-cast info from CFA can
     /// elide checks.
-    Cast { dst: Reg, src: Reg, ty: TypeRef, safe: bool },
+    Cast {
+        dst: Reg,
+        src: Reg,
+        ty: TypeRef,
+        safe: bool,
+    },
     /// `is T` check; result is a `Bool`.
     InstanceOf { dst: Reg, src: Reg, ty: TypeRef },
     /// `!!` not-null assertion.
@@ -293,14 +319,22 @@ pub enum Inst {
     /// runtime: if `this_idx`'s captured value is an instance with a
     /// field/method named `name`, read it; otherwise fall back to
     /// LoadGlobal(name).
-    LoadFromThisOrGlobal { dst: Reg, this_idx: u16, name: ConstId },
+    LoadFromThisOrGlobal {
+        dst: Reg,
+        this_idx: u16,
+        name: ConstId,
+    },
     /// Symmetric write counterpart of `LoadFromThisOrGlobal`.
     /// runtime: if `this_idx`'s captured value is an instance with a
     /// member named `name`, `SetField` it; otherwise fall back to
     /// `StoreGlobal(name)`. Lets an unqualified write inside a
     /// receiver lambda reach the bound receiver's property while a
     /// genuine top-level binding still routes to globals.
-    StoreToThisOrGlobal { this_idx: u16, name: ConstId, value: Reg },
+    StoreToThisOrGlobal {
+        this_idx: u16,
+        name: ConstId,
+        value: Reg,
+    },
     /// Call a bare-name function inside a lambda body that may be
     /// invoked with a this-receiver. If the captured this is an
     /// instance with a method named `name`, dispatch as a member
@@ -391,32 +425,62 @@ pub struct SpreadPart {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Mod, Pow,
-    Eq, NotEq, Less, LessEq, Greater, GreaterEq,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    Eq,
+    NotEq,
+    Less,
+    LessEq,
+    Greater,
+    GreaterEq,
     /// Equality on a value that came through an `as Any` cast or
     /// a statically-Any-typed path. Uses bitwise comparison for
     /// `Double` / `Float` so NaN == NaN and +0.0 != -0.0.
-    BoxedEq, BoxedNotEq,
+    BoxedEq,
+    BoxedNotEq,
     /// Referential identity (`===` / `!==`). Compares heap values by
     /// backing-cell pointer and never dispatches a user `equals`.
-    IdentEq, IdentNeq,
-    And, Or, Xor, Shl, Shr, UShr,
-    RangeTo, RangeUntil, DownTo,
+    IdentEq,
+    IdentNeq,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    UShr,
+    RangeTo,
+    RangeUntil,
+    DownTo,
     Elvis,
     StringConcat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnOp {
-    Neg, Plus, Inc, Dec,
+    Neg,
+    Plus,
+    Inc,
+    Dec,
 }
 
 /// Terminator at the end of every block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Terminator {
     Goto(BlockId),
-    Branch { cond: Reg, t: BlockId, f: BlockId },
-    Switch { reg: Reg, arms: Vec<(ConstId, BlockId)>, default: BlockId },
+    Branch {
+        cond: Reg,
+        t: BlockId,
+        f: BlockId,
+    },
+    Switch {
+        reg: Reg,
+        arms: Vec<(ConstId, BlockId)>,
+        default: BlockId,
+    },
     Return(Option<Reg>),
     Throw(Reg),
     Unreachable,
@@ -424,13 +488,20 @@ pub enum Terminator {
     /// new param values. The evaluator rebinds the param regs
     /// from this contiguous register run and restarts execution
     /// without pushing a new call frame.
-    TailJump { args: Reg, n_args: u8 },
+    TailJump {
+        args: Reg,
+        n_args: u8,
+    },
     /// Cross-function tail call: replace the current frame's function
     /// with `func`, rebind its params from the contiguous register run
     /// at `args`, and restart the new entry block. Lowered for tail
     /// calls between two `tailrec` functions so mutual recursion stays
     /// in a single host frame.
-    TailCallFunc { func: FuncId, args: Reg, n_args: u8 },
+    TailCallFunc {
+        func: FuncId,
+        args: Reg,
+        n_args: u8,
+    },
     /// Non-local return — propagates an `EvalError::NonLocalReturn`
     /// up through enclosing lambda frames until a non-lambda fn
     /// catches it and converts it into a normal return value.
@@ -495,6 +566,10 @@ pub struct Block {
 }
 
 /// A function body in IR form.
+// Each flag is an independent, serde-stable property of the body read
+// directly across the Vm and lowering; packing them would churn the
+// serialized IR and every field access.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Func {
     pub id: FuncId,
@@ -650,8 +725,7 @@ pub struct ModuleRegistry {
     /// in call position `name(args)` binds to a hierarchy member
     /// function even when a same-named value/param is in scope.
     #[serde(default)]
-    pub hierarchy_methods:
-        std::collections::HashMap<String, std::collections::HashSet<String>>,
+    pub hierarchy_methods: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Body-property `(class, prop)` pairs declared with `by`.
     #[serde(default)]
     pub delegated_body_props: std::collections::HashSet<(String, String)>,
@@ -663,8 +737,7 @@ pub struct ModuleRegistry {
     /// includes the declaring class — at any other call site the
     /// dispatcher must skip it. Empty for top-level extensions.
     #[serde(default)]
-    pub member_ext_owner_class:
-        std::collections::HashMap<FuncId, String>,
+    pub member_ext_owner_class: std::collections::HashMap<FuncId, String>,
     /// Per-local-function default-arg thunks. Keyed by the local
     /// fn's lowered body `FuncId`; each slot holds the `FuncId` of a
     /// 0-arg thunk producing that parameter's default (binding the
@@ -672,8 +745,7 @@ pub struct ModuleRegistry {
     /// folds these into its `func_defaults` table so closure calls
     /// pad missing trailing args the same way top-level calls do.
     #[serde(default)]
-    pub local_fn_defaults:
-        std::collections::HashMap<FuncId, Vec<Option<FuncId>>>,
+    pub local_fn_defaults: std::collections::HashMap<FuncId, Vec<Option<FuncId>>>,
     /// Default-arg thunks for *bodyless* (abstract / interface)
     /// member declarations, keyed by `(class simple name, method
     /// name)`. The body is skipped during lowering, but Kotlin lets a
@@ -682,8 +754,7 @@ pub struct ModuleRegistry {
     /// these onto the overriding member's `func_defaults` so an
     /// omitted argument fills the inherited default instead of `Unit`.
     #[serde(default)]
-    pub abstract_member_defaults:
-        std::collections::HashMap<(String, String), Vec<Option<FuncId>>>,
+    pub abstract_member_defaults: std::collections::HashMap<(String, String), Vec<Option<FuncId>>>,
     /// `typealias Name = Target` → `Name` ↦ `Target`'s simple head
     /// name. Lets a bare-name lookup of an alias resolve the aliased
     /// class for constructor / companion / static access (the type
@@ -716,8 +787,7 @@ pub struct ModuleRegistry {
     /// companion is referenced from the class's own primary-ctor
     /// body before the companion's singleton is materialized).
     #[serde(default)]
-    pub class_const_inits:
-        std::collections::HashMap<(String, String), Const>,
+    pub class_const_inits: std::collections::HashMap<(String, String), Const>,
 }
 
 impl Module {
@@ -764,8 +834,7 @@ impl Module {
     pub fn funcs_by_simple_name(&self, name: &str) -> &[FuncId] {
         self.func_name_index
             .get(name)
-            .map(std::vec::Vec::as_slice)
-            .unwrap_or(&[])
+            .map_or(&[], std::vec::Vec::as_slice)
     }
 
     #[must_use]
@@ -849,16 +918,15 @@ impl Module {
     /// intended target.
     #[must_use]
     pub fn func_id_by_fqn(&self, fqn: &str) -> Option<FuncId> {
-        self.funcs
-            .iter()
-            .find(|f| f.fqn == fqn)
-            .map(|f| f.id)
+        self.funcs.iter().find(|f| f.fqn == fqn).map(|f| f.id)
     }
 
     /// Register a class declaration and return its id. If the name
     /// was previously [`reserve_class`](Self::reserve_class)d, the
     /// reserved slot/id is reused so forward references that resolved
     /// to that id stay valid.
+    // Class count is bounded well below u32::MAX; the index is the new ClassId.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn add_class(&mut self, mut class: Class) -> ClassId {
         if let Some(&(_, id)) = self.class_index.iter().find(|(n, _)| n == &class.name) {
             let existing = &self.classes[id.0 as usize];
@@ -912,6 +980,8 @@ impl Module {
     /// (a method body can name a class declared later in the module).
     /// The placeholder is overwritten by the real definition when
     /// `add_class` runs for the same name.
+    // Class count is bounded well below u32::MAX; the index is the new ClassId.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn reserve_class(&mut self, name: &str) -> ClassId {
         if let Some(&(_, id)) = self.class_index.iter().find(|(n, _)| n == name) {
             return id;
@@ -958,6 +1028,9 @@ impl Module {
     /// Append a constant to the pool, returning its id. Today's pool
     /// is unsorted-and-unique by structural equality; lowering passes
     /// can deduplicate when they care.
+    // Const pool index is bounded well below u32::MAX; each per-variant
+    // equality arm binds a distinct payload type so they cannot be merged.
+    #[allow(clippy::cast_possible_truncation, clippy::match_same_arms)]
     pub fn intern_const(&mut self, c: Const) -> ConstId {
         if let Some((i, _)) = self.consts.iter().enumerate().find(|(_, k)| match (k, &c) {
             (Const::Unit, Const::Unit) => true,

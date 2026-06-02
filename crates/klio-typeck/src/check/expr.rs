@@ -1,4 +1,10 @@
-use super::{Checker, Block, Type, stmt_span, Diagnostic, codes, Stmt, Binding, Decl, convert_type_ref_lossy, class_name_from_typeref, single_path_name, ClassInfo, Expr, AssignOp, Span, Visibility, type_has_compound_assign, StringPart, substitute_type_params, dot_path_key, UnOp, is_numeric, PostfixOp, lub, is_labelable_target, WhenPatternKind, FunctionBody, ExtensionPropSig, HashSet, FnSig};
+use super::{
+    AssignOp, Binding, Block, Checker, ClassInfo, Decl, Diagnostic, Expr, ExtensionPropSig, FnSig,
+    FunctionBody, HashSet, PostfixOp, Span, Stmt, StringPart, Type, UnOp, Visibility,
+    WhenPatternKind, class_name_from_typeref, codes, convert_type_ref_lossy, dot_path_key,
+    is_labelable_target, is_numeric, lub, single_path_name, stmt_span, substitute_type_params,
+    type_has_compound_assign,
+};
 
 impl Checker<'_> {
     // ---- statements & blocks --------------------------------------------
@@ -15,16 +21,12 @@ impl Checker<'_> {
             // reachability variant picks up Nothing-returning
             // expressions in earlier statements (return / throw /
             // error("...") / TODO()).
-            let cfg_dead = self
-                .cfg_is_unreachable_at(stmt_span(s))
-                .unwrap_or(false);
+            let cfg_dead = self.cfg_is_unreachable_at(stmt_span(s)).unwrap_or(false);
             if cfg_dead && !warned {
                 self.diagnostics.emit(
                     Diagnostic::warning("Unreachable code".to_string(), stmt_span(s))
                         .with_code(codes::WARN_UNREACHABLE_CODE)
-                        .with_factory(
-                            &klio_diagnostics::generated::factories::UNREACHABLE_CODE,
-                        ),
+                        .with_factory(&klio_diagnostics::generated::factories::UNREACHABLE_CODE),
                 );
                 warned = true;
             }
@@ -41,11 +43,21 @@ impl Checker<'_> {
                 self.check_local_decl(d);
                 Type::Unit
             }
-            Stmt::Assign { target, op, value, span } => {
+            Stmt::Assign {
+                target,
+                op,
+                value,
+                span,
+            } => {
                 self.check_assign(target, *op, value, *span);
                 Type::Unit
             }
-            Stmt::DestructuringDecl { names, init, mutable, .. } => {
+            Stmt::DestructuringDecl {
+                names,
+                init,
+                mutable,
+                ..
+            } => {
                 let _ = self.check_expr(init, None);
                 // Spec ch.9: each non-`_` slot dispatches `componentN`.
                 let init_cls = self.expr_class.get(&init.span()).cloned();
@@ -60,7 +72,10 @@ impl Checker<'_> {
                         Binding {
                             ty: Type::Unresolved,
                             mutable: *mutable,
-                            decl_span: Some(n.span), class_name: None, decl_type_name: None },
+                            decl_span: Some(n.span),
+                            class_name: None,
+                            decl_type_name: None,
+                        },
                     );
                 }
                 Type::Unit
@@ -86,9 +101,10 @@ impl Checker<'_> {
                 }
                 let mut cn = p.ty.as_ref().and_then(class_name_from_typeref);
                 if cn.is_none()
-                    && let Some(init) = &p.init {
-                        cn = self.expr_class.get(&init.span()).cloned();
-                    }
+                    && let Some(init) = &p.init
+                {
+                    cn = self.expr_class.get(&init.span()).cloned();
+                }
                 self.current_frame().bindings.insert(
                     p.name.name.clone(),
                     Binding {
@@ -96,7 +112,7 @@ impl Checker<'_> {
                         mutable: p.mutable,
                         decl_span: Some(p.name.span),
                         class_name: cn,
-                        
+
                         decl_type_name: p
                             .ty
                             .as_ref()
@@ -109,21 +125,20 @@ impl Checker<'_> {
                 // (mutable bindings can be reassigned, breaking the alias).
                 if !p.mutable
                     && let Some(init) = &p.init
-                        && let Some(src) = single_path_name(init) {
-                            // Require the source to be an immutable binding
-                            // in some scope. Otherwise the alias may not
-                            // hold (the source can be reassigned).
-                            let src_is_stable = self
-                                .lookup(&src)
-                                .is_some_and(|b| !b.mutable);
-                            // Bound smart-cast aliasing lives in the
-                            // CFG lowering's `aliases` map; consulted
-                            // by cfg_narrowed_at when chasing chains.
-                            let _ = src_is_stable;
-                        }
+                    && let Some(src) = single_path_name(init)
+                {
+                    // Require the source to be an immutable binding
+                    // in some scope. Otherwise the alias may not
+                    // hold (the source can be reassigned).
+                    let src_is_stable = self.lookup(&src).is_some_and(|b| !b.mutable);
+                    // Bound smart-cast aliasing lives in the
+                    // CFG lowering's `aliases` map; consulted
+                    // by cfg_narrowed_at when chasing chains.
+                    let _ = src_is_stable;
+                }
             }
             Decl::Function(f) => {
-                let sig = self.signature_of(f);
+                let sig = Self::signature_of(f);
                 let fn_ty = Type::Function {
                     params: sig.params.clone(),
                     return_type: Box::new(sig.return_ty.clone()),
@@ -131,7 +146,13 @@ impl Checker<'_> {
                 };
                 self.current_frame().bindings.insert(
                     f.name.name.clone(),
-                    Binding { ty: fn_ty, mutable: false, decl_span: Some(f.name.span), class_name: None, decl_type_name: None },
+                    Binding {
+                        ty: fn_ty,
+                        mutable: false,
+                        decl_span: Some(f.name.span),
+                        class_name: None,
+                        decl_type_name: None,
+                    },
                 );
                 let nm = f.name.name.clone();
                 self.push_fn_sig(&nm, sig, f.is_expect || f.is_actual);
@@ -144,10 +165,12 @@ impl Checker<'_> {
                 self.check_class(c);
             }
             Decl::Object(o) => {
-                let mut info = ClassInfo::default();
-                info.is_object = true;
-                info.is_local_or_anonymous = true;
-                info.decl_file = Some(o.name.span.file);
+                let mut info = ClassInfo {
+                    is_object: true,
+                    is_local_or_anonymous: true,
+                    decl_file: Some(o.name.span.file),
+                    ..ClassInfo::default()
+                };
                 self.collect_members(&o.members, &mut info);
                 self.classes.insert(o.name.name.clone(), info);
                 self.check_object(o);
@@ -165,62 +188,57 @@ impl Checker<'_> {
         }
         // Reassignment-of-val check for the simple identifier case.
         if let Expr::Path { segments, span } = target
-            && segments.len() == 1 {
-                let name = &segments[0].name;
-                // Spec §4.6: per-accessor visibility on `var x; private set`.
-                // Reject the write when use site is outside the setter's
-                // declared scope.
-                if let Some((sv, decl_file)) = self.setter_visibility.get(name).copied()
-                    && matches!(sv, Visibility::Private) && span.file != decl_file {
-                        self.diagnostics.emit(
-                            Diagnostic::error(
-                                format!(
-                                    "Cannot assign to `{name}`: setter is `private` in its \
+            && segments.len() == 1
+        {
+            let name = &segments[0].name;
+            // Spec §4.6: per-accessor visibility on `var x; private set`.
+            // Reject the write when use site is outside the setter's
+            // declared scope.
+            if let Some((sv, decl_file)) = self.setter_visibility.get(name).copied()
+                && matches!(sv, Visibility::Private)
+                && span.file != decl_file
+            {
+                self.diagnostics.emit(
+                    Diagnostic::error(
+                        format!(
+                            "Cannot assign to `{name}`: setter is `private` in its \
                                      declaring file"
-                                ),
-                                *span,
-                            )
-                            .with_code(codes::TYPE_INVISIBLE_REFERENCE),
-                        );
-                    }
-                let info = self
-                    .lookup(name)
-                    .map(|b| (b.ty.clone(), b.mutable));
-                if let Some((want, mutable)) = info {
-                    // `val x: T` followed by `x = …` later in scope:
-                    // CFG VIA reports `x` as Unassigned at the
-                    // assignment span, marking this as the binding's
-                    // first (and only legal) write. CFG fact `None`
-                    // (no DeclLocal upstream) means the binding is
-                    // already in scope as a parameter or top-level
-                    // — never a first write.
-                    let is_first_write = matches!(
-                        self.cfg_via_unassigned_at(name, *span),
-                        Some(true)
-                    );
-                    // §7.1.2: a compound assignment to a `val` is permitted
-                    // when the LHS type carries a matching `*Assign` operator
-                    // (the operator-function path mutates in place, never
-                    // rebinds the name). Plain `=` reassignment still errors.
-                    let compound_with_assign = !matches!(op, AssignOp::Assign)
-                        && type_has_compound_assign(&want, op);
-                    if !mutable && !is_first_write && !compound_with_assign {
-                        self.diagnostics.emit(
-                            Diagnostic::error(
-                                format!("Val cannot be reassigned: `{name}`"),
-                                *span,
-                            )
-                            .with_code(codes::TYPE_VAL_REASSIGN),
-                        );
-                    }
-                    let got = self.check_expr(value, Some(&want));
-                    self.check_assignable(&got, &want, value.span());
-                    // killDataFlow lives in the CFG: Node::KillDataFlow
-                    // at every loop head invalidates narrowings on
-                    // reassigned places.
-                    return;
-                }
+                        ),
+                        *span,
+                    )
+                    .with_code(codes::TYPE_INVISIBLE_REFERENCE),
+                );
             }
+            let info = self.lookup(name).map(|b| (b.ty.clone(), b.mutable));
+            if let Some((want, mutable)) = info {
+                // `val x: T` followed by `x = …` later in scope:
+                // CFG VIA reports `x` as Unassigned at the
+                // assignment span, marking this as the binding's
+                // first (and only legal) write. CFG fact `None`
+                // (no DeclLocal upstream) means the binding is
+                // already in scope as a parameter or top-level
+                // — never a first write.
+                let is_first_write = matches!(self.cfg_via_unassigned_at(name, *span), Some(true));
+                // §7.1.2: a compound assignment to a `val` is permitted
+                // when the LHS type carries a matching `*Assign` operator
+                // (the operator-function path mutates in place, never
+                // rebinds the name). Plain `=` reassignment still errors.
+                let compound_with_assign =
+                    !matches!(op, AssignOp::Assign) && type_has_compound_assign(&want, op);
+                if !mutable && !is_first_write && !compound_with_assign {
+                    self.diagnostics.emit(
+                        Diagnostic::error(format!("Val cannot be reassigned: `{name}`"), *span)
+                            .with_code(codes::TYPE_VAL_REASSIGN),
+                    );
+                }
+                let got = self.check_expr(value, Some(&want));
+                self.check_assignable(&got, &want, value.span());
+                // killDataFlow lives in the CFG: Node::KillDataFlow
+                // at every loop head invalidates narrowings on
+                // reassigned places.
+                return;
+            }
+        }
         let _ = self.check_expr(target, None);
         let _ = self.check_expr(value, None);
     }
@@ -259,9 +277,10 @@ impl Checker<'_> {
                             | Type::ULong
                             | Type::UShort
                             | Type::UByte
-                    ) {
-                        return t.non_null().clone();
-                    }
+                    )
+                {
+                    return t.non_null().clone();
+                }
                 Type::Int
             }
             Expr::FloatLit { kind, .. } => {
@@ -269,9 +288,10 @@ impl Checker<'_> {
                     return Type::Float;
                 }
                 if let Some(t) = expected
-                    && matches!(t.non_null(), Type::Float | Type::Double) {
-                        return t.non_null().clone();
-                    }
+                    && matches!(t.non_null(), Type::Float | Type::Double)
+                {
+                    return t.non_null().clone();
+                }
                 Type::Double
             }
             Expr::BoolLit { .. } => Type::Boolean,
@@ -314,9 +334,7 @@ impl Checker<'_> {
                         if matches!(self.cfg_via_unassigned_at(name, *span), Some(true)) {
                             self.diagnostics.emit(
                                 Diagnostic::error(
-                                    format!(
-                                        "Variable '{name}' must be initialized"
-                                    ),
+                                    format!("Variable '{name}' must be initialized"),
                                     *span,
                                 )
                                 .with_code(codes::TYPE_VAR_NOT_DEFINITELY_ASSIGNED),
@@ -360,7 +378,12 @@ impl Checker<'_> {
                 }
                 Type::Unresolved
             }
-            Expr::Member { receiver, name, safe, span } => {
+            Expr::Member {
+                receiver,
+                name,
+                safe,
+                span,
+            } => {
                 if let Some(key) = dot_path_key(expr) {
                     if let Some(cn) = self.cfg_narrowed_class_at(&key, *span) {
                         self.expr_class.insert(*span, cn);
@@ -373,7 +396,10 @@ impl Checker<'_> {
                 // §17.5.9: `this@Outer.b` is rejected when a closer DSL
                 // receiver sharing a marker with `Outer` is also in scope
                 // and itself exposes a member named `b`.
-                if let Expr::This { qualifier: Some(q), .. } = receiver.as_ref() {
+                if let Expr::This {
+                    qualifier: Some(q), ..
+                } = receiver.as_ref()
+                {
                     self.enforce_dsl_scope_for_qualified_this(&q.name, &name.name, name.span);
                 }
                 let recv_ty = self.check_expr(receiver, None);
@@ -387,31 +413,43 @@ impl Checker<'_> {
                     *span,
                 )
             }
-            Expr::Call { callee, args, arg_names, type_args, span, is_infix, .. } => {
+            Expr::Call {
+                callee,
+                args,
+                arg_names,
+                type_args,
+                span,
+                is_infix,
+                ..
+            } => {
                 if let Expr::Path { segments, .. } = callee.as_ref()
-                    && segments.len() == 1 {
-                        let name = &segments[0].name;
-                        if self.classes.contains_key(name) {
-                            self.expr_class.insert(*span, name.clone());
-                        }
+                    && segments.len() == 1
+                {
+                    let name = &segments[0].name;
+                    if self.classes.contains_key(name) {
+                        self.expr_class.insert(*span, name.clone());
                     }
+                }
                 // Spec §11.2.2: `super.f(...)` with no `<Qualifier>` must
                 // resolve to a member from exactly one direct supertype.
                 // Two or more contributing supertypes require the caller
                 // to disambiguate via `super<Type>.f(...)`.
                 if let Expr::Member { receiver, name, .. } = callee.as_ref()
-                    && let Expr::Super { qualifier, span: super_span, .. } =
-                        receiver.as_ref()
-                    {
-                        match qualifier {
-                            None => {
-                                self.check_ambiguous_super(name.name.as_str(), *super_span);
-                            }
-                            Some(q) => {
-                                self.check_super_qualifier(q, *super_span);
-                            }
+                    && let Expr::Super {
+                        qualifier,
+                        span: super_span,
+                        ..
+                    } = receiver.as_ref()
+                {
+                    match qualifier {
+                        None => {
+                            self.check_ambiguous_super(name.name.as_str(), *super_span);
+                        }
+                        Some(q) => {
+                            self.check_super_qualifier(q, *super_span);
                         }
                     }
+                }
                 // Spec §4.2: implicit lambda label — bind the call's
                 // callee simple name as a label visible inside any lambda
                 // argument so `xs.forEach { return@forEach }` checks.
@@ -432,7 +470,11 @@ impl Checker<'_> {
                 }
                 result
             }
-            Expr::Index { receiver, args, span } => {
+            Expr::Index {
+                receiver,
+                args,
+                span,
+            } => {
                 let _ = self.check_expr(receiver, None);
                 for a in args {
                     self.check_expr(a, None);
@@ -460,8 +502,6 @@ impl Checker<'_> {
                     UnOp::Neg | UnOp::Pos => {
                         if is_numeric(&t) {
                             t
-                        } else if matches!(t, Type::Unresolved) {
-                            Type::Unresolved
                         } else {
                             Type::Unresolved
                         }
@@ -495,7 +535,12 @@ impl Checker<'_> {
                     }
                 }
             }
-            Expr::If { cond, then_branch, else_branch, .. } => {
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 let _ = self.check_expr(cond, Some(&Type::Boolean));
                 self.push_frame();
                 // All branch narrowings and definite-assignment
@@ -528,7 +573,13 @@ impl Checker<'_> {
                 self.check_expr(cond, Some(&Type::Boolean));
                 Type::Unit
             }
-            Expr::For { vars, iter, body, span, .. } => {
+            Expr::For {
+                vars,
+                iter,
+                body,
+                span,
+                ..
+            } => {
                 let _ = self.check_expr(iter, None);
                 // Spec ch.9: `for (x in c)` dispatches `iterator()` on `c`,
                 // then `hasNext()` / `next()` on the iterator. We only know
@@ -540,7 +591,13 @@ impl Checker<'_> {
                 for v in vars {
                     self.current_frame().bindings.insert(
                         v.name.clone(),
-                        Binding { ty: Type::Unresolved, mutable: false, decl_span: Some(v.span), class_name: None, decl_type_name: None },
+                        Binding {
+                            ty: Type::Unresolved,
+                            mutable: false,
+                            decl_span: Some(v.span),
+                            class_name: None,
+                            decl_type_name: None,
+                        },
                     );
                 }
                 self.check_expr(body, None);
@@ -553,28 +610,24 @@ impl Checker<'_> {
                     let _ = self.check_expr(v, expected.as_ref());
                 }
                 if let Some(l) = label
-                    && !self.label_stack.iter().any(|x| x == &l.name) {
-                        self.diagnostics.emit(
-                            Diagnostic::error(
-                                format!("label `{}` is not bound here", l.name),
-                                *span,
-                            )
+                    && !self.label_stack.iter().any(|x| x == &l.name)
+                {
+                    self.diagnostics.emit(
+                        Diagnostic::error(format!("label `{}` is not bound here", l.name), *span)
                             .with_code(codes::TYPE_UNRESOLVED_LABEL),
-                        );
-                    }
+                    );
+                }
                 Type::Nothing
             }
             Expr::Break { label, span } | Expr::Continue { label, span } => {
                 if let Some(l) = label
-                    && !self.label_stack.iter().any(|x| x == &l.name) {
-                        self.diagnostics.emit(
-                            Diagnostic::error(
-                                format!("label `{}` is not bound here", l.name),
-                                *span,
-                            )
+                    && !self.label_stack.iter().any(|x| x == &l.name)
+                {
+                    self.diagnostics.emit(
+                        Diagnostic::error(format!("label `{}` is not bound here", l.name), *span)
                             .with_code(codes::TYPE_UNRESOLVED_LABEL),
-                        );
-                    }
+                    );
+                }
                 Type::Nothing
             }
             Expr::Labeled { label, expr, .. } => {
@@ -615,25 +668,22 @@ impl Checker<'_> {
                 // the static type is erased at runtime and the throw is
                 // unsafe.
                 if let Expr::Path { segments, .. } = value.as_ref()
-                    && segments.len() == 1 {
-                        let name = &segments[0].name;
-                        let decl_ty_name = self
-                            .frames
-                            .iter()
-                            .rev()
-                            .find_map(|f| f.bindings.get(name))
-                            .and_then(|b| b.decl_type_name.clone());
-                        if let Some(tname) = decl_ty_name {
-                            let is_type_param = self
-                                .type_params_in_scope
-                                .iter()
-                                .any(|s| s.contains(&tname));
-                            let is_reified = self
-                                .reified_type_params
-                                .iter()
-                                .any(|s| s.contains(&tname));
-                            if is_type_param && !is_reified {
-                                self.diagnostics.emit(
+                    && segments.len() == 1
+                {
+                    let name = &segments[0].name;
+                    let decl_ty_name = self
+                        .frames
+                        .iter()
+                        .rev()
+                        .find_map(|f| f.bindings.get(name))
+                        .and_then(|b| b.decl_type_name.clone());
+                    if let Some(tname) = decl_ty_name {
+                        let is_type_param =
+                            self.type_params_in_scope.iter().any(|s| s.contains(&tname));
+                        let is_reified =
+                            self.reified_type_params.iter().any(|s| s.contains(&tname));
+                        if is_type_param && !is_reified {
+                            self.diagnostics.emit(
                                     Diagnostic::error(
                                         format!(
                                             "Cannot throw a value of erased type parameter `{tname}` — the type must be runtime-available. Mark `{tname}` as `reified` on an `inline fun` or throw a concrete exception type."
@@ -642,12 +692,17 @@ impl Checker<'_> {
                                     )
                                     .with_code(codes::TYPE_RUNTIME_UNAVAILABLE_CATCH_TYPE),
                                 );
-                            }
                         }
                     }
+                }
                 Type::Nothing
             }
-            Expr::Try { body, catches, finally, .. } => {
+            Expr::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
                 let body_ty = self.check_block(body, expected);
                 let mut acc = body_ty;
                 for c in catches {
@@ -658,14 +713,9 @@ impl Checker<'_> {
                     // can be matched by the JVM/native dispatch.
                     {
                         let tname = &c.ty.name.name;
-                        let is_type_param = self
-                            .type_params_in_scope
-                            .iter()
-                            .any(|s| s.contains(tname));
-                        let is_reified = self
-                            .reified_type_params
-                            .iter()
-                            .any(|s| s.contains(tname));
+                        let is_type_param =
+                            self.type_params_in_scope.iter().any(|s| s.contains(tname));
+                        let is_reified = self.reified_type_params.iter().any(|s| s.contains(tname));
                         if is_type_param && !is_reified {
                             self.diagnostics.emit(
                                 Diagnostic::error(
@@ -695,7 +745,10 @@ impl Checker<'_> {
                         Binding {
                             ty: convert_type_ref_lossy(&c.ty),
                             mutable: false,
-                            decl_span: Some(c.binding.span), class_name: None, decl_type_name: None },
+                            decl_span: Some(c.binding.span),
+                            class_name: None,
+                            decl_type_name: None,
+                        },
                     );
                     let cty = self.check_block(&c.body, expected);
                     self.pop_frame();
@@ -724,8 +777,7 @@ impl Checker<'_> {
                 }
                 Type::Unresolved
             }
-            Expr::Super { .. } => Type::Unresolved,
-            Expr::PropertyRef { .. } => Type::Unresolved,
+            Expr::Super { .. } | Expr::PropertyRef { .. } => Type::Unresolved,
             Expr::MemberRef { receiver, name, .. } => {
                 // Class-literal LHS validation per spec §15 / §15.1: only
                 // non-nullable runtime-available types may appear on the
@@ -733,19 +785,16 @@ impl Checker<'_> {
                 // when `reified`.
                 if name.name == "class" {
                     if let Expr::Path { segments, .. } = receiver.as_ref()
-                        && segments.len() == 1 {
-                            let tname = &segments[0].name;
-                            let is_type_param = self
-                                .type_params_in_scope
-                                .iter()
-                                .any(|s| s.contains(tname));
-                            if is_type_param {
-                                let is_reified = self
-                                    .reified_type_params
-                                    .iter()
-                                    .any(|s| s.contains(tname));
-                                if !is_reified {
-                                    self.diagnostics.emit(
+                        && segments.len() == 1
+                    {
+                        let tname = &segments[0].name;
+                        let is_type_param =
+                            self.type_params_in_scope.iter().any(|s| s.contains(tname));
+                        if is_type_param {
+                            let is_reified =
+                                self.reified_type_params.iter().any(|s| s.contains(tname));
+                            if !is_reified {
+                                self.diagnostics.emit(
                                         Diagnostic::error(
                                             format!(
                                                 "`{tname}::class` is not allowed — type parameter is erased at runtime. Mark it as `reified` on an `inline fun` to make the class literal available."
@@ -754,13 +803,13 @@ impl Checker<'_> {
                                         )
                                         .with_code(codes::TYPE_NON_REIFIED_CLASS_LITERAL),
                                     );
-                                }
-                                // Skip the receiver pass — Path[T] would
-                                // otherwise emit a misleading
-                                // UNRESOLVED_REFERENCE.
-                                return Type::Unresolved;
                             }
+                            // Skip the receiver pass — Path[T] would
+                            // otherwise emit a misleading
+                            // UNRESOLVED_REFERENCE.
+                            return Type::Unresolved;
                         }
+                    }
                     let rty = self.check_expr(receiver, None);
                     if matches!(rty, Type::Nullable(_)) {
                         self.diagnostics.emit(
@@ -776,7 +825,12 @@ impl Checker<'_> {
                 self.check_expr(receiver, None);
                 Type::Unresolved
             }
-            Expr::When { subject, subject_binding, branches, span } => {
+            Expr::When {
+                subject,
+                subject_binding,
+                branches,
+                span,
+            } => {
                 let subj_class = if let Some(s) = subject {
                     self.check_expr(s, None);
                     self.expr_class.get(&s.span()).cloned()
@@ -790,9 +844,10 @@ impl Checker<'_> {
                     let ty = if let Some(t) = &b.ty {
                         convert_type_ref_lossy(t)
                     } else {
-                        subject.as_ref().and_then(|s| {
-                            self.types.get(&s.span()).cloned()
-                        }).unwrap_or(Type::Unresolved)
+                        subject
+                            .as_ref()
+                            .and_then(|s| self.types.get(&s.span()).cloned())
+                            .unwrap_or(Type::Unresolved)
                     };
                     let class_name = subject
                         .as_ref()
@@ -804,7 +859,7 @@ impl Checker<'_> {
                             mutable: false,
                             decl_span: Some(b.name.span),
                             class_name,
-                            
+
                             decl_type_name: None,
                         },
                     );
@@ -833,7 +888,10 @@ impl Checker<'_> {
                             _ => {}
                         }
                     }
-                    if b.patterns.iter().any(|p| matches!(p.kind, WhenPatternKind::Else)) {
+                    if b.patterns
+                        .iter()
+                        .any(|p| matches!(p.kind, WhenPatternKind::Else))
+                    {
                         has_else = true;
                     }
                     // Narrow the subject inside this branch if it's a single
@@ -861,7 +919,12 @@ impl Checker<'_> {
                 }
                 acc.unwrap_or(Type::Unit)
             }
-            Expr::IsCheck { expr, ty, negated, span } => {
+            Expr::IsCheck {
+                expr,
+                ty,
+                negated,
+                span,
+            } => {
                 let lhs_ty = self.check_expr(expr, None);
                 // Spec §8.11.1 note: `null is T?` is always `true`; `null is
                 // T` (non-nullable) is always `false`. Surface the
@@ -912,7 +975,12 @@ impl Checker<'_> {
                 }
                 Type::Boolean
             }
-            Expr::As { expr, ty, safe, span } => {
+            Expr::As {
+                expr,
+                ty,
+                safe,
+                span,
+            } => {
                 let subj_ty = self.check_expr(expr, None);
                 let target_ty = convert_type_ref_lossy(ty);
                 if !matches!(subj_ty, Type::Unresolved)
@@ -931,7 +999,10 @@ impl Checker<'_> {
                 if ty.type_args.iter().any(|a| !a.is_star) {
                     self.diagnostics.emit(
                         Diagnostic::warning(
-                            format!("Unchecked cast: target type `{}` has erased type arguments", ty.name.name),
+                            format!(
+                                "Unchecked cast: target type `{}` has erased type arguments",
+                                ty.name.name
+                            ),
                             ty.span,
                         )
                         .with_code(codes::TYPE_UNCHECKED_CAST),
@@ -983,13 +1054,15 @@ impl Checker<'_> {
                 // `expr as T` narrowing is handled by the CFG via the
                 // AssumeIs node the lowering emits for the cast.
                 let () = ();
-                if *safe {
-                    target.as_nullable()
-                } else {
-                    target
-                }
+                if *safe { target.as_nullable() } else { target }
             }
-            Expr::AnonFun { params, return_ty, body, is_suspend, .. } => {
+            Expr::AnonFun {
+                params,
+                return_ty,
+                body,
+                is_suspend,
+                ..
+            } => {
                 self.push_frame();
                 for p in params {
                     let pty = convert_type_ref_lossy(&p.ty);
@@ -1000,8 +1073,10 @@ impl Checker<'_> {
                             mutable: false,
                             decl_span: Some(p.span),
                             class_name: None,
-                            
-                            decl_type_name: if klio_types::builtin_by_name(&p.ty.name.name).is_none() {
+
+                            decl_type_name: if klio_types::builtin_by_name(&p.ty.name.name)
+                                .is_none()
+                            {
                                 Some(p.ty.name.name.clone())
                             } else {
                                 None
@@ -1045,14 +1120,22 @@ impl Checker<'_> {
                 self.check_expr(expr, None);
                 Type::Unresolved
             }
-            Expr::ObjectExpr { supertypes, supertype_args, supertype_delegates, members, .. } => {
+            Expr::ObjectExpr {
+                supertypes,
+                supertype_args,
+                supertype_delegates,
+                members,
+                ..
+            } => {
                 // Spec §5.1.2: anonymous object inheriting from a sealed type
                 // is rejected — sealed inheritors require a fully-qualified
                 // name. Same code path also catches inherit-from-object /
                 // inherit-from-final-class for anonymous objects.
                 for s in supertypes {
                     let pname = &s.name.name;
-                    let Some(parent) = self.classes.get(pname) else { continue };
+                    let Some(parent) = self.classes.get(pname) else {
+                        continue;
+                    };
                     if parent.is_sealed {
                         self.diagnostics.emit(
                             Diagnostic::error(
@@ -1159,17 +1242,14 @@ impl Checker<'_> {
             self.check_member_visibility(class, name, Some(class), member_span);
         }
         if !found_as_member
-            && let Some(ep) = self.lookup_extension_property(recv_ty, recv_class, name) {
-                result = ep.ty.clone();
-                if let Some(cn) = ep.return_class.clone() {
-                    self.expr_class.insert(member_span, cn);
-                }
+            && let Some(ep) = self.lookup_extension_property(recv_ty, recv_class, name)
+        {
+            result = ep.ty.clone();
+            if let Some(cn) = ep.return_class.clone() {
+                self.expr_class.insert(member_span, cn);
             }
-        if safe {
-            result.as_nullable()
-        } else {
-            result
         }
+        if safe { result.as_nullable() } else { result }
     }
 
     pub(crate) fn lookup_extension_property(
@@ -1186,9 +1266,13 @@ impl Checker<'_> {
             let mut frontier: Vec<String> = vec![c.to_string()];
             let mut steps = 0;
             while let Some(cn) = frontier.pop() {
-                if steps > 64 { break; }
+                if steps > 64 {
+                    break;
+                }
                 steps += 1;
-                let Some(info) = self.classes.get(&cn) else { continue };
+                let Some(info) = self.classes.get(&cn) else {
+                    continue;
+                };
                 for s in &info.supertypes {
                     if seen.insert(s.clone()) {
                         keys.push(s.clone());
@@ -1211,12 +1295,15 @@ impl Checker<'_> {
             _ => None,
         };
         if let Some(h) = head
-            && !keys.iter().any(|k| k == &h) {
-                keys.push(h);
-            }
+            && !keys.iter().any(|k| k == &h)
+        {
+            keys.push(h);
+        }
         keys.push("Any".to_string());
         for key in &keys {
-            let Some(list) = self.extension_properties.get(key) else { continue };
+            let Some(list) = self.extension_properties.get(key) else {
+                continue;
+            };
             for ep in list {
                 if ep.name == name {
                     return Some(ep.clone());
@@ -1246,7 +1333,9 @@ impl Checker<'_> {
                 break;
             }
             steps += 1;
-            let Some(info) = self.classes.get(&c) else { continue };
+            let Some(info) = self.classes.get(&c) else {
+                continue;
+            };
             for s in &info.supertypes {
                 if seen.insert(s.clone()) {
                     keys.push(s.clone());
@@ -1256,7 +1345,9 @@ impl Checker<'_> {
         }
         keys.push("Any".to_string());
         for key in &keys {
-            let Some(list) = self.extensions.get(key) else { continue };
+            let Some(list) = self.extensions.get(key) else {
+                continue;
+            };
             for ext in list {
                 if ext.name != name {
                     continue;

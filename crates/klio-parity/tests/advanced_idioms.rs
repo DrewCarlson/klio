@@ -34,7 +34,7 @@ fun main() {
 }
 
 #[test]
-fn lateinit_var_with_isInitialized() {
+fn lateinit_var_with_is_initialized() {
     let src = r#"
 class Box { lateinit var name: String }
 fun main() {
@@ -139,7 +139,7 @@ fun main() {
 }
 
 #[test]
-fn collection_groupBy_associate() {
+fn collection_group_by_associate() {
     let src = r#"
 fun main() {
     val words = listOf("alpha", "ant", "bear", "bat", "cat")
@@ -165,7 +165,11 @@ fun main() {
     println("$flat|$unique")
 }
 "#;
-    assert_klio("flat_distinct", src, "[1, 2, 2, 2, 3, 3, 3, 4]|[1, 2, 3, 4]\n");
+    assert_klio(
+        "flat_distinct",
+        src,
+        "[1, 2, 2, 2, 3, 3, 3, 4]|[1, 2, 3, 4]\n",
+    );
 }
 
 #[test]

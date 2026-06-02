@@ -1,4 +1,4 @@
-use super::{CallCtx, Value, RuntimeError, Arc, range_iter_int, make_list};
+use super::{Arc, CallCtx, RuntimeError, Value, make_list, range_iter_int};
 
 // ============================================================
 // Range progressions
@@ -6,7 +6,12 @@ use super::{CallCtx, Value, RuntimeError, Arc, range_iter_int, make_list};
 
 pub(crate) fn ranges_down_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (a, b) = pair_int_args(ctx, "downTo")?;
-    Ok(Value::Range { start: a, end: b, step: -1, kind: klio_runtime::RangeKind::Int })
+    Ok(Value::Range {
+        start: a,
+        end: b,
+        step: -1,
+        kind: klio_runtime::RangeKind::Int,
+    })
 }
 
 pub(crate) fn ranges_until(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -21,22 +26,35 @@ pub(crate) fn ranges_until(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 pub(crate) fn ranges_step(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     match ctx.args {
-        [Value::Range { start, end, step, kind }, step_arg] if step_arg.is_integral() => {
+        [
+            Value::Range {
+                start,
+                end,
+                step,
+                kind,
+            },
+            step_arg,
+        ] if step_arg.is_integral() => {
             let n = step_arg.as_i64().unwrap();
             if n <= 0 {
                 return Err(RuntimeError::Thrown(Value::Exception {
                     fqn: Arc::new("kotlin.IllegalArgumentException".into()),
-                    message: Some(Arc::new(format!(
-                        "Step must be positive, was: {n}."
-                    ))),
+                    message: Some(Arc::new(format!("Step must be positive, was: {n}."))),
                     cause: None,
                 }));
             }
             let signed = if *step < 0 { -n } else { n };
             let normalized_end = normalize_progression_end(*start, *end, signed);
-            Ok(Value::Range { start: *start, end: normalized_end, step: signed, kind: *kind })
+            Ok(Value::Range {
+                start: *start,
+                end: normalized_end,
+                step: signed,
+                kind: *kind,
+            })
         }
-        _ => Err(RuntimeError::Type("step requires IntRange . step(Int)".into())),
+        _ => Err(RuntimeError::Type(
+            "step requires IntRange . step(Int)".into(),
+        )),
     }
 }
 
@@ -71,10 +89,14 @@ pub(crate) fn pair_int_args(ctx: &CallCtx<'_>, what: &str) -> Result<(i64, i64),
         [a, b] if a.is_integral() && b.is_integral() => {
             Ok((a.as_i64().unwrap(), b.as_i64().unwrap()))
         }
-        _ => Err(RuntimeError::Type(format!("{what} requires two Int operands"))),
+        _ => Err(RuntimeError::Type(format!(
+            "{what} requires two Int operands"
+        ))),
     }
 }
 
+// Int narrows the endpoint; Char reinterprets it as a UTF-16 code unit.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn range_endpoint(kind: klio_runtime::RangeKind, v: i64) -> Value {
     match kind {
         klio_runtime::RangeKind::Long => Value::Long(v),
@@ -95,7 +117,12 @@ pub(crate) fn range_endpoint(kind: klio_runtime::RangeKind, v: i64) -> Value {
 pub(crate) fn as_range_view(v: &Value) -> Option<(i64, i64, i64, klio_runtime::RangeKind)> {
     use klio_runtime::RangeKind;
     match v {
-        Value::Range { start, end, step, kind } => Some((*start, *end, *step, *kind)),
+        Value::Range {
+            start,
+            end,
+            step,
+            kind,
+        } => Some((*start, *end, *step, *kind)),
         Value::Instance(inst) => {
             let b = inst.borrow();
             let fqn = b.class.fqn.as_str();
@@ -135,7 +162,10 @@ pub(crate) fn as_range_view(v: &Value) -> Option<(i64, i64, i64, klio_runtime::R
     }
 }
 
-pub(crate) fn range_view_arg(ctx: &CallCtx, op: &str) -> Result<(i64, i64, i64, klio_runtime::RangeKind), RuntimeError> {
+pub(crate) fn range_view_arg(
+    ctx: &CallCtx,
+    op: &str,
+) -> Result<(i64, i64, i64, klio_runtime::RangeKind), RuntimeError> {
     ctx.args
         .first()
         .and_then(as_range_view)
@@ -159,14 +189,21 @@ pub(crate) fn range_step_field(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
 
 pub(crate) fn range_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (start, end, step, kind) = range_view_arg(ctx, "toString")?;
-    let r = Value::Range { start, end, step, kind };
+    let r = Value::Range {
+        start,
+        end,
+        step,
+        kind,
+    };
     Ok(Value::String(Arc::new(format!("{r}"))))
 }
 
 pub(crate) fn range_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (start, end, step, _kind) = range_view_arg(ctx, "contains")?;
     let Some(n) = ctx.args.get(1).and_then(Value::as_i64) else {
-        return Err(RuntimeError::Type("Range.contains requires an Int argument".into()));
+        return Err(RuntimeError::Type(
+            "Range.contains requires an Int argument".into(),
+        ));
     };
     let (lo, hi) = if step > 0 { (start, end) } else { (end, start) };
     let in_bounds = n >= lo && n <= hi;
@@ -185,7 +222,12 @@ pub(crate) fn range_is_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 pub(crate) fn range_reversed(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (start, end, step, kind) = range_view_arg(ctx, "reversed")?;
-    Ok(Value::Range { start: end, end: start, step: -step, kind })
+    Ok(Value::Range {
+        start: end,
+        end: start,
+        step: -step,
+        kind,
+    })
 }
 
 pub(crate) fn range_to_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -196,6 +238,8 @@ pub(crate) fn range_to_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_list(items, false))
 }
 
+// The element count is a Kotlin Int; range sizes never exceed i64::MAX.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn range_count(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (start, end, step, _kind) = range_view_arg(ctx, "count")?;
     let n = range_iter_int(start, end, step).count() as i64;
@@ -207,8 +251,6 @@ pub(crate) fn range_sum(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s: i64 = range_iter_int(start, end, step).sum();
     Ok(match kind {
         klio_runtime::RangeKind::Long => Value::Long(s),
-        klio_runtime::RangeKind::Int => Value::new_int(s),
-        klio_runtime::RangeKind::Char => Value::new_int(s),
+        klio_runtime::RangeKind::Int | klio_runtime::RangeKind::Char => Value::new_int(s),
     })
 }
-

@@ -1,4 +1,15 @@
-use crate::{VmHost, IN_PROGRESS, Arc, VmIntrinsicHost, receiver_compatible_with_param};
+use crate::{Arc, IN_PROGRESS, VmHost, VmIntrinsicHost, receiver_compatible_with_param};
+
+/// Clears a top-level property name from the in-progress set when an
+/// on-demand initializer returns, breaking re-entrant init cycles.
+struct InitGuard(String);
+impl Drop for InitGuard {
+    fn drop(&mut self) {
+        IN_PROGRESS.with(|s| {
+            s.borrow_mut().remove(&self.0);
+        });
+    }
+}
 
 impl VmHost<'_> {
     /// Drive a top-level property's initializer on demand when it is
@@ -24,15 +35,7 @@ impl VmHost<'_> {
         if already {
             return Ok(None);
         }
-        struct Guard(String);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                IN_PROGRESS.with(|s| {
-                    s.borrow_mut().remove(&self.0);
-                });
-            }
-        }
-        let _guard = Guard(name.to_string());
+        let _guard = InitGuard(name.to_string());
         let func = self
             .module
             .funcs
@@ -56,22 +59,28 @@ impl VmHost<'_> {
     /// already established. `fence_and_publish` marks the boundary.
     pub(crate) fn join_spawned(&mut self, id: u64) -> Result<(), klio_runtime::RuntimeError> {
         let handle = {
-            let mut g = self.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut g = self
+                .threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.get_mut(&id).and_then(|e| e.handle.take())
         };
         let Some(handle) = handle else {
             return Ok(());
         };
-        let res = handle.join().map_err(|_| {
-            klio_runtime::RuntimeError::Type("spawned thread panicked".into())
-        })?;
+        let res = handle
+            .join()
+            .map_err(|_| klio_runtime::RuntimeError::Type("spawned thread panicked".into()))?;
         klio_runtime::fence_and_publish(); // thread join
         res
     }
 
     /// Whether spawned thread `id` is still running.
     pub(crate) fn thread_alive(&self, id: u64) -> bool {
-        let g = self.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let g = self
+            .threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match g.get(&id) {
             Some(e) => e.handle.as_ref().is_some_and(|h| !h.is_finished()),
             None => false,
@@ -102,16 +111,19 @@ impl VmHost<'_> {
             out_sink: self.out_sink.clone(),
             threads: Arc::clone(&self.threads),
         };
-        klio_stdlib::materialise_sequence(seq_val, &mut intrinsic_host, &mut *self.out)
-            .map_err(|e| match e {
+        klio_stdlib::materialise_sequence(seq_val, &mut intrinsic_host, &mut *self.out).map_err(
+            |e| match e {
                 klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
                 other => klio_ir::eval::EvalError::Type(format!("{other}")),
-            })
+            },
+        )
     }
     /// Score an arg/param compatibility for overload resolution.
     /// Higher is better. Exact type match wins over `Any`, which
     /// wins over a type-parameter (`T`) fallback. Returning `None`
     /// disqualifies the candidate.
+    // Single sequential overload-scoring dispatch.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn overload_score_arg(
         &self,
         param_ty: &klio_ir::TypeRef,
@@ -148,13 +160,14 @@ impl VmHost<'_> {
         // arity does the real disambiguation between overloads.
         let arg_arity: Option<usize> = match arg {
             klio_runtime::Value::Lambda { params, .. } => Some(params.len()),
+            // Closure id indexes the closure table.
+            #[allow(clippy::cast_possible_truncation)]
             klio_runtime::Value::IrClosure { id, .. } => {
                 self.closures.get(*id as usize).map(|c| c.n_params)
             }
             _ => None,
         };
-        let is_callable = arg_arity.is_some()
-            || arg.type_fqn().starts_with("kotlin.Function");
+        let is_callable = arg_arity.is_some() || arg.type_fqn().starts_with("kotlin.Function");
         if is_callable {
             // `FunctionN` carries the expected lambda arity. Rank an
             // exact match high so overloads differing only in the
@@ -162,13 +175,14 @@ impl VmHost<'_> {
             // mismatch still scores (low) rather than disqualifying,
             // to stay tolerant of receiver-style function types.
             if let Some(expected) = nm.strip_prefix("Function")
-                && let Ok(want) = expected.parse::<usize>() {
-                    return Some(match arg_arity {
-                        Some(got) if got == want => 90,
-                        Some(_) => 2,
-                        None => 15,
-                    });
-                }
+                && let Ok(want) = expected.parse::<usize>()
+            {
+                return Some(match arg_arity {
+                    Some(got) if got == want => 90,
+                    Some(_) => 2,
+                    None => 15,
+                });
+            }
             return Some(15);
         }
         // Subtype: an instance argument whose class transitively
@@ -185,8 +199,7 @@ impl VmHost<'_> {
             // `CoroutineContext.ensureActive` (which would recurse).
             let mut queue: std::collections::VecDeque<(String, i32)> =
                 std::collections::VecDeque::new();
-            let mut seen: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             queue.push_back((v_ty.to_string(), 0));
             while let Some((cur, depth)) = queue.pop_front() {
                 if !seen.insert(cur.clone()) {
@@ -214,38 +227,39 @@ impl VmHost<'_> {
         // match below an exact name but above a callable / generic.
         let builtin_supers: &[&str] = match v_ty {
             "List" => &[
-                "Collection", "Iterable", "MutableList",
-                "MutableCollection", "MutableIterable",
+                "Collection",
+                "Iterable",
+                "MutableList",
+                "MutableCollection",
+                "MutableIterable",
             ],
             "MutableList" => &[
-                "List", "Collection", "Iterable", "MutableCollection",
+                "List",
+                "Collection",
+                "Iterable",
+                "MutableCollection",
                 "MutableIterable",
             ],
             "Set" => &[
-                "Collection", "Iterable", "MutableSet",
-                "MutableCollection", "MutableIterable",
+                "Collection",
+                "Iterable",
+                "MutableSet",
+                "MutableCollection",
+                "MutableIterable",
             ],
             "MutableSet" => &[
-                "Set", "Collection", "Iterable", "MutableCollection",
+                "Set",
+                "Collection",
+                "Iterable",
+                "MutableCollection",
                 "MutableIterable",
             ],
             "Map" => &["MutableMap"],
             "MutableMap" => &["Map"],
-            "IntRange" => &[
-                "IntProgression", "ClosedRange", "Iterable",
-                "OpenEndRange",
-            ],
-            "LongRange" => &[
-                "LongProgression", "ClosedRange", "Iterable",
-                "OpenEndRange",
-            ],
-            "CharRange" => &[
-                "CharProgression", "ClosedRange", "Iterable",
-                "OpenEndRange",
-            ],
-            "IntProgression" | "LongProgression" | "CharProgression" => {
-                &["Iterable"]
-            }
+            "IntRange" => &["IntProgression", "ClosedRange", "Iterable", "OpenEndRange"],
+            "LongRange" => &["LongProgression", "ClosedRange", "Iterable", "OpenEndRange"],
+            "CharRange" => &["CharProgression", "ClosedRange", "Iterable", "OpenEndRange"],
+            "IntProgression" | "LongProgression" | "CharProgression" => &["Iterable"],
             "String" => &["CharSequence", "Comparable"],
             _ => &[],
         };
@@ -258,10 +272,14 @@ impl VmHost<'_> {
         // `List.last` identically (both 55) and the first-registered
         // candidate wins — which lets a generic shim recurse on its
         // own smart-cast-narrowed `this.last()` call.
-        if let Some(pos) =
-            builtin_supers.iter().position(|s| *s == nm || *s == nm_simple)
+        if let Some(pos) = builtin_supers
+            .iter()
+            .position(|s| *s == nm || *s == nm_simple)
         {
-            return Some(75 - (pos as i32).min(20));
+            // Position in a short fixed list; always fits in i32.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let dist = (pos as i32).min(20);
+            return Some(75 - dist);
         }
         // Generic single-letter type-parameter — accept any.
         if nm.len() <= 2 && nm.chars().all(|c| c.is_ascii_uppercase()) {
@@ -318,10 +336,8 @@ impl VmHost<'_> {
         if self.classes.borrow().get(&start).is_none() {
             return false;
         }
-        let mut queue: std::collections::VecDeque<String> =
-            std::collections::VecDeque::new();
-        let mut seen: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         queue.push_back(start);
         while let Some(cur) = queue.pop_front() {
             if cur == pn {
@@ -357,10 +373,7 @@ impl VmHost<'_> {
             // (`CoroutineContext.plus(CoroutineContext)`), instead of
             // dispatching a non-applicable narrowing overload.
             let f = &candidates[0];
-            let params_skip = usize::from(f
-                .params
-                .first()
-                .is_some_and(|p| p.name == "this"));
+            let params_skip = usize::from(f.params.first().is_some_and(|p| p.name == "this"));
             let effective = &f.params[params_skip..];
             for (p, a) in effective.iter().zip(args.iter()) {
                 if self.arg_definitely_not_param_type(&p.ty, a) {
@@ -397,7 +410,9 @@ impl VmHost<'_> {
             let mut total: i32 = 0;
             let mut ok = true;
             for (p, a) in effective.iter().zip(args.iter()) {
-                if let Some(s) = self.overload_score_arg(&p.ty, a) { total += s } else {
+                if let Some(s) = self.overload_score_arg(&p.ty, a) {
+                    total += s
+                } else {
                     ok = false;
                     break;
                 }
@@ -435,9 +450,10 @@ impl VmHost<'_> {
                 continue;
             }
             if let Some(total) = self.overload_score(module, *cand, args)
-                && best.is_none_or(|(_, s)| total > s) {
-                    best = Some((*cand, total));
-                }
+                && best.is_none_or(|(_, s)| total > s)
+            {
+                best = Some((*cand, total));
+            }
         }
         best.map(|(id, _)| id)
     }
@@ -483,7 +499,8 @@ impl VmHost<'_> {
     /// `installed_bindings` overlay first so a loaded pack's binding
     /// shadows the stdlib's default implementation.
     pub(crate) fn lookup_intrinsic(&self, fqn: &str) -> Option<klio_runtime::StdlibFn> {
-        self.prog.installed_bindings
+        self.prog
+            .installed_bindings
             .resolve(fqn)
             .or_else(|| klio_stdlib::implementation(fqn))
     }
@@ -521,22 +538,18 @@ impl VmHost<'_> {
             // try/catch can match the handler against the exception
             // class. Stringifying here would break `try { … } catch`.
             klio_runtime::RuntimeError::Thrown(v) => klio_ir::eval::EvalError::Throw(v),
-            klio_runtime::RuntimeError::Return(v) => {
-                klio_ir::eval::EvalError::NonLocalReturn(v)
-            }
+            klio_runtime::RuntimeError::Return(v) => klio_ir::eval::EvalError::NonLocalReturn(v),
             // A suspending primitive (`delay` / `yield`) asked to
             // park. Seed a fresh SuspendState; each enclosing
             // `eval` frame snapshots itself as it unwinds, and the
             // coroutine driver parks the result under a token.
             klio_runtime::RuntimeError::Suspend(wake) => {
-                klio_ir::eval::EvalError::Suspended(Box::new(
-                    klio_ir::eval::SuspendState {
-                        token: 0,
-                        frames: Vec::new(),
-                        wake_in_millis: wake,
-                        pending_resume_reg: None,
-                    },
-                ))
+                klio_ir::eval::EvalError::Suspended(Box::new(klio_ir::eval::SuspendState {
+                    token: 0,
+                    frames: Vec::new(),
+                    wake_in_millis: wake,
+                    pending_resume_reg: None,
+                }))
             }
             other => klio_ir::eval::EvalError::Type(format!("{other}")),
         })
@@ -548,6 +561,8 @@ impl VmHost<'_> {
     /// filter, unique-exact-arity, then receiver/arg type scoring).
     /// Shared so the named-argument path picks the *same* overload
     /// the positional path does.
+    // Single extension-overload resolution scan.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn resolve_ext_overload(
         &self,
         name: &str,
@@ -563,7 +578,11 @@ impl VmHost<'_> {
             .funcs_by_simple_name(name)
             .iter()
             .filter_map(|fid| {
-                self.module.funcs.get(fid.0 as usize).cloned().map(|f| (*fid, f))
+                self.module
+                    .funcs
+                    .get(fid.0 as usize)
+                    .cloned()
+                    .map(|f| (*fid, f))
             })
             // Only genuine extension fns (synthetic `this` first param)
             // are candidates for member-call resolution; a plain
@@ -584,9 +603,7 @@ impl VmHost<'_> {
         let candidates: Vec<(klio_ir::FuncId, klio_ir::Func)> = if any_compat {
             candidates
                 .into_iter()
-                .filter(|(_, f)| {
-                    receiver_compatible_with_param(receiver, &f.params[0].ty)
-                })
+                .filter(|(_, f)| receiver_compatible_with_param(receiver, &f.params[0].ty))
                 .collect()
         } else {
             let type_fqn = receiver.type_fqn();
@@ -617,24 +634,21 @@ impl VmHost<'_> {
             }
             let upar = np - 1; // user-facing params (excl. `this`)
             let mut filled = vec![false; upar];
-            let mut score: i64 =
-                i64::from(self.overload_score_arg(&f.params[0].ty, receiver)
-                    .unwrap_or(-2));
+            let mut score: i64 = i64::from(
+                self.overload_score_arg(&f.params[0].ty, receiver)
+                    .unwrap_or(-2),
+            );
             let mut viable = true;
             // Named args bind by parameter name.
             for (i, an) in arg_names.iter().enumerate() {
                 if let Some(nm) = an {
-                    if let Some(slot) = f.params[1..]
-                        .iter()
-                        .position(|p| &p.name == nm) {
+                    if let Some(slot) = f.params[1..].iter().position(|p| &p.name == nm) {
                         filled[slot] = true;
                         if let Some(a) = args.get(i) {
-                            score += i64::from(self
-                                .overload_score_arg(
-                                    &f.params[slot + 1].ty,
-                                    a,
-                                )
-                                .unwrap_or(-2));
+                            score += i64::from(
+                                self.overload_score_arg(&f.params[slot + 1].ty, a)
+                                    .unwrap_or(-2),
+                            );
                         }
                     } else {
                         viable = false; // unknown named arg
@@ -660,12 +674,10 @@ impl VmHost<'_> {
                 }
                 filled[next] = true;
                 if let Some(a) = args.get(i) {
-                    score += i64::from(self
-                        .overload_score_arg(
-                            &f.params[next + 1].ty,
-                            a,
-                        )
-                        .unwrap_or(-2));
+                    score += i64::from(
+                        self.overload_score_arg(&f.params[next + 1].ty, a)
+                            .unwrap_or(-2),
+                    );
                 }
                 next += 1;
             }
@@ -719,9 +731,7 @@ impl VmHost<'_> {
                 .unwrap_or(-1);
             for (i, a) in args.iter().enumerate() {
                 if let Some(p) = f.params.get(i + 1) {
-                    score += self
-                        .overload_score_arg(&p.ty, a)
-                        .unwrap_or(-1);
+                    score += self.overload_score_arg(&p.ty, a).unwrap_or(-1);
                 }
             }
             if f.params.len() == want {
@@ -761,16 +771,12 @@ impl VmHost<'_> {
         let mut next_args: Vec<klio_runtime::Value> =
             Vec::with_capacity(entry.delegation_arg_thunks.len());
         for fid in &entry.delegation_arg_thunks {
-            let func = module
-                .funcs
-                .get(fid.0 as usize)
-                .cloned()
-                .ok_or_else(|| {
-                    klio_ir::eval::EvalError::Type(format!(
-                        "secondary ctor arg FuncId {} out of range",
-                        fid.0
-                    ))
-                })?;
+            let func = module.funcs.get(fid.0 as usize).cloned().ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "secondary ctor arg FuncId {} out of range",
+                    fid.0
+                ))
+            })?;
             let v = klio_ir::eval::eval_with(&module, &func, args.to_vec(), self)?;
             next_args.push(v);
         }
@@ -792,13 +798,13 @@ impl VmHost<'_> {
             }
         }
         if let Some(body_fid) = entry.body
-            && let Some(body_func) = module.funcs.get(body_fid.0 as usize).cloned() {
-                let mut all: Vec<klio_runtime::Value> =
-                    Vec::with_capacity(1 + args.len());
-                all.push(leaf.clone());
-                all.extend_from_slice(args);
-                klio_ir::eval::eval_with(&module, &body_func, all, self)?;
-            }
+            && let Some(body_func) = module.funcs.get(body_fid.0 as usize).cloned()
+        {
+            let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(1 + args.len());
+            all.push(leaf.clone());
+            all.extend_from_slice(args);
+            klio_ir::eval::eval_with(&module, &body_func, all, self)?;
+        }
         Ok(())
     }
 
@@ -821,15 +827,15 @@ impl VmHost<'_> {
             items.push(v);
             if items.len() > 1_000_000 {
                 return Err(klio_ir::eval::EvalError::Type(
-                    "Iterable.<extension>: iterator produced over 1,000,000 items"
-                        .into(),
+                    "Iterable.<extension>: iterator produced over 1,000,000 items".into(),
                 ));
             }
         }
         Ok(klio_runtime::Value::List {
             items: klio_runtime::ObjRef::new(items),
             mutable: false,
-            enum_class: None, backing: None,
+            enum_class: None,
+            backing: None,
         })
     }
 
@@ -874,8 +880,7 @@ impl VmHost<'_> {
             }
             if let Some(f) = self.module.funcs.get(fid.0 as usize).cloned() {
                 let module = Arc::clone(&self.module);
-                let mut all: Vec<klio_runtime::Value> =
-                    Vec::with_capacity(1 + cls_args.len());
+                let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(1 + cls_args.len());
                 all.push(inst_value.clone());
                 all.extend(cls_args.iter().cloned());
                 klio_ir::eval::eval_with(&module, &f, all, self)?;

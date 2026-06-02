@@ -27,6 +27,12 @@ const PUSHES_PER_THREAD: usize = 2_000;
 /// `SHARED` lock must serialize every access: the final length equals
 /// the exact total of pushes and every element is one we pushed
 /// (no corruption, no lost write).
+// Test indices stay well within i32/usize range; the casts round-trip exactly.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 #[test]
 fn shared_objref_concurrent_push_is_consistent() {
     let obj: ObjRef<Vec<i32>> = ObjRef::new(Vec::new());
@@ -63,7 +69,10 @@ fn shared_objref_concurrent_push_is_consistent() {
     for &v in g.iter() {
         let v = v as usize;
         assert!(v < seen.len(), "corrupted element {v}");
-        assert!(!seen[v], "duplicated element {v} (lost-update / torn write)");
+        assert!(
+            !seen[v],
+            "duplicated element {v} (lost-update / torn write)"
+        );
         seen[v] = true;
     }
     assert!(seen.into_iter().all(|b| b), "missing elements");
@@ -74,6 +83,8 @@ fn shared_objref_concurrent_push_is_consistent() {
 /// over a channel. The reader (which only sees the handle *after*
 /// publish) must observe the fully-written value, never a partial
 /// state.
+// Loop index 0..64 fits in i32 exactly.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 #[test]
 fn publish_then_handoff_orders_the_write() {
     use std::sync::mpsc::channel;
@@ -110,6 +121,12 @@ fn publish_then_handoff_orders_the_write() {
 /// Many threads each clone the shared handle and do a long
 /// read/modify under the lock; an atomic side-counter cross-checks
 /// that exactly the expected number of mutations were applied.
+// THREADS*PUSHES_PER_THREAD fits in both i64 and usize; the casts round-trip exactly.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 #[test]
 fn shared_objref_read_modify_counter() {
     let obj: ObjRef<i64> = ObjRef::new(0);

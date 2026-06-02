@@ -33,7 +33,7 @@ fun main() {
 }
 
 #[test]
-fn list_indexOfFirst_indexOfLast() {
+fn list_index_of_first_index_of_last() {
     let src = r#"
 fun main() {
     val xs = listOf(1, 2, 3, 4, 2, 5)
@@ -68,7 +68,7 @@ fun main() {
 }
 
 #[test]
-fn list_groupBy_count() {
+fn list_group_by_count() {
     let src = r#"
 fun main() {
     val xs = listOf(1, 2, 3, 4, 5, 6)
@@ -96,7 +96,7 @@ fun main() {
 }
 
 #[test]
-fn list_distinct_distinctBy() {
+fn list_distinct_distinct_by() {
     let src = r#"
 fun main() {
     val xs = listOf("alpha", "ant", "beta", "bee", "bear")

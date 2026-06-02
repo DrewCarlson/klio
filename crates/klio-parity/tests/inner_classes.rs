@@ -153,8 +153,7 @@ fun main() {
     println(Wrap().Builder().render(listOf("a", "b")))
 }
 "#;
-    assert_klio("inner_outer_ext_str", src,
-        "[a::a],[b::b]\n");
+    assert_klio("inner_outer_ext_str", src, "[a::a],[b::b]\n");
 }
 
 #[test]
@@ -194,8 +193,7 @@ fun main() {
     println(make(3).pipeline())
 }
 "#;
-    assert_klio("anon_abstract_pipeline", src,
-        "1:4,2:4,3:4\n1:9,2:9,3:9\n");
+    assert_klio("anon_abstract_pipeline", src, "1:4,2:4,3:4\n1:9,2:9,3:9\n");
 }
 
 #[test]

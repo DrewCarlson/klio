@@ -18,8 +18,8 @@
 
 use crate::builder::CfgBuilder;
 use crate::ir::{
-    BlockId, Cfg, EdgeKind, ExprRef, FieldId, LoopId, Node, Pattern, Place, Reg,
-    SwitchArm, Symbol, Terminator,
+    BlockId, Cfg, EdgeKind, ExprRef, FieldId, LoopId, Node, Pattern, Place, Reg, SwitchArm, Symbol,
+    Terminator,
 };
 use klio_ast::{
     BinOp, Block, Catch, Decl, Expr, Ident, PostfixOp, Stmt, StringPart, UnOp, WhenBranch,
@@ -85,12 +85,26 @@ struct TryFrame {
 /// `AssumeNull` on the correct branch arm.
 #[derive(Debug, Clone)]
 enum Refinement {
-    Is { reg: Reg, ty: Type, class_name: Option<String>, polarity: bool, span: Span },
-    NullEq { reg: Reg, span: Span, eq_null: bool },
+    Is {
+        reg: Reg,
+        ty: Type,
+        class_name: Option<String>,
+        polarity: bool,
+        span: Span,
+    },
+    NullEq {
+        reg: Reg,
+        span: Span,
+        eq_null: bool,
+    },
     /// Reference-equality of two registers, both of which hold a
     /// `Place`. Used to narrow each place to the intersection of
     /// the two on the truthy branch.
-    RefEq { reg_a: Reg, reg_b: Reg, span: Span },
+    RefEq {
+        reg_a: Reg,
+        reg_b: Reg,
+        span: Span,
+    },
     /// `!cond` flips polarity of every contained refinement.
     Not(Box<Refinement>),
     /// `&&` of multiple refinements — all hold on the true branch.
@@ -115,7 +129,7 @@ pub struct Lowering {
 }
 
 impl Lowering {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             b: CfgBuilder::new(),
@@ -134,7 +148,7 @@ impl Lowering {
     /// synthetic exit block; every `return` jumps to the exit. The
     /// implicit fall-off-the-end of a `Unit`-typed body is wired to
     /// the exit by an explicit `Goto`.
-    #[must_use] 
+    #[must_use]
     pub fn lower_function(mut self, body: &Block, source: Span) -> Lowered {
         let entry = self.b.new_block();
         let exit = self.b.new_block();
@@ -165,7 +179,13 @@ impl Lowering {
     /// the else-arm.
     fn emit_refinement(&mut self, blk: BlockId, refinement: &Refinement, truth: bool) {
         match refinement {
-            Refinement::Is { reg, ty, class_name, polarity, span } => {
+            Refinement::Is {
+                reg,
+                ty,
+                class_name,
+                polarity,
+                span,
+            } => {
                 let effective = *polarity == truth;
                 self.b.push(
                     blk,
@@ -182,8 +202,14 @@ impl Lowering {
                 // `x == null` true on then; the refinement is "x == null".
                 // Truth=true keeps eq_null; truth=false flips it.
                 let effective = *eq_null == truth;
-                self.b
-                    .push(blk, Node::AssumeNull { reg: *reg, eq_null: effective, span: *span });
+                self.b.push(
+                    blk,
+                    Node::AssumeNull {
+                        reg: *reg,
+                        eq_null: effective,
+                        span: *span,
+                    },
+                );
             }
             Refinement::RefEq { reg_a, reg_b, span } => {
                 self.b.push(
@@ -247,9 +273,10 @@ impl Lowering {
                     // the aliasing so smart-cast lookups for the new
                     // name can follow the chain.
                     if !p.mutable
-                        && let Some(src) = self.expr_to_place(init) {
-                            self.aliases.insert(Symbol(p.name.name.clone()), src);
-                        }
+                        && let Some(src) = Self::expr_to_place(init)
+                    {
+                        self.aliases.insert(Symbol(p.name.name.clone()), src);
+                    }
                     self.b.push(
                         *cur,
                         Node::Assign {
@@ -262,9 +289,14 @@ impl Lowering {
                 None
             }
             Stmt::Decl(_) => None,
-            Stmt::Assign { target, op: _, value, span } => {
+            Stmt::Assign {
+                target,
+                op: _,
+                value,
+                span,
+            } => {
                 let rhs = self.lower_expr(value, cur);
-                let lhs_place = self.expr_to_place(target);
+                let lhs_place = Self::expr_to_place(target);
                 let place = lhs_place.unwrap_or(Place::Local(Symbol("<expr>".into())));
                 // Record both the assignment span and the LHS
                 // target's span as pointing at the position right
@@ -275,10 +307,19 @@ impl Lowering {
                 let lhs_span = target.span();
                 self.span_to_pos
                     .insert((lhs_span.start, lhs_span.end), (*cur, pos));
-                self.b.push(*cur, Node::Assign { lhs: place, rhs, span: *span });
+                self.b.push(
+                    *cur,
+                    Node::Assign {
+                        lhs: place,
+                        rhs,
+                        span: *span,
+                    },
+                );
                 None
             }
-            Stmt::DestructuringDecl { names, init, span, .. } => {
+            Stmt::DestructuringDecl {
+                names, init, span, ..
+            } => {
                 let r = self.lower_expr(init, cur);
                 for n in names {
                     if n.name == "_" {
@@ -306,13 +347,18 @@ impl Lowering {
         }
     }
 
-    fn expr_to_place(&self, e: &Expr) -> Option<Place> {
+    fn expr_to_place(e: &Expr) -> Option<Place> {
         match e {
             Expr::Path { segments, .. } if segments.len() == 1 => {
                 Some(Place::Local(Symbol(segments[0].name.clone())))
             }
-            Expr::Member { receiver, name, safe: false, .. } => {
-                let inner = self.expr_to_place(receiver)?;
+            Expr::Member {
+                receiver,
+                name,
+                safe: false,
+                ..
+            } => {
+                let inner = Self::expr_to_place(receiver)?;
                 Some(Place::Field {
                     receiver: Box::new(inner),
                     field: FieldId(name.name.clone()),
@@ -345,11 +391,21 @@ impl Lowering {
             .current_node_count(cur)
             .expect("emit_eval target block must exist");
         self.span_to_pos.insert((span.start, span.end), (cur, pos));
-        self.b
-            .push(cur, Node::Eval { reg, expr: ExprRef { span, ty: Type::Unresolved } });
+        self.b.push(
+            cur,
+            Node::Eval {
+                reg,
+                expr: ExprRef {
+                    span,
+                    ty: Type::Unresolved,
+                },
+            },
+        );
         self.record_reg(span, reg)
     }
 
+    // single dispatch over every Expr variant; arms are grouped by lowering category
+    #[allow(clippy::too_many_lines, clippy::match_same_arms)]
     fn lower_expr(&mut self, expr: &Expr, cur: &mut BlockId) -> Reg {
         match expr {
             Expr::IntLit { span, .. }
@@ -372,7 +428,7 @@ impl Lowering {
             | Expr::Super { span, .. }
             | Expr::PropertyRef { span, .. } => {
                 let reg = self.emit_eval(*cur, *span);
-                if let Some(place) = self.expr_to_place(expr) {
+                if let Some(place) = Self::expr_to_place(expr) {
                     self.reg_to_place.insert(reg, place);
                 }
                 reg
@@ -381,7 +437,7 @@ impl Lowering {
             Expr::Member { receiver, span, .. } => {
                 let _ = self.lower_expr(receiver, cur);
                 let reg = self.emit_eval(*cur, *span);
-                if let Some(place) = self.expr_to_place(expr) {
+                if let Some(place) = Self::expr_to_place(expr) {
                     self.reg_to_place.insert(reg, place);
                 }
                 reg
@@ -391,7 +447,9 @@ impl Lowering {
                 self.emit_eval(*cur, *span)
             }
 
-            Expr::Call { callee, args, span, .. } => {
+            Expr::Call {
+                callee, args, span, ..
+            } => {
                 // Spec §12.2.5 callsInPlace(EXACTLY_ONCE): if the
                 // callee is one of the stdlib scope functions and
                 // the last argument is a lambda literal, inline the
@@ -426,7 +484,11 @@ impl Lowering {
                     result
                 }
             }
-            Expr::Index { receiver, args, span } => {
+            Expr::Index {
+                receiver,
+                args,
+                span,
+            } => {
                 let _ = self.lower_expr(receiver, cur);
                 for a in args {
                     let _ = self.lower_expr(a, cur);
@@ -443,23 +505,39 @@ impl Lowering {
             Expr::Unary { op, expr, span } => {
                 let inner = self.lower_expr(expr, cur);
                 if matches!(op, UnOp::PreInc | UnOp::PreDec)
-                    && let Some(place) = self.expr_to_place(expr) {
-                        self.b.push(*cur, Node::Assign { lhs: place, rhs: inner, span: *span });
-                    }
+                    && let Some(place) = Self::expr_to_place(expr)
+                {
+                    self.b.push(
+                        *cur,
+                        Node::Assign {
+                            lhs: place,
+                            rhs: inner,
+                            span: *span,
+                        },
+                    );
+                }
                 let result = self.emit_eval(*cur, *span);
                 if matches!(op, UnOp::Not)
-                    && let Some(r) = self.pending_refinements.get(&inner).cloned() {
-                        self.pending_refinements
-                            .insert(result, Refinement::Not(Box::new(r)));
-                    }
+                    && let Some(r) = self.pending_refinements.get(&inner).cloned()
+                {
+                    self.pending_refinements
+                        .insert(result, Refinement::Not(Box::new(r)));
+                }
                 result
             }
 
             Expr::Postfix { op, expr, span } => match op {
                 PostfixOp::Inc | PostfixOp::Dec => {
                     let r = self.lower_expr(expr, cur);
-                    if let Some(place) = self.expr_to_place(expr) {
-                        self.b.push(*cur, Node::Assign { lhs: place, rhs: r, span: *span });
+                    if let Some(place) = Self::expr_to_place(expr) {
+                        self.b.push(
+                            *cur,
+                            Node::Assign {
+                                lhs: place,
+                                rhs: r,
+                                span: *span,
+                            },
+                        );
                     }
                     self.emit_eval(*cur, *span)
                 }
@@ -467,26 +545,44 @@ impl Lowering {
                     let r = self.lower_expr(expr, cur);
                     self.b.push(
                         *cur,
-                        Node::AssumeNull { reg: r, eq_null: false, span: *span },
+                        Node::AssumeNull {
+                            reg: r,
+                            eq_null: false,
+                            span: *span,
+                        },
                     );
-                    self.b.push(*cur, Node::Assert { reg: r, span: *span });
+                    self.b.push(
+                        *cur,
+                        Node::Assert {
+                            reg: r,
+                            span: *span,
+                        },
+                    );
                     r
                 }
             },
 
-            Expr::If { cond, then_branch, else_branch, span } => {
-                self.lower_if(cond, then_branch, else_branch.as_deref(), *span, cur)
-            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                span,
+            } => self.lower_if(cond, then_branch, else_branch.as_deref(), *span, cur),
 
-            Expr::When { subject, branches, span, .. } => {
-                self.lower_when(subject.as_deref(), branches, *span, cur)
-            }
+            Expr::When {
+                subject,
+                branches,
+                span,
+                ..
+            } => self.lower_when(subject.as_deref(), branches, *span, cur),
 
             Expr::While { cond, body, span } => self.lower_while(cond, body, *span, cur),
             Expr::DoWhile { body, cond, span } => {
                 self.lower_do_while(body.as_deref(), cond, *span, cur)
             }
-            Expr::For { iter, body, span, .. } => self.lower_for(iter, body, *span, cur),
+            Expr::For {
+                iter, body, span, ..
+            } => self.lower_for(iter, body, *span, cur),
 
             Expr::Return { value, label, span } => {
                 let r = value.as_ref().map(|v| self.lower_expr(v, cur));
@@ -537,9 +633,12 @@ impl Lowering {
                 .lower_block(b, cur)
                 .unwrap_or_else(|| self.emit_eval(*cur, b.span)),
 
-            Expr::Try { body, catches, finally, span } => {
-                self.lower_try(body, catches, finally.as_ref(), *span, cur)
-            }
+            Expr::Try {
+                body,
+                catches,
+                finally,
+                span,
+            } => self.lower_try(body, catches, finally.as_ref(), *span, cur),
 
             Expr::Lambda { body, span, .. } => {
                 let _ = body;
@@ -548,12 +647,23 @@ impl Lowering {
             Expr::AnonFun { span, .. } => self.emit_eval(*cur, *span),
             Expr::ObjectExpr { span, .. } => self.emit_eval(*cur, *span),
 
-            Expr::IsCheck { expr, ty, negated, span } => {
+            Expr::IsCheck {
+                expr,
+                ty,
+                negated,
+                span,
+            } => {
                 let r = self.lower_expr(expr, cur);
                 let result = self.b.new_reg();
                 self.b.push(
                     *cur,
-                    Node::Eval { reg: result, expr: ExprRef { span: *span, ty: Type::Boolean } },
+                    Node::Eval {
+                        reg: result,
+                        expr: ExprRef {
+                            span: *span,
+                            ty: Type::Boolean,
+                        },
+                    },
                 );
                 let ty_t = klio_types::convert_type_ref_lossy(ty);
                 let class_name = if klio_types::builtin_by_name(&ty.name.name).is_none() {
@@ -573,7 +683,12 @@ impl Lowering {
                 );
                 self.record_reg(*span, result)
             }
-            Expr::As { expr, ty, safe, span } => {
+            Expr::As {
+                expr,
+                ty,
+                safe,
+                span,
+            } => {
                 let r = self.lower_expr(expr, cur);
                 let ty_t = klio_types::convert_type_ref_lossy(ty);
                 let class_name = if klio_types::builtin_by_name(&ty.name.name).is_none() {
@@ -592,7 +707,13 @@ impl Lowering {
                             span: *span,
                         },
                     );
-                    self.b.push(*cur, Node::Assert { reg: r, span: *span });
+                    self.b.push(
+                        *cur,
+                        Node::Assert {
+                            reg: r,
+                            span: *span,
+                        },
+                    );
                 }
                 self.emit_eval(*cur, *span)
             }
@@ -608,8 +729,12 @@ impl Lowering {
         cur: &mut BlockId,
     ) -> Reg {
         match op {
-            BinOp::And => self.lower_short_circuit(lhs, rhs, span, cur, /*short_on_false=*/ true),
-            BinOp::Or => self.lower_short_circuit(lhs, rhs, span, cur, /*short_on_false=*/ false),
+            BinOp::And => {
+                self.lower_short_circuit(lhs, rhs, span, cur, /*short_on_false=*/ true)
+            }
+            BinOp::Or => {
+                self.lower_short_circuit(lhs, rhs, span, cur, /*short_on_false=*/ false)
+            }
             BinOp::Elvis => self.lower_elvis(lhs, rhs, span, cur),
             BinOp::Eq | BinOp::Neq | BinOp::IdentEq | BinOp::IdentNeq => {
                 let l = self.lower_expr(lhs, cur);
@@ -619,20 +744,30 @@ impl Lowering {
                 if is_null_lit(rhs) {
                     self.pending_refinements.insert(
                         result,
-                        Refinement::NullEq { reg: l, span, eq_null: eq_op },
+                        Refinement::NullEq {
+                            reg: l,
+                            span,
+                            eq_null: eq_op,
+                        },
                     );
                 } else if is_null_lit(lhs) {
                     self.pending_refinements.insert(
                         result,
-                        Refinement::NullEq { reg: r, span, eq_null: eq_op },
+                        Refinement::NullEq {
+                            reg: r,
+                            span,
+                            eq_null: eq_op,
+                        },
                     );
-                } else if self.reg_to_place.contains_key(&l)
-                    && self.reg_to_place.contains_key(&r)
-                {
+                } else if self.reg_to_place.contains_key(&l) && self.reg_to_place.contains_key(&r) {
                     // Cross-variable reference equality on two
                     // place expressions. Negation flips at branch
                     // emission time via `emit_refinement(truth=...)`.
-                    let refinement = Refinement::RefEq { reg_a: l, reg_b: r, span };
+                    let refinement = Refinement::RefEq {
+                        reg_a: l,
+                        reg_b: r,
+                        span,
+                    };
                     let wrapped = if eq_op {
                         refinement
                     } else {
@@ -664,11 +799,25 @@ impl Lowering {
         let lhs_refinement = self.pending_refinements.get(&l).cloned();
         let rhs_blk = self.b.new_block();
         let join = self.b.new_block();
-        let (then_blk, else_blk) = if short_on_false { (rhs_blk, join) } else { (join, rhs_blk) };
-        self.b.set_terminator(*cur, Terminator::Branch { cond: l, then_blk, else_blk });
+        let (then_blk, else_blk) = if short_on_false {
+            (rhs_blk, join)
+        } else {
+            (join, rhs_blk)
+        };
+        self.b.set_terminator(
+            *cur,
+            Terminator::Branch {
+                cond: l,
+                then_blk,
+                else_blk,
+            },
+        );
         self.b.push(
             rhs_blk,
-            Node::Assume { reg: l, polarity: short_on_false },
+            Node::Assume {
+                reg: l,
+                polarity: short_on_false,
+            },
         );
         if let Some(r) = &lhs_refinement {
             // On the rhs-eval block, lhs's truth-polarity matches
@@ -682,7 +831,10 @@ impl Lowering {
         self.b.set_terminator(rhs_cur, Terminator::Goto(join));
         self.b.push(
             join,
-            Node::Assume { reg: l, polarity: !short_on_false },
+            Node::Assume {
+                reg: l,
+                polarity: !short_on_false,
+            },
         );
         let combined = match (lhs_refinement, rhs_refinement) {
             (Some(a), Some(b)) => Some(if short_on_false {
@@ -703,29 +855,37 @@ impl Lowering {
 
     /// `a ?: b` => evaluate `a`; if non-null, that's the result; if
     /// null, evaluate `b`. Lowered as a null-check branch.
-    fn lower_elvis(
-        &mut self,
-        lhs: &Expr,
-        rhs: &Expr,
-        span: Span,
-        cur: &mut BlockId,
-    ) -> Reg {
+    fn lower_elvis(&mut self, lhs: &Expr, rhs: &Expr, span: Span, cur: &mut BlockId) -> Reg {
         let l = self.lower_expr(lhs, cur);
         let null_blk = self.b.new_block();
         let nonnull_blk = self.b.new_block();
         let join = self.b.new_block();
-        self.b
-            .set_terminator(*cur, Terminator::Branch { cond: l, then_blk: nonnull_blk, else_blk: null_blk });
+        self.b.set_terminator(
+            *cur,
+            Terminator::Branch {
+                cond: l,
+                then_blk: nonnull_blk,
+                else_blk: null_blk,
+            },
+        );
         self.b.push(
             null_blk,
-            Node::AssumeNull { reg: l, eq_null: true, span },
+            Node::AssumeNull {
+                reg: l,
+                eq_null: true,
+                span,
+            },
         );
         let mut null_cur = null_blk;
         let _ = self.lower_expr(rhs, &mut null_cur);
         self.b.set_terminator(null_cur, Terminator::Goto(join));
         self.b.push(
             nonnull_blk,
-            Node::AssumeNull { reg: l, eq_null: false, span },
+            Node::AssumeNull {
+                reg: l,
+                eq_null: false,
+                span,
+            },
         );
         self.b.set_terminator(nonnull_blk, Terminator::Goto(join));
         *cur = join;
@@ -745,9 +905,22 @@ impl Lowering {
         let then_blk = self.b.new_block();
         let else_blk = self.b.new_block();
         let join = self.b.new_block();
-        self.b.set_terminator(*cur, Terminator::Branch { cond: c, then_blk, else_blk });
+        self.b.set_terminator(
+            *cur,
+            Terminator::Branch {
+                cond: c,
+                then_blk,
+                else_blk,
+            },
+        );
 
-        self.b.push(then_blk, Node::Assume { reg: c, polarity: true });
+        self.b.push(
+            then_blk,
+            Node::Assume {
+                reg: c,
+                polarity: true,
+            },
+        );
         if let Some(r) = &refinement {
             self.emit_refinement(then_blk, r, true);
         }
@@ -755,7 +928,13 @@ impl Lowering {
         let _ = self.lower_expr(then_branch, &mut then_cur);
         self.b.set_terminator(then_cur, Terminator::Goto(join));
 
-        self.b.push(else_blk, Node::Assume { reg: c, polarity: false });
+        self.b.push(
+            else_blk,
+            Node::Assume {
+                reg: c,
+                polarity: false,
+            },
+        );
         if let Some(r) = &refinement {
             self.emit_refinement(else_blk, r, false);
         }
@@ -825,18 +1004,29 @@ impl Lowering {
                         cur,
                         Node::Eval {
                             reg: cmp,
-                            expr: ExprRef { span: e.span(), ty: Type::Boolean },
+                            expr: ExprRef {
+                                span: e.span(),
+                                ty: Type::Boolean,
+                            },
                         },
                     );
                     let _ = s;
                     self.b.set_terminator(
                         cur,
-                        Terminator::Branch { cond: cmp, then_blk: match_blk, else_blk: miss_blk },
+                        Terminator::Branch {
+                            cond: cmp,
+                            then_blk: match_blk,
+                            else_blk: miss_blk,
+                        },
                     );
                 } else {
                     self.b.set_terminator(
                         cur,
-                        Terminator::Branch { cond: v, then_blk: match_blk, else_blk: miss_blk },
+                        Terminator::Branch {
+                            cond: v,
+                            then_blk: match_blk,
+                            else_blk: miss_blk,
+                        },
                     );
                 }
             }
@@ -845,11 +1035,21 @@ impl Lowering {
                 let cmp = self.b.new_reg();
                 self.b.push(
                     cur,
-                    Node::Eval { reg: cmp, expr: ExprRef { span: e.span(), ty: Type::Boolean } },
+                    Node::Eval {
+                        reg: cmp,
+                        expr: ExprRef {
+                            span: e.span(),
+                            ty: Type::Boolean,
+                        },
+                    },
                 );
                 self.b.set_terminator(
                     cur,
-                    Terminator::Branch { cond: cmp, then_blk: match_blk, else_blk: miss_blk },
+                    Terminator::Branch {
+                        cond: cmp,
+                        then_blk: match_blk,
+                        else_blk: miss_blk,
+                    },
                 );
             }
             WhenPatternKind::IsType(ty) | WhenPatternKind::NotIsType(ty) => {
@@ -875,17 +1075,34 @@ impl Lowering {
                     );
                     self.b.push(
                         cur,
-                        Node::Eval { reg: cmp, expr: ExprRef { span: ty.span, ty: Type::Boolean } },
+                        Node::Eval {
+                            reg: cmp,
+                            expr: ExprRef {
+                                span: ty.span,
+                                ty: Type::Boolean,
+                            },
+                        },
                     );
                     let arms = vec![SwitchArm {
                         pattern: Pattern::Is { ty: ty_t, polarity },
                         target: match_blk,
                     }];
-                    self.b.set_terminator(cur, Terminator::Switch { reg: s, arms, default: miss_blk });
+                    self.b.set_terminator(
+                        cur,
+                        Terminator::Switch {
+                            reg: s,
+                            arms,
+                            default: miss_blk,
+                        },
+                    );
                 } else {
                     self.b.set_terminator(
                         cur,
-                        Terminator::Branch { cond: cmp, then_blk: match_blk, else_blk: miss_blk },
+                        Terminator::Branch {
+                            cond: cmp,
+                            then_blk: match_blk,
+                            else_blk: miss_blk,
+                        },
                     );
                 }
             }
@@ -908,12 +1125,22 @@ impl Lowering {
             let r = self.lower_expr(cond, &mut head_cur);
             self.b.set_terminator(
                 head_cur,
-                Terminator::Branch { cond: r, then_blk: body_blk, else_blk: exit },
+                Terminator::Branch {
+                    cond: r,
+                    then_blk: body_blk,
+                    else_blk: exit,
+                },
             );
             r
         };
 
-        self.b.push(body_blk, Node::Assume { reg: c, polarity: true });
+        self.b.push(
+            body_blk,
+            Node::Assume {
+                reg: c,
+                polarity: true,
+            },
+        );
         self.loop_stack.push(LoopFrame {
             id: lid,
             cont_target: head,
@@ -926,7 +1153,13 @@ impl Lowering {
         self.b.set_terminator(body_cur, Terminator::Goto(head));
         self.loop_stack.pop();
 
-        self.b.push(exit, Node::Assume { reg: c, polarity: false });
+        self.b.push(
+            exit,
+            Node::Assume {
+                reg: c,
+                polarity: false,
+            },
+        );
         *cur = exit;
         self.emit_eval(*cur, span)
     }
@@ -960,10 +1193,22 @@ impl Lowering {
         let mut cond_cur = cond_blk;
         let r = self.lower_expr(cond, &mut cond_cur);
         self.b.push(cond_cur, Node::Backedge { loop_id: lid });
-        self.b
-            .set_terminator(cond_cur, Terminator::Branch { cond: r, then_blk: head, else_blk: exit });
+        self.b.set_terminator(
+            cond_cur,
+            Terminator::Branch {
+                cond: r,
+                then_blk: head,
+                else_blk: exit,
+            },
+        );
 
-        self.b.push(exit, Node::Assume { reg: r, polarity: false });
+        self.b.push(
+            exit,
+            Node::Assume {
+                reg: r,
+                polarity: false,
+            },
+        );
         *cur = exit;
         self.emit_eval(*cur, span)
     }
@@ -982,10 +1227,22 @@ impl Lowering {
         let cond = self.b.new_reg();
         self.b.push(
             head,
-            Node::Eval { reg: cond, expr: ExprRef { span, ty: Type::Boolean } },
+            Node::Eval {
+                reg: cond,
+                expr: ExprRef {
+                    span,
+                    ty: Type::Boolean,
+                },
+            },
         );
-        self.b
-            .set_terminator(head, Terminator::Branch { cond, then_blk: body_blk, else_blk: exit });
+        self.b.set_terminator(
+            head,
+            Terminator::Branch {
+                cond,
+                then_blk: body_blk,
+                else_blk: exit,
+            },
+        );
         self.loop_stack.push(LoopFrame {
             id: lid,
             cont_target: head,
@@ -1032,7 +1289,8 @@ impl Lowering {
         let mut body_cur = body_blk;
         let _ = self.lower_block(body, &mut body_cur);
         let body_exit_to = normal_finally_blk.unwrap_or(join);
-        self.b.set_terminator(body_cur, Terminator::Goto(body_exit_to));
+        self.b
+            .set_terminator(body_cur, Terminator::Goto(body_exit_to));
         // Exception edges from every node in the body to each handler.
         for (ty, h) in &handlers_entry {
             self.b
@@ -1085,7 +1343,8 @@ impl Lowering {
             let handlers = frame.handlers.clone();
             let finally_entry = frame.finally_entry;
             for (ty, h) in &handlers {
-                self.b.add_edge(from, *h, EdgeKind::Exception { ty: ty.clone() });
+                self.b
+                    .add_edge(from, *h, EdgeKind::Exception { ty: ty.clone() });
             }
             if let Some(fe) = finally_entry {
                 self.b.add_edge(from, fe, EdgeKind::FinallyEntry);
@@ -1099,7 +1358,8 @@ impl Lowering {
                 .label_stack
                 .iter()
                 .rev()
-                .find(|f| f.name == name.name).map_or_else(|| self.fn_target(), |f| f.target),
+                .find(|f| f.name == name.name)
+                .map_or_else(|| self.fn_target(), |f| f.target),
             None => self.fn_target(),
         }
     }
@@ -1155,9 +1415,9 @@ impl Lowering {
                 .iter_mut()
                 .rev()
                 .find(|f| f.name == name.name)
-            {
-                frame.result = Some(reg);
-            }
+        {
+            frame.result = Some(reg);
+        }
     }
 }
 
@@ -1185,17 +1445,18 @@ fn simple_name(callee: &Expr) -> Option<&str> {
 /// CFG should inline them inline so VIA and smart-cast see them
 /// without crossing a lambda boundary.
 fn lambda_calls_in_place(callee: &Expr, args: &[Expr]) -> bool {
-    let Some(last) = args.last() else { return false };
+    let Some(last) = args.last() else {
+        return false;
+    };
     if !matches!(last, Expr::Lambda { .. }) {
         return false;
     }
     match callee {
         // `recv.let/run/apply/also { ... }` — member-form. `with` is
         // top-level but takes a receiver as a positional argument.
-        Expr::Member { name, safe: false, .. } => matches!(
-            name.name.as_str(),
-            "let" | "run" | "apply" | "also"
-        ),
+        Expr::Member {
+            name, safe: false, ..
+        } => matches!(name.name.as_str(), "let" | "run" | "apply" | "also"),
         Expr::Path { segments, .. } if segments.len() == 1 => {
             let name = segments[0].name.as_str();
             // `run { ... }` / `with(x) { ... }` — top-level scope fns.
@@ -1234,21 +1495,33 @@ impl Lowering {
         cur: BlockId,
         span: Span,
     ) {
-        use crate::analyses::contracts::{stdlib_contract, ContractEffect};
-        let Some(name) = simple_name(callee) else { return };
+        use crate::analyses::contracts::{ContractEffect, stdlib_contract};
+        let Some(name) = simple_name(callee) else {
+            return;
+        };
         for effect in stdlib_contract(name) {
             match effect {
                 ContractEffect::AssumeNonNull { arg_idx } => {
                     if let (Some(r), Some(_)) = (arg_regs.get(*arg_idx), args.get(*arg_idx)) {
                         self.b.push(
                             cur,
-                            Node::AssumeNull { reg: *r, eq_null: false, span },
+                            Node::AssumeNull {
+                                reg: *r,
+                                eq_null: false,
+                                span,
+                            },
                         );
                     }
                 }
                 ContractEffect::AssumePredicate { arg_idx } => {
                     if let (Some(r), Some(_)) = (arg_regs.get(*arg_idx), args.get(*arg_idx)) {
-                        self.b.push(cur, Node::Assume { reg: *r, polarity: true });
+                        self.b.push(
+                            cur,
+                            Node::Assume {
+                                reg: *r,
+                                polarity: true,
+                            },
+                        );
                         if let Some(refinement) = self.pending_refinements.get(r).cloned() {
                             self.emit_refinement(cur, &refinement, true);
                         }
@@ -1260,7 +1533,7 @@ impl Lowering {
 }
 
 /// Convenience entry point: lower a function body into a CFG.
-#[must_use] 
+#[must_use]
 pub fn lower_function(body: &Block, source: Span) -> Lowered {
     Lowering::new().lower_function(body, source)
 }

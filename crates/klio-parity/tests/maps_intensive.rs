@@ -43,12 +43,11 @@ fun main() {
     println("$keyFilt|$valFilt")
 }
 "#;
-    assert_klio("map_filter", src,
-        "{c=3, d=4}|{b=2, d=4}\n");
+    assert_klio("map_filter", src, "{c=3, d=4}|{b=2, d=4}\n");
 }
 
 #[test]
-fn map_mapValues_chain() {
+fn map_map_values_chain() {
     let src = r#"
 fun main() {
     val m = mapOf("x" to 1, "y" to 2, "z" to 3)
@@ -60,7 +59,7 @@ fun main() {
 }
 
 #[test]
-fn mutable_map_getOrPut() {
+fn mutable_map_get_or_put() {
     let src = r#"
 fun main() {
     val cache = mutableMapOf<String, Int>()
@@ -108,7 +107,11 @@ fun main() {
     println("$a|$b|$c")
 }
 "#;
-    assert_klio("map_plus_minus", src, "{x=1, y=2}|{x=1, y=2, z=3}|{y=2, z=3}\n");
+    assert_klio(
+        "map_plus_minus",
+        src,
+        "{x=1, y=2}|{x=1, y=2, z=3}|{y=2, z=3}\n",
+    );
 }
 
 #[test]

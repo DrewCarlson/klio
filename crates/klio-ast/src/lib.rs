@@ -73,6 +73,8 @@ pub struct ImportDecl {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// public AST node; boxing variants would churn matching across every crate
+#[allow(clippy::large_enum_variant)]
 pub enum Decl {
     Function(Function),
     Property(Property),
@@ -96,6 +98,8 @@ pub struct TypeAlias {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// public AST node; modifier flags mirror Kotlin source and are read field-wise everywhere
+#[allow(clippy::struct_excessive_bools)]
 pub struct Function {
     pub name: Ident,
     /// Receiver type for an extension function declared as
@@ -197,6 +201,8 @@ pub struct TypeArg {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// public AST node; boxing variants would churn matching across every crate
+#[allow(clippy::large_enum_variant)]
 pub enum FunctionBody {
     Block(Block),
     Expr(Expr),
@@ -221,6 +227,8 @@ pub struct Param {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// public AST node; modifier flags mirror Kotlin source and are read field-wise everywhere
+#[allow(clippy::struct_excessive_bools)]
 pub struct Property {
     pub mutable: bool,
     pub name: Ident,
@@ -306,6 +314,8 @@ pub struct Accessor {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// public AST node; modifier flags mirror Kotlin source and are read field-wise everywhere
+#[allow(clippy::struct_excessive_bools)]
 pub struct Class {
     pub name: Ident,
     /// Generic type parameters: `class Box<out T>`.
@@ -519,6 +529,8 @@ pub struct Block {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// public AST node; boxing variants would churn matching across every crate
+#[allow(clippy::large_enum_variant)]
 pub enum Stmt {
     Expr(Expr),
     Decl(Decl),
@@ -574,14 +586,41 @@ pub enum FloatLitKind {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Expr {
-    IntLit { value: i64, kind: IntLitKind, span: Span },
-    FloatLit { value: f64, kind: FloatLitKind, span: Span },
-    BoolLit { value: bool, span: Span },
-    NullLit { span: Span },
-    CharLit { value: u16, span: Span },
-    StringTemplate { parts: Vec<StringPart>, span: Span },
-    Path { segments: Vec<Ident>, span: Span },
-    Member { receiver: Box<Expr>, name: Ident, safe: bool, span: Span },
+    IntLit {
+        value: i64,
+        kind: IntLitKind,
+        span: Span,
+    },
+    FloatLit {
+        value: f64,
+        kind: FloatLitKind,
+        span: Span,
+    },
+    BoolLit {
+        value: bool,
+        span: Span,
+    },
+    NullLit {
+        span: Span,
+    },
+    CharLit {
+        value: u16,
+        span: Span,
+    },
+    StringTemplate {
+        parts: Vec<StringPart>,
+        span: Span,
+    },
+    Path {
+        segments: Vec<Ident>,
+        span: Span,
+    },
+    Member {
+        receiver: Box<Expr>,
+        name: Ident,
+        safe: bool,
+        span: Span,
+    },
     /// `callee(args)`. `arg_names` is parallel to `args`: a `Some(label)`
     /// entry means the source wrote `label = arg`, a `None` entry is
     /// positional. The interpreter uses these labels to reorder against a
@@ -599,35 +638,100 @@ pub enum Expr {
         is_infix: bool,
         span: Span,
     },
-    Index { receiver: Box<Expr>, args: Vec<Expr>, span: Span },
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
-    Unary { op: UnOp, expr: Box<Expr>, span: Span },
-    Postfix { op: PostfixOp, expr: Box<Expr>, span: Span },
-    If { cond: Box<Expr>, then_branch: Box<Expr>, else_branch: Option<Box<Expr>>, span: Span },
-    While { cond: Box<Expr>, body: Box<Expr>, span: Span },
+    Index {
+        receiver: Box<Expr>,
+        args: Vec<Expr>,
+        span: Span,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        span: Span,
+    },
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+        span: Span,
+    },
+    Postfix {
+        op: PostfixOp,
+        expr: Box<Expr>,
+        span: Span,
+    },
+    If {
+        cond: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Option<Box<Expr>>,
+        span: Span,
+    },
+    While {
+        cond: Box<Expr>,
+        body: Box<Expr>,
+        span: Span,
+    },
     /// `do body while (cond)` — post-tested loop. Body is always evaluated at
     /// least once (§7.2.2). Optional body covers the spec form `do; while(c)`.
-    DoWhile { body: Option<Box<Expr>>, cond: Box<Expr>, span: Span },
+    DoWhile {
+        body: Option<Box<Expr>>,
+        cond: Box<Expr>,
+        span: Span,
+    },
     /// `for (vars in iter) body`. `vars` has length 1 for the normal case
     /// `for (x in xs)`; length 2+ when the source used destructuring like
     /// `for ((k, v) in m)`. The interpreter pulls the matching component
     /// from each iteration element (`Pair`/`Map.Entry`/general `componentN`).
-    For { vars: Vec<Ident>, var_ty: Option<TypeRef>, iter: Box<Expr>, body: Box<Expr>, span: Span },
-    Return { value: Option<Box<Expr>>, label: Option<Ident>, span: Span },
-    Break { label: Option<Ident>, span: Span },
-    Continue { label: Option<Ident>, span: Span },
+    For {
+        vars: Vec<Ident>,
+        var_ty: Option<TypeRef>,
+        iter: Box<Expr>,
+        body: Box<Expr>,
+        span: Span,
+    },
+    Return {
+        value: Option<Box<Expr>>,
+        label: Option<Ident>,
+        span: Span,
+    },
+    Break {
+        label: Option<Ident>,
+        span: Span,
+    },
+    Continue {
+        label: Option<Ident>,
+        span: Span,
+    },
     /// `label@ expr` — binds an explicit label name to `expr`. The label is
     /// the jump target for `return@label` / `break@label` / `continue@label`
     /// within `expr`. Used on loop expressions and lambda / call expressions.
-    Labeled { label: Ident, expr: Box<Expr>, span: Span },
+    Labeled {
+        label: Ident,
+        expr: Box<Expr>,
+        span: Span,
+    },
     Block(Block),
-    Throw { value: Box<Expr>, span: Span },
-    Try { body: Block, catches: Vec<Catch>, finally: Option<Block>, span: Span },
-    Lambda { params: Vec<Ident>, body: Block, span: Span },
+    Throw {
+        value: Box<Expr>,
+        span: Span,
+    },
+    Try {
+        body: Block,
+        catches: Vec<Catch>,
+        finally: Option<Block>,
+        span: Span,
+    },
+    Lambda {
+        params: Vec<Ident>,
+        body: Block,
+        span: Span,
+    },
     /// `this` or `this@Label`. `qualifier` is `Some(name)` for the labeled
     /// form, used inside an inner class to refer to the enclosing
     /// outer-class instance (`this@Outer`).
-    This { qualifier: Option<Ident>, span: Span },
+    This {
+        qualifier: Option<Ident>,
+        span: Span,
+    },
     /// `super` — only meaningful as the receiver of `super.foo` /
     /// `super.foo(...)`. Evaluation resolves the member against the
     /// owning class's parent class. `qualifier` carries the `<Klazz>`
@@ -637,15 +741,26 @@ pub enum Expr {
     /// inside an inner class to dispatch through the outer class's
     /// parent rather than the inner class's. Both are `None` for a
     /// bare `super`.
-    Super { qualifier: Option<TypeRef>, label: Option<Ident>, span: Span },
+    Super {
+        qualifier: Option<TypeRef>,
+        label: Option<Ident>,
+        span: Span,
+    },
     /// `::foo` — callable/property reference to a top-level or in-scope
     /// name. Today the runtime treats it as a lightweight property
     /// metadata value with `.name` and `.get()` — enough for delegates.
-    PropertyRef { name: Ident, span: Span },
+    PropertyRef {
+        name: Ident,
+        span: Span,
+    },
     /// `Receiver::name` — qualified callable / property reference. The
     /// receiver is a class (`Foo::method`, `Foo::class`) or an instance
     /// (`obj::method`). Evaluation depends on the resolved receiver kind.
-    MemberRef { receiver: Box<Expr>, name: Ident, span: Span },
+    MemberRef {
+        receiver: Box<Expr>,
+        name: Ident,
+        span: Span,
+    },
     /// `when` expression. `subject` is `Some` for the subject-bound form
     /// `when (x) { … }` and `None` for the subject-free form
     /// `when { cond -> … }`. Branches are tried in order; the first matching
@@ -659,11 +774,21 @@ pub enum Expr {
         span: Span,
     },
     /// `expr is Type` / `expr !is Type`. `negated` is `true` for `!is`.
-    IsCheck { expr: Box<Expr>, ty: TypeRef, negated: bool, span: Span },
+    IsCheck {
+        expr: Box<Expr>,
+        ty: TypeRef,
+        negated: bool,
+        span: Span,
+    },
     /// `expr as Type` / `expr as? Type`. `safe` is `true` for `as?`, in which
     /// case a failed runtime cast yields `null` instead of throwing
     /// `kotlin.ClassCastException`.
-    As { expr: Box<Expr>, ty: TypeRef, safe: bool, span: Span },
+    As {
+        expr: Box<Expr>,
+        ty: TypeRef,
+        safe: bool,
+        span: Span,
+    },
     /// Anonymous function expression: `fun(x: Int): Int = x + 1` /
     /// `fun T.foo(): T { ... }`. `return` inside the body is a local return
     /// out of this function rather than the enclosing one.
@@ -680,7 +805,10 @@ pub enum Expr {
     /// with positional args. The interpreter flattens it into the vararg
     /// array; the type checker rejects it when the bound parameter is not
     /// `vararg`.
-    Spread { expr: Box<Expr>, span: Span },
+    Spread {
+        expr: Box<Expr>,
+        span: Span,
+    },
     /// Anonymous object expression: `object { ... }`, `object : Foo { ... }`,
     /// `object : Parent(args), Iface { ... }`. Captures the enclosing scope
     /// for method bodies (closure-like). Each occurrence produces a fresh
@@ -747,6 +875,8 @@ pub struct Catch {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// public AST node; boxing variants would churn matching across every crate
+#[allow(clippy::large_enum_variant)]
 pub enum StringPart {
     Text(String),
     ShortInterp(Ident),
@@ -755,15 +885,27 @@ pub enum StringPart {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Rem,
-    Eq, Neq, IdentEq, IdentNeq,
-    Lt, Le, Gt, Ge,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Neq,
+    IdentEq,
+    IdentNeq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     /// `lhs in rhs` — membership. Implemented by `value_in` in the interp.
     In,
     /// `lhs !in rhs`.
     NotIn,
-    And, Or,
-    Range, RangeUntil,
+    And,
+    Or,
+    Range,
+    RangeUntil,
     Elvis,
     Assign,
 }

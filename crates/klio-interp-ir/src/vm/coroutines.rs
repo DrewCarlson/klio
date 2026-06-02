@@ -1,4 +1,7 @@
-use crate::{DriverWakeup, Arc, SLOT_OWNERS, CooperativeInterceptor, coroutine_time_mode, TimeMode, register_slot_owner, unregister_slot};
+use crate::{
+    Arc, CooperativeInterceptor, DriverWakeup, SLOT_OWNERS, TimeMode, coroutine_time_mode,
+    register_slot_owner, unregister_slot,
+};
 
 impl DriverWakeup {
     pub(crate) fn new() -> Arc<Self> {
@@ -20,15 +23,18 @@ impl DriverWakeup {
     }
 
     pub(crate) fn pending(&self) -> usize {
-        self.pending_workers.load(std::sync::atomic::Ordering::Acquire)
+        self.pending_workers
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn worker_started(&self) {
-        self.pending_workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.pending_workers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     pub(crate) fn worker_done(&self) {
-        self.pending_workers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.pending_workers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         self.cv.notify_all();
     }
 
@@ -70,10 +76,10 @@ impl CooperativeInterceptor {
     pub(crate) fn now_millis(&mut self) -> i64 {
         match self.mode {
             TimeMode::Virtual => self.virtual_now,
+            // Elapsed millis as a Kotlin Long clock reading.
+            #[allow(clippy::cast_possible_truncation)]
             TimeMode::Wall => {
-                let start = *self
-                    .started
-                    .get_or_insert_with(std::time::Instant::now);
+                let start = *self.started.get_or_insert_with(std::time::Instant::now);
                 start.elapsed().as_millis() as i64
             }
         }
@@ -161,25 +167,18 @@ impl CooperativeInterceptor {
     /// `startCoroutine` driver to hand a coroutine that parked
     /// awaiting an external `resume` to program-lifetime storage so
     /// it survives the driver's return.
-    pub(crate) fn drain_indefinite_parked(
-        &mut self,
-    ) -> Vec<(i64, klio_ir::eval::SuspendState)> {
-        let slots: Vec<(i64, u64)> = self
-            .slot_to_token
-            .iter()
-            .map(|(s, t)| (*s, *t))
-            .collect();
+    pub(crate) fn drain_indefinite_parked(&mut self) -> Vec<(i64, klio_ir::eval::SuspendState)> {
+        let slots: Vec<(i64, u64)> = self.slot_to_token.iter().map(|(s, t)| (*s, *t)).collect();
         let mut out = Vec::new();
         for (slot, token) in slots {
             let is_indefinite = self
                 .parked
                 .get(&token)
                 .is_some_and(|(_, wake)| *wake == i64::MAX);
-            if is_indefinite
-                && let Some((state, _)) = self.parked.remove(&token) {
-                    self.slot_to_token.remove(&slot);
-                    out.push((slot, state));
-                }
+            if is_indefinite && let Some((state, _)) = self.parked.remove(&token) {
+                self.slot_to_token.remove(&slot);
+                out.push((slot, state));
+            }
         }
         out
     }
@@ -212,7 +211,7 @@ impl CooperativeInterceptor {
     /// suspension point), and the token is queued ready. Indefinite
     /// parks (`wake_at` == `i64::MAX`) such as join/await/channel-receive
     /// are not touched.
-    pub(crate) fn cancel_timed_parks(&mut self, failure: klio_runtime::Value) {
+    pub(crate) fn cancel_timed_parks(&mut self, failure: &klio_runtime::Value) {
         let due: Vec<u64> = self
             .parked
             .iter()
@@ -249,7 +248,10 @@ impl CooperativeInterceptor {
             TimeMode::Wall => {
                 let wait = (t - self.now_millis()).max(0);
                 if wait > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(wait as u64));
+                    // `wait` is guarded positive here.
+                    #[allow(clippy::cast_sign_loss)]
+                    let wait_ms = wait as u64;
+                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
                 }
             }
         }

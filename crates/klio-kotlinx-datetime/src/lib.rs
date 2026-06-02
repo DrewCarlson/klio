@@ -15,7 +15,9 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc,
+};
 use chrono_tz::Tz;
 use klio_runtime::{CallCtx, PrimitiveArrayKind, RuntimeError, Value};
 
@@ -33,16 +35,22 @@ klio_stdlib::host_bindings! {
     }
 }
 
+// Host binding behind a fixed `fn(&mut CallCtx) -> Result<..>` pointer.
+#[allow(clippy::unnecessary_wraps)]
 fn current_time_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let now = Utc::now();
     Ok(Value::Long(now.timestamp_millis()))
 }
 
+// Host binding behind a fixed `fn(&mut CallCtx) -> Result<..>` pointer.
+#[allow(clippy::unnecessary_wraps)]
 fn current_nanos_of_second(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let now = Utc::now();
     Ok(Value::new_int(i64::from(now.timestamp_subsec_nanos())))
 }
 
+// Host binding behind a fixed `fn(&mut CallCtx) -> Result<..>` pointer.
+#[allow(clippy::unnecessary_wraps)]
 fn current_system_tz_id(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let id = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
     Ok(Value::String(Arc::new(id)))
@@ -59,6 +67,8 @@ fn arg_long(ctx: &CallCtx, idx: usize) -> Result<i64, RuntimeError> {
 }
 
 fn arg_i32(ctx: &CallCtx, idx: usize) -> Result<i32, RuntimeError> {
+    // Kotlin Long.toInt() truncates.
+    #[allow(clippy::cast_possible_truncation)]
     Ok(arg_long(ctx, idx)? as i32)
 }
 
@@ -88,11 +98,14 @@ fn make_long_array(values: &[i64]) -> Value {
 
 fn instant_to_local_parts(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let epoch_sec = arg_long(ctx, 0)?;
+    // Kotlin Int nanos reinterpreted as the u32 the chrono API expects.
+    #[allow(clippy::cast_sign_loss)]
     let nanos = arg_i32(ctx, 1)? as u32;
     let tz_id = arg_str(ctx, 2)?;
-    let utc = Utc.timestamp_opt(epoch_sec, nanos).single().ok_or_else(|| {
-        RuntimeError::Type(format!("invalid epoch seconds: {epoch_sec}"))
-    })?;
+    let utc = Utc
+        .timestamp_opt(epoch_sec, nanos)
+        .single()
+        .ok_or_else(|| RuntimeError::Type(format!("invalid epoch seconds: {epoch_sec}")))?;
     let local = match parse_tz(&tz_id) {
         Some(tz) => utc.with_timezone(&tz).naive_local(),
         None => utc.naive_utc(),
@@ -108,6 +121,8 @@ fn instant_to_local_parts(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     ]))
 }
 
+// Kotlin Int date/time components reinterpreted as the u32s chrono expects.
+#[allow(clippy::cast_sign_loss)]
 fn local_to_instant(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let year = arg_i32(ctx, 0)?;
     let month = arg_i32(ctx, 1)? as u32;
@@ -123,30 +138,42 @@ fn local_to_instant(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .ok_or_else(|| RuntimeError::Type("invalid time-of-day".into()))?;
     let naive = NaiveDateTime::new(date, time);
     let utc: DateTime<Utc> = match parse_tz(&tz_id) {
-        Some(tz) => tz.from_local_datetime(&naive).single().ok_or_else(|| {
-            RuntimeError::Type("ambiguous or non-existent local time".into())
-        })?.with_timezone(&Utc),
+        Some(tz) => tz
+            .from_local_datetime(&naive)
+            .single()
+            .ok_or_else(|| RuntimeError::Type("ambiguous or non-existent local time".into()))?
+            .with_timezone(&Utc),
         None => Utc.from_utc_datetime(&naive),
     };
-    Ok(make_long_array(&[utc.timestamp(), i64::from(utc.timestamp_subsec_nanos())]))
+    Ok(make_long_array(&[
+        utc.timestamp(),
+        i64::from(utc.timestamp_subsec_nanos()),
+    ]))
 }
 
 fn instant_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let epoch_sec = arg_long(ctx, 0)?;
+    // Kotlin Int nanos reinterpreted as the u32 the chrono API expects.
+    #[allow(clippy::cast_sign_loss)]
     let nanos = arg_i32(ctx, 1)? as u32;
-    let dt = Utc.timestamp_opt(epoch_sec, nanos).single().ok_or_else(|| {
-        RuntimeError::Type(format!("invalid epoch seconds: {epoch_sec}"))
-    })?;
-    Ok(Value::String(Arc::new(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))))
+    let dt = Utc
+        .timestamp_opt(epoch_sec, nanos)
+        .single()
+        .ok_or_else(|| RuntimeError::Type(format!("invalid epoch seconds: {epoch_sec}")))?;
+    Ok(Value::String(Arc::new(
+        dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+    )))
 }
 
 fn parse_instant(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let input = arg_str(ctx, 0)?;
-    let dt = DateTime::<FixedOffset>::parse_from_rfc3339(&input).map_err(|e| {
-        RuntimeError::Type(format!("failed to parse Instant `{input}`: {e}"))
-    })?;
+    let dt = DateTime::<FixedOffset>::parse_from_rfc3339(&input)
+        .map_err(|e| RuntimeError::Type(format!("failed to parse Instant `{input}`: {e}")))?;
     let utc = dt.with_timezone(&Utc);
-    Ok(make_long_array(&[utc.timestamp(), i64::from(utc.timestamp_subsec_nanos())]))
+    Ok(make_long_array(&[
+        utc.timestamp(),
+        i64::from(utc.timestamp_subsec_nanos()),
+    ]))
 }
 
 fn validate_time_zone(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -158,6 +185,9 @@ fn validate_time_zone(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 ///
 /// Arguments: epochSeconds, nanos, years, months, days, hours,
 /// minutes, seconds, nanoAdjust, tzId. Returns `[epochSeconds, nanos]`.
+// Kotlin Int nanos reinterpreted as u32; the month count is pre-clamped
+// to u32::MAX before narrowing.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn add_period(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     use chrono::Months;
     let epoch_sec = arg_long(ctx, 0)?;
@@ -170,9 +200,10 @@ fn add_period(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let seconds = arg_i32(ctx, 7)?;
     let nano_adjust = arg_long(ctx, 8)?;
     let tz_id = arg_str(ctx, 9)?;
-    let utc = Utc.timestamp_opt(epoch_sec, nanos).single().ok_or_else(|| {
-        RuntimeError::Type(format!("invalid epoch seconds: {epoch_sec}"))
-    })?;
+    let utc = Utc
+        .timestamp_opt(epoch_sec, nanos)
+        .single()
+        .ok_or_else(|| RuntimeError::Type(format!("invalid epoch seconds: {epoch_sec}")))?;
     let total_months = i64::from(years) * 12 + i64::from(months);
     let local: chrono::DateTime<chrono::FixedOffset> = match parse_tz(&tz_id) {
         Some(tz) => utc.with_timezone(&tz).fixed_offset(),

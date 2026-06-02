@@ -62,8 +62,11 @@ fun main() {
     println(r.joinToString(","))
 }
 "#;
-    assert_klio("char_isX", src,
-        "true/false,false/true,false/false,true/false,false/true,false/false\n");
+    assert_klio(
+        "char_isX",
+        src,
+        "true/false,false/true,false/false,true/false,false/true,false/false\n",
+    );
 }
 
 #[test]
@@ -106,7 +109,7 @@ fun main() {
 }
 
 #[test]
-fn string_codePoints_via_chars() {
+fn string_code_points_via_chars() {
     let src = r#"
 fun main() {
     val s = "ABC"

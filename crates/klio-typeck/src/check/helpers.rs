@@ -1,4 +1,7 @@
-use super::{TypeRef, Type, builtin_by_name, convert_type_ref_lossy, Stmt, Expr, Span, Decl, Accessor, FunctionBody, Block, AssignOp, HashMap, ClassInfo, HashSet, FnSig, WhenPatternKind};
+use super::{
+    Accessor, AssignOp, Block, ClassInfo, Decl, Expr, FnSig, FunctionBody, HashMap, HashSet, Span,
+    Stmt, Type, TypeRef, WhenPatternKind, builtin_by_name, convert_type_ref_lossy,
+};
 
 pub(crate) fn type_ref_uses(t: &TypeRef, name: &str) -> bool {
     // `@UnsafeVariance` annotation on the TypeRef itself suppresses the
@@ -16,9 +19,10 @@ pub(crate) fn type_ref_uses(t: &TypeRef, name: &str) -> bool {
     }
     if let Some(f) = &t.function {
         if let Some(r) = &f.receiver
-            && type_ref_uses(r, name) {
-                return true;
-            }
+            && type_ref_uses(r, name)
+        {
+            return true;
+        }
         for p in &f.params {
             if type_ref_uses(p, name) {
                 return true;
@@ -40,19 +44,13 @@ pub(crate) fn has_unsafe_variance(anns: &[klio_ast::Annotation]) -> bool {
 }
 
 pub(crate) fn annotations_include(anns: &[klio_ast::Annotation], simple_name: &str) -> bool {
-    anns.iter().any(|a| {
-        a.path
-            .last()
-            .is_some_and(|seg| seg.name == simple_name)
-    })
+    anns.iter()
+        .any(|a| a.path.last().is_some_and(|seg| seg.name == simple_name))
 }
 
 pub(crate) fn has_published_api(anns: &[klio_ast::Annotation]) -> bool {
-    anns.iter().any(|a| {
-        a.path
-            .last()
-            .is_some_and(|seg| seg.name == "PublishedApi")
-    })
+    anns.iter()
+        .any(|a| a.path.last().is_some_and(|seg| seg.name == "PublishedApi"))
 }
 
 /// Returns the user-class name a `TypeRef` refers to, ignoring nullability.
@@ -94,15 +92,23 @@ pub(crate) fn expected_changed(before: &Type, after: &Type) -> bool {
     before != after
 }
 
-pub(crate) fn substitute_type_params(t: &Type, subst: &std::collections::HashMap<String, Type>) -> Type {
+pub(crate) fn substitute_type_params(
+    t: &Type,
+    subst: &std::collections::HashMap<String, Type>,
+) -> Type {
     use klio_types::GenericArg;
     match t {
         Type::TypeParam(n) => subst.get(n).cloned().unwrap_or_else(|| t.clone()),
-        Type::Nullable(inner) => {
-            substitute_type_params(inner, subst).as_nullable()
-        }
-        Type::Function { params, return_type, is_suspend } => Type::Function {
-            params: params.iter().map(|p| substitute_type_params(p, subst)).collect(),
+        Type::Nullable(inner) => substitute_type_params(inner, subst).as_nullable(),
+        Type::Function {
+            params,
+            return_type,
+            is_suspend,
+        } => Type::Function {
+            params: params
+                .iter()
+                .map(|p| substitute_type_params(p, subst))
+                .collect(),
             return_type: Box::new(substitute_type_params(return_type, subst)),
             is_suspend: *is_suspend,
         },
@@ -131,14 +137,21 @@ pub(crate) fn substitute_type_params(t: &Type, subst: &std::collections::HashMap
 /// can identify them. Outside of `tparams`, falls back to
 /// `convert_type_ref_lossy`. Nested generic arguments and function
 /// receiver / params / return are walked recursively.
-pub(crate) fn convert_type_ref_with_tparams(t: &TypeRef, tparams: &std::collections::HashSet<String>) -> Type {
+pub(crate) fn convert_type_ref_with_tparams(
+    t: &TypeRef,
+    tparams: &std::collections::HashSet<String>,
+) -> Type {
     use klio_types::GenericArg;
     if t.name.name == "*" {
         return Type::Any;
     }
     if tparams.contains(t.name.name.as_str()) && t.type_args.is_empty() && t.function.is_none() {
         let inner = Type::TypeParam(t.name.name.clone());
-        return if t.nullable { inner.as_nullable() } else { inner };
+        return if t.nullable {
+            inner.as_nullable()
+        } else {
+            inner
+        };
     }
     if let Some(ft) = &t.function {
         let params: Vec<Type> = ft
@@ -163,7 +176,11 @@ pub(crate) fn convert_type_ref_with_tparams(t: &TypeRef, tparams: &std::collecti
             .iter()
             .map(|a| {
                 if a.is_star {
-                    GenericArg { variance: a.variance.into(), is_star: true, ty: Type::Any }
+                    GenericArg {
+                        variance: a.variance.into(),
+                        is_star: true,
+                        ty: Type::Any,
+                    }
                 } else {
                     GenericArg {
                         variance: a.variance.into(),
@@ -173,7 +190,10 @@ pub(crate) fn convert_type_ref_with_tparams(t: &TypeRef, tparams: &std::collecti
                 }
             })
             .collect();
-        let g = Type::Generic { name: t.name.name.clone(), args };
+        let g = Type::Generic {
+            name: t.name.name.clone(),
+            args,
+        };
         return if t.nullable { g.as_nullable() } else { g };
     }
     convert_type_ref_lossy(t)
@@ -200,41 +220,64 @@ pub(crate) fn scan_lambda_stmts_for_return(stmts: &[Stmt]) -> bool {
             scan_lambda_expr_for_return(target) || scan_lambda_expr_for_return(value)
         }
         Stmt::DestructuringDecl { init, .. } => scan_lambda_expr_for_return(init),
-        Stmt::Decl(klio_ast::Decl::Property(p)) => p
-            .init
-            .as_ref()
-            .is_some_and(scan_lambda_expr_for_return),
-        _ => false,
+        Stmt::Decl(klio_ast::Decl::Property(p)) => {
+            p.init.as_ref().is_some_and(scan_lambda_expr_for_return)
+        }
+        Stmt::Decl(_) => false,
     })
 }
 
 pub(crate) fn scan_lambda_expr_for_return(e: &Expr) -> bool {
+    // The nested function-like arm is kept explicit to document that the
+    // walk deliberately stops there, even though it shares `_`'s body.
+    #[allow(clippy::match_same_arms)]
     match e {
         Expr::Return { .. } => true,
         Expr::Lambda { .. } | Expr::AnonFun { .. } | Expr::ObjectExpr { .. } => false,
         Expr::Block(b) => scan_lambda_stmts_for_return(&b.stmts),
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             scan_lambda_expr_for_return(cond)
                 || scan_lambda_expr_for_return(then_branch)
-                || else_branch.as_ref().is_some_and(|e| scan_lambda_expr_for_return(e))
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|e| scan_lambda_expr_for_return(e))
         }
         Expr::While { cond, body, .. } => {
             scan_lambda_expr_for_return(cond) || scan_lambda_expr_for_return(body)
         }
         Expr::DoWhile { body, cond, .. } => {
-            body.as_ref().is_some_and(|b| scan_lambda_expr_for_return(b))
+            body.as_ref()
+                .is_some_and(|b| scan_lambda_expr_for_return(b))
                 || scan_lambda_expr_for_return(cond)
         }
         Expr::For { iter, body, .. } => {
             scan_lambda_expr_for_return(iter) || scan_lambda_expr_for_return(body)
         }
-        Expr::When { subject, branches, .. } => {
-            subject.as_ref().is_some_and(|s| scan_lambda_expr_for_return(s))
-                || branches.iter().any(|br| scan_lambda_expr_for_return(&br.body))
+        Expr::When {
+            subject, branches, ..
+        } => {
+            subject
+                .as_ref()
+                .is_some_and(|s| scan_lambda_expr_for_return(s))
+                || branches
+                    .iter()
+                    .any(|br| scan_lambda_expr_for_return(&br.body))
         }
-        Expr::Try { body, catches, finally, .. } => {
+        Expr::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
             scan_lambda_stmts_for_return(&body.stmts)
-                || catches.iter().any(|c| scan_lambda_stmts_for_return(&c.body.stmts))
+                || catches
+                    .iter()
+                    .any(|c| scan_lambda_stmts_for_return(&c.body.stmts))
                 || finally
                     .as_ref()
                     .is_some_and(|fb| scan_lambda_stmts_for_return(&fb.stmts))
@@ -337,11 +380,11 @@ pub(crate) fn collect_property_reads(
     match e {
         Expr::Path { segments, .. } => {
             if let Some(first) = segments.first()
-                && let Some(&idx) = by_name.get(&first.name) {
-                    out.insert(idx);
-                }
+                && let Some(&idx) = by_name.get(&first.name)
+            {
+                out.insert(idx);
+            }
         }
-        Expr::Member { receiver, .. } => collect_property_reads(receiver, by_name, out),
         Expr::Call { callee, args, .. } => {
             collect_property_reads(callee, by_name, out);
             for a in args {
@@ -358,17 +401,21 @@ pub(crate) fn collect_property_reads(
             collect_property_reads(lhs, by_name, out);
             collect_property_reads(rhs, by_name, out);
         }
-        Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => {
-            collect_property_reads(expr, by_name, out);
-        }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             collect_property_reads(cond, by_name, out);
             collect_property_reads(then_branch, by_name, out);
             if let Some(eb) = else_branch {
                 collect_property_reads(eb, by_name, out);
             }
         }
-        Expr::When { subject, branches, .. } => {
+        Expr::When {
+            subject, branches, ..
+        } => {
             if let Some(s) = subject {
                 collect_property_reads(s, by_name, out);
             }
@@ -386,7 +433,6 @@ pub(crate) fn collect_property_reads(
                 collect_property_reads(&b.body, by_name, out);
             }
         }
-        Expr::Labeled { expr, .. } => collect_property_reads(expr, by_name, out),
         Expr::Block(b) => {
             for s in &b.stmts {
                 if let Stmt::Expr(e) = s {
@@ -407,12 +453,19 @@ pub(crate) fn collect_property_reads(
                 }
             }
         }
-        Expr::Return { value: Some(v), .. } | Expr::Throw { value: v, .. } => {
-            collect_property_reads(v, by_name, out);
+        Expr::Member {
+            receiver: inner, ..
         }
-        Expr::IsCheck { expr, .. } | Expr::As { expr, .. } | Expr::Spread { expr, .. } => {
-            collect_property_reads(expr, by_name, out);
+        | Expr::Unary { expr: inner, .. }
+        | Expr::Postfix { expr: inner, .. }
+        | Expr::Labeled { expr: inner, .. }
+        | Expr::Return {
+            value: Some(inner), ..
         }
+        | Expr::Throw { value: inner, .. }
+        | Expr::IsCheck { expr: inner, .. }
+        | Expr::As { expr: inner, .. }
+        | Expr::Spread { expr: inner, .. } => collect_property_reads(inner, by_name, out),
         _ => {}
     }
 }
@@ -470,8 +523,7 @@ pub(crate) fn type_has_compound_assign(ty: &Type, op: AssignOp) -> bool {
 
 pub(crate) fn is_labelable_target(e: &Expr) -> bool {
     match e {
-        Expr::Lambda { .. } => true,
-        Expr::For { .. } | Expr::While { .. } | Expr::DoWhile { .. } => true,
+        Expr::Lambda { .. } | Expr::For { .. } | Expr::While { .. } | Expr::DoWhile { .. } => true,
         Expr::Call { args, .. } => matches!(args.last(), Some(Expr::Lambda { .. })),
         _ => false,
     }
@@ -479,38 +531,44 @@ pub(crate) fn is_labelable_target(e: &Expr) -> bool {
 
 pub(crate) fn expr_uses_field(e: &Expr) -> bool {
     match e {
-        Expr::Path { segments, .. } => {
-            segments.len() == 1 && segments[0].name == "field"
-        }
+        Expr::Path { segments, .. } => segments.len() == 1 && segments[0].name == "field",
         Expr::Block(b) => block_uses_field(b),
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             expr_uses_field(cond)
                 || expr_uses_field(then_branch)
                 || else_branch.as_ref().is_some_and(|e| expr_uses_field(e))
         }
-        Expr::When { subject, branches, .. } => {
+        Expr::When {
+            subject, branches, ..
+        } => {
             subject.as_ref().is_some_and(|s| expr_uses_field(s))
                 || branches.iter().any(|b| expr_uses_field(&b.body))
         }
         Expr::Call { callee, args, .. } => {
             expr_uses_field(callee) || args.iter().any(expr_uses_field)
         }
-        Expr::Member { receiver, .. } => expr_uses_field(receiver),
         Expr::Index { receiver, args, .. } => {
             expr_uses_field(receiver) || args.iter().any(expr_uses_field)
         }
         Expr::Binary { lhs, rhs, .. } => expr_uses_field(lhs) || expr_uses_field(rhs),
-        Expr::Unary { expr, .. } => expr_uses_field(expr),
-        Expr::Postfix { expr, .. } => expr_uses_field(expr),
         Expr::Return { value, .. } => value.as_ref().is_some_and(|e| expr_uses_field(e)),
-        Expr::As { expr, .. } => expr_uses_field(expr),
-        Expr::IsCheck { expr, .. } => expr_uses_field(expr),
-        Expr::Spread { expr, .. } => expr_uses_field(expr),
-        Expr::Labeled { expr, .. } => expr_uses_field(expr),
+        Expr::Member {
+            receiver: inner, ..
+        }
+        | Expr::Unary { expr: inner, .. }
+        | Expr::Postfix { expr: inner, .. }
+        | Expr::As { expr: inner, .. }
+        | Expr::IsCheck { expr: inner, .. }
+        | Expr::Spread { expr: inner, .. }
+        | Expr::Labeled { expr: inner, .. } => expr_uses_field(inner),
         _ => false,
     }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhaseFScope {
@@ -531,7 +589,12 @@ pub(crate) fn type_display(t: &Type) -> String {
 pub(crate) fn dot_path_key(e: &Expr) -> Option<String> {
     match e {
         Expr::Path { segments, .. } if segments.len() == 1 => Some(segments[0].name.clone()),
-        Expr::Member { receiver, name, safe, .. } if !*safe => {
+        Expr::Member {
+            receiver,
+            name,
+            safe,
+            ..
+        } if !*safe => {
             let lhs = dot_path_key(receiver)?;
             Some(format!("{lhs}.{}", name.name))
         }
@@ -541,9 +604,10 @@ pub(crate) fn dot_path_key(e: &Expr) -> Option<String> {
 
 pub(crate) fn single_path_name(e: &Expr) -> Option<String> {
     if let Expr::Path { segments, .. } = e
-        && segments.len() == 1 {
-            return Some(segments[0].name.clone());
-        }
+        && segments.len() == 1
+    {
+        return Some(segments[0].name.clone());
+    }
     None
 }
 
@@ -652,7 +716,11 @@ pub(crate) fn numeric_lub(a: &Type, b: &Type) -> Type {
     match (numeric_rank(a), numeric_rank(b)) {
         (Some(ra), Some(rb)) => {
             let max_rank = ra.max(rb);
-            let winner = if ra >= rb { a.non_null().clone() } else { b.non_null().clone() };
+            let winner = if ra >= rb {
+                a.non_null().clone()
+            } else {
+                b.non_null().clone()
+            };
             // Byte/Short arithmetic promotes to Int (Kotlin spec).
             if max_rank <= 3 && matches!(winner, Type::Byte | Type::Short) {
                 Type::Int
@@ -728,6 +796,8 @@ pub(crate) fn describe_params(params: &[Type]) -> String {
 /// to 0 — they're handled by ordinary subtyping in the MSC test, never by
 /// the widening rule.
 pub(crate) fn int_widen_rank(t: &Type) -> u32 {
+    // `Int` keeps an explicit rank distinct from the non-integer default.
+    #[allow(clippy::match_same_arms)]
     match t {
         Type::Int => 0,
         Type::Short => 1,
@@ -752,6 +822,8 @@ pub(crate) fn is_builtin_numeric(t: &Type) -> bool {
 /// specificity case; integer-vs-integer keeps `int_widen_rank`'s
 /// literal-widening preference untouched.
 pub(crate) fn num_tower_rank(t: &Type) -> u32 {
+    // `Byte` keeps an explicit rank distinct from the non-numeric default.
+    #[allow(clippy::match_same_arms)]
     match t {
         Type::Byte => 0,
         Type::Short => 1,
@@ -771,14 +843,20 @@ pub(crate) fn class_is_subtype_of(
     sub: &str,
     sup: &str,
 ) -> bool {
-    if sub == sup { return true; }
+    if sub == sup {
+        return true;
+    }
     let mut stack: Vec<String> = vec![sub.to_string()];
     let mut seen: HashSet<String> = HashSet::new();
     while let Some(n) = stack.pop() {
-        if !seen.insert(n.clone()) { continue; }
+        if !seen.insert(n.clone()) {
+            continue;
+        }
         if let Some(info) = classes.get(&n) {
             for s in &info.supertypes {
-                if s == sup { return true; }
+                if s == sup {
+                    return true;
+                }
                 stack.push(s.clone());
             }
         }
@@ -830,10 +908,10 @@ pub(crate) fn at_least_as_applicable(
             if let (Some(xn), Some(yn)) = (
                 f1.param_class_names.get(k).and_then(|n| n.as_deref()),
                 f2.param_class_names.get(k).and_then(|n| n.as_deref()),
-            )
-                && !class_is_subtype_of(classes, xn, yn) {
-                    return false;
-                }
+            ) && !class_is_subtype_of(classes, xn, yn)
+            {
+                return false;
+            }
         } else if !x.is_subtype_of(y) {
             return false;
         }
@@ -860,9 +938,10 @@ pub(crate) fn pick_msc<'a>(
     // other candidate. Spec §11.4.2 case 1 picks a unique frontier member.
     let mut frontier: Vec<&FnSig> = Vec::new();
     for (i, f1) in fitting.iter().enumerate() {
-        let dominates_all = fitting.iter().enumerate().all(|(j, f2)| {
-            i == j || at_least_as_applicable(f1, f2, arg_count, classes)
-        });
+        let dominates_all = fitting
+            .iter()
+            .enumerate()
+            .all(|(j, f2)| i == j || at_least_as_applicable(f1, f2, arg_count, classes));
         if dominates_all {
             frontier.push(*f1);
         }
@@ -949,8 +1028,13 @@ pub(crate) fn tailrec_walk_expr(
     fn_name: &str,
     sites: &mut std::collections::HashSet<Span>,
 ) {
+    // The function-like arm is kept explicit to document where the walk
+    // stops, even though it shares the catch-all's empty body.
+    #[allow(clippy::match_same_arms)]
     match e {
-        Expr::Call { callee, args, span, .. } => {
+        Expr::Call {
+            callee, args, span, ..
+        } => {
             if tail && tailrec_is_self_call(callee, fn_name) {
                 sites.insert(*span);
             }
@@ -959,14 +1043,21 @@ pub(crate) fn tailrec_walk_expr(
                 tailrec_walk_expr(a, false, fn_name, sites);
             }
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             tailrec_walk_expr(cond, false, fn_name, sites);
             tailrec_walk_expr(then_branch, tail, fn_name, sites);
             if let Some(eb) = else_branch {
                 tailrec_walk_expr(eb, tail, fn_name, sites);
             }
         }
-        Expr::When { subject, branches, .. } => {
+        Expr::When {
+            subject, branches, ..
+        } => {
             if let Some(s) = subject {
                 tailrec_walk_expr(s, false, fn_name, sites);
             }
@@ -995,7 +1086,12 @@ pub(crate) fn tailrec_walk_expr(
             }
         }
         Expr::Labeled { expr, .. } => tailrec_walk_expr(expr, tail, fn_name, sites),
-        Expr::Try { body, catches, finally, .. } => {
+        Expr::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
             tailrec_walk_block(body, false, fn_name, sites);
             for c in catches {
                 tailrec_walk_block(&c.body, false, fn_name, sites);
@@ -1022,21 +1118,22 @@ pub(crate) fn tailrec_walk_expr(
             tailrec_walk_expr(lhs, false, fn_name, sites);
             tailrec_walk_expr(rhs, false, fn_name, sites);
         }
-        Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => {
-            tailrec_walk_expr(expr, false, fn_name, sites);
-        }
-        Expr::Member { receiver, .. } => tailrec_walk_expr(receiver, false, fn_name, sites),
         Expr::Index { receiver, args, .. } => {
             tailrec_walk_expr(receiver, false, fn_name, sites);
             for a in args {
                 tailrec_walk_expr(a, false, fn_name, sites);
             }
         }
-        Expr::Throw { value, .. } => tailrec_walk_expr(value, false, fn_name, sites),
-        Expr::IsCheck { expr, .. } | Expr::As { expr, .. } => {
-            tailrec_walk_expr(expr, false, fn_name, sites);
+        Expr::Unary { expr: inner, .. }
+        | Expr::Postfix { expr: inner, .. }
+        | Expr::Member {
+            receiver: inner, ..
         }
-        Expr::Spread { expr, .. } => tailrec_walk_expr(expr, false, fn_name, sites),
+        | Expr::Throw { value: inner, .. }
+        | Expr::IsCheck { expr: inner, .. }
+        | Expr::As { expr: inner, .. }
+        | Expr::Spread { expr: inner, .. } => tailrec_walk_expr(inner, false, fn_name, sites),
+        // Nested function-like exprs deliberately stop the walk.
         Expr::Lambda { .. } | Expr::AnonFun { .. } | Expr::ObjectExpr { .. } => {}
         _ => {}
     }
@@ -1059,8 +1156,13 @@ pub(crate) fn tailrec_collect_all_block(b: &Block, fn_name: &str, out: &mut Vec<
 }
 
 pub(crate) fn tailrec_collect_all_expr(e: &Expr, fn_name: &str, out: &mut Vec<Span>) {
+    // The function-like arm is kept explicit to document where the walk
+    // stops, even though it shares the catch-all's empty body.
+    #[allow(clippy::match_same_arms)]
     match e {
-        Expr::Call { callee, args, span, .. } => {
+        Expr::Call {
+            callee, args, span, ..
+        } => {
             if tailrec_is_self_call(callee, fn_name) {
                 out.push(*span);
             }
@@ -1069,14 +1171,21 @@ pub(crate) fn tailrec_collect_all_expr(e: &Expr, fn_name: &str, out: &mut Vec<Sp
                 tailrec_collect_all_expr(a, fn_name, out);
             }
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             tailrec_collect_all_expr(cond, fn_name, out);
             tailrec_collect_all_expr(then_branch, fn_name, out);
             if let Some(eb) = else_branch {
                 tailrec_collect_all_expr(eb, fn_name, out);
             }
         }
-        Expr::When { subject, branches, .. } => {
+        Expr::When {
+            subject, branches, ..
+        } => {
             if let Some(s) = subject {
                 tailrec_collect_all_expr(s, fn_name, out);
             }
@@ -1095,13 +1204,15 @@ pub(crate) fn tailrec_collect_all_expr(e: &Expr, fn_name: &str, out: &mut Vec<Sp
             }
         }
         Expr::Block(b) => tailrec_collect_all_block(b, fn_name, out),
-        Expr::Return { value, .. } => {
-            if let Some(v) = value {
-                tailrec_collect_all_expr(v, fn_name, out);
-            }
+        Expr::Return { value: Some(v), .. } => {
+            tailrec_collect_all_expr(v, fn_name, out);
         }
-        Expr::Labeled { expr, .. } => tailrec_collect_all_expr(expr, fn_name, out),
-        Expr::Try { body, catches, finally, .. } => {
+        Expr::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
             tailrec_collect_all_block(body, fn_name, out);
             for c in catches {
                 tailrec_collect_all_block(&c.body, fn_name, out);
@@ -1128,21 +1239,23 @@ pub(crate) fn tailrec_collect_all_expr(e: &Expr, fn_name: &str, out: &mut Vec<Sp
             tailrec_collect_all_expr(lhs, fn_name, out);
             tailrec_collect_all_expr(rhs, fn_name, out);
         }
-        Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => {
-            tailrec_collect_all_expr(expr, fn_name, out);
-        }
-        Expr::Member { receiver, .. } => tailrec_collect_all_expr(receiver, fn_name, out),
         Expr::Index { receiver, args, .. } => {
             tailrec_collect_all_expr(receiver, fn_name, out);
             for a in args {
                 tailrec_collect_all_expr(a, fn_name, out);
             }
         }
-        Expr::Throw { value, .. } => tailrec_collect_all_expr(value, fn_name, out),
-        Expr::IsCheck { expr, .. } | Expr::As { expr, .. } => {
-            tailrec_collect_all_expr(expr, fn_name, out);
+        Expr::Labeled { expr: inner, .. }
+        | Expr::Unary { expr: inner, .. }
+        | Expr::Postfix { expr: inner, .. }
+        | Expr::Member {
+            receiver: inner, ..
         }
-        Expr::Spread { expr, .. } => tailrec_collect_all_expr(expr, fn_name, out),
+        | Expr::Throw { value: inner, .. }
+        | Expr::IsCheck { expr: inner, .. }
+        | Expr::As { expr: inner, .. }
+        | Expr::Spread { expr: inner, .. } => tailrec_collect_all_expr(inner, fn_name, out),
+        // Nested function-like exprs deliberately stop the walk.
         Expr::Lambda { .. } | Expr::AnonFun { .. } | Expr::ObjectExpr { .. } => {}
         _ => {}
     }

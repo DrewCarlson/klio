@@ -3,15 +3,14 @@
 pub(crate) use std::collections::{HashMap, HashSet};
 
 pub(crate) use klio_ast::{
-    Accessor, AssignOp, BinOp, Block, Class, CtorDelegation, Decl, EnumEntry, Expr,
-    Function, FunctionBody, KotlinFile, ObjectDecl, Param, PostfixOp, Property,
-    SecondaryCtor, Stmt, StringPart, TypeParam, TypeRef, UnOp, Visibility, WhenBranch,
-    WhenPatternKind, WhereBound,
+    Accessor, AssignOp, BinOp, Block, Class, CtorDelegation, Decl, EnumEntry, Expr, Function,
+    FunctionBody, KotlinFile, ObjectDecl, Param, PostfixOp, Property, SecondaryCtor, Stmt,
+    StringPart, TypeParam, TypeRef, UnOp, Visibility, WhenBranch, WhenPatternKind, WhereBound,
 };
 pub(crate) use klio_diagnostics::{Diagnostic, DiagnosticSink};
 pub(crate) use klio_resolver::Resolution;
 pub(crate) use klio_span::Span;
-pub(crate) use klio_types::{builtin_by_name, convert_type_ref_lossy, GenericArg, Type, Variance};
+pub(crate) use klio_types::{GenericArg, Type, Variance, builtin_by_name, convert_type_ref_lossy};
 
 /// Output of the type-checking pass.
 #[derive(Debug)]
@@ -60,12 +59,9 @@ pub fn typecheck(file: &KotlinFile, resolution: &Resolution) -> TypeCheck {
 /// trailing-lambda inline scheme to user contracts so a `val`
 /// assigned inside the lambda is observed as definitely assigned
 /// at the call site.
-fn scan_user_inline_contracts(
-    file: &KotlinFile,
-) -> std::collections::HashMap<String, Vec<String>> {
+fn scan_user_inline_contracts(file: &KotlinFile) -> std::collections::HashMap<String, Vec<String>> {
     use klio_ast::{Decl, Expr, FunctionBody, Stmt};
-    let mut out: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for d in &file.decls {
         let Decl::Function(f) = d else { continue };
         if !f.is_inline {
@@ -76,15 +72,21 @@ fn scan_user_inline_contracts(
             _ => continue,
         };
         let Some(first) = stmts.first() else { continue };
-        let Stmt::Expr(Expr::Call { callee, args, .. }) = first else { continue };
+        let Stmt::Expr(Expr::Call { callee, args, .. }) = first else {
+            continue;
+        };
         if !matches!(callee.as_ref(), Expr::Path { segments, .. } if segments.last().is_some_and(|s| s.name == "contract"))
         {
             continue;
         }
-        let Some(Expr::Lambda { body, .. }) = args.last() else { continue };
+        let Some(Expr::Lambda { body, .. }) = args.last() else {
+            continue;
+        };
         let mut once: Vec<String> = Vec::new();
         for s in &body.stmts {
-            let Stmt::Expr(Expr::Call { callee, args, .. }) = s else { continue };
+            let Stmt::Expr(Expr::Call { callee, args, .. }) = s else {
+                continue;
+            };
             if !matches!(callee.as_ref(), Expr::Path { segments, .. } if segments.last().is_some_and(|s| s.name == "callsInPlace"))
             {
                 continue;
@@ -92,8 +94,16 @@ fn scan_user_inline_contracts(
             if args.len() < 2 {
                 continue;
             }
-            let Expr::Path { segments: target_segs, .. } = &args[0] else { continue };
-            let Some(target_name) = target_segs.last().map(|s| s.name.clone()) else { continue };
+            let Expr::Path {
+                segments: target_segs,
+                ..
+            } = &args[0]
+            else {
+                continue;
+            };
+            let Some(target_name) = target_segs.last().map(|s| s.name.clone()) else {
+                continue;
+            };
             let kind_tail = match &args[1] {
                 Expr::Path { segments, .. } => segments.last().map(|s| s.name.clone()),
                 Expr::Member { name, .. } => Some(name.name.clone()),
@@ -128,7 +138,11 @@ fn merge_module_files(files: &[KotlinFile]) -> KotlinFile {
             package: None,
             imports: Vec::new(),
             decls: Vec::new(),
-            span: klio_span::Span { file: klio_span::FileId(0), start: 0, end: 0 },
+            span: klio_span::Span {
+                file: klio_span::FileId(0),
+                start: 0,
+                end: 0,
+            },
         };
     };
     let mut out = first.clone();
@@ -556,7 +570,6 @@ pub(crate) struct Binding {
     decl_type_name: Option<String>,
 }
 
-
 /// One extension declaration on a given receiver type.
 #[derive(Debug, Clone)]
 struct ExtensionSig {
@@ -627,6 +640,8 @@ pub(crate) struct FnSig {
 }
 
 /// Description of a user-declared class.
+// Fields are independent class modifiers, not mutually exclusive states, so they stay as separate bools.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ClassInfo {
     /// Has any secondary constructor — we then relax primary-ctor arity
@@ -716,6 +731,8 @@ pub(crate) enum MemberSig {
     },
 }
 
+// Fields are independent member modifiers, not mutually exclusive states, so they stay as separate bools.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct MemberFlags {
     is_open: bool,
@@ -879,17 +896,17 @@ struct TypeAliasInfo {
     name_span: Span,
 }
 
+mod annotations;
 mod decl;
-mod phases;
 mod expr;
 mod expr_calls;
-mod visibility;
-mod narrowing;
 mod helpers;
-mod annotations;
+mod narrowing;
+mod phases;
+mod visibility;
 
-pub(crate) use helpers::*;
 pub(crate) use annotations::*;
+pub(crate) use helpers::*;
 
 #[cfg(test)]
 mod tests {
@@ -919,7 +936,11 @@ mod tests {
     #[test]
     fn literal_types() {
         let tc = check_src("fun main() { val x: Int = 1; val y: String = \"hi\" }");
-        assert!(codes(&tc).is_empty(), "diags: {:?}", tc.diagnostics.diagnostics());
+        assert!(
+            codes(&tc).is_empty(),
+            "diags: {:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -960,19 +981,25 @@ mod tests {
 
     #[test]
     fn smart_cast_after_unsafe_as() {
-        let tc = check_src(
-            "fun main() { val a: Any = \"hi\"; val s = a as String; println(a.length) }",
+        let tc =
+            check_src("fun main() { val a: Any = \"hi\"; val s = a as String; println(a.length) }");
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
     fn smart_cast_safe_as_does_not_narrow_subject() {
         // `a as? String` yields String? but does NOT narrow a — a may still be the original Any.
-        let tc = check_src(
-            "fun main() { val a: Any = \"hi\"; val s = a as? String; val x: Any = a }",
+        let tc =
+            check_src("fun main() { val a: Any = \"hi\"; val s = a as? String; val x: Any = a }");
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
@@ -983,7 +1010,11 @@ mod tests {
         let tc = check_src(
             "fun f(a: String?): Int { while (true) { if (a == null) return -1; break }; return a.length }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -991,7 +1022,11 @@ mod tests {
         let tc = check_src(
             "fun f(a: String?): Int { do { if (a == null) return -1 } while (false); return a.length }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1000,19 +1035,29 @@ mod tests {
         // postponed-type-variable inference is not implemented; we just
         // ensure the surface call shape isn't a hard error.
         let tc = check_src("fun main() { val xs = buildList<Int> {} }");
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
         let tc = check_src("fun main() { val m = buildMap<String, Int> {} }");
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
     fn bare_type_argument_inference_is_check() {
         // Spec §14.4: `x is List` / `x is Map` (no <T>) accepted; type
         // arguments are inferred to star projections.
-        let tc = check_src(
-            "fun f(x: Any) { if (x is List) {}; if (x is Map) {} }",
+        let tc = check_src("fun f(x: Any) { if (x is List) {}; if (x is Map) {} }");
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
@@ -1021,7 +1066,11 @@ mod tests {
             "class Box<T>(val v: T); fun f(x: Any) { if (x is Box) {}; val y = x as Box }",
         );
         // The unsafe cast may emit an UNCHECKED_CAST warning, but no errors.
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1030,10 +1079,12 @@ mod tests {
         // a zero-`->` lambda is treated as zero-arity (no phantom `it`),
         // and its body's non-Unit final expression is accepted under the
         // Unit-fallback rule (bullet 2 of step 5).
-        let tc = check_src(
-            "fun foreach(action: () -> Unit) {}; fun main() { foreach { 1 + 2 } }",
+        let tc = check_src("fun foreach(action: () -> Unit) {}; fun main() { foreach { 1 + 2 } }");
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
@@ -1041,7 +1092,11 @@ mod tests {
         let tc = check_src(
             "fun action(a: (Int) -> Int): Int { return a(1) }; fun main() { action { it + 1 } }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1050,7 +1105,11 @@ mod tests {
         let tc = check_src(
             "fun f(a: Any): Int { val b = a; if (b is String) { return a.length }; return -1 }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1059,7 +1118,11 @@ mod tests {
         let tc = check_src(
             "fun f(a: Any): Int { val b = a; if (a is String) { return b.length }; return -1 }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1067,31 +1130,41 @@ mod tests {
         let tc = check_src(
             "fun f(a: Any): Int { val b = a; val c = b; if (a is String) { return c.length }; return -1 }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
     fn smart_cast_after_not_is_return() {
-        let tc = check_src(
-            "fun f(x: Any): Int { if (x !is String) return -1; return x.length }",
+        let tc = check_src("fun f(x: Any): Int { if (x !is String) return -1; return x.length }");
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
     fn smart_cast_not_is_else_branch() {
-        let tc = check_src(
-            "fun f(x: Any): Int = if (x !is String) -1 else x.length",
+        let tc = check_src("fun f(x: Any): Int = if (x !is String) -1 else x.length");
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
     fn smart_cast_when_subject_is_branch() {
-        let tc = check_src(
-            "fun f(x: Any): Int = when (x) { is String -> x.length; else -> 0 }",
+        let tc = check_src("fun f(x: Any): Int = when (x) { is String -> x.length; else -> 0 }");
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
@@ -1100,7 +1173,11 @@ mod tests {
         let tc = check_src(
             "fun f(): Int = when (val v: Any = \"hi\") { is String -> v.length; else -> 0 }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1108,7 +1185,11 @@ mod tests {
         let tc = check_src(
             "fun main() { val a: Any? = \"hi\"; val b: String = \"bye\"; if (a === b) { val x: String = a; } }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1118,15 +1199,22 @@ mod tests {
         let tc = check_src(
             "fun main() { val a: Any? = \"x\"; val b: String = \"y\"; if (a !== b) {} else { val s: String = a } }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
     fn smart_cast_after_elvis_return() {
-        let tc = check_src(
-            "fun greet(name: String?) { val n = name ?: return; println(name.length) }",
+        let tc =
+            check_src("fun greet(name: String?) { val n = name ?: return; println(name.length) }");
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
@@ -1134,7 +1222,11 @@ mod tests {
         let tc = check_src(
             "fun greet(name: String?) { name ?: throw RuntimeException(\"x\"); println(name.length) }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1142,7 +1234,11 @@ mod tests {
         let tc = check_src(
             "fun greet(name: String?) { if (name == null) return; println(name.length) }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1151,15 +1247,22 @@ mod tests {
         let tc = check_src(
             "fun greet(name: String?) { if (name != null) {} else return; println(name.length) }",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
     fn smart_cast_after_null_check() {
-        let tc = check_src(
-            "fun main() { val s: String? = null; if (s != null) { println(s.length) } }",
+        let tc =
+            check_src("fun main() { val s: String? = null; if (s != null) { println(s.length) } }");
+        assert!(
+            !codes(&tc).contains(&codes::TYPE_NULL_SAFETY),
+            "{:?}",
+            tc.diagnostics.diagnostics()
         );
-        assert!(!codes(&tc).contains(&codes::TYPE_NULL_SAFETY), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
@@ -1176,17 +1279,14 @@ mod tests {
 
     #[test]
     fn if_lub_string_int_is_any() {
-        let tc = check_src(
-            "fun main() { val x: Any = if (true) \"hi\" else 1 }",
-        );
+        let tc = check_src("fun main() { val x: Any = if (true) \"hi\" else 1 }");
         assert!(codes(&tc).is_empty(), "{:?}", tc.diagnostics.diagnostics());
     }
 
     #[test]
     fn is_check_narrows_in_branch() {
-        let tc = check_src(
-            "fun main() { val a: Any = \"hi\"; if (a is String) { println(a.length) } }",
-        );
+        let tc =
+            check_src("fun main() { val a: Any = \"hi\"; if (a is String) { println(a.length) } }");
         // No null-safety should fire; member-access on String is Unresolved
         // (we don't model String members) but that's silent.
         assert!(!codes(&tc).contains(&codes::TYPE_NULL_SAFETY));
@@ -1206,7 +1306,11 @@ mod tests {
             fun main() { val b = Box(3); println(b.x) }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1224,7 +1328,11 @@ mod tests {
     fn lambda_param_types_from_expected() {
         // Without a known expected type the body uses Unresolved.
         let tc = check_src("fun main() { val f: (Int) -> Int = { x -> x + 1 }; println(f(2)) }");
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1422,7 +1530,11 @@ mod tests {
             }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1437,7 +1549,11 @@ mod tests {
             }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1454,7 +1570,11 @@ mod tests {
             }
             "#,
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1474,7 +1594,11 @@ mod tests {
             }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1489,7 +1613,11 @@ mod tests {
             }
             "#,
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1506,7 +1634,11 @@ mod tests {
             }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1524,7 +1656,11 @@ mod tests {
             }
             "#,
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1549,7 +1685,11 @@ mod tests {
             fun main() { val r: Int = f<Int>(1) }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1566,7 +1706,11 @@ mod tests {
             fun main() { val r: String = f(Dog()) }
             "#,
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1580,7 +1724,11 @@ mod tests {
             fun main() { val _r: Int = f(1) }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1605,8 +1753,11 @@ mod tests {
             fun f(x: String): String = x
             ",
         );
-        assert!(!codes(&tc).contains(&codes::TYPE_CONFLICTING_OVERLOADS),
-            "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !codes(&tc).contains(&codes::TYPE_CONFLICTING_OVERLOADS),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1637,7 +1788,11 @@ mod tests {
             ",
         );
         let cs = codes(&tc);
-        assert!(!cs.contains(&codes::TYPE_AMBIGUOUS_SUPER), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !cs.contains(&codes::TYPE_AMBIGUOUS_SUPER),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1656,7 +1811,11 @@ mod tests {
             }
             "#,
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1687,8 +1846,11 @@ mod tests {
             ",
         );
         let _ = tc;
-        assert!(codes(&tc2).contains(&codes::TYPE_OVERLOAD_RESOLUTION_AMBIGUITY),
-            "{:?}", tc2.diagnostics.diagnostics());
+        assert!(
+            codes(&tc2).contains(&codes::TYPE_OVERLOAD_RESOLUTION_AMBIGUITY),
+            "{:?}",
+            tc2.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1720,7 +1882,11 @@ mod tests {
             fun main() { val _r: Int = f(1) }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1758,7 +1924,11 @@ mod tests {
             }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1776,7 +1946,11 @@ mod tests {
             }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1911,7 +2085,11 @@ mod tests {
             fun main() { println(Foo(true).x) }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1926,7 +2104,11 @@ mod tests {
             }
             "#,
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1942,7 +2124,11 @@ mod tests {
             }
             "#,
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1956,7 +2142,11 @@ mod tests {
             }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1971,7 +2161,11 @@ mod tests {
             }
             ",
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -1985,7 +2179,11 @@ mod tests {
             fun main() { println(f("hi")) }
             "#,
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -2003,7 +2201,11 @@ mod tests {
             }
             "#,
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -2022,8 +2224,14 @@ mod tests {
         ";
         let tc = check_src(src);
         let cs = codes(&tc);
-        let opt_in_errors = cs.iter().filter(|c| **c == codes::TYPE_OPT_IN_REQUIRED).count();
-        assert_eq!(opt_in_errors, 1, "expected one T0112 for `unsafe`, got: {cs:?}");
+        let opt_in_errors = cs
+            .iter()
+            .filter(|c| **c == codes::TYPE_OPT_IN_REQUIRED)
+            .count();
+        assert_eq!(
+            opt_in_errors, 1,
+            "expected one T0112 for `unsafe`, got: {cs:?}"
+        );
     }
 
     #[test]
@@ -2059,7 +2267,11 @@ mod tests {
             }
             "#,
         );
-        assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
+        assert!(
+            !tc.diagnostics.has_errors(),
+            "{:?}",
+            tc.diagnostics.diagnostics()
+        );
     }
 
     #[test]
@@ -2072,7 +2284,10 @@ mod tests {
             ",
         );
         let cs = codes(&tc);
-        assert!(!cs.contains(&codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND), "{cs:?}");
+        assert!(
+            !cs.contains(&codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND),
+            "{cs:?}"
+        );
     }
 
     #[test]

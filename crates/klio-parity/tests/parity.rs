@@ -38,11 +38,7 @@ fn check_paths(label: &'static str, paths: &[PathBuf]) {
 
     let failures = res.failures();
     for f in &failures {
-        let rel = f
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?");
+        let rel = f.path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
         match &f.verdict {
             klio_parity::SweepVerdict::Mismatch(report) => {
                 eprintln!("[{label}] MISMATCH {rel}");
@@ -76,7 +72,11 @@ fn check_paths(label: &'static str, paths: &[PathBuf]) {
 
 fn collect(dir: &Path, what: &str) -> Vec<PathBuf> {
     let paths = klio_parity::collect_kt(dir);
-    assert!(!paths.is_empty(), "no {what} .kt files in {}", dir.display());
+    assert!(
+        !paths.is_empty(),
+        "no {what} .kt files in {}",
+        dir.display()
+    );
     paths
 }
 

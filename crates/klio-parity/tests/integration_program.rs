@@ -89,11 +89,7 @@ fun main() {
     // "10" -> 10
     // "" -> empty
     // "5 / 2" -> bad op:/  (op was '/' when next number 2 came in)
-    assert_klio(
-        "small_eval",
-        src,
-        "Ok(5)|Ok(10)|Err(empty)|Err(bad op:/)\n",
-    );
+    assert_klio("small_eval", src, "Ok(5)|Ok(10)|Err(empty)|Err(bad op:/)\n");
 }
 
 // 2. State machine via sealed + transition function, with sorted

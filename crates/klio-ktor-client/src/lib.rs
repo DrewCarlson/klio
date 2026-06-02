@@ -53,7 +53,10 @@ fn arg_string_array(ctx: &CallCtx, idx: usize) -> Result<Vec<String>, RuntimeErr
 }
 
 fn make_string_array(values: Vec<String>) -> Value {
-    let items: Vec<Value> = values.into_iter().map(|s| Value::String(Arc::new(s))).collect();
+    let items: Vec<Value> = values
+        .into_iter()
+        .map(|s| Value::String(Arc::new(s)))
+        .collect();
     Value::Array {
         items: klio_runtime::ObjRef::new(items),
         prim: None,
@@ -86,8 +89,8 @@ fn perform(method: &str, url: &str, body: &str, headers: &[String]) -> Vec<Strin
             }
         }
     }
-    let mut builder = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_millis(timeout_ms));
+    let mut builder =
+        ureq::AgentBuilder::new().timeout(std::time::Duration::from_millis(timeout_ms));
     if let Some(ms) = connect_timeout_ms {
         builder = builder.timeout_connect(std::time::Duration::from_millis(ms));
     }
@@ -98,7 +101,9 @@ fn perform(method: &str, url: &str, body: &str, headers: &[String]) -> Vec<Strin
         // ureq's "tls" feature wires rustls-platform-verifier by
         // default. Surface the request explicitly so users know it
         // was honored.
-        eprintln!("warning: __klio_cfg_tls_insecure requested; insecure mode is a no-op until a custom rustls verifier is wired");
+        eprintln!(
+            "warning: __klio_cfg_tls_insecure requested; insecure mode is a no-op until a custom rustls verifier is wired"
+        );
     }
     let agent = builder.build();
     let mut req = agent.request(method, url);
@@ -106,11 +111,12 @@ fn perform(method: &str, url: &str, body: &str, headers: &[String]) -> Vec<Strin
     while let (Some(k), Some(v)) = (hi.next(), hi.next()) {
         req = req.set(k, v);
     }
-    let resp_result = if method == "GET" || method == "HEAD" || method == "DELETE" || body.is_empty() {
-        req.call()
-    } else {
-        req.send_string(body)
-    };
+    let resp_result =
+        if method == "GET" || method == "HEAD" || method == "DELETE" || body.is_empty() {
+            req.call()
+        } else {
+            req.send_string(body)
+        };
     match resp_result {
         Ok(resp) => {
             let status = resp.status();
@@ -166,6 +172,8 @@ fn post(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_string_array(perform("POST", &url, &body, &[])))
 }
 
+// Signature is fixed by the `host_bindings!` registration table.
+#[allow(clippy::unnecessary_wraps)]
 fn set_header(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Unit)
 }

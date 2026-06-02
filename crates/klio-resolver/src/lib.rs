@@ -114,9 +114,15 @@ impl Resolution {
 }
 
 const BUILTINS: &[&str] = &[
-    "println", "print",
+    "println",
+    "print",
     // Stdlib scope functions with contracts (§12.2.5).
-    "run", "with", "check", "require", "repeat", "contract",
+    "run",
+    "with",
+    "check",
+    "require",
+    "repeat",
+    "contract",
     // Threads / monitors. `synchronized` is in `kotlin` (implicitly
     // imported); `thread` lives in `kotlin.concurrent` and is reached
     // via `import kotlin.concurrent.thread`, but the use site is a
@@ -124,12 +130,18 @@ const BUILTINS: &[&str] = &[
     // `Thread` is the class whose statics (`Thread.sleep`,
     // `Thread.currentThread`) resolve through the builtins scope as a
     // bare name.
-    "synchronized", "thread", "Thread",
+    "synchronized",
+    "thread",
+    "Thread",
     // Spec §14.5 builder-style inference entry points. Typeck threads the
     // lambda body through `check_builder_call` so member references on the
     // implicit receiver (e.g. `add`, `put`) resolve through the receiver's
     // class table.
-    "buildList", "buildMap", "buildSet", "sequence", "iterator",
+    "buildList",
+    "buildMap",
+    "buildSet",
+    "sequence",
+    "iterator",
 ];
 
 /// Resolve a parsed file. The returned `Resolution` always contains a
@@ -151,7 +163,7 @@ pub fn resolve(file: &KotlinFile) -> Resolution {
 /// only inside its own decls (file-local import scoping per spec
 /// §10.1). Use-spans across files remain distinguishable through the
 /// `klio_span::FileId` carried on each Span.
-#[must_use] 
+#[must_use]
 pub fn resolve_module(files: &[KotlinFile]) -> Resolution {
     let mut r = Resolver::new();
     let builtins = ScopeId(0);
@@ -160,7 +172,11 @@ pub fn resolve_module(files: &[KotlinFile]) -> Resolution {
     // shared module scope so cross-file references resolve.
     for file in files {
         r.file_package = file.package.as_ref().map(|p| {
-            p.path.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(".")
+            p.path
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+                .join(".")
         });
         for decl in &file.decls {
             r.declare_top_level(module_scope, decl);
@@ -170,7 +186,11 @@ pub fn resolve_module(files: &[KotlinFile]) -> Resolution {
     // a fresh child of the module scope, then resolves decl bodies.
     for file in files {
         r.file_package = file.package.as_ref().map(|p| {
-            p.path.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(".")
+            p.path
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+                .join(".")
         });
         let file_scope = r.push_scope(Some(module_scope), ScopeKind::File);
         for imp in &file.imports {
@@ -227,10 +247,13 @@ impl Resolver {
         let builtins = ScopeId(0);
         let file_scope = self.push_scope(Some(builtins), ScopeKind::File);
 
-        self.file_package = file
-            .package
-            .as_ref()
-            .map(|p| p.path.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join("."));
+        self.file_package = file.package.as_ref().map(|p| {
+            p.path
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+                .join(".")
+        });
 
         for imp in &file.imports {
             self.check_import(imp);
@@ -258,8 +281,7 @@ impl Resolver {
             return;
         }
         let own_pkg = self.file_package.clone();
-        let path_owned: Vec<String> =
-            imp.path.iter().map(|seg| seg.name.clone()).collect();
+        let path_owned: Vec<String> = imp.path.iter().map(|seg| seg.name.clone()).collect();
         let path_str = path_owned.join(".");
 
         // Importing from the file's own package is permitted by the spec and
@@ -348,12 +370,21 @@ impl Resolver {
         // prevents spurious UNRESOLVED_REFERENCE on valid code. The
         // qualified `recv.ext()` path resolves independently.
         if let Decl::Property(p) = decl
-            && p.receiver_type.is_some() {
-                return;
-            }
+            && p.receiver_type.is_some()
+        {
+            return;
+        }
         let (name, kind, span) = match decl {
-            Decl::Function(f) => (f.name.name.clone(), SymbolKind::TopLevelFunction, f.name.span),
-            Decl::Property(p) => (p.name.name.clone(), SymbolKind::TopLevelProperty, p.name.span),
+            Decl::Function(f) => (
+                f.name.name.clone(),
+                SymbolKind::TopLevelFunction,
+                f.name.span,
+            ),
+            Decl::Property(p) => (
+                p.name.name.clone(),
+                SymbolKind::TopLevelProperty,
+                p.name.span,
+            ),
             Decl::Class(c) => (c.name.name.clone(), SymbolKind::Class, c.name.span),
             Decl::Object(o) => (o.name.name.clone(), SymbolKind::Class, o.name.span),
             Decl::TypeAlias(a) => (a.name.name.clone(), SymbolKind::TypeAlias, a.name.span),
@@ -378,9 +409,7 @@ impl Resolver {
                     .get(&name)
                     .and_then(|id| self.symbols[id.0 as usize].decl_span);
                 let mut d = Diagnostic::error(
-                    format!(
-                        "Conflicting declarations: duplicate top-level declaration `{name}`"
-                    ),
+                    format!("Conflicting declarations: duplicate top-level declaration `{name}`"),
                     span,
                 )
                 .with_code("R0004")
@@ -457,7 +486,9 @@ impl Resolver {
         match decl {
             Decl::Function(f) => self.resolve_function(scope, f),
             Decl::Property(p) => self.resolve_property(scope, p, is_top_level),
-            Decl::Class(c) => self.resolve_class_body(scope, &c.primary_params, &c.init_blocks, &c.members),
+            Decl::Class(c) => {
+                self.resolve_class_body(scope, &c.primary_params, &c.init_blocks, &c.members)
+            }
             Decl::Object(o) => self.resolve_class_body(scope, &[], &[], &o.members),
             Decl::TypeAlias(_) => {
                 // The aliased type is resolved by the type checker; no
@@ -484,10 +515,16 @@ impl Resolver {
         for p in primary_params {
             let sym = self.add_symbol(
                 p.name.name.clone(),
-                if p.property.is_some() { SymbolKind::LocalProperty } else { SymbolKind::Parameter },
+                if p.property.is_some() {
+                    SymbolKind::LocalProperty
+                } else {
+                    SymbolKind::Parameter
+                },
                 Some(p.name.span),
             );
-            self.scopes[body_scope.0 as usize].bindings.insert(p.name.name.clone(), sym);
+            self.scopes[body_scope.0 as usize]
+                .bindings
+                .insert(p.name.name.clone(), sym);
         }
         for m in members {
             let (name, kind, span) = match m {
@@ -508,7 +545,9 @@ impl Resolver {
                 Decl::TypeAlias(a) => (a.name.name.clone(), SymbolKind::TypeAlias, a.name.span),
             };
             let sym = self.add_symbol(name.clone(), kind, Some(span));
-            self.scopes[body_scope.0 as usize].bindings.insert(name, sym);
+            self.scopes[body_scope.0 as usize]
+                .bindings
+                .insert(name, sym);
         }
         for b in init_blocks {
             self.resolve_block(body_scope, b, /*new_scope=*/ false);
@@ -525,14 +564,22 @@ impl Resolver {
         }
         if let Some(body) = &f.body {
             match body {
-                FunctionBody::Block(b) => self.resolve_block(fn_scope, b, /*new_scope=*/ false),
+                FunctionBody::Block(b) => {
+                    self.resolve_block(fn_scope, b, /*new_scope=*/ false)
+                }
                 FunctionBody::Expr(e) => self.resolve_expr(fn_scope, e),
             }
         }
     }
 
     fn resolve_param(&mut self, scope: ScopeId, p: &Param) {
-        self.declare(scope, p.name.name.clone(), SymbolKind::Parameter, p.name.span, true);
+        self.declare(
+            scope,
+            p.name.name.clone(),
+            SymbolKind::Parameter,
+            p.name.span,
+            true,
+        );
         if let Some(default) = &p.default {
             self.resolve_expr(scope, default);
         }
@@ -540,9 +587,10 @@ impl Resolver {
 
     fn resolve_property(&mut self, scope: ScopeId, p: &Property, _is_top_level: bool) {
         if let Some(ty) = &p.ty
-            && let Some(id) = self.scopes[scope.0 as usize].bindings.get(&p.name.name) {
-                self.symbols[id.0 as usize].nullable = Some(ty.nullable);
-            }
+            && let Some(id) = self.scopes[scope.0 as usize].bindings.get(&p.name.name)
+        {
+            self.symbols[id.0 as usize].nullable = Some(ty.nullable);
+        }
         if let Some(init) = &p.init {
             self.resolve_expr(scope, init);
         }
@@ -651,6 +699,10 @@ impl Resolver {
         }
     }
 
+    // Single dispatch over every Expr variant; arms are kept per-variant for
+    // clarity and several carry explanatory comments, so identical bodies and
+    // the overall length are left as-is rather than merged.
+    #[allow(clippy::too_many_lines, clippy::match_same_arms)]
     fn resolve_expr(&mut self, scope: ScopeId, expr: &Expr) {
         match expr {
             Expr::IntLit { .. }
@@ -676,7 +728,12 @@ impl Resolver {
                     self.resolve_name_use(scope, &first.name, first.span);
                 }
             }
-            Expr::Member { receiver, safe, span, .. } => {
+            Expr::Member {
+                receiver,
+                safe,
+                span,
+                ..
+            } => {
                 if *safe {
                     self.check_unnecessary_safe_call(scope, receiver, *span);
                 }
@@ -701,7 +758,12 @@ impl Resolver {
             Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => {
                 self.resolve_expr(scope, expr);
             }
-            Expr::If { cond, then_branch, else_branch, .. } => {
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 self.resolve_expr(scope, cond);
                 self.resolve_expr(scope, then_branch);
                 if let Some(e) = else_branch {
@@ -718,11 +780,19 @@ impl Resolver {
                 }
                 self.resolve_expr(scope, cond);
             }
-            Expr::For { vars, iter, body, .. } => {
+            Expr::For {
+                vars, iter, body, ..
+            } => {
                 self.resolve_expr(scope, iter);
                 let for_scope = self.push_scope(Some(scope), ScopeKind::Block);
                 for var in vars {
-                    self.declare(for_scope, var.name.clone(), SymbolKind::ForVar, var.span, true);
+                    self.declare(
+                        for_scope,
+                        var.name.clone(),
+                        SymbolKind::ForVar,
+                        var.span,
+                        true,
+                    );
                 }
                 self.resolve_expr(for_scope, body);
             }
@@ -736,11 +806,20 @@ impl Resolver {
             }
             Expr::Block(b) => self.resolve_block(scope, b, /*new_scope=*/ true),
             Expr::Throw { value, .. } => self.resolve_expr(scope, value),
-            Expr::Try { body, catches, finally, .. } => {
+            Expr::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
                 self.resolve_block(scope, body, /*new_scope=*/ true);
                 for c in catches {
                     let catch_scope = self.push_scope(Some(scope), ScopeKind::Block);
-                    let sym = self.add_symbol(c.binding.name.clone(), SymbolKind::LocalProperty, Some(c.binding.span));
+                    let sym = self.add_symbol(
+                        c.binding.name.clone(),
+                        SymbolKind::LocalProperty,
+                        Some(c.binding.span),
+                    );
                     self.scopes[catch_scope.0 as usize]
                         .bindings
                         .insert(c.binding.name.clone(), sym);
@@ -764,7 +843,9 @@ impl Resolver {
                 // No resolver-level diagnostic. The interpreter checks at
                 // evaluation time whether `this` / `super` is bound.
             }
-            Expr::When { subject, branches, .. } => {
+            Expr::When {
+                subject, branches, ..
+            } => {
                 if let Some(s) = subject {
                     self.resolve_expr(scope, s);
                 }
@@ -815,7 +896,12 @@ impl Resolver {
                 self.resolve_expr(scope, receiver);
             }
             Expr::Spread { expr, .. } => self.resolve_expr(scope, expr),
-            Expr::ObjectExpr { supertype_args, supertype_delegates, members, .. } => {
+            Expr::ObjectExpr {
+                supertype_args,
+                supertype_delegates,
+                members,
+                ..
+            } => {
                 for args in supertype_args.iter().flatten() {
                     for a in args {
                         self.resolve_expr(scope, a);
@@ -831,20 +917,18 @@ impl Resolver {
                 let body_scope = self.push_scope(Some(scope), ScopeKind::Block);
                 for m in members {
                     let (name, kind, span) = match m {
-                        Decl::Function(f) => (
-                            f.name.name.clone(),
-                            SymbolKind::LocalFunction,
-                            f.name.span,
-                        ),
-                        Decl::Property(p) => (
-                            p.name.name.clone(),
-                            SymbolKind::LocalProperty,
-                            p.name.span,
-                        ),
+                        Decl::Function(f) => {
+                            (f.name.name.clone(), SymbolKind::LocalFunction, f.name.span)
+                        }
+                        Decl::Property(p) => {
+                            (p.name.name.clone(), SymbolKind::LocalProperty, p.name.span)
+                        }
                         Decl::Class(_) | Decl::Object(_) | Decl::TypeAlias(_) => continue,
                     };
                     let sym = self.add_symbol(name.clone(), kind, Some(span));
-                    self.scopes[body_scope.0 as usize].bindings.insert(name, sym);
+                    self.scopes[body_scope.0 as usize]
+                        .bindings
+                        .insert(name, sym);
                 }
                 for m in members {
                     self.resolve_member_decl(body_scope, m);
@@ -883,8 +967,7 @@ impl Resolver {
                     self.resolve_expr(scope, d);
                 }
             }
-            Decl::Class(_) | Decl::Object(_) => {}
-            Decl::TypeAlias(_) => {}
+            Decl::Class(_) | Decl::Object(_) | Decl::TypeAlias(_) => {}
         }
     }
 
@@ -894,12 +977,16 @@ impl Resolver {
     /// type — to avoid noise until the inference work in the type checker
     /// gives us a more complete picture.
     fn check_unnecessary_safe_call(&mut self, scope: ScopeId, receiver: &Expr, op_span: Span) {
-        let Expr::Path { segments, .. } = receiver else { return };
+        let Expr::Path { segments, .. } = receiver else {
+            return;
+        };
         if segments.len() != 1 {
             return;
         }
         let name = &segments[0].name;
-        let Some(sym_id) = self.lookup(scope, name) else { return };
+        let Some(sym_id) = self.lookup(scope, name) else {
+            return;
+        };
         let nullable = self.symbols[sym_id.0 as usize].nullable;
         if matches!(nullable, Some(false)) {
             self.diagnostics.emit(
@@ -958,6 +1045,8 @@ impl Resolver {
     }
 
     fn push_scope(&mut self, parent: Option<ScopeId>, kind: ScopeKind) -> ScopeId {
+        // Scope ids index a Vec that never approaches u32::MAX in practice.
+        #[allow(clippy::cast_possible_truncation)]
         let id = ScopeId(self.scopes.len() as u32);
         self.scopes.push(Scope {
             id,
@@ -968,14 +1057,17 @@ impl Resolver {
         id
     }
 
-    fn add_symbol(
-        &mut self,
-        name: String,
-        kind: SymbolKind,
-        decl_span: Option<Span>,
-    ) -> SymbolId {
+    fn add_symbol(&mut self, name: String, kind: SymbolKind, decl_span: Option<Span>) -> SymbolId {
+        // Symbol ids index a Vec that never approaches u32::MAX in practice.
+        #[allow(clippy::cast_possible_truncation)]
         let id = SymbolId(self.symbols.len() as u32);
-        self.symbols.push(Symbol { id, name, kind, decl_span, nullable: None });
+        self.symbols.push(Symbol {
+            id,
+            name,
+            kind,
+            decl_span,
+            nullable: None,
+        });
         id
     }
 
@@ -989,7 +1081,8 @@ impl Resolver {
         }
         let leaf = imp
             .alias
-            .as_ref().map_or_else(|| imp.path.last().unwrap().name.clone(), |a| a.name.clone());
+            .as_ref()
+            .map_or_else(|| imp.path.last().unwrap().name.clone(), |a| a.name.clone());
         if self.lookup(scope, &leaf).is_some() {
             return;
         }
@@ -1066,56 +1159,66 @@ mod tests {
 
     #[test]
     fn non_kotlin_import_emits_r0003() {
-        let ast = parse(r"
+        let ast = parse(
+            r"
             import com.example.Thing
             fun main() {}
-        ");
+        ",
+        );
         let r = resolve(&ast);
         assert!(codes(&r).contains(&"R0003"));
     }
 
     #[test]
     fn kotlin_import_is_accepted() {
-        let ast = parse(r"
+        let ast = parse(
+            r"
             import kotlin.math.PI
             fun main() {}
-        ");
+        ",
+        );
         let r = resolve(&ast);
         assert!(!codes(&r).contains(&"R0003"));
     }
 
     #[test]
     fn duplicate_top_level_emits_r0004() {
-        let ast = parse(r"
+        let ast = parse(
+            r"
             fun foo() {}
             fun foo() {}
-        ");
+        ",
+        );
         let r = resolve(&ast);
         assert!(codes(&r).contains(&"R0004"));
     }
 
     #[test]
     fn shadowing_in_inner_scope_emits_r0002() {
-        let ast = parse(r"
+        let ast = parse(
+            r"
             fun main() {
                 val x = 1
                 val x = 2
                 println(x)
             }
-        ");
+        ",
+        );
         let r = resolve(&ast);
         assert!(codes(&r).contains(&"R0002"));
     }
 
     #[test]
     fn for_loop_variable_is_resolvable_in_body() {
-        let ast = parse(r"
+        let ast = parse(
+            r"
             fun main() {
                 for (i in 1..3) {
                     println(i)
                 }
             }
-        ");
+        ",
+        );
         let r = resolve(&ast);
         assert!(!r.diagnostics.has_errors());
         let any_for_var = r
@@ -1127,9 +1230,11 @@ mod tests {
 
     #[test]
     fn function_parameter_resolves_inside_body() {
-        let ast = parse(r"
+        let ast = parse(
+            r"
             fun id(x: Int): Int = x
-        ");
+        ",
+        );
         let r = resolve(&ast);
         assert!(!r.diagnostics.has_errors());
         let saw_param = r
@@ -1141,22 +1246,30 @@ mod tests {
 
     #[test]
     fn mutual_recursion_resolves() {
-        let ast = parse(r"
+        let ast = parse(
+            r"
             fun even(n: Int): Boolean = if (n == 0) true else odd(n - 1)
             fun odd(n: Int): Boolean = if (n == 0) false else even(n - 1)
-        ");
+        ",
+        );
         let r = resolve(&ast);
-        assert!(!r.diagnostics.has_errors(), "{:?}", r.diagnostics.diagnostics());
+        assert!(
+            !r.diagnostics.has_errors(),
+            "{:?}",
+            r.diagnostics.diagnostics()
+        );
     }
 
     #[test]
     fn unnecessary_safe_call_on_non_nullable() {
-        let ast = parse(r#"
+        let ast = parse(
+            r#"
             fun main() {
                 val s: String = "hi"
                 val n = s?.length
             }
-        "#);
+        "#,
+        );
         let r = resolve(&ast);
         let warns: Vec<_> = r
             .diagnostics
@@ -1164,17 +1277,24 @@ mod tests {
             .iter()
             .filter(|d| d.code() == Some("UNNECESSARY_SAFE_CALL"))
             .collect();
-        assert_eq!(warns.len(), 1, "expected one R0005 warning: {:?}", r.diagnostics.diagnostics());
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected one R0005 warning: {:?}",
+            r.diagnostics.diagnostics()
+        );
     }
 
     #[test]
     fn safe_call_on_nullable_is_silent() {
-        let ast = parse(r"
+        let ast = parse(
+            r"
             fun main() {
                 val s: String? = null
                 val n = s?.length
             }
-        ");
+        ",
+        );
         let r = resolve(&ast);
         let warns: Vec<_> = r
             .diagnostics
@@ -1189,13 +1309,15 @@ mod tests {
     fn class_member_sibling_reference_resolves() {
         // Spec §6.1: class body is a declaration scope; sibling members
         // see each other regardless of source order.
-        let ast = parse(r"
+        let ast = parse(
+            r"
             class C {
                 fun a(): Int = b() + 1
                 fun b(): Int = 10
             }
             fun main() { println(C().a()) }
-        ");
+        ",
+        );
         let r = resolve(&ast);
         assert!(
             !r.diagnostics.has_errors(),
@@ -1208,19 +1330,22 @@ mod tests {
     fn forward_reference_to_local_val_in_statement_scope_errors() {
         // Spec §6: statement scopes bind names in source order; forward refs
         // are illegal.
-        let ast = parse(r"
+        let ast = parse(
+            r"
             fun main() {
                 println(x)
                 val x = 1
             }
-        ");
+        ",
+        );
         let r = resolve(&ast);
         assert!(codes(&r).contains(&"R0001"));
     }
 
     #[test]
     fn object_literal_member_forward_reference_resolves() {
-        let ast = parse(r#"
+        let ast = parse(
+            r#"
             interface Greeter { fun hello(): String }
             fun main() {
                 val g = object : Greeter {
@@ -1229,7 +1354,8 @@ mod tests {
                 }
                 println(g.hello())
             }
-        "#);
+        "#,
+        );
         let r = resolve(&ast);
         assert!(
             !r.diagnostics.has_errors(),
@@ -1242,12 +1368,14 @@ mod tests {
     fn safe_call_without_annotation_is_silent() {
         // Without an explicit annotation we don't know the type; refusing to
         // warn keeps the diagnostic noise-free until inference lands.
-        let ast = parse(r#"
+        let ast = parse(
+            r#"
             fun main() {
                 val s = "hi"
                 val n = s?.length
             }
-        "#);
+        "#,
+        );
         let r = resolve(&ast);
         let warns: Vec<_> = r
             .diagnostics

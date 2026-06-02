@@ -27,7 +27,7 @@ mod env;
 pub use env::*;
 
 mod gc_traverse;
-pub(crate) use gc_traverse::{publish_value, publish_env};
+pub(crate) use gc_traverse::{publish_env, publish_value};
 
 /// The whole point of the value-model migration: a `Value` (and the
 /// interpreter state reachable through it) can be sent and shared
@@ -117,7 +117,8 @@ mod tests {
         let entries = Value::List {
             items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
-            enum_class: Some(Arc::new("Color".to_string())), backing: None,
+            enum_class: Some(Arc::new("Color".to_string())),
+            backing: None,
         };
         assert!(entries.is_runtime_type("List"));
         assert!(entries.is_runtime_type("EnumEntries"));
@@ -126,7 +127,8 @@ mod tests {
         let plain = Value::List {
             items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
-            enum_class: None, backing: None,
+            enum_class: None,
+            backing: None,
         };
         assert!(plain.is_runtime_type("List"));
         assert!(!plain.is_runtime_type("EnumEntries"));
@@ -140,7 +142,10 @@ mod tests {
             Value::String(Arc::new("k".into())),
             Value::Cell(cell.clone()),
         )]);
-        let map = Value::Map { entries: map_entries.clone(), mutable: true };
+        let map = Value::Map {
+            entries: map_entries.clone(),
+            mutable: true,
+        };
         let cls = make_class("Holder", false, false, false);
         let inst = ObjRef::new(InstanceData {
             class: cls,
@@ -150,7 +155,12 @@ mod tests {
             native_state: None,
         });
         let items = ObjRef::new(vec![Value::Instance(inst.clone())]);
-        let root = Value::List { items: items.clone(), mutable: false, enum_class: None, backing: None };
+        let root = Value::List {
+            items: items.clone(),
+            mutable: false,
+            enum_class: None,
+            backing: None,
+        };
 
         assert!(!items.is_shared());
         assert!(!inst.is_shared());
@@ -213,7 +223,12 @@ mod tests {
     fn publish_deep_is_idempotent() {
         let cell = ObjRef::new(Value::Int(1));
         let items = ObjRef::new(vec![Value::Cell(cell.clone())]);
-        let root = Value::List { items: items.clone(), mutable: true, enum_class: None, backing: None };
+        let root = Value::List {
+            items: items.clone(),
+            mutable: true,
+            enum_class: None,
+            backing: None,
+        };
 
         root.publish_deep();
         root.publish_deep();
@@ -242,7 +257,8 @@ mod tests {
         let entries = Value::List {
             items: ObjRef::new(vec![Value::Int(1)]),
             mutable: false,
-            enum_class: Some(Arc::new("Color".to_string())), backing: None,
+            enum_class: Some(Arc::new("Color".to_string())),
+            backing: None,
         };
         assert_eq!(entries.type_fqn(), "kotlin.collections.List");
     }
@@ -260,7 +276,12 @@ mod tests {
         let live = ObjRef::new(vec![Value::Int(7)]);
         env.borrow_mut().define(
             "xs",
-            Value::List { items: live.clone(), mutable: true, enum_class: None, backing: None },
+            Value::List {
+                items: live.clone(),
+                mutable: true,
+                enum_class: None,
+                backing: None,
+            },
         );
         gc::register_root_env(&env);
 
@@ -272,7 +293,10 @@ mod tests {
         // retaining handle for it.
         let garbage = ObjRef::new(vec![Value::Int(99)]);
         let garbage_id = garbage.identity();
-        assert!(gc::heap_contains(garbage_id), "newly allocated cell is registered");
+        assert!(
+            gc::heap_contains(garbage_id),
+            "newly allocated cell is registered"
+        );
 
         gc::collect();
 

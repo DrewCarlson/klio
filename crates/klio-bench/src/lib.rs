@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use klio_ast::KotlinFile;
-use klio_interp_ir::{build::build_module, Vm};
+use klio_interp_ir::{Vm, build::build_module};
 
 #[derive(Default)]
 struct CaptureOutput {
@@ -32,12 +32,12 @@ impl klio_runtime::Output for CaptureOutput {
 }
 use klio_lexer::{LexResult, Lexer};
 use klio_parser::Parser as KtParser;
-use klio_resolver::{resolve, Resolution};
+use klio_resolver::{Resolution, resolve};
 use klio_span::{FileId, SourceMap};
-use klio_typeck::{typecheck, TypeCheck};
+use klio_typeck::{TypeCheck, typecheck};
 
-pub mod schema;
 pub mod refrunner;
+pub mod schema;
 
 pub use schema::{BenchRecord, BenchReport, RegressionLevel};
 
@@ -101,7 +101,11 @@ pub struct Lexed<'a> {
 pub fn lex<'a>(map: &mut SourceMap, prog: &'a Program) -> Lexed<'a> {
     let id = map.add(&prog.path, prog.source.clone());
     let result = Lexer::new(id, &prog.source).tokenize();
-    Lexed { id, source: &prog.source, result }
+    Lexed {
+        id,
+        source: &prog.source,
+        result,
+    }
 }
 
 #[must_use]
@@ -136,7 +140,8 @@ pub fn run_full(prog: &Program) -> Result<String, String> {
         return Err("no main function in module".into());
     };
     let (mut vm, _main) = Vm::from_built(built);
-    vm.run(main_id, &mut out).map_err(|e| format!("runtime: {e}"))?;
+    vm.run(main_id, &mut out)
+        .map_err(|e| format!("runtime: {e}"))?;
     Ok(out.lines.join("\n"))
 }
 
@@ -144,6 +149,8 @@ pub fn run_full(prog: &Program) -> Result<String, String> {
 /// and p99 of per-iter samples and the total iter count. Cheap and good
 /// enough for end-to-end workloads where criterion's harness overhead is
 /// noise — for tight inner loops, prefer criterion proper.
+// nanosecond samples are u128 for accumulation; reporting truncates to u64 ns
+#[allow(clippy::cast_possible_truncation)]
 pub fn time_iters<F: FnMut()>(mut f: F, min_total: Duration, min_iters: u32) -> Timing {
     let mut samples: Vec<u128> = Vec::new();
     let start_all = Instant::now();
@@ -159,7 +166,11 @@ pub fn time_iters<F: FnMut()>(mut f: F, min_total: Duration, min_iters: u32) -> 
     let n = samples.len();
     let median = samples[n / 2];
     let p99 = samples[(n * 99 / 100).min(n - 1)];
-    Timing { iters: n as u64, median_ns: median as u64, p99_ns: p99 as u64 }
+    Timing {
+        iters: n as u64,
+        median_ns: median as u64,
+        p99_ns: p99 as u64,
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -212,7 +223,13 @@ pub fn time_pipeline_stages(prog: &Program, budget_per_stage: Duration) -> Stage
         budget_per_stage,
         5,
     );
-    let interp_t = time_iters(|| { let _ = run_full(prog); }, budget_per_stage, 3);
+    let interp_t = time_iters(
+        || {
+            let _ = run_full(prog);
+        },
+        budget_per_stage,
+        3,
+    );
     StageTimings {
         lex: lex_t,
         parse: parse_t,
@@ -235,6 +252,8 @@ pub struct StageTimings {
 /// time. We deliberately do NOT shell out to ps here — dhat (behind the
 /// feature flag) is the authoritative memory channel.
 #[must_use]
+// elapsed nanos is u128; one workload run fits in u64 ns
+#[allow(clippy::cast_possible_truncation)]
 pub fn quick_run_ns<F: FnOnce()>(f: F) -> u64 {
     let t = Instant::now();
     f();

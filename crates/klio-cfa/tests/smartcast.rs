@@ -10,7 +10,12 @@ use klio_lexer::Lexer;
 use klio_span::SourceMap;
 use klio_types::Type;
 
-fn parse_and_lower(src: &str) -> (klio_cfa::Cfg, std::collections::HashMap<klio_cfa::Reg, Place>) {
+fn parse_and_lower(
+    src: &str,
+) -> (
+    klio_cfa::Cfg,
+    std::collections::HashMap<klio_cfa::Reg, Place>,
+) {
     let mut map = SourceMap::new();
     let id = map.add("t.kt", src);
     let owned = map.get(id).source.clone();
@@ -35,6 +40,8 @@ fn parse_and_lower(src: &str) -> (klio_cfa::Cfg, std::collections::HashMap<klio_
     (lowered.cfg, lowered.reg_to_place)
 }
 
+// block index fits in u32 for these CFGs
+#[allow(clippy::cast_possible_truncation)]
 fn any_narrowing_anywhere(
     cfg: &klio_cfa::Cfg,
     r2p: &std::collections::HashMap<klio_cfa::Reg, Place>,
@@ -47,9 +54,10 @@ fn any_narrowing_anywhere(
         let walk = smartcast::states_within_block(cfg, bid, st.clone(), r2p);
         for s in walk {
             if let Some(fact) = s.map.get(place)
-                && f(fact) {
-                    return true;
-                }
+                && f(fact)
+            {
+                return true;
+            }
         }
     }
     false
@@ -102,11 +110,11 @@ fn fact_resets_after_assignment() {
 
 #[test]
 fn join_drops_disagreeing_narrowings() {
+    use klio_cfa::dataflow::Lattice;
     let mut fact_a = SmartCastFact::unknown();
     fact_a.assume_is(Type::String, None);
     let mut fact_b = SmartCastFact::unknown();
     fact_b.assume_is(Type::Int, None);
-    use klio_cfa::dataflow::Lattice;
     fact_a.join(&fact_b);
     // String join Int should drop to None — disagreement.
     assert_eq!(fact_a.narrowed, Some(Type::Any));
@@ -114,6 +122,7 @@ fn join_drops_disagreeing_narrowings() {
 
 #[test]
 fn killdataflow_invalidates_narrowing() {
+    use klio_cfa::dataflow::infer_kill_data_flow;
     let (cfg, r2p) = parse_and_lower(
         "fun foo(x: Any) {
             var y: Any = x
@@ -127,7 +136,6 @@ fn killdataflow_invalidates_narrowing() {
             }
         }",
     );
-    use klio_cfa::dataflow::infer_kill_data_flow;
     let mut cfg = cfg;
     infer_kill_data_flow(&mut cfg);
     let states = smartcast::solve(&cfg, &r2p);
@@ -251,4 +259,3 @@ fn empty_program_has_no_facts() {
     }
     let _ = MapLattice::<Place, SmartCastFact>::default();
 }
-

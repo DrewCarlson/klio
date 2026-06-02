@@ -19,21 +19,35 @@ use std::sync::{Arc, Mutex};
 
 pub use klio_runtime::Output;
 
+/// Runtime-lowered method bodies for anonymous-object / local
+/// classes, keyed by `(class, method)`: the owning module, the body's
+/// `FuncId`, and the captured-name/value pairs to bind on call.
+type AnonMethods = klio_runtime::ObjRef<
+    std::collections::HashMap<
+        (String, String),
+        (
+            Arc<klio_ir::Module>,
+            klio_ir::FuncId,
+            Vec<(String, klio_runtime::Value)>,
+        ),
+    >,
+>;
+
 pub mod build;
 
 mod vm {
-    pub(crate) mod run;
-    pub(crate) mod vmhost;
-    pub(crate) mod host_impl;
-    pub(crate) mod host_globals;
-    pub(crate) mod host_call_value;
-    pub(crate) mod host_fields;
-    pub(crate) mod host_classes;
+    pub(crate) mod coroutines;
     pub(crate) mod host_call_func;
     pub(crate) mod host_call_member;
+    pub(crate) mod host_call_value;
+    pub(crate) mod host_classes;
+    pub(crate) mod host_fields;
+    pub(crate) mod host_globals;
+    pub(crate) mod host_impl;
     pub(crate) mod host_instances;
-    pub(crate) mod coroutines;
     pub(crate) mod intrinsic_host;
+    pub(crate) mod run;
+    pub(crate) mod vmhost;
 }
 
 /// Build-time-immutable program metadata. Produced once by
@@ -47,25 +61,16 @@ pub struct ProgramImage {
     /// initializer on demand when it is read before the in-order
     /// startup pass reaches it.
     top_level_prop_inits: std::collections::HashMap<String, klio_ir::FuncId>,
-    body_prop_inits:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    instance_prop_getters:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    instance_prop_setters:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    parent_ctor_args:
-        std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    body_prop_inits: std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    instance_prop_getters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    instance_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    parent_ctor_args: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     init_blocks: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
-    extension_props:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    extension_prop_setters:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
-    secondary_ctors:
-        std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
-    class_delegates:
-        std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
-    func_defaults:
-        std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
+    extension_props: std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    extension_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    secondary_ctors: std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
+    class_delegates: std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
+    func_defaults: std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     installed_bindings: Arc<klio_stdlib::HostBindings>,
 }
 
@@ -81,11 +86,18 @@ impl SharedClosures {
         Self(Arc::new(Mutex::new(Vec::new())))
     }
     fn get(&self, id: usize) -> Option<ClosureInfo> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id).cloned()
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
     }
     /// Append `info`, returning its stable id.
     fn push(&self, info: ClosureInfo) -> u64 {
-        let mut g = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = g.len() as u64;
         g.push(info);
         id
@@ -119,15 +131,24 @@ impl DispatchGate {
     }
     /// Block until a permit is free, then take it.
     fn acquire(&self) {
-        let mut avail = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut avail = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *avail == 0 {
-            avail = self.cv.wait(avail).unwrap_or_else(std::sync::PoisonError::into_inner);
+            avail = self
+                .cv
+                .wait(avail)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         *avail -= 1;
     }
     /// Return a permit and wake one waiter.
     fn release(&self) {
-        let mut avail = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut avail = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *avail += 1;
         self.cv.notify_one();
     }
@@ -140,8 +161,7 @@ impl DispatchGate {
 fn default_gate() -> &'static DispatchGate {
     static GATE: std::sync::OnceLock<DispatchGate> = std::sync::OnceLock::new();
     GATE.get_or_init(|| {
-        let cap = std::thread::available_parallelism()
-            .map_or(4, std::num::NonZero::get);
+        let cap = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         DispatchGate::new(cap)
     })
 }
@@ -177,10 +197,7 @@ pub struct Vm {
         klio_runtime::ObjRef<std::collections::HashMap<String, klio_runtime::Value>>,
     /// Runtime-lowered method bodies for anonymous-object / local
     /// classes. Shared by handle with spawned threads.
-    anon_methods: klio_runtime::ObjRef<std::collections::HashMap<
-        (String, String),
-        (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
-    >>,
+    anon_methods: AnonMethods,
     /// Closure side-table, shared (mutex) across threads so a thread
     /// body can create lambdas without invalidating existing ids.
     closures: SharedClosures,
@@ -215,10 +232,7 @@ pub struct SendableVmSeed {
     instance_id_counter: Arc<AtomicU64>,
     classes: klio_runtime::ObjRef<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>,
     prog: Arc<ProgramImage>,
-    anon_methods: klio_runtime::ObjRef<std::collections::HashMap<
-        (String, String),
-        (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
-    >>,
+    anon_methods: AnonMethods,
     class_default_outer:
         klio_runtime::ObjRef<std::collections::HashMap<String, klio_runtime::Value>>,
     closures: SharedClosures,
@@ -232,7 +246,7 @@ impl SendableVmSeed {
     /// closure table, id counter, and stdout sink; it gets its own
     /// fresh cooperative scheduler (coroutine state is `thread_local`
     /// already).
-    #[must_use] 
+    #[must_use]
     pub fn materialize(self) -> Vm {
         Vm {
             module: self.module,
@@ -290,12 +304,13 @@ impl From<klio_ir::eval::EvalError> for VmError {
         // fqn + message so the user-facing diagnostic is
         // actionable rather than the trait's generic phrase.
         if let klio_ir::eval::EvalError::Throw(v) = &e
-            && let klio_runtime::Value::Exception { fqn, message, .. } = v {
-                let msg = message
-                    .as_deref()
-                    .map_or("<no message>", std::string::String::as_str);
-                return VmError::Eval(format!("uncaught {fqn}: {msg}"));
-            }
+            && let klio_runtime::Value::Exception { fqn, message, .. } = v
+        {
+            let msg = message
+                .as_deref()
+                .map_or("<no message>", std::string::String::as_str);
+            return VmError::Eval(format!("uncaught {fqn}: {msg}"));
+        }
         VmError::Eval(e.to_string())
     }
 }
@@ -333,8 +348,7 @@ fn member_is_property(
             continue;
         }
         seen.push(c.name.clone());
-        if c
-            .primary_params
+        if c.primary_params
             .iter()
             .any(|p| p.property.is_some() && p.name == name)
         {
@@ -362,12 +376,24 @@ fn member_is_property(
 /// never rejects a legitimately-bound overload, only flags a body
 /// bound to the wrong type-specialized sibling.
 fn primitive_param_accepts(type_name: &str, v: &klio_runtime::Value) -> bool {
-    use klio_runtime::Value::{Int, Long, Short, Byte, UInt, ULong, UShort, UByte, Double, Float, Char, Bool, String};
+    use klio_runtime::Value::{
+        Bool, Byte, Char, Double, Float, Int, Long, Short, String, UByte, UInt, ULong, UShort,
+    };
     let arg_is_primitive = matches!(
         v,
-        Int(_) | Long(_) | Short(_) | Byte(_)
-            | UInt(_) | ULong(_) | UShort(_) | UByte(_)
-            | Double(_) | Float(_) | Char(_) | Bool(_) | String(_)
+        Int(_)
+            | Long(_)
+            | Short(_)
+            | Byte(_)
+            | UInt(_)
+            | ULong(_)
+            | UShort(_)
+            | UByte(_)
+            | Double(_)
+            | Float(_)
+            | Char(_)
+            | Bool(_)
+            | String(_)
     );
     if !arg_is_primitive {
         return true;
@@ -398,10 +424,7 @@ struct VmHost<'a> {
     instance_id_counter: Arc<AtomicU64>,
     classes: klio_runtime::ObjRef<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>,
     prog: Arc<ProgramImage>,
-    anon_methods: klio_runtime::ObjRef<std::collections::HashMap<
-        (String, String),
-        (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
-    >>,
+    anon_methods: AnonMethods,
     class_default_outer:
         klio_runtime::ObjRef<std::collections::HashMap<String, klio_runtime::Value>>,
     closures: SharedClosures,
@@ -435,8 +458,7 @@ fn receiver_compatible_with_param(
     let pn_simple = pn.rsplit('.').next().unwrap_or(pn);
     if matches!(pn_simple, "Any" | "Any?" | "Unit")
         || pn_simple.starts_with("Function")
-        || (pn_simple.len() <= 2
-            && pn_simple.chars().all(|c| c.is_ascii_uppercase()))
+        || (pn_simple.len() <= 2 && pn_simple.chars().all(|c| c.is_ascii_uppercase()))
     {
         return true;
     }
@@ -453,12 +475,32 @@ fn ext_decl_recv_is_user_class(ty_name: &str) -> bool {
     }
     !matches!(
         s,
-        "String" | "StringBuilder" | "CharSequence" | "Appendable"
-            | "Int" | "Long" | "Short" | "Byte" | "Double" | "Float"
-            | "Char" | "Boolean" | "Number" | "Array" | "List"
-            | "MutableList" | "Collection" | "Iterable" | "Map"
-            | "MutableMap" | "Set" | "MutableSet" | "Sequence"
-            | "Comparable" | "Any" | "Unit"
+        "String"
+            | "StringBuilder"
+            | "CharSequence"
+            | "Appendable"
+            | "Int"
+            | "Long"
+            | "Short"
+            | "Byte"
+            | "Double"
+            | "Float"
+            | "Char"
+            | "Boolean"
+            | "Number"
+            | "Array"
+            | "List"
+            | "MutableList"
+            | "Collection"
+            | "Iterable"
+            | "Map"
+            | "MutableMap"
+            | "Set"
+            | "MutableSet"
+            | "Sequence"
+            | "Comparable"
+            | "Any"
+            | "Unit"
     )
 }
 
@@ -518,24 +560,25 @@ fn pack_vararg_args(
     args: Vec<klio_runtime::Value>,
 ) -> Vec<klio_runtime::Value> {
     if let Some(last) = func.params.last()
-        && last.is_vararg {
-            let fixed = func.params.len().saturating_sub(1);
-            if args.len() == func.params.len()
-                && matches!(args.last(), Some(klio_runtime::Value::Array { .. })) {
-                    return args;
-                }
-            let mut out: Vec<klio_runtime::Value> = Vec::with_capacity(func.params.len());
-            for v in args.iter().take(fixed) {
-                out.push(v.clone());
-            }
-            let rest: Vec<klio_runtime::Value> =
-                args.into_iter().skip(fixed).collect();
-            out.push(klio_runtime::Value::Array {
-                items: klio_runtime::ObjRef::new(rest),
-                prim: None,
-            });
-            return out;
+        && last.is_vararg
+    {
+        let fixed = func.params.len().saturating_sub(1);
+        if args.len() == func.params.len()
+            && matches!(args.last(), Some(klio_runtime::Value::Array { .. }))
+        {
+            return args;
         }
+        let mut out: Vec<klio_runtime::Value> = Vec::with_capacity(func.params.len());
+        for v in args.iter().take(fixed) {
+            out.push(v.clone());
+        }
+        let rest: Vec<klio_runtime::Value> = args.into_iter().skip(fixed).collect();
+        out.push(klio_runtime::Value::Array {
+            items: klio_runtime::ObjRef::new(rest),
+            prim: None,
+        });
+        return out;
+    }
     args
 }
 
@@ -582,16 +625,12 @@ fn pad_args_with_defaults<H: klio_ir::eval::Host>(
         }
         let dfid = defaults.and_then(|d| d.get(i).copied().flatten());
         if let Some(dfid) = dfid {
-            let dfunc = module
-                .funcs
-                .get(dfid.0 as usize)
-                .cloned()
-                .ok_or_else(|| {
-                    klio_ir::eval::EvalError::Type(format!(
-                        "default-arg FuncId {} out of range",
-                        dfid.0
-                    ))
-                })?;
+            let dfunc = module.funcs.get(dfid.0 as usize).cloned().ok_or_else(|| {
+                klio_ir::eval::EvalError::Type(format!(
+                    "default-arg FuncId {} out of range",
+                    dfid.0
+                ))
+            })?;
             // A default-arg thunk lowered inside an extension fn
             // body that references the receiver (`toIndex = size` on
             // `IntArray.fill`) records `this` as a capture, not a
@@ -626,11 +665,27 @@ fn pad_args_with_defaults<H: klio_ir::eval::Host>(
 /// previously found no handler and fell through to a recursive fallback that
 /// allocated without bound (OOM). Instances are handled by their own
 /// identity/override path and are not routed here.
+// Kotlin hashCode() reinterprets/folds bit patterns (UInt as Int, the
+// Long fold, Double bits) so truncation/wrap/sign-loss are required.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn kotlin_hash_code(v: &klio_runtime::Value) -> i32 {
-    use klio_runtime::Value::{Null, Bool, Char, Byte, Short, Int, UByte, UShort, UInt, Long, ULong, Float, Double, String, List, Set, Map, Array, Range};
+    use klio_runtime::Value::{
+        Array, Bool, Byte, Char, Double, Float, Int, List, Long, Map, Null, Range, Set, Short,
+        String, UByte, UInt, ULong, UShort,
+    };
     match v {
         Null => 0,
-        Bool(b) => if *b { 1231 } else { 1237 },
+        Bool(b) => {
+            if *b {
+                1231
+            } else {
+                1237
+            }
+        }
         Char(c) => i32::from(*c),
         Byte(x) => i32::from(*x),
         Short(x) => i32::from(*x),
@@ -686,7 +741,9 @@ fn kotlin_hash_code(v: &klio_runtime::Value) -> i32 {
         // no range-vs-progression tag, so use step==1 as the discriminant
         // (the common case; `a..b step 1` — a step-1 progression — is the only
         // rare divergence). Empty ranges hash to -1.
-        Range { start, end, step, .. } => {
+        Range {
+            start, end, step, ..
+        } => {
             let (f, l, s) = (*start as i32, *end as i32, *step as i32);
             let empty = if *step > 0 { start > end } else { start < end };
             if empty {
@@ -703,26 +760,70 @@ fn kotlin_hash_code(v: &klio_runtime::Value) -> i32 {
     }
 }
 
+// Folds a 64-bit digest down to the i32 Kotlin hashCode() returns.
+#[allow(clippy::cast_possible_truncation)]
 fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
-    use klio_runtime::Value::{Unit, Null, Bool, Char, Int, Long, Short, Byte, UInt, ULong, UShort, UByte, Float, Double, String};
+    use klio_runtime::Value::{
+        Bool, Byte, Char, Double, Float, Int, Long, Null, Short, String, UByte, UInt, ULong,
+        UShort, Unit,
+    };
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     match v {
         Unit => 0i32.hash(&mut h),
         Null => 1i32.hash(&mut h),
-        Bool(b) => { 2i32.hash(&mut h); b.hash(&mut h); }
-        Char(c) => { 3i32.hash(&mut h); c.hash(&mut h); }
-        Int(i) => { 4i32.hash(&mut h); i64::from(*i).hash(&mut h); }
-        Long(l) => { 4i32.hash(&mut h); l.hash(&mut h); }
-        Short(s) => { 4i32.hash(&mut h); i64::from(*s).hash(&mut h); }
-        Byte(b) => { 4i32.hash(&mut h); i64::from(*b).hash(&mut h); }
-        UInt(u) => { 4i32.hash(&mut h); i64::from(*u).hash(&mut h); }
-        ULong(u) => { 4i32.hash(&mut h); u.hash(&mut h); }
-        UShort(u) => { 4i32.hash(&mut h); i64::from(*u).hash(&mut h); }
-        UByte(u) => { 4i32.hash(&mut h); i64::from(*u).hash(&mut h); }
-        Float(f) => { 5i32.hash(&mut h); f.to_bits().hash(&mut h); }
-        Double(d) => { 5i32.hash(&mut h); d.to_bits().hash(&mut h); }
-        String(s) => { 6i32.hash(&mut h); s.hash(&mut h); }
+        Bool(b) => {
+            2i32.hash(&mut h);
+            b.hash(&mut h);
+        }
+        Char(c) => {
+            3i32.hash(&mut h);
+            c.hash(&mut h);
+        }
+        Int(i) => {
+            4i32.hash(&mut h);
+            i64::from(*i).hash(&mut h);
+        }
+        Long(l) => {
+            4i32.hash(&mut h);
+            l.hash(&mut h);
+        }
+        Short(s) => {
+            4i32.hash(&mut h);
+            i64::from(*s).hash(&mut h);
+        }
+        Byte(b) => {
+            4i32.hash(&mut h);
+            i64::from(*b).hash(&mut h);
+        }
+        UInt(u) => {
+            4i32.hash(&mut h);
+            i64::from(*u).hash(&mut h);
+        }
+        ULong(u) => {
+            4i32.hash(&mut h);
+            u.hash(&mut h);
+        }
+        UShort(u) => {
+            4i32.hash(&mut h);
+            i64::from(*u).hash(&mut h);
+        }
+        UByte(u) => {
+            4i32.hash(&mut h);
+            i64::from(*u).hash(&mut h);
+        }
+        Float(f) => {
+            5i32.hash(&mut h);
+            f.to_bits().hash(&mut h);
+        }
+        Double(d) => {
+            5i32.hash(&mut h);
+            d.to_bits().hash(&mut h);
+        }
+        String(s) => {
+            6i32.hash(&mut h);
+            s.hash(&mut h);
+        }
         _ => 7i32.hash(&mut h),
     }
     h.finish() as i32
@@ -737,9 +838,7 @@ fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
 /// calls (`mutableListOf()` / `mutableMapOf()` / `mutableSetOf()` /
 /// `listOf()` / `setOf()` / `mapOf()` / `emptyList()` / `emptySet()`
 /// / `emptyMap()`) that arise in property-bag class declarations.
-fn default_value_for_primary(
-    e: &klio_ast::Expr,
-) -> Option<klio_runtime::Value> {
+fn default_value_for_primary(e: &klio_ast::Expr) -> Option<klio_runtime::Value> {
     use klio_ast::Expr::{Call, Path};
     if let Some(v) = simple_literal(e) {
         return Some(v);
@@ -749,62 +848,71 @@ fn default_value_for_primary(
             return None;
         }
         if let Path { segments, .. } = callee.as_ref()
-            && segments.len() == 1 {
-                match segments[0].name.as_str() {
-                    "mutableListOf" | "arrayListOf" | "ArrayList" | "ArrayDeque" => {
-                        return Some(klio_runtime::Value::List {
-                            items: klio_runtime::ObjRef::new(Vec::new()),
-                            mutable: true,
-                            enum_class: None, backing: None,
-                        });
-                    }
-                    "listOf" | "emptyList" => {
-                        return Some(klio_runtime::Value::List {
-                            items: klio_runtime::ObjRef::new(Vec::new()),
-                            mutable: false,
-                            enum_class: None, backing: None,
-                        });
-                    }
-                    "mutableSetOf" | "hashSetOf" | "linkedSetOf" => {
-                        return Some(klio_runtime::Value::Set {
-                            items: klio_runtime::ObjRef::new(Vec::new()),
-                            mutable: true, backing: None,
-                        });
-                    }
-                    "setOf" | "emptySet" => {
-                        return Some(klio_runtime::Value::Set {
-                            items: klio_runtime::ObjRef::new(Vec::new()),
-                            mutable: false, backing: None,
-                        });
-                    }
-                    "mutableMapOf" | "hashMapOf" | "linkedMapOf" => {
-                        return Some(klio_runtime::Value::Map {
-                            entries: klio_runtime::ObjRef::new(Vec::new()),
-                            mutable: true,
-                        });
-                    }
-                    "mapOf" | "emptyMap" => {
-                        return Some(klio_runtime::Value::Map {
-                            entries: klio_runtime::ObjRef::new(Vec::new()),
-                            mutable: false,
-                        });
-                    }
-                    _ => {}
+            && segments.len() == 1
+        {
+            match segments[0].name.as_str() {
+                "mutableListOf" | "arrayListOf" | "ArrayList" | "ArrayDeque" => {
+                    return Some(klio_runtime::Value::List {
+                        items: klio_runtime::ObjRef::new(Vec::new()),
+                        mutable: true,
+                        enum_class: None,
+                        backing: None,
+                    });
                 }
+                "listOf" | "emptyList" => {
+                    return Some(klio_runtime::Value::List {
+                        items: klio_runtime::ObjRef::new(Vec::new()),
+                        mutable: false,
+                        enum_class: None,
+                        backing: None,
+                    });
+                }
+                "mutableSetOf" | "hashSetOf" | "linkedSetOf" => {
+                    return Some(klio_runtime::Value::Set {
+                        items: klio_runtime::ObjRef::new(Vec::new()),
+                        mutable: true,
+                        backing: None,
+                    });
+                }
+                "setOf" | "emptySet" => {
+                    return Some(klio_runtime::Value::Set {
+                        items: klio_runtime::ObjRef::new(Vec::new()),
+                        mutable: false,
+                        backing: None,
+                    });
+                }
+                "mutableMapOf" | "hashMapOf" | "linkedMapOf" => {
+                    return Some(klio_runtime::Value::Map {
+                        entries: klio_runtime::ObjRef::new(Vec::new()),
+                        mutable: true,
+                    });
+                }
+                "mapOf" | "emptyMap" => {
+                    return Some(klio_runtime::Value::Map {
+                        entries: klio_runtime::ObjRef::new(Vec::new()),
+                        mutable: false,
+                    });
+                }
+                _ => {}
             }
+        }
     }
     None
 }
 
 fn simple_literal(e: &klio_ast::Expr) -> Option<klio_runtime::Value> {
-    use klio_ast::Expr::{IntLit, FloatLit, BoolLit, NullLit, CharLit, StringTemplate};
+    use klio_ast::Expr::{BoolLit, CharLit, FloatLit, IntLit, NullLit, StringTemplate};
     match e {
         IntLit { value, .. } => Some(klio_runtime::Value::new_int(*value)),
         FloatLit { value, .. } => Some(klio_runtime::Value::Double(*value)),
         BoolLit { value, .. } => Some(klio_runtime::Value::Bool(*value)),
         NullLit { .. } => Some(klio_runtime::Value::Null),
         CharLit { value, .. } => Some(klio_runtime::Value::Char(*value)),
-        StringTemplate { parts, .. } if parts.iter().all(|p| matches!(p, klio_ast::StringPart::Text(_))) => {
+        StringTemplate { parts, .. }
+            if parts
+                .iter()
+                .all(|p| matches!(p, klio_ast::StringPart::Text(_))) =>
+        {
             let mut s = String::new();
             for p in parts {
                 if let klio_ast::StringPart::Text(t) = p {
@@ -817,6 +925,8 @@ fn simple_literal(e: &klio_ast::Expr) -> Option<klio_runtime::Value> {
     }
 }
 
+// Kotlin Char ranges materialize code units; the i64 cursor narrows to u16.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn materialise_range_items(
     start: i64,
     end: i64,
@@ -866,10 +976,7 @@ struct VmIntrinsicHost<'a> {
     globals: klio_runtime::ObjRef<klio_runtime::Env>,
     classes: klio_runtime::ObjRef<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>,
     prog: Arc<ProgramImage>,
-    anon_methods: klio_runtime::ObjRef<std::collections::HashMap<
-        (String, String),
-        (Arc<klio_ir::Module>, klio_ir::FuncId, Vec<(String, klio_runtime::Value)>),
-    >>,
+    anon_methods: AnonMethods,
     class_default_outer:
         klio_runtime::ObjRef<std::collections::HashMap<String, klio_runtime::Value>>,
     instance_id_counter: Arc<AtomicU64>,
@@ -1135,11 +1242,7 @@ impl Drop for TlInitGuard {
 /// Run `f` only if `(id, name)` is not already being resolved through
 /// the `get_field` heuristic fallbacks; pushes/pops the pair so the
 /// recursion is bounded by the distinct instances on the stack.
-fn with_field_resolve_pair<R>(
-    id: usize,
-    name: &str,
-    f: impl FnOnce() -> R,
-) -> Option<R> {
+fn with_field_resolve_pair<R>(id: usize, name: &str, f: impl FnOnce() -> R) -> Option<R> {
     let key = (id, name.to_string());
     let entered = FIELD_RESOLVE_STACK.with(|s| {
         if s.borrow().iter().any(|k| k == &key) {
@@ -1201,8 +1304,7 @@ fn with_coro<R>(f: impl FnOnce(&RefCell<Vec<CooperativeInterceptor>>) -> R) -> R
 fn is_cancellation_exception(v: &klio_runtime::Value) -> bool {
     if let klio_runtime::Value::Exception { fqn, .. } = v {
         let s: &str = fqn;
-        return s.ends_with("CancellationException")
-            || s.ends_with("TimeoutCancellationException");
+        return s.ends_with("CancellationException") || s.ends_with("TimeoutCancellationException");
     }
     if let klio_runtime::Value::Instance(inst) = v {
         let name = inst.borrow().class.name.clone();
@@ -1247,9 +1349,7 @@ fn with_ctor_guard<R>(f: impl FnOnce(&RefCell<Vec<String>>) -> R) -> R {
 
 /// Run `f` against this thread's enclosing-`this` stack for receiver
 /// lambdas.
-fn with_inner_outer_hint<R>(
-    f: impl FnOnce(&RefCell<Vec<klio_runtime::Value>>) -> R,
-) -> R {
+fn with_inner_outer_hint<R>(f: impl FnOnce(&RefCell<Vec<klio_runtime::Value>>) -> R) -> R {
     EXEC.with(|e| f(&e.inner_outer_hint))
 }
 
@@ -1258,9 +1358,7 @@ fn with_outer_this<R>(f: impl FnOnce(&RefCell<Vec<klio_runtime::Value>>) -> R) -
 }
 
 /// Run `f` against this thread's active receiver-lambda label stack.
-fn with_receiver_labels<R>(
-    f: impl FnOnce(&RefCell<Vec<(String, klio_runtime::Value)>>) -> R,
-) -> R {
+fn with_receiver_labels<R>(f: impl FnOnce(&RefCell<Vec<(String, klio_runtime::Value)>>) -> R) -> R {
     EXEC.with(|e| f(&e.receiver_labels))
 }
 
@@ -1303,12 +1401,18 @@ mod tests {
         let r = b.emit_const(Const::Int(42));
         b.terminate(Terminator::Return(Some(r)));
         let main_func = b.finish("main", "main", TypeRef::int());
+        // FuncId is u32-indexed; the test module's func count fits.
+        #[allow(clippy::cast_possible_truncation)]
         let main_id = klio_ir::FuncId(module.funcs.len() as u32);
         let mut placed = main_func;
         placed.id = main_id;
         module.funcs.push(placed);
         module.func_index.push(("main".into(), main_id));
-        module.func_name_index.entry("main".into()).or_default().push(main_id);
+        module
+            .func_name_index
+            .entry("main".into())
+            .or_default()
+            .push(main_id);
         module.top_level.push(main_id);
 
         let mut vm = Vm::new(Arc::new(module));
@@ -1326,10 +1430,16 @@ mod tests {
         let mut b = FuncBuilder::new(&mut module);
         let callee = b.alloc_reg();
         let nm = b.module.intern_const(Const::String("println".into()));
-        b.push(Inst::LoadGlobal { dst: callee, name: nm });
+        b.push(Inst::LoadGlobal {
+            dst: callee,
+            name: nm,
+        });
         let arg = b.emit_const(Const::String("hello".into()));
         let args_start = b.alloc_reg();
-        b.push(Inst::Move { dst: args_start, src: arg });
+        b.push(Inst::Move {
+            dst: args_start,
+            src: arg,
+        });
         let dst = b.alloc_reg();
         b.push(Inst::CallValue {
             dst,
@@ -1340,12 +1450,18 @@ mod tests {
         });
         b.terminate(Terminator::Return(Some(dst)));
         let main_func = b.finish("main", "main", TypeRef::unit());
+        // FuncId is u32-indexed; the test module's func count fits.
+        #[allow(clippy::cast_possible_truncation)]
         let main_id = klio_ir::FuncId(module.funcs.len() as u32);
         let mut placed = main_func;
         placed.id = main_id;
         module.funcs.push(placed);
         module.func_index.push(("main".into(), main_id));
-        module.func_name_index.entry("main".into()).or_default().push(main_id);
+        module
+            .func_name_index
+            .entry("main".into())
+            .or_default()
+            .push(main_id);
         module.top_level.push(main_id);
 
         let mut vm = Vm::new(Arc::new(module));
@@ -1354,4 +1470,3 @@ mod tests {
         assert_eq!(out.0, "hello\n");
     }
 }
-

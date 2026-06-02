@@ -19,10 +19,8 @@ fn expected(stem: &str) -> String {
         if let Some(rest) = t.strip_prefix("//>") {
             out.push_str(rest.strip_prefix(' ').unwrap_or(rest));
             out.push('\n');
-        } else if t.starts_with("//") {
-            continue;
-        } else if out.is_empty() {
-            continue;
+        } else if t.starts_with("//") || out.is_empty() {
+            // Skip leading comments and blank lead-in.
         } else {
             break;
         }
@@ -43,10 +41,31 @@ fn run_smoke(stem: &str) {
     }
 }
 
-#[test] fn cs1_launch_delay()    { run_smoke("cs1_launch_delay"); }
-#[test] fn cs2_async_await()     { run_smoke("cs2_async_await"); }
-#[test] fn cs3_many_launch()     { run_smoke("cs3_many_launch"); }
-#[test] fn cs4_suspend_seq()     { run_smoke("cs4_suspend_seq"); }
-#[test] fn cs5_flow_builder()    { run_smoke("cs5_flow_builder"); }
-#[test] fn cs6_flow_operators()  { run_smoke("cs6_flow_operators"); }
-#[test] fn cs7_scope_builders()  { run_smoke("cs7_scope_builders"); }
+#[test]
+fn cs1_launch_delay() {
+    run_smoke("cs1_launch_delay");
+}
+#[test]
+fn cs2_async_await() {
+    run_smoke("cs2_async_await");
+}
+#[test]
+fn cs3_many_launch() {
+    run_smoke("cs3_many_launch");
+}
+#[test]
+fn cs4_suspend_seq() {
+    run_smoke("cs4_suspend_seq");
+}
+#[test]
+fn cs5_flow_builder() {
+    run_smoke("cs5_flow_builder");
+}
+#[test]
+fn cs6_flow_operators() {
+    run_smoke("cs6_flow_operators");
+}
+#[test]
+fn cs7_scope_builders() {
+    run_smoke("cs7_scope_builders");
+}

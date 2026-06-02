@@ -16,29 +16,92 @@ pub fn host_bindings() -> HostBindings {
     let mut b = HostBindings::new();
     let bindings: &[(&'static str, StdlibFn)] = &[
         ("kotlinx.atomicfu.AtomicInt.compareAndSet", atomic_int_cas),
-        ("kotlinx.atomicfu.AtomicInt.getAndSet", atomic_int_get_and_set),
-        ("kotlinx.atomicfu.AtomicInt.getAndIncrement", atomic_int_get_and_increment),
-        ("kotlinx.atomicfu.AtomicInt.getAndDecrement", atomic_int_get_and_decrement),
-        ("kotlinx.atomicfu.AtomicInt.incrementAndGet", atomic_int_increment_and_get),
-        ("kotlinx.atomicfu.AtomicInt.decrementAndGet", atomic_int_decrement_and_get),
-        ("kotlinx.atomicfu.AtomicInt.getAndAdd", atomic_int_get_and_add),
-        ("kotlinx.atomicfu.AtomicInt.addAndGet", atomic_int_add_and_get),
-        ("kotlinx.atomicfu.AtomicInt.plusAssign", atomic_int_plus_assign),
-        ("kotlinx.atomicfu.AtomicInt.minusAssign", atomic_int_minus_assign),
+        (
+            "kotlinx.atomicfu.AtomicInt.getAndSet",
+            atomic_int_get_and_set,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicInt.getAndIncrement",
+            atomic_int_get_and_increment,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicInt.getAndDecrement",
+            atomic_int_get_and_decrement,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicInt.incrementAndGet",
+            atomic_int_increment_and_get,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicInt.decrementAndGet",
+            atomic_int_decrement_and_get,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicInt.getAndAdd",
+            atomic_int_get_and_add,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicInt.addAndGet",
+            atomic_int_add_and_get,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicInt.plusAssign",
+            atomic_int_plus_assign,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicInt.minusAssign",
+            atomic_int_minus_assign,
+        ),
         ("kotlinx.atomicfu.AtomicLong.compareAndSet", atomic_long_cas),
-        ("kotlinx.atomicfu.AtomicLong.getAndSet", atomic_long_get_and_set),
-        ("kotlinx.atomicfu.AtomicLong.getAndIncrement", atomic_long_get_and_increment),
-        ("kotlinx.atomicfu.AtomicLong.getAndDecrement", atomic_long_get_and_decrement),
-        ("kotlinx.atomicfu.AtomicLong.incrementAndGet", atomic_long_increment_and_get),
-        ("kotlinx.atomicfu.AtomicLong.decrementAndGet", atomic_long_decrement_and_get),
-        ("kotlinx.atomicfu.AtomicLong.getAndAdd", atomic_long_get_and_add),
-        ("kotlinx.atomicfu.AtomicLong.addAndGet", atomic_long_add_and_get),
-        ("kotlinx.atomicfu.AtomicLong.plusAssign", atomic_long_plus_assign),
-        ("kotlinx.atomicfu.AtomicLong.minusAssign", atomic_long_minus_assign),
-        ("kotlinx.atomicfu.AtomicBoolean.compareAndSet", atomic_bool_cas),
-        ("kotlinx.atomicfu.AtomicBoolean.getAndSet", atomic_bool_get_and_set),
+        (
+            "kotlinx.atomicfu.AtomicLong.getAndSet",
+            atomic_long_get_and_set,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicLong.getAndIncrement",
+            atomic_long_get_and_increment,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicLong.getAndDecrement",
+            atomic_long_get_and_decrement,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicLong.incrementAndGet",
+            atomic_long_increment_and_get,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicLong.decrementAndGet",
+            atomic_long_decrement_and_get,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicLong.getAndAdd",
+            atomic_long_get_and_add,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicLong.addAndGet",
+            atomic_long_add_and_get,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicLong.plusAssign",
+            atomic_long_plus_assign,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicLong.minusAssign",
+            atomic_long_minus_assign,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicBoolean.compareAndSet",
+            atomic_bool_cas,
+        ),
+        (
+            "kotlinx.atomicfu.AtomicBoolean.getAndSet",
+            atomic_bool_get_and_set,
+        ),
         ("kotlinx.atomicfu.AtomicRef.compareAndSet", atomic_ref_cas),
-        ("kotlinx.atomicfu.AtomicRef.getAndSet", atomic_ref_get_and_set),
+        (
+            "kotlinx.atomicfu.AtomicRef.getAndSet",
+            atomic_ref_get_and_set,
+        ),
     ];
     for (k, f) in bindings {
         b.register(k, *f);
@@ -67,7 +130,9 @@ fn int_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result<
     }
 }
 
-fn long_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result<i64, RuntimeError> {
+fn long_field(
+    inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>,
+) -> Result<i64, RuntimeError> {
     match inst.borrow().get("value") {
         Some(Value::Long(l)) => Ok(l),
         Some(Value::Int(i)) => Ok(i64::from(i)),
@@ -77,7 +142,9 @@ fn long_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result
     }
 }
 
-fn bool_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result<bool, RuntimeError> {
+fn bool_field(
+    inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>,
+) -> Result<bool, RuntimeError> {
     match inst.borrow().get("value") {
         Some(Value::Bool(b)) => Ok(b),
         _ => Err(RuntimeError::Type(
@@ -136,7 +203,7 @@ fn with_int_field_mut<R>(
         _ => {
             return Err(RuntimeError::Type(
                 "AtomicInt: receiver missing `value: Int`".into(),
-            ))
+            ));
         }
     };
     let (next, out) = f(cur);

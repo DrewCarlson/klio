@@ -110,7 +110,7 @@ fun main() = runBlocking {
 }
 
 #[test]
-fn nested_runBlocking_returns_value() {
+fn nested_run_blocking_returns_value() {
     let src = r"
 import kotlinx.coroutines.*
 fun compute(): Int = runBlocking {

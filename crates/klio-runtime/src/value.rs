@@ -1,4 +1,7 @@
-use crate::{ObjRef, Env, StdlibFn, InstanceData, MethodDef, ClassDef, char_unit_to_string, kotlin_double_to_string, kotlin_float_to_string};
+use crate::{
+    ClassDef, Env, InstanceData, MethodDef, ObjRef, StdlibFn, char_unit_to_string,
+    kotlin_double_to_string, kotlin_float_to_string,
+};
 
 use std::fmt;
 use std::sync::Arc;
@@ -60,8 +63,16 @@ pub enum Value {
     /// `{start:10,end:1,step:-1}`; `x step n` produces `step:n`. Iteration
     /// honors `step`'s sign. `kind` distinguishes `IntRange` (values widen to
     /// `Value::Int`) from `LongRange` (values widen to `Value::Long`).
-    Range { start: i64, end: i64, step: i64, kind: RangeKind },
-    Function { decl: Arc<klio_ast::Function>, env: ObjRef<Env> },
+    Range {
+        start: i64,
+        end: i64,
+        step: i64,
+        kind: RangeKind,
+    },
+    Function {
+        decl: Arc<klio_ast::Function>,
+        env: ObjRef<Env>,
+    },
     Lambda {
         params: Arc<Vec<String>>,
         body: Arc<klio_ast::Block>,
@@ -73,26 +84,43 @@ pub enum Value {
         /// enclosing function (the inline-lambda case).
         absorb_return: bool,
     },
-    Intrinsic { fqn: &'static str, func: StdlibFn },
+    Intrinsic {
+        fqn: &'static str,
+        func: StdlibFn,
+    },
     /// IR-side closure handle. Produced by the IR evaluator's
     /// `Inst::Lambda` op via the Host's `build_closure` callback.
     /// `id` is an opaque side-table key; the IR host resolves it
     /// back to a `(module, body_func, captures)` triple at call
     /// time. Distinct from `Value::Lambda` (which carries an AST
     /// block + env tied to the tree walker).
-    IrClosure { id: u64, captures: Arc<Vec<Value>> },
+    IrClosure {
+        id: u64,
+        captures: Arc<Vec<Value>>,
+    },
     /// A method intrinsic bound to a specific receiver — produced by member
     /// access like `s.uppercase`. Calling it invokes `func` with the receiver
     /// prepended to the user arguments.
-    BoundMethod { fqn: &'static str, func: StdlibFn, receiver: Box<Value> },
+    BoundMethod {
+        fqn: &'static str,
+        func: StdlibFn,
+        receiver: Box<Value>,
+    },
     /// A user-method reference bound to a specific instance — produced by
     /// `instance::method`. Calling it dispatches through the method
     /// resolution chain on `receiver` with the caller's arguments.
-    BoundUserMethod { receiver: ObjRef<InstanceData>, method: Arc<MethodDef> },
+    BoundUserMethod {
+        receiver: ObjRef<InstanceData>,
+        method: Arc<MethodDef>,
+    },
     /// A thrown value, modeled as a Kotlin Throwable. Carries an FQN
     /// (e.g. `kotlin.IllegalArgumentException`), an optional message, and
     /// an optional cause (another Throwable) per spec §3.12.
-    Exception { fqn: Arc<String>, message: Option<Arc<String>>, cause: Option<Box<Value>> },
+    Exception {
+        fqn: Arc<String>,
+        message: Option<Arc<String>>,
+        cause: Option<Box<Value>>,
+    },
     /// `kotlin.collections.List` / `MutableList`. The mutability tag drives
     /// `type_fqn` and any mutability checks; the storage is shared.
     /// `enum_class` is `Some(name)` for the result of `EnumName.entries` /
@@ -128,7 +156,10 @@ pub enum Value {
     },
     /// `kotlin.collections.Map` / `MutableMap`. Vec-backed, insertion-ordered
     /// (mirrors `LinkedHashMap`, which is Kotlin's default Map impl).
-    Map { entries: ObjRef<Vec<(Value, Value)>>, mutable: bool },
+    Map {
+        entries: ObjRef<Vec<(Value, Value)>>,
+        mutable: bool,
+    },
     /// `kotlin.Pair`. `to` constructs one.
     Pair(Box<Value>, Box<Value>),
     /// `kotlin.Triple`. Built by `Triple(a, b, c)`.
@@ -144,13 +175,19 @@ pub enum Value {
     },
     /// `kotlin.Result<T>`. `ok` distinguishes success from failure; `payload`
     /// is the success value or the captured `kotlin.Throwable`.
-    Result { ok: bool, payload: Box<Value> },
+    Result {
+        ok: bool,
+        payload: Box<Value>,
+    },
     /// `kotlin.Comparator<T>`. A chain of key selectors (each a `Lambda`
     /// paired with a per-step `descending` flag) applied in order; the
     /// first non-equal step wins. The outer `descending` flag is the
     /// "reversed" toggle that flips every step's effective direction
     /// (built by `Comparator.reversed`).
-    Comparator { steps: Arc<Vec<(Value, bool)>>, descending: bool },
+    Comparator {
+        steps: Arc<Vec<(Value, bool)>>,
+        descending: bool,
+    },
     /// A user-declared class. Calling it constructs an `Instance`. Holds the
     /// declaration plus the env it was declared in (for resolving names from
     /// method bodies, supertypes, etc.).
@@ -159,7 +196,10 @@ pub enum Value {
     /// the source navigates `outer.Inner` (or refers to `Inner` unqualified
     /// inside an outer-class method, where `this` is the outer instance).
     /// Calling it constructs an `Instance` with `InstanceData.outer = Some(outer)`.
-    BoundInnerClass { class: Arc<ClassDef>, outer: ObjRef<InstanceData> },
+    BoundInnerClass {
+        class: Arc<ClassDef>,
+        outer: ObjRef<InstanceData>,
+    },
     /// A live instance of a user-declared class.
     Instance(ObjRef<InstanceData>),
     /// `kotlin.sequences.Sequence<T>`. Lazy: a source plus a chain of
@@ -183,7 +223,12 @@ pub enum Value {
     /// state. `kind` selects the element width (`Int`/`Long`/`Char`).
     /// Produced by `iterator()` on a `Value::Range` so `for (i in a..b)`,
     /// `repeat(n)`, and `range.forEach { }` never allocate per-element.
-    RangeIter { cur: ObjRef<i64>, end: i64, step: i64, kind: RangeKind },
+    RangeIter {
+        cur: ObjRef<i64>,
+        end: i64,
+        step: i64,
+        kind: RangeKind,
+    },
     /// A built-in property delegate produced by `lazy { … }` /
     /// `Delegates.observable(...)` / `Delegates.notNull()`. Carries the
     /// state the delegate needs across calls (cached value, change
@@ -193,7 +238,9 @@ pub enum Value {
     /// `.name: String` member is the only feature delegate `getValue` /
     /// `setValue` calls reach for; anything richer waits on a reflection
     /// surface.
-    PropertyRef { name: Arc<String> },
+    PropertyRef {
+        name: Arc<String>,
+    },
     /// `kotlin.text.Regex`. Carries the source pattern plus a compiled
     /// Rust regex. The compiled object is shared via `Rc` so cloning a
     /// `Value::Regex` is cheap.
@@ -205,7 +252,11 @@ pub enum Value {
     /// `kotlin.text.MatchGroup` — one captured group of a `MatchResult`.
     /// `value` is the matched substring; `start`/`end_inclusive` are
     /// Kotlin char-indices into the original input.
-    MatchGroup { value: Arc<String>, start: i64, end_inclusive: i64 },
+    MatchGroup {
+        value: Arc<String>,
+        start: i64,
+        end_inclusive: i64,
+    },
     /// `kotlin.text.StringBuilder` — mutable string buffer. Shared
     /// storage so `sb1 === sb2` semantics hold across cloned values.
     StringBuilder(ObjRef<String>),
@@ -268,6 +319,9 @@ macro_rules! impl_to_i64 {
     ($($t:ty),*) => {
         $(impl ToI64 for $t {
             #[inline]
+            // Reinterprets each integer width into the runtime's i64 slot,
+            // matching Kotlin's integer normalization (unsigned widths wrap).
+            #[allow(clippy::cast_lossless, clippy::cast_possible_wrap)]
             fn to_i64(self) -> i64 { self as i64 }
         })*
     };
@@ -366,7 +420,10 @@ pub enum DelegateKind {
     /// `lazy { producer }`. First read evaluates the producer (in the
     /// captured env) and stores the result; subsequent reads return the
     /// cache.
-    Lazy { producer: Value, cached: Option<Value> },
+    Lazy {
+        producer: Value,
+        cached: Option<Value>,
+    },
     /// `Delegates.observable(initial) { property, old, new -> … }`.
     Observable { value: Value, on_change: Value },
     /// `Delegates.notNull<T>()`. Reads before the first write throw
@@ -409,7 +466,10 @@ pub enum SuspendTransition {
     Return,
     /// Branch on a boolean register produced by the last stmt:
     /// jump to `then_state` if true, `else_state` otherwise.
-    Branch { then_state: usize, else_state: usize },
+    Branch {
+        then_state: usize,
+        else_state: usize,
+    },
 }
 
 /// A live `suspend fun` invocation. Holds enough state to resume
@@ -472,7 +532,10 @@ pub enum SequenceSource {
     /// `generateSequence(seed) { it -> next }`. `seed` is `None` for the
     /// nullary form `generateSequence { nextOrNull }` — that variant emits
     /// values from the lambda until it returns `null`.
-    Generate { seed: Option<Box<Value>>, next: Box<Value> },
+    Generate {
+        seed: Option<Box<Value>>,
+        next: Box<Value>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -525,12 +588,19 @@ impl fmt::Debug for Value {
             Self::String(v) => write!(f, "String({v:?})"),
             Self::Char(v) => write!(f, "Char('{}')", char_unit_to_string(*v)),
             Self::Null => write!(f, "Null"),
-            Self::Range { start, end, step, kind } => {
+            Self::Range {
+                start,
+                end,
+                step,
+                kind,
+            } => {
                 write!(f, "Range({start}..{end} step {step} kind={kind:?})")
             }
             Self::Function { decl, .. } => write!(f, "Function({})", decl.name.name),
             Self::Lambda { params, .. } => write!(f, "Lambda(params={})", params.len()),
-            Self::IrClosure { id, captures } => write!(f, "IrClosure(id={id}, captures={})", captures.len()),
+            Self::IrClosure { id, captures } => {
+                write!(f, "IrClosure(id={id}, captures={})", captures.len())
+            }
             Self::Intrinsic { fqn, .. } => write!(f, "Intrinsic({fqn})"),
             Self::BoundMethod { fqn, .. } => write!(f, "BoundMethod({fqn})"),
             Self::BoundUserMethod { receiver, method } => write!(
@@ -543,7 +613,12 @@ impl fmt::Debug for Value {
                 Some(m) => write!(f, "Exception({fqn}: {m:?})"),
                 None => write!(f, "Exception({fqn})"),
             },
-            Self::List { items, mutable, enum_class, .. } => {
+            Self::List {
+                items,
+                mutable,
+                enum_class,
+                ..
+            } => {
                 let tag = match enum_class {
                     Some(n) => format!("EnumEntries<{n}>"),
                     None => (if *mutable { "mut" } else { "ro" }).to_string(),
@@ -551,10 +626,20 @@ impl fmt::Debug for Value {
                 write!(f, "List({}, {} items)", tag, items.borrow().len())
             }
             Self::Set { items, mutable, .. } => {
-                write!(f, "Set({}, {} items)", if *mutable { "mut" } else { "ro" }, items.borrow().len())
+                write!(
+                    f,
+                    "Set({}, {} items)",
+                    if *mutable { "mut" } else { "ro" },
+                    items.borrow().len()
+                )
             }
             Self::Map { entries, mutable } => {
-                write!(f, "Map({}, {} entries)", if *mutable { "mut" } else { "ro" }, entries.borrow().len())
+                write!(
+                    f,
+                    "Map({}, {} entries)",
+                    if *mutable { "mut" } else { "ro" },
+                    entries.borrow().len()
+                )
             }
             Self::Pair(a, b) => write!(f, "Pair({a:?}, {b:?})"),
             Self::Triple(a, b, c) => write!(f, "Triple({a:?}, {b:?}, {c:?})"),
@@ -566,14 +651,24 @@ impl fmt::Debug for Value {
                 steps.len(),
                 descending
             ),
-            Self::Sequence(data) => write!(f, "Sequence(source={:?}, ops={})", data.source, data.ops.len()),
+            Self::Sequence(data) => write!(
+                f,
+                "Sequence(source={:?}, ops={})",
+                data.source,
+                data.ops.len()
+            ),
             Self::Iterator { items, pos, prim } => write!(
                 f,
                 "Iterator(prim={prim:?}, pos={}/{})",
                 pos.borrow(),
                 items.borrow().len()
             ),
-            Self::RangeIter { cur, end, step, kind } => write!(
+            Self::RangeIter {
+                cur,
+                end,
+                step,
+                kind,
+            } => write!(
                 f,
                 "RangeIter(cur={}, end={end}, step={step}, kind={kind:?})",
                 cur.borrow()
@@ -583,12 +678,9 @@ impl fmt::Debug for Value {
             Self::Instance(i) => write!(f, "Instance({})", i.borrow().class.fqn),
             Self::Delegate(d) => write!(f, "Delegate({:?})", d.borrow()),
             Self::PropertyRef { name } => write!(f, "PropertyRef({name})"),
-            Self::Array { items, prim } => write!(
-                f,
-                "Array({:?}, {} items)",
-                prim,
-                items.borrow().len()
-            ),
+            Self::Array { items, prim } => {
+                write!(f, "Array({:?}, {} items)", prim, items.borrow().len())
+            }
             Self::Regex(d) => write!(f, "Regex({:?})", d.pattern),
             Self::Match(m) => write!(f, "Match({:?})", m.groups.first()),
             Self::MatchGroup { value, .. } => write!(f, "MatchGroup({value:?})"),
@@ -598,6 +690,9 @@ impl fmt::Debug for Value {
 }
 
 impl fmt::Display for Value {
+    // Single dispatch over every Value variant; arms stay per-variant for
+    // clarity, so the length and any incidentally identical bodies remain.
+    #[allow(clippy::too_many_lines, clippy::match_same_arms)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cell(c) => write!(f, "{}", c.borrow()),
@@ -617,7 +712,9 @@ impl fmt::Display for Value {
             Self::String(v) => write!(f, "{v}"),
             Self::Char(v) => write!(f, "{}", char_unit_to_string(*v)),
             Self::Null => write!(f, "null"),
-            Self::Range { start, end, step, .. } => {
+            Self::Range {
+                start, end, step, ..
+            } => {
                 // Kotlin renders progressions as:
                 //   IntRange (step == 1): "1..10"
                 //   forward IntProgression: "1..10 step 2"
@@ -637,7 +734,12 @@ impl fmt::Display for Value {
                 write!(f, "fun {fqn}(...)")
             }
             Self::BoundUserMethod { receiver, method } => {
-                write!(f, "fun {}.{}(...)", receiver.borrow().class.name, method.name)
+                write!(
+                    f,
+                    "fun {}.{}(...)",
+                    receiver.borrow().class.name,
+                    method.name
+                )
             }
             Self::Exception { fqn, message, .. } => match message {
                 Some(m) => write!(f, "{fqn}: {m}"),
@@ -646,7 +748,9 @@ impl fmt::Display for Value {
             Self::List { items, .. } => {
                 write!(f, "[")?;
                 for (i, v) in items.borrow().iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write_collection_element(f, v)?;
                 }
                 write!(f, "]")
@@ -668,7 +772,9 @@ impl fmt::Display for Value {
             Self::Set { items, .. } => {
                 write!(f, "[")?;
                 for (i, v) in items.borrow().iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write_collection_element(f, v)?;
                 }
                 write!(f, "]")
@@ -676,7 +782,9 @@ impl fmt::Display for Value {
             Self::Map { entries, .. } => {
                 write!(f, "{{")?;
                 for (i, (k, v)) in entries.borrow().iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write_collection_element(f, k)?;
                     write!(f, "=")?;
                     write_collection_element(f, v)?;
@@ -729,7 +837,9 @@ impl fmt::Display for Value {
             Self::Class(c) => write!(f, "class {}", c.name),
             Self::BoundInnerClass { class, .. } => write!(f, "class {}", class.name),
             Self::Delegate(_) => write!(f, "<delegate>"),
-            Self::PropertyRef { name } => write!(f, "property {name} (Kotlin reflection is not available)"),
+            Self::PropertyRef { name } => {
+                write!(f, "property {name} (Kotlin reflection is not available)")
+            }
             Self::Regex(d) => write!(f, "{}", d.pattern),
             Self::Match(m) => {
                 let v = m.groups.first().and_then(|g| g.as_ref());
@@ -758,7 +868,9 @@ impl fmt::Display for Value {
                     write!(f, "{}(", inst.class.name)?;
                     let mut first = true;
                     for p in &inst.class.primary_params {
-                        if !first { write!(f, ", ")?; }
+                        if !first {
+                            write!(f, ", ")?;
+                        }
                         first = false;
                         let v = inst.get(&p.name).unwrap_or(Value::Null);
                         write!(f, "{}=", p.name)?;
@@ -826,6 +938,8 @@ impl Value {
 
     /// Widen any integral variant to `i64`. Floating types return `None`;
     /// use `as_f64` for those.
+    // Kotlin ULong.toLong() reinterprets the bit pattern (wraps).
+    #[allow(clippy::cast_possible_wrap)]
     #[must_use]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
@@ -843,6 +957,8 @@ impl Value {
 
     /// Widen any integral variant to `u64`. Mirrors `as_i64` for the
     /// unsigned-arithmetic path. Negative signed values wrap.
+    // Kotlin toULong() reinterprets the bit pattern (negative values wrap).
+    #[allow(clippy::cast_sign_loss)]
     #[must_use]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
@@ -859,6 +975,8 @@ impl Value {
     }
 
     /// Widen any numeric variant (integral or floating) to `f64`.
+    // Kotlin Long/ULong.toDouble() may lose precision past 2^53.
+    #[allow(clippy::cast_precision_loss)]
     #[must_use]
     pub fn as_f64(&self) -> Option<f64> {
         match self {
@@ -877,6 +995,8 @@ impl Value {
     }
 
     /// Widen any numeric variant to `f32`. Used by `Float`-typed arithmetic.
+    // Kotlin toFloat() loses precision on wide integers and Double->Float truncates.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     #[must_use]
     pub fn as_f32(&self) -> Option<f32> {
         match self {
@@ -898,6 +1018,8 @@ impl Value {
     /// the 32-bit storage width. Convenience for the (very common) call
     /// pattern where stdlib helpers compute in `i64` / `usize` / `isize`
     /// and need to hand a `kotlin.Int` back.
+    // Kotlin toInt() truncates to the 32-bit storage width.
+    #[allow(clippy::cast_possible_truncation)]
     #[must_use]
     pub fn new_int<T: ToI64>(v: T) -> Value {
         Value::Int(v.to_i64() as i32)
@@ -908,11 +1030,15 @@ impl Value {
         Value::Long(v.to_i64())
     }
 
+    // Kotlin toShort() truncates to the 16-bit storage width.
+    #[allow(clippy::cast_possible_truncation)]
     #[must_use]
     pub fn new_short<T: ToI64>(v: T) -> Value {
         Value::Short(v.to_i64() as i16)
     }
 
+    // Kotlin toByte() truncates to the 8-bit storage width.
+    #[allow(clippy::cast_possible_truncation)]
     #[must_use]
     pub fn new_byte<T: ToI64>(v: T) -> Value {
         Value::Byte(v.to_i64() as i8)
@@ -941,6 +1067,8 @@ impl Value {
     /// `None` if `self` is not numeric. Truncates/wraps on narrowing —
     /// callers should always promote *up* (max of operand ranks) for
     /// arithmetic, never down.
+    // Kotlin narrowing conversions (toByte/toShort/toInt and unsigned forms) truncate.
+    #[allow(clippy::cast_possible_truncation)]
     #[must_use]
     pub fn promote_to(&self, rank: NumericRank) -> Option<Value> {
         match rank {
@@ -960,6 +1088,13 @@ impl Value {
     /// Truncate an `i64` arithmetic result back to the storage range of
     /// the requested integer rank. Use after `i64::wrapping_*` to apply
     /// 8/16/32-bit overflow semantics. Long is returned as-is.
+    // Kotlin narrowing/unsigned reinterpretation truncates and drops the sign;
+    // the explicit Long arm and the unreachable-float fallback share a body.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::match_same_arms
+    )]
     #[must_use]
     pub fn wrap_integer(rank: NumericRank, v: i64) -> Value {
         match rank {
@@ -977,6 +1112,9 @@ impl Value {
 
     /// Wrap a `u64` arithmetic result into the unsigned variant
     /// matching `rank`. Truncates on narrowing.
+    // Kotlin unsigned narrowing (toUByte/toUShort/toUInt) truncates; the
+    // explicit ULong arm and the fallback share a body.
+    #[allow(clippy::cast_possible_truncation, clippy::match_same_arms)]
     #[must_use]
     pub fn wrap_unsigned(rank: NumericRank, v: u64) -> Value {
         match rank {
@@ -1105,6 +1243,9 @@ impl Value {
     /// captures). Primitive builtins map by `Value` variant; instances walk
     /// their class hierarchy. Recognized aliases follow Kotlin's
     /// type-check surface (e.g. `Any` matches every non-null value).
+    // Single dispatch over every Value variant; arms stay per-variant for
+    // clarity, so the length and incidentally identical `false` arms remain.
+    #[allow(clippy::too_many_lines, clippy::match_same_arms)]
     #[must_use]
     pub fn is_runtime_type(&self, name: &str) -> bool {
         match self {
@@ -1121,10 +1262,7 @@ impl Value {
             Value::Double(_) => matches!(name, "Double" | "Number" | "Any" | "Comparable"),
             Value::Float(_) => matches!(name, "Float" | "Number" | "Any" | "Comparable"),
             Value::Bool(_) => matches!(name, "Boolean" | "Any" | "Comparable"),
-            Value::String(_) => matches!(
-                name,
-                "String" | "CharSequence" | "Any" | "Comparable"
-            ),
+            Value::String(_) => matches!(name, "String" | "CharSequence" | "Any" | "Comparable"),
             Value::Char(_) => matches!(name, "Char" | "Any" | "Comparable"),
             Value::Unit => matches!(name, "Unit" | "Any"),
             Value::Null => false,
@@ -1142,7 +1280,11 @@ impl Value {
                     "CharRange" | "CharProgression" | "ClosedRange" | "Iterable" | "Any"
                 ),
             },
-            Value::List { mutable, enum_class, .. } => {
+            Value::List {
+                mutable,
+                enum_class,
+                ..
+            } => {
                 if matches!(name, "EnumEntries") {
                     return enum_class.is_some();
                 }
@@ -1167,7 +1309,10 @@ impl Value {
             }
             Value::Set { mutable, .. } => {
                 if *mutable {
-                    matches!(name, "MutableSet" | "Set" | "Collection" | "Iterable" | "Any")
+                    matches!(
+                        name,
+                        "MutableSet" | "Set" | "Collection" | "Iterable" | "Any"
+                    )
                 } else {
                     matches!(name, "Set" | "Collection" | "Iterable" | "Any")
                 }
@@ -1225,15 +1370,17 @@ impl Value {
                 // Match the arity-tagged `FunctionN` form when the value
                 // carries explicit parameter info. Intrinsics / bound methods
                 // hide arity, so they only match the base `Function`.
-                if let Some(stripped) =
-                    name.strip_prefix("Function").or_else(|| name.strip_prefix("kotlin.Function"))
-                    && let Ok(n) = stripped.parse::<usize>() {
-                        return match self {
-                            Value::Lambda { params, .. } => params.len() == n,
-                            Value::Function { decl, .. } => decl.params.len() == n,
-                            _ => false,
-                        };
-                    }
+                if let Some(stripped) = name
+                    .strip_prefix("Function")
+                    .or_else(|| name.strip_prefix("kotlin.Function"))
+                    && let Ok(n) = stripped.parse::<usize>()
+                {
+                    return match self {
+                        Value::Lambda { params, .. } => params.len() == n,
+                        Value::Function { decl, .. } => decl.params.len() == n,
+                        _ => false,
+                    };
+                }
                 false
             }
             Value::Exception { fqn, .. } => {
@@ -1242,10 +1389,9 @@ impl Value {
                     || matches!(name, "Throwable" | "Exception" | "Any")
                     || fqn.as_str() == name
             }
-            Value::Class(_) | Value::BoundInnerClass { .. } => matches!(
-                name,
-                "KClass" | "kotlin.reflect.KClass" | "Any"
-            ),
+            Value::Class(_) | Value::BoundInnerClass { .. } => {
+                matches!(name, "KClass" | "kotlin.reflect.KClass" | "Any")
+            }
             Value::Instance(i) => {
                 let inst = i.borrow();
                 if name == "Any" {
@@ -1258,9 +1404,10 @@ impl Value {
                 // the trailing simple name when the dotted prefix names an
                 // enclosing classifier of this instance's class.
                 if let Some((_outer, simple)) = name.rsplit_once('.')
-                    && inst.class.is_subtype_of(simple) {
-                        return true;
-                    }
+                    && inst.class.is_subtype_of(simple)
+                {
+                    return true;
+                }
                 false
             }
             Value::Delegate(_) => matches!(name, "Any"),
@@ -1330,7 +1477,10 @@ impl Value {
     /// `listOf(1) == listOf(1L)` evaluates to `false`). Non-numeric,
     /// non-collection values fall back to the structural rules.
     pub fn structural_eq_boxed(a: &Value, b: &Value) -> bool {
-        use Value::{Double, Float, Int, Long, Short, Byte, UInt, ULong, UShort, UByte, List, Set, Map, Pair, Triple, MapEntry};
+        use Value::{
+            Byte, Double, Float, Int, List, Long, Map, MapEntry, Pair, Set, Short, Triple, UByte,
+            UInt, ULong, UShort,
+        };
         match (a, b) {
             (Double(x), Double(y)) => x.to_bits() == y.to_bits(),
             (Float(x), Float(y)) => x.to_bits() == y.to_bits(),
@@ -1345,20 +1495,24 @@ impl Value {
             (List { items: a, .. }, List { items: b, .. }) => {
                 let (ab, bb) = (a.borrow(), b.borrow());
                 ab.len() == bb.len()
-                    && ab.iter().zip(bb.iter()).all(|(x, y)| Value::structural_eq_boxed(x, y))
+                    && ab
+                        .iter()
+                        .zip(bb.iter())
+                        .all(|(x, y)| Value::structural_eq_boxed(x, y))
             }
             (Set { items: a, .. }, Set { items: b, .. }) => {
                 let (ab, bb) = (a.borrow(), b.borrow());
                 ab.len() == bb.len()
-                    && ab.iter().all(|x| bb.iter().any(|y| Value::structural_eq_boxed(x, y)))
+                    && ab
+                        .iter()
+                        .all(|x| bb.iter().any(|y| Value::structural_eq_boxed(x, y)))
             }
             (Map { entries: a, .. }, Map { entries: b, .. }) => {
                 let (ab, bb) = (a.borrow(), b.borrow());
                 ab.len() == bb.len()
                     && ab.iter().all(|(k, v)| {
                         bb.iter().any(|(k2, v2)| {
-                            Value::structural_eq_boxed(k, k2)
-                                && Value::structural_eq_boxed(v, v2)
+                            Value::structural_eq_boxed(k, k2) && Value::structural_eq_boxed(v, v2)
                         })
                     })
             }
@@ -1370,9 +1524,14 @@ impl Value {
                     && Value::structural_eq_boxed(a2, b2)
                     && Value::structural_eq_boxed(a3, b3)
             }
-            (MapEntry { key: k1, value: v1, .. }, MapEntry { key: k2, value: v2, .. }) => {
-                Value::structural_eq_boxed(k1, k2) && Value::structural_eq_boxed(v1, v2)
-            }
+            (
+                MapEntry {
+                    key: k1, value: v1, ..
+                },
+                MapEntry {
+                    key: k2, value: v2, ..
+                },
+            ) => Value::structural_eq_boxed(k1, k2) && Value::structural_eq_boxed(v1, v2),
             // Any other mix of two numerics (Int vs Long, Int vs Double, …)
             // is a cross-type boxed comparison: never equal.
             _ if a.is_numeric() && b.is_numeric() => false,
@@ -1380,9 +1539,16 @@ impl Value {
         }
     }
 
-    #[must_use] 
+    // Per-variant-pair dispatch; arms stay distinct for clarity even where
+    // their bodies coincide (e.g. the unit-like `=> true` cases).
+    #[allow(clippy::match_same_arms)]
+    #[must_use]
     pub fn structural_eq(a: &Value, b: &Value) -> bool {
-        use Value::{Int, Long, Short, Byte, UInt, ULong, UShort, UByte, Double, Float, Bool, String, Char, Null, Unit, CoroutineSuspended, Range, List, Set, Map, Pair, Triple, MapEntry, Result, Class, Lambda, IrClosure, BoundMethod, Instance};
+        use Value::{
+            Bool, BoundMethod, Byte, Char, Class, CoroutineSuspended, Double, Float, Instance, Int,
+            IrClosure, Lambda, List, Long, Map, MapEntry, Null, Pair, Range, Result, Set, Short,
+            String, Triple, UByte, UInt, ULong, UShort, Unit,
+        };
         // Numeric `equals` matches Kotlin's boxed `Number` semantics: each
         // type only equals its own type (`1 != 1L`, `1 != 1.0`). Valid Kotlin
         // only compares same-typed numerics with `==` (or boxes both to a
@@ -1413,8 +1579,18 @@ impl Value {
             (Unit, Unit) => true,
             (CoroutineSuspended, CoroutineSuspended) => true,
             (
-                Range { start: a1, end: a2, step: s1, kind: k1 },
-                Range { start: b1, end: b2, step: s2, kind: k2 },
+                Range {
+                    start: a1,
+                    end: a2,
+                    step: s1,
+                    kind: k1,
+                },
+                Range {
+                    start: b1,
+                    end: b2,
+                    step: s2,
+                    kind: k2,
+                },
             ) => a1 == b1 && a2 == b2 && s1 == s2 && k1 == k2,
             // Collection elements / tuple components are boxed, so they
             // compare with boxed `Number` semantics: `listOf(1) == listOf(1L)`
@@ -1423,13 +1599,18 @@ impl Value {
                 let ab = a.borrow();
                 let bb = b.borrow();
                 ab.len() == bb.len()
-                    && ab.iter().zip(bb.iter()).all(|(x, y)| Value::structural_eq_boxed(x, y))
+                    && ab
+                        .iter()
+                        .zip(bb.iter())
+                        .all(|(x, y)| Value::structural_eq_boxed(x, y))
             }
             (Set { items: a, .. }, Set { items: b, .. }) => {
                 let ab = a.borrow();
                 let bb = b.borrow();
                 ab.len() == bb.len()
-                    && ab.iter().all(|x| bb.iter().any(|y| Value::structural_eq_boxed(x, y)))
+                    && ab
+                        .iter()
+                        .all(|x| bb.iter().any(|y| Value::structural_eq_boxed(x, y)))
             }
             (Map { entries: a, .. }, Map { entries: b, .. }) => {
                 let ab = a.borrow();
@@ -1449,12 +1630,24 @@ impl Value {
                     && Value::structural_eq_boxed(a2, b2)
                     && Value::structural_eq_boxed(a3, b3)
             }
-            (MapEntry { key: k1, value: v1, .. }, MapEntry { key: k2, value: v2, .. }) => {
-                Value::structural_eq_boxed(k1, k2) && Value::structural_eq_boxed(v1, v2)
-            }
-            (Result { ok: o1, payload: p1 }, Result { ok: o2, payload: p2 }) => {
-                o1 == o2 && Value::structural_eq(p1, p2)
-            }
+            (
+                MapEntry {
+                    key: k1, value: v1, ..
+                },
+                MapEntry {
+                    key: k2, value: v2, ..
+                },
+            ) => Value::structural_eq_boxed(k1, k2) && Value::structural_eq_boxed(v1, v2),
+            (
+                Result {
+                    ok: o1,
+                    payload: p1,
+                },
+                Result {
+                    ok: o2,
+                    payload: p2,
+                },
+            ) => o1 == o2 && Value::structural_eq(p1, p2),
             (Class(a), Class(b)) => a.fqn == b.fqn,
             // Function values compare by identity. Two distinct
             // closures created by the same source position are still
@@ -1462,16 +1655,35 @@ impl Value {
             // reference equality, which gives `List.remove(handler)`
             // a way to drop the exact callable that subscribe()
             // returned.
-            (Lambda { body: a, env: ea, .. }, Lambda { body: b, env: eb, .. }) => {
-                Arc::ptr_eq(a, b) && ObjRef::ptr_eq(ea, eb)
-            }
             (
-                IrClosure { id: a, captures: ca },
-                IrClosure { id: b, captures: cb },
+                Lambda {
+                    body: a, env: ea, ..
+                },
+                Lambda {
+                    body: b, env: eb, ..
+                },
+            ) => Arc::ptr_eq(a, b) && ObjRef::ptr_eq(ea, eb),
+            (
+                IrClosure {
+                    id: a,
+                    captures: ca,
+                },
+                IrClosure {
+                    id: b,
+                    captures: cb,
+                },
             ) => a == b && Arc::ptr_eq(ca, cb),
             (
-                BoundMethod { fqn: fa, receiver: ra, .. },
-                BoundMethod { fqn: fb, receiver: rb, .. },
+                BoundMethod {
+                    fqn: fa,
+                    receiver: ra,
+                    ..
+                },
+                BoundMethod {
+                    fqn: fb,
+                    receiver: rb,
+                    ..
+                },
             ) => fa == fb && Value::structural_eq(ra, rb),
             (Instance(a), Instance(b)) => {
                 if ObjRef::ptr_eq(a, b) {
@@ -1505,9 +1717,12 @@ impl Value {
     /// `==`) fall back to structural equality. Crucially this never
     /// dispatches a user `equals`, so a `this === other` guard inside
     /// an `equals` / `plus` override cannot recurse into itself.
+    // Per-variant-pair dispatch; arms stay distinct for clarity even where
+    // their pointer-identity bodies coincide.
+    #[allow(clippy::match_same_arms)]
     #[must_use]
     pub fn reference_eq(a: &Value, b: &Value) -> bool {
-        use Value::{Instance, Cell, List, Set, Map, Array, Intrinsic, CoroutineSuspended};
+        use Value::{Array, Cell, CoroutineSuspended, Instance, Intrinsic, List, Map, Set};
         match (a, b) {
             (Instance(x), Instance(y)) => ObjRef::ptr_eq(x, y),
             (Cell(x), Cell(y)) => ObjRef::ptr_eq(x, y),

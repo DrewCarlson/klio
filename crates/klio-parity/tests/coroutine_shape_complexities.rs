@@ -116,11 +116,7 @@ fun main() {
     println(findFirstPair(grid, 99))
 }
 "#;
-    assert_klio(
-        "two_level_inline_composition",
-        src,
-        "found(5)\nmissing\n",
-    );
+    assert_klio("two_level_inline_composition", src, "found(5)\nmissing\n");
 }
 
 // 4. Sealed hierarchy + when + smart-cast + enclosing-fn capture +
@@ -159,11 +155,7 @@ fun main() {
     println(s.drain(listOf(Event.Msg("hi"), Event.Tick, Event.Err(7), Event.Msg("bye"))))
 }
 "#;
-    assert_klio(
-        "sealed_smartcast_inline_ext",
-        src,
-        "M:hi|T|E:7|M:bye|\n",
-    );
+    assert_klio("sealed_smartcast_inline_ext", src, "M:hi|T|E:7|M:bye|\n");
 }
 
 // 5. Subclass + private member referenced from a lambda inside a
@@ -183,11 +175,7 @@ class Sub(s: Int) : Base(s) {
 fun main() { println(Sub(5).process(listOf(0, 1, 2, 3))) }
 "#;
     // seed=5; mix(n) = (n xor 5) + 1 ; xor: 0^5=5,1^5=4,2^5=7,3^5=6 ; +1: 6,5,8,7
-    assert_klio(
-        "subclass_private_via_inline_tap",
-        src,
-        "6,5,8,7\n",
-    );
+    assert_klio("subclass_private_via_inline_tap", src, "6,5,8,7\n");
 }
 
 // 6. Generic class with two nested generic classes, inline extension

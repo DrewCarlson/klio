@@ -1,46 +1,42 @@
-use crate::{VmHost, with_outer_this, MEMBER_ONLY_PROBE, with_inner_outer_hint, in_top_level_init, Arc, ClosureInfo};
+use crate::{
+    Arc, ClosureInfo, MEMBER_ONLY_PROBE, VmHost, in_top_level_init, with_inner_outer_hint,
+    with_outer_this,
+};
 
 impl VmHost<'_> {
+    // Thread-local enclosing-`this` stack accessors; `self` is kept to
+    // mirror the Host trait method signatures these forward to.
+    #[allow(clippy::unused_self)]
     pub(crate) fn enclosing_this(&self) -> Option<klio_runtime::Value> {
         with_outer_this(|s| s.borrow().last().cloned())
     }
 
+    #[allow(clippy::unused_self)]
     pub(crate) fn enclosing_this_chain(&self) -> Vec<klio_runtime::Value> {
         with_outer_this(|s| s.borrow().iter().rev().cloned().collect())
     }
 
-    pub(crate) fn callable_receiver_shape(
-        &self,
-        v: &klio_runtime::Value,
-    ) -> Option<(usize, bool)> {
+    // Closure ids index the side-table; the u64 id narrows to usize.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn callable_receiver_shape(&self, v: &klio_runtime::Value) -> Option<(usize, bool)> {
         if let klio_runtime::Value::IrClosure { id, .. } = v {
             let info = self.closures.get(*id as usize)?;
             let func = self.module.funcs.get(info.body_func.0 as usize)?;
-            let first_is_this = func
-                .params
-                .first()
-                .is_some_and(|p| p.name == "this");
+            let first_is_this = func.params.first().is_some_and(|p| p.name == "this");
             return Some((info.n_params, first_is_this));
         }
         None
     }
 
-    pub(crate) fn closure_needs_this_capture(
-        &self,
-        v: &klio_runtime::Value,
-    ) -> bool {
+    // Closure ids index the side-table; the u64 id narrows to usize.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn closure_needs_this_capture(&self, v: &klio_runtime::Value) -> bool {
         if let klio_runtime::Value::IrClosure { id, captures } = v {
-            let info = match self.closures.get(*id as usize) {
-                Some(i) => i,
-                None => return false,
+            let Some(info) = self.closures.get(*id as usize) else {
+                return false;
             };
-            let idx = match info
-                .capture_names
-                .iter()
-                .position(|n| n == "this")
-            {
-                Some(i) => i,
-                None => return false,
+            let Some(idx) = info.capture_names.iter().position(|n| n == "this") else {
+                return false;
             };
             let snap = captures.get(idx);
             !matches!(snap, Some(klio_runtime::Value::Instance(_)))
@@ -49,6 +45,8 @@ impl VmHost<'_> {
         }
     }
 
+    // Closure ids index the side-table; the u64 id narrows to usize.
+    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn override_closure_this(
         &mut self,
         v: &klio_runtime::Value,
@@ -56,18 +54,17 @@ impl VmHost<'_> {
     ) {
         if let klio_runtime::Value::IrClosure { id, .. } = v
             && let Some(info) = self.closures.get(*id as usize)
-                && let Some(idx) =
-                    info.capture_names.iter().position(|n| n == "this")
-                {
-                    let captures = info.captures.clone();
-                    let mut cap = captures.borrow_mut();
-                    if idx < cap.len() {
-                        cap[idx] = new_this.clone();
-                    } else {
-                        cap.resize(idx + 1, klio_runtime::Value::Null);
-                        cap[idx] = new_this.clone();
-                    }
-                }
+            && let Some(idx) = info.capture_names.iter().position(|n| n == "this")
+        {
+            let captures = info.captures.clone();
+            let mut cap = captures.borrow_mut();
+            if idx < cap.len() {
+                cap[idx] = new_this.clone();
+            } else {
+                cap.resize(idx + 1, klio_runtime::Value::Null);
+                cap[idx] = new_this.clone();
+            }
+        }
     }
 
     pub(crate) fn call_member_only(
@@ -102,26 +99,36 @@ impl VmHost<'_> {
         )
     }
 
+    // Thread-local hint/enclosing-stack mutators; `self` is kept to mirror
+    // the Host trait method signatures these forward to.
+    #[allow(clippy::unused_self)]
     pub(crate) fn push_inner_outer_hint(&mut self, v: &klio_runtime::Value) {
         with_inner_outer_hint(|s| s.borrow_mut().push(v.clone()));
     }
 
+    #[allow(clippy::unused_self)]
     pub(crate) fn pop_inner_outer_hint(&mut self) {
         with_inner_outer_hint(|s| {
             s.borrow_mut().pop();
         });
     }
 
+    #[allow(clippy::unused_self)]
     pub(crate) fn push_access_enclosing(&self, v: &klio_runtime::Value) {
         with_outer_this(|s| s.borrow_mut().push(v.clone()));
     }
 
+    #[allow(clippy::unused_self)]
     pub(crate) fn pop_access_enclosing(&self) {
         with_outer_this(|s| {
             s.borrow_mut().pop();
         });
     }
 
+    // One ordered name-resolution probe chain (cached global, delegate
+    // auto-resolve, user class/function, stdlib FQN probes, synthetic class
+    // names, typealias follow); splitting it would fragment the fallthrough.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         let cached = self.globals.borrow().lookup(name);
         // Forward reference to a top-level property whose own
@@ -134,24 +141,30 @@ impl VmHost<'_> {
             && matches!(&cached, None | Some(klio_runtime::Value::Null))
             && self.prog.top_level_prop_inits.contains_key(name)
             && let Ok(Some(v)) = self.ensure_top_level_inited(name)
-                && !matches!(v, klio_runtime::Value::Null) {
-                    return Some(v);
-                }
-        if self.module.registry.top_level_delegated_props.contains(name)
+            && !matches!(v, klio_runtime::Value::Null)
+        {
+            return Some(v);
+        }
+        if self
+            .module
+            .registry
+            .top_level_delegated_props
+            .contains(name)
             && let Some(v) = cached.clone()
-                && matches!(v, klio_runtime::Value::Instance(_)) {
-                    let prop_ref = klio_runtime::Value::PropertyRef {
-                        name: Arc::new(name.to_string()),
-                    };
-                    if let Ok(result) = <Self as klio_ir::eval::Host>::call_member(
-                        self,
-                        &v,
-                        "getValue",
-                        &[klio_runtime::Value::Null, prop_ref],
-                    ) {
-                        return Some(result);
-                    }
-                }
+            && matches!(v, klio_runtime::Value::Instance(_))
+        {
+            let prop_ref = klio_runtime::Value::PropertyRef {
+                name: Arc::new(name.to_string()),
+            };
+            if let Ok(result) = <Self as klio_ir::eval::Host>::call_member(
+                self,
+                &v,
+                "getValue",
+                &[klio_runtime::Value::Null, prop_ref],
+            ) {
+                return Some(result);
+            }
+        }
         if let Some(v) = cached {
             // Delegate auto-resolve for top-level `var/val X by <delegate>`.
             if let klio_runtime::Value::Delegate(d) = &v {
@@ -176,13 +189,14 @@ impl VmHost<'_> {
                         return Some(v);
                     }
                     klio_runtime::DelegateKind::NotNull { value, name: _ } => {
-                        if let Some(x) = value.clone() { return Some(x) } else {
-                            // Reading a `Delegates.notNull` slot
-                            // before it's been written throws
-                            // IllegalStateException per Kotlin.
-                            let _ = name;
-                            return None;
+                        if let Some(x) = value.clone() {
+                            return Some(x);
                         }
+                        // Reading a `Delegates.notNull` slot
+                        // before it's been written throws
+                        // IllegalStateException per Kotlin.
+                        let _ = name;
+                        return None;
                     }
                     klio_runtime::DelegateKind::Observable { value, .. } => {
                         return Some(value.clone());
@@ -278,11 +292,11 @@ impl VmHost<'_> {
         // `direct_probes` about every pack's package.
         {
             let suffix = format!(".{name}");
-            let entry: Option<(&'static str, klio_runtime::StdlibFn)> = self.prog
+            let entry: Option<(&'static str, klio_runtime::StdlibFn)> = self
+                .prog
                 .installed_bindings
                 .entries()
-                .find(|(k, _)| k.ends_with(&suffix))
-                .map(|(k, f)| (k, f));
+                .find(|(k, _)| k.ends_with(&suffix));
             if let Some((fqn, func)) = entry {
                 return Some(klio_runtime::Value::Intrinsic { fqn, func });
             }
@@ -301,10 +315,9 @@ impl VmHost<'_> {
                         .chars()
                         .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit());
                 let leaked: &'static str = Box::leak(fqn.clone().into_boxed_str());
-                if looks_const
-                    && let Ok(v) = self.dispatch_intrinsic(func, &[]) {
-                        return Some(v);
-                    }
+                if looks_const && let Ok(v) = self.dispatch_intrinsic(func, &[]) {
+                    return Some(v);
+                }
                 return Some(klio_runtime::Value::Intrinsic { fqn: leaked, func });
             }
         }
@@ -346,9 +359,23 @@ impl VmHost<'_> {
         // simple name + a kotlin.* fqn for reflection-style reads.
         if matches!(
             name,
-            "Int" | "Long" | "Short" | "Byte" | "Float" | "Double" | "Boolean"
-                | "Char" | "String" | "Unit" | "Any" | "Nothing" | "UInt"
-                | "ULong" | "UShort" | "UByte" | "Number"
+            "Int"
+                | "Long"
+                | "Short"
+                | "Byte"
+                | "Float"
+                | "Double"
+                | "Boolean"
+                | "Char"
+                | "String"
+                | "Unit"
+                | "Any"
+                | "Nothing"
+                | "UInt"
+                | "ULong"
+                | "UShort"
+                | "UByte"
+                | "Number"
         ) {
             let def = Arc::new(klio_runtime::ClassDef {
                 name: name.to_string(),
@@ -358,7 +385,7 @@ impl VmHost<'_> {
                 methods: Vec::new(),
                 body_properties: Vec::new(),
                 init_blocks: Vec::new(),
-            init_block_property_positions: Vec::new(),
+                init_block_property_positions: Vec::new(),
                 is_data: false,
                 is_value: false,
                 is_object: false,
@@ -391,9 +418,10 @@ impl VmHost<'_> {
         // dotted-name global ref; we split on `.` and consult the
         // stdlib's primitive-companion table.
         if let Some((ty, member)) = name.split_once('.')
-            && let Some(v) = klio_stdlib::primitive_companion_const(ty, member) {
-                return Some(v);
-            }
+            && let Some(v) = klio_stdlib::primitive_companion_const(ty, member)
+        {
+            return Some(v);
+        }
         // Package-qualified reference (not a call) to a user / pack
         // top-level class. The class table is keyed by simple name
         // (the package prefix lives on each decl's `fqn`), so retry
@@ -403,25 +431,20 @@ impl VmHost<'_> {
         // `Inst::Call` at lower time so they keep overload
         // resolution; this only covers bare refs.
         if let Some((_, tail)) = name.rsplit_once('.')
-            && tail != name && !tail.is_empty()
-                && let Some(def) = self.classes.borrow().get(tail).cloned() {
-                    return Some(klio_runtime::Value::Class(def));
-                }
+            && tail != name
+            && !tail.is_empty()
+            && let Some(def) = self.classes.borrow().get(tail).cloned()
+        {
+            return Some(klio_runtime::Value::Class(def));
+        }
         // `typealias Alias = Target` — resolve the alias to the
         // aliased declaration for value/qualifier position
         // (`Alias.of(...)`, `Alias(...)`). Follow chains with a
         // cycle guard.
         {
             let mut cur = name.to_string();
-            let mut seen: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            while let Some(target) = self
-                .module
-                .registry
-                .type_aliases
-                .get(&cur)
-                .cloned()
-            {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            while let Some(target) = self.module.registry.type_aliases.get(&cur).cloned() {
                 if !seen.insert(cur.clone()) {
                     break;
                 }
@@ -439,21 +462,27 @@ impl VmHost<'_> {
         name: &str,
         value: klio_runtime::Value,
     ) -> Result<(), klio_ir::eval::EvalError> {
-        if self.module.registry.top_level_delegated_props.contains(name) {
+        if self
+            .module
+            .registry
+            .top_level_delegated_props
+            .contains(name)
+        {
             let existing = self.globals.borrow().lookup(name);
             if let Some(d) = existing
-                && matches!(d, klio_runtime::Value::Instance(_)) {
-                    let prop_ref = klio_runtime::Value::PropertyRef {
-                        name: Arc::new(name.to_string()),
-                    };
-                    <Self as klio_ir::eval::Host>::call_member(
-                        self,
-                        &d,
-                        "setValue",
-                        &[klio_runtime::Value::Null, prop_ref, value],
-                    )?;
-                    return Ok(());
-                }
+                && matches!(d, klio_runtime::Value::Instance(_))
+            {
+                let prop_ref = klio_runtime::Value::PropertyRef {
+                    name: Arc::new(name.to_string()),
+                };
+                <Self as klio_ir::eval::Host>::call_member(
+                    self,
+                    &d,
+                    "setValue",
+                    &[klio_runtime::Value::Null, prop_ref, value],
+                )?;
+                return Ok(());
+            }
         }
         // Delegate-aware write: if the slot currently holds a
         // `Value::Delegate(NotNull/Observable)`, route the write
@@ -470,7 +499,10 @@ impl VmHost<'_> {
                     };
                     return Ok(());
                 }
-                klio_runtime::DelegateKind::Observable { value: old, on_change } => {
+                klio_runtime::DelegateKind::Observable {
+                    value: old,
+                    on_change,
+                } => {
                     *d.borrow_mut() = klio_runtime::DelegateKind::Observable {
                         value: value.clone(),
                         on_change: on_change.clone(),
@@ -485,7 +517,7 @@ impl VmHost<'_> {
                     )?;
                     return Ok(());
                 }
-                _ => {}
+                klio_runtime::DelegateKind::Lazy { .. } => {}
             }
         }
         // Assign through the scope chain so a write to an existing
@@ -510,17 +542,18 @@ impl VmHost<'_> {
     ) -> Result<Option<klio_runtime::Value>, klio_ir::eval::EvalError> {
         let raw = self.globals.borrow().lookup(name);
         if let Some(klio_runtime::Value::Delegate(d)) = &raw
-            && let klio_runtime::DelegateKind::NotNull { value: None, .. } = &*d.borrow() {
-                return Err(klio_ir::eval::EvalError::Throw(
-                    klio_runtime::Value::Exception {
-                        fqn: Arc::new("kotlin.IllegalStateException".to_string()),
-                        message: Some(Arc::new(format!(
-                            "Property {name} should be initialized before get."
-                        ))),
-                        cause: None,
-                    },
-                ));
-            }
+            && let klio_runtime::DelegateKind::NotNull { value: None, .. } = &*d.borrow()
+        {
+            return Err(klio_ir::eval::EvalError::Throw(
+                klio_runtime::Value::Exception {
+                    fqn: Arc::new("kotlin.IllegalStateException".to_string()),
+                    message: Some(Arc::new(format!(
+                        "Property {name} should be initialized before get."
+                    ))),
+                    cause: None,
+                },
+            ));
+        }
         // Top-level delegated property backed by an Instance delegate
         // (e.g. `by Delegates.notNull()` which inlines to a
         // NotNullProperty instance): dispatch getValue and PROPAGATE its
@@ -528,19 +561,24 @@ impl VmHost<'_> {
         // error and falls back to returning the delegate instance, so a
         // NotNullProperty read-before-init silently yielded the delegate
         // instead of throwing IllegalStateException.
-        if self.module.registry.top_level_delegated_props.contains(name)
-            && let Some(v @ klio_runtime::Value::Instance(_)) = raw.clone() {
-                let prop_ref = klio_runtime::Value::PropertyRef {
-                    name: Arc::new(name.to_string()),
-                };
-                let result = <Self as klio_ir::eval::Host>::call_member(
-                    self,
-                    &v,
-                    "getValue",
-                    &[klio_runtime::Value::Null, prop_ref],
-                )?;
-                return Ok(Some(result));
-            }
+        if self
+            .module
+            .registry
+            .top_level_delegated_props
+            .contains(name)
+            && let Some(v @ klio_runtime::Value::Instance(_)) = raw.clone()
+        {
+            let prop_ref = klio_runtime::Value::PropertyRef {
+                name: Arc::new(name.to_string()),
+            };
+            let result = <Self as klio_ir::eval::Host>::call_member(
+                self,
+                &v,
+                "getValue",
+                &[klio_runtime::Value::Null, prop_ref],
+            )?;
+            return Ok(Some(result));
+        }
         Ok(self.lookup_global(name))
     }
 }

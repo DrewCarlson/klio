@@ -1,4 +1,7 @@
-use super::{Parser, ModifierFlags, Function, TokenKind, Ident, FunctionBody, Expr, Param, Keyword, TypeRef, Property, Accessor, Visibility};
+use super::{
+    Accessor, Expr, Function, FunctionBody, Ident, Keyword, ModifierFlags, Param, Parser, Property,
+    TokenKind, TypeRef, Visibility,
+};
 
 impl Parser<'_, '_> {
     pub(crate) fn parse_fun(&mut self, flags: ModifierFlags) -> Option<Function> {
@@ -11,6 +14,60 @@ impl Parser<'_, '_> {
         } else {
             Vec::new()
         };
+        let receiver_type = self.parse_fun_receiver()?;
+        let name = self.parse_ident("function name")?;
+        self.expect(&TokenKind::LParen, "`(`")?;
+        let params = self.parse_param_list();
+        self.expect(&TokenKind::RParen, "`)`")?;
+        let return_type = if matches!(self.peek_kind(), TokenKind::Colon) {
+            self.bump();
+            self.parse_type()
+        } else {
+            None
+        };
+        let where_bounds = self.parse_where_clause();
+        self.skip_nl();
+        let body = match self.peek_kind() {
+            TokenKind::LBrace => self.parse_block().map(FunctionBody::Block),
+            TokenKind::Eq => {
+                self.bump();
+                self.skip_nl();
+                self.parse_expr_body().map(FunctionBody::Expr)
+            }
+            _ => None, // Function declaration without body (abstract / external).
+        };
+        let end = self.tokens[self.pos.saturating_sub(1)].span;
+        Some(Function {
+            name,
+            receiver_type,
+            type_params,
+            where_bounds,
+            params,
+            return_type,
+            body,
+            is_open: flags.is_open || flags.is_abstract,
+            is_override: flags.is_override,
+            is_abstract: flags.is_abstract,
+            is_operator: flags.is_operator,
+            is_inline: flags.is_inline,
+            is_infix: flags.is_infix,
+            is_tailrec: flags.is_tailrec,
+            is_suspend: flags.is_suspend,
+            is_expect: flags.is_expect,
+            is_actual: flags.is_actual,
+            visibility: flags.visibility,
+            annotations: flags.annotations,
+            span: kw.span.join(end),
+        })
+    }
+
+    /// Parse the optional extension receiver preceding a function name.
+    /// Returns `Some(None)` when there is no receiver, `Some(ty)` for a
+    /// receiver, and `None` to propagate a parse failure to the caller.
+    // The three states (parse failure / no receiver / receiver type) are all
+    // meaningful here.
+    #[allow(clippy::option_option)]
+    fn parse_fun_receiver(&mut self) -> Option<Option<TypeRef>> {
         // Receiver-typed extension function: `fun T.foo(...)` or
         // `fun T?.foo(...)`. We pre-scan for the pattern
         // `Ident (?)? . Ident` so the regular non-extension path can
@@ -38,7 +95,9 @@ impl Parser<'_, '_> {
                     && matches!(after_2, Some(TokenKind::Dot))
                 {
                     self.bump(); // '.'
-                    let Some(seg) = self.parse_ident("type segment") else { break };
+                    let Some(seg) = self.parse_ident("type segment") else {
+                        break;
+                    };
                     t.name = Ident {
                         name: format!("{}.{}", t.name.name, seg.name),
                         span: t.name.span.join(seg.span),
@@ -115,50 +174,7 @@ impl Parser<'_, '_> {
         } else {
             None
         };
-        let name = self.parse_ident("function name")?;
-        self.expect(&TokenKind::LParen, "`(`")?;
-        let params = self.parse_param_list();
-        self.expect(&TokenKind::RParen, "`)`")?;
-        let return_type = if matches!(self.peek_kind(), TokenKind::Colon) {
-            self.bump();
-            self.parse_type()
-        } else {
-            None
-        };
-        let where_bounds = self.parse_where_clause();
-        self.skip_nl();
-        let body = match self.peek_kind() {
-            TokenKind::LBrace => self.parse_block().map(FunctionBody::Block),
-            TokenKind::Eq => {
-                self.bump();
-                self.skip_nl();
-                self.parse_expr_body().map(FunctionBody::Expr)
-            }
-            _ => None, // Function declaration without body (abstract / external).
-        };
-        let end = self.tokens[self.pos.saturating_sub(1)].span;
-        Some(Function {
-            name,
-            receiver_type,
-            type_params,
-            where_bounds,
-            params,
-            return_type,
-            body,
-            is_open: flags.is_open || flags.is_abstract,
-            is_override: flags.is_override,
-            is_abstract: flags.is_abstract,
-            is_operator: flags.is_operator,
-            is_inline: flags.is_inline,
-            is_infix: flags.is_infix,
-            is_tailrec: flags.is_tailrec,
-            is_suspend: flags.is_suspend,
-            is_expect: flags.is_expect,
-            is_actual: flags.is_actual,
-            visibility: flags.visibility,
-            annotations: flags.annotations,
-            span: kw.span.join(end),
-        })
+        Some(receiver_type)
     }
 
     /// Anonymous-function expression: `fun [<T>] [Receiver.](...) [: Ret] [body]`.
@@ -174,11 +190,12 @@ impl Parser<'_, '_> {
         let receiver_ty = if self.looks_like_anon_fun_receiver() {
             let mut ty = self.parse_simple_type();
             if let Some(t) = ty.as_mut()
-                && self.peek_kind().is_question() {
-                    let q = self.bump();
-                    t.nullable = true;
-                    t.span = t.span.join(q.span);
-                }
+                && self.peek_kind().is_question()
+            {
+                let q = self.bump();
+                t.nullable = true;
+                t.span = t.span.join(q.span);
+            }
             self.expect(&TokenKind::Dot, "`.`")?;
             self.skip_nl();
             ty
@@ -201,7 +218,8 @@ impl Parser<'_, '_> {
             TokenKind::Eq => {
                 self.bump();
                 self.skip_nl();
-                self.parse_expr_body().map(|e| Box::new(FunctionBody::Expr(e)))
+                self.parse_expr_body()
+                    .map(|e| Box::new(FunctionBody::Expr(e)))
             }
             _ => None,
         };
@@ -220,7 +238,9 @@ impl Parser<'_, '_> {
     /// Distinct from named-fun extension receivers because no name follows
     /// the dot.
     pub(crate) fn looks_like_anon_fun_receiver(&self) -> bool {
-        let Some(t0) = self.tokens.get(self.pos) else { return false };
+        let Some(t0) = self.tokens.get(self.pos) else {
+            return false;
+        };
         if !matches!(t0.kind, TokenKind::Ident) {
             return false;
         }
@@ -229,7 +249,10 @@ impl Parser<'_, '_> {
             j += 1;
         }
         matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Dot))
-            && matches!(self.tokens.get(j + 1).map(|t| &t.kind), Some(TokenKind::LParen))
+            && matches!(
+                self.tokens.get(j + 1).map(|t| &t.kind),
+                Some(TokenKind::LParen)
+            )
     }
 
     /// Look-ahead for `Ident (?)? . Ident` at the current cursor — the
@@ -237,7 +260,9 @@ impl Parser<'_, '_> {
     /// Avoids parser commitment so the regular non-extension declaration
     /// path stays unaffected when no receiver is present.
     pub(crate) fn looks_like_extension_receiver(&self) -> bool {
-        let Some(t0) = self.tokens.get(self.pos) else { return false };
+        let Some(t0) = self.tokens.get(self.pos) else {
+            return false;
+        };
         if !matches!(t0.kind, TokenKind::Ident) {
             return false;
         }
@@ -261,11 +286,20 @@ impl Parser<'_, '_> {
         }
         // `T?.foo` lexes the `?.` as a single `QuestionDot` token; treat it
         // as nullable-receiver followed by the member separator.
-        if matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::QuestionDot)) {
-            return matches!(self.tokens.get(j + 1).map(|t| &t.kind), Some(TokenKind::Ident));
+        if matches!(
+            self.tokens.get(j).map(|t| &t.kind),
+            Some(TokenKind::QuestionDot)
+        ) {
+            return matches!(
+                self.tokens.get(j + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident)
+            );
         }
         matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Dot))
-            && matches!(self.tokens.get(j + 1).map(|t| &t.kind), Some(TokenKind::Ident))
+            && matches!(
+                self.tokens.get(j + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident)
+            )
     }
 
     /// Look-ahead for a parenthesized extension receiver:
@@ -274,7 +308,10 @@ impl Parser<'_, '_> {
     /// type, so the `Ident`-led [`looks_like_extension_receiver`]
     /// scan does not apply.
     pub(crate) fn looks_like_paren_extension_receiver(&self) -> bool {
-        if !matches!(self.tokens.get(self.pos).map(|t| &t.kind), Some(TokenKind::LParen)) {
+        if !matches!(
+            self.tokens.get(self.pos).map(|t| &t.kind),
+            Some(TokenKind::LParen)
+        ) {
             return false;
         }
         let mut depth = 0usize;
@@ -297,11 +334,20 @@ impl Parser<'_, '_> {
         if self.tokens.get(j).is_some_and(|t| t.kind.is_question()) {
             j += 1;
         }
-        if matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::QuestionDot)) {
-            return matches!(self.tokens.get(j + 1).map(|t| &t.kind), Some(TokenKind::Ident));
+        if matches!(
+            self.tokens.get(j).map(|t| &t.kind),
+            Some(TokenKind::QuestionDot)
+        ) {
+            return matches!(
+                self.tokens.get(j + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident)
+            );
         }
         matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Dot))
-            && matches!(self.tokens.get(j + 1).map(|t| &t.kind), Some(TokenKind::Ident))
+            && matches!(
+                self.tokens.get(j + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident)
+            )
     }
 
     pub(crate) fn parse_param_list(&mut self) -> Vec<Param> {
@@ -368,7 +414,10 @@ impl Parser<'_, '_> {
             }
             let ty = if has_colon || !allow_no_type {
                 self.parse_type().unwrap_or_else(|| TypeRef {
-                    name: Ident { name: "Any".into(), span: name.span },
+                    name: Ident {
+                        name: "Any".into(),
+                        span: name.span,
+                    },
                     nullable: true,
                     span: name.span,
                     type_args: Vec::new(),
@@ -380,7 +429,10 @@ impl Parser<'_, '_> {
                 // No colon and the caller allows it: synthesise an
                 // `Any?` placeholder without trying to parse a type.
                 TypeRef {
-                    name: Ident { name: "Any".into(), span: name.span },
+                    name: Ident {
+                        name: "Any".into(),
+                        span: name.span,
+                    },
                     nullable: true,
                     span: name.span,
                     type_args: Vec::new(),
@@ -456,6 +508,57 @@ impl Parser<'_, '_> {
             let _ = self.parse_annotations();
             self.skip_nl();
         }
+        let receiver_type = self.parse_property_receiver()?;
+        let name = self.parse_ident("property name")?;
+        let ty = if matches!(self.peek_kind(), TokenKind::Colon) {
+            self.bump();
+            self.parse_type()
+        } else {
+            None
+        };
+        let mut init: Option<Expr> = None;
+        let mut delegate: Option<Expr> = None;
+        if matches!(self.peek_kind(), TokenKind::Eq) {
+            self.bump();
+            self.skip_nl();
+            init = self.parse_expr();
+        } else if self.peek_ident_text() == Some("by") {
+            self.bump();
+            self.skip_nl();
+            delegate = self.parse_expr();
+        }
+        let (getter, setter, setter_visibility) = self.parse_property_accessors()?;
+        let end = self.tokens[self.pos.saturating_sub(1)].span;
+        Some(Property {
+            mutable,
+            name,
+            receiver_type,
+            ty,
+            init,
+            delegate,
+            getter,
+            setter,
+            is_abstract: flags.is_abstract,
+            is_open: flags.is_open,
+            is_override: flags.is_override,
+            is_lateinit: flags.is_lateinit,
+            is_const: flags.is_const,
+            is_inline: flags.is_inline,
+            is_expect: flags.is_expect,
+            is_actual: flags.is_actual,
+            setter_visibility,
+            visibility: flags.visibility,
+            annotations: flags.annotations,
+            span: kw_tok.span.join(end),
+        })
+    }
+
+    /// Parse the optional extension receiver preceding a property name.
+    /// Returns `Some(None)` when there is no receiver, `Some(ty)` for a
+    /// receiver, and `None` to propagate a parse failure to the caller.
+    // Tri-state: outer `None` = parse failure, `Some(None)` = no receiver, `Some(Some)` = receiver type.
+    #[allow(clippy::option_option)]
+    fn parse_property_receiver(&mut self) -> Option<Option<TypeRef>> {
         let receiver_type = if self.looks_like_extension_receiver() {
             let saved_sqp = self.suppress_qualified_path;
             self.suppress_qualified_path = true;
@@ -493,76 +596,77 @@ impl Parser<'_, '_> {
         } else {
             None
         };
-        let name = self.parse_ident("property name")?;
-        let ty = if matches!(self.peek_kind(), TokenKind::Colon) {
-            self.bump();
-            self.parse_type()
-        } else {
-            None
-        };
-        let mut init: Option<Expr> = None;
-        let mut delegate: Option<Expr> = None;
-        if matches!(self.peek_kind(), TokenKind::Eq) {
-            self.bump();
-            self.skip_nl();
-            init = self.parse_expr();
-        } else if self.peek_ident_text() == Some("by") {
-            self.bump();
-            self.skip_nl();
-            delegate = self.parse_expr();
+        Some(receiver_type)
+    }
+
+    /// Lookahead from `from`, skipping newlines and any leading `inline` /
+    /// visibility modifiers ahead of a `get` / `set` keyword. Returns the
+    /// token index of the keyword candidate plus the modifiers seen. Does
+    /// not advance `self.pos`.
+    fn scan_accessor_modifiers(&self, from: usize) -> (usize, Option<Visibility>, bool) {
+        let mut i = from;
+        while matches!(
+            self.tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Newline)
+        ) {
+            i += 1;
         }
-        // Optional get()/set(value) accessors. They may follow on the next
-        // line or after newlines. Both can appear in either order.
+        let mut acc_visibility: Option<Visibility> = None;
+        let mut acc_inline = false;
+        // Accept `inline` and / or a visibility modifier in either order
+        // ahead of the `get` / `set` keyword. Kotlin allows `inline get()`
+        // and `private inline set(v)`; both combinations parse here.
+        while let Some(tok) = self.tokens.get(i) {
+            if !matches!(tok.kind, TokenKind::Ident) {
+                break;
+            }
+            let txt = self.text(tok.span);
+            let v = match txt {
+                "public" => Some(Visibility::Public),
+                "private" => Some(Visibility::Private),
+                "protected" => Some(Visibility::Protected),
+                "internal" => Some(Visibility::Internal),
+                _ => None,
+            };
+            if v.is_some() && acc_visibility.is_none() {
+                acc_visibility = v;
+                i += 1;
+                while matches!(
+                    self.tokens.get(i).map(|t| &t.kind),
+                    Some(TokenKind::Newline)
+                ) {
+                    i += 1;
+                }
+                continue;
+            }
+            if txt == "inline" && !acc_inline {
+                acc_inline = true;
+                i += 1;
+                while matches!(
+                    self.tokens.get(i).map(|t| &t.kind),
+                    Some(TokenKind::Newline)
+                ) {
+                    i += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        (i, acc_visibility, acc_inline)
+    }
+
+    /// Parse the optional `get` / `set` accessors that may follow a property,
+    /// in either order and across newlines. Returns the getter, setter, and
+    /// any bare-`set` visibility, or `None` to propagate a parse failure.
+    fn parse_property_accessors(
+        &mut self,
+    ) -> Option<(Option<Accessor>, Option<Accessor>, Option<Visibility>)> {
         let mut getter: Option<Accessor> = None;
         let mut setter: Option<Accessor> = None;
         let mut setter_visibility: Option<Visibility> = None;
         loop {
             let save = self.pos;
-            // Peek across newlines for an optional visibility modifier
-            // followed by `get` / `set`. Accepts forms like `private set`
-            // (no body) and `private get() = ...`.
-            let mut i = self.pos;
-            while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
-                i += 1;
-            }
-            let mut acc_visibility: Option<Visibility> = None;
-            let mut acc_inline = false;
-            // Accept `inline` and / or a visibility modifier in either
-            // order ahead of the `get` / `set` keyword. Kotlin allows
-            // `inline get()` and `private inline set(v)`; both
-            // combinations parse here. Lookahead-only: the `pos` is
-            // committed below once the accessor is confirmed.
-            loop {
-                let Some(tok) = self.tokens.get(i) else { break };
-                if !matches!(tok.kind, TokenKind::Ident) {
-                    break;
-                }
-                let txt = self.text(tok.span);
-                let v = match txt {
-                    "public" => Some(Visibility::Public),
-                    "private" => Some(Visibility::Private),
-                    "protected" => Some(Visibility::Protected),
-                    "internal" => Some(Visibility::Internal),
-                    _ => None,
-                };
-                if v.is_some() && acc_visibility.is_none() {
-                    acc_visibility = v;
-                    i += 1;
-                    while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
-                        i += 1;
-                    }
-                    continue;
-                }
-                if txt == "inline" && !acc_inline {
-                    acc_inline = true;
-                    i += 1;
-                    while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
-                        i += 1;
-                    }
-                    continue;
-                }
-                break;
-            }
+            let (i, acc_visibility, acc_inline) = self.scan_accessor_modifiers(self.pos);
             let Some(tok) = self.tokens.get(i) else { break };
             if !matches!(tok.kind, TokenKind::Ident) {
                 break;
@@ -589,10 +693,9 @@ impl Parser<'_, '_> {
                 // `private set` (no `(...)`): record visibility on the
                 // Property itself; do NOT synthesize a custom accessor —
                 // the default one stays in effect.
-                if is_set
-                    && let Some(v) = acc_visibility {
-                        setter_visibility = Some(v);
-                    }
+                if is_set && let Some(v) = acc_visibility {
+                    setter_visibility = Some(v);
+                }
                 continue;
             }
             self.expect(&TokenKind::LParen, "`(`")?;
@@ -641,29 +744,6 @@ impl Parser<'_, '_> {
                 setter = Some(acc);
             }
         }
-        let end = self.tokens[self.pos.saturating_sub(1)].span;
-        Some(Property {
-            mutable,
-            name,
-            receiver_type,
-            ty,
-            init,
-            delegate,
-            getter,
-            setter,
-            is_abstract: flags.is_abstract,
-            is_open: flags.is_open,
-            is_override: flags.is_override,
-            is_lateinit: flags.is_lateinit,
-            is_const: flags.is_const,
-            is_inline: flags.is_inline,
-            is_expect: flags.is_expect,
-            is_actual: flags.is_actual,
-            setter_visibility,
-            visibility: flags.visibility,
-            annotations: flags.annotations,
-            span: kw_tok.span.join(end),
-        })
+        Some((getter, setter, setter_visibility))
     }
-
 }

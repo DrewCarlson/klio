@@ -128,7 +128,7 @@ fun main() {
 }
 
 #[test]
-fn data_class_componentN() {
+fn data_class_component_n() {
     let src = r#"
 data class Point(val x: Int, val y: Int, val z: Int)
 fun main() {

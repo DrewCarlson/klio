@@ -22,30 +22,28 @@ mod literals;
 mod thunks;
 mod when_expr;
 use ast_scan::{
-    collect_dotted_fqn, collect_path_idents, collect_path_idents_stmt,
-    compute_boxed_vars, is_boxed_to_any_form,
+    collect_dotted_fqn, collect_path_idents, collect_path_idents_stmt, compute_boxed_vars,
+    is_boxed_to_any_form,
+};
+use for_loop::{lower_for, lower_for_labeled};
+use inline_call::{
+    arg_lambda_has_nonlocal_return, splice_inline_lambda, try_inline_call_with_type_args,
 };
 use inline_state::inline_fn_ast;
-use for_loop::{lower_for, lower_for_labeled};
-pub use thunks::{
-    lower_accessor_block, lower_accessor_expr, lower_binary_expr_as_thunk,
-    lower_block_as_thunk, lower_block_as_unary_thunk, lower_empty_thunk,
-    lower_expr_as_param_thunk, lower_expr_as_param_thunk_scoped,
-    lower_expr_as_thunk, lower_init_block, lower_init_block_with_params,
-    lower_unary_expr_as_thunk,
-};
-use inline_call::{
-    arg_lambda_has_nonlocal_return, splice_inline_lambda,
-    try_inline_call_with_type_args,
-};
+pub use inline_state::{set_inline_fn_asts, set_shadowed_inline_names};
 use lambda_body::{
     lower_lambda_body_capturing, lower_lambda_body_capturing_kind,
     lower_lambda_body_capturing_kind_with, resolve_capture,
 };
-use when_expr::lower_when;
-pub use inline_state::{set_inline_fn_asts, set_shadowed_inline_names};
 pub use literals::widen_numeric_literal;
 use literals::{is_package_head, is_pkg_root};
+pub use thunks::{
+    lower_accessor_block, lower_accessor_expr, lower_binary_expr_as_thunk, lower_block_as_thunk,
+    lower_block_as_unary_thunk, lower_empty_thunk, lower_expr_as_param_thunk,
+    lower_expr_as_param_thunk_scoped, lower_expr_as_thunk, lower_init_block,
+    lower_init_block_with_params, lower_unary_expr_as_thunk,
+};
+use when_expr::lower_when;
 
 mod helpers;
 pub(crate) use helpers::*;
@@ -101,7 +99,10 @@ mod tests {
         let func = b.finish("f", "test.f", TypeRef::int());
         // 2 consts + 1 binop
         assert_eq!(func.blocks[0].insts.len(), 3);
-        assert!(matches!(func.blocks[0].insts[2], Inst::BinOp { op: BinOp::Add, .. }));
+        assert!(matches!(
+            func.blocks[0].insts[2],
+            Inst::BinOp { op: BinOp::Add, .. }
+        ));
     }
 
     #[test]
@@ -111,7 +112,10 @@ mod tests {
         let p = b.alloc_reg();
         b.bind("x", p);
         let path = Expr::Path {
-            segments: vec![klio_ast::Ident { name: "x".into(), span: dummy_span() }],
+            segments: vec![klio_ast::Ident {
+                name: "x".into(),
+                span: dummy_span(),
+            }],
             span: dummy_span(),
         };
         let r = lower_expr(&mut b, &path);
@@ -126,19 +130,27 @@ mod tests {
         b.bind("o", recv);
         let expr = Expr::Member {
             receiver: Box::new(Expr::Path {
-                segments: vec![klio_ast::Ident { name: "o".into(), span: dummy_span() }],
+                segments: vec![klio_ast::Ident {
+                    name: "o".into(),
+                    span: dummy_span(),
+                }],
                 span: dummy_span(),
             }),
-            name: klio_ast::Ident { name: "field".into(), span: dummy_span() },
+            name: klio_ast::Ident {
+                name: "field".into(),
+                span: dummy_span(),
+            },
             safe: false,
             span: dummy_span(),
         };
         let _ = lower_expr(&mut b, &expr);
         let func = b.finish("f", "test.f", TypeRef::unit());
-        assert!(func.blocks[0]
-            .insts
-            .iter()
-            .any(|i| matches!(i, Inst::GetField { .. })));
+        assert!(
+            func.blocks[0]
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::GetField { .. }))
+        );
     }
 
     #[test]
@@ -150,10 +162,16 @@ mod tests {
         let expr = Expr::Call {
             callee: Box::new(Expr::Member {
                 receiver: Box::new(Expr::Path {
-                    segments: vec![klio_ast::Ident { name: "o".into(), span: dummy_span() }],
+                    segments: vec![klio_ast::Ident {
+                        name: "o".into(),
+                        span: dummy_span(),
+                    }],
                     span: dummy_span(),
                 }),
-                name: klio_ast::Ident { name: "doit".into(), span: dummy_span() },
+                name: klio_ast::Ident {
+                    name: "doit".into(),
+                    span: dummy_span(),
+                },
                 safe: false,
                 span: dummy_span(),
             }),
@@ -165,18 +183,26 @@ mod tests {
         };
         let _ = lower_expr(&mut b, &expr);
         let func = b.finish("f", "test.f", TypeRef::unit());
-        assert!(func.blocks[0]
-            .insts
-            .iter()
-            .any(|i| matches!(i, Inst::CallMember { n_args: 2, .. })));
+        assert!(
+            func.blocks[0]
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::CallMember { n_args: 2, .. }))
+        );
     }
 
     #[test]
     fn lowers_while_loop_shape() {
         let mut m = Module::default();
         let mut b = FuncBuilder::new(&mut m);
-        let cond = Expr::BoolLit { value: true, span: dummy_span() };
-        let body = Expr::Block(klio_ast::Block { stmts: Vec::new(), span: dummy_span() });
+        let cond = Expr::BoolLit {
+            value: true,
+            span: dummy_span(),
+        };
+        let body = Expr::Block(klio_ast::Block {
+            stmts: Vec::new(),
+            span: dummy_span(),
+        });
         let w = Expr::While {
             cond: Box::new(cond),
             body: Box::new(body),
@@ -193,7 +219,10 @@ mod tests {
         let mut m = Module::default();
         let mut b = FuncBuilder::new(&mut m);
         let expr = Expr::If {
-            cond: Box::new(Expr::BoolLit { value: true, span: dummy_span() }),
+            cond: Box::new(Expr::BoolLit {
+                value: true,
+                span: dummy_span(),
+            }),
             then_branch: Box::new(int_lit(1)),
             else_branch: Some(Box::new(int_lit(2))),
             span: dummy_span(),

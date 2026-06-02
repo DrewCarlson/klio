@@ -653,13 +653,18 @@ fn floor_log2_pow10(x: i32) -> i32 {
 
 #[inline]
 fn pow10_f64(k: i32) -> (u64, u64) {
-    POW10[(k - POW10_MIN_K) as usize]
+    // `k - POW10_MIN_K` is a valid non-negative table index for callers.
+    #[allow(clippy::cast_sign_loss)]
+    let idx = (k - POW10_MIN_K) as usize;
+    POW10[idx]
 }
 
 /// `round_to_odd(g, cp)` — the high 64 bits of `cp · g` (128-bit `g`),
 /// with the low bits folded into bit 0 so the result is odd iff the exact
 /// product had any set bits below the top word past the first.
 #[inline]
+// The `as u64` casts deliberately extract the low and high 64-bit words.
+#[allow(clippy::cast_possible_truncation)]
 fn round_to_odd_128(g: (u64, u64), cp: u64) -> u64 {
     let x = u128::from(cp) * u128::from(g.1);
     let y = u128::from(cp) * u128::from(g.0) + (x >> 64);
@@ -673,20 +678,12 @@ fn multiple_of_pow2(value: u64, e2: i32) -> bool {
     value & ((1u64 << e2) - 1) == 0
 }
 
-#[inline]
-fn decimal_length(mut x: u64) -> usize {
-    let mut n = 1;
-    while x >= 10 {
-        x /= 10;
-        n += 1;
-    }
-    n
-}
-
 /// Schubfach digit generation for a finite, non-zero `f64` bit pattern.
 /// Returns `(digits, exponent)` such that the value's magnitude equals
 /// `digits · 10^exponent` and `digits` is the shortest significand Java
 /// would print (possibly with one trailing zero, stripped by the layout).
+// Single-letter locals mirror the published Schubfach variable names.
+#[allow(clippy::many_single_char_names)]
 fn schubfach_f64(bits: u64) -> (u64, i32) {
     const HIDDEN_BIT: u64 = 1 << 52;
     const FRACTION_MASK: u64 = (1 << 52) - 1;
@@ -759,6 +756,13 @@ fn schubfach_f64(bits: u64) -> (u64, i32) {
 /// Kotlin's `Double`/`Float` `toString` form: plain decimal when the
 /// scientific exponent is in `[-3, 6]`, else `d.ddddE±x` notation, always
 /// with a fractional part (`.0` for integers, single-digit mantissas).
+// Digit counts and decimal-point offsets here stay small and non-negative
+// where used as lengths/indices; the i32<->usize casts cannot lose data.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 fn layout_kotlin(neg: bool, mut digits: u64, mut exponent: i32) -> String {
     // Strip trailing zeros — Schubfach may return e.g. `10·10^k`, which is
     // one significant digit (`1·10^(k+1)`), and the layout counts digits.
@@ -820,10 +824,18 @@ pub fn double_to_string(d: f64) -> String {
         return "NaN".to_string();
     }
     if d.is_infinite() {
-        return if d > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        return if d > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
     }
     if d == 0.0 {
-        return if d.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
+        return if d.is_sign_negative() {
+            "-0.0".into()
+        } else {
+            "0.0".into()
+        };
     }
     let neg = d.is_sign_negative();
     let (digits, exponent) = schubfach_f64(d.to_bits());
@@ -834,6 +846,9 @@ pub fn double_to_string(d: f64) -> String {
 /// Same algorithm as [`schubfach_f64`] with single-precision parameters;
 /// the 128-bit `POW10` table is shared (f32's `-k` range `[-31, 45]` is a
 /// subset of the table's `[-292, 324]`).
+// Single-letter locals mirror the published Schubfach variable names; the
+// exponent cast reads an 8-bit field that always fits in i32.
+#[allow(clippy::many_single_char_names, clippy::cast_possible_wrap)]
 fn schubfach_f32(bits: u32) -> (u64, i32) {
     const HIDDEN_BIT: u32 = 1 << 23;
     const FRACTION_MASK: u32 = (1 << 23) - 1;
@@ -909,10 +924,18 @@ pub fn float_to_string(f: f32) -> String {
         return "NaN".to_string();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        return if f > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
     }
     if f == 0.0 {
-        return if f.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
+        return if f.is_sign_negative() {
+            "-0.0".into()
+        } else {
+            "0.0".into()
+        };
     }
     let neg = f.is_sign_negative();
     let (digits, exponent) = schubfach_f32(f.to_bits());
@@ -929,7 +952,7 @@ mod tests {
     #[test]
     fn double_matches_jvm() {
         let cases: &[(u64, &str)] = &[
-            (1, "4.9E-324"),                       // Double.MIN_VALUE
+            (1, "4.9E-324"), // Double.MIN_VALUE
             (2, "9.9E-324"),
             (10, "4.9E-323"),
             (12, "5.9E-323"),
@@ -944,7 +967,11 @@ mod tests {
             (0x8000000000000000, "-0.0"),
         ];
         for &(bits, want) in cases {
-            assert_eq!(double_to_string(f64::from_bits(bits)), want, "bits={bits:#x}");
+            assert_eq!(
+                double_to_string(f64::from_bits(bits)),
+                want,
+                "bits={bits:#x}"
+            );
         }
         assert_eq!(double_to_string(1.0e20), "1.0E20");
         assert_eq!(double_to_string(1.0e7), "1.0E7");
@@ -961,7 +988,7 @@ mod tests {
     #[test]
     fn float_matches_jvm() {
         let cases: &[(u32, &str)] = &[
-            (1, "1.4E-45"),    // Float.MIN_VALUE
+            (1, "1.4E-45"), // Float.MIN_VALUE
             (2, "2.8E-45"),
             (3, "4.2E-45"),
             (71, "9.9E-44"),
@@ -972,7 +999,11 @@ mod tests {
             (0x80000000, "-0.0"),
         ];
         for &(bits, want) in cases {
-            assert_eq!(float_to_string(f32::from_bits(bits)), want, "bits={bits:#x}");
+            assert_eq!(
+                float_to_string(f32::from_bits(bits)),
+                want,
+                "bits={bits:#x}"
+            );
         }
         assert_eq!(float_to_string(3.14159f32), "3.14159");
         assert_eq!(float_to_string(0.1f32), "0.1");
@@ -984,8 +1015,14 @@ mod tests {
     #[test]
     fn double_round_trips() {
         for bits in [
-            1u64, 2, 10, 0x3FB999999999999A, 0x3FF0000000000000,
-            0x7FEFFFFFFFFFFFFF, 0x0010000000000000, 0x4341C37937E08000,
+            1u64,
+            2,
+            10,
+            0x3FB999999999999A,
+            0x3FF0000000000000,
+            0x7FEFFFFFFFFFFFFF,
+            0x0010000000000000,
+            0x4341C37937E08000,
         ] {
             let v = f64::from_bits(bits);
             let s = double_to_string(v);

@@ -96,7 +96,7 @@ fun main() {
 }
 
 #[test]
-fn compareTo_returns_consistent() {
+fn compare_to_returns_consistent() {
     let src = r#"
 fun main() {
     val a = "apple"; val b = "banana"; val c = "apple"

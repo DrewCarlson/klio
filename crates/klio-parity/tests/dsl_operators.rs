@@ -130,7 +130,7 @@ fun main() {
 }
 
 #[test]
-fn rangeTo_in_range() {
+fn range_to_in_range() {
     // Custom user-Iterable through the new Iterable-extension
     // dispatch fallback. Uses a dedicated iterator class so all
     // state lives in primary-ctor fields and the dispatch is
@@ -189,7 +189,7 @@ fun main() {
 }
 
 #[test]
-fn componentN_destructuring() {
+fn component_n_destructuring() {
     let src = r#"
 class Triple3(val a: Int, val b: Int, val c: Int) {
     operator fun component1(): Int = a

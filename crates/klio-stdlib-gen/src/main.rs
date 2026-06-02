@@ -1,10 +1,10 @@
 //! Stdlib codegen binary.
 //!
 //! Subcommands:
-//!   * `build`    — mine the upstream stdlib sources and emit Rust into
-//!                  `crates/klio-stdlib/src/generated/`.
-//!   * `coverage` — print implemented / total counts from the current
-//!                  generated registry.
+//! * `build` mines the upstream stdlib sources and emits Rust into
+//!   `crates/klio-stdlib/src/generated/`.
+//! * `coverage` prints implemented / total counts from the current
+//!   generated registry.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -14,7 +14,10 @@ use clap::{Parser, Subcommand};
 use klio_stdlib_gen::{collect_decls, emit_generated};
 
 #[derive(Parser)]
-#[command(name = "klio-stdlib-gen", about = "Kotlin stdlib codegen for klio-stdlib")]
+#[command(
+    name = "klio-stdlib-gen",
+    about = "Kotlin stdlib codegen for klio-stdlib"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

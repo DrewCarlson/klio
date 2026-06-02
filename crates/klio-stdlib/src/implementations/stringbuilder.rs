@@ -1,4 +1,7 @@
-use super::{Value, ObjRef, RuntimeError, CallCtx, make_exception, char_units_to_string, Arc, char_unit_to_string, utf16_len, utf16_unit_at};
+use super::{
+    Arc, CallCtx, ObjRef, RuntimeError, Value, char_unit_to_string, char_units_to_string,
+    make_exception, utf16_len, utf16_unit_at,
+};
 
 // ============================================================
 // StringBuilder
@@ -16,6 +19,8 @@ pub(crate) fn sb_arg(args: &[Value], what: &str) -> Result<ObjRef<String>, Runti
 /// `String()` / `String(chars: CharArray)` / `String(chars, offset, length)`
 /// / `String(other: CharSequence)`. klio registers `String` as a host ctor so
 /// these shapes don't hit a 0-arg-only declaration.
+// offset/count are Int args clamped to be non-negative before use as usize.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn string_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = match ctx.args.first() {
         None => String::new(),
@@ -34,7 +39,10 @@ pub(crate) fn string_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             if start > chars.len() || end > chars.len() {
                 return Err(RuntimeError::Thrown(make_exception(
                     "kotlin.IndexOutOfBoundsException",
-                    Some(format!("offset {start}, count {count}, size {}", chars.len())),
+                    Some(format!(
+                        "offset {start}, count {count}, size {}",
+                        chars.len()
+                    )),
                 )));
             }
             char_units_to_string(chars[start..end].iter().map(|v| match v {
@@ -49,6 +57,8 @@ pub(crate) fn string_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::String(Arc::new(s)))
 }
 
+// The capacity arg is a non-negative Int used as a usize reservation.
+#[allow(clippy::cast_sign_loss)]
 pub(crate) fn string_builder_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let seed = match ctx.args {
         [] => String::new(),
@@ -62,9 +72,11 @@ pub(crate) fn string_builder_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
             }
             String::with_capacity(*n as usize)
         }
-        _ => return Err(RuntimeError::Type(
-            "StringBuilder takes 0 or 1 argument".into(),
-        )),
+        _ => {
+            return Err(RuntimeError::Type(
+                "StringBuilder takes 0 or 1 argument".into(),
+            ));
+        }
     };
     Ok(Value::StringBuilder(ObjRef::new(seed)))
 }
@@ -114,13 +126,18 @@ pub(crate) fn string_builder_to_string(ctx: &mut CallCtx) -> Result<Value, Runti
     Ok(Value::String(Arc::new(sb.borrow().clone())))
 }
 
+// The index is an Int; the bounds-checked value indexes the code units.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub(crate) fn string_builder_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.get")?;
-    let idx = match ctx.args.get(1).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type(
+    let Some(idx) = ctx.args.get(1).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type(
             "StringBuilder[index] requires Int".into(),
-        )),
+        ));
     };
     let buf = sb.borrow();
     let n = utf16_len(&buf) as i64;
@@ -149,6 +166,9 @@ pub(crate) fn string_builder_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeEr
     Ok(Value::StringBuilder(sb))
 }
 
+// idx is an Int char index; negatives are rejected above, so the conversion to
+// usize is on a non-negative value.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn sb_char_byte(buf: &str, idx: i64) -> Option<usize> {
     if idx < 0 {
         return None;
@@ -159,15 +179,17 @@ pub(crate) fn sb_char_byte(buf: &str, idx: i64) -> Option<usize> {
     buf.char_indices().nth(idx as usize).map(|(b, _)| b)
 }
 
+// The char count fits an Int (Kotlin length); insert index is an Int.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn string_builder_insert(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.insert")?;
-    let idx = match ctx.args.get(1).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type("insert index must be Int".into())),
+    let Some(idx) = ctx.args.get(1).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type("insert index must be Int".into()));
     };
-    let v = ctx.args.get(2).ok_or_else(|| {
-        RuntimeError::Arity("insert requires a value".into())
-    })?;
+    let v = ctx
+        .args
+        .get(2)
+        .ok_or_else(|| RuntimeError::Arity("insert requires a value".into()))?;
     let mut piece = String::new();
     append_value(&mut piece, v);
     let mut buf = sb.borrow_mut();
@@ -184,11 +206,12 @@ pub(crate) fn string_builder_insert(ctx: &mut CallCtx) -> Result<Value, RuntimeE
     Ok(Value::StringBuilder(sb))
 }
 
+// The char count fits an Int (Kotlin length); deleteAt index is an Int.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn string_builder_delete_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.deleteAt")?;
-    let idx = match ctx.args.get(1).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type("deleteAt index must be Int".into())),
+    let Some(idx) = ctx.args.get(1).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type("deleteAt index must be Int".into()));
     };
     let mut buf = sb.borrow_mut();
     let n = buf.chars().count() as i64;
@@ -205,15 +228,15 @@ pub(crate) fn string_builder_delete_at(ctx: &mut CallCtx) -> Result<Value, Runti
     Ok(Value::StringBuilder(sb))
 }
 
+// The char count fits an Int (Kotlin length); the range bounds are Ints.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn string_builder_delete_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.deleteRange")?;
-    let start = match ctx.args.get(1).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type("deleteRange start must be Int".into())),
+    let Some(start) = ctx.args.get(1).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type("deleteRange start must be Int".into()));
     };
-    let end = match ctx.args.get(2).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type("deleteRange end must be Int".into())),
+    let Some(end) = ctx.args.get(2).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type("deleteRange end must be Int".into()));
     };
     let mut buf = sb.borrow_mut();
     let n = buf.chars().count() as i64;
@@ -230,11 +253,12 @@ pub(crate) fn string_builder_delete_range(ctx: &mut CallCtx) -> Result<Value, Ru
     Ok(Value::StringBuilder(sb))
 }
 
+// The char count fits an Int (Kotlin length); newLength is an Int.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn string_builder_set_length(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.setLength")?;
-    let new_len = match ctx.args.get(1).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type("setLength requires Int".into())),
+    let Some(new_len) = ctx.args.get(1).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type("setLength requires Int".into()));
     };
     if new_len < 0 {
         return Err(RuntimeError::Thrown(make_exception(
@@ -263,11 +287,12 @@ pub(crate) fn string_builder_reverse(ctx: &mut CallCtx) -> Result<Value, Runtime
     Ok(Value::StringBuilder(sb))
 }
 
+// The char count fits an Int (Kotlin length); start/end are Ints.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn string_builder_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.substring")?;
-    let start = match ctx.args.get(1).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type("substring start must be Int".into())),
+    let Some(start) = ctx.args.get(1).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type("substring start must be Int".into()));
     };
     let buf = sb.borrow();
     let n = buf.chars().count() as i64;
@@ -287,11 +312,12 @@ pub(crate) fn string_builder_substring(ctx: &mut CallCtx) -> Result<Value, Runti
     Ok(Value::String(Arc::new(buf[sb_byte..eb_byte].to_string())))
 }
 
+// The char count fits an Int (Kotlin length); setCharAt index is an Int.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn string_builder_set_char_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.setCharAt")?;
-    let idx = match ctx.args.get(1).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type("setCharAt index must be Int".into())),
+    let Some(idx) = ctx.args.get(1).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type("setCharAt index must be Int".into()));
     };
     let ch = match ctx.args.get(2) {
         Some(Value::Char(c)) => *c,
@@ -314,20 +340,24 @@ pub(crate) fn string_builder_set_char_at(ctx: &mut CallCtx) -> Result<Value, Run
 
 /// `replace(startIndex, endIndex, newString)` — splice `newString` over the
 /// `[start, end)` char range. Returns the builder (Kotlin/JVM semantics).
+// The char count fits an Int (Kotlin length); start/end are Ints.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn string_builder_replace(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.replace")?;
-    let start = match ctx.args.get(1).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type("replace start must be Int".into())),
+    let Some(start) = ctx.args.get(1).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type("replace start must be Int".into()));
     };
-    let end = match ctx.args.get(2).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type("replace end must be Int".into())),
+    let Some(end) = ctx.args.get(2).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type("replace end must be Int".into()));
     };
     let repl = match ctx.args.get(3) {
         Some(Value::String(s)) => (**s).clone(),
         Some(other) => format!("{other}"),
-        None => return Err(RuntimeError::Type("replace requires a replacement string".into())),
+        None => {
+            return Err(RuntimeError::Type(
+                "replace requires a replacement string".into(),
+            ));
+        }
     };
     let mut buf = sb.borrow_mut();
     let n = buf.chars().count() as i64;
@@ -346,9 +376,10 @@ pub(crate) fn string_builder_replace(ctx: &mut CallCtx) -> Result<Value, Runtime
     Ok(Value::StringBuilder(sb))
 }
 
+// The char count fits an Int (Kotlin length); lastIndex returns it minus one.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn string_builder_last_index(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.lastIndex")?;
     let n = sb.borrow().chars().count() as i64;
     Ok(Value::new_int(n - 1))
 }
-

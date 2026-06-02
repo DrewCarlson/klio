@@ -1,4 +1,7 @@
-use super::{Value, Arc, RuntimeError, make_exception, CallCtx, make_sequence, char, char_unit_to_string, BufRead, make_list};
+use super::{
+    Arc, CallCtx, RuntimeError, Value, char, char_unit_to_string, make_exception, make_list,
+    make_sequence,
+};
 
 // ============================================================
 // Regex / MatchResult / MatchGroup
@@ -9,7 +12,9 @@ use klio_runtime::{MatchData, MatchGroupData, RegexData};
 pub(crate) fn regex_arg(args: &[Value], what: &str) -> Result<Arc<RegexData>, RuntimeError> {
     match args.first() {
         Some(Value::Regex(r)) => Ok(Arc::clone(r)),
-        _ => Err(RuntimeError::Type(format!("{what} requires a Regex receiver"))),
+        _ => Err(RuntimeError::Type(format!(
+            "{what} requires a Regex receiver"
+        ))),
     }
 }
 
@@ -71,11 +76,17 @@ pub(crate) fn compile_regex(pattern: &str) -> Result<Arc<RegexData>, RuntimeErro
     }
 }
 
+// Char index is a Kotlin Int; the UTF-16 count is bounded by string length.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn byte_to_char(s: &str, byte: usize) -> i64 {
     s[..byte].encode_utf16().count() as i64
 }
 
-pub(crate) fn build_match(re: &Arc<RegexData>, input: &Arc<String>, caps: regex::Captures<'_>) -> MatchData {
+pub(crate) fn build_match(
+    re: &Arc<RegexData>,
+    input: &Arc<String>,
+    caps: &regex::Captures<'_>,
+) -> MatchData {
     let mut groups: Vec<Option<MatchGroupData>> = Vec::with_capacity(caps.len());
     for i in 0..caps.len() {
         match caps.get(i) {
@@ -128,10 +139,15 @@ pub(crate) fn regex_matches(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let r = regex_arg(ctx.args, "Regex.matches")?;
     let s = match ctx.args.get(1) {
         Some(Value::String(s)) => s.clone(),
-        _ => return Err(RuntimeError::Type("Regex.matches requires a String input".into())),
+        _ => {
+            return Err(RuntimeError::Type(
+                "Regex.matches requires a String input".into(),
+            ));
+        }
     };
     Ok(Value::Bool(
-        r.re.find(&s).is_some_and(|m| m.start() == 0 && m.end() == s.len()),
+        r.re.find(&s)
+            .is_some_and(|m| m.start() == 0 && m.end() == s.len()),
     ))
 }
 
@@ -139,13 +155,17 @@ pub(crate) fn regex_contains_match_in(ctx: &mut CallCtx) -> Result<Value, Runtim
     let r = regex_arg(ctx.args, "Regex.containsMatchIn")?;
     let s = match ctx.args.get(1) {
         Some(Value::String(s)) => s.clone(),
-        _ => return Err(RuntimeError::Type(
-            "Regex.containsMatchIn requires a String".into(),
-        )),
+        _ => {
+            return Err(RuntimeError::Type(
+                "Regex.containsMatchIn requires a String".into(),
+            ));
+        }
     };
     Ok(Value::Bool(r.re.is_match(&s)))
 }
 
+// The char index is compared against a Kotlin Int (i64) start offset.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn regex_find(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let r = regex_arg(ctx.args, "Regex.find")?;
     let s = match ctx.args.get(1) {
@@ -166,11 +186,15 @@ pub(crate) fn regex_find(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             }
             if n == 0 { 0 } else { bi }
         }
-        _ => return Err(RuntimeError::Type("Regex.find startIndex must be Int".into())),
+        _ => {
+            return Err(RuntimeError::Type(
+                "Regex.find startIndex must be Int".into(),
+            ));
+        }
     };
     let caps = r.re.captures_at(&s, start);
     match caps {
-        Some(c) => Ok(Value::Match(Arc::new(build_match(&r, &s, c)))),
+        Some(c) => Ok(Value::Match(Arc::new(build_match(&r, &s, &c)))),
         None => Ok(Value::Null),
     }
 }
@@ -183,7 +207,7 @@ pub(crate) fn regex_find_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     let mut items = Vec::new();
     for caps in r.re.captures_iter(&s) {
-        items.push(Value::Match(Arc::new(build_match(&r, &s, caps))));
+        items.push(Value::Match(Arc::new(build_match(&r, &s, &caps))));
     }
     Ok(make_sequence(items))
 }
@@ -192,26 +216,35 @@ pub(crate) fn regex_match_entire(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
     let r = regex_arg(ctx.args, "Regex.matchEntire")?;
     let s = match ctx.args.get(1) {
         Some(Value::String(s)) => s.clone(),
-        _ => return Err(RuntimeError::Type("Regex.matchEntire requires a String".into())),
+        _ => {
+            return Err(RuntimeError::Type(
+                "Regex.matchEntire requires a String".into(),
+            ));
+        }
     };
-    let Some(caps) = r.re.captures(&s) else { return Ok(Value::Null) };
+    let Some(caps) = r.re.captures(&s) else {
+        return Ok(Value::Null);
+    };
     let m0 = caps.get(0).unwrap();
     if m0.start() == 0 && m0.end() == s.len() {
-        Ok(Value::Match(Arc::new(build_match(&r, &s, caps))))
+        Ok(Value::Match(Arc::new(build_match(&r, &s, &caps))))
     } else {
         Ok(Value::Null)
     }
 }
 
+// The char index is compared against a Kotlin Int (i64) start offset.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn regex_match_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let r = regex_arg(ctx.args, "Regex.matchAt")?;
     let s = match ctx.args.get(1) {
         Some(Value::String(s)) => s.clone(),
         _ => return Err(RuntimeError::Type("Regex.matchAt requires a String".into())),
     };
-    let idx = match ctx.args.get(2).and_then(Value::as_i64) {
-        Some(n) => n,
-        _ => return Err(RuntimeError::Type("Regex.matchAt requires Int index".into())),
+    let Some(idx) = ctx.args.get(2).and_then(Value::as_i64) else {
+        return Err(RuntimeError::Type(
+            "Regex.matchAt requires Int index".into(),
+        ));
     };
     let mut byte = s.len();
     for (i, (b, _)) in s.char_indices().enumerate() {
@@ -220,9 +253,11 @@ pub(crate) fn regex_match_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             break;
         }
     }
-    let Some(caps) = r.re.captures_at(&s, byte) else { return Ok(Value::Null) };
+    let Some(caps) = r.re.captures_at(&s, byte) else {
+        return Ok(Value::Null);
+    };
     if caps.get(0).is_some_and(|m| m.start() == byte) {
-        Ok(Value::Match(Arc::new(build_match(&r, &s, caps))))
+        Ok(Value::Match(Arc::new(build_match(&r, &s, &caps))))
     } else {
         Ok(Value::Null)
     }
@@ -279,8 +314,10 @@ pub(crate) fn expand_kotlin_replacement(
                     }
                     if let Ok(idx) = key.parse::<usize>() {
                         out.push_str(group_text(idx));
-                    } else if let Some(idx) =
-                        regex.re.capture_names().position(|n| n == Some(key.as_str()))
+                    } else if let Some(idx) = regex
+                        .re
+                        .capture_names()
+                        .position(|n| n == Some(key.as_str()))
                     {
                         out.push_str(group_text(idx));
                     }
@@ -326,7 +363,7 @@ pub(crate) fn perform_regex_replace(
                 let m0 = caps.get(0).unwrap();
                 out.push_str(&s[last..m0.start()]);
                 last = m0.end();
-                let md = build_match(r, s, caps);
+                let md = build_match(r, s, &caps);
                 out.push_str(&expand_kotlin_replacement(&template, r, &md.groups));
                 if first_only {
                     break;
@@ -342,14 +379,16 @@ pub(crate) fn perform_regex_replace(
             for caps in r.re.captures_iter(s) {
                 let m0 = caps.get(0).unwrap();
                 let (start, end) = (m0.start(), m0.end());
-                spans.push((start, end, build_match(r, s, caps)));
+                spans.push((start, end, build_match(r, s, &caps)));
                 if first_only {
                     break;
                 }
             }
             let mut out = String::with_capacity(s.len());
             let mut last = 0usize;
-            let CallCtx { out: sink, host, .. } = ctx;
+            let CallCtx {
+                out: sink, host, ..
+            } = ctx;
             for (start, end, md) in spans {
                 out.push_str(&s[last..start]);
                 last = end;
@@ -361,7 +400,7 @@ pub(crate) fn perform_regex_replace(
                     other => {
                         return Err(RuntimeError::Type(format!(
                             "{who} transform must return a CharSequence, got {other:?}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -386,12 +425,18 @@ pub(crate) fn regex_replace_first(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
     let r = regex_arg(ctx.args, "Regex.replaceFirst")?;
     let s = match ctx.args.get(1) {
         Some(Value::String(s)) => s.clone(),
-        _ => return Err(RuntimeError::Type("Regex.replaceFirst requires a String".into())),
+        _ => {
+            return Err(RuntimeError::Type(
+                "Regex.replaceFirst requires a String".into(),
+            ));
+        }
     };
     let repl = ctx.args.get(2).cloned();
     perform_regex_replace(ctx, &r, &s, repl, true, "Regex.replaceFirst")
 }
 
+// `limit` is already constrained positive before narrowing to a usize count.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn regex_split(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let r = regex_arg(ctx.args, "Regex.split")?;
     let s = match ctx.args.get(1) {
@@ -428,19 +473,17 @@ pub(crate) fn kotlin_literal_escape(s: &str) -> String {
         out.push_str(part);
         out.push_str("\\E");
     }
-    if out.is_empty() {
-        "\\Q\\E".into()
-    } else {
-        out
-    }
+    if out.is_empty() { "\\Q\\E".into() } else { out }
 }
 
 pub(crate) fn regex_static_escape(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = match ctx.args.first() {
         Some(Value::String(s)) => (**s).clone(),
-        _ => return Err(RuntimeError::Type(
-            "Regex.escape requires a String literal".into(),
-        )),
+        _ => {
+            return Err(RuntimeError::Type(
+                "Regex.escape requires a String literal".into(),
+            ));
+        }
     };
     Ok(Value::String(Arc::new(kotlin_literal_escape(&s))))
 }
@@ -448,9 +491,11 @@ pub(crate) fn regex_static_escape(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
 pub(crate) fn regex_from_literal(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = match ctx.args.first() {
         Some(Value::String(s)) => (**s).clone(),
-        _ => return Err(RuntimeError::Type(
-            "Regex.fromLiteral requires a String".into(),
-        )),
+        _ => {
+            return Err(RuntimeError::Type(
+                "Regex.fromLiteral requires a String".into(),
+            ));
+        }
     };
     Ok(Value::Regex(compile_regex(&kotlin_literal_escape(&s))?))
 }
@@ -458,9 +503,11 @@ pub(crate) fn regex_from_literal(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 pub(crate) fn regex_static_escape_replacement(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = match ctx.args.first() {
         Some(Value::String(s)) => (**s).clone(),
-        _ => return Err(RuntimeError::Type(
-            "Regex.escapeReplacement requires a String".into(),
-        )),
+        _ => {
+            return Err(RuntimeError::Type(
+                "Regex.escapeReplacement requires a String".into(),
+            ));
+        }
     };
     // Rust's regex replacement only needs `$` escaped; `\` is literal.
     let mut out = String::with_capacity(s.len());
@@ -484,18 +531,27 @@ pub(crate) fn match_arg(args: &[Value], what: &str) -> Result<Arc<MatchData>, Ru
 
 pub(crate) fn match_result_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let m = match_arg(ctx.args, "MatchResult.value")?;
-    let g0 = m.groups.first().and_then(|g| g.as_ref()).ok_or_else(|| {
-        RuntimeError::Type("MatchResult has no whole-match group".into())
-    })?;
+    let g0 = m
+        .groups
+        .first()
+        .and_then(|g| g.as_ref())
+        .ok_or_else(|| RuntimeError::Type("MatchResult has no whole-match group".into()))?;
     Ok(Value::String(Arc::clone(&g0.value)))
 }
 
 pub(crate) fn match_result_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let m = match_arg(ctx.args, "MatchResult.range")?;
-    let g0 = m.groups.first().and_then(|g| g.as_ref()).ok_or_else(|| {
-        RuntimeError::Type("MatchResult has no whole-match group".into())
-    })?;
-    Ok(Value::Range { start: g0.start, end: g0.end_inclusive, step: 1, kind: klio_runtime::RangeKind::Int })
+    let g0 = m
+        .groups
+        .first()
+        .and_then(|g| g.as_ref())
+        .ok_or_else(|| RuntimeError::Type("MatchResult has no whole-match group".into()))?;
+    Ok(Value::Range {
+        start: g0.start,
+        end: g0.end_inclusive,
+        step: 1,
+        kind: klio_runtime::RangeKind::Int,
+    })
 }
 
 pub(crate) fn match_result_group_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -534,18 +590,19 @@ pub(crate) fn match_result_next(ctx: &mut CallCtx) -> Result<Value, RuntimeError
     // Avoid infinite loops on zero-width matches: advance one char.
     let g0 = m.groups.first().and_then(|g| g.as_ref());
     if let Some(g) = g0
-        && g.end_inclusive < g.start {
-            if let Some((next_b, _)) = m.input[start..].char_indices().nth(1) {
-                start += next_b;
-            } else {
-                start = m.input.len();
-            }
+        && g.end_inclusive < g.start
+    {
+        if let Some((next_b, _)) = m.input[start..].char_indices().nth(1) {
+            start += next_b;
+        } else {
+            start = m.input.len();
         }
+    }
     if start > m.input.len() {
         return Ok(Value::Null);
     }
     match m.regex.re.captures_at(&m.input, start) {
-        Some(c) => Ok(Value::Match(Arc::new(build_match(&m.regex, &m.input, c)))),
+        Some(c) => Ok(Value::Match(Arc::new(build_match(&m.regex, &m.input, &c)))),
         None => Ok(Value::Null),
     }
 }
@@ -569,7 +626,11 @@ pub(crate) fn match_group_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError
 
 pub(crate) fn match_group_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     match ctx.args.first() {
-        Some(Value::MatchGroup { start, end_inclusive, .. }) => Ok(Value::Range {
+        Some(Value::MatchGroup {
+            start,
+            end_inclusive,
+            ..
+        }) => Ok(Value::Range {
             start: *start,
             end: *end_inclusive,
             step: 1,
@@ -580,4 +641,3 @@ pub(crate) fn match_group_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError
         )),
     }
 }
-

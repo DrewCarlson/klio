@@ -50,7 +50,10 @@ pub enum Place {
     /// Named local or parameter.
     Local(Symbol),
     /// Dotted access onto another place: `receiver.field`.
-    Field { receiver: Box<Place>, field: FieldId },
+    Field {
+        receiver: Box<Place>,
+        field: FieldId,
+    },
     /// `this` of the enclosing class/lambda receiver.
     This,
 }
@@ -77,7 +80,11 @@ pub enum Node {
     /// Write a register into a place.
     Assign { lhs: Place, rhs: Reg, span: Span },
     /// Declare a fresh local; VIA seeds this place as `Unassigned`.
-    DeclLocal { place: Symbol, declared_ty: Type, span: Span },
+    DeclLocal {
+        place: Symbol,
+        declared_ty: Type,
+        span: Span,
+    },
     /// Assume `reg` is true (false). Emitted on `Branch::True` /
     /// `Branch::False` arms after lowering `if`/`when`/`&&`/`||`.
     Assume { reg: Reg, polarity: bool },
@@ -87,7 +94,13 @@ pub enum Node {
     /// simple name so the typechecker can recover a user-class
     /// narrowing — `ty` itself is `Type::Unresolved` for any name
     /// not in `builtin_by_name`.
-    AssumeIs { reg: Reg, ty: Type, class_name: Option<String>, polarity: bool, span: Span },
+    AssumeIs {
+        reg: Reg,
+        ty: Type,
+        class_name: Option<String>,
+        polarity: bool,
+        span: Span,
+    },
     /// Assume `reg == null` (or `reg != null`). Distinct from
     /// `AssumeIs Nothing?` because nullability is its own axis on
     /// the smart-cast lattice.
@@ -97,7 +110,12 @@ pub enum Node {
     /// at least one side is non-nullable) and consumed by smart-
     /// cast: both registers' places narrow to the intersection of
     /// their facts on the truthy branch.
-    AssumeRefEq { reg_a: Reg, reg_b: Reg, polarity: bool, span: Span },
+    AssumeRefEq {
+        reg_a: Reg,
+        reg_b: Reg,
+        polarity: bool,
+        span: Span,
+    },
     /// Assert `reg` is true; if it is not, control diverges (the
     /// containing block ends in `Terminator::Unreachable` along the
     /// false edge). Used for `!!`, `as`, and contract `require`.
@@ -126,11 +144,19 @@ pub enum Terminator {
     /// Fall through to one successor.
     Goto(BlockId),
     /// Two-way branch on a boolean register.
-    Branch { cond: Reg, then_blk: BlockId, else_blk: BlockId },
+    Branch {
+        cond: Reg,
+        then_blk: BlockId,
+        else_blk: BlockId,
+    },
     /// N-way switch driven by a register and a list of patterns.
     /// Used for `when (subject)` lowerings; arms are exclusive,
     /// `default` is taken if none match.
-    Switch { reg: Reg, arms: Vec<SwitchArm>, default: BlockId },
+    Switch {
+        reg: Reg,
+        arms: Vec<SwitchArm>,
+        default: BlockId,
+    },
     /// Throw a value; control transfers to the nearest matching
     /// catch handler (resolved by exception edges on this block).
     Throw(Reg),
@@ -177,7 +203,9 @@ pub enum EdgeKind {
     /// Edge that may be taken when the source block throws a value
     /// whose runtime type is a subtype of `ty`. Lowered for every
     /// statement inside a `try` whose handler matches.
-    Exception { ty: Option<Type> },
+    Exception {
+        ty: Option<Type>,
+    },
     /// Edge into the `finally` block from the normal exit of a `try`
     /// body or its handler.
     FinallyEntry,
@@ -221,7 +249,7 @@ pub struct Cfg {
 }
 
 impl Cfg {
-    #[must_use] 
+    #[must_use]
     pub fn block(&self, id: BlockId) -> &BasicBlock {
         &self.blocks[id.0 as usize]
     }

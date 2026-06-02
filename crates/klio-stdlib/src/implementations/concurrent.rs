@@ -1,4 +1,4 @@
-use super::{Arc, CallCtx, Value, RuntimeError, thread_handle_stub};
+use super::{Arc, CallCtx, RuntimeError, Value, thread_handle_stub};
 
 /// State of one reentrant monitor: which thread (if any) currently
 /// owns it and how deep its nesting is.
@@ -13,16 +13,20 @@ pub(crate) struct MonitorState {
 pub(crate) fn monitor_for(key: usize) -> Arc<(std::sync::Mutex<MonitorState>, std::sync::Condvar)> {
     use std::collections::HashMap;
     use std::sync::OnceLock;
-    type Reg = std::sync::Mutex<
-        HashMap<usize, Arc<(std::sync::Mutex<MonitorState>, std::sync::Condvar)>>,
-    >;
+    type Reg =
+        std::sync::Mutex<HashMap<usize, Arc<(std::sync::Mutex<MonitorState>, std::sync::Condvar)>>>;
     static REGISTRY: OnceLock<Reg> = OnceLock::new();
     let reg = REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut g = reg.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut g = reg
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     g.entry(key)
         .or_insert_with(|| {
             Arc::new((
-                std::sync::Mutex::new(MonitorState { owner: None, depth: 0 }),
+                std::sync::Mutex::new(MonitorState {
+                    owner: None,
+                    depth: 0,
+                }),
                 std::sync::Condvar::new(),
             ))
         })
@@ -52,7 +56,10 @@ pub fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
     // Acquire (reentrant): block until the monitor is free or already
     // owned by this thread, then take/deepen ownership.
     {
-        let mut st = mon.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = mon
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             match st.owner {
                 Some(o) if o == me => {
@@ -65,7 +72,10 @@ pub fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
                     break;
                 }
                 Some(_) => {
-                    st = mon.1.wait(st).unwrap_or_else(std::sync::PoisonError::into_inner);
+                    st = mon
+                        .1
+                        .wait(st)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
             }
         }
@@ -78,7 +88,10 @@ pub fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
     klio_runtime::fence_and_publish(); // monitor exit
     // Release one level; wake a waiter when fully released.
     {
-        let mut st = mon.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = mon
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if st.depth > 0 {
             st.depth -= 1;
         }
@@ -103,6 +116,8 @@ pub fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
 /// is `false`, and `name` is a stable string. This is observably
 /// correct for every race-free program, which is the only class
 /// Kotlin defines behaviour for.
+// The OS thread id is carried as a Kotlin Long via a bit reinterpretation.
+#[allow(clippy::cast_possible_wrap)]
 pub(crate) fn concurrent_thread(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let block = ctx
         .args
@@ -142,6 +157,8 @@ pub(crate) fn concurrent_thread(ctx: &mut CallCtx) -> Result<Value, RuntimeError
 /// requested duration. Combined with `kotlin.concurrent.thread`'s real
 /// `std::thread::spawn`, N threads each sleeping for D run in ~D wall
 /// time, not ~N·D — genuine parallel suspension, not a busy spin.
+// `millis` is guarded positive before converting to the sleep duration.
+#[allow(clippy::cast_sign_loss)]
 pub(crate) fn concurrent_thread_sleep(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let millis = match ctx.args.first() {
         Some(Value::Long(v)) => *v,
@@ -151,7 +168,7 @@ pub(crate) fn concurrent_thread_sleep(ctx: &mut CallCtx) -> Result<Value, Runtim
         _ => {
             return Err(RuntimeError::Type(
                 "Thread.sleep expects a Long or Int millisecond argument".into(),
-            ))
+            ));
         }
     };
     if millis > 0 {
@@ -165,6 +182,9 @@ pub(crate) fn concurrent_thread_sleep(ctx: &mut CallCtx) -> Result<Value, Runtim
 /// OS thread id, so two calls on the same thread report the same name
 /// and distinct threads report distinct names; `.isAlive` is `true`
 /// (the calling thread is, by definition, running).
+// The thread id is carried as a Kotlin Long via a bit reinterpretation;
+// the Result signature matches the builtin handler function-pointer table.
+#[allow(clippy::cast_possible_wrap, clippy::unnecessary_wraps)]
 pub(crate) fn concurrent_thread_current(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let raw = format!("{:?}", std::thread::current().id());
     // `ThreadId(N)` -> N; fall back to a hash of the debug string.

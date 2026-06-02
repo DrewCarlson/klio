@@ -15,6 +15,7 @@
 use crate::ir::{BlockId, Cfg, Node, Terminator};
 use klio_types::Type;
 use std::collections::{BTreeSet, HashMap};
+use std::hash::BuildHasher;
 
 #[derive(Debug, Clone)]
 pub struct Reachability {
@@ -22,12 +23,14 @@ pub struct Reachability {
 }
 
 impl Reachability {
-    #[must_use] 
+    #[must_use]
     pub fn is_reachable(&self, b: BlockId) -> bool {
         self.reachable.get(b.0 as usize).copied().unwrap_or(false)
     }
 
-    #[must_use] 
+    #[must_use]
+    // block count fits in u32
+    #[allow(clippy::cast_possible_truncation)]
     pub fn unreachable_blocks(&self) -> Vec<BlockId> {
         self.reachable
             .iter()
@@ -37,17 +40,20 @@ impl Reachability {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn analyse(cfg: &Cfg) -> Reachability {
-    analyse_with_types(cfg, None)
+    analyse_with_types::<std::collections::hash_map::RandomState>(cfg, None)
 }
 
 /// Same as `analyse` but consults `type_map` (typechecker-supplied
 /// span→Type results) so an `Eval` of a `Nothing`-typed expression
 /// is treated like an in-block `Unreachable` marker: control does
 /// not propagate past it.
-#[must_use] 
-pub fn analyse_with_types(cfg: &Cfg, type_map: Option<&HashMap<(u32, u32), Type>>) -> Reachability {
+#[must_use]
+pub fn analyse_with_types<S: BuildHasher>(
+    cfg: &Cfg,
+    type_map: Option<&HashMap<(u32, u32), Type, S>>,
+) -> Reachability {
     let mut reachable = vec![false; cfg.blocks.len()];
     let mut stack: Vec<BlockId> = vec![cfg.entry];
     let mut visited: BTreeSet<BlockId> = BTreeSet::new();

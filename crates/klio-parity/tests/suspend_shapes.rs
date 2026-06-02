@@ -105,7 +105,7 @@ fun main() = runBlocking {
 }
 
 #[test]
-fn coroutine_returns_through_runBlocking() {
+fn coroutine_returns_through_run_blocking() {
     let src = r"
 import kotlinx.coroutines.*
 fun compute(): Int = runBlocking {

@@ -5,6 +5,7 @@
 
 use crate::{Diagnostic, Severity};
 use klio_span::SourceMap;
+use std::fmt::Write;
 
 pub fn render(
     diagnostics: &[Diagnostic],
@@ -13,12 +14,18 @@ pub fn render(
 ) -> std::io::Result<()> {
     let mut s = String::new();
     s.push_str("{\"version\":\"2.1.0\",\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\":{");
-    push(&mut s, "name", json_string("klio"));
-    push(&mut s, "informationUri", json_string("https://github.com/DrewCarlson/kt-exp"));
-    push(&mut s, "rules", rules_array(diagnostics));
+    push(&mut s, "name", &json_string("klio"));
+    push(
+        &mut s,
+        "informationUri",
+        &json_string("https://github.com/DrewCarlson/kt-exp"),
+    );
+    push(&mut s, "rules", &rules_array(diagnostics));
     s.push_str("}},\"results\":[");
     for (i, d) in diagnostics.iter().enumerate() {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         s.push_str(&result_object(d, sources));
     }
     s.push_str("]}]}");
@@ -38,19 +45,24 @@ fn rules_array(diagnostics: &[Diagnostic]) -> String {
     let mut seen: Vec<&'static str> = Vec::new();
     for d in diagnostics {
         if let Some(code) = d.code()
-            && !seen.contains(&code) {
-                seen.push(code);
-            }
+            && !seen.contains(&code)
+        {
+            seen.push(code);
+        }
     }
     let mut s = String::new();
     s.push('[');
     for (i, code) in seen.iter().enumerate() {
-        if i > 0 { s.push(','); }
-        s.push_str(&format!(
+        if i > 0 {
+            s.push(',');
+        }
+        write!(
+            s,
             "{{\"id\":{},\"name\":{}}}",
             json_string(code),
             json_string(code),
-        ));
+        )
+        .unwrap();
     }
     s.push(']');
     s
@@ -68,23 +80,27 @@ fn result_object(d: &Diagnostic, sources: &SourceMap) -> String {
     let rule_id = d.code().unwrap_or("klio.diagnostic");
     let mut s = String::new();
     s.push('{');
-    push(&mut s, "ruleId", json_string(rule_id));
-    push(&mut s, "level", json_string(level));
-    push(&mut s, "message", format!("{{\"text\":{}}}", json_string(&d.message)));
+    push(&mut s, "ruleId", &json_string(rule_id));
+    push(&mut s, "level", &json_string(level));
+    push(
+        &mut s,
+        "message",
+        &format!("{{\"text\":{}}}", json_string(&d.message)),
+    );
     let loc = format!(
         "[{{\"physicalLocation\":{{\"artifactLocation\":{{\"uri\":{uri}}},\"region\":{{\"startLine\":{sl},\"startColumn\":{sc},\"endLine\":{el},\"endColumn\":{ec}}}}}}}]",
         uri = json_string(&file.path.to_string_lossy()),
     );
-    push(&mut s, "locations", loc);
+    push(&mut s, "locations", &loc);
     s.push('}');
     s
 }
 
-fn push(buf: &mut String, key: &str, value: String) {
+fn push(buf: &mut String, key: &str, value: &str) {
     if !buf.ends_with('{') {
         buf.push(',');
     }
-    buf.push_str(&format!("\"{key}\":{value}"));
+    write!(buf, "\"{key}\":{value}").unwrap();
 }
 
 fn json_string(s: &str) -> String {
@@ -97,7 +113,7 @@ fn json_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32).unwrap(),
             c => out.push(c),
         }
     }

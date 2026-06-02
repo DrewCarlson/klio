@@ -4,9 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use klio_pack::schema::{
-    encode, ModifierBits, SourceLoc, SymbolIndex, SymbolKind, SymbolRecord,
-};
+use klio_pack::schema::{ModifierBits, SourceLoc, SymbolIndex, SymbolKind, SymbolRecord, encode};
 
 use crate::parse::{Decl, DeclKind};
 use crate::walk::FileDecls;
@@ -27,9 +25,8 @@ pub fn emit_generated(out_dir: &Path, files: &[FileDecls]) -> std::io::Result<us
     }
     let count = entries.len();
     entries.sort_by(|a, b| a.fqn.cmp(&b.fqn));
-    let bytes = encode(&SymbolIndex { entries }).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-    })?;
+    let bytes = encode(&SymbolIndex { entries })
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     fs::write(out_dir.join("symbols.postcard"), &bytes)?;
     Ok(count)
 }

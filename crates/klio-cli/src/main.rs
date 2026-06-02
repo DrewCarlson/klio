@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser as ClapParser, Subcommand, ValueEnum};
-use klio_diagnostics::{render, DiagnosticSink, Severity};
+use klio_diagnostics::{DiagnosticSink, Severity, render};
 use klio_lexer::Lexer;
 use klio_parser::Parser;
 use klio_span::SourceMap;
@@ -205,11 +205,13 @@ fn main_inner() -> ExitCode {
     match cli.cmd {
         Cmd::Lex { file } => run_lex(&file),
         Cmd::Parse { file } => run_parse(&file),
-        Cmd::Run { files, ir_vm: _, virtual_time } => {
+        Cmd::Run {
+            files,
+            ir_vm: _,
+            virtual_time,
+        } => {
             if virtual_time {
-                klio_interp_ir::set_coroutine_time_mode(
-                    klio_interp_ir::TimeMode::Virtual,
-                );
+                klio_interp_ir::set_coroutine_time_mode(klio_interp_ir::TimeMode::Virtual);
             }
             match files.as_slice() {
                 [] => {
@@ -228,20 +230,25 @@ fn main_inner() -> ExitCode {
     }
 }
 
-
 mod commands;
 mod pack_build;
 mod pack_cache;
 
 #[cfg(test)]
 mod source_selection_tests {
-    use crate::pack_build::{collect_pack_sources, pat_match, SourceRoot};
+    use crate::pack_build::{SourceRoot, collect_pack_sources, pat_match};
 
     fn sr(root: &str, include: &[&str], exclude: &[&str]) -> SourceRoot {
         SourceRoot {
             root: root.to_string(),
-            include: include.iter().map(std::string::ToString::to_string).collect(),
-            exclude: exclude.iter().map(std::string::ToString::to_string).collect(),
+            include: include
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            exclude: exclude
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
         }
     }
 
@@ -301,11 +308,7 @@ mod source_selection_tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "klio-src-sel-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let base = std::env::temp_dir().join(format!("klio-src-sel-{}-{}", std::process::id(), n));
         let d = &base;
         std::fs::create_dir_all(d.join("a/sub")).unwrap();
         std::fs::create_dir_all(d.join("b")).unwrap();
@@ -340,8 +343,7 @@ mod source_selection_tests {
     #[test]
     fn exclude_overrides_include() {
         let td = fixture();
-        let files =
-            collect_pack_sources(td.path(), &[sr("a", &["X.kt"], &["X.kt"])]).unwrap();
+        let files = collect_pack_sources(td.path(), &[sr("a", &["X.kt"], &["X.kt"])]).unwrap();
         assert!(files.is_empty());
     }
 
@@ -383,18 +385,27 @@ mod source_selection_tests {
                 &["upstream/kotlinx-coroutines-core/common/src", "klioMain"],
                 &["klioMain/"],
             ),
-            ("crates/klio-kotlinx-io", &["upstream", "klioMain"], &["upstream/Buffer.kt"]),
-            ("crates/klio-kotlinx-datetime", &["klioMain"], &["klioMain/"]),
-            ("crates/klio-kotlinx-atomicfu", &["klioMain"], &["klioMain/"]),
+            (
+                "crates/klio-kotlinx-io",
+                &["upstream", "klioMain"],
+                &["upstream/Buffer.kt"],
+            ),
+            (
+                "crates/klio-kotlinx-datetime",
+                &["klioMain"],
+                &["klioMain/"],
+            ),
+            (
+                "crates/klio-kotlinx-atomicfu",
+                &["klioMain"],
+                &["klioMain/"],
+            ),
             ("crates/klio-ktor-client", &["shim"], &["shim/"]),
         ];
         for (pack, roots, _known_pat) in cases {
             let dir = workspace.join(pack);
             // Plain source_roots strings -> unfiltered SourceRoots.
-            let plain: Vec<SourceRoot> = roots
-                .iter()
-                .map(|r| sr(r, &[], &[]))
-                .collect();
+            let plain: Vec<SourceRoot> = roots.iter().map(|r| sr(r, &[], &[])).collect();
             let plain_files = collect_pack_sources(&dir, &plain).unwrap();
             assert!(
                 !plain_files.is_empty(),
@@ -402,10 +413,7 @@ mod source_selection_tests {
             );
             // Same roots, but routed through the [[source]] path with
             // no include/exclude -> must be byte-identical.
-            let wrapped: Vec<SourceRoot> = roots
-                .iter()
-                .map(|r| sr(r, &[], &[]))
-                .collect();
+            let wrapped: Vec<SourceRoot> = roots.iter().map(|r| sr(r, &[], &[])).collect();
             let wrapped_files = collect_pack_sources(&dir, &wrapped).unwrap();
             assert_eq!(
                 rels(&plain_files),
@@ -413,7 +421,11 @@ mod source_selection_tests {
                 "pack {pack}: rel_path set diverged"
             );
             for (p, w) in plain_files.iter().zip(wrapped_files.iter()) {
-                assert_eq!(p.bytes, w.bytes, "pack {pack}: bytes diverged for {}", p.rel_path);
+                assert_eq!(
+                    p.bytes, w.bytes,
+                    "pack {pack}: bytes diverged for {}",
+                    p.rel_path
+                );
             }
             // Every rel_path stays crate-dir-relative (prefixed by
             // the root), exactly as the pre-change inline walk.

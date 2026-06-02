@@ -230,9 +230,5 @@ fun main() {
     println(b)
 }
 "#;
-    assert_klio(
-        "chained_scope_this_label",
-        src,
-        "[B]a;[B]b;[B]c\n",
-    );
+    assert_klio("chained_scope_this_label", src, "[B]a;[B]b;[B]c\n");
 }

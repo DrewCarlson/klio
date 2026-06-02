@@ -1,6 +1,8 @@
-use crate::{VmHost, Arc, AtomicOrdering, simple_literal, with_outer_this, receiver_for_label};
+use crate::{Arc, AtomicOrdering, VmHost, receiver_for_label, simple_literal, with_outer_this};
 
 impl VmHost<'_> {
+    // Result kept for symmetry with the `Host::register_class` trait method.
+    #[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
     pub(crate) fn register_class(
         &mut self,
         class: &klio_ast::Class,
@@ -85,8 +87,7 @@ impl VmHost<'_> {
         // them. The synth class name is the user-declared name; if
         // it collides with a top-level class, the local lookup
         // wins (the runtime classes table is updated in-place).
-        let mut own_members: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut own_members: std::collections::HashSet<String> = std::collections::HashSet::new();
         for p in &class.primary_params {
             if p.property.is_some() {
                 own_members.insert(p.name.name.clone());
@@ -126,10 +127,7 @@ impl VmHost<'_> {
                     ),
                     entry.clone(),
                 );
-                tbl.insert(
-                    (class.name.name.clone(), f.name.name.clone()),
-                    entry,
-                );
+                tbl.insert((class.name.name.clone(), f.name.name.clone()), entry);
             }
         }
         Ok(())
@@ -160,8 +158,7 @@ impl VmHost<'_> {
         // `this.X` and resolve via the outer chain at runtime.
         if let Some(klio_runtime::Value::Instance(this_inst)) = captured_this {
             let outer_class = this_inst.borrow().class.clone();
-            let mut extras: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut extras: std::collections::HashSet<String> = std::collections::HashSet::new();
             for p in &outer_class.primary_params {
                 extras.insert(p.name.clone());
             }
@@ -208,20 +205,14 @@ impl VmHost<'_> {
                         ),
                         entry.clone(),
                     );
-                    tbl.insert(
-                        (class.name.name.clone(), f.name.name.clone()),
-                        entry,
-                    );
+                    tbl.insert((class.name.name.clone(), f.name.name.clone()), entry);
                 }
             }
         }
         // Patch the just-registered method entries with the captured
         // outer-env so dispatch can layer them under globals.
-        let capture_pairs: Vec<(String, klio_runtime::Value)> = captured_names
-            .iter()
-            .cloned()
-            .zip(captures)
-            .collect();
+        let capture_pairs: Vec<(String, klio_runtime::Value)> =
+            captured_names.iter().cloned().zip(captures).collect();
         if capture_pairs.is_empty() {
             return Ok(());
         }
@@ -236,7 +227,7 @@ impl VmHost<'_> {
                     (class.name.name.clone(), f.name.name.clone()),
                 ] {
                     if let Some(entry) = tbl.get_mut(&key) {
-                        entry.2 = capture_pairs.clone();
+                        entry.2.clone_from(&capture_pairs);
                     }
                 }
             }
@@ -244,17 +235,16 @@ impl VmHost<'_> {
         Ok(())
     }
 
+    // One cohesive anonymous-object build flow over shared state.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn build_object(
         &mut self,
         ast: &klio_ast::Expr,
         captured_names: &[String],
         captures: Vec<klio_runtime::Value>,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        let capture_pairs: Vec<(String, klio_runtime::Value)> = captured_names
-            .iter()
-            .cloned()
-            .zip(captures)
-            .collect();
+        let capture_pairs: Vec<(String, klio_runtime::Value)> =
+            captured_names.iter().cloned().zip(captures).collect();
         // Minimal anonymous-object support: synthesise an
         // InstanceData backed by a fresh ClassDef from the AST's
         // ObjectExpr shape, with no parent ctor chain, no method
@@ -262,8 +252,17 @@ impl VmHost<'_> {
         // markers and `object : SomeInterface { override fun ... }`
         // SAM-like wrappers used by tests. Full lowering lands when
         // the IR Class shape supports it.
-        if let klio_ast::Expr::ObjectExpr { members, supertypes, supertype_args, .. } = ast {
-            let identity = self.instance_id_counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        if let klio_ast::Expr::ObjectExpr {
+            members,
+            supertypes,
+            supertype_args,
+            ..
+        } = ast
+        {
+            let identity = self
+                .instance_id_counter
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                + 1;
             // Lower each method body into a per-method side
             // module + FuncId. dispatch at call_member time.
             let synth_class_name = format!("$anon${identity}");
@@ -357,10 +356,7 @@ impl VmHost<'_> {
                         ),
                         entry.clone(),
                     );
-                    tbl.insert(
-                        (synth_class_name.clone(), f.name.name.clone()),
-                        entry,
-                    );
+                    tbl.insert((synth_class_name.clone(), f.name.name.clone()), entry);
                 }
             }
             klio_ir::lower::set_lower_anon_captures(None);
@@ -393,10 +389,11 @@ impl VmHost<'_> {
                 let classes = self.classes.borrow();
                 for n in &supertype_names {
                     if let Some(def) = classes.get(n).cloned()
-                        && !def.is_interface {
-                            anon_parent = Some(def);
-                            break;
-                        }
+                        && !def.is_interface
+                    {
+                        anon_parent = Some(def);
+                        break;
+                    }
                 }
             }
             let class_def = Arc::new(klio_runtime::ClassDef {
@@ -407,7 +404,7 @@ impl VmHost<'_> {
                 methods: Vec::new(),
                 body_properties,
                 init_blocks: Vec::new(),
-            init_block_property_positions: Vec::new(),
+                init_block_property_positions: Vec::new(),
                 is_data: false,
                 is_value: false,
                 is_object: false,
@@ -482,7 +479,10 @@ impl VmHost<'_> {
                     };
                     fields.push((p.name.clone(), v));
                 } else {
-                    let v = p.primitive_zero.clone().unwrap_or(klio_runtime::Value::Null);
+                    let v = p
+                        .primitive_zero
+                        .clone()
+                        .unwrap_or(klio_runtime::Value::Null);
                     fields.push((p.name.clone(), v));
                 }
             }
@@ -496,17 +496,19 @@ impl VmHost<'_> {
                     return v;
                 }
                 if let klio_ast::Expr::Path { segments, .. } = expr
-                    && segments.len() == 1 {
-                        let nm = &segments[0].name;
-                        if let Some((_, v)) = capture_pairs.iter().find(|(n, _)| n == nm) {
-                            return v.clone();
-                        }
-                        if let Some((_, klio_runtime::Value::Instance(i))) =
-                            capture_pairs.iter().find(|(n, _)| n == "this")
-                            && let Some(v) = i.borrow().get(nm) {
-                                return v;
-                            }
+                    && segments.len() == 1
+                {
+                    let nm = &segments[0].name;
+                    if let Some((_, v)) = capture_pairs.iter().find(|(n, _)| n == nm) {
+                        return v.clone();
                     }
+                    if let Some((_, klio_runtime::Value::Instance(i))) =
+                        capture_pairs.iter().find(|(n, _)| n == "this")
+                        && let Some(v) = i.borrow().get(nm)
+                    {
+                        return v;
+                    }
+                }
                 klio_runtime::Value::Null
             };
             // Populate parent's primary-param fields from
@@ -571,8 +573,8 @@ impl VmHost<'_> {
             let parent_chain: Vec<Arc<klio_runtime::ClassDef>> = {
                 let mut v = Vec::new();
                 let mut cur = inst.borrow().class.parent.borrow().clone();
-                while let Some(c) = cur {
-                    cur = c.parent.borrow().clone();
+                while let Some(c) = cur.take() {
+                    cur.clone_from(&c.parent.borrow());
                     v.push(c);
                 }
                 v
@@ -580,8 +582,10 @@ impl VmHost<'_> {
             // Bottom-up so a parent's field exists before a nearer
             // ancestor overrides the same name.
             for cls in parent_chain.iter().rev() {
-                let cls_args: Vec<klio_runtime::Value> =
-                    super_args_by_class.get(&cls.name).cloned().unwrap_or_default();
+                let cls_args: Vec<klio_runtime::Value> = super_args_by_class
+                    .get(&cls.name)
+                    .cloned()
+                    .unwrap_or_default();
                 for p in &cls.body_properties {
                     let Some(fid) = self
                         .prog
@@ -595,8 +599,7 @@ impl VmHost<'_> {
                         continue;
                     };
                     let module = Arc::clone(&self.module);
-                    let mut all: Vec<klio_runtime::Value> =
-                        Vec::with_capacity(1 + cls_args.len());
+                    let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(1 + cls_args.len());
                     all.push(inst_value.clone());
                     all.extend_from_slice(&cls_args);
                     let v = klio_ir::eval::eval_with(&module, &func, all, self)?;
@@ -609,9 +612,13 @@ impl VmHost<'_> {
             }
             return Ok(inst_value);
         }
-        Err(klio_ir::eval::EvalError::Type("Vm::build_object: not an ObjectExpr AST node".to_string()))
+        Err(klio_ir::eval::EvalError::Type(
+            "Vm::build_object: not an ObjectExpr AST node".to_string(),
+        ))
     }
 
+    // Single supertype-chain dispatch walk; splitting fragments it.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn call_super(
         &mut self,
         receiver: &klio_runtime::Value,
@@ -670,14 +677,14 @@ impl VmHost<'_> {
             if let Some(cls_ir) = cls_ir {
                 for fid in &cls_ir.methods {
                     if let Some(func) = self.module.funcs.get(fid.0 as usize).cloned()
-                        && func.name == name {
-                            let mut all: Vec<klio_runtime::Value> =
-                                Vec::with_capacity(args.len() + 1);
-                            all.push(receiver.clone());
-                            all.extend_from_slice(args);
-                            let module = Arc::clone(&self.module);
-                            return klio_ir::eval::eval_with(&module, &func, all, self);
-                        }
+                        && func.name == name
+                    {
+                        let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
+                        all.push(receiver.clone());
+                        all.extend_from_slice(args);
+                        let module = Arc::clone(&self.module);
+                        return klio_ir::eval::eval_with(&module, &func, all, self);
+                    }
                 }
             }
             // `super.<prop>` (a property read, lowered as a 0-arg
@@ -692,17 +699,11 @@ impl VmHost<'_> {
                     .instance_prop_getters
                     .get(&(cname.clone(), name.to_string()))
                     .copied()
-                    && let Some(func) =
-                        self.module.funcs.get(fid.0 as usize).cloned()
-                    {
-                        let module = Arc::clone(&self.module);
-                        return klio_ir::eval::eval_with(
-                            &module,
-                            &func,
-                            vec![receiver.clone()],
-                            self,
-                        );
-                    }
+                && let Some(func) = self.module.funcs.get(fid.0 as usize).cloned()
+            {
+                let module = Arc::clone(&self.module);
+                return klio_ir::eval::eval_with(&module, &func, vec![receiver.clone()], self);
+            }
             // Step to the next non-interface supertype.
             let next: Option<String> = self
                 .classes
@@ -716,9 +717,10 @@ impl VmHost<'_> {
         // instance directly rather than failing.
         if args.is_empty()
             && let klio_runtime::Value::Instance(inst) = receiver
-                && let Some(v) = inst.borrow().get(name) {
-                    return Ok(v);
-                }
+            && let Some(v) = inst.borrow().get(name)
+        {
+            return Ok(v);
+        }
         // The chain bottomed out at a builtin (`Any` / `Throwable`),
         // which declares no IR method. Supply the inherited
         // `Any`/`Throwable` semantics so `override fun toString() =
@@ -730,8 +732,7 @@ impl VmHost<'_> {
                     let i = inst.borrow();
                     let is_throwable = {
                         let classes = self.classes.borrow();
-                        let mut stack: Vec<String> =
-                            vec![i.class.name.clone()];
+                        let mut stack: Vec<String> = vec![i.class.name.clone()];
                         let mut seen = std::collections::HashSet::new();
                         let mut found = false;
                         while let Some(cn) = stack.pop() {
@@ -750,18 +751,14 @@ impl VmHost<'_> {
                                 break;
                             }
                             if let Some(d) = classes.get(&cn) {
-                                stack.extend(
-                                    d.supertype_names.iter().cloned(),
-                                );
+                                stack.extend(d.supertype_names.iter().cloned());
                             }
                         }
                         found
                     };
                     if is_throwable {
                         let msg = match i.get("message") {
-                            Some(klio_runtime::Value::String(s)) => {
-                                Some((*s).clone())
-                            }
+                            Some(klio_runtime::Value::String(s)) => Some((*s).clone()),
                             _ => None,
                         };
                         let s = match msg {
@@ -770,14 +767,16 @@ impl VmHost<'_> {
                         };
                         return Ok(klio_runtime::Value::String(Arc::new(s)));
                     }
-                    return Ok(klio_runtime::Value::String(Arc::new(
-                        format!("{}@{:x}", i.class.fqn, i.identity),
-                    )));
+                    return Ok(klio_runtime::Value::String(Arc::new(format!(
+                        "{}@{:x}",
+                        i.class.fqn, i.identity
+                    ))));
                 }
                 ("hashCode", 0) => {
-                    return Ok(klio_runtime::Value::new_int(
-                        inst.borrow().identity as i64,
-                    ));
+                    // Kotlin hashCode() reinterprets the identity bits as Int.
+                    #[allow(clippy::cast_possible_wrap)]
+                    let hash = inst.borrow().identity as i64;
+                    return Ok(klio_runtime::Value::new_int(hash));
                 }
                 ("equals", 1) => {
                     let same = matches!(
@@ -807,11 +806,11 @@ impl VmHost<'_> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             let mut cur: Option<Arc<klio_runtime::ClassDef>> =
                 Some(Arc::clone(&inst.borrow().class));
-            while let Some(c) = cur {
+            while let Some(c) = cur.take() {
                 if c.name == qualifier || c.fqn == qualifier {
                     return Ok(receiver.clone());
                 }
-                cur = c.parent.borrow().clone();
+                cur.clone_from(&c.parent.borrow());
             }
             let mut outer = inst.borrow().outer.clone();
             while let Some(klio_runtime::Value::Instance(o_inst)) = outer.clone() {
@@ -820,13 +819,13 @@ impl VmHost<'_> {
                     return Ok(klio_runtime::Value::Instance(o_inst.clone()));
                 }
                 let mut p = cls.parent.borrow().clone();
-                while let Some(c) = p {
+                while let Some(c) = p.take() {
                     if c.name == qualifier || c.fqn == qualifier {
                         return Ok(klio_runtime::Value::Instance(o_inst.clone()));
                     }
-                    p = c.parent.borrow().clone();
+                    p.clone_from(&c.parent.borrow());
                 }
-                outer = o_inst.borrow().outer.clone();
+                outer.clone_from(&o_inst.borrow().outer);
             }
         }
         // No class match — `this@<fn-name>` (extension fn label) or
@@ -849,11 +848,11 @@ impl VmHost<'_> {
             if let klio_runtime::Value::Instance(o_inst) = encl_v {
                 let mut cur: Option<Arc<klio_runtime::ClassDef>> =
                     Some(o_inst.borrow().class.clone());
-                while let Some(c) = cur {
+                while let Some(c) = cur.take() {
                     if c.name == qualifier || c.fqn == qualifier {
                         return Ok(klio_runtime::Value::Instance(o_inst.clone()));
                     }
-                    cur = c.parent.borrow().clone();
+                    cur.clone_from(&c.parent.borrow());
                 }
             }
         }
@@ -865,10 +864,9 @@ impl VmHost<'_> {
         // `with(n) { sb.apply { this@with } }` resolve `this@with` to `n`
         // rather than the inner `apply` receiver. Only consulted for
         // non-class qualifiers so `this@ClassName` keeps binding the class.
-        if !known_class
-            && let Some(v) = receiver_for_label(qualifier) {
-                return Ok(v);
-            }
+        if !known_class && let Some(v) = receiver_for_label(qualifier) {
+            return Ok(v);
+        }
         if !known_class && !matches!(receiver, klio_runtime::Value::Null) {
             // `this@<fn-label>` — the qualifier is an extension/fn
             // label, not a class. Inside a receiver lambda whose own
@@ -887,26 +885,21 @@ impl VmHost<'_> {
             // is what broke `this@thenBy.compare` inside the stdlib
             // `Comparator<T>.thenBy { … }` SAM, where the enclosing
             // stack held an unrelated instance from the sort driver.
-            let receiver_is_bound_instance =
-                !matches!(receiver, klio_runtime::Value::Null | klio_runtime::Value::Unit);
-            if !receiver_is_bound_instance
-                && let Some(encl) = enclosing {
-                    let same = match (&encl, receiver) {
-                        (
-                            klio_runtime::Value::Instance(a),
-                            klio_runtime::Value::Instance(b),
-                        ) => klio_runtime::ObjRef::ptr_eq(a, b),
-                        _ => false,
-                    };
-                    if !same
-                        && !matches!(
-                            encl,
-                            klio_runtime::Value::Null | klio_runtime::Value::Unit
-                        )
-                    {
-                        return Ok(encl);
+            let receiver_is_bound_instance = !matches!(
+                receiver,
+                klio_runtime::Value::Null | klio_runtime::Value::Unit
+            );
+            if !receiver_is_bound_instance && let Some(encl) = enclosing {
+                let same = match (&encl, receiver) {
+                    (klio_runtime::Value::Instance(a), klio_runtime::Value::Instance(b)) => {
+                        klio_runtime::ObjRef::ptr_eq(a, b)
                     }
+                    _ => false,
+                };
+                if !same && !matches!(encl, klio_runtime::Value::Null | klio_runtime::Value::Unit) {
+                    return Ok(encl);
                 }
+            }
             return Ok(receiver.clone());
         }
         Err(klio_ir::eval::EvalError::Type(format!(
@@ -914,6 +907,8 @@ impl VmHost<'_> {
         )))
     }
 
+    // Single type-check dispatch over runtime value shapes.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn instance_of(
         &mut self,
         value: &klio_runtime::Value,
@@ -938,15 +933,16 @@ impl VmHost<'_> {
         // its own name.
         if self.module.class_id(&ty.name).is_none()
             && let Some(bound) = self.lookup_global(&ty.name)
-                && let klio_runtime::Value::Class(cls) = bound
-                    && cls.name != ty.name {
-                        let resolved = klio_ir::TypeRef {
-                            name: cls.name.clone(),
-                            nullable: ty.nullable,
-                            args: ty.args.clone(),
-                        };
-                        return self.instance_of(value, &resolved);
-                    }
+            && let klio_runtime::Value::Class(cls) = bound
+            && cls.name != ty.name
+        {
+            let resolved = klio_ir::TypeRef {
+                name: cls.name.clone(),
+                nullable: ty.nullable,
+                args: ty.args.clone(),
+            };
+            return self.instance_of(value, &resolved);
+        }
         // `Any` is the universal supertype for non-null values.
         if ty.name == "Any" {
             return true;
@@ -958,8 +954,13 @@ impl VmHost<'_> {
         // accordingly so `is`-checks return what kotlinc produces.
         if matches!(
             ty.name.as_str(),
-            "KProperty" | "KCallable" | "KFunction" | "KFunction0"
-                | "KFunction1" | "KFunction2" | "KMutableProperty"
+            "KProperty"
+                | "KCallable"
+                | "KFunction"
+                | "KFunction0"
+                | "KFunction1"
+                | "KFunction2"
+                | "KMutableProperty"
         ) {
             if let klio_runtime::Value::Instance(inst) = value {
                 let snap = inst.borrow();
@@ -970,9 +971,7 @@ impl VmHost<'_> {
                     );
                     return match ty.name.as_str() {
                         "KProperty" | "KMutableProperty" => is_property,
-                        "KFunction" | "KFunction0" | "KFunction1" | "KFunction2" => {
-                            !is_property
-                        }
+                        "KFunction" | "KFunction0" | "KFunction1" | "KFunction2" => !is_property,
                         "KCallable" => true,
                         _ => false,
                     };
@@ -987,7 +986,10 @@ impl VmHost<'_> {
                     | klio_runtime::Value::Lambda { .. }
                     | klio_runtime::Value::Function { .. }
             ) {
-                return matches!(ty.name.as_str(), "KFunction" | "KCallable" | "KFunction0" | "KFunction1" | "KFunction2");
+                return matches!(
+                    ty.name.as_str(),
+                    "KFunction" | "KCallable" | "KFunction0" | "KFunction1" | "KFunction2"
+                );
             }
         }
         if ty.name == "KClass" {
@@ -996,7 +998,10 @@ impl VmHost<'_> {
         if ty.name == "EnumEntries" {
             return matches!(
                 value,
-                klio_runtime::Value::List { enum_class: Some(_), .. }
+                klio_runtime::Value::List {
+                    enum_class: Some(_),
+                    ..
+                }
             );
         }
         // Builtin collection / array / range values match their Kotlin
@@ -1008,10 +1013,9 @@ impl VmHost<'_> {
         // surfaced as "cast to `Array` failed". Mutable views match the
         // Mutable* supertypes only when the value is actually mutable.
         match value {
-            klio_runtime::Value::Array { .. }
-                if ty.name == "Array" => {
-                    return true;
-                }
+            klio_runtime::Value::Array { .. } if ty.name == "Array" => {
+                return true;
+            }
             // The read-only/mutable distinction is erased on the JVM (both map
             // to java.util.List/Set/Map), so kotlinc reports `listOf(…) is
             // MutableList` as true. Match that — our parity oracle is JVM
@@ -1088,22 +1092,25 @@ impl VmHost<'_> {
                 return true;
             }
             if let Some(rest) = ty.name.strip_prefix("Function")
-                && rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
-                    return true;
-                }
+                && rest.chars().all(|c| c.is_ascii_digit())
+                && !rest.is_empty()
+            {
+                return true;
+            }
         }
         // Dotted nested-class names (`S.A`, `Outer.Inner`) — match
         // by the last segment, which corresponds to the lifted
         // top-level class name in our module table.
         if ty.name.contains('.')
-            && let Some(last) = ty.name.rsplit('.').next() {
-                let alt = klio_ir::TypeRef {
-                    name: last.to_string(),
-                    nullable: ty.nullable,
-                    args: ty.args.clone(),
-                };
-                return self.instance_of(value, &alt);
-            }
+            && let Some(last) = ty.name.rsplit('.').next()
+        {
+            let alt = klio_ir::TypeRef {
+                name: last.to_string(),
+                nullable: ty.nullable,
+                args: ty.args.clone(),
+            };
+            return self.instance_of(value, &alt);
+        }
         // Generic type-parameter casts (`x as T`) are erased at
         // runtime — Kotlin matches them unchecked. Single-letter
         // (or short uppercase) type names are conventionally
@@ -1111,8 +1118,10 @@ impl VmHost<'_> {
         // as accept-any-non-null — unless the call site bound a
         // reified type-param to a concrete `Value::Class`, in
         // which case redirect the check to that class's name.
-        if matches!(ty.name.as_str(), "T" | "U" | "V" | "K" | "R" | "E" | "X" | "Y" | "Z" | "A" | "B" | "C" | "D")
-        {
+        if matches!(
+            ty.name.as_str(),
+            "T" | "U" | "V" | "K" | "R" | "E" | "X" | "Y" | "Z" | "A" | "B" | "C" | "D"
+        ) {
             let bound = self.globals.borrow().lookup(&ty.name);
             if let Some(klio_runtime::Value::Class(c)) = bound {
                 let alt = klio_ir::TypeRef {
@@ -1146,16 +1155,28 @@ impl VmHost<'_> {
             // case here is the immediate parent.
             if matches!(
                 (tail, ty.name.as_str()),
-                ("IllegalArgumentException" | "IllegalStateException" |
-"IndexOutOfBoundsException" | "ArrayIndexOutOfBoundsException" |
-"StringIndexOutOfBoundsException" | "NullPointerException" |
-"ArithmeticException" | "ClassCastException" | "NoSuchElementException" |
-"NumberFormatException" | "UnsupportedOperationException" |
-"UninitializedPropertyAccessException" | "ConcurrentModificationException" |
-"NoWhenBranchMatchedException", "RuntimeException") |
-("ArrayIndexOutOfBoundsException" | "StringIndexOutOfBoundsException",
-"IndexOutOfBoundsException") | ("AssertionError", "Error") |
-("RuntimeException", "Exception") | ("Error" | "Exception", "Throwable")
+                (
+                    "IllegalArgumentException"
+                        | "IllegalStateException"
+                        | "IndexOutOfBoundsException"
+                        | "ArrayIndexOutOfBoundsException"
+                        | "StringIndexOutOfBoundsException"
+                        | "NullPointerException"
+                        | "ArithmeticException"
+                        | "ClassCastException"
+                        | "NoSuchElementException"
+                        | "NumberFormatException"
+                        | "UnsupportedOperationException"
+                        | "UninitializedPropertyAccessException"
+                        | "ConcurrentModificationException"
+                        | "NoWhenBranchMatchedException",
+                    "RuntimeException"
+                ) | (
+                    "ArrayIndexOutOfBoundsException" | "StringIndexOutOfBoundsException",
+                    "IndexOutOfBoundsException"
+                ) | ("AssertionError", "Error")
+                    | ("RuntimeException", "Exception")
+                    | ("Error" | "Exception", "Throwable")
             ) {
                 return true;
             }
@@ -1181,7 +1202,7 @@ impl VmHost<'_> {
             ];
             let mut cur: Option<Arc<klio_runtime::ClassDef>> =
                 Some(Arc::clone(&inst.borrow().class));
-            while let Some(c) = cur {
+            while let Some(c) = cur.take() {
                 if c.name == ty.name || c.fqn == ty.name {
                     return true;
                 }
@@ -1243,7 +1264,7 @@ impl VmHost<'_> {
                         return true;
                     }
                 }
-                cur = c.parent.borrow().clone();
+                cur.clone_from(&c.parent.borrow());
             }
             // `Any` matches every instance.
             if ty.name == "Any" {

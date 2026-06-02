@@ -1,8 +1,10 @@
-use super::{CallCtx, Value, RuntimeError, compare_values, Arc};
+use super::{Arc, CallCtx, RuntimeError, Value, compare_values};
 
 pub(crate) fn cmp_compare_values_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() < 3 {
-        return Err(RuntimeError::Arity("compareValuesBy expects (a, b, selector, ...)".into()));
+        return Err(RuntimeError::Arity(
+            "compareValuesBy expects (a, b, selector, ...)".into(),
+        ));
     }
     let a = ctx.args[0].clone();
     let b = ctx.args[1].clone();
@@ -35,7 +37,9 @@ pub(crate) fn cmp_compare_values_by(ctx: &mut CallCtx) -> Result<Value, RuntimeE
 
 pub(crate) fn cmp_comparator_sam(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() != 1 {
-        return Err(RuntimeError::Arity("Comparator { … } expects a 2-arg comparison lambda".into()));
+        return Err(RuntimeError::Arity(
+            "Comparator { … } expects a 2-arg comparison lambda".into(),
+        ));
     }
     let lam = ctx.args[0].clone();
     if !matches!(&lam, Value::Lambda { .. } | Value::IrClosure { .. }) {
@@ -49,25 +53,37 @@ pub(crate) fn cmp_comparator_sam(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
     })
 }
 
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn cmp_compare_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut steps: Vec<(Value, bool)> = Vec::with_capacity(ctx.args.len());
     for a in ctx.args {
         steps.push((a.clone(), false));
     }
-    Ok(Value::Comparator { steps: Arc::new(steps), descending: false })
+    Ok(Value::Comparator {
+        steps: Arc::new(steps),
+        descending: false,
+    })
 }
 
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn cmp_compare_by_descending(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut steps: Vec<(Value, bool)> = Vec::with_capacity(ctx.args.len());
     for a in ctx.args {
         steps.push((a.clone(), true));
     }
-    Ok(Value::Comparator { steps: Arc::new(steps), descending: false })
+    Ok(Value::Comparator {
+        steps: Arc::new(steps),
+        descending: false,
+    })
 }
 
 pub(crate) fn cmp_compare_values(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("compareValues expects two arguments".into()));
+        return Err(RuntimeError::Arity(
+            "compareValues expects two arguments".into(),
+        ));
     }
     let a = &ctx.args[0];
     let b = &ctx.args[1];
@@ -88,13 +104,22 @@ pub(crate) fn cmp_compare_values(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 // Comparator factories
 // ============================================================
 
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn comparator_natural_order(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // Empty step chain — the interp's sort path treats an empty-step
     // Comparator as "compare items directly via the natural order".
-    Ok(Value::Comparator { steps: Arc::new(Vec::new()), descending: false })
+    Ok(Value::Comparator {
+        steps: Arc::new(Vec::new()),
+        descending: false,
+    })
 }
 
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn comparator_reverse_order(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::Comparator { steps: Arc::new(Vec::new()), descending: true })
+    Ok(Value::Comparator {
+        steps: Arc::new(Vec::new()),
+        descending: true,
+    })
 }
-

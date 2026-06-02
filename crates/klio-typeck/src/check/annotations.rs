@@ -1,4 +1,8 @@
-use super::{Expr, Decl, HashMap, KotlinFile, Diagnostic, FunctionBody, Block, Stmt, WhenPatternKind, StringPart, Span, codes, DiagnosticSink, Checker, Function, Property, Class, HashSet, is_primitive_type_name};
+use super::{
+    Block, Checker, Class, Decl, Diagnostic, DiagnosticSink, Expr, Function, FunctionBody, HashMap,
+    HashSet, KotlinFile, Property, Span, Stmt, StringPart, WhenPatternKind, codes,
+    is_primitive_type_name,
+};
 
 /// Severity of an opt-in requirement; parallels `DeprecationLevel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +23,10 @@ pub(crate) fn parse_requires_opt_in(anns: &[klio_ast::Annotation]) -> Option<Opt
         if leaf != "RequiresOptIn" {
             continue;
         }
-        let mut info = OptInMarker { level: OptInLevel::Error, message: None };
+        let mut info = OptInMarker {
+            level: OptInLevel::Error,
+            message: None,
+        };
         let mut positional = 0usize;
         for (i, arg) in a.args.iter().enumerate() {
             let name = a.arg_names.get(i).cloned().flatten();
@@ -115,9 +122,10 @@ pub(crate) fn marker_names_in(
     let mut out: Vec<String> = Vec::new();
     for a in anns {
         if let Some(leaf) = a.path.last()
-            && markers.contains_key(&leaf.name) {
-                out.push(leaf.name.clone());
-            }
+            && markers.contains_key(&leaf.name)
+        {
+            out.push(leaf.name.clone());
+        }
     }
     out
 }
@@ -134,10 +142,11 @@ pub(crate) fn opt_in_markers_in(anns: &[klio_ast::Annotation]) -> Vec<String> {
         for arg in &a.args {
             if let Expr::MemberRef { receiver, name, .. } = arg
                 && name.name == "class"
-                    && let Expr::Path { segments, .. } = receiver.as_ref()
-                        && let Some(seg) = segments.last() {
-                            out.push(seg.name.clone());
-                        }
+                && let Expr::Path { segments, .. } = receiver.as_ref()
+                && let Some(seg) = segments.last()
+            {
+                out.push(seg.name.clone());
+            }
         }
     }
     out
@@ -297,6 +306,8 @@ pub(crate) fn walk_block_for_opt_in(
     }
 }
 
+// Single recursive walk over every Expr variant.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn walk_expr_for_opt_in(
     e: &Expr,
     markers: &HashMap<String, OptInMarker>,
@@ -305,23 +316,18 @@ pub(crate) fn walk_expr_for_opt_in(
     out: &mut Vec<Diagnostic>,
 ) {
     match e {
-        Expr::Path { segments, span }
-            if segments.len() == 1 => {
-                emit_opt_in_at(&segments[0].name, *span, markers, required, scope, out);
-            }
-        Expr::Call { callee, args, span, .. } => {
+        Expr::Path { segments, span } if segments.len() == 1 => {
+            emit_opt_in_at(&segments[0].name, *span, markers, required, scope, out);
+        }
+        Expr::Call {
+            callee, args, span, ..
+        } => {
             let mut emitted = false;
             if let Expr::Path { segments, .. } = callee.as_ref()
-                && segments.len() == 1 {
-                    emitted = emit_opt_in_at(
-                        &segments[0].name,
-                        *span,
-                        markers,
-                        required,
-                        scope,
-                        out,
-                    );
-                }
+                && segments.len() == 1
+            {
+                emitted = emit_opt_in_at(&segments[0].name, *span, markers, required, scope, out);
+            }
             if !emitted {
                 walk_expr_for_opt_in(callee, markers, required, scope, out);
             }
@@ -329,14 +335,27 @@ pub(crate) fn walk_expr_for_opt_in(
                 walk_expr_for_opt_in(a, markers, required, scope, out);
             }
         }
-        Expr::Member { receiver, .. } => walk_expr_for_opt_in(receiver, markers, required, scope, out),
-        Expr::MemberRef { receiver, .. } => walk_expr_for_opt_in(receiver, markers, required, scope, out),
         Expr::Binary { lhs, rhs, .. } => {
             walk_expr_for_opt_in(lhs, markers, required, scope, out);
             walk_expr_for_opt_in(rhs, markers, required, scope, out);
         }
-        Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => {
-            walk_expr_for_opt_in(expr, markers, required, scope, out);
+        Expr::Member {
+            receiver: inner, ..
+        }
+        | Expr::MemberRef {
+            receiver: inner, ..
+        }
+        | Expr::Unary { expr: inner, .. }
+        | Expr::Postfix { expr: inner, .. }
+        | Expr::As { expr: inner, .. }
+        | Expr::IsCheck { expr: inner, .. }
+        | Expr::Spread { expr: inner, .. }
+        | Expr::Labeled { expr: inner, .. }
+        | Expr::Return {
+            value: Some(inner), ..
+        }
+        | Expr::Throw { value: inner, .. } => {
+            walk_expr_for_opt_in(inner, markers, required, scope, out);
         }
         Expr::Index { receiver, args, .. } => {
             walk_expr_for_opt_in(receiver, markers, required, scope, out);
@@ -344,36 +363,39 @@ pub(crate) fn walk_expr_for_opt_in(
                 walk_expr_for_opt_in(a, markers, required, scope, out);
             }
         }
-        Expr::Return { value, .. } => {
-            if let Some(v) = value {
-                walk_expr_for_opt_in(v, markers, required, scope, out);
-            }
-        }
-        Expr::As { expr, .. } | Expr::IsCheck { expr, .. } => {
-            walk_expr_for_opt_in(expr, markers, required, scope, out);
-        }
-        Expr::Spread { expr, .. } | Expr::Labeled { expr, .. } => {
-            walk_expr_for_opt_in(expr, markers, required, scope, out);
-        }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             walk_expr_for_opt_in(cond, markers, required, scope, out);
             walk_expr_for_opt_in(then_branch, markers, required, scope, out);
             if let Some(eb) = else_branch {
                 walk_expr_for_opt_in(eb, markers, required, scope, out);
             }
         }
-        Expr::While { cond, body, .. } | Expr::DoWhile { cond, body: Some(body), .. } => {
+        Expr::While { cond, body, .. }
+        | Expr::DoWhile {
+            cond,
+            body: Some(body),
+            ..
+        } => {
             walk_expr_for_opt_in(cond, markers, required, scope, out);
             walk_expr_for_opt_in(body, markers, required, scope, out);
         }
-        Expr::DoWhile { cond, body: None, .. } => {
+        Expr::DoWhile {
+            cond, body: None, ..
+        } => {
             walk_expr_for_opt_in(cond, markers, required, scope, out);
         }
         Expr::For { iter, body, .. } => {
             walk_expr_for_opt_in(iter, markers, required, scope, out);
             walk_expr_for_opt_in(body, markers, required, scope, out);
         }
-        Expr::When { subject, branches, .. } => {
+        Expr::When {
+            subject, branches, ..
+        } => {
             if let Some(s) = subject {
                 walk_expr_for_opt_in(s, markers, required, scope, out);
             }
@@ -391,7 +413,12 @@ pub(crate) fn walk_expr_for_opt_in(
                 walk_expr_for_opt_in(&br.body, markers, required, scope, out);
             }
         }
-        Expr::Try { body, catches, finally, .. } => {
+        Expr::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
             walk_block_for_opt_in(body, markers, required, scope, out);
             for c in catches {
                 walk_block_for_opt_in(&c.body, markers, required, scope, out);
@@ -400,18 +427,19 @@ pub(crate) fn walk_expr_for_opt_in(
                 walk_block_for_opt_in(f, markers, required, scope, out);
             }
         }
-        Expr::Throw { value, .. } => walk_expr_for_opt_in(value, markers, required, scope, out),
-        Expr::Block(b) => walk_block_for_opt_in(b, markers, required, scope, out),
-        Expr::Lambda { body, .. } => walk_block_for_opt_in(body, markers, required, scope, out),
-        Expr::AnonFun { body, .. } => {
-            if let Some(b) = body {
-                match b.as_ref() {
-                    FunctionBody::Expr(e) => walk_expr_for_opt_in(e, markers, required, scope, out),
-                    FunctionBody::Block(blk) => walk_block_for_opt_in(blk, markers, required, scope, out),
-                }
-            }
+        Expr::Block(blk) | Expr::Lambda { body: blk, .. } => {
+            walk_block_for_opt_in(blk, markers, required, scope, out);
         }
-        Expr::ObjectExpr { members, supertype_args, supertype_delegates, .. } => {
+        Expr::AnonFun { body: Some(b), .. } => match b.as_ref() {
+            FunctionBody::Expr(e) => walk_expr_for_opt_in(e, markers, required, scope, out),
+            FunctionBody::Block(blk) => walk_block_for_opt_in(blk, markers, required, scope, out),
+        },
+        Expr::ObjectExpr {
+            members,
+            supertype_args,
+            supertype_delegates,
+            ..
+        } => {
             for m in members {
                 walk_decl_for_opt_in(m, markers, required, scope, out);
             }
@@ -443,27 +471,26 @@ pub(crate) fn emit_opt_in_at(
     scope: &[String],
     out: &mut Vec<Diagnostic>,
 ) -> bool {
-    let Some(needed) = required.get(name) else { return false };
+    let Some(needed) = required.get(name) else {
+        return false;
+    };
     let mut emitted = false;
     for marker in needed {
         if scope.iter().any(|m| m == marker) {
             continue;
         }
-        let info = match markers.get(marker) {
-            Some(i) => i,
-            None => continue,
+        let Some(info) = markers.get(marker) else {
+            continue;
         };
         let suffix = match &info.message {
             Some(m) if !m.is_empty() => format!(": {m}"),
             _ => String::new(),
         };
-        let body = format!(
-            "`{name}` requires opt-in via `@OptIn({marker}::class)`{suffix}"
-        );
+        let body = format!("`{name}` requires opt-in via `@OptIn({marker}::class)`{suffix}");
         match info.level {
-            OptInLevel::Warning => out.push(
-                Diagnostic::warning(body, span).with_code(codes::WARN_OPT_IN),
-            ),
+            OptInLevel::Warning => {
+                out.push(Diagnostic::warning(body, span).with_code(codes::WARN_OPT_IN))
+            }
             OptInLevel::Error => {
                 out.push(Diagnostic::error(body, span).with_code(codes::TYPE_OPT_IN_REQUIRED));
             }
@@ -484,19 +511,20 @@ pub(crate) fn apply_suppress_annotations(file: &KotlinFile, diagnostics: &mut Di
         return;
     }
     diagnostics.retain(|d| {
-        let code = match d.code() {
-            Some(c) => c,
-            None => return true,
+        let Some(code) = d.code() else {
+            return true;
         };
         let span = d.primary.span;
         for r in &regions {
             if r.span.file != span.file {
                 continue;
             }
-            if r.span.start <= span.start && span.end <= r.span.end
-                && r.codes.iter().any(|c| c == code) {
-                    return false;
-                }
+            if r.span.start <= span.start
+                && span.end <= r.span.end
+                && r.codes.iter().any(|c| c == code)
+            {
+                return false;
+            }
         }
         true
     });
@@ -596,7 +624,10 @@ pub(crate) fn parse_deprecation(anns: &[klio_ast::Annotation]) -> Option<Depreca
         if leaf != "Deprecated" {
             continue;
         }
-        let mut info = DeprecationInfo { level: DeprecationLevel::Warning, message: None };
+        let mut info = DeprecationInfo {
+            level: DeprecationLevel::Warning,
+            message: None,
+        };
         // Positional first arg is `message: String` unless an explicit
         // `message = ...` named arg is also given. ReplaceWith / level
         // can appear in any position by name.
@@ -805,27 +836,31 @@ pub(crate) fn walk_stmt_for_deprecation(
     }
 }
 
+// Single recursive walk over every Expr variant.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn walk_expr_for_deprecation(
     e: &Expr,
     info: &HashMap<String, DeprecationInfo>,
     out: &mut Vec<Diagnostic>,
 ) {
     match e {
-        Expr::Path { segments, span }
-            if segments.len() == 1 => {
-                emit_deprecation_at(&segments[0].name, *span, info, out);
-            }
-        Expr::Call { callee, args, span, .. } => {
+        Expr::Path { segments, span } if segments.len() == 1 => {
+            emit_deprecation_at(&segments[0].name, *span, info, out);
+        }
+        Expr::Call {
+            callee, args, span, ..
+        } => {
             // Recurse into the callee unless it's a bare-name reference
             // to a deprecated symbol — we emit once for the call as a
             // whole using the call's span.
             let mut emitted_at_call = false;
             if let Expr::Path { segments, .. } = callee.as_ref()
                 && segments.len() == 1
-                    && info.contains_key(&segments[0].name) {
-                        emit_deprecation_at(&segments[0].name, *span, info, out);
-                        emitted_at_call = true;
-                    }
+                && info.contains_key(&segments[0].name)
+            {
+                emit_deprecation_at(&segments[0].name, *span, info, out);
+                emitted_at_call = true;
+            }
             if !emitted_at_call {
                 walk_expr_for_deprecation(callee, info, out);
             }
@@ -833,48 +868,65 @@ pub(crate) fn walk_expr_for_deprecation(
                 walk_expr_for_deprecation(a, info, out);
             }
         }
-        Expr::Member { receiver, .. } => walk_expr_for_deprecation(receiver, info, out),
-        Expr::MemberRef { receiver, .. } => walk_expr_for_deprecation(receiver, info, out),
         Expr::Binary { lhs, rhs, .. } => {
             walk_expr_for_deprecation(lhs, info, out);
             walk_expr_for_deprecation(rhs, info, out);
         }
-        Expr::Unary { expr, .. } => walk_expr_for_deprecation(expr, info, out),
-        Expr::Postfix { expr, .. } => walk_expr_for_deprecation(expr, info, out),
+        Expr::Member {
+            receiver: inner, ..
+        }
+        | Expr::MemberRef {
+            receiver: inner, ..
+        }
+        | Expr::Unary { expr: inner, .. }
+        | Expr::Postfix { expr: inner, .. }
+        | Expr::As { expr: inner, .. }
+        | Expr::IsCheck { expr: inner, .. }
+        | Expr::Spread { expr: inner, .. }
+        | Expr::Labeled { expr: inner, .. }
+        | Expr::Return {
+            value: Some(inner), ..
+        }
+        | Expr::Throw { value: inner, .. } => walk_expr_for_deprecation(inner, info, out),
         Expr::Index { receiver, args, .. } => {
             walk_expr_for_deprecation(receiver, info, out);
             for a in args {
                 walk_expr_for_deprecation(a, info, out);
             }
         }
-        Expr::Return { value, .. } => {
-            if let Some(v) = value {
-                walk_expr_for_deprecation(v, info, out);
-            }
-        }
-        Expr::As { expr, .. } => walk_expr_for_deprecation(expr, info, out),
-        Expr::IsCheck { expr, .. } => walk_expr_for_deprecation(expr, info, out),
-        Expr::Spread { expr, .. } => walk_expr_for_deprecation(expr, info, out),
-        Expr::Labeled { expr, .. } => walk_expr_for_deprecation(expr, info, out),
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             walk_expr_for_deprecation(cond, info, out);
             walk_expr_for_deprecation(then_branch, info, out);
             if let Some(eb) = else_branch {
                 walk_expr_for_deprecation(eb, info, out);
             }
         }
-        Expr::While { cond, body, .. } | Expr::DoWhile { cond, body: Some(body), .. } => {
+        Expr::While { cond, body, .. }
+        | Expr::DoWhile {
+            cond,
+            body: Some(body),
+            ..
+        } => {
             walk_expr_for_deprecation(cond, info, out);
             walk_expr_for_deprecation(body, info, out);
         }
-        Expr::DoWhile { cond, body: None, .. } => {
+        Expr::DoWhile {
+            cond, body: None, ..
+        } => {
             walk_expr_for_deprecation(cond, info, out);
         }
         Expr::For { iter, body, .. } => {
             walk_expr_for_deprecation(iter, info, out);
             walk_expr_for_deprecation(body, info, out);
         }
-        Expr::When { subject, branches, .. } => {
+        Expr::When {
+            subject, branches, ..
+        } => {
             if let Some(s) = subject {
                 walk_expr_for_deprecation(s, info, out);
             }
@@ -892,7 +944,12 @@ pub(crate) fn walk_expr_for_deprecation(
                 walk_expr_for_deprecation(&br.body, info, out);
             }
         }
-        Expr::Try { body, catches, finally, .. } => {
+        Expr::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
             walk_block_for_deprecation(body, info, out);
             for c in catches {
                 walk_block_for_deprecation(&c.body, info, out);
@@ -901,18 +958,19 @@ pub(crate) fn walk_expr_for_deprecation(
                 walk_block_for_deprecation(f, info, out);
             }
         }
-        Expr::Throw { value, .. } => walk_expr_for_deprecation(value, info, out),
-        Expr::Block(b) => walk_block_for_deprecation(b, info, out),
-        Expr::Lambda { body, .. } => walk_block_for_deprecation(body, info, out),
-        Expr::AnonFun { body, .. } => {
-            if let Some(b) = body {
-                match b.as_ref() {
-                    FunctionBody::Expr(e) => walk_expr_for_deprecation(e, info, out),
-                    FunctionBody::Block(blk) => walk_block_for_deprecation(blk, info, out),
-                }
-            }
+        Expr::Block(blk) | Expr::Lambda { body: blk, .. } => {
+            walk_block_for_deprecation(blk, info, out);
         }
-        Expr::ObjectExpr { members, supertype_args, supertype_delegates, .. } => {
+        Expr::AnonFun { body: Some(b), .. } => match b.as_ref() {
+            FunctionBody::Expr(e) => walk_expr_for_deprecation(e, info, out),
+            FunctionBody::Block(blk) => walk_block_for_deprecation(blk, info, out),
+        },
+        Expr::ObjectExpr {
+            members,
+            supertype_args,
+            supertype_delegates,
+            ..
+        } => {
             for m in members {
                 walk_decl_for_deprecation(m, info, out);
             }
@@ -950,9 +1008,7 @@ pub(crate) fn emit_deprecation_at(
     let body = format!("`{name}` is deprecated{suffix}");
     match d.level {
         DeprecationLevel::Warning => {
-            out.push(
-                Diagnostic::warning(body, span).with_code(codes::WARN_DEPRECATED),
-            );
+            out.push(Diagnostic::warning(body, span).with_code(codes::WARN_DEPRECATED));
         }
         DeprecationLevel::Error | DeprecationLevel::Hidden => {
             out.push(Diagnostic::error(body, span).with_code(codes::TYPE_DEPRECATED_ERROR));
@@ -1036,9 +1092,10 @@ pub(crate) fn extract_annotation_targets(e: &Expr, out: &mut Vec<AnnotationTarge
     match e {
         Expr::Path { segments, .. } => {
             if let Some(seg) = segments.last()
-                && let Some(t) = AnnotationTarget::from_name(&seg.name) {
-                    out.push(t);
-                }
+                && let Some(t) = AnnotationTarget::from_name(&seg.name)
+            {
+                out.push(t);
+            }
         }
         Expr::Member { name, .. } => {
             if let Some(t) = AnnotationTarget::from_name(&name.name) {
@@ -1142,8 +1199,9 @@ impl AnnotationWalker<'_, '_> {
             // class and it carries a @Target list.
             if let Some(m) = self.meta.get(&leaf)
                 && let Some(targets) = &m.targets
-                    && !targets.contains(&site) {
-                        self.ch.diagnostics.emit(
+                && !targets.contains(&site)
+            {
+                self.ch.diagnostics.emit(
                             Diagnostic::error(
                                 format!(
                                     "annotation `@{}` cannot be applied to {} — declared @Target list is {{{}}}",
@@ -1159,14 +1217,15 @@ impl AnnotationWalker<'_, '_> {
                             )
                             .with_code(codes::TYPE_ANNOTATION_TARGET_MISMATCH),
                         );
-                    }
+            }
             // §17.4 duplicate detection — only when the annotation class
             // is known to be non-repeatable (it lives in `self.meta` and
             // its `repeatable` flag is `false`).
             if let Some((prev_span, _)) = counts.get(&leaf) {
                 if let Some(m) = self.meta.get(&leaf)
-                    && !m.repeatable {
-                        self.ch.diagnostics.emit(
+                    && !m.repeatable
+                {
+                    self.ch.diagnostics.emit(
                             Diagnostic::error(
                                 format!(
                                     "annotation `@{leaf}` is not repeatable but is applied more than once"
@@ -1176,7 +1235,7 @@ impl AnnotationWalker<'_, '_> {
                             .with_code(codes::TYPE_ANNOTATION_NOT_REPEATABLE)
                             .with_label(*prev_span, "previously applied here"),
                         );
-                    }
+                }
             } else {
                 counts.insert(leaf, (a.span, a));
             }

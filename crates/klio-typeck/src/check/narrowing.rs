@@ -1,4 +1,7 @@
-use super::{Checker, Frame, Binding, Span, Type, Class, Block, Stmt, Property, Expr, Decl, Resolution, WhenBranch, WhenPatternKind, Diagnostic, codes};
+use super::{
+    Binding, Block, Checker, Class, Decl, Diagnostic, Expr, Frame, Property, Resolution, Span,
+    Stmt, Type, WhenBranch, WhenPatternKind, codes,
+};
 
 impl Checker<'_> {
     // ---- env helpers ----------------------------------------------------
@@ -47,13 +50,10 @@ impl Checker<'_> {
             .get(&(query_span.start, query_span.end))
             .copied()?;
         let declared = self.cfg_declared_types();
-        let entry = smartcast::solve_with_declared(
-            &lowered.cfg,
-            &lowered.reg_to_place,
-            Some(&declared),
-        )
-        .into_iter()
-        .nth(bid.0 as usize)?;
+        let entry =
+            smartcast::solve_with_declared(&lowered.cfg, &lowered.reg_to_place, Some(&declared))
+                .into_iter()
+                .nth(bid.0 as usize)?;
         let states = smartcast::states_within_block_with_declared(
             &lowered.cfg,
             bid,
@@ -86,16 +86,18 @@ impl Checker<'_> {
                         None
                     };
                     if let Some(declared) = bound
-                        && declared.is_nullable() {
-                            return Some(declared.non_null().clone());
-                        }
+                        && declared.is_nullable()
+                    {
+                        return Some(declared.non_null().clone());
+                    }
                 }
             }
             if let klio_cfa::Place::Local(sym) = &place
-                && let Some(next) = lowered.aliases.get(sym) {
-                    place = next.clone();
-                    continue;
-                }
+                && let Some(next) = lowered.aliases.get(sym)
+            {
+                place = next.clone();
+                continue;
+            }
             break;
         }
         None
@@ -110,22 +112,28 @@ impl Checker<'_> {
     /// in-scope place at this program point; empty when the CFG
     /// has no class narrowings or the declared types don't carry
     /// type parameters.
-    pub(crate) fn cfg_gadt_subst_at(&self, query_span: Span) -> std::collections::HashMap<String, Type> {
+    pub(crate) fn cfg_gadt_subst_at(
+        &self,
+        query_span: Span,
+    ) -> std::collections::HashMap<String, Type> {
+        use klio_cfa::analyses::smartcast;
         let mut subst = std::collections::HashMap::new();
-        let Some(fn_span) = self.cfg_fn_stack.last().copied() else { return subst };
-        let Some(lowered) = self.lowerings.get(&fn_span) else { return subst };
+        let Some(fn_span) = self.cfg_fn_stack.last().copied() else {
+            return subst;
+        };
+        let Some(lowered) = self.lowerings.get(&fn_span) else {
+            return subst;
+        };
         let Some((bid, pos)) = lowered
             .span_to_pos
             .get(&(query_span.start, query_span.end))
             .copied()
-        else { return subst };
-        use klio_cfa::analyses::smartcast;
+        else {
+            return subst;
+        };
         let declared = self.cfg_declared_types();
-        let entries = smartcast::solve_with_declared(
-            &lowered.cfg,
-            &lowered.reg_to_place,
-            Some(&declared),
-        );
+        let entries =
+            smartcast::solve_with_declared(&lowered.cfg, &lowered.reg_to_place, Some(&declared));
         let Some(entry) = entries.into_iter().nth(bid.0 as usize) else {
             return subst;
         };
@@ -136,18 +144,27 @@ impl Checker<'_> {
             &lowered.reg_to_place,
             Some(&declared),
         );
-        let Some(state) = states.get(pos) else { return subst };
+        let Some(state) = states.get(pos) else {
+            return subst;
+        };
         for (place, fact) in &state.map {
-            let Some(narrowed_class) = &fact.narrowed_class else { continue };
-            let klio_cfa::Place::Local(sym) = place else { continue };
-            let Some(binding) = self.lookup(&sym.0) else { continue };
-            let Type::Generic { name: declared_head, args: declared_args } =
-                &binding.ty.non_null()
+            let Some(narrowed_class) = &fact.narrowed_class else {
+                continue;
+            };
+            let klio_cfa::Place::Local(sym) = place else {
+                continue;
+            };
+            let Some(binding) = self.lookup(&sym.0) else {
+                continue;
+            };
+            let Type::Generic {
+                name: declared_head,
+                args: declared_args,
+            } = &binding.ty.non_null()
             else {
                 continue;
             };
-            let Some(supertype_args) =
-                self.walk_supertype_args(narrowed_class, declared_head)
+            let Some(supertype_args) = self.walk_supertype_args(narrowed_class, declared_head)
             else {
                 continue;
             };
@@ -156,9 +173,12 @@ impl Checker<'_> {
                     continue;
                 }
                 if let Type::TypeParam(tp_name) = &declared_arg.ty
-                    && !matches!(super_arg, Type::TypeParam(_) | Type::Unresolved) {
-                        subst.entry(tp_name.clone()).or_insert_with(|| super_arg.clone());
-                    }
+                    && !matches!(super_arg, Type::TypeParam(_) | Type::Unresolved)
+                {
+                    subst
+                        .entry(tp_name.clone())
+                        .or_insert_with(|| super_arg.clone());
+                }
             }
         }
         subst
@@ -172,6 +192,8 @@ impl Checker<'_> {
     /// whose exit state's VIA tells us which uninitialized
     /// properties were definitely assigned along every primary-
     /// ctor path.
+    // Method form kept for call-site symmetry with the other cfg_* helpers in decl.rs.
+    #[allow(clippy::unused_self)]
     pub(crate) fn synthesize_class_init_body(&self, c: &Class) -> Block {
         let mut stmts: Vec<Stmt> = Vec::new();
         // Primary-param properties are pre-assigned by their
@@ -224,7 +246,10 @@ impl Checker<'_> {
                 stmts.push(s.clone());
             }
         }
-        Block { stmts, span: c.name.span }
+        Block {
+            stmts,
+            span: c.name.span,
+        }
     }
 
     /// VIA classification of `name` at the *exit* of the CFG whose
@@ -298,10 +323,7 @@ impl Checker<'_> {
             .iter()
             .map(|(s, t)| ((s.start, s.end), t.clone()))
             .collect();
-        let r = klio_cfa::analyses::reachable::analyse_with_types(
-            &lowered.cfg,
-            Some(&type_map),
-        );
+        let r = klio_cfa::analyses::reachable::analyse_with_types(&lowered.cfg, Some(&type_map));
         Some(!r.is_reachable(bid))
     }
 
@@ -325,21 +347,18 @@ impl Checker<'_> {
     /// CFG-derived class-name narrowing for `name` at `query_span`.
     /// Parallels `cfg_narrowed_at` for the user-class branch.
     pub(crate) fn cfg_narrowed_class_at(&self, name: &str, query_span: Span) -> Option<String> {
+        use klio_cfa::analyses::smartcast;
         let fn_span = *self.cfg_fn_stack.last()?;
         let lowered = self.lowerings.get(&fn_span)?;
         let (bid, pos) = lowered
             .span_to_pos
             .get(&(query_span.start, query_span.end))
             .copied()?;
-        use klio_cfa::analyses::smartcast;
         let declared = self.cfg_declared_types();
-        let entry = smartcast::solve_with_declared(
-            &lowered.cfg,
-            &lowered.reg_to_place,
-            Some(&declared),
-        )
-        .into_iter()
-        .nth(bid.0 as usize)?;
+        let entry =
+            smartcast::solve_with_declared(&lowered.cfg, &lowered.reg_to_place, Some(&declared))
+                .into_iter()
+                .nth(bid.0 as usize)?;
         let states = smartcast::states_within_block_with_declared(
             &lowered.cfg,
             bid,
@@ -351,14 +370,16 @@ impl Checker<'_> {
         let mut place = klio_cfa::Place::Local(klio_cfa::Symbol(name.to_string()));
         for _ in 0..8 {
             if let Some(fact) = state.map.get(&place)
-                && let Some(cn) = fact.narrowed_class.clone() {
-                    return Some(cn);
-                }
+                && let Some(cn) = fact.narrowed_class.clone()
+            {
+                return Some(cn);
+            }
             if let klio_cfa::Place::Local(sym) = &place
-                && let Some(next) = lowered.aliases.get(sym) {
-                    place = next.clone();
-                    continue;
-                }
+                && let Some(next) = lowered.aliases.get(sym)
+            {
+                place = next.clone();
+                continue;
+            }
             break;
         }
         None
@@ -412,7 +433,9 @@ impl Checker<'_> {
         branches: &[WhenBranch],
         when_span: Span,
     ) {
-        let Some(root_info) = self.classes.get(subject_class) else { return };
+        let Some(root_info) = self.classes.get(subject_class) else {
+            return;
+        };
         if !root_info.is_sealed {
             return;
         }
@@ -434,10 +457,11 @@ impl Checker<'_> {
             'b: for br in branches {
                 for p in &br.patterns {
                     if let WhenPatternKind::IsType(t) = &p.kind
-                        && self.is_class_or_subclass(leaf, &t.name.name) {
-                            covered = true;
-                            break 'b;
-                        }
+                        && self.is_class_or_subclass(leaf, &t.name.name)
+                    {
+                        covered = true;
+                        break 'b;
+                    }
                 }
             }
             if !covered {

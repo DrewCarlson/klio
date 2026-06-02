@@ -1,4 +1,7 @@
-use super::{Parser, TypeParam, TokenKind, Variance, Keyword, WhereBound, TypeArg, TypeRef, Ident, FunctionTypeRef, Span, Token};
+use super::{
+    FunctionTypeRef, Ident, Keyword, Parser, Span, Token, TokenKind, TypeArg, TypeParam, TypeRef,
+    Variance, WhereBound,
+};
 
 impl Parser<'_, '_> {
     /// Parse a `<T, out U : Foo, reified V>`-style type-parameter list.
@@ -32,13 +35,11 @@ impl Parser<'_, '_> {
                         self.bump();
                         self.skip_nl();
                         variance = Variance::Out;
-                        continue;
                     }
                     Some("reified") if allow_reified => {
                         self.bump();
                         self.skip_nl();
                         is_reified = true;
-                        continue;
                     }
                     _ => break,
                 }
@@ -81,7 +82,10 @@ impl Parser<'_, '_> {
         // on the next line, but if it isn't there we must leave the newlines
         // alone so they continue serving as statement separators.
         let mut i = self.pos;
-        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+        while matches!(
+            self.tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Newline)
+        ) {
             i += 1;
         }
         let next = self.tokens.get(i);
@@ -102,7 +106,11 @@ impl Parser<'_, '_> {
             self.skip_nl();
             let Some(ty) = self.parse_type() else { break };
             let span = start.join(ty.span);
-            bounds.push(WhereBound { name, bound: ty, span });
+            bounds.push(WhereBound {
+                name,
+                bound: ty,
+                span,
+            });
             self.skip_nl();
             if matches!(self.peek_kind(), TokenKind::Comma) {
                 self.bump();
@@ -135,7 +143,10 @@ impl Parser<'_, '_> {
                     variance: Variance::Invariant,
                     is_star: true,
                     ty: TypeRef {
-                        name: Ident { name: "*".into(), span: s.span },
+                        name: Ident {
+                            name: "*".into(),
+                            span: s.span,
+                        },
                         nullable: false,
                         span: s.span,
                         type_args: Vec::new(),
@@ -158,7 +169,12 @@ impl Parser<'_, '_> {
                 }
                 let Some(t) = self.parse_type() else { break };
                 let span = start.join(t.span);
-                args.push(TypeArg { variance, is_star: false, ty: t, span });
+                args.push(TypeArg {
+                    variance,
+                    is_star: false,
+                    ty: t,
+                    span,
+                });
             }
             self.skip_nl();
             if matches!(self.peek_kind(), TokenKind::Comma) {
@@ -190,7 +206,10 @@ impl Parser<'_, '_> {
             if matches!(self.peek_kind(), TokenKind::Star) {
                 let s = self.bump();
                 args.push(TypeRef {
-                    name: Ident { name: "*".into(), span: s.span },
+                    name: Ident {
+                        name: "*".into(),
+                        span: s.span,
+                    },
                     nullable: false,
                     span: s.span,
                     type_args: Vec::new(),
@@ -207,7 +226,10 @@ impl Parser<'_, '_> {
                 // and lets the surrounding inference flow set it.
                 let s = self.bump();
                 args.push(TypeRef {
-                    name: Ident { name: "_".into(), span: s.span },
+                    name: Ident {
+                        name: "_".into(),
+                        span: s.span,
+                    },
                     nullable: false,
                     span: s.span,
                     type_args: Vec::new(),
@@ -216,10 +238,9 @@ impl Parser<'_, '_> {
                     annotations: Vec::new(),
                 });
             } else {
-                if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::In)) {
-                    self.bump();
-                    self.skip_nl();
-                } else if self.peek_ident_text() == Some("out") {
+                if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::In))
+                    || self.peek_ident_text() == Some("out")
+                {
                     self.bump();
                     self.skip_nl();
                 }
@@ -280,7 +301,10 @@ impl Parser<'_, '_> {
         {
             let save_pos = self.pos;
             let mut i = self.pos;
-            while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+            while matches!(
+                self.tokens.get(i).map(|t| &t.kind),
+                Some(TokenKind::Newline)
+            ) {
                 i += 1;
             }
             if matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Amp)) {
@@ -307,7 +331,10 @@ impl Parser<'_, '_> {
         // immediately followed by `(`; bare `.` after a type would be a path
         // continuation handled elsewhere.
         if matches!(self.peek_kind(), TokenKind::Dot)
-            && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::LParen))
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LParen)
+            )
         {
             self.bump(); // '.'
             let (params, _lp, rp) = self.parse_function_type_params()?;
@@ -325,7 +352,10 @@ impl Parser<'_, '_> {
                 span: rp.span.join(arrow.span).join(ret_span),
             };
             return Some(TypeRef {
-                name: Ident { name: "<function>".into(), span },
+                name: Ident {
+                    name: "<function>".into(),
+                    span,
+                },
                 nullable: false,
                 span,
                 type_args: Vec::new(),
@@ -338,10 +368,9 @@ impl Parser<'_, '_> {
         // was produced. If `suspend` was claimed but no function type
         // materialised, we silently drop it (parity-safe; lambdas don't
         // care).
-        if is_suspend
-            && let Some(f) = ty.function.as_mut() {
-                f.is_suspend = true;
-            }
+        if is_suspend && let Some(f) = ty.function.as_mut() {
+            f.is_suspend = true;
+        }
         Some(ty)
     }
 
@@ -411,7 +440,9 @@ impl Parser<'_, '_> {
                 break;
             }
             self.bump(); // '.'
-            let Some(seg) = self.parse_ident("type segment") else { break };
+            let Some(seg) = self.parse_ident("type segment") else {
+                break;
+            };
             let new_name = Ident {
                 name: format!("{}.{}", head.name.name, seg.name),
                 span: start.join(seg.span),
@@ -440,7 +471,6 @@ impl Parser<'_, '_> {
         }
         Some(head)
     }
-
 
     /// At `(`. Either:
     ///   - `(T)` — parenthesized type (returns the inner type).
@@ -494,7 +524,10 @@ impl Parser<'_, '_> {
                 span: lp.span.join(arrow.span).join(ret_span),
             };
             Some(TypeRef {
-                name: Ident { name: "<function>".into(), span },
+                name: Ident {
+                    name: "<function>".into(),
+                    span,
+                },
                 nullable: false,
                 span,
                 type_args: Vec::new(),
@@ -577,8 +610,13 @@ impl Parser<'_, '_> {
                         let next = self.tokens.get(i + 1).map(|t| &t.kind);
                         return matches!(
                             next,
-                            Some(TokenKind::LParen | TokenKind::LBrace | TokenKind::Dot |
-TokenKind::QuestionDot | TokenKind::ColonColon)
+                            Some(
+                                TokenKind::LParen
+                                    | TokenKind::LBrace
+                                    | TokenKind::Dot
+                                    | TokenKind::QuestionDot
+                                    | TokenKind::ColonColon
+                            )
                         );
                     }
                 }
@@ -609,5 +647,4 @@ TokenKind::QuestionDot | TokenKind::ColonColon)
         }
         false
     }
-
 }

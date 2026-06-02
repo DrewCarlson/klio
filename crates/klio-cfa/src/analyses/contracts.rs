@@ -46,16 +46,16 @@ thread_local! {
 /// Replace the user-contract registry. Called once per module
 /// build, before any per-function lowering starts. Passing an
 /// empty map effectively clears the registry between modules.
-pub fn set_user_inline_contracts(
-    map: std::collections::HashMap<String, Vec<String>>,
-) {
+// stored into a fixed-hasher thread-local; the map type must match that static
+#[allow(clippy::implicit_hasher)]
+pub fn set_user_inline_contracts(map: std::collections::HashMap<String, Vec<String>>) {
     USER_INLINE_CONTRACTS.with(|c| *c.borrow_mut() = map);
 }
 
 /// Lookup the param names of the user inline fn `name` whose
 /// contract declares `callsInPlace(p, EXACTLY_ONCE)`. Empty when no
 /// user contract is registered for that name.
-#[must_use] 
+#[must_use]
 pub fn user_exactly_once_params(name: &str) -> Vec<String> {
     USER_INLINE_CONTRACTS.with(|c| c.borrow().get(name).cloned().unwrap_or_default())
 }

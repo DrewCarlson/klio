@@ -4,7 +4,9 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct FileId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -46,6 +48,8 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
+    // Source spans are u32-addressed; line offsets fit by construction.
+    #[allow(clippy::cast_possible_truncation)]
     #[must_use]
     pub fn new(id: FileId, path: PathBuf, source: impl Into<Arc<str>>) -> Self {
         let source = source.into();
@@ -55,9 +59,16 @@ impl SourceFile {
                 line_starts.push((i + 1) as u32);
             }
         }
-        Self { id, path, source, line_starts }
+        Self {
+            id,
+            path,
+            source,
+            line_starts,
+        }
     }
 
+    // Line index comes from a u32-bounded line_starts table.
+    #[allow(clippy::cast_possible_truncation)]
     #[must_use]
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
         let line = match self.line_starts.binary_search(&offset) {
@@ -80,9 +91,12 @@ impl SourceMap {
         Self::default()
     }
 
+    // FileId is u32; a source map never holds more than u32::MAX files.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn add(&mut self, path: impl AsRef<Path>, source: impl Into<Arc<str>>) -> FileId {
         let id = FileId(self.files.len() as u32);
-        self.files.push(SourceFile::new(id, path.as_ref().to_path_buf(), source));
+        self.files
+            .push(SourceFile::new(id, path.as_ref().to_path_buf(), source));
         id
     }
 

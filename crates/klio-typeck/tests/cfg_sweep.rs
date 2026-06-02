@@ -75,5 +75,8 @@ fn corpus_cfgs_run_every_analysis() {
             let _ = klio_cfa::analyses::smartcast::solve(cfg, &r2p);
         }
     }
-    assert!(total_cfgs > 0, "expected at least one CFG across {total_files} files");
+    assert!(
+        total_cfgs > 0,
+        "expected at least one CFG across {total_files} files"
+    );
 }

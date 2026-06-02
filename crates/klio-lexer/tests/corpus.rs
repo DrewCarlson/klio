@@ -4,6 +4,8 @@
 //! Add new programs to `tests/corpus/` and a new test below. Snapshots live in
 //! `tests/snapshots/` and are reviewed via `cargo insta review`.
 
+use std::fmt::Write;
+
 use klio_lexer::{Lexer, Token, TokenKind};
 use klio_span::SourceMap;
 
@@ -22,12 +24,15 @@ fn render(src: &str) -> String {
         out.push_str("\n# diagnostics\n");
         for d in result.diagnostics.diagnostics() {
             let code = d.code().unwrap_or("");
-            out.push_str(&format!("[{code}] {sev:?} {msg} @{start}..{end}\n",
+            writeln!(
+                out,
+                "[{code}] {sev:?} {msg} @{start}..{end}",
                 sev = d.severity,
                 msg = d.message,
                 start = d.primary.span.start,
                 end = d.primary.span.end,
-            ));
+            )
+            .unwrap();
         }
     }
     out
@@ -50,7 +55,9 @@ fn render_token(t: &Token, src: &str) -> String {
         TokenKind::NullLiteral => "NULL".to_string(),
         TokenKind::CharLiteral(c) => char::from_u32(u32::from(*c))
             .map_or_else(|| format!("CHAR[{c}]"), |ch| format!("CHAR[{ch:?}]")),
-        TokenKind::StringQuote { triple } => format!("QUOTE[{}]", if *triple { "\"\"\"" } else { "\"" }),
+        TokenKind::StringQuote { triple } => {
+            format!("QUOTE[{}]", if *triple { "\"\"\"" } else { "\"" })
+        }
         TokenKind::StringText(s) => format!("STR_TEXT[{s:?}]"),
         TokenKind::InterpStart => "INTERP_START".to_string(),
         TokenKind::InterpEnd => "INTERP_END".to_string(),
@@ -61,7 +68,8 @@ fn render_token(t: &Token, src: &str) -> String {
         TokenKind::Eof => "EOF".to_string(),
         other => format!("{other:?}"),
     };
-    format!("{label:<20} {start:>4}..{end:<4} {text}",
+    format!(
+        "{label:<20} {start:>4}..{end:<4} {text}",
         start = t.span.start,
         end = t.span.end,
     )

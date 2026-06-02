@@ -1,31 +1,52 @@
-use super::{Value, RuntimeError, CallCtx, Arc};
+use super::{Arc, CallCtx, RuntimeError, Value};
 
 // ============================================================
 // Result
 // ============================================================
 
-pub(crate) fn recv_result<'a>(args: &'a [Value], what: &str) -> Result<(bool, &'a Value), RuntimeError> {
+pub(crate) fn recv_result<'a>(
+    args: &'a [Value],
+    what: &str,
+) -> Result<(bool, &'a Value), RuntimeError> {
     match args.first() {
         Some(Value::Result { ok, payload }) => Ok((*ok, payload.as_ref())),
-        _ => Err(RuntimeError::Type(format!("{what} requires a Result receiver"))),
+        _ => Err(RuntimeError::Type(format!(
+            "{what} requires a Result receiver"
+        ))),
     }
 }
 
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn result_success(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = ctx.args.first().cloned().unwrap_or(Value::Unit);
-    Ok(Value::Result { ok: true, payload: Box::new(v) })
+    Ok(Value::Result {
+        ok: true,
+        payload: Box::new(v),
+    })
 }
 
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn result_failure(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let v = ctx.args.first().cloned().unwrap_or(Value::Unit);
-    Ok(Value::Result { ok: false, payload: Box::new(v) })
+    Ok(Value::Result {
+        ok: false,
+        payload: Box::new(v),
+    })
 }
 
-pub(crate) fn run_catching_impl(block: Value, ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+pub(crate) fn run_catching_impl(block: &Value, ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let CallCtx { out, host, .. } = ctx;
-    match host.invoke_callable(&block, &[], *out) {
-        Ok(v) => Ok(Value::Result { ok: true, payload: Box::new(v) }),
-        Err(RuntimeError::Thrown(e)) => Ok(Value::Result { ok: false, payload: Box::new(e) }),
+    match host.invoke_callable(block, &[], *out) {
+        Ok(v) => Ok(Value::Result {
+            ok: true,
+            payload: Box::new(v),
+        }),
+        Err(RuntimeError::Thrown(e)) => Ok(Value::Result {
+            ok: false,
+            payload: Box::new(e),
+        }),
         Err(e) => Err(e),
     }
 }
@@ -36,24 +57,34 @@ pub(crate) fn result_run_catching(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
     //   x.runCatching { … }  -> 2 args (receiver, block); receiver bound as `this`
     if ctx.args.len() == 1 {
         let block = ctx.args[0].clone();
-        return run_catching_impl(block, ctx);
+        return run_catching_impl(&block, ctx);
     }
     if ctx.args.len() == 2 {
         let recv = ctx.args[0].clone();
         let block = ctx.args[1].clone();
         let CallCtx { out, host, .. } = ctx;
         return match host.invoke_callable_with_this(&block, &[], &recv, *out) {
-            Ok(v) => Ok(Value::Result { ok: true, payload: Box::new(v) }),
-            Err(RuntimeError::Thrown(e)) => Ok(Value::Result { ok: false, payload: Box::new(e) }),
+            Ok(v) => Ok(Value::Result {
+                ok: true,
+                payload: Box::new(v),
+            }),
+            Err(RuntimeError::Thrown(e)) => Ok(Value::Result {
+                ok: false,
+                payload: Box::new(e),
+            }),
             Err(e) => Err(e),
         };
     }
-    Err(RuntimeError::Arity("runCatching expects (block) or (receiver, block)".into()))
+    Err(RuntimeError::Arity(
+        "runCatching expects (block) or (receiver, block)".into(),
+    ))
 }
 
 pub(crate) fn result_fold(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() != 3 {
-        return Err(RuntimeError::Arity("Result.fold expects (receiver, onSuccess, onFailure)".into()));
+        return Err(RuntimeError::Arity(
+            "Result.fold expects (receiver, onSuccess, onFailure)".into(),
+        ));
     }
     let (ok, payload) = recv_result(ctx.args, "Result.fold")?;
     let payload = payload.clone();
@@ -69,40 +100,61 @@ pub(crate) fn result_fold(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 pub(crate) fn result_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("Result.map expects (receiver, block)".into()));
+        return Err(RuntimeError::Arity(
+            "Result.map expects (receiver, block)".into(),
+        ));
     }
     let (ok, payload) = recv_result(ctx.args, "Result.map")?;
     let payload = payload.clone();
     let block = ctx.args[1].clone();
     let CallCtx { out, host, .. } = ctx;
     if !ok {
-        return Ok(Value::Result { ok: false, payload: Box::new(payload) });
+        return Ok(Value::Result {
+            ok: false,
+            payload: Box::new(payload),
+        });
     }
     let v = host.invoke_callable(&block, std::slice::from_ref(&payload), *out)?;
-    Ok(Value::Result { ok: true, payload: Box::new(v) })
+    Ok(Value::Result {
+        ok: true,
+        payload: Box::new(v),
+    })
 }
 
 pub(crate) fn result_map_catching(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("Result.mapCatching expects (receiver, block)".into()));
+        return Err(RuntimeError::Arity(
+            "Result.mapCatching expects (receiver, block)".into(),
+        ));
     }
     let (ok, payload) = recv_result(ctx.args, "Result.mapCatching")?;
     let payload = payload.clone();
     let block = ctx.args[1].clone();
     let CallCtx { out, host, .. } = ctx;
     if !ok {
-        return Ok(Value::Result { ok: false, payload: Box::new(payload) });
+        return Ok(Value::Result {
+            ok: false,
+            payload: Box::new(payload),
+        });
     }
     match host.invoke_callable(&block, std::slice::from_ref(&payload), *out) {
-        Ok(v) => Ok(Value::Result { ok: true, payload: Box::new(v) }),
-        Err(RuntimeError::Thrown(e)) => Ok(Value::Result { ok: false, payload: Box::new(e) }),
+        Ok(v) => Ok(Value::Result {
+            ok: true,
+            payload: Box::new(v),
+        }),
+        Err(RuntimeError::Thrown(e)) => Ok(Value::Result {
+            ok: false,
+            payload: Box::new(e),
+        }),
         Err(e) => Err(e),
     }
 }
 
 pub(crate) fn result_on_success(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("Result.onSuccess expects (receiver, block)".into()));
+        return Err(RuntimeError::Arity(
+            "Result.onSuccess expects (receiver, block)".into(),
+        ));
     }
     let recv = ctx.args[0].clone();
     let (ok, payload) = recv_result(ctx.args, "Result.onSuccess")?;
@@ -117,7 +169,9 @@ pub(crate) fn result_on_success(ctx: &mut CallCtx) -> Result<Value, RuntimeError
 
 pub(crate) fn result_on_failure(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() != 2 {
-        return Err(RuntimeError::Arity("Result.onFailure expects (receiver, block)".into()));
+        return Err(RuntimeError::Arity(
+            "Result.onFailure expects (receiver, block)".into(),
+        ));
     }
     let recv = ctx.args[0].clone();
     let (ok, payload) = recv_result(ctx.args, "Result.onFailure")?;
@@ -142,12 +196,20 @@ pub(crate) fn result_is_failure(ctx: &mut CallCtx) -> Result<Value, RuntimeError
 
 pub(crate) fn result_get_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (ok, payload) = recv_result(ctx.args, "Result.getOrNull")?;
-    if ok { Ok(payload.clone()) } else { Ok(Value::Null) }
+    if ok {
+        Ok(payload.clone())
+    } else {
+        Ok(Value::Null)
+    }
 }
 
 pub(crate) fn result_exception_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (ok, payload) = recv_result(ctx.args, "Result.exceptionOrNull")?;
-    if ok { Ok(Value::Null) } else { Ok(payload.clone()) }
+    if ok {
+        Ok(Value::Null)
+    } else {
+        Ok(payload.clone())
+    }
 }
 
 /// `kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED` — the
@@ -155,6 +217,8 @@ pub(crate) fn result_exception_or_null(ctx: &mut CallCtx) -> Result<Value, Runti
 /// returns to signal it parked rather than producing a value.
 /// One logical instance, so `x === COROUTINE_SUSPENDED` holds for
 /// any sentinel `x`.
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn coroutine_suspended_sentinel(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::CoroutineSuspended)
 }
@@ -167,6 +231,8 @@ pub(crate) static CO_NEXT_SLOT: std::sync::atomic::AtomicI64 = std::sync::atomic
 
 /// `__klio_co_newSlot()` — a fresh slot id for a `suspendCoroutine`
 /// rendezvous.
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn coro_new_slot(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let id = CO_NEXT_SLOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(Value::Long(id))
@@ -201,6 +267,8 @@ pub(crate) fn coro_arm_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 /// `__klio_co_disarmSlot()` — cancel a pending arm (the block
 /// returned a value without suspending).
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn coro_disarm_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     ctx.host.coroutine_disarm_slot();
     Ok(Value::Unit)
@@ -212,7 +280,10 @@ pub(crate) fn coro_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let slot = slot_arg(ctx.args, "__klio_co_resume")?;
     let ok = matches!(ctx.args.get(1), Some(Value::Bool(true)));
     let payload = ctx.args.get(2).cloned().unwrap_or(Value::Null);
-    let result = Value::Result { ok, payload: Box::new(payload) };
+    let result = Value::Result {
+        ok,
+        payload: Box::new(payload),
+    };
     ctx.host.coroutine_resume_external(slot, result, ctx.out);
     Ok(Value::Unit)
 }
@@ -225,7 +296,7 @@ pub(crate) fn coro_run_root(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         None => {
             return Err(RuntimeError::Type(
                 "__klio_co_runRoot: missing block".into(),
-            ))
+            ));
         }
     };
     ctx.host.coroutine_run_root(&block, ctx.out)
@@ -277,4 +348,3 @@ pub(crate) fn result_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
     };
     Ok(Value::String(Arc::new(s)))
 }
-

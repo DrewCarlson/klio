@@ -40,16 +40,19 @@ pub fn start_memory_watchdog() {
         let pid = std::process::id();
         std::thread::Builder::new()
             .name("klio-parity-memguard".into())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(100));
-                if let Some(rss) = current_rss_kb(pid)
-                    && rss > cap_kb {
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(100));
+                    if let Some(rss) = current_rss_kb(pid)
+                        && rss > cap_kb
+                    {
                         eprintln!(
                             "[klio-parity] RSS {rss}KB exceeded cap {cap_kb}KB — aborting \
                              to avoid system OOM (raise KLIO_PARITY_RSS_CAP_KB if intentional)"
                         );
                         std::process::abort();
                     }
+                }
             })
             .ok();
     });
@@ -63,7 +66,10 @@ fn current_rss_kb(pid: u32) -> Option<u64> {
         .arg(pid.to_string())
         .output()
         .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 use klio_interp_ir::Vm;
@@ -154,10 +160,18 @@ impl KotlincKind {
     fn binary_name(self) -> &'static str {
         match self {
             Self::Jvm => {
-                if cfg!(windows) { "kotlinc.bat" } else { "kotlinc" }
+                if cfg!(windows) {
+                    "kotlinc.bat"
+                } else {
+                    "kotlinc"
+                }
             }
             Self::Native => {
-                if cfg!(windows) { "kotlinc-native.bat" } else { "kotlinc-native" }
+                if cfg!(windows) {
+                    "kotlinc-native.bat"
+                } else {
+                    "kotlinc-native"
+                }
             }
         }
     }
@@ -176,11 +190,15 @@ fn java_filename() -> &'static str {
 
 fn workspace_root() -> PathBuf {
     let m = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    m.parent().and_then(|p| p.parent()).map(PathBuf::from).unwrap_or(m)
+    m.parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or(m)
 }
 
 fn parity_cache_dir() -> PathBuf {
-    let target = env::var_os("CARGO_TARGET_DIR").map_or_else(|| workspace_root().join("target"), PathBuf::from);
+    let target = env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace_root().join("target"), PathBuf::from);
     target.join("parity-cache")
 }
 
@@ -342,11 +360,13 @@ fn install_jvm(version: &str) -> Result<PathBuf, ParityError> {
     }
 
     let archive_name = format!("kotlin-compiler-{version}.zip");
-    let url = format!(
-        "https://github.com/JetBrains/kotlin/releases/download/v{version}/{archive_name}"
-    );
+    let url =
+        format!("https://github.com/JetBrains/kotlin/releases/download/v{version}/{archive_name}");
     let archive_path = cache.join(&archive_name);
-    eprintln!("[parity] installing JVM kotlinc {version} into {}", cache.display());
+    eprintln!(
+        "[parity] installing JVM kotlinc {version} into {}",
+        cache.display()
+    );
     eprintln!("[parity] downloading {url}");
     download(&url, &archive_path)?;
 
@@ -363,7 +383,11 @@ fn install_jvm(version: &str) -> Result<PathBuf, ParityError> {
         let _ = fs::remove_dir_all(&dest);
     }
     fs::rename(&inner, &dest).map_err(|e| {
-        ParityError::Install(format!("rename {} -> {}: {e}", inner.display(), dest.display()))
+        ParityError::Install(format!(
+            "rename {} -> {}: {e}",
+            inner.display(),
+            dest.display()
+        ))
     })?;
     let _ = fs::remove_dir_all(&staging);
     let _ = fs::remove_file(&archive_path);
@@ -459,7 +483,10 @@ fn install_native(version: &str) -> Result<PathBuf, ParityError> {
             kotlinc.display()
         )));
     }
-    eprintln!("[parity] kotlin-native {version} ready at {}", dest.display());
+    eprintln!(
+        "[parity] kotlin-native {version} ready at {}",
+        dest.display()
+    );
     Ok(dest)
 }
 
@@ -533,7 +560,11 @@ impl InstallLock {
                 .create_new(true)
                 .open(path)
             {
-                Ok(_) => return Ok(Self { path: path.to_path_buf() }),
+                Ok(_) => {
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                    });
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if let Ok(meta) = fs::metadata(path)
                         && let Ok(modified) = meta.modified()
@@ -664,7 +695,11 @@ fn run_capped(mut cmd: Command, timeout: Duration) -> std::io::Result<std::proce
     };
     let stdout = h_out.join().unwrap_or_default();
     let stderr = h_err.join().unwrap_or_default();
-    Ok(std::process::Output { status, stdout, stderr })
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Run a previously-compiled jar under `java -jar`, returning captured stdout
@@ -674,7 +709,9 @@ fn run_capped(mut cmd: Command, timeout: Duration) -> std::io::Result<std::proce
 pub fn run_kotlinc_jar(jar: &Path) -> Result<(String, Option<i32>), ParityError> {
     let java = locate_java()?;
     let mut cmd = Command::new(java);
-    cmd.arg(format!("-Xmx{}m", java_xmx_mb())).arg("-jar").arg(jar);
+    cmd.arg(format!("-Xmx{}m", java_xmx_mb()))
+        .arg("-jar")
+        .arg(jar);
     let result = run_capped(cmd, java_timeout())?;
     let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
     Ok((stdout, result.status.code()))
@@ -754,7 +791,9 @@ pub fn corpus_entry_output(
 /// True when every staged entry already has a cached corpus output.
 #[must_use]
 pub fn corpus_outputs_all_cached(staged: &[PathBuf]) -> bool {
-    staged.iter().all(|s| read_expected(&corpus_entry_key(s)).is_some())
+    staged
+        .iter()
+        .all(|s| read_expected(&corpus_entry_key(s)).is_some())
 }
 
 /// The workspace corpus directory (`crates/klio-parity/tests/corpus`).
@@ -780,11 +819,14 @@ pub fn examples_dir() -> PathBuf {
 /// count; override with `KLIO_PARITY_JOBS` for machines with more headroom.
 #[must_use]
 pub fn default_jobs() -> usize {
-    if let Some(j) = env::var("KLIO_PARITY_JOBS").ok().and_then(|v| v.parse::<usize>().ok()) {
+    if let Some(j) = env::var("KLIO_PARITY_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         return j.max(1);
     }
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-    cores.min(6).max(1)
+    cores.clamp(1, 6)
 }
 
 /// Every `.kt` file directly under `dir`, sorted by path.
@@ -884,7 +926,10 @@ pub struct SweepResult {
 impl SweepResult {
     #[must_use]
     pub fn passed(&self) -> usize {
-        self.results.iter().filter(|r| matches!(r.verdict, SweepVerdict::Pass)).count()
+        self.results
+            .iter()
+            .filter(|r| matches!(r.verdict, SweepVerdict::Pass))
+            .count()
     }
     /// Files that are genuine parity failures (mismatch / klio error / timeout).
     /// A `KotlincError` is a harness problem (no kotlinc), not a klio failure.
@@ -908,24 +953,37 @@ impl SweepResult {
 /// per staged source — `java` runs only on a cache miss) against a fresh
 /// in-process `klio` run. `jobs` worker threads share the file list. A fully
 /// warm sweep spawns neither kotlinc nor java.
-pub fn run_sweep(label: &str, paths: &[PathBuf], jobs: usize, per_file_timeout: Duration) -> Result<SweepResult, ParityError> {
+///
+/// # Panics
+///
+/// Panics if a worker thread poisons a result slot's mutex (i.e. a worker
+/// panicked while holding the lock).
+pub fn run_sweep(
+    label: &str,
+    paths: &[PathBuf],
+    jobs: usize,
+    per_file_timeout: Duration,
+) -> Result<SweepResult, ParityError> {
     start_memory_watchdog();
     let build = compile_corpus(label, paths)?;
     let entries = build.classes;
     let jar = build.jar;
     let next = AtomicUsize::new(0);
-    let slots: Vec<Mutex<Option<SweepVerdict>>> = entries.iter().map(|_| Mutex::new(None)).collect();
+    let slots: Vec<Mutex<Option<SweepVerdict>>> =
+        entries.iter().map(|_| Mutex::new(None)).collect();
     let jobs = jobs.max(1);
     std::thread::scope(|scope| {
         for _ in 0..jobs {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= entries.len() {
-                    break;
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= entries.len() {
+                        break;
+                    }
+                    let entry = &entries[i];
+                    let verdict = sweep_one(&jar, entry, per_file_timeout);
+                    *slots[i].lock().unwrap() = Some(verdict);
                 }
-                let entry = &entries[i];
-                let verdict = sweep_one(&jar, entry, per_file_timeout);
-                *slots[i].lock().unwrap() = Some(verdict);
             });
         }
     });
@@ -1048,7 +1106,11 @@ pub fn compile_corpus(label: &str, files: &[PathBuf]) -> Result<CorpusBuild, Par
     }
 
     if jar.is_file() {
-        return Ok(CorpusBuild { jar, stage_dir: stage, classes });
+        return Ok(CorpusBuild {
+            jar,
+            stage_dir: stage,
+            classes,
+        });
     }
 
     // kotlinc picks output kind from the `-d` extension: `.jar` → jar file,
@@ -1074,7 +1136,11 @@ pub fn compile_corpus(label: &str, files: &[PathBuf]) -> Result<CorpusBuild, Par
         )));
     }
     fs::rename(&tmp, &jar)?;
-    Ok(CorpusBuild { jar, stage_dir: stage, classes })
+    Ok(CorpusBuild {
+        jar,
+        stage_dir: stage,
+        classes,
+    })
 }
 
 fn corpus_cache_key(label: &str, files: &[PathBuf]) -> String {
@@ -1083,7 +1149,10 @@ fn corpus_cache_key(label: &str, files: &[PathBuf]) -> String {
     let mut sorted: Vec<&PathBuf> = files.iter().collect();
     sorted.sort();
     for f in sorted {
-        f.file_name().and_then(|s| s.to_str()).unwrap_or("").hash(&mut h);
+        f.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .hash(&mut h);
         let bytes = fs::read(f).unwrap_or_default();
         bytes.hash(&mut h);
     }
@@ -1099,15 +1168,70 @@ fn corpus_cache_key(label: &str, files: &[PathBuf]) -> String {
 fn sanitize_pkg_segment(stem: &str) -> String {
     const RESERVED: &[&str] = &[
         // Kotlin hard keywords
-        "as", "break", "class", "continue", "do", "else", "false", "for", "fun", "if", "in",
-        "interface", "is", "null", "object", "package", "return", "super", "this", "throw",
-        "true", "try", "typealias", "typeof", "val", "var", "when", "while",
+        "as",
+        "break",
+        "class",
+        "continue",
+        "do",
+        "else",
+        "false",
+        "for",
+        "fun",
+        "if",
+        "in",
+        "interface",
+        "is",
+        "null",
+        "object",
+        "package",
+        "return",
+        "super",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typealias",
+        "typeof",
+        "val",
+        "var",
+        "when",
+        "while",
         // Java reserved words (JVM backend rejects these as package segments too)
-        "abstract", "assert", "boolean", "byte", "case", "catch", "char", "const", "default",
-        "double", "enum", "extends", "final", "finally", "float", "goto", "implements",
-        "import", "instanceof", "int", "long", "native", "new", "private", "protected",
-        "public", "short", "static", "strictfp", "switch", "synchronized", "throws",
-        "transient", "void", "volatile",
+        "abstract",
+        "assert",
+        "boolean",
+        "byte",
+        "case",
+        "catch",
+        "char",
+        "const",
+        "default",
+        "double",
+        "enum",
+        "extends",
+        "final",
+        "finally",
+        "float",
+        "goto",
+        "implements",
+        "import",
+        "instanceof",
+        "int",
+        "long",
+        "native",
+        "new",
+        "private",
+        "protected",
+        "public",
+        "short",
+        "static",
+        "strictfp",
+        "switch",
+        "synchronized",
+        "throws",
+        "transient",
+        "void",
+        "volatile",
     ];
     if RESERVED.contains(&stem) {
         format!("{stem}_")
@@ -1268,7 +1392,10 @@ pub fn run_with_ktc(file: &Path) -> Result<String, String> {
     let owned = map.get(id).source.clone();
     let lexed = Lexer::new(id, &owned).tokenize();
     if lexed.diagnostics.has_errors() {
-        return Err(format!("lex diagnostics: {:?}", lexed.diagnostics.diagnostics()));
+        return Err(format!(
+            "lex diagnostics: {:?}",
+            lexed.diagnostics.diagnostics()
+        ));
     }
     let (ast, diags) = KtParser::new(id, &owned, &lexed.tokens).parse_file();
     if diags.has_errors() {
@@ -1293,7 +1420,8 @@ pub fn run_with_ktc(file: &Path) -> Result<String, String> {
         return Err("no main function in module".into());
     };
     let (mut vm, _main) = Vm::from_built(built);
-    vm.run(main_id, &mut out).map_err(|e| format!("runtime error: {e}"))?;
+    vm.run(main_id, &mut out)
+        .map_err(|e| format!("runtime error: {e}"))?;
     if !out.cur.is_empty() {
         let trailing = std::mem::take(&mut out.cur);
         out.lines.push(trailing);
@@ -1395,7 +1523,11 @@ fn parse_manifest_roots(toml: &str) -> Vec<ManifestRoot> {
             if let Some(c) = cur.take() {
                 tables.push(c);
             }
-            cur = Some(ManifestRoot { root: String::new(), include: Vec::new(), exclude: Vec::new() });
+            cur = Some(ManifestRoot {
+                root: String::new(),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            });
             in_source_table = true;
             continue;
         }
@@ -1406,7 +1538,9 @@ fn parse_manifest_roots(toml: &str) -> Vec<ManifestRoot> {
             in_source_table = false;
             continue;
         }
-        let Some((key, val)) = line.split_once('=') else { continue };
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         let val = val.trim();
         if in_source_table {
@@ -1427,7 +1561,11 @@ fn parse_manifest_roots(toml: &str) -> Vec<ManifestRoot> {
 
     let mut out: Vec<ManifestRoot> = plain
         .into_iter()
-        .map(|root| ManifestRoot { root, include: Vec::new(), exclude: Vec::new() })
+        .map(|root| ManifestRoot {
+            root,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        })
         .collect();
     out.extend(tables);
     out
@@ -1436,7 +1574,9 @@ fn parse_manifest_roots(toml: &str) -> Vec<ManifestRoot> {
 /// Recursively collect every `.kt` file under `dir`, returning paths
 /// relative to `dir` (slash-normalized).
 fn walk_kt(dir: &Path, base: &Path, out: &mut Vec<(String, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut entries: Vec<_> = entries.flatten().collect();
     entries.sort_by_key(std::fs::DirEntry::path);
     for e in entries {
@@ -1480,8 +1620,8 @@ fn collect_manifest_sources(pack_dir: &Path) -> Result<Vec<PathBuf>, String> {
         let mut found: Vec<(String, PathBuf)> = Vec::new();
         walk_kt(&root_path, &root_path, &mut found);
         for (rel, abs) in found {
-            let included = r.include.is_empty()
-                || r.include.iter().any(|pat| manifest_pat_match(&rel, pat));
+            let included =
+                r.include.is_empty() || r.include.iter().any(|pat| manifest_pat_match(&rel, pat));
             if !included {
                 continue;
             }
@@ -1511,10 +1651,9 @@ fn embedded_stdlib_sources(
     map: &mut SourceMap,
 ) -> Vec<klio_ast::KotlinFile> {
     use klio_pack::schema::decode;
-    use klio_pack::{section_names, PackReader};
+    use klio_pack::{PackReader, section_names};
 
-    let mut import_prefixes: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut import_prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
     for f in existing {
         for imp in &f.imports {
             let p = imp
@@ -1530,13 +1669,11 @@ fn embedded_stdlib_sources(
     }
 
     let bytes = klio_stdlib_pack::stdlib_pack_bytes();
-    let pack = match PackReader::from_bytes(bytes.into_owned()) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
+    let Ok(pack) = PackReader::from_bytes(bytes.into_owned()) else {
+        return Vec::new();
     };
-    let payload = match pack.read_section(section_names::SOURCES) {
-        Ok(Some(p)) => p,
-        _ => return Vec::new(),
+    let Ok(Some(payload)) = pack.read_section(section_names::SOURCES) else {
+        return Vec::new();
     };
     let bundle: klio_pack::schema::SourceBundle = match decode(&payload) {
         Ok(b) => b,
@@ -1598,8 +1735,7 @@ fn embedded_stdlib_sources(
     parsed
         .into_iter()
         .filter(|(pkg, _)| {
-            let is_implicit =
-                !pkg.is_empty() && klio_stdlib::is_implicitly_imported_package(pkg);
+            let is_implicit = !pkg.is_empty() && klio_stdlib::is_implicitly_imported_package(pkg);
             is_implicit || load_gated
         })
         .map(|(_, ast)| ast)
@@ -1615,8 +1751,9 @@ fn embedded_stdlib_sources(
 mod pack_ast_cache {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    static CACHE: Mutex<Option<Vec<(PathBuf, Arc<Vec<klio_ast::KotlinFile>>)>>> =
-        Mutex::new(None);
+
+    type CacheEntries = Vec<(PathBuf, Arc<Vec<klio_ast::KotlinFile>>)>;
+    static CACHE: Mutex<Option<CacheEntries>> = Mutex::new(None);
     pub fn get(pack_dir: &Path) -> Option<Arc<Vec<klio_ast::KotlinFile>>> {
         let g = CACHE.lock().ok()?;
         let entries = g.as_ref()?;
@@ -1651,25 +1788,96 @@ pub fn run_with_packs(file: &Path) -> Result<String, String> {
     stacker::grow(16 * 1024 * 1024, || run_with_packs_inner(file))
 }
 
-fn run_with_packs_inner(file: &Path) -> Result<String, String> {
-    fn parse(
-        map: &mut SourceMap,
-        path: &Path,
-        text: String,
-    ) -> Result<klio_ast::KotlinFile, String> {
-        let id = map.add(path, text);
-        let src = map.get(id).source.clone();
-        let lexed = Lexer::new(id, &src).tokenize();
-        if lexed.diagnostics.has_errors() {
-            return Err(format!("lex: {:?}", lexed.diagnostics.diagnostics()));
-        }
-        let (ast, diags) = KtParser::new(id, &src, &lexed.tokens).parse_file();
-        if diags.has_errors() {
-            return Err(format!("parse: {:?}", diags.diagnostics()));
-        }
-        Ok(ast)
+fn parse_pack_file(
+    map: &mut SourceMap,
+    path: &Path,
+    text: String,
+) -> Result<klio_ast::KotlinFile, String> {
+    let id = map.add(path, text);
+    let src = map.get(id).source.clone();
+    let lexed = Lexer::new(id, &src).tokenize();
+    if lexed.diagnostics.has_errors() {
+        return Err(format!("lex: {:?}", lexed.diagnostics.diagnostics()));
     }
+    let (ast, diags) = KtParser::new(id, &src, &lexed.tokens).parse_file();
+    if diags.has_errors() {
+        return Err(format!("parse: {:?}", diags.diagnostics()));
+    }
+    Ok(ast)
+}
 
+fn manifest_library_id(pack_dir: &Path) -> Option<String> {
+    let toml = std::fs::read_to_string(pack_dir.join("klio.toml")).ok()?;
+    for line in toml.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if let Some(rest) = l.strip_prefix("id") {
+            let v = rest.trim_start_matches([' ', '=']).trim().trim_matches('"');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Register the package declared by `ast` (if any) as a known package.
+fn register_ast_package(ast: &klio_ast::KotlinFile) {
+    if let Some(pkg) = &ast.package {
+        let path = pkg
+            .path
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        if !path.is_empty() {
+            klio_stdlib::register_known_package(path);
+        }
+    }
+}
+
+/// Append each in-repo kotlinx pack's parsed sources to `asts`, gated on the
+/// imports actually in play. Parsed ASTs are cached per pack-dir for the
+/// life of the process.
+fn load_kotlinx_packs(
+    pack_dirs: &[PathBuf],
+    import_prefixes: &std::collections::HashSet<String>,
+    imports_coroutines: bool,
+    map: &mut SourceMap,
+    asts: &mut Vec<klio_ast::KotlinFile>,
+) -> Result<(), String> {
+    for pack_dir in pack_dirs {
+        let lib_id = manifest_library_id(pack_dir).unwrap_or_default();
+        let wanted = import_prefixes.iter().any(|imp| {
+            imp == &lib_id
+                || imp.starts_with(&format!("{lib_id}."))
+                || lib_id.starts_with(&format!("{imp}."))
+        }) || (lib_id == "kotlinx.atomicfu" && imports_coroutines);
+        if !wanted {
+            continue;
+        }
+        let pack_asts: std::sync::Arc<Vec<klio_ast::KotlinFile>> =
+            if let Some(cached) = pack_ast_cache::get(pack_dir) {
+                cached
+            } else {
+                let mut fresh: Vec<klio_ast::KotlinFile> = Vec::new();
+                for src_path in collect_manifest_sources(pack_dir)? {
+                    let text = std::fs::read_to_string(&src_path).map_err(|e| e.to_string())?;
+                    let ast = parse_pack_file(map, &src_path, text)?;
+                    register_ast_package(&ast);
+                    fresh.push(ast);
+                }
+                pack_ast_cache::insert(pack_dir, fresh);
+                pack_ast_cache::get(pack_dir).expect("just inserted")
+            };
+        for ast in pack_asts.iter() {
+            register_ast_package(ast);
+            asts.push(ast.clone());
+        }
+    }
+    Ok(())
+}
+
+fn run_with_packs_inner(file: &Path) -> Result<String, String> {
     let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -1696,7 +1904,7 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
     // diverging from `klio run` (and overflowing on programs that
     // never touch coroutines).
     let user_src = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
-    let user_ast = parse(&mut map, file, user_src)?;
+    let user_ast = parse_pack_file(&mut map, file, user_src)?;
     let mut user_import_prefixes: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for imp in &user_ast.imports {
@@ -1710,80 +1918,20 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
             user_import_prefixes.insert(p);
         }
     }
-    fn manifest_library_id(pack_dir: &Path) -> Option<String> {
-        let toml = std::fs::read_to_string(pack_dir.join("klio.toml")).ok()?;
-        for line in toml.lines() {
-            let l = line.split('#').next().unwrap_or("").trim();
-            if let Some(rest) = l.strip_prefix("id") {
-                let v = rest.trim_start_matches([' ', '=']).trim().trim_matches('"');
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-        None
-    }
     let imports_coroutines = user_import_prefixes
         .iter()
         .any(|imp| imp == "kotlinx.coroutines" || imp.starts_with("kotlinx.coroutines."));
-    for pack_dir in &pack_dirs {
-        let lib_id = manifest_library_id(pack_dir).unwrap_or_default();
-        let wanted = user_import_prefixes.iter().any(|imp| {
-            imp == &lib_id
-                || imp.starts_with(&format!("{lib_id}."))
-                || lib_id.starts_with(&format!("{imp}."))
-        }) || (lib_id == "kotlinx.atomicfu" && imports_coroutines);
-        if !wanted {
-            continue;
-        }
-        // Cache the parsed pack ASTs per-process: each pack's source
-        // set is bytes-static within a test run, but parsing the
-        // upstream kotlinx-coroutines commonMain on every call
-        // dominates a parity-test suite's wall-clock. The cache is
-        // keyed by pack-dir path and stores cloned ASTs so repeated
-        // calls only pay the deep-clone instead of the lex+parse
-        // sweep.
-        let cached = pack_ast_cache::get(pack_dir);
-        let pack_asts: std::sync::Arc<Vec<klio_ast::KotlinFile>> = if let Some(cached) = cached {
-            cached
-        } else {
-            let mut fresh: Vec<klio_ast::KotlinFile> = Vec::new();
-            for src_path in collect_manifest_sources(pack_dir)? {
-                let text = std::fs::read_to_string(&src_path).map_err(|e| e.to_string())?;
-                let ast = parse(&mut map, &src_path, text)?;
-                if let Some(pkg) = &ast.package {
-                    let path = pkg
-                        .path
-                        .iter()
-                        .map(|i| i.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    if !path.is_empty() {
-                        klio_stdlib::register_known_package(path);
-                    }
-                }
-                fresh.push(ast);
-            }
-            pack_ast_cache::insert(pack_dir, fresh);
-            pack_ast_cache::get(pack_dir).expect("just inserted")
-        };
-        for ast in pack_asts.iter() {
-            if let Some(pkg) = &ast.package {
-                let path = pkg
-                    .path
-                    .iter()
-                    .map(|i| i.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".");
-                if !path.is_empty() {
-                    klio_stdlib::register_known_package(path);
-                }
-            }
-        }
-        for ast in pack_asts.iter() {
-            asts.push(ast.clone());
-        }
-    }
+    // Cache the parsed pack ASTs per-process: each pack's source set is
+    // bytes-static within a test run, but parsing the upstream
+    // kotlinx-coroutines commonMain on every call dominates a parity-test
+    // suite's wall-clock.
+    load_kotlinx_packs(
+        &pack_dirs,
+        &user_import_prefixes,
+        imports_coroutines,
+        &mut map,
+        &mut asts,
+    )?;
 
     // Mirror the production binary: surface the embedded stdlib pack's
     // curated `SOURCES` (the real `kotlin.coroutines` / `kotlin.time`
@@ -1803,17 +1951,7 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
         .chain(std::iter::once(user_ast.clone()))
         .collect();
     for ast in embedded_stdlib_sources(&import_probe_asts, &mut map) {
-        if let Some(pkg) = &ast.package {
-            let path = pkg
-                .path
-                .iter()
-                .map(|i| i.name.as_str())
-                .collect::<Vec<_>>()
-                .join(".");
-            if !path.is_empty() {
-                klio_stdlib::register_known_package(path);
-            }
-        }
+        register_ast_package(&ast);
         asts.push(ast);
     }
     asts.push(user_ast);
@@ -1848,7 +1986,6 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
     Ok(joined)
 }
 
-
 /// Full parity check: compile + run both compilers, return a report.
 pub fn check(file: &Path) -> Result<ParityReport, ParityError> {
     start_memory_watchdog();
@@ -1861,7 +1998,9 @@ pub fn check(file: &Path) -> Result<ParityReport, ParityError> {
     // klio's own output (the `assert_klio` half of every test) is
     // already enough signal.
     if env::var("KLIO_SKIP_KOTLINC_PARITY")
-        .ok().as_ref().is_some_and(|v| !v.is_empty() && v != "0")
+        .ok()
+        .as_ref()
+        .is_some_and(|v| !v.is_empty() && v != "0")
     {
         return Err(ParityError::NoKotlinc);
     }

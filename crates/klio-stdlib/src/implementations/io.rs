@@ -1,4 +1,4 @@
-use super::{CallCtx, Value, RuntimeError, BufRead, Arc};
+use super::{Arc, BufRead, CallCtx, RuntimeError, Value};
 
 // ============================================================
 // io
@@ -9,15 +9,10 @@ use super::{CallCtx, Value, RuntimeError, BufRead, Arc};
 /// rendering. Used by `println` / `print` so plain-class instances
 /// pick up `override fun toString()` rather than always landing on
 /// the default `ClassName@<hex>` shape.
-pub(crate) fn render_via_user_to_string(
-    ctx: &mut CallCtx,
-    v: &Value,
-) -> String {
+pub(crate) fn render_via_user_to_string(ctx: &mut CallCtx, v: &Value) -> String {
     if matches!(v, Value::Instance(_)) {
         let CallCtx { out, host, .. } = ctx;
-        if let Some(Ok(Value::String(s))) =
-            host.invoke_method(v, "toString", &[], *out)
-        {
+        if let Some(Ok(Value::String(s))) = host.invoke_method(v, "toString", &[], *out) {
             return (*s).clone();
         }
     }
@@ -75,4 +70,3 @@ pub(crate) fn io_read_line(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         Err(e) => Err(RuntimeError::Type(format!("readLine failed: {e}"))),
     }
 }
-

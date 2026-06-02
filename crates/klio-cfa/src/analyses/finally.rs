@@ -12,6 +12,8 @@
 use crate::analyses::reachable;
 use crate::ir::{BlockId, Cfg, EdgeKind, Terminator};
 
+// block count fits in u32
+#[allow(clippy::cast_possible_truncation)]
 pub fn prune_divergent_finally(cfg: &mut Cfg) -> usize {
     let mut pruned = 0usize;
     let reach = reachable::analyse(cfg);

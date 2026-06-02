@@ -1,4 +1,4 @@
-use super::{FuncBuilder, Expr, Reg, Inst, lower_expr, Const, AstBinOp, BinOp};
+use super::{AstBinOp, BinOp, Const, Expr, FuncBuilder, Inst, Reg, lower_expr};
 
 /// Bind function parameters into the current scope. Each param is
 /// loaded into a fresh register via `Inst::LoadParam` so subsequent
@@ -35,156 +35,213 @@ pub(crate) fn is_any_typed_path(b: &FuncBuilder<'_>, e: &Expr) -> bool {
 /// writeback path to know which captured names to sync back to
 /// the caller's regs after a HOF call returns.
 pub(crate) fn lambda_mutated_outer_vars(b: &FuncBuilder<'_>, arg: &Expr) -> Vec<String> {
-    let Expr::Lambda { body, .. } = arg else { return Vec::new(); };
+    let Expr::Lambda { body, .. } = arg else {
+        return Vec::new();
+    };
     let visible = b.visible_names();
     let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    fn walk(
-        stmt: &klio_ast::Stmt,
-        visible: &std::collections::HashSet<String>,
-        out: &mut std::collections::BTreeSet<String>,
-    ) {
-        match stmt {
-            klio_ast::Stmt::Assign { target, .. } => {
-                if let Expr::Path { segments, .. } = target
-                    && segments.len() == 1 && visible.contains(&segments[0].name) {
-                        out.insert(segments[0].name.clone());
-                    }
-            }
-            klio_ast::Stmt::Expr(e) => walk_expr(e, visible, out),
-            _ => {}
-        }
-    }
-    fn visit_path(
-        e: &Expr,
-        visible: &std::collections::HashSet<String>,
-        out: &mut std::collections::BTreeSet<String>,
-    ) {
-        if let Expr::Path { segments, .. } = e
-            && segments.len() == 1 && visible.contains(&segments[0].name) {
-                out.insert(segments[0].name.clone());
-            }
-    }
-    fn walk_expr(
-        e: &Expr,
-        visible: &std::collections::HashSet<String>,
-        out: &mut std::collections::BTreeSet<String>,
-    ) {
-        match e {
-            Expr::Postfix { op, expr, .. } => {
-                if matches!(op, klio_ast::PostfixOp::Inc | klio_ast::PostfixOp::Dec) {
-                    visit_path(expr, visible, out);
-                }
-            }
-            Expr::Unary { op, expr, .. } => {
-                if matches!(op, klio_ast::UnOp::PreInc | klio_ast::UnOp::PreDec) {
-                    visit_path(expr, visible, out);
-                }
-            }
-            Expr::Block(b) => { for s in &b.stmts { walk(s, visible, out); } }
-            Expr::If { cond, then_branch, else_branch, .. } => {
-                walk_expr(cond, visible, out);
-                walk_expr(then_branch, visible, out);
-                if let Some(e) = else_branch { walk_expr(e, visible, out); }
-            }
-            Expr::While { cond, body, .. } => {
-                walk_expr(cond, visible, out);
-                walk_expr(body, visible, out);
-            }
-            Expr::DoWhile { body, cond, .. } => {
-                if let Some(b) = body { walk_expr(b, visible, out); }
-                walk_expr(cond, visible, out);
-            }
-            Expr::For { body, .. } => walk_expr(body, visible, out),
-            Expr::When { branches, .. } => {
-                for br in branches { walk_expr(&br.body, visible, out); }
-            }
-            Expr::Try { body, catches, finally, .. } => {
-                for s in &body.stmts { walk(s, visible, out); }
-                for c in catches { for s in &c.body.stmts { walk(s, visible, out); } }
-                if let Some(b) = finally { for s in &b.stmts { walk(s, visible, out); } }
-            }
-            _ => {}
-        }
-    }
     for s in &body.stmts {
-        walk(s, &visible, &mut out);
+        mutated_walk_stmt(s, &visible, &mut out);
     }
     out.into_iter().collect()
 }
 
+fn mutated_walk_stmt(
+    stmt: &klio_ast::Stmt,
+    visible: &std::collections::HashSet<String>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    match stmt {
+        klio_ast::Stmt::Assign { target, .. } => {
+            if let Expr::Path { segments, .. } = target
+                && segments.len() == 1
+                && visible.contains(&segments[0].name)
+            {
+                out.insert(segments[0].name.clone());
+            }
+        }
+        klio_ast::Stmt::Expr(e) => mutated_walk_expr(e, visible, out),
+        _ => {}
+    }
+}
+
+fn mutated_visit_path(
+    e: &Expr,
+    visible: &std::collections::HashSet<String>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    if let Expr::Path { segments, .. } = e
+        && segments.len() == 1
+        && visible.contains(&segments[0].name)
+    {
+        out.insert(segments[0].name.clone());
+    }
+}
+
+fn mutated_walk_expr(
+    e: &Expr,
+    visible: &std::collections::HashSet<String>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    match e {
+        Expr::Postfix { op, expr, .. } => {
+            if matches!(op, klio_ast::PostfixOp::Inc | klio_ast::PostfixOp::Dec) {
+                mutated_visit_path(expr, visible, out);
+            }
+        }
+        Expr::Unary { op, expr, .. } => {
+            if matches!(op, klio_ast::UnOp::PreInc | klio_ast::UnOp::PreDec) {
+                mutated_visit_path(expr, visible, out);
+            }
+        }
+        Expr::Block(b) => {
+            for s in &b.stmts {
+                mutated_walk_stmt(s, visible, out);
+            }
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            mutated_walk_expr(cond, visible, out);
+            mutated_walk_expr(then_branch, visible, out);
+            if let Some(e) = else_branch {
+                mutated_walk_expr(e, visible, out);
+            }
+        }
+        Expr::While { cond, body, .. } => {
+            mutated_walk_expr(cond, visible, out);
+            mutated_walk_expr(body, visible, out);
+        }
+        Expr::DoWhile { body, cond, .. } => {
+            if let Some(b) = body {
+                mutated_walk_expr(b, visible, out);
+            }
+            mutated_walk_expr(cond, visible, out);
+        }
+        Expr::For { body, .. } => mutated_walk_expr(body, visible, out),
+        Expr::When { branches, .. } => {
+            for br in branches {
+                mutated_walk_expr(&br.body, visible, out);
+            }
+        }
+        Expr::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
+            for s in &body.stmts {
+                mutated_walk_stmt(s, visible, out);
+            }
+            for c in catches {
+                for s in &c.body.stmts {
+                    mutated_walk_stmt(s, visible, out);
+                }
+            }
+            if let Some(b) = finally {
+                for s in &b.stmts {
+                    mutated_walk_stmt(s, visible, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn lambda_writes_outer_var(b: &FuncBuilder<'_>, arg: &Expr) -> bool {
-    let body = match arg {
-        Expr::Lambda { body, .. } => body,
-        _ => return false,
+    let Expr::Lambda { body, .. } = arg else {
+        return false;
     };
     let visible = b.visible_names();
-    fn walk(stmt: &klio_ast::Stmt, visible: &std::collections::HashSet<String>) -> bool {
-        match stmt {
-            klio_ast::Stmt::Assign { target, .. } => {
-                if let Expr::Path { segments, .. } = target
-                    && segments.len() == 1 && visible.contains(&segments[0].name) {
-                        return true;
-                    }
-                false
+    body.stmts.iter().any(|s| writes_walk_stmt(s, &visible))
+}
+
+fn writes_walk_stmt(stmt: &klio_ast::Stmt, visible: &std::collections::HashSet<String>) -> bool {
+    match stmt {
+        klio_ast::Stmt::Assign { target, .. } => {
+            if let Expr::Path { segments, .. } = target
+                && segments.len() == 1
+                && visible.contains(&segments[0].name)
+            {
+                return true;
             }
-            klio_ast::Stmt::Expr(e) => walk_expr(e, visible),
-            _ => false,
+            false
         }
+        klio_ast::Stmt::Expr(e) => writes_walk_expr(e, visible),
+        _ => false,
     }
-    // Postfix `x++` / `x--` and prefix `++x` / `--x` on a Path
-    // visible from the outer scope mutate that var. Also count
-    // `return` from inside the lambda body: when the bare `return`
-    // resolves to a non-local return (e.g. `forEach` lambda
-    // returning from the enclosing function), the IR's lambda
-    // would translate it as a local return and lose the semantics.
-    fn is_path_outer(e: &Expr, visible: &std::collections::HashSet<String>) -> bool {
-        matches!(e, Expr::Path { segments, .. } if segments.len() == 1 && visible.contains(&segments[0].name))
-    }
-    fn walk_expr(e: &Expr, visible: &std::collections::HashSet<String>) -> bool {
-        match e {
-            Expr::Postfix { op, expr, .. } => {
-                matches!(op, klio_ast::PostfixOp::Inc | klio_ast::PostfixOp::Dec)
-                    && is_path_outer(expr, visible)
-            }
-            Expr::Unary { op, expr, .. } => {
-                matches!(op, klio_ast::UnOp::PreInc | klio_ast::UnOp::PreDec)
-                    && is_path_outer(expr, visible)
-            }
-            Expr::Return { .. } => {
-                // Non-local return from inside the lambda body
-                // propagates as `EvalError::NonLocalReturn` through
-                // the host's `call_value_named`; the enclosing IR
-                // fn frame catches it. No EvalAst fallback needed.
-                false
-            }
-            Expr::Block(b) => b.stmts.iter().any(|s| walk(s, visible)),
-            Expr::If { cond, then_branch, else_branch, .. } => {
-                walk_expr(cond, visible)
-                    || walk_expr(then_branch, visible)
-                    || else_branch.as_ref().is_some_and(|e| walk_expr(e, visible))
-            }
-            Expr::While { cond, body, .. } => {
-                walk_expr(cond, visible) || walk_expr(body, visible)
-            }
-            Expr::DoWhile { body, cond, .. } => {
-                body.as_ref().is_some_and(|b| walk_expr(b, visible))
-                    || walk_expr(cond, visible)
-            }
-            Expr::For { body, .. } => walk_expr(body, visible),
-            Expr::When { branches, .. } => branches.iter().any(|br| walk_expr(&br.body, visible)),
-            Expr::Try { body, catches, finally, .. } => {
-                body.stmts.iter().any(|s| walk(s, visible))
-                    || catches
-                        .iter()
-                        .any(|c| c.body.stmts.iter().any(|s| walk(s, visible)))
-                    || finally
-                        .as_ref()
-                        .is_some_and(|b| b.stmts.iter().any(|s| walk(s, visible)))
-            }
-            _ => false,
+}
+
+fn writes_is_path_outer(e: &Expr, visible: &std::collections::HashSet<String>) -> bool {
+    matches!(e, Expr::Path { segments, .. } if segments.len() == 1 && visible.contains(&segments[0].name))
+}
+
+// Postfix `x++` / `x--` and prefix `++x` / `--x` on a Path
+// visible from the outer scope mutate that var. Also count
+// `return` from inside the lambda body: when the bare `return`
+// resolves to a non-local return (e.g. `forEach` lambda
+// returning from the enclosing function), the IR's lambda
+// would translate it as a local return and lose the semantics.
+fn writes_walk_expr(e: &Expr, visible: &std::collections::HashSet<String>) -> bool {
+    match e {
+        Expr::Postfix { op, expr, .. } => {
+            matches!(op, klio_ast::PostfixOp::Inc | klio_ast::PostfixOp::Dec)
+                && writes_is_path_outer(expr, visible)
         }
+        Expr::Unary { op, expr, .. } => {
+            matches!(op, klio_ast::UnOp::PreInc | klio_ast::UnOp::PreDec)
+                && writes_is_path_outer(expr, visible)
+        }
+        // Non-local return from inside the lambda body propagates
+        // as `EvalError::NonLocalReturn` through the host's
+        // `call_value_named`; the enclosing IR fn frame catches it.
+        // No EvalAst fallback needed. Kept as an explicit arm to
+        // document that decision rather than fall into the wildcard.
+        #[allow(clippy::match_same_arms)]
+        Expr::Return { .. } => false,
+        Expr::Block(b) => b.stmts.iter().any(|s| writes_walk_stmt(s, visible)),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            writes_walk_expr(cond, visible)
+                || writes_walk_expr(then_branch, visible)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|e| writes_walk_expr(e, visible))
+        }
+        Expr::While { cond, body, .. } => {
+            writes_walk_expr(cond, visible) || writes_walk_expr(body, visible)
+        }
+        Expr::DoWhile { body, cond, .. } => {
+            body.as_ref().is_some_and(|b| writes_walk_expr(b, visible))
+                || writes_walk_expr(cond, visible)
+        }
+        Expr::For { body, .. } => writes_walk_expr(body, visible),
+        Expr::When { branches, .. } => branches
+            .iter()
+            .any(|br| writes_walk_expr(&br.body, visible)),
+        Expr::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
+            body.stmts.iter().any(|s| writes_walk_stmt(s, visible))
+                || catches
+                    .iter()
+                    .any(|c| c.body.stmts.iter().any(|s| writes_walk_stmt(s, visible)))
+                || finally
+                    .as_ref()
+                    .is_some_and(|b| b.stmts.iter().any(|s| writes_walk_stmt(s, visible)))
+        }
+        _ => false,
     }
-    body.stmts.iter().any(|s| walk(s, &visible))
 }
 
 // `collect_path_idents{,_stmt}`, `names_referenced_in_lambdas`,
@@ -216,14 +273,14 @@ pub(crate) fn boxed_cell_reg(b: &mut FuncBuilder, name: &str) -> Reg {
 /// name (a call on an arbitrary value expression).
 pub(crate) fn callee_label(callee: &Expr) -> Option<String> {
     match callee {
-        Expr::Path { segments, .. } if segments.len() == 1 => {
-            Some(segments[0].name.clone())
-        }
+        Expr::Path { segments, .. } if segments.len() == 1 => Some(segments[0].name.clone()),
         Expr::Member { name, .. } => Some(name.name.clone()),
         _ => None,
     }
 }
 
+// n_args is a u8 slot; an IR call's argument count is bounded by it.
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn lower_arg_run(b: &mut FuncBuilder<'_>, args: &[Expr]) -> (Reg, u8) {
     let n = args.len();
     if n == 0 {
@@ -243,7 +300,7 @@ pub(crate) fn lower_arg_run(b: &mut FuncBuilder<'_>, args: &[Expr]) -> (Reg, u8)
     // records it, then clear it so it never leaks past this run.
     let call_label = b.pending_lambda_label.take();
     for (slot, arg) in slots.iter().zip(args.iter()) {
-        b.pending_lambda_label = call_label.clone();
+        b.pending_lambda_label.clone_from(&call_label);
         let r = lower_expr(b, arg);
         b.pending_lambda_label = None;
         b.push(Inst::Move { dst: *slot, src: r });
@@ -263,7 +320,10 @@ pub(crate) fn intern_arg_names(
     }
     arg_names
         .iter()
-        .map(|opt| opt.as_ref().map(|s| module.intern_const(Const::String(s.clone()))))
+        .map(|opt| {
+            opt.as_ref()
+                .map(|s| module.intern_const(Const::String(s.clone())))
+        })
         .collect()
 }
 
@@ -305,6 +365,7 @@ pub(crate) fn ast_binop(op: AstBinOp) -> BinOp {
         // SetField for assign). Fall back to Add so the lowering
         // pass remains total; the dedicated forms land in the next
         // pass.
+        #[allow(clippy::match_same_arms)]
         AstBinOp::In | AstBinOp::NotIn | AstBinOp::Assign => BinOp::Add,
     }
 }

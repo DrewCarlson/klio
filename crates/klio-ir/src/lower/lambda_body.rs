@@ -45,10 +45,20 @@ pub(super) fn lower_lambda_body_capturing_kind(
     tailrec_self: Option<&str>,
 ) -> (crate::FuncId, Vec<String>) {
     lower_lambda_body_capturing_kind_with(
-        module, params, body, outer, is_lambda, outer_boxed, tailrec_self, false,
+        module,
+        params,
+        body,
+        outer,
+        is_lambda,
+        outer_boxed,
+        tailrec_self,
+        false,
     )
 }
 
+// Innermost rung of the lambda-body lowering wrapper chain; each flag/ref
+// is threaded straight from the AST and bundling them would only obscure it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_lambda_body_capturing_kind_with(
     module: &mut crate::Module,
     params: &[klio_ast::Ident],
@@ -92,6 +102,8 @@ pub(super) fn lower_lambda_body_capturing_kind_with(
     b.terminate(Terminator::Return(Some(result)));
     let captured = b.captures_taken().to_vec();
     let func = b.finish("<lambda>", "<lambda>", crate::TypeRef::unit());
+    // Function count is bounded well below u32::MAX; the index is the new FuncId.
+    #[allow(clippy::cast_possible_truncation)]
     let id = crate::FuncId(module.funcs.len() as u32);
     let mut placed = func;
     placed.id = id;

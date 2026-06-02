@@ -1,4 +1,11 @@
-use super::{Checker, Visibility, HashSet, Span, Diagnostic, codes, ClassInfo, has_published_api, Type, Expr, at_least_as_applicable, AssignOp, TypeRef};
+use super::{
+    AssignOp, Checker, ClassInfo, Diagnostic, Expr, HashSet, Span, Type, TypeRef, Visibility,
+    at_least_as_applicable, codes, has_published_api,
+};
+
+/// A conflicting-overload pair: the two declaration spans, the shared
+/// function name, and each overload's parameter-name list.
+type OverloadPair = (Span, Span, String, Vec<String>, Vec<String>);
 
 impl Checker<'_> {
     /// Look up the effective visibility a class declares for a member.
@@ -20,7 +27,9 @@ impl Checker<'_> {
             if !seen.insert(c.clone()) {
                 continue;
             }
-            let Some(info) = self.classes.get(&c) else { continue };
+            let Some(info) = self.classes.get(&c) else {
+                continue;
+            };
             if let Some(v) = info.member_visibility.get(name).copied() {
                 return Some((v, c));
             }
@@ -43,9 +52,11 @@ impl Checker<'_> {
         declaring_class: &str,
         recv_class: Option<&str>,
     ) -> bool {
-        let Some(enclosing) = self.class_stack.last() else { return false };
-        let in_subclass = enclosing == declaring_class
-            || self.is_subtype_of(enclosing, declaring_class);
+        let Some(enclosing) = self.class_stack.last() else {
+            return false;
+        };
+        let in_subclass =
+            enclosing == declaring_class || self.is_subtype_of(enclosing, declaring_class);
         if !in_subclass {
             return false;
         }
@@ -75,14 +86,8 @@ impl Checker<'_> {
         };
         let allowed = match v {
             Visibility::Public | Visibility::Internal => true,
-            Visibility::Private => {
-                self.class_stack
-                    .last()
-                    .is_some_and(|c| c == &decl_class)
-            }
-            Visibility::Protected => {
-                self.protected_access_allowed(&decl_class, recv_class)
-            }
+            Visibility::Private => self.class_stack.last().is_some_and(|c| c == &decl_class),
+            Visibility::Protected => self.protected_access_allowed(&decl_class, recv_class),
         };
         if allowed {
             return;
@@ -94,9 +99,7 @@ impl Checker<'_> {
         };
         self.diagnostics.emit(
             Diagnostic::error(
-                format!(
-                    "Cannot access `{name}`: it is {kind} in `{decl_class}`"
-                ),
+                format!("Cannot access `{name}`: it is {kind} in `{decl_class}`"),
                 member_span,
             )
             .with_code(codes::TYPE_INVISIBLE_MEMBER),
@@ -116,29 +119,31 @@ impl Checker<'_> {
         // Spec §4.6: a per-primary-ctor visibility (`class Foo private
         // constructor(...)`) gates constructor invocations independently of
         // the class visibility itself.
-        let same_file = info
-            .decl_file
-            .is_none_or(|f| f == use_span.file);
+        let same_file = info.decl_file.is_none_or(|f| f == use_span.file);
         if let Some(pcv) = info.primary_ctor_visibility
-            && matches!(pcv, Visibility::Private) && !same_file {
-                self.diagnostics.emit(
-                    Diagnostic::error(
-                        format!("Cannot access `{name}`: primary constructor is private"),
-                        use_span,
-                    )
-                    .with_code(codes::TYPE_INVISIBLE_MEMBER),
-                );
-                return;
-            }
-        if matches!(info.decl_visibility, Visibility::Public | Visibility::Internal) {
+            && matches!(pcv, Visibility::Private)
+            && !same_file
+        {
+            self.diagnostics.emit(
+                Diagnostic::error(
+                    format!("Cannot access `{name}`: primary constructor is private"),
+                    use_span,
+                )
+                .with_code(codes::TYPE_INVISIBLE_MEMBER),
+            );
+            return;
+        }
+        if matches!(
+            info.decl_visibility,
+            Visibility::Public | Visibility::Internal
+        ) {
             return;
         }
         match info.decl_visibility {
             Visibility::Private if same_file => return,
-            Visibility::Protected
-                if self.protected_access_allowed(name, None) => {
-                    return;
-                }
+            Visibility::Protected if self.protected_access_allowed(name, None) => {
+                return;
+            }
             _ => {}
         }
         let kind = match info.decl_visibility {
@@ -147,11 +152,8 @@ impl Checker<'_> {
             _ => "invisible",
         };
         self.diagnostics.emit(
-            Diagnostic::error(
-                format!("Cannot access `{name}`: class is {kind}"),
-                use_span,
-            )
-            .with_code(codes::TYPE_INVISIBLE_MEMBER),
+            Diagnostic::error(format!("Cannot access `{name}`: class is {kind}"), use_span)
+                .with_code(codes::TYPE_INVISIBLE_MEMBER),
         );
     }
 
@@ -204,9 +206,7 @@ impl Checker<'_> {
         }
         self.diagnostics.emit(
             Diagnostic::error(
-                format!(
-                    "Cannot access `{name}`: it is private in its declaring file"
-                ),
+                format!("Cannot access `{name}`: it is private in its declaring file"),
                 use_span,
             )
             .with_code(codes::TYPE_INVISIBLE_REFERENCE),
@@ -233,7 +233,9 @@ impl Checker<'_> {
             if !seen.insert(c.clone()) {
                 continue;
             }
-            let Some(info) = self.classes.get(&c) else { continue };
+            let Some(info) = self.classes.get(&c) else {
+                continue;
+            };
             if let Some(ty) = info.members.get(name) {
                 let cn = info.member_class.get(name).cloned();
                 return Some((ty.clone(), cn));
@@ -251,7 +253,9 @@ impl Checker<'_> {
     /// actually owns the member. Emits T0113 at `member_span` otherwise.
     pub(crate) fn enforce_dsl_scope_for_member(&mut self, name: &str, member_span: Span) {
         let stack = self.dsl_receiver_stack.clone();
-        if stack.len() < 2 { return; }
+        if stack.len() < 2 {
+            return;
+        }
         let last_idx = stack.len() - 1;
         let mut resolved: Option<usize> = None;
         for (i, (cls, _)) in stack.iter().enumerate() {
@@ -260,9 +264,13 @@ impl Checker<'_> {
             }
         }
         let Some(idx) = resolved else { return };
-        if idx == last_idx { return; }
+        if idx == last_idx {
+            return;
+        }
         let (resolved_cls, resolved_markers) = stack[idx].clone();
-        if resolved_markers.is_empty() { return; }
+        if resolved_markers.is_empty() {
+            return;
+        }
         let mut inner_cls: Option<String> = None;
         for (cls, markers) in &stack[idx + 1..] {
             if markers.iter().any(|m| resolved_markers.contains(m)) {
@@ -291,12 +299,25 @@ impl Checker<'_> {
         member_span: Span,
     ) {
         let stack = self.dsl_receiver_stack.clone();
-        if stack.len() < 2 { return; }
-        let Some(idx) = stack.iter().position(|(c, _)| c == qualifier) else { return };
-        if idx == stack.len() - 1 { return; }
+        if stack.len() < 2 {
+            return;
+        }
+        let Some(idx) = stack.iter().position(|(c, _)| c == qualifier) else {
+            return;
+        };
+        if idx == stack.len() - 1 {
+            return;
+        }
         let (resolved_cls, resolved_markers) = stack[idx].clone();
-        if resolved_markers.is_empty() { return; }
-        if self.lookup_member_through_chain(&resolved_cls, member_name).is_none() { return; }
+        if resolved_markers.is_empty() {
+            return;
+        }
+        if self
+            .lookup_member_through_chain(&resolved_cls, member_name)
+            .is_none()
+        {
+            return;
+        }
         let mut inner_cls: Option<String> = None;
         for (cls, markers) in &stack[idx + 1..] {
             if markers.iter().any(|m| resolved_markers.contains(m)) {
@@ -321,7 +342,9 @@ impl Checker<'_> {
     /// members, and extension functions visible on the lhs's class chain;
     /// emits T0029 when no candidate has the modifier set.
     pub(crate) fn check_infix_modifier(&mut self, callee: &Expr, args: &[Expr], call_span: Span) {
-        let Expr::Path { segments, .. } = callee else { return };
+        let Expr::Path { segments, .. } = callee else {
+            return;
+        };
         if segments.len() != 1 {
             return;
         }
@@ -336,74 +359,73 @@ impl Checker<'_> {
                 }
             }
         }
-        if !found
-            && let Some(lhs) = args.first() {
-                let lhs_class = self.expr_class.get(&lhs.span()).cloned();
-                if let Some(cn) = lhs_class {
-                    let mut seen: HashSet<String> = HashSet::new();
-                    let mut frontier: Vec<String> = vec![cn.clone()];
-                    let mut steps = 0;
-                    while let Some(c) = frontier.pop() {
-                        if steps > 64 {
+        if !found && let Some(lhs) = args.first() {
+            let lhs_class = self.expr_class.get(&lhs.span()).cloned();
+            if let Some(cn) = lhs_class {
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut frontier: Vec<String> = vec![cn.clone()];
+                let mut steps = 0;
+                while let Some(c) = frontier.pop() {
+                    if steps > 64 {
+                        break;
+                    }
+                    steps += 1;
+                    if !seen.insert(c.clone()) {
+                        continue;
+                    }
+                    if let Some(info) = self.classes.get(&c) {
+                        if let Some(flags) = info.member_flags.get(name) {
+                            any = true;
+                            if flags.is_infix {
+                                found = true;
+                                break;
+                            }
+                        }
+                        for s in &info.supertypes {
+                            frontier.push(s.clone());
+                        }
+                    }
+                }
+                if !found {
+                    let mut keys: Vec<String> = vec![cn.clone()];
+                    let mut seen2: HashSet<String> = HashSet::new();
+                    seen2.insert(cn.clone());
+                    let mut f2: Vec<String> = vec![cn.clone()];
+                    let mut steps2 = 0;
+                    while let Some(c) = f2.pop() {
+                        if steps2 > 64 {
                             break;
                         }
-                        steps += 1;
-                        if !seen.insert(c.clone()) {
-                            continue;
-                        }
+                        steps2 += 1;
                         if let Some(info) = self.classes.get(&c) {
-                            if let Some(flags) = info.member_flags.get(name) {
-                                any = true;
-                                if flags.is_infix {
-                                    found = true;
-                                    break;
-                                }
-                            }
                             for s in &info.supertypes {
-                                frontier.push(s.clone());
+                                if seen2.insert(s.clone()) {
+                                    keys.push(s.clone());
+                                    f2.push(s.clone());
+                                }
                             }
                         }
                     }
-                    if !found {
-                        let mut keys: Vec<String> = vec![cn.clone()];
-                        let mut seen2: HashSet<String> = HashSet::new();
-                        seen2.insert(cn.clone());
-                        let mut f2: Vec<String> = vec![cn.clone()];
-                        let mut steps2 = 0;
-                        while let Some(c) = f2.pop() {
-                            if steps2 > 64 {
-                                break;
-                            }
-                            steps2 += 1;
-                            if let Some(info) = self.classes.get(&c) {
-                                for s in &info.supertypes {
-                                    if seen2.insert(s.clone()) {
-                                        keys.push(s.clone());
-                                        f2.push(s.clone());
+                    keys.push("Any".to_string());
+                    for key in &keys {
+                        if let Some(list) = self.extensions.get(key) {
+                            for ext in list {
+                                if ext.name == *name {
+                                    any = true;
+                                    if ext.sig.is_infix {
+                                        found = true;
+                                        break;
                                     }
                                 }
                             }
                         }
-                        keys.push("Any".to_string());
-                        for key in &keys {
-                            if let Some(list) = self.extensions.get(key) {
-                                for ext in list {
-                                    if ext.name == *name {
-                                        any = true;
-                                        if ext.sig.is_infix {
-                                            found = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if found {
-                                break;
-                            }
+                        if found {
+                            break;
                         }
                     }
                 }
             }
+        }
         if any && !found {
             self.diagnostics.emit(
                 Diagnostic::error(
@@ -422,18 +444,24 @@ impl Checker<'_> {
     /// pairwise MSC test and the case-3 tiebreakers also fail to pick a
     /// winner, the pair is a compile-time conflict.
     pub(crate) fn check_conflicting_overloads(&mut self) {
-        let mut pairs: Vec<(Span, Span, String, Vec<String>, Vec<String>)> = Vec::new();
+        let mut pairs: Vec<OverloadPair> = Vec::new();
         let classes_snapshot = self.classes.clone();
         for (name, sigs) in &self.fns {
-            if sigs.len() < 2 { continue; }
+            if sigs.len() < 2 {
+                continue;
+            }
             for i in 0..sigs.len() {
                 for j in (i + 1)..sigs.len() {
                     let (a, b) = (&sigs[i], &sigs[j]);
-                    if a.params.len() != b.params.len() { continue; }
+                    if a.params.len() != b.params.len() {
+                        continue;
+                    }
                     let n = a.params.len();
                     let a_ge_b = at_least_as_applicable(a, b, n, &classes_snapshot);
                     let b_ge_a = at_least_as_applicable(b, a, n, &classes_snapshot);
-                    if !(a_ge_b && b_ge_a) { continue; }
+                    if !(a_ge_b && b_ge_a) {
+                        continue;
+                    }
                     // Case 3 tiebreakers: non-parameterized, fewer defaults,
                     // no-vararg.
                     if (a.type_param_count == 0) != (b.type_param_count == 0) {
@@ -441,10 +469,14 @@ impl Checker<'_> {
                     }
                     let a_defaults = a.has_default.iter().filter(|h| **h).count();
                     let b_defaults = b.has_default.iter().filter(|h| **h).count();
-                    if a_defaults != b_defaults { continue; }
+                    if a_defaults != b_defaults {
+                        continue;
+                    }
                     let a_va = a.is_vararg.iter().any(|v| *v);
                     let b_va = b.is_vararg.iter().any(|v| *v);
-                    if a_va != b_va { continue; }
+                    if a_va != b_va {
+                        continue;
+                    }
                     if let (Some(sa), Some(sb)) = (a.decl_span, b.decl_span) {
                         pairs.push((
                             sa,
@@ -459,11 +491,8 @@ impl Checker<'_> {
         }
         for (sa, sb, name, _ap, _bp) in pairs {
             self.diagnostics.emit(
-                Diagnostic::error(
-                    format!("Conflicting overloads for `{name}`"),
-                    sa,
-                )
-                .with_code(codes::TYPE_CONFLICTING_OVERLOADS),
+                Diagnostic::error(format!("Conflicting overloads for `{name}`"), sa)
+                    .with_code(codes::TYPE_CONFLICTING_OVERLOADS),
             );
             let _ = sb;
         }
@@ -473,7 +502,12 @@ impl Checker<'_> {
     /// LHS receiver's class declares *both* the `op` binary operator
     /// (`plus` / `minus` / `times` / `div` / `rem`) and the matching
     /// `opAssign` form (`plusAssign` / …). Emits T0079.
-    pub(crate) fn check_compound_assign_ambiguity(&mut self, target: &Expr, op: AssignOp, span: Span) {
+    pub(crate) fn check_compound_assign_ambiguity(
+        &mut self,
+        target: &Expr,
+        op: AssignOp,
+        span: Span,
+    ) {
         let (op_name, assign_name): (&str, &str) = match op {
             AssignOp::Add => ("plus", "plusAssign"),
             AssignOp::Sub => ("minus", "minusAssign"),
@@ -492,7 +526,9 @@ impl Checker<'_> {
             _ => self.expr_class.get(&target.span()).cloned(),
         };
         let Some(class_name) = class_name else { return };
-        let Some(info) = self.classes.get(&class_name) else { return };
+        let Some(info) = self.classes.get(&class_name) else {
+            return;
+        };
         let has_op = info.members.contains_key(op_name);
         let has_assign = info.members.contains_key(assign_name);
         if has_op && has_assign {
@@ -511,8 +547,12 @@ impl Checker<'_> {
     /// Spec §11.2.2: `super<Q>.f(...)` requires `Q` to be an immediate
     /// supertype of the enclosing class. Emits T0073 otherwise.
     pub(crate) fn check_super_qualifier(&mut self, qualifier: &TypeRef, super_span: Span) {
-        let Some(enclosing) = self.class_stack.last().cloned() else { return };
-        let Some(info) = self.classes.get(&enclosing).cloned() else { return };
+        let Some(enclosing) = self.class_stack.last().cloned() else {
+            return;
+        };
+        let Some(info) = self.classes.get(&enclosing).cloned() else {
+            return;
+        };
         let q_name = qualifier.name.name.as_str();
         if !info.supertypes.iter().any(|s| s == q_name) {
             self.diagnostics.emit(
@@ -532,8 +572,12 @@ impl Checker<'_> {
     /// named `name`. The diagnostic encourages disambiguation via
     /// `super<TypeName>.name(...)`.
     pub(crate) fn check_ambiguous_super(&mut self, name: &str, super_span: Span) {
-        let Some(enclosing) = self.class_stack.last().cloned() else { return };
-        let Some(info) = self.classes.get(&enclosing).cloned() else { return };
+        let Some(enclosing) = self.class_stack.last().cloned() else {
+            return;
+        };
+        let Some(info) = self.classes.get(&enclosing).cloned() else {
+            return;
+        };
         let mut contributors: Vec<String> = Vec::new();
         for s in &info.supertypes {
             if self.lookup_member_through_chain(s, name).is_some() {

@@ -6,7 +6,7 @@
 //! simple-name index.
 
 use klio_ast::KotlinFile;
-use klio_interp_ir::{build::build_module_files, Vm};
+use klio_interp_ir::{Vm, build::build_module_files};
 use klio_lexer::Lexer;
 use klio_parser::Parser as KtParser;
 use klio_runtime::Output;

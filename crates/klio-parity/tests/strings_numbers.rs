@@ -93,7 +93,11 @@ fun main() {
     println("$max,$ov,$min,$ov2")
 }
 "#;
-    assert_klio("int_overflow", src, "2147483647,-2147483648,-2147483648,2147483647\n");
+    assert_klio(
+        "int_overflow",
+        src,
+        "2147483647,-2147483648,-2147483648,2147483647\n",
+    );
 }
 
 #[test]

@@ -1,17 +1,19 @@
-use crate::{VmHost, primitive_param_accepts, is_function_type, value_is_callable, pack_vararg_args, ext_decl_recv_is_user_class, value_is_builtin, ClosureInfo, Arc};
+use crate::{
+    Arc, ClosureInfo, VmHost, ext_decl_recv_is_user_class, is_function_type, pack_vararg_args,
+    primitive_param_accepts, value_is_builtin, value_is_callable,
+};
 
 impl VmHost<'_> {
+    // Single function-call dispatch flow.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn call_func(
         &mut self,
         module: &klio_ir::Module,
         func: klio_ir::FuncId,
         args: Vec<klio_runtime::Value>,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        let f = module
-            .funcs
-            .get(func.0 as usize)
-            .cloned()
-            .ok_or_else(|| {
+        let f =
+            module.funcs.get(func.0 as usize).cloned().ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown FuncId {}", func.0))
             })?;
         // Pack-installed binding fast path: a top-level function whose
@@ -34,18 +36,15 @@ impl VmHost<'_> {
         // body whose params match, or that has no intrinsic, runs
         // unchanged.
         if !f.blocks.is_empty() && !args.is_empty() {
-            let user_offset = usize::from(
-                f.params.first().is_some_and(|p| p.name == "this"),
-            );
+            let user_offset = usize::from(f.params.first().is_some_and(|p| p.name == "this"));
             let mismatch = args.iter().enumerate().any(|(i, v)| {
                 f.params
                     .get(user_offset + i)
                     .is_some_and(|p| !p.is_vararg && !primitive_param_accepts(&p.ty.name, v))
             });
-            if mismatch
-                && let Some(intrinsic) = self.lookup_intrinsic(&f.fqn) {
-                    return self.dispatch_intrinsic(intrinsic, &args);
-                }
+            if mismatch && let Some(intrinsic) = self.lookup_intrinsic(&f.fqn) {
+                return self.dispatch_intrinsic(intrinsic, &args);
+            }
         }
         // Bodyless `expect` decl: redirect to a same-name same-arity
         // sibling with a body. Source files are lowered in order, so
@@ -54,9 +53,7 @@ impl VmHost<'_> {
         // `Inst::Call` was baked to the expect's FuncId.
         if f.blocks.is_empty() {
             let want = args.len();
-            let cands: Vec<klio_ir::FuncId> = module
-                .funcs_by_simple_name(&f.name)
-                .to_vec();
+            let cands: Vec<klio_ir::FuncId> = module.funcs_by_simple_name(&f.name).to_vec();
             for cand in &cands {
                 if *cand == func {
                     continue;
@@ -66,18 +63,12 @@ impl VmHost<'_> {
                         continue;
                     }
                     let g_params = g.params.len();
-                    let g_user_params = if g
-                        .params
-                        .first()
-                        .is_some_and(|p| p.name == "this")
-                    {
+                    let g_user_params = if g.params.first().is_some_and(|p| p.name == "this") {
                         g_params - 1
                     } else {
                         g_params
                     };
-                    if g_user_params != want
-                        && !g.params.last().is_some_and(|p| p.is_vararg)
-                    {
+                    if g_user_params != want && !g.params.last().is_some_and(|p| p.is_vararg) {
                         continue;
                     }
                     let new_args = args.clone();
@@ -125,88 +116,80 @@ impl VmHost<'_> {
         // this the lambda would slot into the first (defaulted)
         // param and the real last param would be left unbound.
         if args.len() < f.params.len() && !args.is_empty() {
-            let last_is_fn = f
-                .params
-                .last()
-                .is_some_and(|p| is_function_type(&p.ty));
-            let trailing_is_callable =
-                args.last().is_some_and(value_is_callable);
+            let last_is_fn = f.params.last().is_some_and(|p| is_function_type(&p.ty));
+            let trailing_is_callable = args.last().is_some_and(value_is_callable);
             if last_is_fn && trailing_is_callable {
                 let lead = args.len() - 1;
                 let last_param = f.params.len() - 1;
                 if lead < last_param
-                    && let Some(defaults) = self.prog.func_defaults.get(&func).cloned() {
-                        let trailing = args.pop().unwrap();
-                        for idx in lead..last_param {
-                            if let Some(Some(default_fid)) = defaults.get(idx) {
-                                let dfid = *default_fid;
-                                let dfunc = module
-                                    .funcs
-                                    .get(dfid.0 as usize)
-                                    .cloned()
-                                    .ok_or_else(|| {
-                                        klio_ir::eval::EvalError::Type(format!(
-                                            "default-arg FuncId {} out of range",
-                                            dfid.0
-                                        ))
-                                    })?;
-                                let v = klio_ir::eval::eval_with(
-                                    module,
-                                    &dfunc,
-                                    args.clone(),
-                                    self,
-                                )?;
-                                args.push(v);
-                            } else {
-                                args.push(klio_runtime::Value::Null);
-                            }
+                    && let Some(defaults) = self.prog.func_defaults.get(&func).cloned()
+                {
+                    let trailing = args.pop().unwrap();
+                    for idx in lead..last_param {
+                        if let Some(Some(default_fid)) = defaults.get(idx) {
+                            let dfid = *default_fid;
+                            let dfunc =
+                                module.funcs.get(dfid.0 as usize).cloned().ok_or_else(|| {
+                                    klio_ir::eval::EvalError::Type(format!(
+                                        "default-arg FuncId {} out of range",
+                                        dfid.0
+                                    ))
+                                })?;
+                            let v = klio_ir::eval::eval_with(module, &dfunc, args.clone(), self)?;
+                            args.push(v);
+                        } else {
+                            args.push(klio_runtime::Value::Null);
                         }
-                        args.push(trailing);
                     }
+                    args.push(trailing);
+                }
             }
         }
         if args.len() < f.params.len()
-            && let Some(defaults) = self.prog.func_defaults.get(&func).cloned() {
-                for idx in args.len()..f.params.len() {
-                    if let Some(Some(default_fid)) = defaults.get(idx) {
-                        let dfid = *default_fid;
-                        let dfunc = module
-                            .funcs
-                            .get(dfid.0 as usize)
-                            .cloned()
-                            .ok_or_else(|| {
-                                klio_ir::eval::EvalError::Type(format!(
-                                    "default-arg FuncId {} out of range",
-                                    dfid.0
-                                ))
-                            })?;
-                        // The thunk binds the parameters preceding
-                        // this one, so a default like `endIndex =
-                        // s.length` can read earlier args.
-                        //
-                        // A thunk lowered inside an extension fn body
-                        // that references the receiver records `this`
-                        // as a capture, not a param — seed capture[0]
-                        // with the receiver so a bare member read like
-                        // `size` resolves through it.
-                        let captures: Vec<klio_runtime::Value> = if args.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![args[0].clone()]
-                        };
-                        let v = klio_ir::eval::eval_with_captures(
-                            module, &dfunc, args.clone(), captures, self,
-                        )?;
-                        args.push(v);
+            && let Some(defaults) = self.prog.func_defaults.get(&func).cloned()
+        {
+            for idx in args.len()..f.params.len() {
+                if let Some(Some(default_fid)) = defaults.get(idx) {
+                    let dfid = *default_fid;
+                    let dfunc = module.funcs.get(dfid.0 as usize).cloned().ok_or_else(|| {
+                        klio_ir::eval::EvalError::Type(format!(
+                            "default-arg FuncId {} out of range",
+                            dfid.0
+                        ))
+                    })?;
+                    // The thunk binds the parameters preceding
+                    // this one, so a default like `endIndex =
+                    // s.length` can read earlier args.
+                    //
+                    // A thunk lowered inside an extension fn body
+                    // that references the receiver records `this`
+                    // as a capture, not a param — seed capture[0]
+                    // with the receiver so a bare member read like
+                    // `size` resolves through it.
+                    let captures: Vec<klio_runtime::Value> = if args.is_empty() {
+                        Vec::new()
                     } else {
-                        args.push(klio_runtime::Value::Null);
-                    }
+                        vec![args[0].clone()]
+                    };
+                    let v = klio_ir::eval::eval_with_captures(
+                        module,
+                        &dfunc,
+                        args.clone(),
+                        captures,
+                        self,
+                    )?;
+                    args.push(v);
+                } else {
+                    args.push(klio_runtime::Value::Null);
                 }
             }
+        }
         let args = pack_vararg_args(&f, args);
         klio_ir::eval::eval_with(module, &f, args, self)
     }
 
+    // Single named-argument call dispatch flow.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn call_func_named(
         &mut self,
         module: &klio_ir::Module,
@@ -218,138 +201,118 @@ impl VmHost<'_> {
         // declared parameter list. Positional args fill the next
         // free slot; named args slot by name.
         if arg_names.iter().any(std::option::Option::is_some)
-            && let Some(f) = module.funcs.get(func.0 as usize) {
-                let params = &f.params;
-                let mut slots: Vec<Option<klio_runtime::Value>> = vec![None; params.len()];
-                // Bind named arguments first so a following positional
-                // argument fills the next slot that is *not* already
-                // bound by name. Kotlin allows a positional argument
-                // after a named one (`f(named = x, pos1, pos2)`) and
-                // assigns the positionals to the remaining parameters
-                // in declaration order — a single rolling index would
-                // instead overwrite the named slot and shift every
-                // later argument (dropping the last one).
-                for (i, a) in args.iter().enumerate() {
-                    if let Some(Some(arg_name)) = arg_names.get(i)
-                        && let Some(pos) =
-                            params.iter().position(|p| &p.name == arg_name)
-                        {
-                            slots[pos] = Some(a.clone());
-                        }
+            && let Some(f) = module.funcs.get(func.0 as usize)
+        {
+            let params = &f.params;
+            let mut slots: Vec<Option<klio_runtime::Value>> = vec![None; params.len()];
+            // Bind named arguments first so a following positional
+            // argument fills the next slot that is *not* already
+            // bound by name. Kotlin allows a positional argument
+            // after a named one (`f(named = x, pos1, pos2)`) and
+            // assigns the positionals to the remaining parameters
+            // in declaration order — a single rolling index would
+            // instead overwrite the named slot and shift every
+            // later argument (dropping the last one).
+            for (i, a) in args.iter().enumerate() {
+                if let Some(Some(arg_name)) = arg_names.get(i)
+                    && let Some(pos) = params.iter().position(|p| &p.name == arg_name)
+                {
+                    slots[pos] = Some(a.clone());
                 }
-                // Vararg-aware positional walk: positional args that
-                // land on the vararg slot (and every subsequent
-                // positional before a named slot shows up) accumulate
-                // into a single Array in that slot. A named arg
-                // already-bound elsewhere does not affect the
-                // accumulation.
-                let vararg_pos: Option<usize> =
-                    params.iter().position(|p| p.is_vararg);
-                let mut positional_idx = 0usize;
-                let mut vararg_acc: Vec<klio_runtime::Value> = Vec::new();
-                let mut hit_vararg = false;
-                for (i, a) in args.iter().enumerate() {
-                    if matches!(arg_names.get(i), Some(Some(_))) {
-                        continue;
-                    }
-                    while positional_idx < params.len()
-                        && slots[positional_idx].is_some()
-                    {
-                        positional_idx += 1;
-                    }
-                    if Some(positional_idx) == vararg_pos {
-                        if matches!(a, klio_runtime::Value::Array { .. })
-                            && vararg_acc.is_empty()
-                        {
-                            // Spread case: a single Array argument at
-                            // the vararg position is passed through
-                            // untouched the same way pack_vararg_args
-                            // handles `f(*arr)`.
-                            slots[positional_idx] = Some(a.clone());
-                            positional_idx += 1;
-                            continue;
-                        }
-                        vararg_acc.push(a.clone());
-                        hit_vararg = true;
-                        continue;
-                    }
-                    if positional_idx < params.len() {
-                        slots[positional_idx] = Some(a.clone());
-                    }
+            }
+            // Vararg-aware positional walk: positional args that
+            // land on the vararg slot (and every subsequent
+            // positional before a named slot shows up) accumulate
+            // into a single Array in that slot. A named arg
+            // already-bound elsewhere does not affect the
+            // accumulation.
+            let vararg_pos: Option<usize> = params.iter().position(|p| p.is_vararg);
+            let mut positional_idx = 0usize;
+            let mut vararg_acc: Vec<klio_runtime::Value> = Vec::new();
+            let mut hit_vararg = false;
+            for (i, a) in args.iter().enumerate() {
+                if matches!(arg_names.get(i), Some(Some(_))) {
+                    continue;
+                }
+                while positional_idx < params.len() && slots[positional_idx].is_some() {
                     positional_idx += 1;
                 }
-                if let Some(vp) = vararg_pos {
-                    if hit_vararg {
-                        slots[vp] = Some(klio_runtime::Value::Array {
-                            items: klio_runtime::ObjRef::new(vararg_acc),
-                            prim: None,
-                        });
-                    } else if slots[vp].is_none() {
-                        // No positional landed on the vararg slot —
-                        // bind an empty array so the callee sees a
-                        // zero-length vararg rather than padding-Null.
-                        slots[vp] = Some(klio_runtime::Value::Array {
-                            items: klio_runtime::ObjRef::new(Vec::new()),
-                            prim: None,
-                        });
-                    }
-                }
-                // Fill omitted slots from the function's default-arg
-                // thunks (left-to-right, so a default may read an
-                // earlier param). A named call that skips a
-                // *non-trailing* defaulted param
-                // (`DateTimePeriod(months = 1, days = 2)` skipping
-                // `years`) must evaluate that default, not pass Null.
-                let n_params = params.len();
-                let defaults = self.prog.func_defaults.get(&func).cloned();
-                let mut reordered: Vec<klio_runtime::Value> =
-                    Vec::with_capacity(n_params);
-                let mut truncated = false;
-                for (i, slot) in slots.into_iter().enumerate() {
-                    if let Some(v) = slot {
-                        reordered.push(v);
+                if Some(positional_idx) == vararg_pos {
+                    if matches!(a, klio_runtime::Value::Array { .. }) && vararg_acc.is_empty() {
+                        // Spread case: a single Array argument at
+                        // the vararg position is passed through
+                        // untouched the same way pack_vararg_args
+                        // handles `f(*arr)`.
+                        slots[positional_idx] = Some(a.clone());
+                        positional_idx += 1;
                         continue;
                     }
-                    let dfid = defaults
-                        .as_ref()
-                        .and_then(|d| d.get(i).copied().flatten());
-                    if let Some(dfid) = dfid {
-                        let dfunc = module
-                            .funcs
-                            .get(dfid.0 as usize)
-                            .cloned()
-                            .ok_or_else(|| {
-                                klio_ir::eval::EvalError::Type(format!(
-                                    "default-arg FuncId {} out of range",
-                                    dfid.0
-                                ))
-                            })?;
-                        let v = klio_ir::eval::eval_with(
-                            module,
-                            &dfunc,
-                            reordered.clone(),
-                            self,
-                        )?;
-                        reordered.push(v);
-                    } else {
-                        // No value and no default: a trailing
-                        // omitted param. Hand the prefix to
-                        // call_func, whose own default / vararg /
-                        // trailing-lambda padding finishes the job.
-                        truncated = true;
-                        break;
-                    }
+                    vararg_acc.push(a.clone());
+                    hit_vararg = true;
+                    continue;
                 }
-                if !truncated {
-                    while matches!(
-                        reordered.last(),
-                        Some(klio_runtime::Value::Null)
-                    ) {
-                        reordered.pop();
-                    }
+                if positional_idx < params.len() {
+                    slots[positional_idx] = Some(a.clone());
                 }
-                return self.call_func(module, func, reordered);
+                positional_idx += 1;
             }
+            if let Some(vp) = vararg_pos {
+                if hit_vararg {
+                    slots[vp] = Some(klio_runtime::Value::Array {
+                        items: klio_runtime::ObjRef::new(vararg_acc),
+                        prim: None,
+                    });
+                } else if slots[vp].is_none() {
+                    // No positional landed on the vararg slot —
+                    // bind an empty array so the callee sees a
+                    // zero-length vararg rather than padding-Null.
+                    slots[vp] = Some(klio_runtime::Value::Array {
+                        items: klio_runtime::ObjRef::new(Vec::new()),
+                        prim: None,
+                    });
+                }
+            }
+            // Fill omitted slots from the function's default-arg
+            // thunks (left-to-right, so a default may read an
+            // earlier param). A named call that skips a
+            // *non-trailing* defaulted param
+            // (`DateTimePeriod(months = 1, days = 2)` skipping
+            // `years`) must evaluate that default, not pass Null.
+            let n_params = params.len();
+            let defaults = self.prog.func_defaults.get(&func).cloned();
+            let mut reordered: Vec<klio_runtime::Value> = Vec::with_capacity(n_params);
+            let mut truncated = false;
+            for (i, slot) in slots.into_iter().enumerate() {
+                if let Some(v) = slot {
+                    reordered.push(v);
+                    continue;
+                }
+                let dfid = defaults.as_ref().and_then(|d| d.get(i).copied().flatten());
+                if let Some(dfid) = dfid {
+                    let dfunc = module.funcs.get(dfid.0 as usize).cloned().ok_or_else(|| {
+                        klio_ir::eval::EvalError::Type(format!(
+                            "default-arg FuncId {} out of range",
+                            dfid.0
+                        ))
+                    })?;
+                    let v = klio_ir::eval::eval_with(module, &dfunc, reordered.clone(), self)?;
+                    reordered.push(v);
+                } else {
+                    // No value and no default: a trailing
+                    // omitted param. Hand the prefix to
+                    // call_func, whose own default / vararg /
+                    // trailing-lambda padding finishes the job.
+                    truncated = true;
+                    break;
+                }
+            }
+            if !truncated {
+                while matches!(reordered.last(), Some(klio_runtime::Value::Null)) {
+                    reordered.pop();
+                }
+            }
+            return self.call_func(module, func, reordered);
+        }
         self.call_func(module, func, args)
     }
 
@@ -378,22 +341,24 @@ impl VmHost<'_> {
         // interface- and subtype-receiver extensions are unaffected.
         if let Some(f) = module.funcs.get(func.0 as usize)
             && f.params.first().is_some_and(|p| p.name == "this")
-                && !args.is_empty()
-                && ext_decl_recv_is_user_class(&f.params[0].ty.name)
-                && value_is_builtin(&args[0])
-            {
-                let fname = f.name.clone();
-                let recv = args[0].clone();
-                let rest = args[1..].to_vec();
-                return self.call_member(&recv, &fname, &rest);
-            }
+            && !args.is_empty()
+            && ext_decl_recv_is_user_class(&f.params[0].ty.name)
+            && value_is_builtin(&args[0])
+        {
+            let fname = f.name.clone();
+            let recv = args[0].clone();
+            let rest = args[1..].to_vec();
+            return self.call_member(&recv, &fname, &rest);
+        }
         // Bind each call-site type-arg name to a synth
         // `Value::Class` global for the duration of the call so
         // reified type-param reads (`T::class`) resolve. We
         // snapshot any pre-existing bindings, install the new
         // ones, then restore on exit so concurrent / recursive
         // calls don't see stale T values.
-        let names: Vec<String> = self.module.registry
+        let names: Vec<String> = self
+            .module
+            .registry
             .func_type_params
             .get(&func)
             .cloned()
@@ -446,13 +411,7 @@ impl VmHost<'_> {
             return Ok(None);
         }
         let func = first.expect("count >= 2 implies a first candidate");
-        let result = self.call_func_typed(
-            module,
-            func,
-            args.to_vec(),
-            arg_names,
-            &[],
-        )?;
+        let result = self.call_func_typed(module, func, args.to_vec(), arg_names, &[])?;
         Ok(Some(result))
     }
 
@@ -489,6 +448,8 @@ impl VmHost<'_> {
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         if let klio_runtime::Value::IrClosure { id, .. } = lambda {
+            // Closure id indexes the closure table.
+            #[allow(clippy::cast_possible_truncation)]
             let info = self.closures.get(*id as usize).ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown IrClosure id {id}"))
             })?;

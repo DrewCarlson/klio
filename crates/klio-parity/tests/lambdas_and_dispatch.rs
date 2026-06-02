@@ -223,8 +223,11 @@ fun main() {
     println(listOf("c","d").map(t::invoke).joinToString(","))
 }
 "#;
-    assert_klio("operator_invoke_value", src,
-        "note:hello\nnote:a,note:b\nnote:c,note:d\n");
+    assert_klio(
+        "operator_invoke_value",
+        src,
+        "note:hello\nnote:a,note:b\nnote:c,note:d\n",
+    );
 }
 
 #[test]
@@ -286,9 +289,11 @@ fun main() {
     println(h.result())
 }
 "#;
-    assert_klio("receiver_lambda_bare",
+    assert_klio(
+        "receiver_lambda_bare",
         src,
-        "<div><p>first</p><p>second</p></div>\n");
+        "<div><p>first</p><p>second</p></div>\n",
+    );
 }
 
 #[test]

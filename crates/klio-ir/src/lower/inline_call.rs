@@ -13,12 +13,14 @@ pub(super) fn arg_lambda_has_nonlocal_return(args: &[Expr]) -> bool {
             Stmt::Expr(e) => scan(e),
             Stmt::Assign { target, value, .. } => scan(target) || scan(value),
             Stmt::DestructuringDecl { init, .. } => scan(init),
-            Stmt::Decl(klio_ast::Decl::Property(p)) => {
-                p.init.as_ref().is_some_and(scan)
-            }
-            _ => false,
+            Stmt::Decl(klio_ast::Decl::Property(p)) => p.init.as_ref().is_some_and(scan),
+            Stmt::Decl(_) => false,
         })
     }
+    // The explicit Lambda/AnonFun/ObjectExpr arm documents that a
+    // non-local return inside a nested scope is its own and must not
+    // count here; keep it distinct from the catch-all default.
+    #[allow(clippy::match_same_arms)]
     fn scan(e: &Expr) -> bool {
         match e {
             Expr::Return { .. } => true,
@@ -27,7 +29,9 @@ pub(super) fn arg_lambda_has_nonlocal_return(args: &[Expr]) -> bool {
             | Expr::Unary { expr: receiver, .. }
             | Expr::Postfix { expr: receiver, .. }
             | Expr::Spread { expr: receiver, .. }
-            | Expr::Throw { value: receiver, .. }
+            | Expr::Throw {
+                value: receiver, ..
+            }
             | Expr::Labeled { expr: receiver, .. }
             | Expr::As { expr: receiver, .. }
             | Expr::IsCheck { expr: receiver, .. }
@@ -35,27 +39,33 @@ pub(super) fn arg_lambda_has_nonlocal_return(args: &[Expr]) -> bool {
             Expr::Call { callee, args, .. } => scan(callee) || args.iter().any(scan),
             Expr::Index { receiver, args, .. } => scan(receiver) || args.iter().any(scan),
             Expr::Binary { lhs, rhs, .. } => scan(lhs) || scan(rhs),
-            Expr::If { cond, then_branch, else_branch, .. } => {
-                scan(cond)
-                    || scan(then_branch)
-                    || else_branch.as_ref().is_some_and(|e| scan(e))
-            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => scan(cond) || scan(then_branch) || else_branch.as_ref().is_some_and(|e| scan(e)),
             Expr::While { cond, body, .. } => scan(cond) || scan(body),
             Expr::DoWhile { body, cond, .. } => {
                 body.as_ref().is_some_and(|b| scan(b)) || scan(cond)
             }
             Expr::For { iter, body, .. } => scan(iter) || scan(body),
             Expr::Block(b) => scan_stmts(&b.stmts),
-            Expr::When { subject, branches, .. } => {
+            Expr::When {
+                subject, branches, ..
+            } => {
                 subject.as_ref().is_some_and(|s| scan(s))
                     || branches.iter().any(|br| scan(&br.body))
             }
-            Expr::Try { body, catches, finally, .. } => {
+            Expr::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
                 scan_stmts(&body.stmts)
                     || catches.iter().any(|c| scan_stmts(&c.body.stmts))
-                    || finally
-                        .as_ref()
-                        .is_some_and(|fb| scan_stmts(&fb.stmts))
+                    || finally.as_ref().is_some_and(|fb| scan_stmts(&fb.stmts))
             }
             _ => false,
         }
@@ -71,11 +81,7 @@ pub(super) fn arg_lambda_has_nonlocal_return(args: &[Expr]) -> bool {
 
 /// Splice an `inline fun` argument lambda where the inlined body
 /// invokes the corresponding lambda parameter.
-pub(super) fn splice_inline_lambda(
-    b: &mut FuncBuilder<'_>,
-    lam: &Expr,
-    arg_exprs: &[Expr],
-) -> Reg {
+pub(super) fn splice_inline_lambda(b: &mut FuncBuilder<'_>, lam: &Expr, arg_exprs: &[Expr]) -> Reg {
     let Expr::Lambda { params, body, .. } = lam else {
         return lower_expr(b, lam);
     };
@@ -99,14 +105,20 @@ pub(super) fn splice_inline_lambda(
     }
     let result = b.alloc_reg();
     let unit0 = b.emit_const(Const::Unit);
-    b.push(Inst::Move { dst: result, src: unit0 });
+    b.push(Inst::Move {
+        dst: result,
+        src: unit0,
+    });
     let end = b.alloc_block();
     let label = b.current_inline_fn();
     if let Some(lbl) = &label {
         b.push_inline_lambda_ret(lbl.clone(), result, end);
     }
     let v = lower_block(b, body);
-    b.push(Inst::Move { dst: result, src: v });
+    b.push(Inst::Move {
+        dst: result,
+        src: v,
+    });
     b.terminate(Terminator::Goto(end));
     b.switch_to(end);
     if label.is_some() {
@@ -170,8 +182,7 @@ pub(super) fn try_inline_call_with_type_args(
     }
     b.push_inline_name(fname.to_string());
     b.push_scope();
-    let mut lambda_map: std::collections::HashMap<String, Expr> =
-        std::collections::HashMap::new();
+    let mut lambda_map: std::collections::HashMap<String, Expr> = std::collections::HashMap::new();
     for (p, a) in f.params.iter().zip(ordered.iter()) {
         let a = a.as_ref().expect("filled above");
         let r = lower_expr(b, a);
@@ -208,8 +219,11 @@ pub(super) fn try_inline_call_with_type_args(
     // leaking the mark onto a same-named caller local.
     let mut marked_generic: Vec<String> = Vec::new();
     if !f.type_params.is_empty() {
-        let tp_names: std::collections::HashSet<&str> =
-            f.type_params.iter().map(|tp| tp.name.name.as_str()).collect();
+        let tp_names: std::collections::HashSet<&str> = f
+            .type_params
+            .iter()
+            .map(|tp| tp.name.name.as_str())
+            .collect();
         for p in &f.params {
             if p.ty.function.is_none()
                 && !p.ty.nullable
@@ -223,10 +237,11 @@ pub(super) fn try_inline_call_with_type_args(
     }
     b.push_inline_lambda_frame(lambda_map);
     if f.receiver_type.is_some()
-        && let Some(recv) = this_arg {
-            let rr = lower_expr(b, recv);
-            b.bind("this".to_string(), rr);
-        }
+        && let Some(recv) = this_arg
+    {
+        let rr = lower_expr(b, recv);
+        b.bind("this".to_string(), rr);
+    }
     // Bind each reified type parameter to the resolved class value
     // at the call site. Two bindings are needed:
     //
@@ -252,21 +267,33 @@ pub(super) fn try_inline_call_with_type_args(
         };
         let cls_reg = b.alloc_reg();
         let arg_name = b.module.intern_const(Const::String(arg.name.name.clone()));
-        b.push(Inst::LoadGlobal { dst: cls_reg, name: arg_name });
+        b.push(Inst::LoadGlobal {
+            dst: cls_reg,
+            name: arg_name,
+        });
         b.bind(tp.name.name.clone(), cls_reg);
         let tp_global = b.module.intern_const(Const::String(tp.name.name.clone()));
-        b.push(Inst::StoreGlobal { name: tp_global, value: cls_reg });
+        b.push(Inst::StoreGlobal {
+            name: tp_global,
+            value: cls_reg,
+        });
     }
     let result = b.alloc_reg();
     let unit0 = b.emit_const(Const::Unit);
-    b.push(Inst::Move { dst: result, src: unit0 });
+    b.push(Inst::Move {
+        dst: result,
+        src: unit0,
+    });
     let join = b.alloc_block();
     b.push_inline_return(result, join);
     let body_val = match body {
         klio_ast::FunctionBody::Expr(e) => lower_expr(b, e),
         klio_ast::FunctionBody::Block(blk) => lower_block(b, blk),
     };
-    b.push(Inst::Move { dst: result, src: body_val });
+    b.push(Inst::Move {
+        dst: result,
+        src: body_val,
+    });
     b.terminate(Terminator::Goto(join));
     b.switch_to(join);
     b.pop_inline_return();

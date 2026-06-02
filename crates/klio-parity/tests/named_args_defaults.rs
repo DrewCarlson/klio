@@ -68,7 +68,11 @@ fun main() {
     // rect(3): w=3, h=6, p=2*(3+6)=18
     // rect(3,5): w=3, h=5, p=2*8=16
     // rect(3,5,20): w=3, h=5, p=20
-    assert_klio("default_prior", src, "w=3 h=6 p=18|w=3 h=5 p=16|w=3 h=5 p=20\n");
+    assert_klio(
+        "default_prior",
+        src,
+        "w=3 h=6 p=18|w=3 h=5 p=16|w=3 h=5 p=20\n",
+    );
 }
 
 #[test]
@@ -108,8 +112,11 @@ fun main() {
     println("$a|$b|$c|$d")
 }
 "#;
-    assert_klio("data_copy_named", src,
-        "P(x=0, y=0, tag=)|P(x=5, y=0, tag=)|P(x=0, y=0, tag=T)|P(x=1, y=2, tag=all)\n");
+    assert_klio(
+        "data_copy_named",
+        src,
+        "P(x=0, y=0, tag=)|P(x=5, y=0, tag=)|P(x=0, y=0, tag=T)|P(x=1, y=2, tag=all)\n",
+    );
 }
 
 #[test]
@@ -124,6 +131,9 @@ fun main() {
     println(Cfg(port = 443, tls = true, host = "api.example.com").render())
 }
 "#;
-    assert_klio("ctor_default", src,
-        "http://localhost:8080\nhttp://example.com:8080\nhttps://api.example.com:443\n");
+    assert_klio(
+        "ctor_default",
+        src,
+        "http://localhost:8080\nhttp://example.com:8080\nhttps://api.example.com:443\n",
+    );
 }

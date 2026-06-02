@@ -6,11 +6,23 @@
 
 use crate::{Block, BlockId, Const, Func, Inst, Module, Reg, Terminator, TypeRef};
 
+/// Per inline-fn-splice frame: a lambda-param substitution map paired
+/// with the `inline_return` snapshot taken when the frame was pushed.
+type InlineLambdaFrame = (
+    std::collections::HashMap<String, klio_ast::Expr>,
+    Vec<(Reg, BlockId)>,
+);
+
 /// Per-function builder. Owns a fresh register counter, the list of
 /// blocks, and a "current block" cursor that the lowering pass
 /// appends to. Carries a simple scope stack so the lowering pass
 /// can resolve `Path { name }` reads against function parameters
 /// and locally introduced bindings.
+// The flag fields track independent lowering modes (lambda body,
+// named local fn, inline, param thunk) read directly across the
+// lowering crates; collapsing them into one enum would not model
+// the orthogonal states.
+#[allow(clippy::struct_excessive_bools)]
 pub struct FuncBuilder<'a> {
     pub module: &'a mut Module,
     pub blocks: Vec<Block>,
@@ -142,10 +154,7 @@ pub struct FuncBuilder<'a> {
     /// unlabeled `return` inside the spliced lambda must localize to
     /// that owner splice (restore the snapshot), not fall through to
     /// the heuristic non-local-return unwind.
-    inline_lambda_subst: Vec<(
-        std::collections::HashMap<String, klio_ast::Expr>,
-        Vec<(Reg, BlockId)>,
-    )>,
+    inline_lambda_subst: Vec<InlineLambdaFrame>,
     /// Labeled-return targets for spliced inline-argument lambdas:
     /// `return@<inlineFnName>` inside such a lambda is a *local*
     /// return from the lambda invocation (its value), not a return
@@ -213,7 +222,7 @@ impl<'a> FuncBuilder<'a> {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn current_inline_fn(&self) -> Option<String> {
         self.inline_stack.last().cloned()
     }
@@ -223,7 +232,7 @@ impl<'a> FuncBuilder<'a> {
     pub fn pop_inline_lambda_ret(&mut self) {
         self.inline_lambda_ret.pop();
     }
-    #[must_use] 
+    #[must_use]
     pub fn inline_lambda_ret_for(&self, label: &str) -> Option<(Reg, BlockId)> {
         self.inline_lambda_ret
             .iter()
@@ -232,7 +241,7 @@ impl<'a> FuncBuilder<'a> {
             .map(|(_, r, e)| (*r, *e))
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn inline_active_return(&self) -> Option<(Reg, BlockId)> {
         self.inline_return.last().copied()
     }
@@ -248,7 +257,7 @@ impl<'a> FuncBuilder<'a> {
     pub fn restore_inline_return(&mut self, saved: Vec<(Reg, BlockId)>) {
         self.inline_return = saved;
     }
-    #[must_use] 
+    #[must_use]
     pub fn inline_in_progress(&self, name: &str) -> bool {
         self.inline_stack.iter().any(|n| n == name)
     }
@@ -269,7 +278,7 @@ impl<'a> FuncBuilder<'a> {
         self.inline_lambda_subst.pop();
     }
     /// Only the innermost inline frame's lambda params are in scope.
-    #[must_use] 
+    #[must_use]
     pub fn inline_lambda_for(&self, name: &str) -> Option<klio_ast::Expr> {
         self.inline_lambda_subst
             .last()
@@ -278,10 +287,8 @@ impl<'a> FuncBuilder<'a> {
     /// The `inline_return` snapshot captured when the innermost
     /// inline-lambda frame was pushed — the owner splice's localize
     /// target for an unlabeled `return` in a lambda from that frame.
-    #[must_use] 
-    pub fn inline_lambda_owner_return(
-        &self,
-    ) -> Option<Vec<(Reg, BlockId)>> {
+    #[must_use]
+    pub fn inline_lambda_owner_return(&self) -> Option<Vec<(Reg, BlockId)>> {
         self.inline_lambda_subst.last().map(|(_, s)| s.clone())
     }
 
@@ -341,10 +348,7 @@ impl<'a> FuncBuilder<'a> {
         self.is_lambda_body = true;
     }
 
-    pub fn set_outer_names_without_lambda(
-        &mut self,
-        names: std::collections::HashSet<String>,
-    ) {
+    pub fn set_outer_names_without_lambda(&mut self, names: std::collections::HashSet<String>) {
         self.outer_names = names;
     }
 
@@ -352,21 +356,18 @@ impl<'a> FuncBuilder<'a> {
         self.is_inline = inline;
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_lambda_body(&self) -> bool {
         self.is_lambda_body
     }
 
-    pub fn set_outer_names_named_local_fn(
-        &mut self,
-        names: std::collections::HashSet<String>,
-    ) {
+    pub fn set_outer_names_named_local_fn(&mut self, names: std::collections::HashSet<String>) {
         self.outer_names = names;
         self.is_lambda_body = true;
         self.is_named_local_fn = true;
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn is_named_local_fn(&self) -> bool {
         self.is_named_local_fn
     }
@@ -374,6 +375,8 @@ impl<'a> FuncBuilder<'a> {
     /// Record a capture reference encountered during lowering.
     /// Returns the per-lambda capture index. Idempotent for the
     /// same name.
+    // Capture index is a u16 slot; a lambda's capture count fits it.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn record_capture(&mut self, name: &str) -> u16 {
         if self.capture_regs.contains_key(name) {
             // Already captured at this reg — return its index.
@@ -401,7 +404,7 @@ impl<'a> FuncBuilder<'a> {
     /// Capture-name list in declaration order. Used by the
     /// lambda-construction site to materialise the corresponding
     /// outer registers.
-    #[must_use] 
+    #[must_use]
     pub fn captures_taken(&self) -> &[String] {
         &self.capture_order
     }
@@ -422,11 +425,19 @@ impl<'a> FuncBuilder<'a> {
     pub fn loop_for(&self, label: Option<&str>) -> Option<&LoopFrame> {
         match label {
             None => self.loops.last(),
-            Some(l) => self.loops.iter().rev().find(|f| f.label.as_deref() == Some(l)),
+            Some(l) => self
+                .loops
+                .iter()
+                .rev()
+                .find(|f| f.label.as_deref() == Some(l)),
         }
     }
 
     /// Bind a name in the current scope.
+    ///
+    /// # Panics
+    /// Panics if the scope stack is empty, which the builder's
+    /// invariant (at least one live scope) prevents.
     pub fn bind(&mut self, name: impl Into<String>, reg: Reg) {
         self.scopes
             .last_mut()
@@ -440,6 +451,10 @@ impl<'a> FuncBuilder<'a> {
     /// assignment so writes inside a nested block don't shadow the
     /// outer binding (which would make a `while (n > 0)` after
     /// `n -= 1` loop forever against the outer reg).
+    ///
+    /// # Panics
+    /// Panics if the scope stack is empty, which the builder's
+    /// invariant (at least one live scope) prevents.
     pub fn rebind(&mut self, name: &str, reg: Reg) {
         for frame in self.scopes.iter_mut().rev() {
             if frame.contains_key(name) {
@@ -453,15 +468,10 @@ impl<'a> FuncBuilder<'a> {
             .insert(name.to_string(), reg);
     }
 
-    /// Resolve a simple name through the scope chain. Returns
-    /// `None` when the name is not a local/parameter — callers can
-    /// fall back to module-level lookup (top-level functions,
-    /// imports, etc.).
-    #[must_use]
     pub fn set_owner_class(&mut self, name: String) {
         self.owner_class = Some(name);
     }
-    #[must_use] 
+    #[must_use]
     pub fn owner_class(&self) -> Option<&str> {
         self.owner_class.as_deref()
     }
@@ -478,7 +488,7 @@ impl<'a> FuncBuilder<'a> {
     pub fn private_method_fid(&self, name: &str) -> Option<crate::FuncId> {
         self.private_method_fids.get(name).copied()
     }
-    #[must_use] 
+    #[must_use]
     pub fn has_own_member(&self, name: &str) -> bool {
         self.own_members.contains(name)
     }
@@ -506,42 +516,42 @@ impl<'a> FuncBuilder<'a> {
     pub fn set_param_thunk(&mut self, on: bool) {
         self.is_param_thunk = on;
     }
-    #[must_use] 
+    #[must_use]
     pub fn is_param_thunk(&self) -> bool {
         self.is_param_thunk
     }
     pub fn set_tailrec_self(&mut self, name: String) {
         self.tailrec_self = Some(name);
     }
-    #[must_use] 
+    #[must_use]
     pub fn tailrec_self(&self) -> Option<&str> {
         self.tailrec_self.as_deref()
     }
     pub fn mark_local_fn(&mut self, name: &str) {
         self.local_fns.insert(name.to_string());
     }
-    #[must_use] 
+    #[must_use]
     pub fn is_local_fn(&self, name: &str) -> bool {
         self.local_fns.contains(name)
     }
     pub fn mark_local_ext_fn(&mut self, name: &str) {
         self.local_ext_fns.insert(name.to_string());
     }
-    #[must_use] 
+    #[must_use]
     pub fn is_local_ext_fn(&self, name: &str) -> bool {
         self.local_ext_fns.contains(name)
     }
     pub fn mark_receiver_lambda_param(&mut self, name: &str) {
         self.receiver_lambda_params.insert(name.to_string());
     }
-    #[must_use] 
+    #[must_use]
     pub fn is_receiver_lambda_param(&self, name: &str) -> bool {
         self.receiver_lambda_params.contains(name)
     }
     pub fn mark_generic_typed_param(&mut self, name: &str) {
         self.generic_typed_params.insert(name.to_string());
     }
-    #[must_use] 
+    #[must_use]
     pub fn is_generic_typed_param(&self, name: &str) -> bool {
         self.generic_typed_params.contains(name)
     }
@@ -567,12 +577,12 @@ impl<'a> FuncBuilder<'a> {
     pub fn mark_param(&mut self, name: &str) {
         self.param_names.insert(name.to_string());
     }
-    #[must_use] 
+    #[must_use]
     pub fn is_param(&self, name: &str) -> bool {
         self.param_names.contains(name)
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn resolve(&self, name: &str) -> Option<Reg> {
         for frame in self.scopes.iter().rev() {
             if let Some(r) = frame.get(name) {
@@ -668,6 +678,8 @@ impl<'a> FuncBuilder<'a> {
     }
 
     /// Allocate a fresh empty block.
+    // BlockId indexes self.blocks; the IR caps the block count at u32.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn alloc_block(&mut self) -> BlockId {
         let id = BlockId(self.blocks.len() as u32);
         self.blocks.push(Block {
@@ -725,39 +737,63 @@ impl<'a> FuncBuilder<'a> {
             n_locals,
             blocks: self.blocks,
             entry: BlockId(0),
-        is_suspend: false,
-        is_tailrec: self.tailrec_self.is_some(),
-        is_lambda: false,
-        is_inline: self.is_inline,
-        capture_order: self.capture_order.clone(),
-        implicit_label: None,
+            is_suspend: false,
+            is_tailrec: self.tailrec_self.is_some(),
+            is_lambda: false,
+            is_inline: self.is_inline,
+            capture_order: self.capture_order.clone(),
+            implicit_label: None,
         }
     }
 }
 
 impl TypeRef {
-    #[must_use] 
+    #[must_use]
     pub fn unit() -> Self {
-        Self { name: "kotlin.Unit".to_string(), nullable: false, args: Vec::new() }
+        Self {
+            name: "kotlin.Unit".to_string(),
+            nullable: false,
+            args: Vec::new(),
+        }
     }
-    #[must_use] 
+    #[must_use]
     pub fn nothing() -> Self {
-        Self { name: "kotlin.Nothing".to_string(), nullable: false, args: Vec::new() }
+        Self {
+            name: "kotlin.Nothing".to_string(),
+            nullable: false,
+            args: Vec::new(),
+        }
     }
-    #[must_use] 
+    #[must_use]
     pub fn int() -> Self {
-        Self { name: "kotlin.Int".to_string(), nullable: false, args: Vec::new() }
+        Self {
+            name: "kotlin.Int".to_string(),
+            nullable: false,
+            args: Vec::new(),
+        }
     }
-    #[must_use] 
+    #[must_use]
     pub fn long() -> Self {
-        Self { name: "kotlin.Long".to_string(), nullable: false, args: Vec::new() }
+        Self {
+            name: "kotlin.Long".to_string(),
+            nullable: false,
+            args: Vec::new(),
+        }
     }
-    #[must_use] 
+    #[must_use]
     pub fn bool() -> Self {
-        Self { name: "kotlin.Boolean".to_string(), nullable: false, args: Vec::new() }
+        Self {
+            name: "kotlin.Boolean".to_string(),
+            nullable: false,
+            args: Vec::new(),
+        }
     }
-    #[must_use] 
+    #[must_use]
     pub fn string() -> Self {
-        Self { name: "kotlin.String".to_string(), nullable: false, args: Vec::new() }
+        Self {
+            name: "kotlin.String".to_string(),
+            nullable: false,
+            args: Vec::new(),
+        }
     }
 }

@@ -25,13 +25,17 @@ pub(super) fn is_boxed_to_any_form(e: &Expr) -> bool {
 /// Recursively collect every single-segment `Path` identifier that
 /// appears anywhere in an expression. Used to find which names a
 /// nested lambda references.
+// One exhaustive match over the Expr variants; splitting it would only
+// fragment the dispatch.
+#[allow(clippy::too_many_lines)]
 pub(super) fn collect_path_idents(e: &Expr, out: &mut std::collections::HashSet<String>) {
     match e {
         Expr::Path { segments, .. } if segments.len() == 1 => {
             out.insert(segments[0].name.clone());
         }
-        Expr::Member { receiver, .. } => collect_path_idents(receiver, out),
-        Expr::MemberRef { receiver, .. } => collect_path_idents(receiver, out),
+        Expr::Member { receiver, .. } | Expr::MemberRef { receiver, .. } => {
+            collect_path_idents(receiver, out);
+        }
         Expr::Call { callee, args, .. } => {
             collect_path_idents(callee, out);
             for a in args {
@@ -55,7 +59,12 @@ pub(super) fn collect_path_idents(e: &Expr, out: &mut std::collections::HashSet<
         | Expr::Labeled { expr, .. }
         | Expr::As { expr, .. }
         | Expr::IsCheck { expr, .. } => collect_path_idents(expr, out),
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             collect_path_idents(cond, out);
             collect_path_idents(then_branch, out);
             if let Some(e) = else_branch {
@@ -95,7 +104,9 @@ pub(super) fn collect_path_idents(e: &Expr, out: &mut std::collections::HashSet<
             }
             klio_ast::FunctionBody::Expr(e) => collect_path_idents(e, out),
         },
-        Expr::When { subject, branches, .. } => {
+        Expr::When {
+            subject, branches, ..
+        } => {
             if let Some(s) = subject {
                 collect_path_idents(s, out);
             }
@@ -103,7 +114,12 @@ pub(super) fn collect_path_idents(e: &Expr, out: &mut std::collections::HashSet<
                 collect_path_idents(&br.body, out);
             }
         }
-        Expr::Try { body, catches, finally, .. } => {
+        Expr::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
             for s in &body.stmts {
                 collect_path_idents_stmt(s, out);
             }
@@ -146,12 +162,15 @@ pub(super) fn collect_path_idents_stmt(s: &Stmt, out: &mut std::collections::Has
                 collect_path_idents(e, out);
             }
         }
-        _ => {}
+        Stmt::Decl(_) => {}
     }
 }
 
 /// Names referenced anywhere inside a nested `Lambda` / `AnonFun`
 /// within these statements (recursing into nested lambdas too).
+// One exhaustive match over the Expr/Stmt variants; splitting it would
+// only fragment the dispatch.
+#[allow(clippy::too_many_lines)]
 pub(super) fn names_referenced_in_lambdas(
     stmts: &[Stmt],
     out: &mut std::collections::HashSet<String>,
@@ -175,7 +194,9 @@ pub(super) fn names_referenced_in_lambdas(
             | Expr::Unary { expr: receiver, .. }
             | Expr::Postfix { expr: receiver, .. }
             | Expr::Spread { expr: receiver, .. }
-            | Expr::Throw { value: receiver, .. }
+            | Expr::Throw {
+                value: receiver, ..
+            }
             | Expr::Labeled { expr: receiver, .. }
             | Expr::As { expr: receiver, .. }
             | Expr::IsCheck { expr: receiver, .. }
@@ -196,7 +217,12 @@ pub(super) fn names_referenced_in_lambdas(
                 scan_expr(lhs, out);
                 scan_expr(rhs, out);
             }
-            Expr::If { cond, then_branch, else_branch, .. } => {
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 scan_expr(cond, out);
                 scan_expr(then_branch, out);
                 if let Some(e) = else_branch {
@@ -219,7 +245,9 @@ pub(super) fn names_referenced_in_lambdas(
             }
             Expr::Return { value: Some(v), .. } => scan_expr(v, out),
             Expr::Block(b) => names_referenced_in_lambdas(&b.stmts, out),
-            Expr::When { subject, branches, .. } => {
+            Expr::When {
+                subject, branches, ..
+            } => {
                 if let Some(s) = subject {
                     scan_expr(s, out);
                 }
@@ -227,7 +255,12 @@ pub(super) fn names_referenced_in_lambdas(
                     scan_expr(&br.body, out);
                 }
             }
-            Expr::Try { body, catches, finally, .. } => {
+            Expr::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
                 names_referenced_in_lambdas(&body.stmts, out);
                 for c in catches {
                     names_referenced_in_lambdas(&c.body.stmts, out);
@@ -277,7 +310,7 @@ pub(super) fn names_referenced_in_lambdas(
                     }
                 }
             }
-            _ => {}
+            Stmt::Decl(_) => {}
         }
     }
 }
@@ -291,22 +324,30 @@ pub(super) fn collect_var_decls(stmts: &[Stmt], out: &mut std::collections::Hash
     fn scan_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
         match e {
             Expr::Block(b) => collect_var_decls(&b.stmts, out),
-            Expr::If { then_branch, else_branch, .. } => {
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 scan_expr(then_branch, out);
                 if let Some(e) = else_branch {
                     scan_expr(e, out);
                 }
             }
-            Expr::While { body, .. } => scan_expr(body, out),
+            Expr::While { body, .. } | Expr::For { body, .. } => scan_expr(body, out),
             Expr::DoWhile { body: Some(b), .. } => scan_expr(b, out),
-            Expr::For { body, .. } => scan_expr(body, out),
             Expr::When { branches, .. } => {
                 for br in branches {
                     scan_expr(&br.body, out);
                 }
             }
             Expr::Labeled { expr, .. } => scan_expr(expr, out),
-            Expr::Try { body, catches, finally, .. } => {
+            Expr::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
                 collect_var_decls(&body.stmts, out);
                 for c in catches {
                     collect_var_decls(&c.body.stmts, out);
@@ -329,7 +370,11 @@ pub(super) fn collect_var_decls(stmts: &[Stmt], out: &mut std::collections::Hash
             {
                 out.insert(p.name.name.clone());
             }
-            Stmt::DestructuringDecl { mutable: true, names, .. } => {
+            Stmt::DestructuringDecl {
+                mutable: true,
+                names,
+                ..
+            } => {
                 for n in names {
                     out.insert(n.name.clone());
                 }

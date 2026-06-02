@@ -14,5 +14,5 @@ pub mod parse;
 pub mod walk;
 
 pub use emit::emit_generated;
-pub use parse::{parse_file, Decl, DeclKind, ParsedFile, Visibility};
-pub use walk::{collect_decls, CollectStats};
+pub use parse::{Decl, DeclKind, ParsedFile, Visibility, parse_file};
+pub use walk::{CollectStats, collect_decls};

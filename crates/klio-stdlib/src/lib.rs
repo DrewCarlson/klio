@@ -50,17 +50,32 @@ pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
     ("ClassCastException", "kotlin.ClassCastException"),
     ("Error", "kotlin.Error"),
     ("Exception", "kotlin.Exception"),
-    ("IllegalArgumentException", "kotlin.IllegalArgumentException"),
+    (
+        "IllegalArgumentException",
+        "kotlin.IllegalArgumentException",
+    ),
     ("IllegalStateException", "kotlin.IllegalStateException"),
-    ("IndexOutOfBoundsException", "kotlin.IndexOutOfBoundsException"),
+    (
+        "IndexOutOfBoundsException",
+        "kotlin.IndexOutOfBoundsException",
+    ),
     ("NoSuchElementException", "kotlin.NoSuchElementException"),
     ("NullPointerException", "kotlin.NullPointerException"),
     ("RuntimeException", "kotlin.RuntimeException"),
     ("Throwable", "kotlin.Throwable"),
-    ("UnsupportedOperationException", "kotlin.UnsupportedOperationException"),
-    ("NoWhenBranchMatchedException", "kotlin.NoWhenBranchMatchedException"),
+    (
+        "UnsupportedOperationException",
+        "kotlin.UnsupportedOperationException",
+    ),
+    (
+        "NoWhenBranchMatchedException",
+        "kotlin.NoWhenBranchMatchedException",
+    ),
     ("NumberFormatException", "kotlin.NumberFormatException"),
-    ("ConcurrentModificationException", "kotlin.ConcurrentModificationException"),
+    (
+        "ConcurrentModificationException",
+        "kotlin.ConcurrentModificationException",
+    ),
     ("AssertionError", "kotlin.AssertionError"),
     ("Pair", "kotlin.Pair"),
     ("Triple", "kotlin.Triple"),
@@ -105,7 +120,7 @@ pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
 /// bare names are stdlib top-level entities): take the lowercase
 /// entries (functions, not types/exceptions) and exclude the few
 /// that genuinely are receiver/infix extensions.
-#[must_use] 
+#[must_use]
 pub fn is_toplevel_function(name: &str) -> bool {
     // `to`, `downTo`, `step`, `until` are infix extensions on a
     // receiver — they legitimately dispatch with a receiver.
@@ -113,9 +128,9 @@ pub fn is_toplevel_function(name: &str) -> bool {
     if RECEIVER_INFIX.contains(&name) {
         return false;
     }
-    IMPLICIT_ALIASES.iter().any(|(alias, _)| {
-        *alias == name && alias.chars().next().is_some_and(char::is_lowercase)
-    })
+    IMPLICIT_ALIASES
+        .iter()
+        .any(|(alias, _)| *alias == name && alias.chars().next().is_some_and(char::is_lowercase))
 }
 
 pub mod implementations;
@@ -340,6 +355,8 @@ pub struct Coverage {
 
 impl Coverage {
     #[must_use]
+    // Coverage counts are small; the f64 ratio needs no exact integer fidelity.
+    #[allow(clippy::cast_precision_loss)]
     pub fn percent(self) -> f64 {
         if self.total == 0 {
             0.0
@@ -357,7 +374,10 @@ pub fn coverage() -> Coverage {
         .filter(|e| e.impl_fn.is_some())
         .count();
     let hand_count = implementations::COUNT;
-    Coverage { implemented: registry_count + hand_count, total }
+    Coverage {
+        implemented: registry_count + hand_count,
+        total,
+    }
 }
 
 /// Look up a hand-written intrinsic by FQN. Used by the interpreter to
@@ -580,10 +600,7 @@ mod tests {
             "kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn",
             "kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED",
         ] {
-            assert!(
-                lookup(fqn).is_some(),
-                "stdlib registry missing {fqn}"
-            );
+            assert!(lookup(fqn).is_some(), "stdlib registry missing {fqn}");
         }
     }
 }

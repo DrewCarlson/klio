@@ -15,9 +15,7 @@
 //! `KillDataFlow(place)` node injected at the loop head so smart-
 //! cast analyses know to drop that place's narrowings.
 
-use crate::ir::{
-    BasicBlock, BlockId, Cfg, EdgeKind, Node, Place, Terminator,
-};
+use crate::ir::{BasicBlock, BlockId, Cfg, EdgeKind, Node, Place, Terminator};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// A monotone lattice with a bottom element and a join. `join`
@@ -43,9 +41,8 @@ impl<T: Clone + Eq> Lattice for Flat<T> {
     }
     fn join(&mut self, other: &Self) -> bool {
         let new = match (&*self, other) {
-            (_, Flat::Bottom) => return false,
+            (_, Flat::Bottom) | (Flat::Top, _) => return false,
             (Flat::Bottom, b) => b.clone(),
-            (Flat::Top, _) => return false,
             (_, Flat::Top) => Flat::Top,
             (Flat::Value(a), Flat::Value(b)) => {
                 if a == b {
@@ -68,9 +65,11 @@ pub struct MapLattice<K: Ord + Clone, L: Lattice + Eq> {
 }
 
 impl<K: Ord + Clone, L: Lattice + Eq> MapLattice<K, L> {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
-        Self { map: BTreeMap::new() }
+        Self {
+            map: BTreeMap::new(),
+        }
     }
 
     pub fn get(&self, k: &K) -> L {
@@ -148,31 +147,31 @@ pub fn solve_forward<L: Lattice + Eq, T: ForwardTransfer<L>>(
         for edge in &block.succs {
             let mut succ_in = state.clone();
             transfer.transfer_edge(&edge.kind, &mut succ_in);
-            if in_states[edge.block.0 as usize].join(&succ_in)
-                && !in_queue.contains(&edge.block) {
-                    queue.push_back(edge.block);
-                    in_queue.insert(edge.block);
-                }
+            if in_states[edge.block.0 as usize].join(&succ_in) && !in_queue.contains(&edge.block) {
+                queue.push_back(edge.block);
+                in_queue.insert(edge.block);
+            }
         }
     }
     in_states
 }
 
+fn reverse_postorder_dfs(cfg: &Cfg, bid: BlockId, visited: &mut [bool], order: &mut Vec<BlockId>) {
+    if visited[bid.0 as usize] {
+        return;
+    }
+    visited[bid.0 as usize] = true;
+    let block: &BasicBlock = &cfg.blocks[bid.0 as usize];
+    for e in &block.succs {
+        reverse_postorder_dfs(cfg, e.block, visited, order);
+    }
+    order.push(bid);
+}
+
 fn reverse_postorder(cfg: &Cfg) -> Vec<BlockId> {
     let mut visited = vec![false; cfg.blocks.len()];
     let mut order: Vec<BlockId> = Vec::with_capacity(cfg.blocks.len());
-    fn dfs(cfg: &Cfg, bid: BlockId, visited: &mut [bool], order: &mut Vec<BlockId>) {
-        if visited[bid.0 as usize] {
-            return;
-        }
-        visited[bid.0 as usize] = true;
-        let block: &BasicBlock = &cfg.blocks[bid.0 as usize];
-        for e in &block.succs {
-            dfs(cfg, e.block, visited, order);
-        }
-        order.push(bid);
-    }
-    dfs(cfg, cfg.entry, &mut visited, &mut order);
+    reverse_postorder_dfs(cfg, cfg.entry, &mut visited, &mut order);
     order.reverse();
     order
 }
@@ -293,4 +292,3 @@ fn find_loop_heads(cfg: &Cfg) -> Vec<BlockId> {
     }
     heads.into_iter().collect()
 }
-

@@ -26,8 +26,18 @@ fn main() {
     // or the AST it consumes (klio-ast) changes the pack's contents even
     // though no `.kt` source moved. Watch those crates' sources too, or a
     // lowering fix silently ships against a stale embedded pack.
-    rerun_dir(&PathBuf::from(&manifest_dir).join("..").join("klio-ir").join("src"));
-    rerun_dir(&PathBuf::from(&manifest_dir).join("..").join("klio-ast").join("src"));
+    rerun_dir(
+        &PathBuf::from(&manifest_dir)
+            .join("..")
+            .join("klio-ir")
+            .join("src"),
+    );
+    rerun_dir(
+        &PathBuf::from(&manifest_dir)
+            .join("..")
+            .join("klio-ast")
+            .join("src"),
+    );
     // The pack also embeds curated upstream commonMain sources. Watch
     // the source roots the curated include list draws from so a change
     // to any consumed upstream `.kt` re-packs.

@@ -6,6 +6,7 @@ use klio_lexer::Lexer;
 use klio_parser::Parser;
 use klio_resolver::resolve;
 use klio_span::SourceMap;
+use std::fmt::Write;
 
 fn render(src: &str) -> String {
     let mut map = SourceMap::new();
@@ -18,14 +19,18 @@ fn render(src: &str) -> String {
     let mut out = String::new();
     out.push_str("# symbols\n");
     for s in &r.symbols {
-        let span = s
-            .decl_span.map_or_else(|| "@builtin".into(), |sp| format!("@{}..{}", sp.start, sp.end));
-        out.push_str(&format!(
-            "  [{idx}] {kind:?} {name} {span}\n",
+        let span = s.decl_span.map_or_else(
+            || "@builtin".into(),
+            |sp| format!("@{}..{}", sp.start, sp.end),
+        );
+        writeln!(
+            out,
+            "  [{idx}] {kind:?} {name} {span}",
             idx = s.id.0,
             kind = s.kind,
             name = s.name,
-        ));
+        )
+        .unwrap();
     }
 
     out.push_str("\n# uses\n");
@@ -33,10 +38,12 @@ fn render(src: &str) -> String {
     uses.sort_by_key(|(span, _)| (span.start, span.end));
     for (span, sym_id) in uses {
         let sym = r.symbol(*sym_id);
-        out.push_str(&format!(
-            "  @{}..{} -> [{}] {} ({:?})\n",
+        writeln!(
+            out,
+            "  @{}..{} -> [{}] {} ({:?})",
             span.start, span.end, sym.id.0, sym.name, sym.kind,
-        ));
+        )
+        .unwrap();
     }
 
     let mut all_diags = parse_diags.diagnostics().to_vec();
@@ -45,13 +52,15 @@ fn render(src: &str) -> String {
         out.push_str("\n# diagnostics\n");
         for d in &all_diags {
             let code = d.code().unwrap_or("");
-            out.push_str(&format!(
-                "  [{code}] {sev:?} {msg} @{start}..{end}\n",
+            writeln!(
+                out,
+                "  [{code}] {sev:?} {msg} @{start}..{end}",
                 sev = d.severity,
                 msg = d.message,
                 start = d.primary.span.start,
                 end = d.primary.span.end,
-            ));
+            )
+            .unwrap();
         }
     }
 
@@ -73,7 +82,10 @@ corpus_test!(mutual_recursion, "mutual_recursion.kt");
 corpus_test!(shadowing, "shadowing.kt");
 corpus_test!(diag_unresolved, "diag_unresolved.kt");
 corpus_test!(diag_non_kotlin_import, "diag_non_kotlin_import.kt");
-corpus_test!(diag_unknown_kotlin_package, "diag_unknown_kotlin_package.kt");
+corpus_test!(
+    diag_unknown_kotlin_package,
+    "diag_unknown_kotlin_package.kt"
+);
 corpus_test!(import_own_package, "import_own_package.kt");
 corpus_test!(import_star_kotlin_text, "import_star_kotlin_text.kt");
 corpus_test!(diag_import_star_unknown, "diag_import_star_unknown.kt");

@@ -1,4 +1,7 @@
-use super::{Parser, Expr, TokenKind, BinOp, Keyword, is_valid_infix_name, Ident, UnOp, TypeRef, PostfixOp, is_trailing_lambda_callable};
+use super::{
+    BinOp, Expr, Ident, Keyword, Parser, PostfixOp, TokenKind, TypeRef, UnOp,
+    is_trailing_lambda_callable, is_valid_infix_name,
+};
 
 impl Parser<'_, '_> {
     pub fn parse_expr(&mut self) -> Option<Expr> {
@@ -61,7 +64,12 @@ impl Parser<'_, '_> {
             self.skip_nl();
             let rhs = self.parse_conjunction()?;
             let span = lhs.span().join(rhs.span());
-            lhs = Expr::Binary { op: BinOp::Or, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+            lhs = Expr::Binary {
+                op: BinOp::Or,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
         }
         Some(lhs)
     }
@@ -82,7 +90,12 @@ impl Parser<'_, '_> {
             self.skip_nl();
             let rhs = self.parse_equality()?;
             let span = lhs.span().join(rhs.span());
-            lhs = Expr::Binary { op: BinOp::And, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+            lhs = Expr::Binary {
+                op: BinOp::And,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
         }
         Some(lhs)
     }
@@ -102,7 +115,12 @@ impl Parser<'_, '_> {
             self.skip_nl();
             let rhs = self.parse_comparison()?;
             let span = lhs.span().join(rhs.span());
-            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
         }
         Some(lhs)
     }
@@ -135,7 +153,12 @@ impl Parser<'_, '_> {
             self.skip_nl();
             let rhs = self.parse_named_checks()?;
             let span = lhs.span().join(rhs.span());
-            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
         }
         Some(lhs)
     }
@@ -164,9 +187,16 @@ impl Parser<'_, '_> {
             };
             self.bump(); // `is`
             self.skip_nl();
-            let Some(ty) = self.parse_qualified_type() else { break };
+            let Some(ty) = self.parse_qualified_type() else {
+                break;
+            };
             let span = lhs.span().join(ty.span);
-            lhs = Expr::IsCheck { expr: Box::new(lhs), ty, negated, span };
+            lhs = Expr::IsCheck {
+                expr: Box::new(lhs),
+                ty,
+                negated,
+                span,
+            };
         }
         Some(lhs)
     }
@@ -189,7 +219,12 @@ impl Parser<'_, '_> {
             self.skip_nl();
             let rhs = self.parse_infix_fn()?;
             let span = lhs.span().join(rhs.span());
-            lhs = Expr::Binary { op: BinOp::Elvis, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+            lhs = Expr::Binary {
+                op: BinOp::Elvis,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
         }
         Some(lhs)
     }
@@ -220,7 +255,10 @@ impl Parser<'_, '_> {
             let rhs = self.parse_range()?;
             let span = lhs.span().join(rhs.span());
             let callee = Expr::Path {
-                segments: vec![Ident { name: name_str, span: name_span }],
+                segments: vec![Ident {
+                    name: name_str,
+                    span: name_span,
+                }],
                 span: name_span,
             };
             lhs = Expr::Call {
@@ -246,16 +284,29 @@ impl Parser<'_, '_> {
         // a continuation (`(a) or\n (b)`), not a statement boundary —
         // look past it regardless of bracket nesting.
         let mut i = self.pos + 1;
-        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+        while matches!(
+            self.tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Newline)
+        ) {
             i += 1;
         }
         let next = self.tokens.get(i).map(|t| &t.kind);
         match next {
-            None |
-Some(TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof |
-TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket | TokenKind::Comma
-| TokenKind::Eq | TokenKind::Colon | TokenKind::Arrow | TokenKind::Dot |
-TokenKind::QuestionDot) => false,
+            None
+            | Some(
+                TokenKind::Newline
+                | TokenKind::Semicolon
+                | TokenKind::Eof
+                | TokenKind::RBrace
+                | TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::Comma
+                | TokenKind::Eq
+                | TokenKind::Colon
+                | TokenKind::Arrow
+                | TokenKind::Dot
+                | TokenKind::QuestionDot,
+            ) => false,
             Some(_) => true,
         }
     }
@@ -273,7 +324,12 @@ TokenKind::QuestionDot) => false,
             self.skip_nl();
             let rhs = self.parse_additive()?;
             let span = lhs.span().join(rhs.span());
-            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
         }
         Some(lhs)
     }
@@ -291,7 +347,12 @@ TokenKind::QuestionDot) => false,
             self.skip_nl();
             let rhs = self.parse_multiplicative()?;
             let span = lhs.span().join(rhs.span());
-            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
         }
         Some(lhs)
     }
@@ -310,7 +371,12 @@ TokenKind::QuestionDot) => false,
             self.skip_nl();
             let rhs = self.parse_as()?;
             let span = lhs.span().join(rhs.span());
-            lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs), span };
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
         }
         Some(lhs)
     }
@@ -327,9 +393,16 @@ TokenKind::QuestionDot) => false,
                 self.bump();
             }
             self.skip_nl();
-            let Some(ty) = self.parse_qualified_type() else { break };
+            let Some(ty) = self.parse_qualified_type() else {
+                break;
+            };
             let span = lhs.span().join(ty.span);
-            lhs = Expr::As { expr: Box::new(lhs), ty, safe, span };
+            lhs = Expr::As {
+                expr: Box::new(lhs),
+                ty,
+                safe,
+                span,
+            };
         }
         Some(lhs)
     }
@@ -348,11 +421,17 @@ TokenKind::QuestionDot) => false,
             self.bump();
             let expr = self.parse_prefix()?;
             let span = start.join(expr.span());
-            return Some(Expr::Unary { op, expr: Box::new(expr), span });
+            return Some(Expr::Unary {
+                op,
+                expr: Box::new(expr),
+                span,
+            });
         }
         self.parse_postfix()
     }
 
+    // Single match-dispatch loop over postfix tokens; splitting would fragment it.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn parse_postfix(&mut self) -> Option<Expr> {
         let mut expr = self.parse_primary()?;
         // Generic type args at a call site (`foo<String>(…)`) are captured
@@ -363,25 +442,44 @@ TokenKind::QuestionDot) => false,
                 TokenKind::PlusPlus => {
                     let tok = self.bump();
                     let span = expr.span().join(tok.span);
-                    expr = Expr::Postfix { op: PostfixOp::Inc, expr: Box::new(expr), span };
+                    expr = Expr::Postfix {
+                        op: PostfixOp::Inc,
+                        expr: Box::new(expr),
+                        span,
+                    };
                 }
                 TokenKind::MinusMinus => {
                     let tok = self.bump();
                     let span = expr.span().join(tok.span);
-                    expr = Expr::Postfix { op: PostfixOp::Dec, expr: Box::new(expr), span };
+                    expr = Expr::Postfix {
+                        op: PostfixOp::Dec,
+                        expr: Box::new(expr),
+                        span,
+                    };
                 }
                 TokenKind::BangBang => {
                     let tok = self.bump();
                     let span = expr.span().join(tok.span);
-                    expr = Expr::Postfix { op: PostfixOp::NotNull, expr: Box::new(expr), span };
+                    expr = Expr::Postfix {
+                        op: PostfixOp::NotNull,
+                        expr: Box::new(expr),
+                        span,
+                    };
                 }
                 TokenKind::Dot | TokenKind::QuestionDot => {
                     let safe = matches!(self.peek_kind(), TokenKind::QuestionDot);
                     self.bump();
                     self.skip_nl();
-                    let Some(name) = self.parse_ident("member name") else { return Some(expr); };
+                    let Some(name) = self.parse_ident("member name") else {
+                        return Some(expr);
+                    };
                     let span = expr.span().join(name.span);
-                    expr = Expr::Member { receiver: Box::new(expr), name, safe, span };
+                    expr = Expr::Member {
+                        receiver: Box::new(expr),
+                        name,
+                        safe,
+                        span,
+                    };
                 }
                 TokenKind::ColonColon => {
                     self.bump();
@@ -391,7 +489,10 @@ TokenKind::QuestionDot) => false,
                     // identifier (member name).
                     let name = if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Class)) {
                         let tok = self.bump();
-                        Ident { name: "class".to_string(), span: tok.span }
+                        Ident {
+                            name: "class".to_string(),
+                            span: tok.span,
+                        }
                     } else {
                         self.parse_ident("callable reference name")?
                     };
@@ -408,7 +509,11 @@ TokenKind::QuestionDot) => false,
                     }
                     pending_type_args.clear();
                     let span = expr.span().join(name.span);
-                    expr = Expr::MemberRef { receiver: Box::new(expr), name, span };
+                    expr = Expr::MemberRef {
+                        receiver: Box::new(expr),
+                        name,
+                        span,
+                    };
                 }
                 TokenKind::Lt => {
                     // Generic call type args like `ArrayList<Int>()` or
@@ -432,7 +537,9 @@ TokenKind::QuestionDot) => false,
                     let mut arg_names: Vec<Option<String>> = Vec::new();
                     loop {
                         self.skip_nl();
-                        if matches!(self.peek_kind(), TokenKind::RParen) { break; }
+                        if matches!(self.peek_kind(), TokenKind::RParen) {
+                            break;
+                        }
                         // Capture `name` part of `name = expr` for reorder.
                         let name = self.try_consume_named_arg_name();
                         let arg = self.parse_value_argument()?;
@@ -462,7 +569,9 @@ TokenKind::QuestionDot) => false,
                     let mut args = Vec::new();
                     loop {
                         self.skip_nl();
-                        if matches!(self.peek_kind(), TokenKind::RBracket) { break; }
+                        if matches!(self.peek_kind(), TokenKind::RBracket) {
+                            break;
+                        }
                         let arg = self.parse_expr()?;
                         args.push(arg);
                         self.skip_nl();
@@ -474,7 +583,11 @@ TokenKind::QuestionDot) => false,
                     }
                     let rbr = self.expect(&TokenKind::RBracket, "`]`")?;
                     let span = expr.span().join(rbr.span);
-                    expr = Expr::Index { receiver: Box::new(expr), args, span };
+                    expr = Expr::Index {
+                        receiver: Box::new(expr),
+                        args,
+                        span,
+                    };
                 }
                 // Labeled trailing lambda: `call lbl@ { ... }`. The
                 // label binds the lambda (for `return@lbl`); upstream
@@ -493,7 +606,10 @@ TokenKind::QuestionDot) => false,
                         ) =>
                 {
                     let name_span = self.current_span();
-                    let label = Ident { name: self.ident_name(name_span), span: name_span };
+                    let label = Ident {
+                        name: self.ident_name(name_span),
+                        span: name_span,
+                    };
                     self.bump(); // label ident
                     self.bump(); // `@`
                     let lam = self.parse_trailing_lambda()?;
@@ -506,13 +622,27 @@ TokenKind::QuestionDot) => false,
                     let span = expr.span().join(lspan);
                     let extra_type_args = std::mem::take(&mut pending_type_args);
                     expr = match expr {
-                        Expr::Call { callee, mut args, mut arg_names, mut type_args, is_infix, .. } => {
+                        Expr::Call {
+                            callee,
+                            mut args,
+                            mut arg_names,
+                            mut type_args,
+                            is_infix,
+                            ..
+                        } => {
                             args.push(lam);
                             arg_names.push(None);
                             if type_args.is_empty() {
                                 type_args = extra_type_args;
                             }
-                            Expr::Call { callee, args, arg_names, type_args, is_infix, span }
+                            Expr::Call {
+                                callee,
+                                args,
+                                arg_names,
+                                type_args,
+                                is_infix,
+                                span,
+                            }
                         }
                         other => Expr::Call {
                             callee: Box::new(other),
@@ -531,13 +661,27 @@ TokenKind::QuestionDot) => false,
                     let span = expr.span().join(lam.span());
                     let extra_type_args = std::mem::take(&mut pending_type_args);
                     expr = match expr {
-                        Expr::Call { callee, mut args, mut arg_names, mut type_args, is_infix, .. } => {
+                        Expr::Call {
+                            callee,
+                            mut args,
+                            mut arg_names,
+                            mut type_args,
+                            is_infix,
+                            ..
+                        } => {
                             args.push(lam);
                             arg_names.push(None);
                             if type_args.is_empty() {
                                 type_args = extra_type_args;
                             }
-                            Expr::Call { callee, args, arg_names, type_args, is_infix, span }
+                            Expr::Call {
+                                callee,
+                                args,
+                                arg_names,
+                                type_args,
+                                is_infix,
+                                span,
+                            }
                         }
                         other => Expr::Call {
                             callee: Box::new(other),
@@ -581,7 +725,10 @@ TokenKind::QuestionDot) => false,
             let e = self.parse_expr()?;
             self.reject_trailing_assignment();
             let span = star.span.join(e.span());
-            return Some(Expr::Spread { expr: Box::new(e), span });
+            return Some(Expr::Spread {
+                expr: Box::new(e),
+                span,
+            });
         }
         // A `{ ... }` value-argument is always a lambda literal, even
         // without an explicit `->` header (binds an implicit `it`).
@@ -615,14 +762,17 @@ TokenKind::QuestionDot) => false,
     /// continuation starters.
     pub(crate) fn next_non_newline_is_chain_continuation(&self) -> bool {
         let mut i = self.pos;
-        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+        while matches!(
+            self.tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Newline)
+        ) {
             i += 1;
         }
         matches!(
             self.tokens.get(i).map(|t| &t.kind),
-            Some(TokenKind::Dot | TokenKind::QuestionDot | TokenKind::BangBang |
-TokenKind::LBracket)
+            Some(
+                TokenKind::Dot | TokenKind::QuestionDot | TokenKind::BangBang | TokenKind::LBracket
+            )
         )
     }
-
 }

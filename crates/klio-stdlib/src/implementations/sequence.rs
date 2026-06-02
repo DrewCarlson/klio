@@ -1,4 +1,7 @@
-use super::{Value, Arc, ObjRef, CallCtx, RuntimeError, materialise_sequence, recv_list_items, recv_set_items, recv_string, range_iter_int, make_list, make_set, materialise_sequence_bounded};
+use super::{
+    Arc, CallCtx, ObjRef, RuntimeError, Value, make_list, make_set, materialise_sequence,
+    materialise_sequence_bounded, range_iter_int, recv_list_items, recv_set_items, recv_string,
+};
 
 // ============================================================
 // Sequence (eager; same observable output as List)
@@ -22,13 +25,17 @@ pub(crate) fn make_sequence(items: Vec<Value>) -> Value {
 /// is bounded by the dev memory guard rather than truly lazy.
 pub(crate) fn seq_scope_buffer(scope: &Value) -> Option<ObjRef<Vec<Value>>> {
     if let Value::Instance(inst) = scope
-        && let Some(Value::List { items, .. }) = inst.borrow().get("__seq_buffer") {
-            return Some(items);
-        }
+        && let Some(Value::List { items, .. }) = inst.borrow().get("__seq_buffer")
+    {
+        return Some(items);
+    }
     None
 }
 
-pub(crate) fn run_seq_builder(ctx: &mut CallCtx, who: &str) -> Result<ObjRef<Vec<Value>>, RuntimeError> {
+pub(crate) fn run_seq_builder(
+    ctx: &mut CallCtx,
+    who: &str,
+) -> Result<ObjRef<Vec<Value>>, RuntimeError> {
     let block = ctx
         .args
         .first()
@@ -42,7 +49,12 @@ pub(crate) fn run_seq_builder(ctx: &mut CallCtx, who: &str) -> Result<ObjRef<Vec
             id,
             vec![(
                 "__seq_buffer".to_string(),
-                Value::List { items: buffer.clone(), mutable: true, enum_class: None, backing: None },
+                Value::List {
+                    items: buffer.clone(),
+                    mutable: true,
+                    enum_class: None,
+                    backing: None,
+                },
             )],
         )
     };
@@ -60,7 +72,11 @@ pub(crate) fn seq_builder(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 pub(crate) fn seq_iterator_builder(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let buffer = run_seq_builder(ctx, "iterator")?;
     let items = buffer.borrow().clone();
-    Ok(Value::Iterator { items: ObjRef::new(items), pos: ObjRef::new(0), prim: None })
+    Ok(Value::Iterator {
+        items: ObjRef::new(items),
+        pos: ObjRef::new(0),
+        prim: None,
+    })
 }
 
 pub(crate) fn seq_scope_yield(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -76,8 +92,12 @@ pub(crate) fn seq_scope_yield_all(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
     let buffer = seq_scope_buffer(&ctx.args[0])
         .ok_or_else(|| RuntimeError::Type("yieldAll: not a SequenceScope".into()))?;
     let elems: Vec<Value> = match ctx.args.get(1) {
-        Some(Value::List { items, .. } | Value::Set { items, .. } | Value::Array {
-items, .. } | Value::Iterator { items, .. }) => items.borrow().clone(),
+        Some(
+            Value::List { items, .. }
+            | Value::Set { items, .. }
+            | Value::Array { items, .. }
+            | Value::Iterator { items, .. },
+        ) => items.borrow().clone(),
         Some(Value::Sequence(_)) => {
             let seq = ctx.args[1].clone();
             let CallCtx { out, host, .. } = ctx;
@@ -86,7 +106,7 @@ items, .. } | Value::Iterator { items, .. }) => items.borrow().clone(),
         Some(other) => {
             return Err(RuntimeError::Type(format!(
                 "yieldAll: expected an Iterable/Iterator/Sequence, got {other}"
-            )))
+            )));
         }
         None => return Ok(Value::Unit),
     };
@@ -107,15 +127,24 @@ pub(crate) fn seq_from_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
     Ok(make_sequence(s.encode_utf16().map(Value::Char).collect()))
 }
 pub(crate) fn seq_from_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let Some(Value::Range { start, end, step, .. }) = ctx.args.first() else {
+    let Some(Value::Range {
+        start, end, step, ..
+    }) = ctx.args.first()
+    else {
         return Err(RuntimeError::Type("asSequence requires an IntRange".into()));
     };
-    let items: Vec<Value> = range_iter_int(*start, *end, *step).map(Value::new_int).collect();
+    let items: Vec<Value> = range_iter_int(*start, *end, *step)
+        .map(Value::new_int)
+        .collect();
     Ok(make_sequence(items))
 }
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn seq_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_sequence(ctx.args.to_vec()))
 }
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn seq_empty(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_sequence(Vec::new()))
 }
@@ -123,13 +152,15 @@ pub(crate) fn seq_empty(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 pub(crate) fn seq_generate_sequence(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     use klio_runtime::{SequenceData, SequenceSource};
     match ctx.args {
-        [lam @ (Value::Lambda { .. } | Value::IrClosure { .. })] => Ok(Value::Sequence(Arc::new(SequenceData {
-            source: SequenceSource::Generate {
-                seed: None,
-                next: Box::new(lam.clone()),
-            },
-            ops: Vec::new(),
-        }))),
+        [lam @ (Value::Lambda { .. } | Value::IrClosure { .. })] => {
+            Ok(Value::Sequence(Arc::new(SequenceData {
+                source: SequenceSource::Generate {
+                    seed: None,
+                    next: Box::new(lam.clone()),
+                },
+                ops: Vec::new(),
+            })))
+        }
         [seed, lam @ (Value::Lambda { .. } | Value::IrClosure { .. })] => {
             let seeded = if matches!(seed, Value::Null) {
                 None
@@ -153,16 +184,21 @@ pub(crate) fn seq_generate_sequence(ctx: &mut CallCtx) -> Result<Value, RuntimeE
 /// Fast-path Sequence terminal ops handle the special case of an
 /// `Items`-source Sequence with no ops. Anything more (intermediate ops,
 /// generator sources) goes through `klio-interp`'s lazy materialize path.
-pub(crate) fn recv_seq_eager(args: &[Value], what: &str) -> Result<Option<Arc<Vec<Value>>>, RuntimeError> {
+pub(crate) fn recv_seq_eager(
+    args: &[Value],
+    what: &str,
+) -> Result<Option<Arc<Vec<Value>>>, RuntimeError> {
     let Some(Value::Sequence(data)) = args.first() else {
-        return Err(RuntimeError::Type(format!("{what} requires a Sequence receiver")));
+        return Err(RuntimeError::Type(format!(
+            "{what} requires a Sequence receiver"
+        )));
     };
     if !data.ops.is_empty() {
         return Ok(None);
     }
     match &data.source {
         klio_runtime::SequenceSource::Items(items) => Ok(Some(Arc::clone(items))),
-        _ => Ok(None),
+        klio_runtime::SequenceSource::Generate { .. } => Ok(None),
     }
 }
 
@@ -171,7 +207,8 @@ pub(crate) fn seq_to_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         // Has ops or a non-Items source — caller should have routed this
         // through the interpreter's lazy materializer.
         return Err(RuntimeError::Unimplemented(
-            "Sequence.toList on a non-trivial source/op chain (dispatch via the interpreter)".into(),
+            "Sequence.toList on a non-trivial source/op chain (dispatch via the interpreter)"
+                .into(),
         ));
     };
     Ok(make_list((*items).clone(), false))
@@ -288,23 +325,31 @@ pub(crate) fn seq_last(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         })
     })
 }
+// Result signature kept to match the builtin handler function-pointer table.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn seq_to_string(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // Kotlin returns an opaque id like `kotlin.sequences.TransformingSequence@…`.
     // Stable parity for that string is meaningless (it embeds the heap
     // address), so we emit a deterministic placeholder. Programs that need
     // a useful value should call `.toList()` before printing.
-    Ok(Value::String(Arc::new("kotlin.sequences.Sequence".to_string())))
+    Ok(Value::String(Arc::new(
+        "kotlin.sequences.Sequence".to_string(),
+    )))
 }
 
 pub(crate) fn map_entry_key(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(Value::MapEntry { key, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("Map.Entry.key requires a Map.Entry receiver".into()));
+        return Err(RuntimeError::Type(
+            "Map.Entry.key requires a Map.Entry receiver".into(),
+        ));
     };
     Ok((**key).clone())
 }
 pub(crate) fn map_entry_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let Some(Value::MapEntry { value, .. }) = ctx.args.first() else {
-        return Err(RuntimeError::Type("Map.Entry.value requires a Map.Entry receiver".into()));
+        return Err(RuntimeError::Type(
+            "Map.Entry.value requires a Map.Entry receiver".into(),
+        ));
     };
     Ok((**value).clone())
 }
@@ -316,4 +361,3 @@ pub(crate) fn map_entry_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
     };
     Ok(Value::String(Arc::new(format!("{v}"))))
 }
-

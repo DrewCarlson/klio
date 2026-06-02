@@ -27,7 +27,7 @@
 
 use klio_ast::{
     Accessor, Annotation, AnnotationUseSite, AssignOp, BinOp, Block, Catch, Class, ClassParam,
-    CtorDelegation, Decl, EnumEntry, Expr, FunctionBody, Function, FunctionTypeRef, Ident,
+    CtorDelegation, Decl, EnumEntry, Expr, Function, FunctionBody, FunctionTypeRef, Ident,
     ImportDecl, KotlinFile, ObjectDecl, PackageHeader, Param, PostfixOp, Property, SecondaryCtor,
     Stmt, StringPart, TypeAlias, TypeArg, TypeParam, TypeRef, UnOp, Variance, Visibility,
     WhenBinding, WhenBranch, WhenPattern, WhenPatternKind, WhereBound,
@@ -64,6 +64,9 @@ pub struct Parser<'src, 'tok> {
 
 mod parse;
 
+// Modifier flags map one-to-one to Kotlin declaration modifiers and are
+// constructed/destructured field-by-field across several parse modules.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default, Clone, Copy)]
 struct ClassModifiers {
     is_data: bool,
@@ -80,6 +83,9 @@ struct ClassModifiers {
     is_actual: bool,
 }
 
+// Modifier flags map one-to-one to Kotlin declaration modifiers and are
+// constructed/destructured field-by-field across several parse modules.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default, Clone)]
 struct ModifierFlags {
     is_data: bool,
@@ -121,13 +127,41 @@ struct ModifierFlags {
 fn is_valid_infix_name(name: &str) -> bool {
     !matches!(
         name,
-        "private" | "public" | "protected" | "internal"
-            | "open" | "abstract" | "final" | "override" | "sealed"
-            | "inner" | "lateinit" | "operator" | "infix" | "inline"
-            | "tailrec" | "external" | "suspend" | "annotation" | "const"
-            | "companion" | "data" | "enum" | "by" | "where" | "get" | "set"
-            | "field" | "value" | "actual" | "expect" | "vararg" | "crossinline"
-            | "noinline" | "reified" | "out"
+        "private"
+            | "public"
+            | "protected"
+            | "internal"
+            | "open"
+            | "abstract"
+            | "final"
+            | "override"
+            | "sealed"
+            | "inner"
+            | "lateinit"
+            | "operator"
+            | "infix"
+            | "inline"
+            | "tailrec"
+            | "external"
+            | "suspend"
+            | "annotation"
+            | "const"
+            | "companion"
+            | "data"
+            | "enum"
+            | "by"
+            | "where"
+            | "get"
+            | "set"
+            | "field"
+            | "value"
+            | "actual"
+            | "expect"
+            | "vararg"
+            | "crossinline"
+            | "noinline"
+            | "reified"
+            | "out"
     )
 }
 
@@ -149,8 +183,11 @@ mod tests {
         let id = map.add("t.kt", src);
         let owned = map.get(id).source.clone();
         let lexed = Lexer::new(id, &owned).tokenize();
-        assert!(!lexed.diagnostics.has_errors(),
-            "lex diagnostics: {:?}", lexed.diagnostics.diagnostics());
+        assert!(
+            !lexed.diagnostics.has_errors(),
+            "lex diagnostics: {:?}",
+            lexed.diagnostics.diagnostics()
+        );
         Parser::new(id, &owned, &lexed.tokens).parse_file()
     }
 
@@ -164,12 +201,14 @@ mod tests {
 
     #[test]
     fn package_and_imports() {
-        let (file, diags) = parse(
-            "package a.b.c\nimport kotlin.math.PI\nimport kotlin.collections.*\n"
-        );
+        let (file, diags) =
+            parse("package a.b.c\nimport kotlin.math.PI\nimport kotlin.collections.*\n");
         assert!(!diags.has_errors());
         let pkg = file.package.expect("package");
-        assert_eq!(pkg.path.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        assert_eq!(
+            pkg.path.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
         assert_eq!(file.imports.len(), 2);
         assert!(file.imports[1].wildcard);
         assert!(file.imports[1].alias.is_none());
@@ -197,14 +236,22 @@ mod tests {
     #[test]
     fn import_wildcard_with_alias_is_rejected() {
         let (_file, diags) = parse("import kotlin.collections.* as col\n");
-        let codes: Vec<_> = diags.diagnostics().iter().filter_map(klio_diagnostics::Diagnostic::code).collect();
+        let codes: Vec<_> = diags
+            .diagnostics()
+            .iter()
+            .filter_map(klio_diagnostics::Diagnostic::code)
+            .collect();
         assert!(codes.contains(&"P0044"), "expected P0044, got {codes:?}");
     }
 
     #[test]
     fn class_literal_with_type_arguments_is_rejected() {
         let (_file, diags) = parse("fun main() { val k = Box<Int>::class }\n");
-        let codes: Vec<_> = diags.diagnostics().iter().filter_map(klio_diagnostics::Diagnostic::code).collect();
+        let codes: Vec<_> = diags
+            .diagnostics()
+            .iter()
+            .filter_map(klio_diagnostics::Diagnostic::code)
+            .collect();
         assert!(codes.contains(&"T0104"), "expected T0104, got {codes:?}");
     }
 
@@ -212,7 +259,9 @@ mod tests {
     fn expression_body_function() {
         let (file, diags) = parse("fun sq(x: Int): Int = x * x\n");
         assert!(!diags.has_errors());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
         assert!(matches!(f.body, Some(klio_ast::FunctionBody::Expr(_))));
     }
 
@@ -220,30 +269,57 @@ mod tests {
     fn pratt_precedence() {
         // `2 + 3 * 4` must parse as `2 + (3 * 4)`.
         let (file, _) = parse("fun f() { val x = 2 + 3 * 4 }");
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else { panic!() };
-        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else {
+            panic!()
+        };
         let init = p.init.as_ref().unwrap();
-        let klio_ast::Expr::Binary { op: outer, rhs, .. } = init else { panic!() };
+        let klio_ast::Expr::Binary { op: outer, rhs, .. } = init else {
+            panic!()
+        };
         assert_eq!(*outer, klio_ast::BinOp::Add);
-        assert!(matches!(**rhs, klio_ast::Expr::Binary { op: klio_ast::BinOp::Mul, .. }));
+        assert!(matches!(
+            **rhs,
+            klio_ast::Expr::Binary {
+                op: klio_ast::BinOp::Mul,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn assignment_is_a_statement() {
         let (file, diags) = parse("fun f() { var x = 0; x = 5 }");
         assert!(!diags.has_errors());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else { panic!() };
-        assert!(matches!(b.stmts.last().unwrap(), klio_ast::Stmt::Assign { .. }));
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else {
+            panic!()
+        };
+        assert!(matches!(
+            b.stmts.last().unwrap(),
+            klio_ast::Stmt::Assign { .. }
+        ));
     }
 
     #[test]
     fn compound_assignment_recognized() {
         let (file, _) = parse("fun f() { var x = 0; x += 5 }");
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else { panic!() };
-        let klio_ast::Stmt::Assign { op, .. } = b.stmts.last().unwrap() else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Stmt::Assign { op, .. } = b.stmts.last().unwrap() else {
+            panic!()
+        };
         assert_eq!(*op, klio_ast::AssignOp::Add);
     }
 
@@ -251,10 +327,18 @@ mod tests {
     fn string_template_parts() {
         let (file, diags) = parse(r#"fun f() { val s = "x=$x and ${x + 1}" }"#);
         assert!(!diags.has_errors());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else { panic!() };
-        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else { panic!() };
-        let klio_ast::Expr::StringTemplate { parts, .. } = p.init.as_ref().unwrap() else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else {
+            panic!()
+        };
+        let klio_ast::Expr::StringTemplate { parts, .. } = p.init.as_ref().unwrap() else {
+            panic!()
+        };
         assert_eq!(parts.len(), 4);
         assert!(matches!(parts[0], klio_ast::StringPart::Text(_)));
         assert!(matches!(parts[1], klio_ast::StringPart::ShortInterp(_)));
@@ -264,17 +348,20 @@ mod tests {
 
     #[test]
     fn if_else_chain() {
-        let (_file, diags) = parse(r"
+        let (_file, diags) = parse(
+            r"
             fun f(x: Int): Int {
                 return if (x < 0) -1 else if (x == 0) 0 else 1
             }
-        ");
+        ",
+        );
         assert!(!diags.has_errors());
     }
 
     #[test]
     fn while_with_break_and_continue() {
-        let (file, diags) = parse(r"
+        let (file, diags) = parse(
+            r"
             fun f() {
                 var i = 0
                 while (i < 10) {
@@ -283,7 +370,8 @@ mod tests {
                     i = i + 1
                 }
             }
-        ");
+        ",
+        );
         assert!(!diags.has_errors());
         let _ = file;
     }
@@ -292,18 +380,33 @@ mod tests {
     fn for_loop_parses() {
         let (file, diags) = parse("fun f() { for (k in 1..3) { println(k) } }");
         assert!(!diags.has_errors());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else { panic!() };
-        assert!(matches!(b.stmts[0], klio_ast::Stmt::Expr(klio_ast::Expr::For { .. })));
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else {
+            panic!()
+        };
+        assert!(matches!(
+            b.stmts[0],
+            klio_ast::Stmt::Expr(klio_ast::Expr::For { .. })
+        ));
     }
 
     #[test]
     fn member_chain_and_safe_call() {
         let (file, _) = parse("fun f() { val x = a.b?.c }");
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else { panic!() };
-        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else { panic!() };
-        let klio_ast::Expr::Member { safe, .. } = p.init.as_ref().unwrap() else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else {
+            panic!()
+        };
+        let klio_ast::Expr::Member { safe, .. } = p.init.as_ref().unwrap() else {
+            panic!()
+        };
         assert!(*safe);
     }
 
@@ -314,7 +417,9 @@ mod tests {
     }
 
     fn property_type(file: &klio_ast::KotlinFile) -> &klio_ast::TypeRef {
-        let klio_ast::Decl::Property(p) = &file.decls[0] else { panic!("expected property") };
+        let klio_ast::Decl::Property(p) = &file.decls[0] else {
+            panic!("expected property")
+        };
         p.ty.as_ref().expect("property type annotation")
     }
 
@@ -347,7 +452,9 @@ mod tests {
         let (file, diags) =
             parse("fun apply(f: (Int, String) -> Boolean): Boolean = f(1, \"x\")\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(fn_) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(fn_) = &file.decls[0] else {
+            panic!()
+        };
         let p_ty = &fn_.params[0].ty;
         let f = p_ty.function.as_ref().unwrap();
         assert_eq!(f.params.len(), 2);
@@ -395,7 +502,9 @@ mod tests {
     fn suspend_modifier_on_fun_sets_flag() {
         let (file, diags) = parse("suspend fun f() {}\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
         assert!(f.is_suspend);
     }
 
@@ -403,18 +512,22 @@ mod tests {
     fn suspend_modifier_on_non_suspend_fun_absent() {
         let (file, diags) = parse("fun f() {}\n");
         assert!(!diags.has_errors());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
         assert!(!f.is_suspend);
     }
 
     #[test]
     fn suspend_modifier_on_secondary_ctor_rejected() {
-        let (_file, diags) = parse(
-            "class C { suspend constructor() {} }\n",
-        );
+        let (_file, diags) = parse("class C { suspend constructor() {} }\n");
         assert!(
-            diags.diagnostics().iter().any(|d| d.code() == Some("T0114")),
-            "expected T0114: {:?}", diags.diagnostics()
+            diags
+                .diagnostics()
+                .iter()
+                .any(|d| d.code() == Some("T0114")),
+            "expected T0114: {:?}",
+            diags.diagnostics()
         );
     }
 
@@ -424,8 +537,12 @@ mod tests {
         // klio accepts the (inert) modifier rather than erroring.
         let (file, diags) = parse("suspend val x = 1\n");
         assert!(
-            !diags.diagnostics().iter().any(|d| d.code() == Some("T0114")),
-            "unexpected T0114: {:?}", diags.diagnostics()
+            !diags
+                .diagnostics()
+                .iter()
+                .any(|d| d.code() == Some("T0114")),
+            "unexpected T0114: {:?}",
+            diags.diagnostics()
         );
         assert!(matches!(&file.decls[0], klio_ast::Decl::Property(_)));
     }
@@ -473,7 +590,11 @@ mod tests {
         let (file, diags) = parse("@@@@\nfun main() { println(1) }\n");
         assert!(diags.has_errors());
         // We still recovered to parse `main`.
-        assert!(file.decls.iter().any(|d| matches!(d, klio_ast::Decl::Function(f) if f.name.name == "main")));
+        assert!(
+            file.decls
+                .iter()
+                .any(|d| matches!(d, klio_ast::Decl::Function(f) if f.name.name == "main"))
+        );
     }
 
     // ---------- Phase B: visibility / annotations / when-binding / T & Any.
@@ -511,17 +632,19 @@ mod tests {
     fn visibility_defaults_to_public() {
         let (file, diags) = parse("fun a() {}\n");
         assert!(!diags.has_errors());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
         assert_eq!(f.visibility, klio_ast::Visibility::Public);
     }
 
     #[test]
     fn declaration_site_annotations_captured() {
-        let (file, diags) = parse(
-            "@Suppress(\"x\") @JvmStatic fun main() {}\n",
-        );
+        let (file, diags) = parse("@Suppress(\"x\") @JvmStatic fun main() {}\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
         assert_eq!(f.annotations.len(), 2);
         assert_eq!(f.annotations[0].path[0].name, "Suppress");
         assert_eq!(f.annotations[0].args.len(), 1);
@@ -530,39 +653,56 @@ mod tests {
 
     #[test]
     fn annotation_use_site_target() {
-        let (file, diags) = parse(
-            "class C(@field:Foo val x: Int)\n",
-        );
+        let (file, diags) = parse("class C(@field:Foo val x: Int)\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Class(c) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Class(c) = &file.decls[0] else {
+            panic!()
+        };
         let cp = &c.primary_params[0];
         assert_eq!(cp.annotations.len(), 1);
-        assert_eq!(cp.annotations[0].use_site, Some(klio_ast::AnnotationUseSite::Field));
+        assert_eq!(
+            cp.annotations[0].use_site,
+            Some(klio_ast::AnnotationUseSite::Field)
+        );
         assert_eq!(cp.annotations[0].path[0].name, "Foo");
     }
 
     #[test]
     fn annotation_array_form() {
-        let (file, diags) = parse(
-            "@field:[A B] val x: Int = 1\n",
-        );
+        let (file, diags) = parse("@field:[A B] val x: Int = 1\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Property(p) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Property(p) = &file.decls[0] else {
+            panic!()
+        };
         assert_eq!(p.annotations.len(), 2);
-        assert!(p.annotations.iter().all(|a| a.use_site == Some(klio_ast::AnnotationUseSite::Field)));
+        assert!(
+            p.annotations
+                .iter()
+                .all(|a| a.use_site == Some(klio_ast::AnnotationUseSite::Field))
+        );
         assert_eq!(p.annotations[0].path[0].name, "A");
         assert_eq!(p.annotations[1].path[0].name, "B");
     }
 
     #[test]
     fn when_subject_binding_parsed() {
-        let (file, diags) = parse(
-            "fun f(x: Any): Int = when (val v = x) { is Int -> v; else -> 0 }\n",
-        );
+        let (file, diags) =
+            parse("fun f(x: Any): Int = when (val v = x) { is Int -> v; else -> 0 }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Expr(e)) = &f.body else { panic!() };
-        let klio_ast::Expr::When { subject, subject_binding, .. } = e else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Expr(e)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Expr::When {
+            subject,
+            subject_binding,
+            ..
+        } = e
+        else {
+            panic!()
+        };
         assert!(subject.is_some());
         let b = subject_binding.as_ref().expect("binding");
         assert_eq!(b.name.name, "v");
@@ -571,13 +711,22 @@ mod tests {
 
     #[test]
     fn when_without_binding_still_parses() {
-        let (file, diags) = parse(
-            "fun f(x: Int): Int = when (x) { 1 -> 1; else -> 0 }\n",
-        );
+        let (file, diags) = parse("fun f(x: Int): Int = when (x) { 1 -> 1; else -> 0 }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Expr(e)) = &f.body else { panic!() };
-        let klio_ast::Expr::When { subject, subject_binding, .. } = e else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Expr(e)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Expr::When {
+            subject,
+            subject_binding,
+            ..
+        } = e
+        else {
+            panic!()
+        };
         assert!(subject.is_some());
         assert!(subject_binding.is_none());
     }
@@ -586,9 +735,15 @@ mod tests {
     fn as_basic() {
         let (file, diags) = parse("fun f(x: Any): String = x as String\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Expr(e)) = &f.body else { panic!() };
-        let klio_ast::Expr::As { ty, safe, .. } = e else { panic!("got {e:?}") };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Expr(e)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Expr::As { ty, safe, .. } = e else {
+            panic!("got {e:?}")
+        };
         assert!(!*safe);
         assert_eq!(ty.name.name, "String");
     }
@@ -597,9 +752,15 @@ mod tests {
     fn as_safe() {
         let (file, diags) = parse("fun f(x: Any): String? = x as? String\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Expr(e)) = &f.body else { panic!() };
-        let klio_ast::Expr::As { safe, ty, .. } = e else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Expr(e)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Expr::As { safe, ty, .. } = e else {
+            panic!()
+        };
         assert!(*safe);
         assert_eq!(ty.name.name, "String");
     }
@@ -608,11 +769,24 @@ mod tests {
     fn as_chains_left_associative() {
         let (file, diags) = parse("fun f(x: Any): Any = x as A as B\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Expr(e)) = &f.body else { panic!() };
-        let klio_ast::Expr::As { expr: outer_expr, ty: outer_ty, .. } = e else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Expr(e)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Expr::As {
+            expr: outer_expr,
+            ty: outer_ty,
+            ..
+        } = e
+        else {
+            panic!()
+        };
         assert_eq!(outer_ty.name.name, "B");
-        let klio_ast::Expr::As { ty: inner_ty, .. } = outer_expr.as_ref() else { panic!() };
+        let klio_ast::Expr::As { ty: inner_ty, .. } = outer_expr.as_ref() else {
+            panic!()
+        };
         assert_eq!(inner_ty.name.name, "A");
     }
 
@@ -620,63 +794,101 @@ mod tests {
     fn anon_fun_expr_body() {
         let (file, diags) = parse("fun main() { val f = fun(x: Int): Int = x + 1 }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else { panic!() };
-        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else {
+            panic!()
+        };
         let init = p.init.as_ref().unwrap();
-        let klio_ast::Expr::AnonFun { params, return_ty, body, .. } = init else { panic!() };
+        let klio_ast::Expr::AnonFun {
+            params,
+            return_ty,
+            body,
+            ..
+        } = init
+        else {
+            panic!()
+        };
         assert_eq!(params.len(), 1);
         assert_eq!(return_ty.as_ref().unwrap().name.name, "Int");
-        assert!(matches!(body.as_deref(), Some(klio_ast::FunctionBody::Expr(_))));
+        assert!(matches!(
+            body.as_deref(),
+            Some(klio_ast::FunctionBody::Expr(_))
+        ));
     }
 
     #[test]
     fn anon_fun_block_body() {
-        let (file, diags) = parse(
-            "fun main() { val f = fun(x: Int): Int { return x * 2 } }\n",
-        );
+        let (file, diags) = parse("fun main() { val f = fun(x: Int): Int { return x * 2 } }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else { panic!() };
-        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else { panic!() };
-        let klio_ast::Expr::AnonFun { body, .. } = p.init.as_ref().unwrap() else { panic!() };
-        assert!(matches!(body.as_deref(), Some(klio_ast::FunctionBody::Block(_))));
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else {
+            panic!()
+        };
+        let klio_ast::Expr::AnonFun { body, .. } = p.init.as_ref().unwrap() else {
+            panic!()
+        };
+        assert!(matches!(
+            body.as_deref(),
+            Some(klio_ast::FunctionBody::Block(_))
+        ));
     }
 
     #[test]
     fn anon_fun_optional_param_types() {
-        let (file, diags) = parse(
-            "fun main() { val f = fun(x: Int, y: Int) = x + y }\n",
-        );
+        let (file, diags) = parse("fun main() { val f = fun(x: Int, y: Int) = x + y }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else { panic!() };
-        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else { panic!() };
-        let klio_ast::Expr::AnonFun { params, .. } = p.init.as_ref().unwrap() else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else {
+            panic!()
+        };
+        let klio_ast::Expr::AnonFun { params, .. } = p.init.as_ref().unwrap() else {
+            panic!()
+        };
         assert_eq!(params.len(), 2);
     }
 
     #[test]
     fn anon_fun_with_receiver() {
-        let (file, diags) = parse(
-            "fun main() { val f = fun Int.(): Int = this + 1 }\n",
-        );
+        let (file, diags) = parse("fun main() { val f = fun Int.(): Int = this + 1 }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else { panic!() };
-        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else { panic!() };
-        let klio_ast::Expr::AnonFun { receiver_ty, .. } = p.init.as_ref().unwrap() else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &f.body else {
+            panic!()
+        };
+        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &b.stmts[0] else {
+            panic!()
+        };
+        let klio_ast::Expr::AnonFun { receiver_ty, .. } = p.init.as_ref().unwrap() else {
+            panic!()
+        };
         assert!(receiver_ty.is_some());
         assert_eq!(receiver_ty.as_ref().unwrap().name.name, "Int");
     }
 
     #[test]
     fn definitely_non_nullable_type_parsed() {
-        let (file, diags) = parse(
-            "fun <T> id(x: T & Any): T & Any = x\n",
-        );
+        let (file, diags) = parse("fun <T> id(x: T & Any): T & Any = x\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
         assert!(f.params[0].ty.definitely_non_null);
         assert!(f.return_type.as_ref().unwrap().definitely_non_null);
     }
@@ -694,16 +906,32 @@ mod tests {
             "infix fun Int.plus2(o: Int): Int = this + o\nfun main() { val r = 1 plus2 2 }\n",
         );
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f0) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(f0) = &file.decls[0] else {
+            panic!()
+        };
         assert!(f0.is_infix);
-        let klio_ast::Decl::Function(main) = &file.decls[1] else { panic!() };
+        let klio_ast::Decl::Function(main) = &file.decls[1] else {
+            panic!()
+        };
         let stmts = body_stmts(main);
-        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &stmts[0] else { panic!() };
+        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &stmts[0] else {
+            panic!()
+        };
         let init = p.init.as_ref().unwrap();
-        let Expr::Call { callee, args, is_infix, .. } = init else { panic!("{init:?}") };
+        let Expr::Call {
+            callee,
+            args,
+            is_infix,
+            ..
+        } = init
+        else {
+            panic!("{init:?}")
+        };
         assert!(*is_infix);
         assert_eq!(args.len(), 2);
-        let Expr::Path { segments, .. } = callee.as_ref() else { panic!() };
+        let Expr::Path { segments, .. } = callee.as_ref() else {
+            panic!()
+        };
         assert_eq!(segments[0].name, "plus2");
     }
 
@@ -712,26 +940,37 @@ mod tests {
         // `a\nfoo b` MUST NOT parse as infix: the newline ends the
         // statement before the candidate ident.
         let (file, _) = parse("fun main() { val a = 1\nfoo(2) }\n");
-        let klio_ast::Decl::Function(main) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(main) = &file.decls[0] else {
+            panic!()
+        };
         let stmts = body_stmts(main);
         assert_eq!(stmts.len(), 2);
-        let klio_ast::Stmt::Decl(_) = &stmts[0] else { panic!() };
-        let klio_ast::Stmt::Expr(Expr::Call { is_infix, .. }) = &stmts[1] else { panic!() };
+        let klio_ast::Stmt::Decl(_) = &stmts[0] else {
+            panic!()
+        };
+        let klio_ast::Stmt::Expr(Expr::Call { is_infix, .. }) = &stmts[1] else {
+            panic!()
+        };
         assert!(!*is_infix);
     }
 
     #[test]
     fn infix_call_chain_left_assoc() {
-        let (file, diags) = parse(
-            "infix fun Int.f(o: Int): Int = this\nfun main() { val r = 1 f 2 f 3 }\n",
-        );
+        let (file, diags) =
+            parse("infix fun Int.f(o: Int): Int = this\nfun main() { val r = 1 f 2 f 3 }\n");
         assert!(!diags.has_errors());
-        let klio_ast::Decl::Function(main) = &file.decls[1] else { panic!() };
+        let klio_ast::Decl::Function(main) = &file.decls[1] else {
+            panic!()
+        };
         let stmts = body_stmts(main);
-        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &stmts[0] else { panic!() };
+        let klio_ast::Stmt::Decl(klio_ast::Decl::Property(p)) = &stmts[0] else {
+            panic!()
+        };
         let init = p.init.as_ref().unwrap();
         // Expect ((1 f 2) f 3).
-        let Expr::Call { args, .. } = init else { panic!() };
+        let Expr::Call { args, .. } = init else {
+            panic!()
+        };
         assert!(matches!(&args[0], Expr::Call { .. }));
     }
 
@@ -739,9 +978,13 @@ mod tests {
     fn return_with_label() {
         let (file, diags) = parse("fun main() { foo@ run { return@foo 1 } }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(main) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(main) = &file.decls[0] else {
+            panic!()
+        };
         let stmts = body_stmts(main);
-        let klio_ast::Stmt::Expr(Expr::Labeled { label, .. }) = &stmts[0] else { panic!() };
+        let klio_ast::Stmt::Expr(Expr::Labeled { label, .. }) = &stmts[0] else {
+            panic!()
+        };
         assert_eq!(label.name, "foo");
     }
 
@@ -749,9 +992,13 @@ mod tests {
     fn break_with_label() {
         let (file, diags) = parse("fun main() { outer@ for (i in 1..3) { break@outer } }\n");
         assert!(!diags.has_errors());
-        let klio_ast::Decl::Function(main) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(main) = &file.decls[0] else {
+            panic!()
+        };
         let stmts = body_stmts(main);
-        let klio_ast::Stmt::Expr(Expr::Labeled { label, .. }) = &stmts[0] else { panic!() };
+        let klio_ast::Stmt::Expr(Expr::Labeled { label, .. }) = &stmts[0] else {
+            panic!()
+        };
         assert_eq!(label.name, "outer");
     }
 
@@ -763,26 +1010,30 @@ mod tests {
 
     #[test]
     fn labeled_loop() {
-        let (file, diags) = parse(
-            "fun main() { L@ while (true) { break@L } }\n",
-        );
+        let (file, diags) = parse("fun main() { L@ while (true) { break@L } }\n");
         assert!(!diags.has_errors());
-        let klio_ast::Decl::Function(main) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(main) = &file.decls[0] else {
+            panic!()
+        };
         let stmts = body_stmts(main);
-        let klio_ast::Stmt::Expr(Expr::Labeled { label, expr, .. }) = &stmts[0] else { panic!() };
+        let klio_ast::Stmt::Expr(Expr::Labeled { label, expr, .. }) = &stmts[0] else {
+            panic!()
+        };
         assert_eq!(label.name, "L");
         assert!(matches!(expr.as_ref(), Expr::While { .. }));
     }
 
     #[test]
     fn labeled_lambda_via_run() {
-        let (file, diags) = parse(
-            "fun main() { foo@ run { return@foo } }\n",
-        );
+        let (file, diags) = parse("fun main() { foo@ run { return@foo } }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(main) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(main) = &file.decls[0] else {
+            panic!()
+        };
         let stmts = body_stmts(main);
-        let klio_ast::Stmt::Expr(Expr::Labeled { label, expr, .. }) = &stmts[0] else { panic!() };
+        let klio_ast::Stmt::Expr(Expr::Labeled { label, expr, .. }) = &stmts[0] else {
+            panic!()
+        };
         assert_eq!(label.name, "foo");
         // The inner expression is `run { ... }` — a Call.
         assert!(matches!(expr.as_ref(), Expr::Call { .. }));
@@ -792,7 +1043,9 @@ mod tests {
     fn const_val_flag_captured() {
         let (file, diags) = parse("const val PI: Double = 3.14\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Property(p) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Property(p) = &file.decls[0] else {
+            panic!()
+        };
         assert!(p.is_const);
         assert!(!p.mutable);
     }
@@ -801,7 +1054,9 @@ mod tests {
     fn value_class_flag_captured() {
         let (file, diags) = parse("value class Boxed(val n: Int)\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Class(c) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Class(c) = &file.decls[0] else {
+            panic!()
+        };
         assert!(c.is_value);
         assert!(!c.is_annotation);
     }
@@ -809,17 +1064,28 @@ mod tests {
     #[test]
     fn inline_class_promotes_to_value_with_warning() {
         let (file, diags) = parse("inline class Boxed(val n: Int)\n");
-        let klio_ast::Decl::Class(c) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Class(c) = &file.decls[0] else {
+            panic!()
+        };
         assert!(c.is_value);
-        let codes: Vec<_> = diags.diagnostics().iter().filter_map(klio_diagnostics::Diagnostic::code).collect();
-        assert!(codes.contains(&"W0001"), "expected deprecation warning: {codes:?}");
+        let codes: Vec<_> = diags
+            .diagnostics()
+            .iter()
+            .filter_map(klio_diagnostics::Diagnostic::code)
+            .collect();
+        assert!(
+            codes.contains(&"W0001"),
+            "expected deprecation warning: {codes:?}"
+        );
     }
 
     #[test]
     fn annotation_class_flag_captured() {
         let (file, diags) = parse("annotation class Marker(val name: String)\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Class(c) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Class(c) = &file.decls[0] else {
+            panic!()
+        };
         assert!(c.is_annotation);
         assert_eq!(c.primary_params.len(), 1);
         assert_eq!(c.primary_params[0].name.name, "name");
@@ -827,11 +1093,12 @@ mod tests {
 
     #[test]
     fn tailrec_flag_captured() {
-        let (file, diags) = parse(
-            "tailrec fun loop(n: Int): Int = if (n == 0) 0 else loop(n - 1)\n",
-        );
+        let (file, diags) =
+            parse("tailrec fun loop(n: Int): Int = if (n == 0) 0 else loop(n - 1)\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(f) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Function(f) = &file.decls[0] else {
+            panic!()
+        };
         assert!(f.is_tailrec);
     }
 
@@ -839,7 +1106,9 @@ mod tests {
     fn typealias_top_level() {
         let (file, diags) = parse("typealias IntList = List<Int>\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::TypeAlias(a) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::TypeAlias(a) = &file.decls[0] else {
+            panic!()
+        };
         assert_eq!(a.name.name, "IntList");
         assert_eq!(a.target.name.name, "List");
         assert_eq!(a.target.type_args.len(), 1);
@@ -851,7 +1120,9 @@ mod tests {
     fn typealias_with_type_params() {
         let (file, diags) = parse("typealias Pair2<A> = Pair<A, A>\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::TypeAlias(a) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::TypeAlias(a) = &file.decls[0] else {
+            panic!()
+        };
         assert_eq!(a.name.name, "Pair2");
         assert_eq!(a.type_params.len(), 1);
         assert_eq!(a.type_params[0].name.name, "A");
@@ -863,7 +1134,9 @@ mod tests {
     fn typealias_function_type() {
         let (file, diags) = parse("typealias Pred<T> = (T) -> Boolean\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::TypeAlias(a) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::TypeAlias(a) = &file.decls[0] else {
+            panic!()
+        };
         assert_eq!(a.name.name, "Pred");
         assert!(a.target.function.is_some());
         let func = a.target.function.as_ref().unwrap();
@@ -876,7 +1149,9 @@ mod tests {
     fn extension_property_val_parses() {
         let (file, diags) = parse("val Int.cubed: Int get() = this * this * this\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Property(p) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Property(p) = &file.decls[0] else {
+            panic!()
+        };
         assert_eq!(p.name.name, "cubed");
         assert!(!p.mutable);
         let recv = p.receiver_type.as_ref().expect("receiver");
@@ -888,11 +1163,11 @@ mod tests {
 
     #[test]
     fn extension_property_var_parses() {
-        let (file, diags) = parse(
-            "var Holder.doubled: Int\n    get() = 0\n    set(value) { }\n",
-        );
+        let (file, diags) = parse("var Holder.doubled: Int\n    get() = 0\n    set(value) { }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Property(p) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Property(p) = &file.decls[0] else {
+            panic!()
+        };
         assert!(p.mutable);
         assert_eq!(p.receiver_type.as_ref().unwrap().name.name, "Holder");
         assert!(p.getter.is_some());
@@ -901,11 +1176,11 @@ mod tests {
 
     #[test]
     fn extension_property_on_user_class() {
-        let (file, diags) = parse(
-            "class Box(val n: Int)\nval Box.doubled: Int get() = n * 2\n",
-        );
+        let (file, diags) = parse("class Box(val n: Int)\nval Box.doubled: Int get() = n * 2\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Property(p) = &file.decls[1] else { panic!() };
+        let klio_ast::Decl::Property(p) = &file.decls[1] else {
+            panic!()
+        };
         assert_eq!(p.receiver_type.as_ref().unwrap().name.name, "Box");
         assert!(p.getter.is_some());
     }
@@ -913,37 +1188,41 @@ mod tests {
     #[test]
     fn typealias_in_class_body_parses() {
         // Parser accepts the form; typeck emits T0039 elsewhere.
-        let (file, diags) = parse(
-            "class Outer { typealias Inner = Int }\n",
-        );
+        let (file, diags) = parse("class Outer { typealias Inner = Int }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Class(c) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Class(c) = &file.decls[0] else {
+            panic!()
+        };
         assert_eq!(c.members.len(), 1);
         assert!(matches!(&c.members[0], klio_ast::Decl::TypeAlias(_)));
     }
 
     #[test]
     fn delegation_supertype_parsed() {
-        let (file, diags) = parse(
-            "interface I { fun f(): Int }\nclass C(d: I) : I by d\n",
-        );
+        let (file, diags) = parse("interface I { fun f(): Int }\nclass C(d: I) : I by d\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Class(c) = &file.decls[1] else { panic!() };
+        let klio_ast::Decl::Class(c) = &file.decls[1] else {
+            panic!()
+        };
         assert_eq!(c.supertypes.len(), 1);
         assert_eq!(c.supertype_delegates.len(), 1);
         assert!(c.supertype_args[0].is_none());
-        assert!(matches!(&c.supertype_delegates[0], Some(klio_ast::Expr::Path { .. })));
+        assert!(matches!(
+            &c.supertype_delegates[0],
+            Some(klio_ast::Expr::Path { .. })
+        ));
     }
 
     #[test]
     fn delegation_with_class_body_not_consumed_as_lambda() {
         // The class body's `{ … }` must not be swallowed as a trailing
         // lambda of the delegate expression.
-        let (file, diags) = parse(
-            "interface I { fun f(): Int }\nclass C(d: I) : I by d { fun extra() = 1 }\n",
-        );
+        let (file, diags) =
+            parse("interface I { fun f(): Int }\nclass C(d: I) : I by d { fun extra() = 1 }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Class(c) = &file.decls[1] else { panic!() };
+        let klio_ast::Decl::Class(c) = &file.decls[1] else {
+            panic!()
+        };
         assert_eq!(c.members.len(), 1);
         assert!(matches!(&c.members[0], klio_ast::Decl::Function(f) if f.name.name == "extra"));
     }
@@ -952,7 +1231,9 @@ mod tests {
     fn data_object_parsed() {
         let (file, diags) = parse("data object Foo { val n: Int = 0 }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Object(o) = &file.decls[0] else { panic!() };
+        let klio_ast::Decl::Object(o) = &file.decls[0] else {
+            panic!()
+        };
         assert!(o.is_data);
         assert_eq!(o.name.name, "Foo");
     }
@@ -965,12 +1246,15 @@ mod tests {
 
     #[test]
     fn spread_arg_parsed() {
-        let (file, diags) = parse(
-            "fun show(vararg ns: Int) {}\nfun main() { val a = intArrayOf(1); show(*a) }\n",
-        );
+        let (file, diags) =
+            parse("fun show(vararg ns: Int) {}\nfun main() { val a = intArrayOf(1); show(*a) }\n");
         assert!(!diags.has_errors(), "{:?}", diags.diagnostics());
-        let klio_ast::Decl::Function(main) = &file.decls[1] else { panic!() };
-        let Some(klio_ast::FunctionBody::Block(b)) = &main.body else { panic!() };
+        let klio_ast::Decl::Function(main) = &file.decls[1] else {
+            panic!()
+        };
+        let Some(klio_ast::FunctionBody::Block(b)) = &main.body else {
+            panic!()
+        };
         // The second statement is the call show(*a).
         let klio_ast::Stmt::Expr(klio_ast::Expr::Call { args, .. }) = &b.stmts[1] else {
             panic!("expected call");

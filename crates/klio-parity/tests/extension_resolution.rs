@@ -151,8 +151,7 @@ fun main() {
     println(r)
 }
 "#;
-    assert_klio("with_member_ext_virtual", src,
-        "woof:1,woof:2,woof:3\n");
+    assert_klio("with_member_ext_virtual", src, "woof:1,woof:2,woof:3\n");
 }
 
 #[test]
@@ -211,8 +210,11 @@ fun main() {
     println(b.result())
 }
 "#;
-    assert_klio("inline_dsl_nested", src,
-        "<root>A<inner>BC</inner>D</root>\n");
+    assert_klio(
+        "inline_dsl_nested",
+        src,
+        "<root>A<inner>BC</inner>D</root>\n",
+    );
 }
 
 #[test]
@@ -240,8 +242,7 @@ fun outer(): String {
 }
 fun main() { println(outer()) }
 "#;
-    assert_klio("inline_nonlocal_return", src,
-        ">a\n>b\na1;b1;i=1;early\n");
+    assert_klio("inline_nonlocal_return", src, ">a\n>b\na1;b1;i=1;early\n");
 }
 
 #[test]
@@ -264,7 +265,7 @@ fun main() {
 }
 
 #[test]
-fn flatMapTo_inline_extension_against_user_list() {
+fn flat_map_to_inline_extension_against_user_list() {
     let src = r#"
 inline fun <T, R> List<T>.flatMapTo(out: MutableList<R>, transform: (T) -> List<R>): MutableList<R> {
     for (x in this) out.addAll(transform(x))
@@ -295,4 +296,3 @@ fun main() {
 "#;
     assert_klio("member_ext_unary_primitive", src, "1,2,3\n");
 }
-

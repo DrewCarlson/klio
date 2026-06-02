@@ -92,10 +92,8 @@ fn expected_from_litmus(file: &Path) -> String {
         if let Some(rest) = t.strip_prefix("//>") {
             out.push_str(rest.strip_prefix(' ').unwrap_or(rest));
             out.push('\n');
-        } else if t.starts_with("//") {
-            continue;
-        } else if out.is_empty() {
-            continue;
+        } else if t.starts_with("//") || out.is_empty() {
+            // Skip leading comments and blank lead-in.
         } else {
             break;
         }

@@ -1,8 +1,10 @@
-use super::{CallCtx, Value, RuntimeError, ObjRef, Arc};
+use super::{Arc, CallCtx, ObjRef, RuntimeError, Value};
 
 pub(crate) fn builders_build_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.is_empty() || ctx.args.len() > 2 {
-        return Err(RuntimeError::Arity("buildList expects (block) or (capacity, block)".into()));
+        return Err(RuntimeError::Arity(
+            "buildList expects (block) or (capacity, block)".into(),
+        ));
     }
     let block = ctx.args[ctx.args.len() - 1].clone();
     let buildable = Value::List {
@@ -15,13 +17,22 @@ pub(crate) fn builders_build_list(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
         let CallCtx { out, host, .. } = ctx;
         host.invoke_callable_with_this(&block, &[], &buildable, *out)?;
     }
-    let Value::List { items, .. } = buildable else { unreachable!() };
-    Ok(Value::List { items, mutable: false, enum_class: None, backing: None })
+    let Value::List { items, .. } = buildable else {
+        unreachable!()
+    };
+    Ok(Value::List {
+        items,
+        mutable: false,
+        enum_class: None,
+        backing: None,
+    })
 }
 
 pub(crate) fn builders_build_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.is_empty() || ctx.args.len() > 2 {
-        return Err(RuntimeError::Arity("buildSet expects (block) or (capacity, block)".into()));
+        return Err(RuntimeError::Arity(
+            "buildSet expects (block) or (capacity, block)".into(),
+        ));
     }
     let block = ctx.args[ctx.args.len() - 1].clone();
     let buildable = Value::List {
@@ -34,19 +45,27 @@ pub(crate) fn builders_build_set(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
         let CallCtx { out, host, .. } = ctx;
         host.invoke_callable_with_this(&block, &[], &buildable, *out)?;
     }
-    let Value::List { items, .. } = buildable else { unreachable!() };
+    let Value::List { items, .. } = buildable else {
+        unreachable!()
+    };
     let mut deduped: Vec<Value> = Vec::new();
     for v in items.borrow().iter() {
         if !deduped.iter().any(|x| Value::structural_eq_boxed(x, v)) {
             deduped.push(v.clone());
         }
     }
-    Ok(Value::Set { items: ObjRef::new(deduped), mutable: false, backing: None })
+    Ok(Value::Set {
+        items: ObjRef::new(deduped),
+        mutable: false,
+        backing: None,
+    })
 }
 
 pub(crate) fn builders_build_map(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.is_empty() || ctx.args.len() > 2 {
-        return Err(RuntimeError::Arity("buildMap expects (block) or (capacity, block)".into()));
+        return Err(RuntimeError::Arity(
+            "buildMap expects (block) or (capacity, block)".into(),
+        ));
     }
     let block = ctx.args[ctx.args.len() - 1].clone();
     let buildable = Value::Map {
@@ -57,8 +76,13 @@ pub(crate) fn builders_build_map(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
         let CallCtx { out, host, .. } = ctx;
         host.invoke_callable_with_this(&block, &[], &buildable, *out)?;
     }
-    let Value::Map { entries, .. } = buildable else { unreachable!() };
-    Ok(Value::Map { entries, mutable: false })
+    let Value::Map { entries, .. } = buildable else {
+        unreachable!()
+    };
+    Ok(Value::Map {
+        entries,
+        mutable: false,
+    })
 }
 
 pub(crate) fn builders_build_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -71,7 +95,9 @@ pub(crate) fn builders_build_string(ctx: &mut CallCtx) -> Result<Value, RuntimeE
         let CallCtx { out, host, .. } = ctx;
         host.invoke_callable_with_this(&block, &[], &sb, *out)?;
     }
-    let Value::StringBuilder(s) = sb else { unreachable!() };
+    let Value::StringBuilder(s) = sb else {
+        unreachable!()
+    };
     Ok(Value::String(Arc::new(s.borrow().clone())))
 }
 
@@ -100,4 +126,3 @@ pub(crate) fn contract_todo(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         cause: None,
     }))
 }
-

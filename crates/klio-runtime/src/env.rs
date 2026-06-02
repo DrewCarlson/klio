@@ -1,4 +1,4 @@
-use crate::{ObjRef, Value, RuntimeError, IntrinsicHost, Scheduler, ToI64, Output, publish_value, publish_env};
+use crate::{ObjRef, RuntimeError, Value, publish_env, publish_value};
 
 use std::collections::HashMap;
 
@@ -16,7 +16,10 @@ impl Env {
 
     #[must_use]
     pub fn with_parent(parent: ObjRef<Env>) -> Self {
-        Self { parent: Some(parent), vars: HashMap::new() }
+        Self {
+            parent: Some(parent),
+            vars: HashMap::new(),
+        }
     }
 
     pub fn define(&mut self, name: impl Into<String>, value: Value) {
@@ -58,11 +61,7 @@ impl Env {
     /// `stop_at` and a non-prelude binding (locals, file-scope, …) is
     /// returned; a None means only the prelude could have answered it.
     #[must_use]
-    pub fn lookup_excluding(
-        &self,
-        name: &str,
-        stop_at: &ObjRef<Env>,
-    ) -> Option<Value> {
+    pub fn lookup_excluding(&self, name: &str, stop_at: &ObjRef<Env>) -> Option<Value> {
         if let Some(v) = self.vars.get(name) {
             return Some(v.clone());
         }
@@ -145,9 +144,9 @@ impl Value {
     pub fn lock_identity(&self) -> Option<usize> {
         match self {
             Value::Instance(i) => Some(i.identity()),
-            Value::List { items, .. }
-            | Value::Array { items, .. }
-            | Value::Set { items, .. } => Some(items.identity()),
+            Value::List { items, .. } | Value::Array { items, .. } | Value::Set { items, .. } => {
+                Some(items.identity())
+            }
             Value::Map { entries, .. } => Some(entries.identity()),
             Value::Cell(c) => Some(c.identity()),
             Value::StringBuilder(s) => Some(s.identity()),

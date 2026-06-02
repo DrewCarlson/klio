@@ -37,10 +37,10 @@ thread_local! {
 }
 
 /// Install the suspend-inline-fn AST table for the current build.
-pub fn set_inline_fn_asts(
-    m: std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>>,
+pub fn set_inline_fn_asts<S: ::std::hash::BuildHasher>(
+    m: std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>, S>,
 ) {
-    INLINE_FN_ASTS.with(|c| *c.borrow_mut() = m);
+    INLINE_FN_ASTS.with(|c| *c.borrow_mut() = m.into_iter().collect());
 }
 
 /// Install the set of simple names owned by default-imported host
@@ -48,8 +48,10 @@ pub fn set_inline_fn_asts(
 /// site dispatches through the binding (matches Kotlin's default-import
 /// precedence over a same-simple-name declaration in a non-default
 /// package, e.g. `kotlinx.coroutines.internal.synchronized`).
-pub fn set_shadowed_inline_names(names: std::collections::HashSet<String>) {
-    SHADOWED_INLINE_NAMES.with(|c| *c.borrow_mut() = names);
+pub fn set_shadowed_inline_names<S: ::std::hash::BuildHasher>(
+    names: std::collections::HashSet<String, S>,
+) {
+    SHADOWED_INLINE_NAMES.with(|c| *c.borrow_mut() = names.into_iter().collect());
 }
 
 pub(super) fn inline_fn_ast(name: &str) -> Option<std::rc::Rc<klio_ast::Function>> {

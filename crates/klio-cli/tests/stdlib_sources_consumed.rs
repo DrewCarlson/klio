@@ -10,8 +10,8 @@
 //! failures are listed in `ALLOWED_UNPARSEABLE` with a documented
 //! reason; that list must shrink, never grow silently.
 
-use klio_pack::schema::{decode, SourceBundle};
-use klio_pack::{section_names, PackReader};
+use klio_pack::schema::{SourceBundle, decode};
+use klio_pack::{PackReader, section_names};
 use klio_span::FileId;
 
 /// Curated sources klio cannot yet parse, each with the language
@@ -22,8 +22,14 @@ const ALLOWED_UNPARSEABLE: &[(&str, &str)] = &[
     // Kotlin 2.2 context parameters — `context(T) () -> R` receiver
     // function types and `context(ctx: A)` parameter clauses. Brand-new
     // experimental syntax, not part of the consumed stdlib API surface.
-    ("contextParameters/Context.kt", "Kotlin 2.2 context-receiver function types"),
-    ("contextParameters/ContextOf.kt", "Kotlin 2.2 context parameters"),
+    (
+        "contextParameters/Context.kt",
+        "Kotlin 2.2 context-receiver function types",
+    ),
+    (
+        "contextParameters/ContextOf.kt",
+        "Kotlin 2.2 context parameters",
+    ),
 ];
 
 fn allowed(rel_path: &str) -> Option<&'static str> {

@@ -1,4 +1,11 @@
-use super::{Parser, ClassModifiers, Visibility, Annotation, Class, TokenKind, Keyword, Decl, Block, EnumEntry, Ident, ObjectDecl, TypeRef, Expr, SecondaryCtor, CtorDelegation, ClassParam};
+use super::{
+    Annotation, Block, Class, ClassModifiers, ClassParam, CtorDelegation, Decl, EnumEntry, Expr,
+    Ident, Keyword, ObjectDecl, Parser, SecondaryCtor, TokenKind, TypeRef, Visibility,
+};
+
+/// Parsed supertype list: the supertypes, each entry's optional constructor
+/// argument list, and each entry's optional `by`-delegate expression.
+type SupertypeList = (Vec<TypeRef>, Vec<Option<Vec<Expr>>>, Vec<Option<Expr>>);
 
 impl Parser<'_, '_> {
     pub(crate) fn parse_class(
@@ -31,88 +38,8 @@ impl Parser<'_, '_> {
             Vec::new()
         };
         self.skip_nl();
-        // Optional primary-constructor annotations:
-        // `class Foo @Inject @Deprecated(...) internal constructor(...)`.
-        // Kotlin requires the `constructor` keyword when the primary
-        // constructor is annotated/modified, so only consume a leading
-        // `@…` run when it is actually followed by `[visibility]
-        // constructor` — otherwise the `@` belongs to the *next*
-        // top-level declaration (e.g. `annotation class A` then
-        // `@A fun f()`) and must be left untouched. klio treats
-        // primary-ctor annotations as runtime no-ops.
-        if self.peek_kind().is_at() {
-            let ann_save = self.pos;
-            while self.peek_kind().is_at() {
-                if self.parse_annotation_set().is_none() {
-                    break;
-                }
-                self.skip_nl();
-            }
-            // Skip an optional visibility ident, then require
-            // `constructor`.
-            let mut probe = self.pos;
-            let probe_is_vis = matches!(
-                self.tokens.get(probe).map(|t| &t.kind),
-                Some(TokenKind::Ident)
-            ) && {
-                let t = self.text(self.tokens[probe].span);
-                t == "public" || t == "private" || t == "protected" || t == "internal"
-            };
-            if probe_is_vis {
-                probe += 1;
-                while matches!(
-                    self.tokens.get(probe).map(|t| &t.kind),
-                    Some(TokenKind::Newline)
-                ) {
-                    probe += 1;
-                }
-            }
-            let is_primary_ctor = matches!(
-                self.tokens.get(probe).map(|t| &t.kind),
-                Some(TokenKind::Ident)
-            ) && self.text(self.tokens[probe].span) == "constructor";
-            if !is_primary_ctor {
-                self.pos = ann_save; // the `@` annotates the next decl
-            }
-        }
-        // Optional explicit primary constructor:
-        // `class Foo [visibility] [actual|expect]* constructor(...)`.
-        // Scan a run of soft-keyword constructor modifiers (in any
-        // order) that must terminate in `constructor`; commit only
-        // then. `actual`/`expect` are runtime-inert here (klio's
-        // expect/actual is name-keyed), visibility is recorded.
-        let mut primary_ctor_visibility: Option<Visibility> = None;
-        {
-            let saved = self.pos;
-            let mut vis: Option<Visibility> = None;
-            let mut consumed_modifier = false;
-            loop {
-                if !matches!(self.peek_kind(), TokenKind::Ident) {
-                    break;
-                }
-                match self.text(self.current_span()) {
-                    "public" => vis = Some(Visibility::Public),
-                    "private" => vis = Some(Visibility::Private),
-                    "protected" => vis = Some(Visibility::Protected),
-                    "internal" => vis = Some(Visibility::Internal),
-                    "actual" | "expect" => {}
-                    _ => break,
-                }
-                self.bump();
-                self.skip_nl();
-                consumed_modifier = true;
-            }
-            let at_ctor = matches!(self.peek_kind(), TokenKind::Ident)
-                && self.text(self.current_span()) == "constructor";
-            if at_ctor {
-                primary_ctor_visibility = vis;
-                self.bump(); // `constructor`
-                self.skip_nl();
-            } else if consumed_modifier {
-                // The run was not a constructor header — restore.
-                self.pos = saved;
-            }
-        }
+        self.skip_primary_ctor_annotations();
+        let primary_ctor_visibility = self.parse_primary_ctor_header();
         let primary_params = if matches!(self.peek_kind(), TokenKind::LParen) {
             self.bump();
             let params = self.parse_class_param_list();
@@ -124,14 +51,14 @@ impl Parser<'_, '_> {
         let (supertypes, supertype_args, supertype_delegates) =
             self.parse_optional_supertypes_full();
         let where_bounds = self.parse_where_clause();
-        let (members, init_blocks, init_block_positions, enum_entries, secondary_ctors) =
-            if is_enum {
-                let (m, i, p, e) = self.parse_enum_class_body();
-                (m, i, p, e, Vec::new())
-            } else {
-                let (m, i, p, s) = self.parse_class_body();
-                (m, i, p, Vec::new(), s)
-            };
+        let (members, init_blocks, init_block_positions, enum_entries, secondary_ctors) = if is_enum
+        {
+            let (m, i, p, e) = self.parse_enum_class_body();
+            (m, i, p, e, Vec::new())
+        } else {
+            let (m, i, p, s) = self.parse_class_body();
+            (m, i, p, Vec::new(), s)
+        };
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         Some(Class {
             name,
@@ -165,6 +92,93 @@ impl Parser<'_, '_> {
             annotations,
             span: kw.span.join(end),
         })
+    }
+
+    /// Consume an optional primary-constructor annotation run:
+    /// `class Foo @Inject @Deprecated(...) internal constructor(...)`.
+    /// Kotlin requires the `constructor` keyword when the primary
+    /// constructor is annotated/modified, so only consume a leading
+    /// `@…` run when it is actually followed by `[visibility]
+    /// constructor` — otherwise the `@` belongs to the *next*
+    /// top-level declaration (e.g. `annotation class A` then
+    /// `@A fun f()`) and must be left untouched. klio treats
+    /// primary-ctor annotations as runtime no-ops.
+    fn skip_primary_ctor_annotations(&mut self) {
+        if !self.peek_kind().is_at() {
+            return;
+        }
+        let ann_save = self.pos;
+        while self.peek_kind().is_at() {
+            if self.parse_annotation_set().is_none() {
+                break;
+            }
+            self.skip_nl();
+        }
+        // Skip an optional visibility ident, then require `constructor`.
+        let mut probe = self.pos;
+        let probe_is_vis = matches!(
+            self.tokens.get(probe).map(|t| &t.kind),
+            Some(TokenKind::Ident)
+        ) && {
+            let t = self.text(self.tokens[probe].span);
+            t == "public" || t == "private" || t == "protected" || t == "internal"
+        };
+        if probe_is_vis {
+            probe += 1;
+            while matches!(
+                self.tokens.get(probe).map(|t| &t.kind),
+                Some(TokenKind::Newline)
+            ) {
+                probe += 1;
+            }
+        }
+        let is_primary_ctor = matches!(
+            self.tokens.get(probe).map(|t| &t.kind),
+            Some(TokenKind::Ident)
+        ) && self.text(self.tokens[probe].span) == "constructor";
+        if !is_primary_ctor {
+            self.pos = ann_save; // the `@` annotates the next decl
+        }
+    }
+
+    /// Consume an optional explicit primary constructor header:
+    /// `class Foo [visibility] [actual|expect]* constructor(...)`.
+    /// Scan a run of soft-keyword constructor modifiers (in any
+    /// order) that must terminate in `constructor`; commit only
+    /// then. `actual`/`expect` are runtime-inert here (klio's
+    /// expect/actual is name-keyed), visibility is recorded.
+    fn parse_primary_ctor_header(&mut self) -> Option<Visibility> {
+        let saved = self.pos;
+        let mut vis: Option<Visibility> = None;
+        let mut consumed_modifier = false;
+        loop {
+            if !matches!(self.peek_kind(), TokenKind::Ident) {
+                break;
+            }
+            match self.text(self.current_span()) {
+                "public" => vis = Some(Visibility::Public),
+                "private" => vis = Some(Visibility::Private),
+                "protected" => vis = Some(Visibility::Protected),
+                "internal" => vis = Some(Visibility::Internal),
+                "actual" | "expect" => {}
+                _ => break,
+            }
+            self.bump();
+            self.skip_nl();
+            consumed_modifier = true;
+        }
+        let at_ctor = matches!(self.peek_kind(), TokenKind::Ident)
+            && self.text(self.current_span()) == "constructor";
+        if at_ctor {
+            self.bump(); // `constructor`
+            self.skip_nl();
+            return vis;
+        }
+        if consumed_modifier {
+            // The run was not a constructor header — restore.
+            self.pos = saved;
+        }
+        None
     }
 
     /// Parse an enum class body: optional entry list (comma-separated, with
@@ -279,7 +293,10 @@ impl Parser<'_, '_> {
         let name = if matches!(self.peek_kind(), TokenKind::Ident) {
             self.parse_ident("companion name")?
         } else {
-            Ident { name: "Companion".into(), span: kw.span }
+            Ident {
+                name: "Companion".into(),
+                span: kw.span,
+            }
         };
         let (supertypes, supertype_args, supertype_delegates) =
             self.parse_optional_supertypes_full();
@@ -348,9 +365,7 @@ impl Parser<'_, '_> {
         (t, a)
     }
 
-    pub(crate) fn parse_optional_supertypes_full(
-        &mut self,
-    ) -> (Vec<TypeRef>, Vec<Option<Vec<Expr>>>, Vec<Option<Expr>>) {
+    pub(crate) fn parse_optional_supertypes_full(&mut self) -> SupertypeList {
         let mut types = Vec::new();
         let mut args_list: Vec<Option<Vec<Expr>>> = Vec::new();
         let mut delegates: Vec<Option<Expr>> = Vec::new();
@@ -419,7 +434,9 @@ impl Parser<'_, '_> {
         (types, args_list, delegates)
     }
 
-    pub(crate) fn parse_class_body(&mut self) -> (Vec<Decl>, Vec<Block>, Vec<usize>, Vec<SecondaryCtor>) {
+    pub(crate) fn parse_class_body(
+        &mut self,
+    ) -> (Vec<Decl>, Vec<Block>, Vec<usize>, Vec<SecondaryCtor>) {
         let mut members = Vec::new();
         let mut init_blocks = Vec::new();
         let mut init_block_positions: Vec<usize> = Vec::new();
@@ -559,12 +576,28 @@ impl Parser<'_, '_> {
             while matches!(self.peek_kind(), TokenKind::Ident) {
                 let text = self.text(self.current_span());
                 match text {
-                    "public" => { visibility = Visibility::Public; self.bump(); self.skip_nl(); }
-                    "private" => { visibility = Visibility::Private; self.bump(); self.skip_nl(); }
-                    "protected" => { visibility = Visibility::Protected; self.bump(); self.skip_nl(); }
-                    "internal" => { visibility = Visibility::Internal; self.bump(); self.skip_nl(); }
-                    "override" | "final" | "open" | "abstract" | "lateinit"
-                    | "actual" | "expect" => {
+                    "public" => {
+                        visibility = Visibility::Public;
+                        self.bump();
+                        self.skip_nl();
+                    }
+                    "private" => {
+                        visibility = Visibility::Private;
+                        self.bump();
+                        self.skip_nl();
+                    }
+                    "protected" => {
+                        visibility = Visibility::Protected;
+                        self.bump();
+                        self.skip_nl();
+                    }
+                    "internal" => {
+                        visibility = Visibility::Internal;
+                        self.bump();
+                        self.skip_nl();
+                    }
+                    "override" | "final" | "open" | "abstract" | "lateinit" | "actual"
+                    | "expect" => {
                         self.bump();
                         self.skip_nl();
                     }
@@ -601,7 +634,10 @@ impl Parser<'_, '_> {
             let start = name.span;
             self.expect(&TokenKind::Colon, "`:`");
             let ty = self.parse_type().unwrap_or_else(|| TypeRef {
-                name: Ident { name: "Any".into(), span: name.span },
+                name: Ident {
+                    name: "Any".into(),
+                    span: name.span,
+                },
                 nullable: true,
                 span: name.span,
                 type_args: Vec::new(),
@@ -636,5 +672,4 @@ impl Parser<'_, '_> {
         }
         params
     }
-
 }

@@ -18,7 +18,10 @@ use klio_ast::{Decl, Expr, Ident, KotlinFile};
 use klio_runtime::{ClassDef, ClassParamDef, PropertyDef};
 
 mod lift;
-use lift::{synthesize_class_from_object, lift_class_recursive, substitute_field_with_this, rewrite_block_field};
+use lift::{
+    lift_class_recursive, rewrite_block_field, substitute_field_with_this,
+    synthesize_class_from_object,
+};
 
 /// Result of building an IR module from a single Kotlin file.
 pub struct BuiltModule {
@@ -36,26 +39,22 @@ pub struct BuiltModule {
     /// Properties whose init references `this`, captured outer
     /// state, or another instance field land later as the IR grows
     /// to express them.
-    pub body_prop_inits:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    pub body_prop_inits: std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// `(class name, property name) -> FuncId` for body properties
     /// with a custom getter (`val full: String get() = "$first $last"`).
     /// The Vm calls these `FuncIds` (with `this` as the sole arg) when
     /// `Vm::get_field` is invoked for a custom-getter property.
-    pub instance_prop_getters:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    pub instance_prop_getters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// Custom-setter `FuncIds`, keyed the same as getters. The Vm
     /// invokes the setter (`set(value) { … }`) when `set_field`
     /// targets a property whose class declares one.
-    pub instance_prop_setters:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    pub instance_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// Parent-ctor argument thunks per class. Each entry is the
     /// list of `FuncIds` — one per parent ctor arg — that take the
     /// class's own primary-ctor params and return the value passed
     /// to the parent. `class Dog(name: String) : Animal(name)` ends
     /// up with `{ "Dog" => [thunk(name -> name)] }`.
-    pub parent_ctor_args:
-        std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
+    pub parent_ctor_args: std::collections::HashMap<String, Vec<klio_ir::FuncId>>,
     /// `init { ... }` blocks per class. Each `FuncId` takes `this`
     /// as its sole param and runs the block's statements in order.
     /// `new_instance` invokes them after primary-ctor field
@@ -69,14 +68,12 @@ pub struct BuiltModule {
     /// Keyed by `(receiver simple type name, property name)`. The
     /// Vm probes this table from `get_field` when a regular field
     /// lookup fails.
-    pub extension_props:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    pub extension_props: std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// Extension-property setters keyed by `(receiver type, prop)`.
     /// The Vm invokes the `FuncId` with `[receiver, value]` when
     /// `set_field` targets an extension property declared via
     /// `var T.x: ... set(value) { … }`.
-    pub extension_prop_setters:
-        std::collections::HashMap<(String, String), klio_ir::FuncId>,
+    pub extension_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
     /// `FuncId` of the file's `main`, or `None` when the file has no
     /// `main` entry point.
     pub main: Option<klio_ir::FuncId>,
@@ -97,28 +94,24 @@ pub struct BuiltModule {
     /// `class_name -> Vec<SecondaryCtorEntry>`. The Vm walks each
     /// class's list when `new_instance` is called with an arity
     /// that doesn't match the primary constructor's signature.
-    pub secondary_ctors:
-        std::collections::HashMap<String, Vec<SecondaryCtorEntry>>,
+    pub secondary_ctors: std::collections::HashMap<String, Vec<SecondaryCtorEntry>>,
     /// Class delegation entries: `class W(g: Greeter) : Greeter by g`.
     /// Each tuple is `(supertype simple name, thunk FuncId taking
     /// primary-ctor params)`. The Vm evaluates these at construction
     /// time and stores the result under `__delegate__<superName>` on
     /// the instance; missing methods on `W` then forward to the
     /// delegate.
-    pub class_delegates:
-        std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
+    pub class_delegates: std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
     /// Per-function default-arg thunks. Each entry is keyed by the
     /// target function's `FuncId` and holds an
     /// `Option<FuncId>` slot per parameter; `Some(fid)` runs the
     /// default-init thunk when the caller omits the arg.
-    pub func_defaults:
-        std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
+    pub func_defaults: std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     /// Inner class → outer class name. Populated during the
     /// recursive lift so the Vm can resolve `this@Outer.X` and
     /// outer-chain field lookups for nested classes lifted to
     /// top-level decls.
-    pub enclosing_class:
-        std::collections::HashMap<String, String>,
+    pub enclosing_class: std::collections::HashMap<String, String>,
     /// Pre-lowered method bodies for enum entries with per-entry
     /// `override fun …` blocks. Keyed by (synth class name,
     /// method name) where the synth class is `<EnumClass>$<Entry>`.
@@ -131,13 +124,11 @@ pub struct BuiltModule {
     /// `(enum class name, entry name) -> synth class name` for
     /// entries whose body declares method overrides. The Vm reads
     /// this to identify which enum entries have per-entry methods.
-    pub enum_entry_synth_class:
-        std::collections::HashMap<(String, String), String>,
+    pub enum_entry_synth_class: std::collections::HashMap<(String, String), String>,
     /// Per-function type parameter names (in source order). The Vm
     /// uses this to bind reified type-args as synthesized
     /// `Value::Class` globals for the duration of the call.
-    pub func_type_params:
-        std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
+    pub func_type_params: std::collections::HashMap<klio_ir::FuncId, Vec<String>>,
     /// Top-level property names declared as `var/val X by <delegate>`.
     pub top_level_delegated_props: std::collections::HashSet<String>,
     /// Body-property `(class, prop)` pairs declared as `by <delegate>`.
@@ -177,7 +168,7 @@ pub struct SecondaryCtorEntry {
 /// by `klio run a.kt b.kt …` to share class + function visibility
 /// across the sibling files without going through `klio-interp`'s
 /// module registry.
-#[must_use] 
+#[must_use]
 pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
     use klio_span::{FileId, Span};
     let mut combined = KotlinFile {
@@ -218,10 +209,10 @@ pub fn build_module_files(files: &[KotlinFile]) -> BuiltModule {
         for d in &f.decls {
             collect_class_fqns(d, &prefix, &mut fqn_overrides);
             if let Decl::Function(fn_d) = d
-                && !prefix.is_empty() {
-                    func_fqn_overrides
-                        .insert(fn_d.span, format!("{}.{}", prefix, fn_d.name.name));
-                }
+                && !prefix.is_empty()
+            {
+                func_fqn_overrides.insert(fn_d.span, format!("{}.{}", prefix, fn_d.name.name));
+            }
         }
         combined.decls.extend(f.decls.iter().cloned());
         combined.imports.extend(f.imports.iter().cloned());
@@ -253,12 +244,13 @@ fn collect_class_fqns(
         }
     }
     if let Decl::Object(o) = d
-        && !pkg.is_empty() {
-            out.insert(o.span, format!("{}.{}", pkg, o.name.name));
-        }
+        && !pkg.is_empty()
+    {
+        out.insert(o.span, format!("{}.{}", pkg, o.name.name));
+    }
 }
 
-#[must_use] 
+#[must_use]
 pub fn build_module(file: &KotlinFile) -> BuiltModule {
     build_module_with_overrides(
         file,
@@ -334,14 +326,19 @@ fn collect_hierarchy_member_names(
     }
 }
 
+// Int literals narrow to i32 and Double literals narrow to f32, matching
+// Kotlin's Int/Float literal types.
+#[allow(clippy::cast_possible_truncation)]
 fn literal_to_const(e: &klio_ast::Expr) -> Option<klio_ir::Const> {
     use klio_ast::Expr;
     match e {
         Expr::IntLit { value, kind, .. } => match kind {
-            klio_ast::IntLitKind::Int => Some(klio_ir::Const::Int(*value as i32)),
-            klio_ast::IntLitKind::Long => Some(klio_ir::Const::Long(*value)),
-            klio_ast::IntLitKind::UInt => Some(klio_ir::Const::Int(*value as i32)),
-            klio_ast::IntLitKind::ULong => Some(klio_ir::Const::Long(*value)),
+            klio_ast::IntLitKind::Int | klio_ast::IntLitKind::UInt => {
+                Some(klio_ir::Const::Int(*value as i32))
+            }
+            klio_ast::IntLitKind::Long | klio_ast::IntLitKind::ULong => {
+                Some(klio_ir::Const::Long(*value))
+            }
         },
         Expr::FloatLit { value, kind, .. } => match kind {
             klio_ast::FloatLitKind::Double => Some(klio_ir::Const::Double(*value)),
@@ -362,8 +359,11 @@ fn literal_to_const(e: &klio_ast::Expr) -> Option<klio_ir::Const> {
 /// modCount: Int` and similar non-null fields start as `0` instead of
 /// `Null` at instance construction.
 pub(crate) fn primitive_zero_for(p: &klio_ast::Property) -> Option<klio_runtime::Value> {
-    if p.init.is_some() || p.is_abstract || p.is_lateinit
-        || p.getter.is_some() || p.delegate.is_some()
+    if p.init.is_some()
+        || p.is_abstract
+        || p.is_lateinit
+        || p.getter.is_some()
+        || p.delegate.is_some()
     {
         return None;
     }
@@ -384,6 +384,12 @@ pub(crate) fn primitive_zero_for(p: &klio_ast::Property) -> Option<klio_runtime:
     }
 }
 
+// The whole-file lowering pass: one cohesive walk that threads many shared
+// builders and registries through tightly-coupled phases. Splitting it would
+// fragment that shared state and risk changing lowering order.
+// instance_prop_getters / instance_prop_setters mirror the matching
+// ProgramImage field names, so they read alike by design.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 fn build_module_with_overrides(
     file: &KotlinFile,
     fqn_overrides: &std::collections::HashMap<klio_span::Span, String>,
@@ -471,9 +477,13 @@ fn build_module_with_overrides(
             _ => continue,
         };
         if let Some(fqn) = fqn_overrides.get(&span)
-            && let Some((pkg, _)) = fqn.rsplit_once('.') {
-                pack_pkg_types.entry(pkg.to_string()).or_default().insert(simple);
-            }
+            && let Some((pkg, _)) = fqn.rsplit_once('.')
+        {
+            pack_pkg_types
+                .entry(pkg.to_string())
+                .or_default()
+                .insert(simple);
+        }
     }
     // Pending aliases for mangled pack-private objects, applied after
     // all class names are known: (referencing-class-simple-name,
@@ -494,23 +504,27 @@ fn build_module_with_overrides(
                     let mangled = fqn.replace('.', "$");
                     object_names.push(mangled.clone());
                     let mut synth = synthesize_class_from_object(o);
-                    synth.name = klio_ast::Ident { name: mangled.clone(), span: o.name.span };
+                    synth.name = klio_ast::Ident {
+                        name: mangled.clone(),
+                        span: o.name.span,
+                    };
                     all_decls.push(Decl::Class(synth));
                     // Record the alias for every pack class in this
                     // object's package so their bodies keep resolving
                     // the bare object name to the mangled singleton.
                     if let Some((pkg, _)) = fqn.rsplit_once('.')
-                        && let Some(types) = pack_pkg_types.get(pkg) {
-                            for cls in types {
-                                if cls != &o.name.name {
-                                    pending_object_aliases.push((
-                                        cls.clone(),
-                                        o.name.name.clone(),
-                                        mangled.clone(),
-                                    ));
-                                }
+                        && let Some(types) = pack_pkg_types.get(pkg)
+                    {
+                        for cls in types {
+                            if cls != &o.name.name {
+                                pending_object_aliases.push((
+                                    cls.clone(),
+                                    o.name.name.clone(),
+                                    mangled.clone(),
+                                ));
                             }
                         }
+                    }
                     continue;
                 }
                 object_names.push(o.name.name.clone());
@@ -547,9 +561,7 @@ fn build_module_with_overrides(
     // doesn't execute twice and produce duplicate decls.
     if false {
         for d in &file.decls {
-            match d {
-                Decl::Object(_) => {}
-                Decl::Class(c) => {
+            if let Decl::Class(c) = d {
                 for m in &c.members {
                     if let Decl::Object(co) = m {
                         let comp_name = format!("{}$Companion${}", c.name.name, co.name.name);
@@ -628,15 +640,12 @@ fn build_module_with_overrides(
                                     _ => {}
                                 }
                             }
-                            nested_outer_members
-                                .insert(nested.name.name.clone(), extras);
+                            nested_outer_members.insert(nested.name.name.clone(), extras);
                             all_decls.push(Decl::Class(nested.clone()));
                         }
                     }
                 }
                 all_decls.push(d.clone());
-                }
-                _ => {}
             }
         }
     }
@@ -687,10 +696,7 @@ fn build_module_with_overrides(
             // klio-stdlib intrinsic returns the right Value kind and
             // `list + elem`, `map - key`, etc. work uniformly.
             if !f.is_expect
-                && matches!(
-                    f.name.name.as_str(),
-                    "emptyList" | "emptySet" | "emptyMap"
-                )
+                && matches!(f.name.name.as_str(), "emptyList" | "emptySet" | "emptyMap")
                 && f.params.is_empty()
             {
                 return false;
@@ -711,11 +717,7 @@ fn build_module_with_overrides(
             if !f.is_expect
                 && matches!(
                     f.name.name.as_str(),
-                    "generateSequence"
-                        | "sequenceOf"
-                        | "emptySequence"
-                        | "sequence"
-                        | "iterator"
+                    "generateSequence" | "sequenceOf" | "emptySequence" | "sequence" | "iterator"
                 )
             {
                 let fqn = func_fqn_overrides.get(&f.span).map(String::as_str);
@@ -770,16 +772,13 @@ fn build_module_with_overrides(
             // host's actual — drop the expect so resolution at lower
             // / runtime time doesn't bind to a bodyless declaration
             // and stop the intrinsic dispatch path from firing.
-            let fqn = func_fqn_overrides
-                .get(&f.span)
-                .cloned()
-                .unwrap_or_else(|| {
-                    if package_prefix.is_empty() {
-                        f.name.name.clone()
-                    } else {
-                        format!("{}.{}", package_prefix, f.name.name)
-                    }
-                });
+            let fqn = func_fqn_overrides.get(&f.span).cloned().unwrap_or_else(|| {
+                if package_prefix.is_empty() {
+                    f.name.name.clone()
+                } else {
+                    format!("{}.{}", package_prefix, f.name.name)
+                }
+            });
             if klio_stdlib::implementation(&fqn).is_some() {
                 return false;
             }
@@ -815,10 +814,9 @@ fn build_module_with_overrides(
         }
         Decl::Class(c) => !(c.is_expect && actual_class_names_set.contains(&c.name.name)),
         Decl::Object(o) => !(o.is_expect && actual_object_names_set.contains(&o.name.name)),
-        Decl::Property(p) if matches!(
-            p.name.name.as_str(),
-            "coroutineContext" | "isInitialized"
-        ) => {
+        Decl::Property(p)
+            if matches!(p.name.name.as_str(), "coroutineContext" | "isInitialized") =>
+        {
             // Upstream declares these as `inline val` whose getter
             // throws NotImplementedError ("Implementation is intrinsic")
             // — meant for compiler intrinsic substitution. Klio
@@ -846,8 +844,6 @@ fn build_module_with_overrides(
     // companion-singleton init order issues when the enclosing
     // class's primary ctor body reads a companion's `const val`.
     {
-        let mut class_const_inits: std::collections::HashMap<(String, String), klio_ir::Const> =
-            std::collections::HashMap::new();
         fn collect_consts(
             cls_name: &str,
             members: &[Decl],
@@ -857,9 +853,10 @@ fn build_module_with_overrides(
                 match m {
                     Decl::Property(p) if p.is_const => {
                         if let Some(init) = &p.init
-                            && let Some(c) = literal_to_const(init) {
-                                out.insert((cls_name.to_string(), p.name.name.clone()), c);
-                            }
+                            && let Some(c) = literal_to_const(init)
+                        {
+                            out.insert((cls_name.to_string(), p.name.name.clone()), c);
+                        }
                     }
                     Decl::Class(inner) if inner.is_companion => {
                         collect_consts(cls_name, &inner.members, out);
@@ -868,6 +865,8 @@ fn build_module_with_overrides(
                 }
             }
         }
+        let mut class_const_inits: std::collections::HashMap<(String, String), klio_ir::Const> =
+            std::collections::HashMap::new();
         for d in decls {
             if let Decl::Class(c) = d {
                 collect_consts(&c.name.name, &c.members, &mut class_const_inits);
@@ -878,28 +877,27 @@ fn build_module_with_overrides(
     // Per-class transitive member-function-name set, so the lowerer
     // can resolve a call-position `name(args)` to a hierarchy member
     // function even when a same-named value/param shadows it.
-    let hierarchy_methods: std::collections::HashMap<
-        String,
-        std::collections::HashSet<String>,
-    > = file_classes
-        .keys()
-        .map(|cname| {
-            let mut methods = std::collections::HashSet::new();
-            let mut seen = std::collections::HashSet::new();
-            collect_hierarchy_method_names(
-                cname,
-                &file_classes,
-                &mut methods,
-                &mut seen,
-            );
-            (cname.clone(), methods)
-        })
-        .collect();
+    let hierarchy_methods: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        file_classes
+            .keys()
+            .map(|cname| {
+                let mut methods = std::collections::HashSet::new();
+                let mut seen = std::collections::HashSet::new();
+                collect_hierarchy_method_names(cname, &file_classes, &mut methods, &mut seen);
+                (cname.clone(), methods)
+            })
+            .collect();
     // Visible to `FuncBuilder` during the body-lowering passes below
     // (the registry is otherwise only assembled at the end of this
     // function, too late for lowering to consult).
-    module.registry.hierarchy_methods = hierarchy_methods.clone();
-    module.registry.nested_object_aliases = nested_object_aliases.clone();
+    module
+        .registry
+        .hierarchy_methods
+        .clone_from(&hierarchy_methods);
+    module
+        .registry
+        .nested_object_aliases
+        .clone_from(&nested_object_aliases);
     // Make every `inline fun` body (top-level or nested) available to
     // the lowerer by simple name. The lowerer only expands a suspend
     // builder (continuation capture) or an inline call whose lambda
@@ -907,17 +905,13 @@ fn build_module_with_overrides(
     {
         fn collect_inline(
             d: &Decl,
-            out: &mut std::collections::HashMap<
-                String,
-                std::rc::Rc<klio_ast::Function>,
-            >,
+            out: &mut std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>>,
         ) {
             match d {
-                Decl::Function(f)
-                    if f.is_inline && f.body.is_some() => {
-                        out.entry(f.name.name.clone())
-                            .or_insert_with(|| std::rc::Rc::new(f.clone()));
-                    }
+                Decl::Function(f) if f.is_inline && f.body.is_some() => {
+                    out.entry(f.name.name.clone())
+                        .or_insert_with(|| std::rc::Rc::new(f.clone()));
+                }
                 Decl::Class(c) => {
                     for m in &c.members {
                         collect_inline(m, out);
@@ -931,10 +925,8 @@ fn build_module_with_overrides(
                 _ => {}
             }
         }
-        let mut inline_fns: std::collections::HashMap<
-            String,
-            std::rc::Rc<klio_ast::Function>,
-        > = std::collections::HashMap::new();
+        let mut inline_fns: std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>> =
+            std::collections::HashMap::new();
         for d in &all_decls {
             collect_inline(d, &mut inline_fns);
         }
@@ -989,7 +981,8 @@ fn build_module_with_overrides(
         let segs: Vec<String> = imp.path.iter().map(|i| i.name.clone()).collect();
         let leaf = imp
             .alias
-            .as_ref().map_or_else(|| segs.last().unwrap().clone(), |a| a.name.clone());
+            .as_ref()
+            .map_or_else(|| segs.last().unwrap().clone(), |a| a.name.clone());
         module.registry.import_aliases.insert(leaf, segs);
     }
     // Pre-register every class name so `class_id` resolves
@@ -1032,17 +1025,16 @@ fn build_module_with_overrides(
     let mut stub_ids: Vec<klio_ir::FuncId> = Vec::new();
     for d in decls {
         if let Decl::Function(f) = d {
+            // FuncId is u32-indexed; the module's func count fits.
+            #[allow(clippy::cast_possible_truncation)]
             let id = klio_ir::FuncId(module.funcs.len() as u32);
-            let fqn = func_fqn_overrides
-                .get(&f.span)
-                .cloned()
-                .unwrap_or_else(|| {
-                    if package_prefix.is_empty() {
-                        f.name.name.clone()
-                    } else {
-                        format!("{}.{}", package_prefix, f.name.name)
-                    }
-                });
+            let fqn = func_fqn_overrides.get(&f.span).cloned().unwrap_or_else(|| {
+                if package_prefix.is_empty() {
+                    f.name.name.clone()
+                } else {
+                    format!("{}.{}", package_prefix, f.name.name)
+                }
+            });
             // Forward-reference stub. Seed an implicit `this` first
             // param for an extension function so a call lowered
             // before the real body (which prepends the receiver) can
@@ -1105,7 +1097,7 @@ fn build_module_with_overrides(
             // carries the file's package prefix); `lower_function_*`
             // hard-codes a bare-name fqn that would otherwise lose
             // the package on combined builds.
-            placed.fqn = module.funcs[id.0 as usize].fqn.clone();
+            placed.fqn.clone_from(&module.funcs[id.0 as usize].fqn);
             module.funcs[id.0 as usize] = placed;
             if f.name.name == "main" {
                 main_id = Some(id);
@@ -1139,8 +1131,10 @@ fn build_module_with_overrides(
                     .map(|lf| lf.params.iter().map(|p| p.name.clone()).collect())
                     .unwrap_or_default();
                 let offset = lowered_names.len().saturating_sub(f.params.len());
-                let name_refs: Vec<&str> =
-                    lowered_names.iter().map(std::string::String::as_str).collect();
+                let name_refs: Vec<&str> = lowered_names
+                    .iter()
+                    .map(std::string::String::as_str)
+                    .collect();
                 let mut slots: Vec<Option<klio_ir::FuncId>> =
                     Vec::with_capacity(lowered_names.len().max(f.params.len()));
                 for _ in 0..offset {
@@ -1149,10 +1143,7 @@ fn build_module_with_overrides(
                 for (idx, p) in f.params.iter().enumerate() {
                     if let Some(default_expr) = &p.default {
                         let bind_upto = (offset + idx).min(name_refs.len());
-                        let widened = klio_ir::lower::widen_numeric_literal(
-                            default_expr,
-                            &p.ty,
-                        );
+                        let widened = klio_ir::lower::widen_numeric_literal(default_expr, &p.ty);
                         let fid = klio_ir::lower::lower_expr_as_param_thunk(
                             &mut module,
                             &name_refs[..bind_upto],
@@ -1230,8 +1221,7 @@ fn build_module_with_overrides(
                         );
                         body_prop_inits.insert((c.name.name.clone(), p.name.name.clone()), fid);
                     } else if let Some(delegate) = &p.delegate {
-                        delegated_body_props
-                            .insert((c.name.name.clone(), p.name.name.clone()));
+                        delegated_body_props.insert((c.name.name.clone(), p.name.name.clone()));
                         // evaluate the delegate at construction
                         // time and store under the property name;
                         // get_field on the instance unwraps Lazy /
@@ -1250,8 +1240,7 @@ fn build_module_with_overrides(
                     if let Some(getter) = &p.getter {
                         let fid = match &getter.body {
                             klio_ast::FunctionBody::Expr(body) => {
-                                let rewritten =
-                                    substitute_field_with_this(&p.name.name, body);
+                                let rewritten = substitute_field_with_this(&p.name.name, body);
                                 Some(klio_ir::lower::lower_accessor_expr(
                                     &mut module,
                                     &c.name.name,
@@ -1284,31 +1273,23 @@ fn build_module_with_overrides(
                             // packages; the FQN key lets the lookup
                             // bind the getter to the class that
                             // actually declares it.
-                            let cfqn = fqn_overrides
-                                .get(&c.span)
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    if package_prefix.is_empty() {
-                                        c.name.name.clone()
-                                    } else {
-                                        format!(
-                                            "{}.{}",
-                                            package_prefix, c.name.name
-                                        )
-                                    }
-                                });
+                            let cfqn = fqn_overrides.get(&c.span).cloned().unwrap_or_else(|| {
+                                if package_prefix.is_empty() {
+                                    c.name.name.clone()
+                                } else {
+                                    format!("{}.{}", package_prefix, c.name.name)
+                                }
+                            });
                             if cfqn != c.name.name {
-                                instance_prop_getters.insert(
-                                    (cfqn, p.name.name.clone()),
-                                    fid,
-                                );
+                                instance_prop_getters.insert((cfqn, p.name.name.clone()), fid);
                             }
                         }
                     }
                     if let Some(setter) = &p.setter {
                         let setter_param_name = setter
                             .params
-                            .first().map_or_else(|| "value".to_string(), |n| n.name.clone());
+                            .first()
+                            .map_or_else(|| "value".to_string(), |n| n.name.clone());
                         let fid = match &setter.body {
                             klio_ast::FunctionBody::Expr(body) => {
                                 let rewritten = substitute_field_with_this(&p.name.name, body);
@@ -1383,16 +1364,13 @@ fn build_module_with_overrides(
             let is_object = object_names.iter().any(|n| n == &c.name.name);
             let def = std::sync::Arc::new(ClassDef {
                 name: c.name.name.clone(),
-                fqn: fqn_overrides
-                    .get(&c.span)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        if package_prefix.is_empty() {
-                            c.name.name.clone()
-                        } else {
-                            format!("{}.{}", package_prefix, c.name.name)
-                        }
-                    }),
+                fqn: fqn_overrides.get(&c.span).cloned().unwrap_or_else(|| {
+                    if package_prefix.is_empty() {
+                        c.name.name.clone()
+                    } else {
+                        format!("{}.{}", package_prefix, c.name.name)
+                    }
+                }),
                 annotation_names: Vec::new(),
                 primary_params,
                 methods: Vec::new(),
@@ -1428,11 +1406,7 @@ fn build_module_with_overrides(
                     .iter()
                     .map(|sc| std::sync::Arc::new(sc.clone()))
                     .collect(),
-                supertype_names: c
-                    .supertypes
-                    .iter()
-                    .map(|t| t.name.name.clone())
-                    .collect(),
+                supertype_names: c.supertypes.iter().map(|t| t.name.name.clone()).collect(),
                 parent: klio_runtime::ObjRef::new(None),
                 interfaces: klio_runtime::ObjRef::new(Vec::new()),
                 is_interface: c.is_interface,
@@ -1483,15 +1457,20 @@ fn build_module_with_overrides(
                 for (ordinal, entry) in c.enum_entries.iter().enumerate() {
                     let id = next_id;
                     next_id += 1;
-                    let mut fields: Vec<(String, klio_runtime::Value)> = Vec::new();
-                    fields.push((
-                        "name".to_string(),
-                        klio_runtime::Value::String(std::sync::Arc::new(entry.name.name.clone())),
-                    ));
-                    fields.push((
-                        "ordinal".to_string(),
-                        klio_runtime::Value::new_int(ordinal as i64),
-                    ));
+                    // ordinal is an enumerate() index reported as Kotlin's i64 ordinal.
+                    #[allow(clippy::cast_possible_wrap)]
+                    let fields: Vec<(String, klio_runtime::Value)> = vec![
+                        (
+                            "name".to_string(),
+                            klio_runtime::Value::String(std::sync::Arc::new(
+                                entry.name.name.clone(),
+                            )),
+                        ),
+                        (
+                            "ordinal".to_string(),
+                            klio_runtime::Value::new_int(ordinal as i64),
+                        ),
+                    ];
                     let inst = klio_runtime::ObjRef::new(klio_runtime::InstanceData {
                         class: std::sync::Arc::clone(&class_def),
                         fields,
@@ -1504,10 +1483,7 @@ fn build_module_with_overrides(
                     // body and stash so the Vm can dispatch it
                     // when the entry instance receives a call.
                     if !entry.body_members.is_empty() {
-                        let synth_class_name = format!(
-                            "{}${}",
-                            c.name.name, entry.name.name
-                        );
+                        let synth_class_name = format!("{}${}", c.name.name, entry.name.name);
                         enum_entry_synth_class.insert(
                             (c.name.name.clone(), entry.name.name.clone()),
                             synth_class_name.clone(),
@@ -1554,10 +1530,7 @@ fn build_module_with_overrides(
                             let fid = klio_ir::lower::lower_expr_as_thunk(
                                 &mut module,
                                 arg,
-                                &format!(
-                                    "__enum_arg_{}_{}_{idx}",
-                                    c.name.name, entry.name.name
-                                ),
+                                &format!("__enum_arg_{}_{}_{idx}", c.name.name, entry.name.name),
                             );
                             fids.push(fid);
                         }
@@ -1577,8 +1550,7 @@ fn build_module_with_overrides(
     // hierarchy, qualified_this outer walks) follow the source-
     // declared chain. Single inheritance picks the first
     // non-interface supertype; the rest are added as interfaces.
-    let class_table_snapshot: std::collections::HashMap<String, Arc<ClassDef>> =
-        classes.clone();
+    let class_table_snapshot: std::collections::HashMap<String, Arc<ClassDef>> = classes.clone();
     for def in classes.values() {
         for sup_name in &def.supertype_names {
             if let Some(sup_def) = class_table_snapshot.get(sup_name) {
@@ -1598,60 +1570,59 @@ fn build_module_with_overrides(
     let mut parent_ctor_args: std::collections::HashMap<String, Vec<klio_ir::FuncId>> =
         std::collections::HashMap::new();
     for d in decls {
-        if let Decl::Class(c) = d {
-            for parent_args_opt in &c.supertype_args {
-                if let Some(parent_args) = parent_args_opt {
-                    let param_names: Vec<String> = c
-                        .primary_params
-                        .iter()
-                        .map(|p| p.name.name.clone())
-                        .collect();
-                    let param_refs: Vec<&str> =
-                        param_names.iter().map(std::string::String::as_str).collect();
-                    // Companion object (by its own name) and its
-                    // members are in scope for a superclass-ctor
-                    // delegation argument (the companion is
-                    // initialized before the subclass ctor runs).
-                    let mut own: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                    for m in &c.members {
-                        if let Decl::Class(inner) = m
-                            && inner.is_companion {
-                                own.insert(inner.name.name.clone());
-                                for cm in &inner.members {
-                                    match cm {
-                                        Decl::Function(f) => {
-                                            own.insert(f.name.name.clone());
-                                        }
-                                        Decl::Property(p) => {
-                                            own.insert(p.name.name.clone());
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                for p in &inner.primary_params {
-                                    if p.property.is_some() {
-                                        own.insert(p.name.name.clone());
-                                    }
-                                }
+        if let Decl::Class(c) = d
+            && let Some(parent_args) = c.supertype_args.iter().flatten().next()
+        {
+            let param_names: Vec<String> = c
+                .primary_params
+                .iter()
+                .map(|p| p.name.name.clone())
+                .collect();
+            let param_refs: Vec<&str> = param_names
+                .iter()
+                .map(std::string::String::as_str)
+                .collect();
+            // Companion object (by its own name) and its
+            // members are in scope for a superclass-ctor
+            // delegation argument (the companion is
+            // initialized before the subclass ctor runs).
+            let mut own: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for m in &c.members {
+                if let Decl::Class(inner) = m
+                    && inner.is_companion
+                {
+                    own.insert(inner.name.name.clone());
+                    for cm in &inner.members {
+                        match cm {
+                            Decl::Function(f) => {
+                                own.insert(f.name.name.clone());
                             }
+                            Decl::Property(p) => {
+                                own.insert(p.name.name.clone());
+                            }
+                            _ => {}
+                        }
                     }
-                    let mut fids: Vec<klio_ir::FuncId> = Vec::with_capacity(parent_args.len());
-                    for (idx, e) in parent_args.iter().enumerate() {
-                        let fid = klio_ir::lower::lower_expr_as_param_thunk_scoped(
-                            &mut module,
-                            &param_refs,
-                            e,
-                            &format!("__parent_ctor_arg_{}_{idx}", c.name.name),
-                            Some(c.name.name.as_str()),
-                            Some(&own),
-                        );
-                        fids.push(fid);
+                    for p in &inner.primary_params {
+                        if p.property.is_some() {
+                            own.insert(p.name.name.clone());
+                        }
                     }
-                    parent_ctor_args.insert(c.name.name.clone(), fids);
-                    break;
                 }
             }
+            let mut fids: Vec<klio_ir::FuncId> = Vec::with_capacity(parent_args.len());
+            for (idx, e) in parent_args.iter().enumerate() {
+                let fid = klio_ir::lower::lower_expr_as_param_thunk_scoped(
+                    &mut module,
+                    &param_refs,
+                    e,
+                    &format!("__parent_ctor_arg_{}_{idx}", c.name.name),
+                    Some(c.name.name.as_str()),
+                    Some(&own),
+                );
+                fids.push(fid);
+            }
+            parent_ctor_args.insert(c.name.name.clone(), fids);
         }
     }
 
@@ -1738,8 +1709,10 @@ fn build_module_with_overrides(
                 .iter()
                 .map(|p| p.name.name.clone())
                 .collect();
-            let param_refs: Vec<&str> =
-                param_names.iter().map(std::string::String::as_str).collect();
+            let param_refs: Vec<&str> = param_names
+                .iter()
+                .map(std::string::String::as_str)
+                .collect();
             let mut entries: Vec<(String, klio_ir::FuncId)> = Vec::new();
             for (sup_idx, delegate_opt) in c.supertype_delegates.iter().enumerate() {
                 if let Some(delegate_expr) = delegate_opt {
@@ -1793,24 +1766,22 @@ fn build_module_with_overrides(
             for (sc_idx, sc) in c.secondary_ctors.iter().enumerate() {
                 let param_names: Vec<String> =
                     sc.params.iter().map(|p| p.name.name.clone()).collect();
-                let param_refs: Vec<&str> =
-                    param_names.iter().map(std::string::String::as_str).collect();
+                let param_refs: Vec<&str> = param_names
+                    .iter()
+                    .map(std::string::String::as_str)
+                    .collect();
                 let (delegation_args, is_super, is_this) = match &sc.delegation {
                     klio_ast::CtorDelegation::This(args) => (args.clone(), false, true),
                     klio_ast::CtorDelegation::Super(args) => (args.clone(), true, false),
                     klio_ast::CtorDelegation::None => (Vec::new(), false, false),
                 };
-                let mut arg_fids: Vec<klio_ir::FuncId> =
-                    Vec::with_capacity(delegation_args.len());
+                let mut arg_fids: Vec<klio_ir::FuncId> = Vec::with_capacity(delegation_args.len());
                 for (arg_idx, e) in delegation_args.iter().enumerate() {
                     let fid = klio_ir::lower::lower_expr_as_param_thunk(
                         &mut module,
                         &param_refs,
                         e,
-                        &format!(
-                            "__sec_ctor_{}_{sc_idx}_arg{arg_idx}",
-                            c.name.name
-                        ),
+                        &format!("__sec_ctor_{}_{sc_idx}_arg{arg_idx}", c.name.name),
                     );
                     arg_fids.push(fid);
                 }
@@ -1905,10 +1876,8 @@ fn build_module_with_overrides(
     // 1-arg thunk taking the receiver as `this`.
     let mut extension_props: std::collections::HashMap<(String, String), klio_ir::FuncId> =
         std::collections::HashMap::new();
-    let mut extension_prop_setters: std::collections::HashMap<
-        (String, String),
-        klio_ir::FuncId,
-    > = std::collections::HashMap::new();
+    let mut extension_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId> =
+        std::collections::HashMap::new();
     // Gather every extension property (`val T.name …`): top-level
     // declarations *and* those declared inside a companion / nested
     // object. Companion-scoped extension properties imported via
@@ -1923,17 +1892,19 @@ fn build_module_with_overrides(
             Decl::Class(c) => {
                 for m in &c.members {
                     if let Decl::Property(p) = m
-                        && p.receiver_type.is_some() {
-                            ext_prop_decls.push(p);
-                        }
+                        && p.receiver_type.is_some()
+                    {
+                        ext_prop_decls.push(p);
+                    }
                 }
             }
             Decl::Object(o) => {
                 for m in &o.members {
                     if let Decl::Property(p) = m
-                        && p.receiver_type.is_some() {
-                            ext_prop_decls.push(p);
-                        }
+                        && p.receiver_type.is_some()
+                    {
+                        ext_prop_decls.push(p);
+                    }
                 }
             }
             _ => {}
@@ -1945,36 +1916,36 @@ fn build_module_with_overrides(
                 if let Some(getter) = &p.getter {
                     let empty_members = std::collections::HashSet::new();
                     let fid = match &getter.body {
-                        klio_ast::FunctionBody::Expr(body) => Some(
-                            klio_ir::lower::lower_accessor_expr(
+                        klio_ast::FunctionBody::Expr(body) => {
+                            Some(klio_ir::lower::lower_accessor_expr(
                                 &mut module,
                                 &recv.name.name,
                                 &empty_members,
                                 &["this"],
                                 body,
                                 &format!("__ext_get_{}_{}", recv.name.name, p.name.name),
-                            ),
-                        ),
-                        klio_ast::FunctionBody::Block(blk) => Some(
-                            klio_ir::lower::lower_accessor_block(
+                            ))
+                        }
+                        klio_ast::FunctionBody::Block(blk) => {
+                            Some(klio_ir::lower::lower_accessor_block(
                                 &mut module,
                                 &recv.name.name,
                                 &empty_members,
                                 &["this"],
                                 blk,
                                 &format!("__ext_get_{}_{}", recv.name.name, p.name.name),
-                            ),
-                        ),
+                            ))
+                        }
                     };
                     if let Some(fid) = fid {
-                        extension_props
-                            .insert((recv.name.name.clone(), p.name.name.clone()), fid);
+                        extension_props.insert((recv.name.name.clone(), p.name.name.clone()), fid);
                     }
                 }
                 if let Some(setter) = &p.setter {
                     let setter_param_name = setter
                         .params
-                        .first().map_or_else(|| "value".to_string(), |n| n.name.clone());
+                        .first()
+                        .map_or_else(|| "value".to_string(), |n| n.name.clone());
                     // Receiver-class members are visible bare-name
                     // inside the extension setter (`set(v) { x = v }`
                     // writes to `this.x`).
@@ -1990,32 +1961,26 @@ fn build_module_with_overrides(
                     }
                     let empty_members = recv_members;
                     let fid = match &setter.body {
-                        klio_ast::FunctionBody::Expr(body) => Some(
-                            klio_ir::lower::lower_accessor_expr(
+                        klio_ast::FunctionBody::Expr(body) => {
+                            Some(klio_ir::lower::lower_accessor_expr(
                                 &mut module,
                                 &recv.name.name,
                                 &empty_members,
                                 &["this", setter_param_name.as_str()],
                                 body,
-                                &format!(
-                                    "__ext_set_{}_{}",
-                                    recv.name.name, p.name.name
-                                ),
-                            ),
-                        ),
-                        klio_ast::FunctionBody::Block(blk) => Some(
-                            klio_ir::lower::lower_accessor_block(
+                                &format!("__ext_set_{}_{}", recv.name.name, p.name.name),
+                            ))
+                        }
+                        klio_ast::FunctionBody::Block(blk) => {
+                            Some(klio_ir::lower::lower_accessor_block(
                                 &mut module,
                                 &recv.name.name,
                                 &empty_members,
                                 &["this", setter_param_name.as_str()],
                                 blk,
-                                &format!(
-                                    "__ext_set_{}_{}",
-                                    recv.name.name, p.name.name
-                                ),
-                            ),
-                        ),
+                                &format!("__ext_set_{}_{}", recv.name.name, p.name.name),
+                            ))
+                        }
                     };
                     if let Some(fid) = fid {
                         extension_prop_setters
@@ -2035,8 +2000,7 @@ fn build_module_with_overrides(
     // the local fn's body FuncId) so the closure-call path pads
     // missing trailing args exactly like top-level `call_func` does,
     // and keep them on the registry so a serialized pack carries them.
-    let local_fn_defaults =
-        std::mem::take(&mut module.registry.local_fn_defaults);
+    let local_fn_defaults = std::mem::take(&mut module.registry.local_fn_defaults);
     for (fid, slots) in &local_fn_defaults {
         func_defaults.entry(*fid).or_insert_with(|| slots.clone());
     }
@@ -2058,14 +2022,12 @@ fn build_module_with_overrides(
             .enumerate()
             .map(|(i, c)| (c.id.0, i))
             .collect();
-        let mut inherited: Vec<(klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>)> =
-            Vec::new();
+        let mut inherited: Vec<(klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>)> = Vec::new();
         for c in &module.classes {
             // Transitive supertype closure.
             let mut anc: Vec<usize> = Vec::new();
             let mut queue: Vec<klio_ir::ClassId> = c.supertypes.clone();
-            let mut seen: std::collections::HashSet<u32> =
-                std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
             while let Some(sid) = queue.pop() {
                 if !seen.insert(sid.0) {
                     continue;
@@ -2088,20 +2050,13 @@ fn build_module_with_overrides(
                             continue;
                         }
                         let base = match module.funcs.get(am.0 as usize) {
-                            Some(f)
-                                if f.name == mname
-                                    && f.params.len() == marity =>
-                            {
-                                am
-                            }
+                            Some(f) if f.name == mname && f.params.len() == marity => am,
                             _ => continue,
                         };
                         let Some(bslots) = func_defaults.get(&base) else {
                             continue;
                         };
-                        let cur = merged.get_or_insert_with(|| {
-                            vec![None; bslots.len()]
-                        });
+                        let cur = merged.get_or_insert_with(|| vec![None; bslots.len()]);
                         if cur.len() < bslots.len() {
                             cur.resize(bslots.len(), None);
                         }
@@ -2115,21 +2070,14 @@ fn build_module_with_overrides(
                 // Bodyless (abstract / interface) supertype
                 // declarations contribute no FuncId, so consult the
                 // separately-stashed `(class, method)` default table.
-                for &ai in anc.iter().chain(std::iter::once(
-                    &by_id[&c.id.0],
-                )) {
+                for &ai in anc.iter().chain(std::iter::once(&by_id[&c.id.0])) {
                     let cn = &module.classes[ai].name;
-                    let cn_simple =
-                        cn.rsplit('.').next().unwrap_or(cn).to_string();
+                    let cn_simple = cn.rsplit('.').next().unwrap_or(cn).to_string();
                     let bslots = abstract_defaults
                         .get(&(cn.clone(), mname.clone()))
-                        .or_else(|| {
-                            abstract_defaults
-                                .get(&(cn_simple, mname.clone()))
-                        });
+                        .or_else(|| abstract_defaults.get(&(cn_simple, mname.clone())));
                     let Some(bslots) = bslots else { continue };
-                    let cur = merged
-                        .get_or_insert_with(|| vec![None; bslots.len()]);
+                    let cur = merged.get_or_insert_with(|| vec![None; bslots.len()]);
                     if cur.len() < bslots.len() {
                         cur.resize(bslots.len(), None);
                     }
@@ -2140,9 +2088,10 @@ fn build_module_with_overrides(
                     }
                 }
                 if let Some(slots) = merged
-                    && func_defaults.get(&m) != Some(&slots) {
-                        inherited.push((m, slots));
-                    }
+                    && func_defaults.get(&m) != Some(&slots)
+                {
+                    inherited.push((m, slots));
+                }
             }
         }
         for (fid, slots) in inherited {
@@ -2171,10 +2120,8 @@ fn build_module_with_overrides(
         }
     }
     let import_aliases = std::mem::take(&mut module.registry.import_aliases);
-    let abstract_member_defaults =
-        std::mem::take(&mut module.registry.abstract_member_defaults);
-    let member_ext_owner_class =
-        std::mem::take(&mut module.registry.member_ext_owner_class);
+    let abstract_member_defaults = std::mem::take(&mut module.registry.abstract_member_defaults);
+    let member_ext_owner_class = std::mem::take(&mut module.registry.member_ext_owner_class);
     module.registry = klio_ir::ModuleRegistry {
         object_names: object_names.clone(),
         companion_singletons: companion_singletons.clone(),

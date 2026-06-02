@@ -1,4 +1,4 @@
-use crate::{Value, RuntimeError, Output, ToI64};
+use crate::{Output, RuntimeError, Value};
 
 /// Function pointer signature for a Rust-native stdlib intrinsic.
 ///
@@ -139,7 +139,8 @@ pub trait IntrinsicHost {
         scope: &Value,
         out: &mut dyn Output,
     ) -> Result<(), RuntimeError> {
-        self.invoke_callable_with_this(block, &[], scope, out).map(|_| ())
+        self.invoke_callable_with_this(block, &[], scope, out)
+            .map(|_| ())
     }
 
     /// Record that the activation about to suspend indefinitely is
@@ -197,10 +198,7 @@ pub trait IntrinsicHost {
     /// non-suspending body case (a scope body whose final expression
     /// only queues launches, e.g. fire-and-forget event dispatch).
     /// Default impl is a no-op.
-    fn coroutine_drain_to_idle(
-        &mut self,
-        _out: &mut dyn Output,
-    ) -> Result<(), RuntimeError> {
+    fn coroutine_drain_to_idle(&mut self, _out: &mut dyn Output) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -210,12 +208,7 @@ pub trait IntrinsicHost {
     /// coroutine parked inside a since-returned `startCoroutine`
     /// driver — drive its preserved state to completion here.
     /// Default impl delegates to [`coroutine_resume_slot_value`].
-    fn coroutine_resume_external(
-        &mut self,
-        slot: i64,
-        value: Value,
-        _out: &mut dyn Output,
-    ) {
+    fn coroutine_resume_external(&mut self, slot: i64, value: Value, _out: &mut dyn Output) {
         self.coroutine_resume_slot_value(slot, value);
     }
 
@@ -307,7 +300,7 @@ pub struct InProcessScheduler {
 }
 
 impl InProcessScheduler {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

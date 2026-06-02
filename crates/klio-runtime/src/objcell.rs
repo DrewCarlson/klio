@@ -145,7 +145,7 @@ impl<T: ?Sized> AdaptiveCell<T> {
     /// `UnsafeCell::get` vs loom's `UnsafeCell::with`. Callers must
     /// uphold the borrow protocol exactly as before; this only
     /// abstracts pointer acquisition.
-    #[inline(always)]
+    #[inline]
     fn with_data_ptr<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
         #[cfg(loom)]
         {
@@ -159,7 +159,7 @@ impl<T: ?Sized> AdaptiveCell<T> {
 
     /// Run `f` with a mutable pointer to the cell's data. See
     /// [`Self::with_data_ptr`]; mirrors loom's `UnsafeCell::with_mut`.
-    #[inline(always)]
+    #[inline]
     fn with_data_ptr_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
         #[cfg(loom)]
         {
@@ -179,7 +179,7 @@ impl<T: ?Sized> AdaptiveCell<T> {
     /// self-deadlock against a queued writer. loom's `RwLock` has no
     /// recursive read, but no loom scenario nests borrows on one
     /// thread, so plain `read()` models the protocol exactly.
-    #[inline(always)]
+    #[inline]
     fn lock_shared_read(&self) -> cell_sync::RwLockReadGuard<'_, ()> {
         #[cfg(loom)]
         {
@@ -194,7 +194,7 @@ impl<T: ?Sized> AdaptiveCell<T> {
     /// Acquire the per-cell `RwLock` for an *exclusive* borrow once the
     /// cell is `SHARED`: a write guard, mutually exclusive against
     /// every reader and writer.
-    #[inline(always)]
+    #[inline]
     fn lock_shared_write(&self) -> cell_sync::RwLockWriteGuard<'_, ()> {
         #[cfg(loom)]
         {
@@ -416,8 +416,11 @@ pub mod gc {
 }
 
 impl<T: ?Sized> ObjRef<T> {
-    /// Shared borrow. Panics on an active mutable borrow, exactly
-    /// like `RefCell::borrow`.
+    /// Shared borrow, exactly like `RefCell::borrow`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cell is already mutably borrowed.
     #[must_use]
     pub fn borrow(&self) -> ObjGuard<'_, T> {
         match self.try_borrow() {
@@ -426,13 +429,16 @@ impl<T: ?Sized> ObjRef<T> {
         }
     }
 
-    /// Mutable borrow. Panics on any active borrow, exactly like
-    /// `RefCell::borrow_mut`.
+    /// Mutable borrow, exactly like `RefCell::borrow_mut`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cell is already borrowed (shared or mutable).
     #[must_use]
     pub fn borrow_mut(&self) -> ObjGuardMut<'_, T> {
         match self.try_borrow_mut() {
             Ok(g) => g,
-            Err(_) => panic!("ObjRef already borrowed"),
+            Err(BorrowMutError) => panic!("ObjRef already borrowed"),
         }
     }
 
@@ -447,7 +453,10 @@ impl<T: ?Sized> ObjRef<T> {
             let read = cell.lock_shared_read();
             // SAFETY: a read guard is held for the returned guard's
             // lifetime; no writer can be active concurrently.
-            return Some(ObjGuard { cell, _shared: Some(read) });
+            return Some(ObjGuard {
+                cell,
+                shared: Some(read),
+            });
         }
         let f = cell.flag.get();
         if f < 0 {
@@ -457,7 +466,7 @@ impl<T: ?Sized> ObjRef<T> {
         // SAFETY: flag was >= 0, so no mutable borrow is live; we
         // hand out a shared reference and the guard restores the
         // count on drop.
-        Some(ObjGuard { cell, _shared: None })
+        Some(ObjGuard { cell, shared: None })
     }
 
     /// Fallible mutable borrow (mirrors `RefCell::try_borrow_mut`).
@@ -472,7 +481,10 @@ impl<T: ?Sized> ObjRef<T> {
             let write = cell.lock_shared_write();
             // SAFETY: a write guard is held for the returned guard's
             // lifetime; no other borrow can be active concurrently.
-            return Ok(ObjGuardMut { cell, _shared: Some(write) });
+            return Ok(ObjGuardMut {
+                cell,
+                shared: Some(write),
+            });
         }
         if cell.flag.get() != 0 {
             return Err(BorrowMutError);
@@ -480,7 +492,7 @@ impl<T: ?Sized> ObjRef<T> {
         cell.flag.set(-1);
         // SAFETY: flag was 0, so no other borrow is live; the guard
         // restores it on drop.
-        Ok(ObjGuardMut { cell, _shared: None })
+        Ok(ObjGuardMut { cell, shared: None })
     }
 
     /// Transition the cell to the shared state with a full fence.
@@ -538,11 +550,11 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjRef<T> {
 
 /// Shared-borrow guard. On the UNSHARED path it restores the
 /// `RefCell` borrow count on drop; on the SHARED path it instead
-/// holds a `RwLock` read guard (`_shared`) for its lifetime and the
+/// holds a `RwLock` read guard (`shared`) for its lifetime and the
 /// lock — not `flag` — is the discipline.
 pub struct ObjGuard<'a, T: ?Sized> {
     cell: &'a AdaptiveCell<T>,
-    _shared: Option<cell_sync::RwLockReadGuard<'a, ()>>,
+    shared: Option<cell_sync::RwLockReadGuard<'a, ()>>,
 }
 impl<T: ?Sized> Deref for ObjGuard<'_, T> {
     type Target = T;
@@ -556,9 +568,9 @@ impl<T: ?Sized> Deref for ObjGuard<'_, T> {
 impl<T: ?Sized> Drop for ObjGuard<'_, T> {
     fn drop(&mut self) {
         // UNSHARED path only: SHARED borrows never touched `flag`,
-        // so they must not decrement it. The read guard in `_shared`
+        // so they must not decrement it. The read guard in `shared`
         // is released by its own `Drop` after this.
-        if self._shared.is_none() {
+        if self.shared.is_none() {
             self.cell.flag.set(self.cell.flag.get() - 1);
         }
     }
@@ -576,11 +588,11 @@ impl<T: ?Sized + fmt::Display> fmt::Display for ObjGuard<'_, T> {
 
 /// Mutable-borrow guard. On the UNSHARED path it restores the
 /// `RefCell` borrow flag on drop; on the SHARED path it instead
-/// holds an exclusive `RwLock` write guard (`_shared`) for its
+/// holds an exclusive `RwLock` write guard (`shared`) for its
 /// lifetime.
 pub struct ObjGuardMut<'a, T: ?Sized> {
     cell: &'a AdaptiveCell<T>,
-    _shared: Option<cell_sync::RwLockWriteGuard<'a, ()>>,
+    shared: Option<cell_sync::RwLockWriteGuard<'a, ()>>,
 }
 impl<T: ?Sized> Deref for ObjGuardMut<'_, T> {
     type Target = T;
@@ -601,8 +613,8 @@ impl<T: ?Sized> Drop for ObjGuardMut<'_, T> {
     fn drop(&mut self) {
         // UNSHARED path only: SHARED mutable borrows never set
         // `flag` to -1, so they must not clear it. The write guard
-        // in `_shared` is released by its own `Drop` after this.
-        if self._shared.is_none() {
+        // in `shared` is released by its own `Drop` after this.
+        if self.shared.is_none() {
             self.cell.flag.set(0);
         }
     }

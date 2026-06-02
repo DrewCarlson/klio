@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::parse::{parse_file, Decl};
+use crate::parse::{Decl, parse_file};
 
 #[derive(Debug, Default, Clone)]
 pub struct CollectStats {
@@ -22,7 +22,7 @@ pub struct FileDecls {
 
 /// Walk the curated stdlib roots under `stdlib_root` and return all parsed
 /// declarations. `stdlib_root` is expected to be `kotlin/libraries/stdlib`.
-#[must_use] 
+#[must_use]
 pub fn collect_decls(stdlib_root: &Path) -> (Vec<FileDecls>, CollectStats) {
     let mut out = Vec::new();
     let mut stats = CollectStats::default();

@@ -16,8 +16,7 @@ use std::borrow::Cow;
 
 /// Embedded stdlib pack bytes — written by `build.rs` into `OUT_DIR`
 /// at compile time and included via `include_bytes!`.
-pub const STDLIB_PACK: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/stdlib.klio-pack"));
+pub const STDLIB_PACK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/stdlib.klio-pack"));
 
 /// Return the stdlib pack bytes the host should load. Respects the
 /// `KLIO_STDLIB_PACK` environment variable: when set to a readable
@@ -27,9 +26,10 @@ pub const STDLIB_PACK: &[u8] =
 #[must_use]
 pub fn stdlib_pack_bytes() -> Cow<'static, [u8]> {
     if let Ok(path) = std::env::var("KLIO_STDLIB_PACK")
-        && let Ok(bytes) = std::fs::read(&path) {
-            return Cow::Owned(bytes);
-        }
+        && let Ok(bytes) = std::fs::read(&path)
+    {
+        return Cow::Owned(bytes);
+    }
     Cow::Borrowed(STDLIB_PACK)
 }
 
@@ -60,7 +60,10 @@ mod tests {
     #[test]
     fn embedded_pack_loads() {
         let bytes = stdlib_pack_bytes();
-        assert!(!bytes.is_empty(), "embedded stdlib pack should not be empty");
+        assert!(
+            !bytes.is_empty(),
+            "embedded stdlib pack should not be empty"
+        );
         // Round-trip through PackReader to validate the embed.
         let pack = klio_pack::PackReader::from_bytes(bytes.into_owned())
             .expect("embedded stdlib pack must validate");

@@ -20,7 +20,7 @@ fn assert_klio(name: &str, src: &str, expected: &str) {
 }
 
 #[test]
-fn intArray_init_pattern() {
+fn int_array_init_pattern() {
     let src = r#"
 fun main() {
     val xs = IntArray(5) { it * it }
@@ -92,7 +92,7 @@ fun main() {
 }
 
 #[test]
-fn arrayOfNulls_works() {
+fn array_of_nulls_works() {
     let src = r#"
 fun main() {
     val arr = arrayOfNulls<String>(3)

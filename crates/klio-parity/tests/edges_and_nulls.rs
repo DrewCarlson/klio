@@ -136,11 +136,7 @@ fun main() {
     println("${probe(1)}|${probe(2)}|${probe(3)}")
 }
 "#;
-    assert_klio(
-        "throw_catch_multi_arm",
-        src,
-        "oops:one|rt:two|ok:3\n",
-    );
+    assert_klio("throw_catch_multi_arm", src, "oops:one|rt:two|ok:3\n");
 }
 
 // 6. `Sequence` lazy chain (terminal operator drives evaluation).

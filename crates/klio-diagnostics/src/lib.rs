@@ -30,10 +30,8 @@ impl Severity {
     pub fn as_kotlinc_label(self) -> &'static str {
         match self {
             Self::Error => "error",
-            Self::StrongWarning => "warning",
-            Self::Warning => "warning",
-            Self::Info => "info",
-            Self::Hint => "info",
+            Self::StrongWarning | Self::Warning => "warning",
+            Self::Info | Self::Hint => "info",
         }
     }
 }
@@ -103,7 +101,10 @@ impl Diagnostic {
             factory: None,
             legacy_code: None,
             message: message.into(),
-            primary: Label { span, message: String::new() },
+            primary: Label {
+                span,
+                message: String::new(),
+            },
             secondary: Vec::new(),
             notes: Vec::new(),
             fixits: Vec::new(),
@@ -128,7 +129,10 @@ impl Diagnostic {
             factory: Some(factory),
             legacy_code: None,
             message: factory.message_template.to_string(),
-            primary: Label { span, message: String::new() },
+            primary: Label {
+                span,
+                message: String::new(),
+            },
             secondary: Vec::new(),
             notes: Vec::new(),
             fixits: Vec::new(),
@@ -161,7 +165,10 @@ impl Diagnostic {
 
     #[must_use]
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
-        self.secondary.push(Label { span, message: message.into() });
+        self.secondary.push(Label {
+            span,
+            message: message.into(),
+        });
         self
     }
 

@@ -1,7 +1,11 @@
-use super::{Parser, KotlinFile, DiagnosticSink, TokenKind, Keyword, PackageHeader, ImportDecl, Ident, Decl, ClassModifiers, Diagnostic, Visibility, Annotation, TypeAlias, ModifierFlags, AnnotationUseSite, Span, Expr};
+use super::{
+    Annotation, AnnotationUseSite, ClassModifiers, Decl, Diagnostic, DiagnosticSink, Expr, Ident,
+    ImportDecl, Keyword, KotlinFile, ModifierFlags, PackageHeader, Parser, Span, TokenKind,
+    TypeAlias, Visibility,
+};
 
 impl Parser<'_, '_> {
-    #[must_use] 
+    #[must_use]
     pub fn parse_file(mut self) -> (KotlinFile, DiagnosticSink) {
         self.skip_nl();
         let start = self.current_span();
@@ -24,13 +28,12 @@ impl Parser<'_, '_> {
             }
             if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Package)) {
                 let kw_span = self.current_span();
-                let code = if package.is_some() { "P0045" } else { "P0045" };
                 let msg = if package.is_some() {
                     "duplicate `package` header; a file may declare at most one package"
                 } else {
                     "`package` header must come before any import or declaration"
                 };
-                self.error(code, msg, kw_span);
+                self.error("P0045", msg, kw_span);
                 // Consume the stray header so parsing can continue.
                 let _ = self.parse_package_header();
                 continue;
@@ -54,7 +57,12 @@ impl Parser<'_, '_> {
         }
         let end = self.current_span();
         (
-            KotlinFile { package, imports, decls, span: start.join(end) },
+            KotlinFile {
+                package,
+                imports,
+                decls,
+                span: start.join(end),
+            },
             self.diagnostics,
         )
     }
@@ -77,7 +85,9 @@ impl Parser<'_, '_> {
                 break;
             }
         }
-        let span = pkg_tok.span.join(path.last().map_or(pkg_tok.span, |p| p.span));
+        let span = pkg_tok
+            .span
+            .join(path.last().map_or(pkg_tok.span, |p| p.span));
         Some(PackageHeader { path, span })
     }
 
@@ -94,7 +104,10 @@ impl Parser<'_, '_> {
             self.skip_nl();
             if matches!(self.peek_kind(), TokenKind::Ident) {
                 let tok = self.bump();
-                path.push(Ident { name: self.ident_name(tok.span), span: tok.span });
+                path.push(Ident {
+                    name: self.ident_name(tok.span),
+                    span: tok.span,
+                });
             } else {
                 self.error("P0047", "malformed import: missing path", kw.span);
             }
@@ -108,9 +121,16 @@ impl Parser<'_, '_> {
                 self.skip_nl();
                 if matches!(self.peek_kind(), TokenKind::Ident) {
                     let tok = self.bump();
-                    path.push(Ident { name: self.ident_name(tok.span), span: tok.span });
+                    path.push(Ident {
+                        name: self.ident_name(tok.span),
+                        span: tok.span,
+                    });
                 } else {
-                    self.error("P0047", "malformed import: trailing `.` with no segment", dot.span);
+                    self.error(
+                        "P0047",
+                        "malformed import: trailing `.` with no segment",
+                        dot.span,
+                    );
                     break;
                 }
             }
@@ -118,7 +138,9 @@ impl Parser<'_, '_> {
                 let as_tok = self.bump();
                 let alias_ident = self.parse_ident("import alias");
                 if wildcard {
-                    let span = alias_ident.as_ref().map_or(as_tok.span, |i| as_tok.span.join(i.span));
+                    let span = alias_ident
+                        .as_ref()
+                        .map_or(as_tok.span, |i| as_tok.span.join(i.span));
                     self.error(
                         "P0044",
                         "wildcard import cannot be renamed; remove `as` or replace `*` with a name",
@@ -130,7 +152,12 @@ impl Parser<'_, '_> {
                 None
             };
             let end = self.tokens[self.pos.saturating_sub(1)].span;
-            imports.push(ImportDecl { path, alias, wildcard, span: kw.span.join(end) });
+            imports.push(ImportDecl {
+                path,
+                alias,
+                wildcard,
+                span: kw.span.join(end),
+            });
         }
         imports
     }
@@ -178,16 +205,18 @@ impl Parser<'_, '_> {
                 // When the user wrote `inline` on a class declaration, promote
                 // it to `is_value` and emit a deprecation warning.
                 let is_value = flags.is_value || flags.is_inline;
-                if flags.is_inline && !flags.is_value
-                    && let Some(span) = flags.inline_span {
-                        self.diagnostics.emit(
-                            Diagnostic::warning(
-                                "`inline class` is deprecated; use `value class` instead",
-                                span,
-                            )
-                            .with_code("W0001"),
-                        );
-                    }
+                if flags.is_inline
+                    && !flags.is_value
+                    && let Some(span) = flags.inline_span
+                {
+                    self.diagnostics.emit(
+                        Diagnostic::warning(
+                            "`inline class` is deprecated; use `value class` instead",
+                            span,
+                        )
+                        .with_code("W0001"),
+                    );
+                }
                 self.parse_class(
                     ClassModifiers {
                         is_data: flags.is_data,
@@ -213,14 +242,18 @@ impl Parser<'_, '_> {
                     self.parse_companion_object_as_class(flags.visibility, flags.annotations)
                         .map(Decl::Class)
                 } else {
-                    self.parse_object(flags.is_data, flags.is_expect, flags.is_actual, flags.visibility)
-                        .map(Decl::Object)
+                    self.parse_object(
+                        flags.is_data,
+                        flags.is_expect,
+                        flags.is_actual,
+                        flags.visibility,
+                    )
+                    .map(Decl::Object)
                 }
             }
-            TokenKind::Keyword(Keyword::Typealias) => {
-                self.parse_typealias(flags.visibility, flags.annotations)
-                    .map(Decl::TypeAlias)
-            }
+            TokenKind::Keyword(Keyword::Typealias) => self
+                .parse_typealias(flags.visibility, flags.annotations)
+                .map(Decl::TypeAlias),
             _ => {
                 let span = self.current_span();
                 self.error("E0002", "expected top-level declaration", span);
@@ -389,7 +422,8 @@ impl Parser<'_, '_> {
             self.expect(&TokenKind::RBracket, "`]`");
             return Some(anns);
         }
-        self.parse_unescaped_annotation(use_site, at_span).map(|a| vec![a])
+        self.parse_unescaped_annotation(use_site, at_span)
+            .map(|a| vec![a])
     }
 
     /// Try to consume an annotation use-site target like `field:` / `get:`.
@@ -513,10 +547,11 @@ impl Parser<'_, '_> {
             if !self.peek_kind().is_at() {
                 break;
             }
-            let Some(set) = self.parse_annotation_set() else { break };
+            let Some(set) = self.parse_annotation_set() else {
+                break;
+            };
             out.extend(set);
         }
         out
     }
-
 }

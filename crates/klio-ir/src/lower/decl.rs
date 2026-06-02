@@ -1,9 +1,14 @@
-use super::{FuncBuilder, Inst, widen_numeric_literal, lower_expr_as_param_thunk, lower_expr_as_param_thunk_scoped, compute_boxed_vars, lower_block, lower_expr, Terminator};
+use super::{
+    FuncBuilder, Inst, Terminator, compute_boxed_vars, lower_block, lower_expr,
+    lower_expr_as_param_thunk, lower_expr_as_param_thunk_scoped, widen_numeric_literal,
+};
 
 /// Lower an arbitrary expression as a 0-arg synthetic function whose
 /// body returns the expression's value. The synthetic function is
 /// pushed onto the module so a downstream caller can invoke it via
 /// `eval_with` against `module.funcs[id]`.
+// Param index is a u16 slot; a function's parameter count fits it.
+#[allow(clippy::cast_possible_truncation)]
 pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
     for (i, name) in names.iter().enumerate() {
         let dst = b.alloc_reg();
@@ -24,6 +29,9 @@ pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::Cl
     lower_class_with_file(module, c, &empty)
 }
 
+// Cross-crate API: the file-class map is threaded through a chain of
+// public lowering fns, so it keeps the default hasher.
+#[allow(clippy::implicit_hasher)]
 pub fn lower_class_with_file(
     module: &mut crate::Module,
     c: &klio_ast::Class,
@@ -37,6 +45,9 @@ pub fn lower_class_with_file(
 /// the same simple class name; a distinct FQN lets `add_class` keep
 /// them as separate definitions instead of collapsing one onto the
 /// other.
+// Cross-crate API threading default-hashed file-class / member sets
+// through the public lowering chain.
+#[allow(clippy::implicit_hasher)]
 pub fn lower_class_with_extras_fqn(
     module: &mut crate::Module,
     c: &klio_ast::Class,
@@ -76,15 +87,164 @@ thread_local! {
 
 /// Set (or clear) the anon-object captured-name set consulted while
 /// lowering that object's method bodies.
-pub fn set_lower_anon_captures(
-    names: Option<std::collections::HashSet<String>>,
-) {
+// Stored into a thread_local typed with the default hasher, which a
+// generic parameter cannot express.
+#[allow(clippy::implicit_hasher)]
+pub fn set_lower_anon_captures(names: Option<std::collections::HashSet<String>>) {
     LOWER_ANON_CAPTURES.with(|c| *c.borrow_mut() = names);
 }
 
 pub(crate) fn is_lower_anon_capture(name: &str) -> bool {
-    LOWER_ANON_CAPTURES
-        .with(|c| c.borrow().as_ref().is_some_and(|s| s.contains(name)))
+    LOWER_ANON_CAPTURES.with(|c| c.borrow().as_ref().is_some_and(|s| s.contains(name)))
+}
+
+/// Collect a class's own + inherited member names into `out`, walking
+/// every supertype reachable through the file's class registry.
+fn collect_members(
+    c: &klio_ast::Class,
+    file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
+    out: &mut std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    if !seen.insert(c.name.name.clone()) {
+        return;
+    }
+    for m in &c.members {
+        match m {
+            klio_ast::Decl::Function(f) => {
+                out.insert(f.name.name.clone());
+            }
+            klio_ast::Decl::Property(p) => {
+                out.insert(p.name.name.clone());
+            }
+            klio_ast::Decl::Class(inner) if inner.is_companion => {
+                for cm in &inner.members {
+                    match cm {
+                        klio_ast::Decl::Function(f) => {
+                            out.insert(f.name.name.clone());
+                        }
+                        klio_ast::Decl::Property(p) => {
+                            out.insert(p.name.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                for p in &inner.primary_params {
+                    if p.property.is_some() {
+                        out.insert(p.name.name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for p in &c.primary_params {
+        if p.property.is_some() {
+            out.insert(p.name.name.clone());
+        }
+    }
+    for sup in &c.supertypes {
+        if let Some(parent) = file_classes.get(&sup.name.name) {
+            collect_members(parent, file_classes, out, seen);
+        }
+    }
+}
+
+/// Add enum-entry, nested-class, and companion-member names that are
+/// visible under their bare names inside the class's method bodies.
+fn add_visible_member_names(
+    c: &klio_ast::Class,
+    own_member_names: &mut std::collections::HashSet<String>,
+) {
+    // Enum entry names are visible under their bare names
+    // inside the enum's method bodies (e.g. `RED` in a
+    // `Color.hex()` method). `entries` resolves to the
+    // built-in synthesized list of all entries.
+    if c.is_enum {
+        for entry in &c.enum_entries {
+            own_member_names.insert(entry.name.name.clone());
+        }
+        // Built-in members on every enum entry: synthesised
+        // `name` (entry simple name) and `ordinal` (declaration
+        // index). Bare access from method bodies resolves to
+        // `this.name` / `this.ordinal`.
+        own_member_names.insert("entries".to_string());
+        own_member_names.insert("name".to_string());
+        own_member_names.insert("ordinal".to_string());
+    }
+    // Nested class / enum / object names are visible under
+    // their bare names inside the enclosing class's method
+    // bodies (e.g. `TrafficLight.State.RED` reachable as
+    // `State.RED` from a TrafficLight method).
+    for m in &c.members {
+        if let klio_ast::Decl::Class(inner) = m
+            && !inner.is_companion
+        {
+            own_member_names.insert(inner.name.name.clone());
+        }
+    }
+    // Companion-object members are visible under their bare
+    // names inside this class's method bodies.
+    for m in &c.members {
+        if let klio_ast::Decl::Class(inner) = m
+            && inner.is_companion
+        {
+            for cm in &inner.members {
+                match cm {
+                    klio_ast::Decl::Function(f) => {
+                        own_member_names.insert(f.name.name.clone());
+                    }
+                    klio_ast::Decl::Property(p) => {
+                        own_member_names.insert(p.name.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            for p in &inner.primary_params {
+                if p.property.is_some() {
+                    own_member_names.insert(p.name.name.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Lower the default-arg thunks of a bodyless (abstract) method and
+/// stash them under `(class, method)` so a concrete override inherits
+/// the declaration's default values.
+fn record_abstract_member_defaults(
+    module: &mut crate::Module,
+    c: &klio_ast::Class,
+    f: &klio_ast::Function,
+) {
+    if !f.params.iter().any(|p| p.default.is_some()) {
+        return;
+    }
+    let mut names: Vec<String> = Vec::with_capacity(f.params.len() + 1);
+    names.push("this".to_string());
+    names.extend(f.params.iter().map(|p| p.name.name.clone()));
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut slots: Vec<Option<crate::FuncId>> = Vec::with_capacity(names.len());
+    slots.push(None); // implicit `this`
+    for (idx, p) in f.params.iter().enumerate() {
+        if let Some(de) = &p.default {
+            let bind_upto = (1 + idx).min(name_refs.len());
+            let widened = widen_numeric_literal(de, &p.ty);
+            let fid = lower_expr_as_param_thunk(
+                module,
+                &name_refs[..bind_upto],
+                widened.as_ref().unwrap_or(de),
+                &format!("__default_abstract_{}_{}", f.name.name, p.name.name),
+            );
+            slots.push(Some(fid));
+        } else {
+            slots.push(None);
+        }
+    }
+    module
+        .registry
+        .abstract_member_defaults
+        .insert((c.name.name.clone(), f.name.name.clone()), slots);
 }
 
 /// Same as `lower_class_with_file` but mixes an additional set of
@@ -93,6 +253,9 @@ pub(crate) fn is_lower_anon_capture(name: &str) -> bool {
 /// names are added so bare references inside the inner's body
 /// lower as `this.X` (resolved against the captured outer at
 /// runtime) instead of `LoadGlobal(X)`.
+// Cross-crate API threading default-hashed file-class / member sets
+// through the public lowering chain.
+#[allow(clippy::implicit_hasher)]
 pub fn lower_class_with_extras(
     module: &mut crate::Module,
     c: &klio_ast::Class,
@@ -132,106 +295,14 @@ pub fn lower_class_with_extras(
     // Walk this class + every supertype reachable through the
     // file's class registry so inherited member names also
     // route as `this.<name>` in method-body lowering.
-    fn collect_members(
-        c: &klio_ast::Class,
-        file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
-        out: &mut std::collections::HashSet<String>,
-        seen: &mut std::collections::HashSet<String>,
-    ) {
-        if !seen.insert(c.name.name.clone()) {
-            return;
-        }
-        for m in &c.members {
-            match m {
-                klio_ast::Decl::Function(f) => {
-                    out.insert(f.name.name.clone());
-                }
-                klio_ast::Decl::Property(p) => {
-                    out.insert(p.name.name.clone());
-                }
-                klio_ast::Decl::Class(inner) if inner.is_companion => {
-                    for cm in &inner.members {
-                        match cm {
-                            klio_ast::Decl::Function(f) => {
-                                out.insert(f.name.name.clone());
-                            }
-                            klio_ast::Decl::Property(p) => {
-                                out.insert(p.name.name.clone());
-                            }
-                            _ => {}
-                        }
-                    }
-                    for p in &inner.primary_params {
-                        if p.property.is_some() {
-                            out.insert(p.name.name.clone());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        for p in &c.primary_params {
-            if p.property.is_some() {
-                out.insert(p.name.name.clone());
-            }
-        }
-        for sup in &c.supertypes {
-            if let Some(parent) = file_classes.get(&sup.name.name) {
-                collect_members(parent, file_classes, out, seen);
-            }
-        }
-    }
     let mut seen_for_collect: std::collections::HashSet<String> = std::collections::HashSet::new();
-    collect_members(c, file_classes, &mut own_member_names, &mut seen_for_collect);
-    // Enum entry names are visible under their bare names
-    // inside the enum's method bodies (e.g. `RED` in a
-    // `Color.hex()` method). `entries` resolves to the
-    // built-in synthesized list of all entries.
-    if c.is_enum {
-        for entry in &c.enum_entries {
-            own_member_names.insert(entry.name.name.clone());
-        }
-        // Built-in members on every enum entry: synthesised
-        // `name` (entry simple name) and `ordinal` (declaration
-        // index). Bare access from method bodies resolves to
-        // `this.name` / `this.ordinal`.
-        own_member_names.insert("entries".to_string());
-        own_member_names.insert("name".to_string());
-        own_member_names.insert("ordinal".to_string());
-    }
-    // Nested class / enum / object names are visible under
-    // their bare names inside the enclosing class's method
-    // bodies (e.g. `TrafficLight.State.RED` reachable as
-    // `State.RED` from a TrafficLight method).
-    for m in &c.members {
-        if let klio_ast::Decl::Class(inner) = m
-            && !inner.is_companion {
-                own_member_names.insert(inner.name.name.clone());
-            }
-    }
-    // Companion-object members are visible under their bare
-    // names inside this class's method bodies.
-    for m in &c.members {
-        if let klio_ast::Decl::Class(inner) = m
-            && inner.is_companion {
-                for cm in &inner.members {
-                    match cm {
-                        klio_ast::Decl::Function(f) => {
-                            own_member_names.insert(f.name.name.clone());
-                        }
-                        klio_ast::Decl::Property(p) => {
-                            own_member_names.insert(p.name.name.clone());
-                        }
-                        _ => {}
-                    }
-                }
-                for p in &inner.primary_params {
-                    if p.property.is_some() {
-                        own_member_names.insert(p.name.name.clone());
-                    }
-                }
-            }
-    }
+    collect_members(
+        c,
+        file_classes,
+        &mut own_member_names,
+        &mut seen_for_collect,
+    );
+    add_visible_member_names(c, &mut own_member_names);
     let mut methods: Vec<crate::FuncId> = Vec::new();
     // Track private methods lowered so far in declaration order so a
     // later method's body can statically bind to an earlier private
@@ -255,53 +326,18 @@ pub fn lower_class_with_extras(
                 // values. Lower the default thunks and stash them by
                 // (class, method) so the build pass can fold them onto
                 // the override's own (default-less) parameter slots.
-                if f.params.iter().any(|p| p.default.is_some()) {
-                    let mut names: Vec<String> =
-                        Vec::with_capacity(f.params.len() + 1);
-                    names.push("this".to_string());
-                    names.extend(
-                        f.params.iter().map(|p| p.name.name.clone()),
-                    );
-                    let name_refs: Vec<&str> =
-                        names.iter().map(String::as_str).collect();
-                    let mut slots: Vec<Option<crate::FuncId>> =
-                        Vec::with_capacity(names.len());
-                    slots.push(None); // implicit `this`
-                    for (idx, p) in f.params.iter().enumerate() {
-                        if let Some(de) = &p.default {
-                            let bind_upto =
-                                (1 + idx).min(name_refs.len());
-                            let widened =
-                                widen_numeric_literal(de, &p.ty);
-                            let fid = lower_expr_as_param_thunk(
-                                module,
-                                &name_refs[..bind_upto],
-                                widened.as_ref().unwrap_or(de),
-                                &format!(
-                                    "__default_abstract_{}_{}",
-                                    f.name.name, p.name.name
-                                ),
-                            );
-                            slots.push(Some(fid));
-                        } else {
-                            slots.push(None);
-                        }
-                    }
-                    module
-                        .registry
-                        .abstract_member_defaults
-                        .insert(
-                            (c.name.name.clone(), f.name.name.clone()),
-                            slots,
-                        );
-                }
+                record_abstract_member_defaults(module, c, f);
                 continue;
             }
             // Use the method's own FuncId, not `funcs.len() - 1`:
             // lowering a method also pushes its default-arg thunk
             // funcs, so the last slot is no longer the method body.
             let placed = lower_method_with_private(
-                module, f, &c.name.name, &own_member_names, &private_method_fids,
+                module,
+                f,
+                &c.name.name,
+                &own_member_names,
+                &private_method_fids,
             );
             methods.push(placed.id);
             if matches!(f.visibility, klio_ast::Visibility::Private) {
@@ -332,6 +368,9 @@ pub fn lower_function(module: &mut crate::Module, f: &klio_ast::Function) -> cra
     lower_function_with_file(module, f, &empty)
 }
 
+// Cross-crate API: the file-class map keeps the default hasher.
+// FuncId indexes module.funcs; the IR caps the func count at u32.
+#[allow(clippy::implicit_hasher, clippy::cast_possible_truncation)]
 pub fn lower_function_with_file(
     module: &mut crate::Module,
     f: &klio_ast::Function,
@@ -352,6 +391,8 @@ pub fn lower_function_with_file(
 /// Used by the interpreter's pre-pass-then-fill driver so a function's
 /// `FuncId` is reserved before its body is lowered (enabling forward
 /// references and mutual recursion).
+// Cross-crate API: the file-class map keeps the default hasher.
+#[allow(clippy::implicit_hasher)]
 pub fn lower_function_body_into(
     module: &mut crate::Module,
     f: &klio_ast::Function,
@@ -373,6 +414,40 @@ pub(crate) fn lowered_type_name(ty: &klio_ast::TypeRef) -> String {
     ty.name.name.clone()
 }
 
+/// Collect an extension receiver's own + inherited member names,
+/// walking supertypes reachable through the file's class registry.
+fn collect_recv_members(
+    c: &klio_ast::Class,
+    file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
+    out: &mut std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    if !seen.insert(c.name.name.clone()) {
+        return;
+    }
+    for m in &c.members {
+        match m {
+            klio_ast::Decl::Function(f) => {
+                out.insert(f.name.name.clone());
+            }
+            klio_ast::Decl::Property(p) => {
+                out.insert(p.name.name.clone());
+            }
+            _ => {}
+        }
+    }
+    for p in &c.primary_params {
+        if p.property.is_some() {
+            out.insert(p.name.name.clone());
+        }
+    }
+    for sup in &c.supertypes {
+        if let Some(parent) = file_classes.get(&sup.name.name) {
+            collect_recv_members(parent, file_classes, out, seen);
+        }
+    }
+}
+
 pub(crate) fn lower_function_body(
     module: &mut crate::Module,
     f: &klio_ast::Function,
@@ -387,46 +462,9 @@ pub(crate) fn lower_function_body(
         let mut members: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(parent_cls) = file_classes.get(&recv.name.name) {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            fn collect_recv_members(
-                c: &klio_ast::Class,
-                file_classes: &std::collections::HashMap<String, &klio_ast::Class>,
-                out: &mut std::collections::HashSet<String>,
-                seen: &mut std::collections::HashSet<String>,
-            ) {
-                if !seen.insert(c.name.name.clone()) {
-                    return;
-                }
-                for m in &c.members {
-                    match m {
-                        klio_ast::Decl::Function(f) => {
-                            out.insert(f.name.name.clone());
-                        }
-                        klio_ast::Decl::Property(p) => {
-                            out.insert(p.name.name.clone());
-                        }
-                        _ => {}
-                    }
-                }
-                for p in &c.primary_params {
-                    if p.property.is_some() {
-                        out.insert(p.name.name.clone());
-                    }
-                }
-                for sup in &c.supertypes {
-                    if let Some(parent) = file_classes.get(&sup.name.name) {
-                        collect_recv_members(parent, file_classes, out, seen);
-                    }
-                }
-            }
             collect_recv_members(parent_cls, file_classes, &mut members, &mut seen);
         }
-        lower_function_body_with_implicit_owner(
-            module,
-            f,
-            &["this"],
-            None,
-            Some(&members),
-        )
+        lower_function_body_with_implicit_owner(module, f, &["this"], None, Some(&members))
     } else {
         lower_function_body_with_implicit_owner(module, f, &[], None, None)
     }
@@ -485,15 +523,26 @@ pub(crate) fn record_method_param_defaults(
     module.registry.local_fn_defaults.insert(body_func, slots);
 }
 
+// Cross-crate API: own-member set keeps the default hasher.
+#[allow(clippy::implicit_hasher)]
 pub fn lower_method(
     module: &mut crate::Module,
     f: &klio_ast::Function,
     owner_class: &str,
     own_members: &std::collections::HashSet<String>,
 ) -> crate::Func {
-    lower_method_with_private(module, f, owner_class, own_members, &std::collections::HashMap::new())
+    lower_method_with_private(
+        module,
+        f,
+        owner_class,
+        own_members,
+        &std::collections::HashMap::new(),
+    )
 }
 
+// Cross-crate API: own-member set and private-method map keep the
+// default hasher. FuncId indexes module.funcs; the IR caps it at u32.
+#[allow(clippy::implicit_hasher, clippy::cast_possible_truncation)]
 pub fn lower_method_with_private(
     module: &mut crate::Module,
     f: &klio_ast::Function,
@@ -516,13 +565,7 @@ pub fn lower_method_with_private(
     // through the same extension-call lowering top-level extensions
     // use (the receiver is prepended as the implicit `this`).
     if f.receiver_type.is_some() {
-        let func = lower_function_body_with_implicit_owner(
-            module,
-            f,
-            &["this"],
-            None,
-            None,
-        );
+        let func = lower_function_body_with_implicit_owner(module, f, &["this"], None, None);
         let id = crate::FuncId(module.funcs.len() as u32);
         let mut placed = func;
         placed.id = id;
@@ -568,7 +611,12 @@ pub(crate) fn lower_function_body_with_implicit_owner(
     own_members: Option<&std::collections::HashSet<String>>,
 ) -> crate::Func {
     lower_function_body_with_implicit_owner_priv(
-        module, f, implicit_params, owner_class, own_members, None,
+        module,
+        f,
+        implicit_params,
+        owner_class,
+        own_members,
+        None,
     )
 }
 
@@ -607,8 +655,11 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
     // `compareTo`-based total order, not the IEEE primitive — the
     // comparison-lowering arm consults this.
     if !f.type_params.is_empty() {
-        let tp_names: std::collections::HashSet<&str> =
-            f.type_params.iter().map(|tp| tp.name.name.as_str()).collect();
+        let tp_names: std::collections::HashSet<&str> = f
+            .type_params
+            .iter()
+            .map(|tp| tp.name.name.as_str())
+            .collect();
         for p in &f.params {
             if p.ty.function.is_none()
                 && !p.ty.nullable
@@ -645,11 +696,14 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
     // bare integer-literal result to a `Long` return slot (`fun f(): Long
     // = 0`). Inferred returns (no annotation) stay `Unit` — harmless, as
     // the coercion only triggers on an explicit `Long`.
-    let return_ty = f.return_type.as_ref().map_or_else(crate::TypeRef::unit, |rt| crate::TypeRef {
-        name: lowered_type_name(rt),
-        nullable: rt.nullable,
-        args: Vec::new(),
-    });
+    let return_ty = f
+        .return_type
+        .as_ref()
+        .map_or_else(crate::TypeRef::unit, |rt| crate::TypeRef {
+            name: lowered_type_name(rt),
+            nullable: rt.nullable,
+            args: Vec::new(),
+        });
     let mut func = b.finish(f.name.name.clone(), fqn, return_ty);
     let mut params: Vec<crate::Param> = implicit_params
         .iter()
@@ -680,13 +734,14 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
     // back to declaration order.
     if let Some(rt) = &f.receiver_type
         && let Some(first) = func.params.first_mut()
-            && first.name == "this" {
-                first.ty = crate::TypeRef {
-                    name: lowered_type_name(rt),
-                    nullable: rt.nullable,
-                    args: Vec::new(),
-                };
-            }
+        && first.name == "this"
+    {
+        first.ty = crate::TypeRef {
+            name: lowered_type_name(rt),
+            nullable: rt.nullable,
+            args: Vec::new(),
+        };
+    }
     func.is_suspend = f.is_suspend;
     func
 }

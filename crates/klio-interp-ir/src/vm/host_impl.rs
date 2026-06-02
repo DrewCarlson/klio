@@ -9,10 +9,7 @@ impl klio_ir::eval::Host for VmHost<'_> {
         Self::enclosing_this_chain(self)
     }
 
-    fn callable_receiver_shape(
-        &self,
-        v: &klio_runtime::Value,
-    ) -> Option<(usize, bool)> {
+    fn callable_receiver_shape(&self, v: &klio_runtime::Value) -> Option<(usize, bool)> {
         Self::callable_receiver_shape(self, v)
     }
 
@@ -21,18 +18,11 @@ impl klio_ir::eval::Host for VmHost<'_> {
     /// whether to override the slot with the calling frame's `this`
     /// for a receiver-typed lambda invoked bare (`body()` rather
     /// than `this.body()`).
-    fn closure_needs_this_capture(
-        &self,
-        v: &klio_runtime::Value,
-    ) -> bool {
+    fn closure_needs_this_capture(&self, v: &klio_runtime::Value) -> bool {
         Self::closure_needs_this_capture(self, v)
     }
 
-    fn override_closure_this(
-        &mut self,
-        v: &klio_runtime::Value,
-        new_this: &klio_runtime::Value,
-    ) {
+    fn override_closure_this(&mut self, v: &klio_runtime::Value, new_this: &klio_runtime::Value) {
         Self::override_closure_this(self, v, new_this);
     }
 
@@ -97,9 +87,9 @@ impl klio_ir::eval::Host for VmHost<'_> {
         &mut self,
         callee: &klio_runtime::Value,
         args: &[klio_runtime::Value],
-        _arg_names: &[Option<String>],
+        arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        Self::call_value_named(self, callee, args, _arg_names)
+        Self::call_value_named(self, callee, args, arg_names)
     }
 
     fn call_value_with_this(
@@ -107,9 +97,9 @@ impl klio_ir::eval::Host for VmHost<'_> {
         callee: &klio_runtime::Value,
         this_value: &klio_runtime::Value,
         args: &[klio_runtime::Value],
-        _arg_names: &[Option<String>],
+        arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        Self::call_value_with_this(self, callee, this_value, args, _arg_names)
+        Self::call_value_with_this(self, callee, this_value, args, arg_names)
     }
 
     fn get_field(
@@ -137,10 +127,7 @@ impl klio_ir::eval::Host for VmHost<'_> {
         Self::member_ref(self, receiver, name)
     }
 
-    fn register_class(
-        &mut self,
-        class: &klio_ast::Class,
-    ) -> Result<(), klio_ir::eval::EvalError> {
+    fn register_class(&mut self, class: &klio_ast::Class) -> Result<(), klio_ir::eval::EvalError> {
         Self::register_class(self, class)
     }
 
@@ -169,9 +156,17 @@ impl klio_ir::eval::Host for VmHost<'_> {
         qualifier: Option<&str>,
         name: &str,
         args: &[klio_runtime::Value],
-        _arg_names: &[Option<String>],
+        arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        Self::call_super(self, receiver, owner_class, qualifier, name, args, _arg_names)
+        Self::call_super(
+            self,
+            receiver,
+            owner_class,
+            qualifier,
+            name,
+            args,
+            arg_names,
+        )
     }
 
     fn qualified_this(
@@ -182,11 +177,7 @@ impl klio_ir::eval::Host for VmHost<'_> {
         Self::qualified_this(self, receiver, qualifier)
     }
 
-    fn instance_of(
-        &mut self,
-        value: &klio_runtime::Value,
-        ty: &klio_ir::TypeRef,
-    ) -> bool {
+    fn instance_of(&mut self, value: &klio_runtime::Value, ty: &klio_ir::TypeRef) -> bool {
         Self::instance_of(self, value, ty)
     }
 
@@ -233,13 +224,21 @@ impl klio_ir::eval::Host for VmHost<'_> {
     fn build_ast_lambda_with_flag_funcid(
         &mut self,
         params: &[String],
-        _body: &klio_ast::Block,
+        body: &klio_ast::Block,
         captured_names: &[String],
         captures: Vec<klio_runtime::Value>,
-        _absorb_return: bool,
+        absorb_return: bool,
         body_func: Option<klio_ir::FuncId>,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        Self::build_ast_lambda_with_flag_funcid(self, params, _body, captured_names, captures, _absorb_return, body_func)
+        Self::build_ast_lambda_with_flag_funcid(
+            self,
+            params,
+            body,
+            captured_names,
+            captures,
+            absorb_return,
+            body_func,
+        )
     }
 
     fn read_lambda_capture(
@@ -259,11 +258,7 @@ impl klio_ir::eval::Host for VmHost<'_> {
         Self::call_member(self, receiver, name, args)
     }
 
-    fn host_has_member(
-        &mut self,
-        receiver: &klio_runtime::Value,
-        name: &str,
-    ) -> bool {
+    fn host_has_member(&mut self, receiver: &klio_runtime::Value, name: &str) -> bool {
         Self::host_has_member(self, receiver, name)
     }
 

@@ -13,7 +13,11 @@ fn lower_first_fun(src: &str) -> String {
     let id = map.add("t.kt", src);
     let owned = map.get(id).source.clone();
     let lexed = Lexer::new(id, &owned).tokenize();
-    assert!(!lexed.diagnostics.has_errors(), "lex: {:?}", lexed.diagnostics.diagnostics());
+    assert!(
+        !lexed.diagnostics.has_errors(),
+        "lex: {:?}",
+        lexed.diagnostics.diagnostics()
+    );
     let (file, diags) = klio_parser::Parser::new(id, &owned, &lexed.tokens).parse_file();
     assert!(!diags.has_errors(), "parse: {:?}", diags.diagnostics());
     let func = file
@@ -26,7 +30,10 @@ fn lower_first_fun(src: &str) -> String {
         .expect("no function in source");
     let body = match func.body.as_ref().expect("function has no body") {
         FunctionBody::Block(b) => b.clone(),
-        FunctionBody::Expr(e) => klio_ast::Block { stmts: vec![klio_ast::Stmt::Expr(e.clone())], span: e.span() },
+        FunctionBody::Expr(e) => klio_ast::Block {
+            stmts: vec![klio_ast::Stmt::Expr(e.clone())],
+            span: e.span(),
+        },
     };
     let lowered = lower_function(&body, func.span);
     print_cfg(&lowered.cfg)

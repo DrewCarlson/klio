@@ -63,7 +63,11 @@ class Beth : Greeter { override fun name(): String = "Beth" }
 
 fun main() { println("${Anna().greet()}|${Beth().greet()}") }
 "#;
-    assert_klio("interface_default_method", src, "hello, Anna!|hello, Beth!\n");
+    assert_klio(
+        "interface_default_method",
+        src,
+        "hello, Anna!|hello, Beth!\n",
+    );
 }
 
 // 3. Secondary constructor delegating to the primary one.

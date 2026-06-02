@@ -1,4 +1,6 @@
-use super::{Parser, Block, TokenKind, Stmt, Keyword, Decl, ClassModifiers, Diagnostic, Ident, AssignOp};
+use super::{
+    AssignOp, Block, ClassModifiers, Decl, Diagnostic, Ident, Keyword, Parser, Stmt, TokenKind,
+};
 
 impl Parser<'_, '_> {
     pub(crate) fn parse_block(&mut self) -> Option<Block> {
@@ -25,7 +27,10 @@ impl Parser<'_, '_> {
             }
         }
         let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
-        Some(Block { stmts, span: lbrace.span.join(rbrace.span) })
+        Some(Block {
+            stmts,
+            span: lbrace.span.join(rbrace.span),
+        })
     }
 
     pub(crate) fn skip_stmt_separators(&mut self) {
@@ -34,6 +39,8 @@ impl Parser<'_, '_> {
         }
     }
 
+    // Single match-dispatch over statement-leading tokens; splitting would fragment it.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn parse_stmt(&mut self) -> Option<Stmt> {
         let save = self.pos;
         let flags = self.skip_modifiers_with_flags();
@@ -114,16 +121,18 @@ impl Parser<'_, '_> {
                 let visibility = flags.visibility;
                 let annotations = flags.annotations.clone();
                 let is_value = flags.is_value || flags.is_inline;
-                if flags.is_inline && !flags.is_value
-                    && let Some(span) = flags.inline_span {
-                        self.diagnostics.emit(
-                            Diagnostic::warning(
-                                "`inline class` is deprecated; use `value class` instead",
-                                span,
-                            )
-                            .with_code("W0001"),
-                        );
-                    }
+                if flags.is_inline
+                    && !flags.is_value
+                    && let Some(span) = flags.inline_span
+                {
+                    self.diagnostics.emit(
+                        Diagnostic::warning(
+                            "`inline class` is deprecated; use `value class` instead",
+                            span,
+                        )
+                        .with_code("W0001"),
+                    );
+                }
                 self.parse_class(
                     ClassModifiers {
                         is_data: flags.is_data,
@@ -150,8 +159,13 @@ impl Parser<'_, '_> {
                 // and falls through to expression parsing.
                 let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
                 if matches!(next, Some(TokenKind::Ident)) {
-                    self.parse_object(flags.is_data, flags.is_expect, flags.is_actual, flags.visibility)
-                        .map(|o| Stmt::Decl(Decl::Object(o)))
+                    self.parse_object(
+                        flags.is_data,
+                        flags.is_expect,
+                        flags.is_actual,
+                        flags.visibility,
+                    )
+                    .map(|o| Stmt::Decl(Decl::Object(o)))
                 } else {
                     // Roll back modifiers so the expression parser sees
                     // `object` at the head.
@@ -159,10 +173,9 @@ impl Parser<'_, '_> {
                     self.parse_expr_or_assign_stmt()
                 }
             }
-            TokenKind::Keyword(Keyword::Typealias) => {
-                self.parse_typealias(flags.visibility, flags.annotations)
-                    .map(|a| Stmt::Decl(Decl::TypeAlias(a)))
-            }
+            TokenKind::Keyword(Keyword::Typealias) => self
+                .parse_typealias(flags.visibility, flags.annotations)
+                .map(|a| Stmt::Decl(Decl::TypeAlias(a))),
             _ => {
                 // No declaration matched — roll back so unrelated modifiers
                 // (annotations on expressions, etc.) don't get swallowed.
@@ -193,7 +206,10 @@ impl Parser<'_, '_> {
             // Underscore-discard binding is parsed as an ident named `_`.
             let id = if text == "_" && matches!(self.peek_kind(), TokenKind::Ident) {
                 self.bump();
-                Ident { name: "_".into(), span }
+                Ident {
+                    name: "_".into(),
+                    span,
+                }
             } else {
                 self.parse_ident("destructured name")?
             };
@@ -215,7 +231,12 @@ impl Parser<'_, '_> {
         self.skip_nl();
         let init = self.parse_expr()?;
         let span = kw.span.join(init.span());
-        Some(Stmt::DestructuringDecl { mutable, names, init, span })
+        Some(Stmt::DestructuringDecl {
+            mutable,
+            names,
+            init,
+            span,
+        })
     }
 
     pub(crate) fn parse_expr_or_assign_stmt(&mut self) -> Option<Stmt> {
@@ -235,11 +256,15 @@ impl Parser<'_, '_> {
             self.skip_nl();
             let rhs = self.parse_expr()?;
             let span = lhs.span().join(rhs.span());
-            return Some(Stmt::Assign { target: lhs, op, value: rhs, span });
+            return Some(Stmt::Assign {
+                target: lhs,
+                op,
+                value: rhs,
+                span,
+            });
         }
         Some(Stmt::Expr(lhs))
     }
 
     // ---------- expressions (Pratt) ----------
-
 }
