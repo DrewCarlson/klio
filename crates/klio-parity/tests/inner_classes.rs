@@ -88,7 +88,7 @@ fun main() {
 
 #[test]
 fn inner_class_member_calls_outer_method() {
-    let src = r#"
+    let src = r"
 class Outer(val n: Int) {
     fun double(): Int = n * 2
     inner class Inner {
@@ -98,13 +98,13 @@ class Outer(val n: Int) {
 fun main() {
     println(Outer(5).Inner().work())
 }
-"#;
+";
     assert_klio("inner_calls_outer", src, "11\n");
 }
 
 #[test]
 fn sealed_class_with_nested_data_subclasses() {
-    let src = r#"
+    let src = r"
 sealed class Tree {
     data class Leaf(val v: Int) : Tree()
     data class Branch(val l: Tree, val r: Tree) : Tree()
@@ -117,7 +117,7 @@ fun main() {
     val t = Tree.Branch(Tree.Leaf(1), Tree.Branch(Tree.Leaf(2), Tree.Leaf(3)))
     println(sum(t))
 }
-"#;
+";
     assert_klio("sealed_tree", src, "6\n");
 }
 
@@ -200,7 +200,7 @@ fun main() {
 
 #[test]
 fn inner_class_init_block_sees_outer_field() {
-    let src = r#"
+    let src = r"
 class Listener
 class Bus {
     val listeners = mutableListOf<Listener>()
@@ -220,6 +220,6 @@ fun main() {
     s2.unsubscribe()
     println(b.listeners.size)
 }
-"#;
+";
     assert_klio("inner_init_outer", src, "2\n1\n0\n");
 }

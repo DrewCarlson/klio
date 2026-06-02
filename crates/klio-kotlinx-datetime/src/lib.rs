@@ -40,7 +40,7 @@ fn current_time_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 fn current_nanos_of_second(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let now = Utc::now();
-    Ok(Value::new_int(now.timestamp_subsec_nanos() as i64))
+    Ok(Value::new_int(i64::from(now.timestamp_subsec_nanos())))
 }
 
 fn current_system_tz_id(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -51,7 +51,7 @@ fn current_system_tz_id(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn arg_long(ctx: &CallCtx, idx: usize) -> Result<i64, RuntimeError> {
     match ctx.args.get(idx) {
         Some(Value::Long(l)) => Ok(*l),
-        Some(Value::Int(i)) => Ok(*i as i64),
+        Some(Value::Int(i)) => Ok(i64::from(*i)),
         _ => Err(RuntimeError::Type(format!(
             "kotlinx.datetime: argument {idx} must be Int/Long"
         ))),
@@ -98,13 +98,13 @@ fn instant_to_local_parts(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         None => utc.naive_utc(),
     };
     Ok(make_long_array(&[
-        local.year() as i64,
-        local.month() as i64,
-        local.day() as i64,
-        local.hour() as i64,
-        local.minute() as i64,
-        local.second() as i64,
-        local.nanosecond() as i64,
+        i64::from(local.year()),
+        i64::from(local.month()),
+        i64::from(local.day()),
+        i64::from(local.hour()),
+        i64::from(local.minute()),
+        i64::from(local.second()),
+        i64::from(local.nanosecond()),
     ]))
 }
 
@@ -128,7 +128,7 @@ fn local_to_instant(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         })?.with_timezone(&Utc),
         None => Utc.from_utc_datetime(&naive),
     };
-    Ok(make_long_array(&[utc.timestamp(), utc.timestamp_subsec_nanos() as i64]))
+    Ok(make_long_array(&[utc.timestamp(), i64::from(utc.timestamp_subsec_nanos())]))
 }
 
 fn instant_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -146,7 +146,7 @@ fn parse_instant(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         RuntimeError::Type(format!("failed to parse Instant `{input}`: {e}"))
     })?;
     let utc = dt.with_timezone(&Utc);
-    Ok(make_long_array(&[utc.timestamp(), utc.timestamp_subsec_nanos() as i64]))
+    Ok(make_long_array(&[utc.timestamp(), i64::from(utc.timestamp_subsec_nanos())]))
 }
 
 fn validate_time_zone(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -173,7 +173,7 @@ fn add_period(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let utc = Utc.timestamp_opt(epoch_sec, nanos).single().ok_or_else(|| {
         RuntimeError::Type(format!("invalid epoch seconds: {epoch_sec}"))
     })?;
-    let total_months = (years as i64) * 12 + (months as i64);
+    let total_months = i64::from(years) * 12 + i64::from(months);
     let local: chrono::DateTime<chrono::FixedOffset> = match parse_tz(&tz_id) {
         Some(tz) => utc.with_timezone(&tz).fixed_offset(),
         None => utc.fixed_offset(),
@@ -181,7 +181,7 @@ fn add_period(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let mut shifted = local;
     if total_months != 0 {
         let abs = total_months.unsigned_abs();
-        let months = Months::new(abs.min(u32::MAX as u64) as u32);
+        let months = Months::new(abs.min(u64::from(u32::MAX)) as u32);
         shifted = if total_months > 0 {
             shifted.checked_add_months(months)
         } else {
@@ -189,10 +189,10 @@ fn add_period(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         }
         .ok_or_else(|| RuntimeError::Type("DateTimePeriod month overflow".into()))?;
     }
-    let secs = (days as i64) * 86_400
-        + (hours as i64) * 3_600
-        + (minutes as i64) * 60
-        + (seconds as i64);
+    let secs = i64::from(days) * 86_400
+        + i64::from(hours) * 3_600
+        + i64::from(minutes) * 60
+        + i64::from(seconds);
     let total_nanos = nano_adjust + secs * 1_000_000_000;
     let dur = chrono::Duration::nanoseconds(total_nanos);
     shifted = shifted
@@ -201,6 +201,6 @@ fn add_period(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let utc_back = shifted.with_timezone(&Utc);
     Ok(make_long_array(&[
         utc_back.timestamp(),
-        utc_back.timestamp_subsec_nanos() as i64,
+        i64::from(utc_back.timestamp_subsec_nanos()),
     ]))
 }

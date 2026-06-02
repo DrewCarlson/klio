@@ -1,10 +1,11 @@
-use crate::*;
+use crate::{Vm, Arc, AtomicU64, SharedClosures, ProgramImage, Mutex, build, Output, VmHost, SendableVmSeed, VmIntrinsicHost, VmError, TlInitGuard};
 
 impl Vm {
     /// Build a Vm around an already-lowered IR module. Stdlib
     /// aliases (`print`, `println`, `listOf`, ...) are installed
     /// into globals up front so identifiers covered by Kotlin's
     /// default imports resolve without an explicit `import`.
+    #[must_use] 
     pub fn new(module: Arc<klio_ir::Module>) -> Self {
         let mut env = klio_runtime::Env::new();
         for (name, fqn) in klio_stdlib::IMPLICIT_ALIASES {
@@ -56,7 +57,8 @@ impl Vm {
 
     /// Build a Vm from a fully-prepared `build::BuiltModule`. The
     /// recommended entry point for the driver — it carries both the
-    /// IR module and the synthesised runtime ClassDef table.
+    /// IR module and the synthesised runtime `ClassDef` table.
+    #[must_use] 
     pub fn from_built(built: build::BuiltModule) -> (Self, Option<klio_ir::FuncId>) {
         let main = built.main;
         let mut vm = Self::new(Arc::clone(&built.module));
@@ -117,6 +119,7 @@ impl Vm {
     /// needs to materialize its own child `Vm`. Holding it does not
     /// keep the parent thread's borrows alive — every field is an
     /// owned `Arc`/`ObjRef`/atomic.
+    #[must_use] 
     pub fn spawn_child(&self) -> SendableVmSeed {
         SendableVmSeed {
             module: Arc::clone(&self.module),
@@ -241,16 +244,14 @@ impl Vm {
                 <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
                     .map_err(VmError::from)?
             };
-            if let klio_runtime::Value::Instance(i) = &inst {
-                if let Some((outer_name, _)) = obj_name.split_once("$Companion$") {
-                    if let Some(outer_def) =
+            if let klio_runtime::Value::Instance(i) = &inst
+                && let Some((outer_name, _)) = obj_name.split_once("$Companion$")
+                    && let Some(outer_def) =
                         self.classes.borrow().get(outer_name).cloned()
                     {
                         i.borrow_mut().outer =
                             Some(klio_runtime::Value::Class(outer_def));
                     }
-                }
-            }
             self.globals.borrow_mut().define(obj_name, inst);
         }
         // Run top-level property initialisers before main so global
@@ -267,23 +268,21 @@ impl Vm {
                 let mut host = self.make_host(out);
                 let mut v = klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
                     .map_err(VmError::from)?;
-                if module.registry.top_level_delegated_props.contains(name) {
-                    if let klio_runtime::Value::Instance(ref inst) = v {
+                if module.registry.top_level_delegated_props.contains(name)
+                    && let klio_runtime::Value::Instance(ref inst) = v {
                         let dcls_name = inst.borrow().class.name.clone();
                         let has_provide = module
                             .classes
                             .iter()
                             .find(|c| c.name == dcls_name)
-                            .map(|c| {
+                            .is_some_and(|c| {
                                 c.methods.iter().any(|fid| {
                                     module
                                         .funcs
                                         .get(fid.0 as usize)
-                                        .map(|f| f.name == "provideDelegate")
-                                        .unwrap_or(false)
+                                        .is_some_and(|f| f.name == "provideDelegate")
                                 })
-                            })
-                            .unwrap_or(false);
+                            });
                         if has_provide {
                             let prop_ref = klio_runtime::Value::PropertyRef {
                                 name: Arc::new(name.clone()),
@@ -300,7 +299,6 @@ impl Vm {
                             }
                         }
                     }
-                }
                 v
             };
             self.globals.borrow_mut().define(name, v);
@@ -362,12 +360,12 @@ impl Vm {
         // child that threw surfaces here only if `main` itself did
         // not already fail.
         let pending: Vec<u64> = {
-            let g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+            let g = self.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.keys().copied().collect()
         };
         for id in pending {
             let handle = {
-                let mut g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = self.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 g.get_mut(&id).and_then(|e| e.handle.take())
             };
             if let Some(h) = handle {

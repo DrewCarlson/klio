@@ -8,8 +8,8 @@
 //! `kotlinx_demo` is the sole shipped consumer of the datetime pack;
 //! its stdout is pinned byte-for-byte so the upstream-value-type
 //! migration must keep it identical. `dt_smoke` is a focused datetime
-//! litmus (leap day, UTC Instant<->LocalDateTime round-trip, calendar
-//! DateTimePeriod add, verbatim upstream Month/DayOfWeek enums).
+//! litmus (leap day, UTC Instant<->`LocalDateTime` round-trip, calendar
+//! `DateTimePeriod` add, verbatim upstream Month/DayOfWeek enums).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

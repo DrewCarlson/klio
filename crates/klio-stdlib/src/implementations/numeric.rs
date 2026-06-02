@@ -1,4 +1,4 @@
-use super::*;
+use super::{Value, RuntimeError, CallCtx, make_exception, Arc, kotlin_float_total_cmp, arg2, num_extreme};
 
 // ============================================================
 // Int members
@@ -39,14 +39,14 @@ pub(crate) fn int_to_radix_string(n: i64, radix: u32) -> String {
     let mut x = if negative {
         // Cast through i128 to handle i64::MIN. Kotlin renders the absolute
         // digit run with a leading `-`.
-        (n as i128).unsigned_abs()
+        i128::from(n).unsigned_abs()
     } else {
         n as u128
     };
     let mut digits = Vec::new();
     while x > 0 {
-        let d = (x % radix as u128) as u32;
-        x /= radix as u128;
+        let d = (x % u128::from(radix)) as u32;
+        x /= u128::from(radix);
         digits.push(std::char::from_digit(d, radix).unwrap());
     }
     if negative {
@@ -141,7 +141,7 @@ pub(crate) fn unsigned_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 
 // Float receiver conversions.
 pub(crate) fn float_to_double(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    Ok(Value::Double(recv_float(ctx.args, "Float.toDouble")? as f64))
+    Ok(Value::Double(f64::from(recv_float(ctx.args, "Float.toDouble")?)))
 }
 pub(crate) fn float_to_float(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Float(recv_float(ctx.args, "Float.toFloat")?))
@@ -179,7 +179,7 @@ pub(crate) fn float_compare_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
     })?;
     // `compareTo` is a total order (NaN greatest, -0.0 < 0.0), unlike the
     // IEEE `<`/`>` operators.
-    Ok(Value::new_int(kotlin_float_total_cmp(a as f64, b as f64) as i64))
+    Ok(Value::new_int(kotlin_float_total_cmp(f64::from(a), f64::from(b)) as i64))
 }
 
 // Double additional conversions (Float).
@@ -272,14 +272,14 @@ pub(crate) fn long_compare_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
     let Some(b) = ctx.args.get(1).and_then(Value::as_i64) else {
         return Err(RuntimeError::Type("Long.compareTo requires a Long".into()));
     };
-    Ok(Value::Int(if a < b { -1 } else if a > b { 1 } else { 0 }))
+    Ok(Value::Int(if a < b { -1 } else { i32::from(a > b) }))
 }
 pub(crate) fn int_compare_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let a = recv_int(ctx.args, "Int.compareTo")?;
     let Some(b) = ctx.args.get(1).and_then(Value::as_i64) else {
         return Err(RuntimeError::Type("Int.compareTo requires an Int".into()));
     };
-    Ok(Value::Int(if a < b { -1 } else if a > b { 1 } else { 0 }))
+    Ok(Value::Int(if a < b { -1 } else { i32::from(a > b) }))
 }
 
 // ============================================================
@@ -315,10 +315,10 @@ pub(crate) fn f64_to_i32_kotlin(d: f64) -> i32 {
     if d.is_nan() {
         return 0;
     }
-    if d >= i32::MAX as f64 {
+    if d >= f64::from(i32::MAX) {
         return i32::MAX;
     }
-    if d <= i32::MIN as f64 {
+    if d <= f64::from(i32::MIN) {
         return i32::MIN;
     }
     d as i32
@@ -390,12 +390,12 @@ pub(crate) fn double_from_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
 }
 pub(crate) fn float_to_raw_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let f = recv_float(ctx.args, "Float.toRawBits")?;
-    Ok(Value::new_int(f.to_bits() as i32 as i64))
+    Ok(Value::new_int(i64::from(f.to_bits() as i32)))
 }
 pub(crate) fn float_to_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let f = recv_float(ctx.args, "Float.toBits")?;
     let bits = if f.is_nan() { 0x7fc0_0000u32 } else { f.to_bits() };
-    Ok(Value::new_int(bits as i32 as i64))
+    Ok(Value::new_int(i64::from(bits as i32)))
 }
 pub(crate) fn float_from_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let bits = ctx
@@ -476,7 +476,7 @@ pub(crate) fn int_coerce_at_most(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 /// negative infinity (Kotlin's `floorDiv`, distinct from `/` which
 /// truncates toward zero). Result widens to `Long` if either operand
 /// is `Long`, else `Int`.
-/// `Int`/`Long`.countLeadingZeroBits() — leading zeros in the
+/// `Int`/`Long`.`countLeadingZeroBits()` — leading zeros in the
 /// two's-complement bit pattern (32 / 64 wide). Result is Int.
 pub(crate) fn num_count_leading_zero_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let recv = ctx
@@ -494,10 +494,10 @@ pub(crate) fn num_count_leading_zero_bits(ctx: &mut CallCtx) -> Result<Value, Ru
             )))
         }
     };
-    Ok(Value::new_int(n as i64))
+    Ok(Value::new_int(i64::from(n)))
 }
 
-/// `Int`/`Long`.countTrailingZeroBits().
+/// `Int`/`Long`.`countTrailingZeroBits()`.
 pub(crate) fn num_count_trailing_zero_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let recv = ctx
         .args
@@ -514,10 +514,10 @@ pub(crate) fn num_count_trailing_zero_bits(ctx: &mut CallCtx) -> Result<Value, R
             )))
         }
     };
-    Ok(Value::new_int(n as i64))
+    Ok(Value::new_int(i64::from(n)))
 }
 
-/// `Int`/`Long`.countOneBits() (population count).
+/// `Int`/`Long`.`countOneBits()` (population count).
 pub(crate) fn num_count_one_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let recv = ctx
         .args
@@ -534,7 +534,7 @@ pub(crate) fn num_count_one_bits(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
             )))
         }
     };
-    Ok(Value::new_int(n as i64))
+    Ok(Value::new_int(i64::from(n)))
 }
 
 pub(crate) fn num_floor_div(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

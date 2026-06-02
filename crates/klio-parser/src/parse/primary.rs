@@ -1,6 +1,6 @@
-use super::*;
+use super::{Parser, Expr, TokenKind, Ident, Keyword, StringPart};
 
-impl<'src, 'tok> Parser<'src, 'tok> {
+impl Parser<'_, '_> {
     pub(crate) fn parse_primary(&mut self) -> Option<Expr> {
         self.skip_nl();
         let kind = self.peek_kind().clone();

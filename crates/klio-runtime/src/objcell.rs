@@ -55,7 +55,7 @@ use cell_sync::{AtomicU8, Cell, Ordering, UnsafeCell};
 ///
 /// `flag`: `0` = free, `n > 0` = `n` shared borrows, `-1` = mutably
 /// borrowed (the `RefCell` encoding). Only the UNSHARED path touches
-/// `flag`; the SHARED path's discipline is the RwLock itself.
+/// `flag`; the SHARED path's discipline is the `RwLock` itself.
 ///
 /// # Safety / publication protocol
 ///
@@ -81,7 +81,7 @@ use cell_sync::{AtomicU8, Cell, Ordering, UnsafeCell};
 /// model demands.
 ///
 /// - **Shared-object field access** — every `borrow()`/`borrow_mut()`
-///   on a `SHARED` cell acquires this `AdaptiveCell`'s RwLock (read
+///   on a `SHARED` cell acquires this `AdaptiveCell`'s `RwLock` (read
 ///   or write) and releases it on guard drop. The lock's
 ///   acquire/release plus the `state` `Release` (in [`publish`]) /
 ///   `Acquire` (in every borrow's state load) pair is the
@@ -95,7 +95,7 @@ use cell_sync::{AtomicU8, Cell, Ordering, UnsafeCell};
 ///   unlock happens-before the next lock of the same monitor.
 /// - **`@Volatile`** — *subsumed, by deliberate and sound design*.
 ///   Every field access on a *shared* instance already goes through
-///   this RwLock, which gives sequentially-consistent ordering for
+///   this `RwLock`, which gives sequentially-consistent ordering for
 ///   *all* fields of the object, not just one. Lock-mediated shared
 ///   access is strictly stronger than per-field volatile (it orders
 ///   the whole object, and a `borrow_mut` is a full release of every
@@ -171,7 +171,7 @@ impl<T: ?Sized> AdaptiveCell<T> {
         }
     }
 
-    /// Acquire the per-cell RwLock for a *shared* borrow once the
+    /// Acquire the per-cell `RwLock` for a *shared* borrow once the
     /// cell is `SHARED`: a read guard, so concurrent readers run in
     /// parallel. The non-loom path uses `read_recursive()` so a
     /// thread that already holds a read guard on this cell (the
@@ -191,7 +191,7 @@ impl<T: ?Sized> AdaptiveCell<T> {
         }
     }
 
-    /// Acquire the per-cell RwLock for an *exclusive* borrow once the
+    /// Acquire the per-cell `RwLock` for an *exclusive* borrow once the
     /// cell is `SHARED`: a write guard, mutually exclusive against
     /// every reader and writer.
     #[inline(always)]
@@ -515,7 +515,7 @@ impl<T: ?Sized> ObjRef<T> {
     /// Two `ObjRef`s with this same value share the same cell.
     #[must_use]
     pub fn identity(&self) -> usize {
-        self.as_ptr() as *const () as usize
+        self.as_ptr().cast::<()>() as usize
     }
 }
 
@@ -538,7 +538,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ObjRef<T> {
 
 /// Shared-borrow guard. On the UNSHARED path it restores the
 /// `RefCell` borrow count on drop; on the SHARED path it instead
-/// holds a RwLock read guard (`_shared`) for its lifetime and the
+/// holds a `RwLock` read guard (`_shared`) for its lifetime and the
 /// lock — not `flag` — is the discipline.
 pub struct ObjGuard<'a, T: ?Sized> {
     cell: &'a AdaptiveCell<T>,
@@ -576,7 +576,7 @@ impl<T: ?Sized + fmt::Display> fmt::Display for ObjGuard<'_, T> {
 
 /// Mutable-borrow guard. On the UNSHARED path it restores the
 /// `RefCell` borrow flag on drop; on the SHARED path it instead
-/// holds an exclusive RwLock write guard (`_shared`) for its
+/// holds an exclusive `RwLock` write guard (`_shared`) for its
 /// lifetime.
 pub struct ObjGuardMut<'a, T: ?Sized> {
     cell: &'a AdaptiveCell<T>,
@@ -623,7 +623,7 @@ impl<T: ?Sized + fmt::Display> fmt::Display for ObjGuardMut<'_, T> {
 ///
 /// The concrete happens-before mechanism for every seam is now
 /// real and is stated normatively in the **fence matrix** on
-/// [`AdaptiveCell`] (shared-object access → the cell RwLock + the
+/// [`AdaptiveCell`] (shared-object access → the cell `RwLock` + the
 /// `state` `Release`/`Acquire` on [`ObjRef::publish`]; monitors → the
 /// process-wide reentrant monitor's `Mutex`/`Condvar`; `@Volatile` →
 /// subsumed by lock-mediated shared access; atomics → the underlying

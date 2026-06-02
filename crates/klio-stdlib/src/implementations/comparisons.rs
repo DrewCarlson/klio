@@ -1,4 +1,4 @@
-use super::*;
+use super::{CallCtx, Value, RuntimeError, compare_values, Arc};
 
 pub(crate) fn cmp_compare_values_by(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     if ctx.args.len() < 3 {
@@ -81,7 +81,7 @@ pub(crate) fn cmp_compare_values(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
             std::cmp::Ordering::Greater => 1,
         },
     };
-    Ok(Value::new_int(n as i64))
+    Ok(Value::new_int(i64::from(n)))
 }
 
 // ============================================================

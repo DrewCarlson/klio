@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{SourceMap, PathBuf};
 
 /// Build a single `HostBindings` table that the loader passes to
 /// every pack: starts with `klio-stdlib`'s defaults and unions in
@@ -192,29 +192,23 @@ pub(crate) fn load_installed_packs(
     // `kotlinx.datetime.Instant` is a typealias to
     // `kotlin.time.Instant`) also triggers the load — gating on the
     // user program's imports alone would miss it.
-    let cache = match klio_cache_dir() {
-        Ok(c) => c,
-        Err(_) => {
-            load_embedded_stdlib_sources(
-                &user_import_prefixes,
-                source_map,
-                &mut out_asts,
-                &mut out_bindings,
-            );
-            return (out_asts, out_bindings);
-        }
+    let cache = if let Ok(c) = klio_cache_dir() { c } else {
+        load_embedded_stdlib_sources(
+            &user_import_prefixes,
+            source_map,
+            &mut out_asts,
+            &mut out_bindings,
+        );
+        return (out_asts, out_bindings);
     };
-    let entries = match std::fs::read_dir(&cache) {
-        Ok(e) => e,
-        Err(_) => {
-            load_embedded_stdlib_sources(
-                &user_import_prefixes,
-                source_map,
-                &mut out_asts,
-                &mut out_bindings,
-            );
-            return (out_asts, out_bindings);
-        }
+    let entries = if let Ok(e) = std::fs::read_dir(&cache) { e } else {
+        load_embedded_stdlib_sources(
+            &user_import_prefixes,
+            source_map,
+            &mut out_asts,
+            &mut out_bindings,
+        );
+        return (out_asts, out_bindings);
     };
     let merged = merged_host_bindings();
     // Collect every candidate pack on disk once. Loading is then a
@@ -232,13 +226,12 @@ pub(crate) fn load_installed_packs(
     let mut candidates: Vec<PackCandidate> = Vec::new();
     for e in entries.flatten() {
         let p = e.path();
-        if p.extension().map(|x| x != "klio-pack").unwrap_or(true) {
+        if p.extension().is_none_or(|x| x != "klio-pack") {
             continue;
         }
         if p.file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.starts_with("stdlib"))
-            .unwrap_or(false)
+            .is_some_and(|n| n.starts_with("stdlib"))
         {
             continue;
         }
@@ -304,8 +297,8 @@ pub(crate) fn load_installed_packs(
         // grammar. Falls back to the frozen `ast` bundle only when
         // the `sources` section is absent.
         let mut loaded_from_sources = false;
-        if let Ok(Some(payload)) = pack.read_section(section_names::SOURCES) {
-            if let Ok(bundle) = decode::<klio_pack::schema::SourceBundle>(&payload) {
+        if let Ok(Some(payload)) = pack.read_section(section_names::SOURCES)
+            && let Ok(bundle) = decode::<klio_pack::schema::SourceBundle>(&payload) {
                 for sf in &bundle.files {
                     // See load_embedded_stdlib_sources / klio_stdlib::
                     // CONSUMPTION_DEFERRED_SOURCES: these parse but their
@@ -350,10 +343,9 @@ pub(crate) fn load_installed_packs(
                     loaded_from_sources = true;
                 }
             }
-        }
-        if !loaded_from_sources {
-            if let Ok(Some(payload)) = pack.read_section(section_names::AST) {
-                if let Ok(ast_bundle) = decode::<AstBundle>(&payload) {
+        if !loaded_from_sources
+            && let Ok(Some(payload)) = pack.read_section(section_names::AST)
+                && let Ok(ast_bundle) = decode::<AstBundle>(&payload) {
                     for f in ast_bundle.files {
                         if let Some(pkg) = &f.kotlin_file.package {
                             let path = pkg
@@ -378,10 +370,8 @@ pub(crate) fn load_installed_packs(
                         out_asts.push(f.kotlin_file);
                     }
                 }
-            }
-        }
-        if let Ok(Some(payload)) = pack.read_section(section_names::BINDINGS) {
-            if let Ok(bm) = decode::<BindingManifest>(&payload) {
+        if let Ok(Some(payload)) = pack.read_section(section_names::BINDINGS)
+            && let Ok(bm) = decode::<BindingManifest>(&payload) {
                 for b in bm.bindings {
                     if let Some(f) = merged.resolve(&b.host_symbol) {
                         // HostBindings keys are `'static`; leak the
@@ -394,7 +384,6 @@ pub(crate) fn load_installed_packs(
                     }
                 }
             }
-        }
         // Also bring in any merged binding whose FQN sits under the
         // loaded pack's library_id but isn't explicitly listed in
         // the pack manifest. Newer Rust-side bindings (e.g. host
@@ -499,7 +488,7 @@ fn rebuild_cache_index(cache: &std::path::Path) -> Result<(), String> {
     let mut out: Vec<CacheIndexEntry> = Vec::new();
     for e in entries.flatten() {
         let p = e.path();
-        if p.extension().map(|x| x != "klio-pack").unwrap_or(true) {
+        if p.extension().is_none_or(|x| x != "klio-pack") {
             continue;
         }
         let Ok(m) = read_pack_manifest(&p) else { continue };
@@ -527,7 +516,7 @@ pub(crate) fn list_cache_packs() -> Result<(), String> {
     let mut paths: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "klio-pack").unwrap_or(false))
+        .filter(|p| p.extension().is_some_and(|x| x == "klio-pack"))
         .collect();
     paths.sort();
     for path in paths {
@@ -575,11 +564,10 @@ pub(crate) fn remove_cache_pack(library_id: &str, version: Option<&str>) -> Resu
         if manifest.library_id != library_id {
             continue;
         }
-        if let Some(v) = version {
-            if manifest.library_version != v {
+        if let Some(v) = version
+            && manifest.library_version != v {
                 continue;
             }
-        }
         std::fs::remove_file(&p).map_err(|e| e.to_string())?;
         let _ = rebuild_cache_index(&cache);
         return Ok(p);

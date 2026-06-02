@@ -26,7 +26,7 @@ fn run(src: &str) {
         return;
     };
     let (mut vm, _main) = Vm::from_built(built);
-    let mut out = CaptureOutput::default();
+    let mut out = CaptureOutput;
     let _ = vm.run(main_id, &mut out);
 }
 
@@ -35,12 +35,12 @@ fn bench(c: &mut Criterion, name: &str, body: &str) {
 }
 
 fn bench_intrinsics(c: &mut Criterion) {
-    bench(c, "stdlib_map_filter_fold", r#"
+    bench(c, "stdlib_map_filter_fold", r"
 fun main() {
     val xs = (1..1000).toList()
     val r = xs.map { it * 2 }.filter { it % 3 == 0 }.fold(0) { acc, x -> acc + x }
     println(r)
-}"#);
+}");
     bench(c, "stdlib_string_format", r#"
 fun main() {
     var n = 0
@@ -48,13 +48,13 @@ fun main() {
     while (i < 1000) { n += "%05d".format(i).length; i += 1 }
     println(n)
 }"#);
-    bench(c, "stdlib_stringbuilder", r#"
+    bench(c, "stdlib_stringbuilder", r"
 fun main() {
     val sb = StringBuilder()
     var i = 0
     while (i < 2000) { sb.append(i); sb.append(','); i += 1 }
     println(sb.length)
-}"#);
+}");
     bench(c, "stdlib_regex_match", r#"
 fun main() {
     val r = Regex("\\d+")
@@ -64,13 +64,13 @@ fun main() {
     while (i < 500) { n += r.findAll(s).count(); i += 1 }
     println(n)
 }"#);
-    bench(c, "stdlib_list_grow", r#"
+    bench(c, "stdlib_list_grow", r"
 fun main() {
     val xs = mutableListOf<Int>()
     var i = 0
     while (i < 5000) { xs.add(i); i += 1 }
     println(xs.size)
-}"#);
+}");
 }
 
 criterion_group!(benches, bench_intrinsics);

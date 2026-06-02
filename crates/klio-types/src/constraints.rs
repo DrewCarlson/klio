@@ -27,16 +27,13 @@ pub struct InferenceVar(pub u32);
 /// upper bounds) preference attached to an inference variable. Spec
 /// §13.2.2. Variables default to pull-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SolutionPreference {
+    #[default]
     PullUp,
     PushDown,
 }
 
-impl Default for SolutionPreference {
-    fn default() -> Self {
-        Self::PullUp
-    }
-}
 
 /// A variable that cannot be fixed in the active stage because its
 /// resolution depends on something else (a lambda body that has not
@@ -91,6 +88,7 @@ impl BoundSet {
 
     /// `true` once the postponed gating has been cleared and this
     /// variable is eligible for fixation in the next stage.
+    #[must_use] 
     pub fn is_postponed(&self) -> bool {
         self.postponed.is_some()
     }
@@ -252,6 +250,7 @@ impl ConstraintSystem {
     }
 
     /// Returns the postponed kind for `v`, if any.
+    #[must_use] 
     pub fn postponed_kind(&self, v: InferenceVar) -> Option<&PostponedKind> {
         self.bounds.get(&v).and_then(|b| b.postponed.as_ref())
     }
@@ -329,7 +328,7 @@ impl ConstraintSystem {
         self.equiv.insert(drop, keep);
         // Merge bound sets: drop's bounds become keep's bounds.
         if let Some(dropped) = self.bounds.remove(&drop) {
-            let target = self.bounds.entry(keep).or_insert_with(BoundSet::new);
+            let target = self.bounds.entry(keep).or_default();
             for t in dropped.lower {
                 if !target.lower.contains(&t) {
                     target.lower.push(t);
@@ -357,12 +356,14 @@ impl ConstraintSystem {
     /// Returns the canonical representative of an inference variable's
     /// equivalence class. Callers use this to rewrite bounds through
     /// the union-find before consulting them.
+    #[must_use] 
     pub fn canonical(&self, v: InferenceVar) -> InferenceVar {
         self.find_root(v)
     }
 
     /// The last unsatisfied constraint together with its provenance,
     /// for diagnostics. Resets when the caller clears it.
+    #[must_use] 
     pub fn last_error(&self) -> Option<&(InferenceError, Provenance)> {
         self.last_error.as_ref()
     }
@@ -392,7 +393,7 @@ impl ConstraintSystem {
         // Inference variable on either side -> add a bound.
         if let Some(v) = self.is_inference_var(&lhs) {
             let v = self.find_root(v);
-            self.bounds.entry(v).or_insert_with(BoundSet::new).add_upper(rhs.clone());
+            self.bounds.entry(v).or_default().add_upper(rhs.clone());
             if matches!(kind, ConstraintKind::Equality) {
                 self.bounds.get_mut(&v).unwrap().add_lower(rhs);
             }
@@ -400,7 +401,7 @@ impl ConstraintSystem {
         }
         if let Some(v) = self.is_inference_var(&rhs) {
             let v = self.find_root(v);
-            self.bounds.entry(v).or_insert_with(BoundSet::new).add_lower(lhs.clone());
+            self.bounds.entry(v).or_default().add_lower(lhs.clone());
             if matches!(kind, ConstraintKind::Equality) {
                 self.bounds.get_mut(&v).unwrap().add_upper(lhs);
             }
@@ -686,17 +687,15 @@ impl ConstraintSystem {
         let mut out = Vec::new();
         for (av, bs_a) in &self.bounds {
             for t in &bs_a.upper {
-                if let Some(bv) = self.is_inference_var(t) {
-                    if let Some(bs_b) = self.bounds.get(&bv) {
-                        if bs_b
+                if let Some(bv) = self.is_inference_var(t)
+                    && let Some(bs_b) = self.bounds.get(&bv)
+                        && bs_b
                             .upper
                             .iter()
                             .any(|s| self.is_inference_var(s) == Some(*av))
                         {
                             out.push((*av, bv));
                         }
-                    }
-                }
             }
         }
         out
@@ -723,6 +722,7 @@ impl ConstraintSystem {
     /// order-independent batches are fixed in parallel inside a
     /// stage, and an SCC of mutually-dependent vars is resolved
     /// together by repeated substitution until the fix points.
+    #[must_use] 
     pub fn solve_staged(&self) -> HashMap<InferenceVar, Type> {
         let vars: Vec<InferenceVar> = self.bounds.keys().copied().collect();
         let mut deps: HashMap<InferenceVar, Vec<InferenceVar>> = HashMap::new();
@@ -786,7 +786,7 @@ impl ConstraintSystem {
                 let uppers: Vec<Type> = bs
                     .upper
                     .iter()
-                    .map(|t| substitute(t))
+                    .map(&substitute)
                     .filter(|t| !matches!(t, Type::Nullable(inner) if matches!(**inner, Type::Any)))
                     .filter(|t| self.is_inference_var(t).is_none())
                     .collect();
@@ -800,7 +800,7 @@ impl ConstraintSystem {
                 let lowers: Vec<Type> = bs
                     .lower
                     .iter()
-                    .map(|t| substitute(t))
+                    .map(substitute)
                     .filter(|t| !matches!(t, Type::Nothing))
                     .filter(|t| self.is_inference_var(t).is_none())
                     .collect();
@@ -816,6 +816,7 @@ impl ConstraintSystem {
     /// Picks a concrete substitution for every inference variable using
     /// the spec §13.2.2 rule: push-down → GLB of upper bounds (= their
     /// intersection); pull-up (and default) → LUB of lower bounds.
+    #[must_use] 
     pub fn solve(&self) -> HashMap<InferenceVar, Type> {
         let mut out = HashMap::new();
         for (v, bs) in &self.bounds {

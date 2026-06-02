@@ -59,7 +59,7 @@ fn receiver_instance<'a>(
 
 fn int_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result<i64, RuntimeError> {
     match inst.borrow().get("value") {
-        Some(Value::Int(i)) => Ok(i as i64),
+        Some(Value::Int(i)) => Ok(i64::from(i)),
         Some(Value::Long(l)) => Ok(l),
         _ => Err(RuntimeError::Type(
             "AtomicInt: receiver missing `value: Int`".into(),
@@ -70,7 +70,7 @@ fn int_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result<
 fn long_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result<i64, RuntimeError> {
     match inst.borrow().get("value") {
         Some(Value::Long(l)) => Ok(l),
-        Some(Value::Int(i)) => Ok(i as i64),
+        Some(Value::Int(i)) => Ok(i64::from(i)),
         _ => Err(RuntimeError::Type(
             "AtomicLong: receiver missing `value: Long`".into(),
         )),
@@ -88,7 +88,7 @@ fn bool_field(inst: &klio_runtime::ObjRef<klio_runtime::InstanceData>) -> Result
 
 fn arg_int(ctx: &CallCtx, idx: usize) -> Result<i64, RuntimeError> {
     match ctx.args.get(idx) {
-        Some(Value::Int(i)) => Ok(*i as i64),
+        Some(Value::Int(i)) => Ok(i64::from(*i)),
         Some(Value::Long(l)) => Ok(*l),
         _ => Err(RuntimeError::Type(format!(
             "kotlinx.atomicfu: argument {idx} must be Int/Long"
@@ -131,7 +131,7 @@ fn with_int_field_mut<R>(
 ) -> Result<R, RuntimeError> {
     let mut guard = inst.borrow_mut();
     let cur = match guard.get("value") {
-        Some(Value::Int(i)) => i as i64,
+        Some(Value::Int(i)) => i64::from(i),
         Some(Value::Long(l)) => l,
         _ => {
             return Err(RuntimeError::Type(

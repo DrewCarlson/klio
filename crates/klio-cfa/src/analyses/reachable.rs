@@ -22,10 +22,12 @@ pub struct Reachability {
 }
 
 impl Reachability {
+    #[must_use] 
     pub fn is_reachable(&self, b: BlockId) -> bool {
         self.reachable.get(b.0 as usize).copied().unwrap_or(false)
     }
 
+    #[must_use] 
     pub fn unreachable_blocks(&self) -> Vec<BlockId> {
         self.reachable
             .iter()
@@ -35,6 +37,7 @@ impl Reachability {
     }
 }
 
+#[must_use] 
 pub fn analyse(cfg: &Cfg) -> Reachability {
     analyse_with_types(cfg, None)
 }
@@ -43,6 +46,7 @@ pub fn analyse(cfg: &Cfg) -> Reachability {
 /// span→Type results) so an `Eval` of a `Nothing`-typed expression
 /// is treated like an in-block `Unreachable` marker: control does
 /// not propagate past it.
+#[must_use] 
 pub fn analyse_with_types(cfg: &Cfg, type_map: Option<&HashMap<(u32, u32), Type>>) -> Reachability {
     let mut reachable = vec![false; cfg.blocks.len()];
     let mut stack: Vec<BlockId> = vec![cfg.entry];

@@ -91,15 +91,14 @@ impl PackWriter {
         // Emit the dictionary as a `zstd_dict` section so readers
         // can resolve it on load. If the user explicitly added a
         // zstd_dict section we honour theirs.
-        if let Some(dict) = &self.zstd_dict {
-            if !self.sections.iter().any(|s| s.name == section_names::ZSTD_DICT) {
+        if let Some(dict) = &self.zstd_dict
+            && !self.sections.iter().any(|s| s.name == section_names::ZSTD_DICT) {
                 self.sections.push(PendingSection {
                     name: section_names::ZSTD_DICT.to_string(),
                     payload: dict.clone(),
                     compression: Compression::None,
                 });
             }
-        }
         // Sort by section name so the encoded directory and payload
         // ordering are stable across builds.
         self.sections.sort_by(|a, b| a.name.cmp(&b.name));

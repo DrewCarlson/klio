@@ -1,4 +1,4 @@
-use super::*;
+use super::{Value, RuntimeError, CallCtx, compare_host_aware, compare_values, recv_double, make_exception};
 
 // ============================================================
 // math
@@ -7,7 +7,7 @@ use super::*;
 pub(crate) fn as_double(v: &Value, what: &str) -> Result<f64, RuntimeError> {
     match v {
         Value::Double(d) => Ok(*d),
-        Value::Int(n) => Ok(*n as f64),
+        Value::Int(n) => Ok(f64::from(*n)),
         other => Err(RuntimeError::Type(format!("{what} requires a number, got {other:?}"))),
     }
 }
@@ -34,21 +34,21 @@ pub(crate) fn num_extreme(args: &[Value], want_min: bool, what: &str) -> Result<
     };
     fn as_f(v: &Value) -> Option<f64> {
         match v {
-            Value::Int(x) => Some(*x as f64),
+            Value::Int(x) => Some(f64::from(*x)),
             Value::Long(x) => Some(*x as f64),
-            Value::Short(x) => Some(*x as f64),
-            Value::Byte(x) => Some(*x as f64),
-            Value::Float(x) => Some(*x as f64),
+            Value::Short(x) => Some(f64::from(*x)),
+            Value::Byte(x) => Some(f64::from(*x)),
+            Value::Float(x) => Some(f64::from(*x)),
             Value::Double(x) => Some(*x),
             _ => None,
         }
     }
     fn as_i(v: &Value) -> Option<i64> {
         match v {
-            Value::Int(x) => Some(*x as i64),
+            Value::Int(x) => Some(i64::from(*x)),
             Value::Long(x) => Some(*x),
-            Value::Short(x) => Some(*x as i64),
-            Value::Byte(x) => Some(*x as i64),
+            Value::Short(x) => Some(i64::from(*x)),
+            Value::Byte(x) => Some(i64::from(*x)),
             _ => None,
         }
     }
@@ -201,7 +201,7 @@ pub(crate) fn math_sign(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     match v {
         Value::Int(n) => Ok(Value::Int(n.signum())),
         Value::Long(n) => Ok(Value::Int(n.signum() as i32)),
-        Value::Float(n) => Ok(Value::Float(fsign(*n as f64) as f32)),
+        Value::Float(n) => Ok(Value::Float(fsign(f64::from(*n)) as f32)),
         Value::Double(n) => Ok(Value::Double(fsign(*n))),
         other => Err(RuntimeError::Type(format!("sign requires a number, got {other:?}"))),
     }
@@ -222,9 +222,9 @@ pub(crate) fn num_round_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
         )));
     }
     let r = (d + 0.5).floor();
-    let v = if r >= i32::MAX as f64 {
+    let v = if r >= f64::from(i32::MAX) {
         i32::MAX
-    } else if r <= i32::MIN as f64 {
+    } else if r <= f64::from(i32::MIN) {
         i32::MIN
     } else {
         r as i32
@@ -255,11 +255,11 @@ pub(crate) fn num_take_highest_one_bit(ctx: &mut CallCtx) -> Result<Value, Runti
     match arg1(ctx, "takeHighestOneBit")? {
         Value::Int(n) => {
             let u = *n as u32;
-            Ok(Value::Int(if u == 0 { 0 } else { (1u32 << (31 - u.leading_zeros())) as i32 }))
+            Ok(Value::Int(if u == 0 { 0 } else { (1u32 << u.ilog2()) as i32 }))
         }
         Value::Long(n) => {
             let u = *n as u64;
-            Ok(Value::Long(if u == 0 { 0 } else { (1u64 << (63 - u.leading_zeros())) as i64 }))
+            Ok(Value::Long(if u == 0 { 0 } else { (1u64 << u.ilog2()) as i64 }))
         }
         other => Err(RuntimeError::Type(format!(
             "takeHighestOneBit requires an integer, got {other:?}"

@@ -109,7 +109,7 @@ fn conformance_gated() {
 fn conformance_suite_is_complete() {
     let mut on_disk: Vec<String> = std::fs::read_dir(conformance_dir())
         .expect("conformance dir")
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter_map(|e| {
             let p = e.path();
             (p.extension()?.to_str()? == "kt")

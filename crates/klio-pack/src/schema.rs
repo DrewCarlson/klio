@@ -241,7 +241,7 @@ pub struct AstFile {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TypeckBundle {
     /// Pairs of `(Span, Type)` so the on-disk shape is deterministic
-    /// (HashMap is non-deterministic; a sorted Vec keeps round-trips
+    /// (`HashMap` is non-deterministic; a sorted Vec keeps round-trips
     /// byte-identical).
     pub entries: Vec<(klio_span::Span, klio_types::Type)>,
 }

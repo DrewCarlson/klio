@@ -16,7 +16,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     if file == "--sweep" {
-        return run_sweep_cmd(args.get(2).map(String::as_str).unwrap_or("all"));
+        return run_sweep_cmd(args.get(2).map_or("all", String::as_str));
     }
     if file == "--install" {
         let kinds: &[klio_parity::KotlincKind] = match args.get(2).map(String::as_str) {
@@ -75,7 +75,7 @@ fn run_sweep_cmd(which: &str) -> ExitCode {
         return ExitCode::from(2);
     }
     let jobs = klio_parity::default_jobs();
-    let timeout = Duration::from_secs(60);
+    let timeout = Duration::from_mins(1);
     let mut groups: Vec<(&str, Vec<PathBuf>)> = Vec::new();
     if which == "corpus" || which == "all" {
         groups.push(("corpus", klio_parity::collect_kt(&klio_parity::corpus_dir())));

@@ -5,7 +5,7 @@
 //! `tests/snapshots/` and are reviewed via `cargo insta review`.
 
 use klio_lexer::{Lexer, Token, TokenKind};
-use klio_span::{FileId, SourceMap};
+use klio_span::SourceMap;
 
 fn render(src: &str) -> String {
     let mut map = SourceMap::new();
@@ -51,7 +51,7 @@ fn render_token(t: &Token, src: &str) -> String {
         TokenKind::CharLiteral(c) => char::from_u32(u32::from(*c))
             .map_or_else(|| format!("CHAR[{c}]"), |ch| format!("CHAR[{ch:?}]")),
         TokenKind::StringQuote { triple } => format!("QUOTE[{}]", if *triple { "\"\"\"" } else { "\"" }),
-        TokenKind::StringText(s) => format!("STR_TEXT[{:?}]", s),
+        TokenKind::StringText(s) => format!("STR_TEXT[{s:?}]"),
         TokenKind::InterpStart => "INTERP_START".to_string(),
         TokenKind::InterpEnd => "INTERP_END".to_string(),
         TokenKind::ShortInterp(s) => format!("SHORT_INTERP[{s}]"),

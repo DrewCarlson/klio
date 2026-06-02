@@ -1,4 +1,4 @@
-use super::*;
+use super::{Value, RuntimeError, CallCtx, Arc};
 
 // ============================================================
 // Result
@@ -271,9 +271,9 @@ pub(crate) fn result_get_or_default(ctx: &mut CallCtx) -> Result<Value, RuntimeE
 pub(crate) fn result_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let (ok, payload) = recv_result(ctx.args, "Result.toString")?;
     let s = if ok {
-        format!("Success({})", payload)
+        format!("Success({payload})")
     } else {
-        format!("Failure({})", payload)
+        format!("Failure({payload})")
     };
     Ok(Value::String(Arc::new(s)))
 }

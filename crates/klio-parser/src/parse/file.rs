@@ -1,6 +1,7 @@
-use super::*;
+use super::{Parser, KotlinFile, DiagnosticSink, TokenKind, Keyword, PackageHeader, ImportDecl, Ident, Decl, ClassModifiers, Diagnostic, Visibility, Annotation, TypeAlias, ModifierFlags, AnnotationUseSite, Span, Expr};
 
-impl<'src, 'tok> Parser<'src, 'tok> {
+impl Parser<'_, '_> {
+    #[must_use] 
     pub fn parse_file(mut self) -> (KotlinFile, DiagnosticSink) {
         self.skip_nl();
         let start = self.current_span();
@@ -167,18 +168,18 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 }
                 self.parse_fun(flags).map(Decl::Function)
             }
-            TokenKind::Keyword(Keyword::Val) | TokenKind::Keyword(Keyword::Var) => {
+            TokenKind::Keyword(Keyword::Val | Keyword::Var) => {
                 self.parse_property_with_flags(flags).map(Decl::Property)
             }
-            TokenKind::Keyword(Keyword::Class) | TokenKind::Keyword(Keyword::Interface) => {
+            TokenKind::Keyword(Keyword::Class | Keyword::Interface) => {
                 let visibility = flags.visibility;
                 let annotations = flags.annotations.clone();
                 // `inline class` is the deprecated alias for `value class`.
                 // When the user wrote `inline` on a class declaration, promote
                 // it to `is_value` and emit a deprecation warning.
                 let is_value = flags.is_value || flags.is_inline;
-                if flags.is_inline && !flags.is_value {
-                    if let Some(span) = flags.inline_span {
+                if flags.is_inline && !flags.is_value
+                    && let Some(span) = flags.inline_span {
                         self.diagnostics.emit(
                             Diagnostic::warning(
                                 "`inline class` is deprecated; use `value class` instead",
@@ -187,7 +188,6 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                             .with_code("W0001"),
                         );
                     }
-                }
                 self.parse_class(
                     ClassModifiers {
                         is_data: flags.is_data,

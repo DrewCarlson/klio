@@ -26,11 +26,10 @@ pub const STDLIB_PACK: &[u8] =
 /// [`STDLIB_PACK`] slice is returned.
 #[must_use]
 pub fn stdlib_pack_bytes() -> Cow<'static, [u8]> {
-    if let Ok(path) = std::env::var("KLIO_STDLIB_PACK") {
-        if let Ok(bytes) = std::fs::read(&path) {
+    if let Ok(path) = std::env::var("KLIO_STDLIB_PACK")
+        && let Ok(bytes) = std::fs::read(&path) {
             return Cow::Owned(bytes);
         }
-    }
     Cow::Borrowed(STDLIB_PACK)
 }
 
@@ -66,8 +65,8 @@ mod tests {
         let pack = klio_pack::PackReader::from_bytes(bytes.into_owned())
             .expect("embedded stdlib pack must validate");
         let names: Vec<_> = pack.section_names().collect();
-        assert!(names.iter().any(|n| *n == klio_pack::section_names::MANIFEST));
-        assert!(names.iter().any(|n| *n == klio_pack::section_names::BINDINGS));
+        assert!(names.contains(&klio_pack::section_names::MANIFEST));
+        assert!(names.contains(&klio_pack::section_names::BINDINGS));
     }
 
     #[test]

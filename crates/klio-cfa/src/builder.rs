@@ -17,6 +17,7 @@ pub struct CfgBuilder {
 }
 
 impl CfgBuilder {
+    #[must_use] 
     pub fn new() -> Self {
         Self { blocks: Vec::new(), next_reg: 0, next_loop: 0, next_label: 0 }
     }
@@ -59,6 +60,7 @@ impl CfgBuilder {
     /// Number of nodes already in `blk`. Useful for callers that
     /// want to remember the position a node is about to be pushed
     /// into — the returned value is the insertion index.
+    #[must_use] 
     pub fn current_node_count(&self, blk: BlockId) -> Option<usize> {
         self.blocks.get(blk.0 as usize).map(|b| b.nodes.len())
     }
@@ -117,6 +119,7 @@ impl CfgBuilder {
         }
     }
 
+    #[must_use] 
     pub fn finish(self, entry: BlockId, exits: Vec<BlockId>, source: Span) -> Cfg {
         Cfg { blocks: self.blocks, entry, exits, source, next_reg: self.next_reg }
     }

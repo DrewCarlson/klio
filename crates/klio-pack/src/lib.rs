@@ -137,9 +137,8 @@ mod tests {
     #[test]
     fn zstd_section_round_trip() {
         // Payload long enough that compression is meaningful.
-        let payload: Vec<u8> = std::iter::repeat(b'A')
-            .take(8 * 1024)
-            .chain(std::iter::repeat(b'B').take(8 * 1024))
+        let payload: Vec<u8> = std::iter::repeat_n(b'A', 8 * 1024)
+            .chain(std::iter::repeat_n(b'B', 8 * 1024))
             .collect();
         let mut w = PackWriter::new();
         w.add_zstd("compressed", payload.clone());
@@ -180,9 +179,8 @@ mod tests {
     fn zstd_dict_round_trip() {
         // Same payload pattern twice — a dictionary trained on
         // either should make the second-section encoding small.
-        let payload: Vec<u8> = std::iter::repeat(b'A')
-            .take(8 * 1024)
-            .chain(std::iter::repeat(b'B').take(8 * 1024))
+        let payload: Vec<u8> = std::iter::repeat_n(b'A', 8 * 1024)
+            .chain(std::iter::repeat_n(b'B', 8 * 1024))
             .collect();
         // Hand-rolled "dictionary" — just the payload itself.
         // zstd accepts arbitrary bytes; a real builder would

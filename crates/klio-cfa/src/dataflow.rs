@@ -68,6 +68,7 @@ pub struct MapLattice<K: Ord + Clone, L: Lattice + Eq> {
 }
 
 impl<K: Ord + Clone, L: Lattice + Eq> MapLattice<K, L> {
+    #[must_use] 
     pub fn new() -> Self {
         Self { map: BTreeMap::new() }
     }
@@ -94,16 +95,13 @@ impl<K: Ord + Clone, L: Lattice + Eq> Lattice for MapLattice<K, L> {
     fn join(&mut self, other: &Self) -> bool {
         let mut changed = false;
         for (k, v) in &other.map {
-            match self.map.get_mut(k) {
-                Some(existing) => {
-                    if existing.join(v) {
-                        changed = true;
-                    }
-                }
-                None => {
-                    self.map.insert(k.clone(), v.clone());
+            if let Some(existing) = self.map.get_mut(k) {
+                if existing.join(v) {
                     changed = true;
                 }
+            } else {
+                self.map.insert(k.clone(), v.clone());
+                changed = true;
             }
         }
         changed
@@ -150,12 +148,11 @@ pub fn solve_forward<L: Lattice + Eq, T: ForwardTransfer<L>>(
         for edge in &block.succs {
             let mut succ_in = state.clone();
             transfer.transfer_edge(&edge.kind, &mut succ_in);
-            if in_states[edge.block.0 as usize].join(&succ_in) {
-                if !in_queue.contains(&edge.block) {
+            if in_states[edge.block.0 as usize].join(&succ_in)
+                && !in_queue.contains(&edge.block) {
                     queue.push_back(edge.block);
                     in_queue.insert(edge.block);
                 }
-            }
         }
     }
     in_states

@@ -1,6 +1,6 @@
-use super::*;
+use super::{Expr, Decl, HashMap, KotlinFile, Diagnostic, FunctionBody, Block, Stmt, WhenPatternKind, StringPart, Span, codes, DiagnosticSink, Checker, Function, Property, Class, HashSet, is_primitive_type_name};
 
-/// Severity of an opt-in requirement; parallels DeprecationLevel.
+/// Severity of an opt-in requirement; parallels `DeprecationLevel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OptInLevel {
     Warning,
@@ -15,7 +15,7 @@ pub(crate) struct OptInMarker {
 
 pub(crate) fn parse_requires_opt_in(anns: &[klio_ast::Annotation]) -> Option<OptInMarker> {
     for a in anns {
-        let leaf = a.path.last().map(|s| s.name.as_str()).unwrap_or("");
+        let leaf = a.path.last().map_or("", |s| s.name.as_str());
         if leaf != "RequiresOptIn" {
             continue;
         }
@@ -114,11 +114,10 @@ pub(crate) fn marker_names_in(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for a in anns {
-        if let Some(leaf) = a.path.last() {
-            if markers.contains_key(&leaf.name) {
+        if let Some(leaf) = a.path.last()
+            && markers.contains_key(&leaf.name) {
                 out.push(leaf.name.clone());
             }
-        }
     }
     out
 }
@@ -128,20 +127,17 @@ pub(crate) fn marker_names_in(
 pub(crate) fn opt_in_markers_in(anns: &[klio_ast::Annotation]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for a in anns {
-        let leaf = a.path.last().map(|s| s.name.as_str()).unwrap_or("");
+        let leaf = a.path.last().map_or("", |s| s.name.as_str());
         if leaf != "OptIn" {
             continue;
         }
         for arg in &a.args {
-            if let Expr::MemberRef { receiver, name, .. } = arg {
-                if name.name == "class" {
-                    if let Expr::Path { segments, .. } = receiver.as_ref() {
-                        if let Some(seg) = segments.last() {
+            if let Expr::MemberRef { receiver, name, .. } = arg
+                && name.name == "class"
+                    && let Expr::Path { segments, .. } = receiver.as_ref()
+                        && let Some(seg) = segments.last() {
                             out.push(seg.name.clone());
                         }
-                    }
-                }
-            }
         }
     }
     out
@@ -179,10 +175,10 @@ pub(crate) fn walk_decl_for_opt_in(
             if let Some(body) = &f.body {
                 match body {
                     FunctionBody::Expr(e) => {
-                        walk_expr_for_opt_in(e, markers, required, scope, out)
+                        walk_expr_for_opt_in(e, markers, required, scope, out);
                     }
                     FunctionBody::Block(b) => {
-                        walk_block_for_opt_in(b, markers, required, scope, out)
+                        walk_block_for_opt_in(b, markers, required, scope, out);
                     }
                 }
             }
@@ -210,10 +206,10 @@ pub(crate) fn walk_decl_for_opt_in(
             for acc in [p.getter.as_ref(), p.setter.as_ref()].into_iter().flatten() {
                 match &acc.body {
                     FunctionBody::Expr(e) => {
-                        walk_expr_for_opt_in(e, markers, required, scope, out)
+                        walk_expr_for_opt_in(e, markers, required, scope, out);
                     }
                     FunctionBody::Block(b) => {
-                        walk_block_for_opt_in(b, markers, required, scope, out)
+                        walk_block_for_opt_in(b, markers, required, scope, out);
                     }
                 }
             }
@@ -309,15 +305,14 @@ pub(crate) fn walk_expr_for_opt_in(
     out: &mut Vec<Diagnostic>,
 ) {
     match e {
-        Expr::Path { segments, span } => {
-            if segments.len() == 1 {
+        Expr::Path { segments, span }
+            if segments.len() == 1 => {
                 emit_opt_in_at(&segments[0].name, *span, markers, required, scope, out);
             }
-        }
         Expr::Call { callee, args, span, .. } => {
             let mut emitted = false;
-            if let Expr::Path { segments, .. } = callee.as_ref() {
-                if segments.len() == 1 {
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1 {
                     emitted = emit_opt_in_at(
                         &segments[0].name,
                         *span,
@@ -327,7 +322,6 @@ pub(crate) fn walk_expr_for_opt_in(
                         out,
                     );
                 }
-            }
             if !emitted {
                 walk_expr_for_opt_in(callee, markers, required, scope, out);
             }
@@ -342,7 +336,7 @@ pub(crate) fn walk_expr_for_opt_in(
             walk_expr_for_opt_in(rhs, markers, required, scope, out);
         }
         Expr::Unary { expr, .. } | Expr::Postfix { expr, .. } => {
-            walk_expr_for_opt_in(expr, markers, required, scope, out)
+            walk_expr_for_opt_in(expr, markers, required, scope, out);
         }
         Expr::Index { receiver, args, .. } => {
             walk_expr_for_opt_in(receiver, markers, required, scope, out);
@@ -356,10 +350,10 @@ pub(crate) fn walk_expr_for_opt_in(
             }
         }
         Expr::As { expr, .. } | Expr::IsCheck { expr, .. } => {
-            walk_expr_for_opt_in(expr, markers, required, scope, out)
+            walk_expr_for_opt_in(expr, markers, required, scope, out);
         }
         Expr::Spread { expr, .. } | Expr::Labeled { expr, .. } => {
-            walk_expr_for_opt_in(expr, markers, required, scope, out)
+            walk_expr_for_opt_in(expr, markers, required, scope, out);
         }
         Expr::If { cond, then_branch, else_branch, .. } => {
             walk_expr_for_opt_in(cond, markers, required, scope, out);
@@ -373,7 +367,7 @@ pub(crate) fn walk_expr_for_opt_in(
             walk_expr_for_opt_in(body, markers, required, scope, out);
         }
         Expr::DoWhile { cond, body: None, .. } => {
-            walk_expr_for_opt_in(cond, markers, required, scope, out)
+            walk_expr_for_opt_in(cond, markers, required, scope, out);
         }
         Expr::For { iter, body, .. } => {
             walk_expr_for_opt_in(iter, markers, required, scope, out);
@@ -389,7 +383,7 @@ pub(crate) fn walk_expr_for_opt_in(
                         WhenPatternKind::Value(e)
                         | WhenPatternKind::InRange(e)
                         | WhenPatternKind::NotInRange(e) => {
-                            walk_expr_for_opt_in(e, markers, required, scope, out)
+                            walk_expr_for_opt_in(e, markers, required, scope, out);
                         }
                         _ => {}
                     }
@@ -471,7 +465,7 @@ pub(crate) fn emit_opt_in_at(
                 Diagnostic::warning(body, span).with_code(codes::WARN_OPT_IN),
             ),
             OptInLevel::Error => {
-                out.push(Diagnostic::error(body, span).with_code(codes::TYPE_OPT_IN_REQUIRED))
+                out.push(Diagnostic::error(body, span).with_code(codes::TYPE_OPT_IN_REQUIRED));
             }
         }
         emitted = true;
@@ -499,11 +493,10 @@ pub(crate) fn apply_suppress_annotations(file: &KotlinFile, diagnostics: &mut Di
             if r.span.file != span.file {
                 continue;
             }
-            if r.span.start <= span.start && span.end <= r.span.end {
-                if r.codes.iter().any(|c| c == code) {
+            if r.span.start <= span.start && span.end <= r.span.end
+                && r.codes.iter().any(|c| c == code) {
                     return false;
                 }
-            }
         }
         true
     });
@@ -567,7 +560,7 @@ pub(crate) fn push_suppress(
     out: &mut Vec<SuppressRegion>,
 ) {
     for a in anns {
-        let leaf = a.path.last().map(|s| s.name.as_str()).unwrap_or("");
+        let leaf = a.path.last().map_or("", |s| s.name.as_str());
         if leaf != "Suppress" {
             continue;
         }
@@ -599,7 +592,7 @@ pub(crate) struct DeprecationInfo {
 
 pub(crate) fn parse_deprecation(anns: &[klio_ast::Annotation]) -> Option<DeprecationInfo> {
     for a in anns {
-        let leaf = a.path.last().map(|s| s.name.as_str()).unwrap_or("");
+        let leaf = a.path.last().map_or("", |s| s.name.as_str());
         if leaf != "Deprecated" {
             continue;
         }
@@ -818,24 +811,21 @@ pub(crate) fn walk_expr_for_deprecation(
     out: &mut Vec<Diagnostic>,
 ) {
     match e {
-        Expr::Path { segments, span } => {
-            if segments.len() == 1 {
+        Expr::Path { segments, span }
+            if segments.len() == 1 => {
                 emit_deprecation_at(&segments[0].name, *span, info, out);
             }
-        }
         Expr::Call { callee, args, span, .. } => {
             // Recurse into the callee unless it's a bare-name reference
             // to a deprecated symbol — we emit once for the call as a
             // whole using the call's span.
             let mut emitted_at_call = false;
-            if let Expr::Path { segments, .. } = callee.as_ref() {
-                if segments.len() == 1 {
-                    if info.contains_key(&segments[0].name) {
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1
+                    && info.contains_key(&segments[0].name) {
                         emit_deprecation_at(&segments[0].name, *span, info, out);
                         emitted_at_call = true;
                     }
-                }
-            }
             if !emitted_at_call {
                 walk_expr_for_deprecation(callee, info, out);
             }
@@ -894,7 +884,7 @@ pub(crate) fn walk_expr_for_deprecation(
                         WhenPatternKind::Value(e)
                         | WhenPatternKind::InRange(e)
                         | WhenPatternKind::NotInRange(e) => {
-                            walk_expr_for_deprecation(e, info, out)
+                            walk_expr_for_deprecation(e, info, out);
                         }
                         _ => {}
                     }
@@ -1045,11 +1035,10 @@ pub(crate) struct AnnotationMeta {
 pub(crate) fn extract_annotation_targets(e: &Expr, out: &mut Vec<AnnotationTarget>) {
     match e {
         Expr::Path { segments, .. } => {
-            if let Some(seg) = segments.last() {
-                if let Some(t) = AnnotationTarget::from_name(&seg.name) {
+            if let Some(seg) = segments.last()
+                && let Some(t) = AnnotationTarget::from_name(&seg.name) {
                     out.push(t);
                 }
-            }
         }
         Expr::Member { name, .. } => {
             if let Some(t) = AnnotationTarget::from_name(&name.name) {
@@ -1065,7 +1054,7 @@ pub(crate) struct AnnotationWalker<'a, 'r> {
     pub(crate) meta: &'a HashMap<String, AnnotationMeta>,
 }
 
-impl<'a, 'r> AnnotationWalker<'a, 'r> {
+impl AnnotationWalker<'_, '_> {
     pub(crate) fn walk_file(&mut self, file: &KotlinFile) {
         self.check_set(&[], AnnotationTarget::File);
         for d in &file.decls {
@@ -1151,9 +1140,9 @@ impl<'a, 'r> AnnotationWalker<'a, 'r> {
             };
             // §17.3 @Target check — only when we know the annotation
             // class and it carries a @Target list.
-            if let Some(m) = self.meta.get(&leaf) {
-                if let Some(targets) = &m.targets {
-                    if !targets.contains(&site) {
+            if let Some(m) = self.meta.get(&leaf)
+                && let Some(targets) = &m.targets
+                    && !targets.contains(&site) {
                         self.ch.diagnostics.emit(
                             Diagnostic::error(
                                 format!(
@@ -1171,19 +1160,16 @@ impl<'a, 'r> AnnotationWalker<'a, 'r> {
                             .with_code(codes::TYPE_ANNOTATION_TARGET_MISMATCH),
                         );
                     }
-                }
-            }
             // §17.4 duplicate detection — only when the annotation class
             // is known to be non-repeatable (it lives in `self.meta` and
             // its `repeatable` flag is `false`).
             if let Some((prev_span, _)) = counts.get(&leaf) {
-                if let Some(m) = self.meta.get(&leaf) {
-                    if !m.repeatable {
+                if let Some(m) = self.meta.get(&leaf)
+                    && !m.repeatable {
                         self.ch.diagnostics.emit(
                             Diagnostic::error(
                                 format!(
-                                    "annotation `@{}` is not repeatable but is applied more than once",
-                                    leaf
+                                    "annotation `@{leaf}` is not repeatable but is applied more than once"
                                 ),
                                 a.span,
                             )
@@ -1191,7 +1177,6 @@ impl<'a, 'r> AnnotationWalker<'a, 'r> {
                             .with_label(*prev_span, "previously applied here"),
                         );
                     }
-                }
             } else {
                 counts.insert(leaf, (a.span, a));
             }

@@ -221,6 +221,7 @@ pub struct Cfg {
 }
 
 impl Cfg {
+    #[must_use] 
     pub fn block(&self, id: BlockId) -> &BasicBlock {
         &self.blocks[id.0 as usize]
     }

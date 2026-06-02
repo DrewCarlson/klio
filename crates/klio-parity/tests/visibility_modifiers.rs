@@ -39,7 +39,7 @@ fun main() {
 
 #[test]
 fn internal_property_visible_in_module() {
-    let src = r#"
+    let src = r"
 class Bag {
     internal var count: Int = 0
     fun bump() { count += 1 }
@@ -49,18 +49,18 @@ fun main() {
     b.bump(); b.bump(); b.bump()
     println(b.count)
 }
-"#;
+";
     assert_klio("internal_prop", src, "3\n");
 }
 
 #[test]
 fn private_top_level_used_in_main() {
-    let src = r#"
+    let src = r"
 private fun secret(x: Int): Int = x * 100
 fun main() {
     println(secret(7))
 }
-"#;
+";
     assert_klio("private_toplevel", src, "700\n");
 }
 
@@ -108,7 +108,7 @@ fun main() {
 
 #[test]
 fn private_setter_with_public_getter() {
-    let src = r#"
+    let src = r"
 class Counter {
     var n: Int = 0
         private set
@@ -119,6 +119,6 @@ fun main() {
     c.bump(); c.bump()
     println(c.n)
 }
-"#;
+";
     assert_klio("private_set", src, "2\n");
 }

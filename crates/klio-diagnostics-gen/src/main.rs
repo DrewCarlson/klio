@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(String::as_str).unwrap_or("build");
+    let cmd = args.get(1).map_or("build", String::as_str);
     let rest: &[String] = if args.len() > 2 { &args[2..] } else { &[] };
     match cmd {
         "build" => build(rest),

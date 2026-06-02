@@ -126,11 +126,11 @@ fun main() {
 //    infinitely; runs as a normal call past the splice budget.
 #[test]
 fn inline_recursive_call() {
-    let src = r#"
+    let src = r"
 inline fun sumUpTo(n: Int, acc: Int = 0): Int =
     if (n == 0) acc else sumUpTo(n - 1, acc + n)
 fun main() { println(sumUpTo(10)) }
-"#;
+";
     assert_klio("inline_recursive_call", src, "55\n");
 }
 

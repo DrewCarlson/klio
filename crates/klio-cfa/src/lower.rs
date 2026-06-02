@@ -115,6 +115,7 @@ pub struct Lowering {
 }
 
 impl Lowering {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             b: CfgBuilder::new(),
@@ -133,6 +134,7 @@ impl Lowering {
     /// synthetic exit block; every `return` jumps to the exit. The
     /// implicit fall-off-the-end of a `Unit`-typed body is wired to
     /// the exit by an explicit `Goto`.
+    #[must_use] 
     pub fn lower_function(mut self, body: &Block, source: Span) -> Lowered {
         let entry = self.b.new_block();
         let exit = self.b.new_block();
@@ -244,11 +246,10 @@ impl Lowering {
                     // (another local or a member chain) we record
                     // the aliasing so smart-cast lookups for the new
                     // name can follow the chain.
-                    if !p.mutable {
-                        if let Some(src) = self.expr_to_place(init) {
+                    if !p.mutable
+                        && let Some(src) = self.expr_to_place(init) {
                             self.aliases.insert(Symbol(p.name.name.clone()), src);
                         }
-                    }
                     self.b.push(
                         *cur,
                         Node::Assign {
@@ -441,18 +442,16 @@ impl Lowering {
 
             Expr::Unary { op, expr, span } => {
                 let inner = self.lower_expr(expr, cur);
-                if matches!(op, UnOp::PreInc | UnOp::PreDec) {
-                    if let Some(place) = self.expr_to_place(expr) {
+                if matches!(op, UnOp::PreInc | UnOp::PreDec)
+                    && let Some(place) = self.expr_to_place(expr) {
                         self.b.push(*cur, Node::Assign { lhs: place, rhs: inner, span: *span });
                     }
-                }
                 let result = self.emit_eval(*cur, *span);
-                if matches!(op, UnOp::Not) {
-                    if let Some(r) = self.pending_refinements.get(&inner).cloned() {
+                if matches!(op, UnOp::Not)
+                    && let Some(r) = self.pending_refinements.get(&inner).cloned() {
                         self.pending_refinements
                             .insert(result, Refinement::Not(Box::new(r)));
                     }
-                }
                 result
             }
 
@@ -1100,9 +1099,7 @@ impl Lowering {
                 .label_stack
                 .iter()
                 .rev()
-                .find(|f| f.name == name.name)
-                .map(|f| f.target)
-                .unwrap_or_else(|| self.fn_target()),
+                .find(|f| f.name == name.name).map_or_else(|| self.fn_target(), |f| f.target),
             None => self.fn_target(),
         }
     }
@@ -1152,8 +1149,8 @@ impl Lowering {
     }
 
     fn label_set_result(&mut self, label: Option<&Ident>, reg: Reg) {
-        if let Some(name) = label {
-            if let Some(frame) = self
+        if let Some(name) = label
+            && let Some(frame) = self
                 .label_stack
                 .iter_mut()
                 .rev()
@@ -1161,7 +1158,6 @@ impl Lowering {
             {
                 frame.result = Some(reg);
             }
-        }
     }
 }
 
@@ -1264,6 +1260,7 @@ impl Lowering {
 }
 
 /// Convenience entry point: lower a function body into a CFG.
+#[must_use] 
 pub fn lower_function(body: &Block, source: Span) -> Lowered {
     Lowering::new().lower_function(body, source)
 }

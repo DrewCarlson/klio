@@ -17,8 +17,8 @@ use klio_runtime::Value;
 fn display_throw(v: &Value) -> String {
     match v {
         Value::Exception { fqn, message, .. } => match message {
-            Some(m) => format!("{}({})", fqn, m),
-            None => format!("{}", fqn),
+            Some(m) => format!("{fqn}({m})"),
+            None => format!("{fqn}"),
         },
         Value::Instance(inst) => {
             let b = inst.borrow();
@@ -31,7 +31,7 @@ fn display_throw(v: &Value) -> String {
                 }
             });
             match msg {
-                Some(m) => format!("{}({})", name, m),
+                Some(m) => format!("{name}({m})"),
                 None => name,
             }
         }
@@ -161,11 +161,10 @@ struct Frame<'a> {
 /// values are touched, so a genuine `Int` in an `Int` slot is left
 /// exactly as produced.
 fn coerce_int_to_long_ty(ty: &TypeRef, v: &mut Value) {
-    if let Value::Int(n) = *v {
-        if !ty.nullable && ty.name == "Long" {
+    if let Value::Int(n) = *v
+        && !ty.nullable && ty.name == "Long" {
             *v = Value::Long(i64::from(n));
         }
-    }
 }
 
 /// Apply [`coerce_int_to_long_ty`] to each argument against its
@@ -223,8 +222,8 @@ pub fn eval(module: &Module, func: &Func, args: Vec<Value>) -> Result<Value, Eva
     eval_with(module, func, args, &mut host)
 }
 
-/// Run a function body, routing non-trivial dispatch (CallValue /
-/// CallMember / NewInstance / InstanceOf) through the supplied
+/// Run a function body, routing non-trivial dispatch (`CallValue` /
+/// `CallMember` / `NewInstance` / `InstanceOf`) through the supplied
 /// host implementation.
 pub fn eval_with(
     module: &Module,
@@ -327,11 +326,10 @@ pub fn resume_continuation(
             None
         };
         first = false;
-        if resume_throw.is_none() {
-            if let Some(r) = snap.resume_reg {
+        if resume_throw.is_none()
+            && let Some(r) = snap.resume_reg {
                 frame.write(r, carry.clone());
             }
-        }
         let mut try_stack = snap.try_stack.clone();
         match run_frame_inner(
             module,
@@ -349,7 +347,7 @@ pub fn resume_continuation(
                 // Re-suspended before this frame finished. The newly
                 // captured inner frames stay innermost-first; the
                 // still-pending outer frames sit after them.
-                inner.frames.extend(frames.into_iter());
+                inner.frames.extend(frames);
                 return Err(EvalError::Suspended(inner));
             }
             Err(EvalError::Throw(exc)) => {
@@ -626,7 +624,7 @@ fn run_frame_inner<'a>(
                 cur = if value_truthy(&v)? { t } else { f };
             }
             Terminator::Return(r) => {
-                let v = r.map(|r| frame.read(r)).unwrap_or(Value::Unit);
+                let v = r.map_or(Value::Unit, |r| frame.read(r));
                 // Walk the try-stack for the nearest finally; route
                 // the return through it (finally's own exit completes
                 // the return, and an inner `return` inside finally
@@ -651,14 +649,14 @@ fn run_frame_inner<'a>(
                 return Ok(v);
             }
             Terminator::NonLocalReturn(r) => {
-                let v = r.map(|r| frame.read(r)).unwrap_or(Value::Unit);
+                let v = r.map_or(Value::Unit, |r| frame.read(r));
                 if frame.func.is_lambda || frame.func.is_inline {
                     return Err(EvalError::NonLocalReturn(v));
                 }
                 return Ok(v);
             }
             Terminator::LabeledReturn(label, r) => {
-                let v = r.map(|r| frame.read(r)).unwrap_or(Value::Unit);
+                let v = r.map_or(Value::Unit, |r| frame.read(r));
                 if frame.func.name == *label {
                     return Ok(v);
                 }
@@ -715,7 +713,7 @@ fn run_frame_inner<'a>(
             Terminator::TailJump { args, n_args } => {
                 let mut new_params: Vec<Value> = Vec::with_capacity(n_args as usize);
                 for i in 0..n_args {
-                    new_params.push(frame.read(Reg(args.0 + i as u32)));
+                    new_params.push(frame.read(Reg(args.0 + u32::from(i))));
                 }
                 coerce_int_args_to_long(frame.func, &mut new_params);
                 frame.params = new_params;
@@ -729,7 +727,7 @@ fn run_frame_inner<'a>(
             Terminator::TailCallFunc { func, args, n_args } => {
                 let mut new_params: Vec<Value> = Vec::with_capacity(n_args as usize);
                 for i in 0..n_args {
-                    new_params.push(frame.read(Reg(args.0 + i as u32)));
+                    new_params.push(frame.read(Reg(args.0 + u32::from(i))));
                 }
                 let new_func = &module.funcs[func.0 as usize];
                 coerce_int_args_to_long(new_func, &mut new_params);
@@ -943,22 +941,21 @@ fn exec_inst(
                 frame.write(*dst, Value::Bool(b));
                 return Ok(());
             }
-            if let Some(method) = operator_method(*op) {
-                if matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_)) {
+            if let Some(method) = operator_method(*op)
+                && (matches!(l, Value::Instance(_)) || matches!(r, Value::Instance(_))) {
                     let result = host.call_member(&l, method, std::slice::from_ref(&r))?;
                     // compareTo wrappers (Less/LessEq/Greater/GreaterEq)
                     // need to be reduced to a Bool.
                     let final_val = match *op {
-                        BinOp::Less => Value::Bool(value_to_i64(&result).map_or(false, |i| i < 0)),
-                        BinOp::LessEq => Value::Bool(value_to_i64(&result).map_or(false, |i| i <= 0)),
-                        BinOp::Greater => Value::Bool(value_to_i64(&result).map_or(false, |i| i > 0)),
-                        BinOp::GreaterEq => Value::Bool(value_to_i64(&result).map_or(false, |i| i >= 0)),
+                        BinOp::Less => Value::Bool(value_to_i64(&result).is_some_and(|i| i < 0)),
+                        BinOp::LessEq => Value::Bool(value_to_i64(&result).is_some_and(|i| i <= 0)),
+                        BinOp::Greater => Value::Bool(value_to_i64(&result).is_some_and(|i| i > 0)),
+                        BinOp::GreaterEq => Value::Bool(value_to_i64(&result).is_some_and(|i| i >= 0)),
                         _ => result,
                     };
                     frame.write(*dst, final_val);
                     return Ok(());
                 }
-            }
             let out = apply_binop(*op, &l, &r)?;
             frame.write(*dst, out);
         }
@@ -1049,8 +1046,7 @@ fn exec_inst(
                 .funcs
                 .get(func.0 as usize)
                 .and_then(|f| f.params.first())
-                .map(|p| p.name == "this")
-                .unwrap_or(false);
+                .is_some_and(|p| p.name == "this");
             let pushed_enclosing = if callee_is_ext {
                 let caller_this = frame
                     .func
@@ -1103,22 +1099,18 @@ fn exec_inst(
                 .filter(|v| matches!(v, Value::Instance(_)));
             if let Some((n_params, first_is_this)) =
                 host.callable_receiver_shape(&callee_v)
-            {
-                if first_is_this && arg_values.len() + 1 == n_params {
-                    if let Some(ct) = &caller_this {
+                && first_is_this && arg_values.len() + 1 == n_params
+                    && let Some(ct) = &caller_this {
                         arg_values.insert(0, ct.clone());
                         names.insert(0, None);
                     }
-                }
-            }
             // Receiver lambda whose `this` arrives via a captured
             // slot (not a leading param). `body()` from inside a
             // method body needs the method's `this` substituted in.
-            if host.closure_needs_this_capture(&callee_v) {
-                if let Some(ct) = &caller_this {
+            if host.closure_needs_this_capture(&callee_v)
+                && let Some(ct) = &caller_this {
                     host.override_closure_this(&callee_v, ct);
                 }
-            }
             // Receiver-lambda fallback for bare names lowered as
             // LoadGlobal: push the calling frame's `this` so the
             // global-miss path in LoadGlobal can fall back to a
@@ -1214,15 +1206,12 @@ fn exec_inst(
             // slot is empty, fall back to that param so a bare member
             // call (`sorted()`, `toInt()`) dispatches on the
             // receiver instead of escaping to a global.
-            if matches!(this_val, Value::Null | Value::Unit) {
-                if let Some(idx) =
+            if matches!(this_val, Value::Null | Value::Unit)
+                && let Some(idx) =
                     frame.func.params.iter().position(|p| p.name == "this")
-                {
-                    if let Some(v) = frame.params.get(idx) {
+                    && let Some(v) = frame.params.get(idx) {
                         this_val = v.clone();
                     }
-                }
-            }
             // A bare callee whose name starts uppercase is a
             // constructor / type (`UnsupportedOperationException(msg)`,
             // `Foo(...)`), never an instance member (Kotlin members are
@@ -1234,7 +1223,7 @@ fn exec_inst(
             let is_ctor_name = name_str
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_uppercase());
+                .is_some_and(char::is_uppercase);
             let mut resolved: Option<Value> = None;
             // A probe that *found* the member but whose body failed
             // (any error that is not the `Unimplemented`
@@ -1331,9 +1320,9 @@ fn exec_inst(
             // (`buildString { … }` in a member) a bare call may be a
             // member of the lexically enclosing `this@Outer` rather
             // than the lambda receiver.
-            if resolved.is_none() && !shadow_capture {
-                if let Some(outer) = host.enclosing_this() {
-                    if !matches!(outer, Value::Null | Value::Unit) {
+            if resolved.is_none() && !shadow_capture
+                && let Some(outer) = host.enclosing_this()
+                    && !matches!(outer, Value::Null | Value::Unit) {
                         match host.call_member_named(
                             &outer, &name_str, &arg_values, &names,
                         ) {
@@ -1349,8 +1338,6 @@ fn exec_inst(
                             }
                         }
                     }
-                }
-            }
             // Inner-class outer-chain fallback: a bare call inside an
             // `inner class` method may target an enclosing-class
             // member. The enclosing instance is the receiver's
@@ -1461,75 +1448,70 @@ fn exec_inst(
                         frame.module, &name_str, &arg_values, &names,
                     )? {
                         v
-                    } else {
-                        match host.lookup_global_throwing(&name_str)? {
-                            Some(callee) => host.call_value_named(
-                                &callee, &arg_values, &names,
-                            )?,
-                            None => {
-                                // Last resort: a bare call that is a
-                                // The frame's bound `this` param (the
-                                // method / extension body) — or, when
-                                // the bare call is inside a lambda,
-                                // the lexically enclosing receiver.
-                                // Dispatch the bare call on it before
-                                // giving up so a sibling method
-                                // call resolves.
-                                let own_this = frame
-                                    .func
-                                    .params
-                                    .iter()
-                                    .position(|p| p.name == "this")
-                                    .and_then(|i| frame.params.get(i))
-                                    .cloned()
-                                    .filter(|v| {
-                                        matches!(v, Value::Instance(_))
+                    } else if let Some(callee) = host.lookup_global_throwing(&name_str)? { host.call_value_named(
+                        &callee, &arg_values, &names,
+                    )? } else {
+                        // Last resort: a bare call that is a
+                        // The frame's bound `this` param (the
+                        // method / extension body) — or, when
+                        // the bare call is inside a lambda,
+                        // the lexically enclosing receiver.
+                        // Dispatch the bare call on it before
+                        // giving up so a sibling method
+                        // call resolves.
+                        let own_this = frame
+                            .func
+                            .params
+                            .iter()
+                            .position(|p| p.name == "this")
+                            .and_then(|i| frame.params.get(i))
+                            .cloned()
+                            .filter(|v| {
+                                matches!(v, Value::Instance(_))
+                            })
+                            .or_else(|| {
+                                host.enclosing_this_chain()
+                                    .into_iter()
+                                    .find(|v| {
+                                        matches!(
+                                            v,
+                                            Value::Instance(_)
+                                        ) && host.host_has_member(
+                                            v, &name_str,
+                                        )
                                     })
-                                    .or_else(|| {
-                                        host.enclosing_this_chain()
-                                            .into_iter()
-                                            .find(|v| {
-                                                matches!(
-                                                    v,
-                                                    Value::Instance(_)
-                                                ) && host.host_has_member(
-                                                    v, &name_str,
-                                                )
-                                            })
-                                    });
-                                if let Some(t @ Value::Instance(_)) =
-                                    own_this
-                                {
-                                    match host.call_member_named(
-                                        &t, &name_str, &arg_values,
-                                        &names,
-                                    ) {
-                                        Ok(v) => v,
-                                        Err(
-                                            e @ EvalError::Suspended(_),
-                                        ) => return Err(e),
-                                        Err(_) => {
-                                            return Err(first_real_err
-                                                .unwrap_or(
-                                                EvalError::Unbound(
-                                                    format!("unresolved global `{name_str}`"),
-                                                ),
-                                            ))
-                                        }
-                                    }
-                                } else {
-                                    // Nothing resolved this name. If a
-                                    // probe found the member but its
-                                    // body failed, surface that real
-                                    // error instead of the misleading
-                                    // `unresolved global`.
-                                    return Err(first_real_err.unwrap_or(
-                                        EvalError::Unbound(format!(
-                                            "unresolved global `{name_str}`"
-                                        )),
-                                    ));
+                            });
+                        if let Some(t @ Value::Instance(_)) =
+                            own_this
+                        {
+                            match host.call_member_named(
+                                &t, &name_str, &arg_values,
+                                &names,
+                            ) {
+                                Ok(v) => v,
+                                Err(
+                                    e @ EvalError::Suspended(_),
+                                ) => return Err(e),
+                                Err(_) => {
+                                    return Err(first_real_err
+                                        .unwrap_or(
+                                        EvalError::Unbound(
+                                            format!("unresolved global `{name_str}`"),
+                                        ),
+                                    ))
                                 }
                             }
+                        } else {
+                            // Nothing resolved this name. If a
+                            // probe found the member but its
+                            // body failed, surface that real
+                            // error instead of the misleading
+                            // `unresolved global`.
+                            return Err(first_real_err.unwrap_or(
+                                EvalError::Unbound(format!(
+                                    "unresolved global `{name_str}`"
+                                )),
+                            ));
                         }
                     }
                 }
@@ -1631,7 +1613,7 @@ fn exec_inst(
                         .registry
                         .hierarchy_methods
                         .get(&cls)
-                        .map_or(false, |m| m.contains("invoke"))
+                        .is_some_and(|m| m.contains("invoke"))
                 }
                 _ => false,
             };
@@ -1680,11 +1662,10 @@ fn exec_inst(
                     let b = inst.borrow();
                     b.class.is_inner && b.outer.is_none()
                 };
-                if needs_outer {
-                    if let Some(h) = outer_hint {
+                if needs_outer
+                    && let Some(h) = outer_hint {
                         inst.borrow_mut().outer = Some(h);
                     }
-                }
             }
             frame.write(*dst, result);
         }
@@ -1781,35 +1762,31 @@ fn exec_inst(
                 Const::String(s) => s.clone(),
                 _ => return Err(EvalError::Type("LoadGlobal: name not a string const".into())),
             };
-            let v = match host.lookup_global_throwing(&name_str)? {
-                Some(v) => v,
-                None => {
-                    // Receiver-lambda fallback: a lambda body whose
-                    // bare reference was lowered as LoadGlobal (the
-                    // lower had no type info and assumed top-level)
-                    // may actually name a member of an enclosing
-                    // receiver — pushed onto enclosing-this by
-                    // `invoke_callable_with_this` for scope functions
-                    // and by `CallValue`'s caller-this assist for
-                    // bare receiver-typed lambda invocations.
-                    let mut resolved: Option<Value> = None;
-                    for outer in host.enclosing_this_chain() {
-                        if matches!(outer, Value::Null | Value::Unit) {
-                            continue;
-                        }
-                        if let Ok(v) = host.get_field(&outer, &name_str) {
-                            if !matches!(v, Value::Unit) {
-                                resolved = Some(v);
-                                break;
-                            }
-                        }
+            let v = if let Some(v) = host.lookup_global_throwing(&name_str)? { v } else {
+                // Receiver-lambda fallback: a lambda body whose
+                // bare reference was lowered as LoadGlobal (the
+                // lower had no type info and assumed top-level)
+                // may actually name a member of an enclosing
+                // receiver — pushed onto enclosing-this by
+                // `invoke_callable_with_this` for scope functions
+                // and by `CallValue`'s caller-this assist for
+                // bare receiver-typed lambda invocations.
+                let mut resolved: Option<Value> = None;
+                for outer in host.enclosing_this_chain() {
+                    if matches!(outer, Value::Null | Value::Unit) {
+                        continue;
                     }
-                    resolved.ok_or_else(|| {
-                        EvalError::Unbound(format!(
-                            "unresolved global `{name_str}`"
-                        ))
-                    })?
+                    if let Ok(v) = host.get_field(&outer, &name_str)
+                        && !matches!(v, Value::Unit) {
+                            resolved = Some(v);
+                            break;
+                        }
                 }
+                resolved.ok_or_else(|| {
+                    EvalError::Unbound(format!(
+                        "unresolved global `{name_str}`"
+                    ))
+                })?
             };
             frame.write(*dst, v);
         }
@@ -1839,27 +1816,21 @@ fn exec_inst(
             // First try resolving as a property/field on the captured
             // this. Swallow errors so the global fallback fires.
             let mut resolved: Option<Value> = None;
-            if !matches!(this_val, Value::Null | Value::Unit) {
-                if let Ok(v) = host.get_field(&this_val, &name_str) {
-                    if !matches!(v, Value::Unit) {
+            if !matches!(this_val, Value::Null | Value::Unit)
+                && let Ok(v) = host.get_field(&this_val, &name_str)
+                    && !matches!(v, Value::Unit) {
                         resolved = Some(v);
                     }
-                }
-            }
             // Enclosing-receiver fallback: a bare property read inside
             // a receiver lambda may name a member of the lexically
             // enclosing `this@Outer`.
-            if resolved.is_none() {
-                if let Some(outer) = host.enclosing_this() {
-                    if !matches!(outer, Value::Null | Value::Unit) {
-                        if let Ok(v) = host.get_field(&outer, &name_str) {
-                            if !matches!(v, Value::Unit) {
+            if resolved.is_none()
+                && let Some(outer) = host.enclosing_this()
+                    && !matches!(outer, Value::Null | Value::Unit)
+                        && let Ok(v) = host.get_field(&outer, &name_str)
+                            && !matches!(v, Value::Unit) {
                                 resolved = Some(v);
                             }
-                        }
-                    }
-                }
-            }
             let v = match resolved {
                 Some(v) => v,
                 None => host
@@ -1946,7 +1917,7 @@ fn exec_inst(
 /// for spread-arg dispatch. Returns an error if the value isn't
 /// iterable in a way that maps to positional args.
 fn spread_items(v: &Value) -> Result<Vec<Value>, EvalError> {
-    use Value::*;
+    use Value::{Array, List, Set};
     match v {
         Array { items, .. } => Ok(items.borrow().clone()),
         List { items, .. } => Ok(items.borrow().clone()),
@@ -1960,7 +1931,7 @@ fn spread_items(v: &Value) -> Result<Vec<Value>, EvalError> {
 
 fn read_arg_run(frame: &Frame<'_>, args_start: Reg, n: u8) -> Vec<Value> {
     let mut out = Vec::with_capacity(n as usize);
-    for i in 0..n as u32 {
+    for i in 0..u32::from(n) {
         let reg = Reg(args_start.0 + i);
         out.push(frame.read(reg));
     }
@@ -2038,7 +2009,7 @@ fn apply_unop(op: UnOp, v: &Value) -> Result<Value, EvalError> {
 }
 
 /// Render a Value to its Kotlin string representation. For
-/// Value::Instance, dispatches `toString()` through the host so
+/// `Value::Instance`, dispatches `toString()` through the host so
 /// user-defined overrides fire; primitives use `render_value`'s
 /// fast path.
 fn stringify(host: &mut dyn Host, v: &Value) -> Result<String, EvalError> {
@@ -2054,13 +2025,13 @@ fn stringify(host: &mut dyn Host, v: &Value) -> Result<String, EvalError> {
 
 fn value_to_i64(v: &Value) -> Option<i64> {
     match v {
-        Value::Int(i) => Some(*i as i64),
+        Value::Int(i) => Some(i64::from(*i)),
         Value::Long(l) => Some(*l),
         _ => None,
     }
 }
 
-/// Operator-name a BinOp dispatches through when one operand is a
+/// Operator-name a `BinOp` dispatches through when one operand is a
 /// user class. Returns `None` for ops that have no operator-method
 /// counterpart (e.g. boolean short-circuits).
 fn operator_method(op: BinOp) -> Option<&'static str> {
@@ -2139,8 +2110,8 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
     // the promoted operands are `Int`, so this recurses at most once.
     let promote = |v: &Value| -> Option<Value> {
         match v {
-            Value::Byte(b) => Some(Int(*b as i32)),
-            Value::Short(s) => Some(Int(*s as i32)),
+            Value::Byte(b) => Some(Int(i32::from(*b))),
+            Value::Short(s) => Some(Int(i32::from(*s))),
             _ => None,
         }
     };
@@ -2157,22 +2128,22 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         // Kotlin Char arithmetic: `Char - Char` → Int (code-point
         // distance); `Char + Int` / `Char - Int` → Char.
         (BinOp::Sub, Value::Char(a), Value::Char(b)) => {
-            Ok(Int(*a as i32 - *b as i32))
+            Ok(Int(i32::from(*a) - i32::from(*b)))
         }
         // `Char + Int` / `Char - Int` truncate to the low 16 bits (the
         // result is a single UTF-16 code unit), matching Kotlin's
         // `(this.code + n).toChar()`.
         (BinOp::Add, Value::Char(a), Int(b)) => {
-            Ok(Value::Char((*a as i64).wrapping_add(*b as i64) as u16))
+            Ok(Value::Char(i64::from(*a).wrapping_add(i64::from(*b)) as u16))
         }
         (BinOp::Sub, Value::Char(a), Int(b)) => {
-            Ok(Value::Char((*a as i64).wrapping_sub(*b as i64) as u16))
+            Ok(Value::Char(i64::from(*a).wrapping_sub(i64::from(*b)) as u16))
         }
         (BinOp::Add, Value::Char(a), Long(b)) => {
-            Ok(Value::Char((*a as i64).wrapping_add(*b) as u16))
+            Ok(Value::Char(i64::from(*a).wrapping_add(*b) as u16))
         }
         (BinOp::Sub, Value::Char(a), Long(b)) => {
-            Ok(Value::Char((*a as i64).wrapping_sub(*b) as u16))
+            Ok(Value::Char(i64::from(*a).wrapping_sub(*b) as u16))
         }
         (BinOp::Mul, Int(a), Int(b)) => Ok(Int(a.wrapping_mul(*b))),
         // (Int Div/Mod handled below, after Long, with ArithmeticException throw.)
@@ -2197,25 +2168,25 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         }
         // Mixed Int/Long arithmetic — widen the Int operand to Long
         // and apply Long arithmetic. Matches Kotlin's numeric tower.
-        (BinOp::Add, Long(a), Int(b)) => Ok(Long(a.wrapping_add(*b as i64))),
-        (BinOp::Add, Int(a), Long(b)) => Ok(Long((*a as i64).wrapping_add(*b))),
-        (BinOp::Sub, Long(a), Int(b)) => Ok(Long(a.wrapping_sub(*b as i64))),
-        (BinOp::Sub, Int(a), Long(b)) => Ok(Long((*a as i64).wrapping_sub(*b))),
-        (BinOp::Mul, Long(a), Int(b)) => Ok(Long(a.wrapping_mul(*b as i64))),
-        (BinOp::Mul, Int(a), Long(b)) => Ok(Long((*a as i64).wrapping_mul(*b))),
-        (BinOp::Div, Long(a), Int(b)) => Ok(Long(a.wrapping_div(*b as i64))),
-        (BinOp::Div, Int(a), Long(b)) => Ok(Long((*a as i64).wrapping_div(*b))),
-        (BinOp::Mod, Long(a), Int(b)) => Ok(Long(a.wrapping_rem(*b as i64))),
-        (BinOp::Mod, Int(a), Long(b)) => Ok(Long((*a as i64).wrapping_rem(*b))),
+        (BinOp::Add, Long(a), Int(b)) => Ok(Long(a.wrapping_add(i64::from(*b)))),
+        (BinOp::Add, Int(a), Long(b)) => Ok(Long(i64::from(*a).wrapping_add(*b))),
+        (BinOp::Sub, Long(a), Int(b)) => Ok(Long(a.wrapping_sub(i64::from(*b)))),
+        (BinOp::Sub, Int(a), Long(b)) => Ok(Long(i64::from(*a).wrapping_sub(*b))),
+        (BinOp::Mul, Long(a), Int(b)) => Ok(Long(a.wrapping_mul(i64::from(*b)))),
+        (BinOp::Mul, Int(a), Long(b)) => Ok(Long(i64::from(*a).wrapping_mul(*b))),
+        (BinOp::Div, Long(a), Int(b)) => Ok(Long(a.wrapping_div(i64::from(*b)))),
+        (BinOp::Div, Int(a), Long(b)) => Ok(Long(i64::from(*a).wrapping_div(*b))),
+        (BinOp::Mod, Long(a), Int(b)) => Ok(Long(a.wrapping_rem(i64::from(*b)))),
+        (BinOp::Mod, Int(a), Long(b)) => Ok(Long(i64::from(*a).wrapping_rem(*b))),
         // Mixed Int/Double + Long/Double + Int/Long comparison.
-        (BinOp::Add, Double(a), Int(b)) => Ok(Double(a + (*b as f64))),
-        (BinOp::Add, Int(a), Double(b)) => Ok(Double((*a as f64) + b)),
-        (BinOp::Sub, Double(a), Int(b)) => Ok(Double(a - (*b as f64))),
-        (BinOp::Sub, Int(a), Double(b)) => Ok(Double((*a as f64) - b)),
-        (BinOp::Mul, Double(a), Int(b)) => Ok(Double(a * (*b as f64))),
-        (BinOp::Mul, Int(a), Double(b)) => Ok(Double((*a as f64) * b)),
-        (BinOp::Div, Double(a), Int(b)) => Ok(Double(a / (*b as f64))),
-        (BinOp::Div, Int(a), Double(b)) => Ok(Double((*a as f64) / b)),
+        (BinOp::Add, Double(a), Int(b)) => Ok(Double(a + f64::from(*b))),
+        (BinOp::Add, Int(a), Double(b)) => Ok(Double(f64::from(*a) + b)),
+        (BinOp::Sub, Double(a), Int(b)) => Ok(Double(a - f64::from(*b))),
+        (BinOp::Sub, Int(a), Double(b)) => Ok(Double(f64::from(*a) - b)),
+        (BinOp::Mul, Double(a), Int(b)) => Ok(Double(a * f64::from(*b))),
+        (BinOp::Mul, Int(a), Double(b)) => Ok(Double(f64::from(*a) * b)),
+        (BinOp::Div, Double(a), Int(b)) => Ok(Double(a / f64::from(*b))),
+        (BinOp::Div, Int(a), Double(b)) => Ok(Double(f64::from(*a) / b)),
         (BinOp::Add, Double(a), Long(b)) => Ok(Double(a + (*b as f64))),
         (BinOp::Add, Long(a), Double(b)) => Ok(Double((*a as f64) + b)),
         (BinOp::Sub, Double(a), Long(b)) => Ok(Double(a - (*b as f64))),
@@ -2250,25 +2221,25 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
             Ok(Value::ULong(a % b))
         }
         // Mixed unsigned widening.
-        (BinOp::Add, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_add(*b as u64))),
-        (BinOp::Add, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong((*a as u64).wrapping_add(*b))),
-        (BinOp::Mul, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_mul(*b as u64))),
-        (BinOp::Mul, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong((*a as u64).wrapping_mul(*b))),
-        (BinOp::Sub, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_sub(*b as u64))),
-        (BinOp::Sub, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong((*a as u64).wrapping_sub(*b))),
+        (BinOp::Add, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_add(u64::from(*b)))),
+        (BinOp::Add, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong(u64::from(*a).wrapping_add(*b))),
+        (BinOp::Mul, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_mul(u64::from(*b)))),
+        (BinOp::Mul, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong(u64::from(*a).wrapping_mul(*b))),
+        (BinOp::Sub, Value::ULong(a), Value::UInt(b)) => Ok(Value::ULong(a.wrapping_sub(u64::from(*b)))),
+        (BinOp::Sub, Value::UInt(a), Value::ULong(b)) => Ok(Value::ULong(u64::from(*a).wrapping_sub(*b))),
         // Float arithmetic + mixed Float/Double promotion.
         (BinOp::Add, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
         (BinOp::Sub, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
         (BinOp::Mul, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
         (BinOp::Div, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
-        (BinOp::Add, Value::Float(a), Double(b)) => Ok(Double(*a as f64 + b)),
-        (BinOp::Add, Double(a), Value::Float(b)) => Ok(Double(a + *b as f64)),
-        (BinOp::Sub, Value::Float(a), Double(b)) => Ok(Double(*a as f64 - b)),
-        (BinOp::Sub, Double(a), Value::Float(b)) => Ok(Double(a - *b as f64)),
-        (BinOp::Mul, Value::Float(a), Double(b)) => Ok(Double(*a as f64 * b)),
-        (BinOp::Mul, Double(a), Value::Float(b)) => Ok(Double(a * *b as f64)),
-        (BinOp::Div, Value::Float(a), Double(b)) => Ok(Double(*a as f64 / b)),
-        (BinOp::Div, Double(a), Value::Float(b)) => Ok(Double(a / *b as f64)),
+        (BinOp::Add, Value::Float(a), Double(b)) => Ok(Double(f64::from(*a) + b)),
+        (BinOp::Add, Double(a), Value::Float(b)) => Ok(Double(a + f64::from(*b))),
+        (BinOp::Sub, Value::Float(a), Double(b)) => Ok(Double(f64::from(*a) - b)),
+        (BinOp::Sub, Double(a), Value::Float(b)) => Ok(Double(a - f64::from(*b))),
+        (BinOp::Mul, Value::Float(a), Double(b)) => Ok(Double(f64::from(*a) * b)),
+        (BinOp::Mul, Double(a), Value::Float(b)) => Ok(Double(a * f64::from(*b))),
+        (BinOp::Div, Value::Float(a), Double(b)) => Ok(Double(f64::from(*a) / b)),
+        (BinOp::Div, Double(a), Value::Float(b)) => Ok(Double(a / f64::from(*b))),
         (BinOp::Add, Int(a), Value::Float(b)) => Ok(Value::Float(*a as f32 + b)),
         (BinOp::Add, Value::Float(a), Int(b)) => Ok(Value::Float(a + *b as f32)),
         (BinOp::Sub, Int(a), Value::Float(b)) => Ok(Value::Float(*a as f32 - b)),
@@ -2292,8 +2263,8 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         // `%` on floating-point is IEEE remainder (sign of the dividend),
         // matching Rust's `%` and Kotlin's Double/Float.rem.
         (BinOp::Mod, Double(a), Double(b)) => Ok(Double(a % b)),
-        (BinOp::Mod, Double(a), Int(b)) => Ok(Double(a % (*b as f64))),
-        (BinOp::Mod, Int(a), Double(b)) => Ok(Double((*a as f64) % b)),
+        (BinOp::Mod, Double(a), Int(b)) => Ok(Double(a % f64::from(*b))),
+        (BinOp::Mod, Int(a), Double(b)) => Ok(Double(f64::from(*a) % b)),
         (BinOp::Eq, a, b) => Ok(Bool(Value::structural_eq(a, b))),
         (BinOp::NotEq, a, b) => Ok(Bool(!Value::structural_eq(a, b))),
         (BinOp::BoxedEq, a, b) => Ok(Bool(Value::structural_eq_boxed(a, b))),
@@ -2333,28 +2304,28 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::Greater, Value::UByte(a), Value::UByte(b)) => Ok(Bool(a > b)),
         (BinOp::GreaterEq, Value::UByte(a), Value::UByte(b)) => Ok(Bool(a >= b)),
         // Mixed-type comparisons widen to the larger of the two.
-        (BinOp::Less, Int(a), Long(b)) => Ok(Bool((*a as i64) < *b)),
-        (BinOp::Less, Long(a), Int(b)) => Ok(Bool(*a < *b as i64)),
-        (BinOp::LessEq, Int(a), Long(b)) => Ok(Bool((*a as i64) <= *b)),
-        (BinOp::LessEq, Long(a), Int(b)) => Ok(Bool(*a <= *b as i64)),
-        (BinOp::Greater, Int(a), Long(b)) => Ok(Bool((*a as i64) > *b)),
-        (BinOp::Greater, Long(a), Int(b)) => Ok(Bool(*a > *b as i64)),
-        (BinOp::GreaterEq, Int(a), Long(b)) => Ok(Bool((*a as i64) >= *b)),
-        (BinOp::GreaterEq, Long(a), Int(b)) => Ok(Bool(*a >= *b as i64)),
-        (BinOp::Less, Int(a), Double(b)) => Ok(Bool((*a as f64) < *b)),
-        (BinOp::Less, Double(a), Int(b)) => Ok(Bool(*a < *b as f64)),
+        (BinOp::Less, Int(a), Long(b)) => Ok(Bool(i64::from(*a) < *b)),
+        (BinOp::Less, Long(a), Int(b)) => Ok(Bool(*a < i64::from(*b))),
+        (BinOp::LessEq, Int(a), Long(b)) => Ok(Bool(i64::from(*a) <= *b)),
+        (BinOp::LessEq, Long(a), Int(b)) => Ok(Bool(*a <= i64::from(*b))),
+        (BinOp::Greater, Int(a), Long(b)) => Ok(Bool(i64::from(*a) > *b)),
+        (BinOp::Greater, Long(a), Int(b)) => Ok(Bool(*a > i64::from(*b))),
+        (BinOp::GreaterEq, Int(a), Long(b)) => Ok(Bool(i64::from(*a) >= *b)),
+        (BinOp::GreaterEq, Long(a), Int(b)) => Ok(Bool(*a >= i64::from(*b))),
+        (BinOp::Less, Int(a), Double(b)) => Ok(Bool(f64::from(*a) < *b)),
+        (BinOp::Less, Double(a), Int(b)) => Ok(Bool(*a < f64::from(*b))),
         (BinOp::Less, Long(a), Double(b)) => Ok(Bool((*a as f64) < *b)),
         (BinOp::Less, Double(a), Long(b)) => Ok(Bool(*a < *b as f64)),
-        (BinOp::LessEq, Int(a), Double(b)) => Ok(Bool((*a as f64) <= *b)),
-        (BinOp::LessEq, Double(a), Int(b)) => Ok(Bool(*a <= *b as f64)),
+        (BinOp::LessEq, Int(a), Double(b)) => Ok(Bool(f64::from(*a) <= *b)),
+        (BinOp::LessEq, Double(a), Int(b)) => Ok(Bool(*a <= f64::from(*b))),
         (BinOp::LessEq, Long(a), Double(b)) => Ok(Bool((*a as f64) <= *b)),
         (BinOp::LessEq, Double(a), Long(b)) => Ok(Bool(*a <= *b as f64)),
-        (BinOp::Greater, Int(a), Double(b)) => Ok(Bool((*a as f64) > *b)),
-        (BinOp::Greater, Double(a), Int(b)) => Ok(Bool(*a > *b as f64)),
+        (BinOp::Greater, Int(a), Double(b)) => Ok(Bool(f64::from(*a) > *b)),
+        (BinOp::Greater, Double(a), Int(b)) => Ok(Bool(*a > f64::from(*b))),
         (BinOp::Greater, Long(a), Double(b)) => Ok(Bool((*a as f64) > *b)),
         (BinOp::Greater, Double(a), Long(b)) => Ok(Bool(*a > *b as f64)),
-        (BinOp::GreaterEq, Int(a), Double(b)) => Ok(Bool((*a as f64) >= *b)),
-        (BinOp::GreaterEq, Double(a), Int(b)) => Ok(Bool(*a >= *b as f64)),
+        (BinOp::GreaterEq, Int(a), Double(b)) => Ok(Bool(f64::from(*a) >= *b)),
+        (BinOp::GreaterEq, Double(a), Int(b)) => Ok(Bool(*a >= f64::from(*b))),
         (BinOp::GreaterEq, Long(a), Double(b)) => Ok(Bool((*a as f64) >= *b)),
         (BinOp::GreaterEq, Double(a), Long(b)) => Ok(Bool(*a >= *b as f64)),
         (BinOp::Less, Value::String(a), Value::String(b)) => {
@@ -2372,26 +2343,26 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         (BinOp::And, Bool(a), Bool(b)) => Ok(Bool(*a && *b)),
         (BinOp::Or, Bool(a), Bool(b)) => Ok(Bool(*a || *b)),
         (BinOp::RangeTo, Int(a), Int(b)) => Ok(Value::Range {
-            start: *a as i64,
-            end: *b as i64,
+            start: i64::from(*a),
+            end: i64::from(*b),
             step: 1,
             kind: klio_runtime::RangeKind::Int,
         }),
         (BinOp::RangeUntil, Int(a), Int(b)) => Ok(Value::Range {
-            start: *a as i64,
-            end: (*b as i64) - 1,
+            start: i64::from(*a),
+            end: i64::from(*b) - 1,
             step: 1,
             kind: klio_runtime::RangeKind::Int,
         }),
         (BinOp::RangeTo, Value::Char(a), Value::Char(b)) => Ok(Value::Range {
-            start: *a as i64,
-            end: *b as i64,
+            start: i64::from(*a),
+            end: i64::from(*b),
             step: 1,
             kind: klio_runtime::RangeKind::Char,
         }),
         (BinOp::RangeUntil, Value::Char(a), Value::Char(b)) => Ok(Value::Range {
-            start: *a as i64,
-            end: (*b as i64) - 1,
+            start: i64::from(*a),
+            end: i64::from(*b) - 1,
             step: 1,
             kind: klio_runtime::RangeKind::Char,
         }),

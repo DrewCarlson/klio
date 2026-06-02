@@ -101,6 +101,7 @@ impl Output for CaptureOutput {
 pub struct SharedOutput(Arc<std::sync::Mutex<RecordingSink>>);
 
 impl SharedOutput {
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
@@ -109,17 +110,17 @@ impl SharedOutput {
     /// sink, then clear the recording. Called once after the run and
     /// every spawned thread have completed.
     pub fn replay_into(&self, out: &mut dyn Output) {
-        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         g.replay_into(out);
     }
 }
 
 impl Output for SharedOutput {
     fn writeln(&mut self, s: &str) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).writeln(s);
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).writeln(s);
     }
     fn write(&mut self, s: &str) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).write(s);
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).write(s);
     }
 }
 

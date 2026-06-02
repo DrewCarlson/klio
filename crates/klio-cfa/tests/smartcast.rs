@@ -46,11 +46,10 @@ fn any_narrowing_anywhere(
         let bid = klio_cfa::BlockId(i as u32);
         let walk = smartcast::states_within_block(cfg, bid, st.clone(), r2p);
         for s in walk {
-            if let Some(fact) = s.map.get(place) {
-                if f(fact) {
+            if let Some(fact) = s.map.get(place)
+                && f(fact) {
                     return true;
                 }
-            }
         }
     }
     false

@@ -104,12 +104,12 @@ fun main() {
 
 #[test]
 fn finally_overrides_value_if_returns() {
-    let src = r#"
+    let src = r"
 fun f(): Int {
     try { return 1 } finally { return 2 }
 }
 fun main() { println(f()) }
-"#;
+";
     assert_klio("fin_override", src, "2\n");
 }
 

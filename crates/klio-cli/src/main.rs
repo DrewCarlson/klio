@@ -240,8 +240,8 @@ mod source_selection_tests {
     fn sr(root: &str, include: &[&str], exclude: &[&str]) -> SourceRoot {
         SourceRoot {
             root: root.to_string(),
-            include: include.iter().map(|s| s.to_string()).collect(),
-            exclude: exclude.iter().map(|s| s.to_string()).collect(),
+            include: include.iter().map(std::string::ToString::to_string).collect(),
+            exclude: exclude.iter().map(std::string::ToString::to_string).collect(),
         }
     }
 

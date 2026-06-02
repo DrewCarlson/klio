@@ -135,7 +135,7 @@ fun main() {
 #[test]
 
 fn anonymous_function_local_return() {
-    let src = r#"
+    let src = r"
 fun pickFirstEven(xs: List<Int>): Int? {
     return xs.firstOrNull(fun(n): Boolean {
         if (n < 0) return false
@@ -145,7 +145,7 @@ fun pickFirstEven(xs: List<Int>): Int? {
 fun main() {
     println(pickFirstEven(listOf(1, 3, 4, 5, 6)))
 }
-"#;
+";
     assert_klio("anonymous_fn_local_return", src, "4\n");
 }
 
@@ -197,12 +197,12 @@ fun main() { println("${parity(4)} ${parity(7)}") }
 // 11. Higher-order chain: filter -> map -> reduce.
 #[test]
 fn filter_map_reduce_chain() {
-    let src = r#"
+    let src = r"
 fun main() {
     val n = (1..10).filter { it % 2 == 1 }.map { it * it }.reduce { a, b -> a + b }
     println(n)
 }
-"#;
+";
     // 1+9+25+49+81 = 165
     assert_klio("filter_map_reduce", src, "165\n");
 }

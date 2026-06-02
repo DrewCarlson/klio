@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{ObjRef, Env, ClassDef, InstanceData, DelegateKind, Value, SequenceSource, SeqOp};
 
 use std::sync::Arc;
 
@@ -15,25 +15,23 @@ pub(crate) fn publish_env(env: &Env, seen: &mut std::collections::HashSet<usize>
     for v in env.vars.values() {
         publish_value(v, seen);
     }
-    if let Some(parent) = &env.parent {
-        if mark_cell(parent, seen) {
+    if let Some(parent) = &env.parent
+        && mark_cell(parent, seen) {
             publish_env(&parent.borrow(), seen);
         }
-    }
 }
 
 fn publish_classdef(cls: &Arc<ClassDef>, seen: &mut std::collections::HashSet<usize>) {
     // Key ClassDef walks on the Arc identity so parent/enclosing cycles
     // terminate even though the Arc itself carries no ObjRef cell.
-    let arc_id = Arc::as_ptr(cls) as *const () as usize;
+    let arc_id = Arc::as_ptr(cls).cast::<()>() as usize;
     if !seen.insert(arc_id) {
         return;
     }
-    if mark_cell(&cls.parent, seen) {
-        if let Some(p) = cls.parent.borrow().as_ref() {
+    if mark_cell(&cls.parent, seen)
+        && let Some(p) = cls.parent.borrow().as_ref() {
             publish_classdef(p, seen);
         }
-    }
     if mark_cell(&cls.interfaces, seen) {
         for iface in cls.interfaces.borrow().iter() {
             publish_classdef(iface, seen);
@@ -44,18 +42,15 @@ fn publish_classdef(cls: &Arc<ClassDef>, seen: &mut std::collections::HashSet<us
             publish_value(v, seen);
         }
     }
-    if mark_cell(&cls.companion, seen) {
-        if let Some(c) = cls.companion.borrow().as_ref() {
-            if mark_cell(c, seen) {
+    if mark_cell(&cls.companion, seen)
+        && let Some(c) = cls.companion.borrow().as_ref()
+            && mark_cell(c, seen) {
                 publish_instance(&c.borrow(), seen);
             }
-        }
-    }
-    if mark_cell(&cls.enclosing_class, seen) {
-        if let Some(e) = cls.enclosing_class.borrow().as_ref() {
+    if mark_cell(&cls.enclosing_class, seen)
+        && let Some(e) = cls.enclosing_class.borrow().as_ref() {
             publish_classdef(e, seen);
         }
-    }
     if mark_cell(&cls.nested_classes, seen) {
         for (_, nested) in cls.nested_classes.borrow().iter() {
             publish_classdef(nested, seen);
@@ -80,13 +75,11 @@ fn publish_classdef(cls: &Arc<ClassDef>, seen: &mut std::collections::HashSet<us
             }
         }
     }
-    if mark_cell(&cls.object_singleton, seen) {
-        if let Some(s) = cls.object_singleton.borrow().as_ref() {
-            if mark_cell(s, seen) {
+    if mark_cell(&cls.object_singleton, seen)
+        && let Some(s) = cls.object_singleton.borrow().as_ref()
+            && mark_cell(s, seen) {
                 publish_instance(&s.borrow(), seen);
             }
-        }
-    }
     // Methods can carry SAM-converted lambda values that close over
     // the graph; publish those too.
     for m in &cls.methods {
@@ -158,14 +151,13 @@ pub(crate) fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usiz
                     publish_value(elem, seen);
                 }
             }
-            if let Some(b) = backing {
-                if mark_cell(&b.entries, seen) {
+            if let Some(b) = backing
+                && mark_cell(&b.entries, seen) {
                     for (k, v) in b.entries.borrow().iter() {
                         publish_value(k, seen);
                         publish_value(v, seen);
                     }
                 }
-            }
         }
         Value::Array { items, .. } => {
             if mark_cell(items, seen) {
@@ -249,14 +241,13 @@ pub(crate) fn publish_value(v: &Value, seen: &mut std::collections::HashSet<usiz
         Value::MapEntry { key, value, backing } => {
             publish_value(key, seen);
             publish_value(value, seen);
-            if let Some(b) = backing {
-                if mark_cell(b, seen) {
+            if let Some(b) = backing
+                && mark_cell(b, seen) {
                     for (k, v) in b.borrow().iter() {
                         publish_value(k, seen);
                         publish_value(v, seen);
                     }
                 }
-            }
         }
         Value::Result { payload, .. } => publish_value(payload, seen),
         Value::Exception { cause, .. } => {

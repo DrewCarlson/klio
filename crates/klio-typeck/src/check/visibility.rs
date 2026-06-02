@@ -1,6 +1,6 @@
-use super::*;
+use super::{Checker, Visibility, HashSet, Span, Diagnostic, codes, ClassInfo, has_published_api, Type, Expr, at_least_as_applicable, AssignOp, TypeRef};
 
-impl<'r> Checker<'r> {
+impl Checker<'_> {
     /// Look up the effective visibility a class declares for a member.
     /// Walks the supertype chain so inherited members are seen with the
     /// declaring class's annotation. Returns `(visibility, declaring_class)`.
@@ -78,8 +78,7 @@ impl<'r> Checker<'r> {
             Visibility::Private => {
                 self.class_stack
                     .last()
-                    .map(|c| c == &decl_class)
-                    .unwrap_or(false)
+                    .is_some_and(|c| c == &decl_class)
             }
             Visibility::Protected => {
                 self.protected_access_allowed(&decl_class, recv_class)
@@ -119,10 +118,9 @@ impl<'r> Checker<'r> {
         // the class visibility itself.
         let same_file = info
             .decl_file
-            .map(|f| f == use_span.file)
-            .unwrap_or(true);
-        if let Some(pcv) = info.primary_ctor_visibility {
-            if matches!(pcv, Visibility::Private) && !same_file {
+            .is_none_or(|f| f == use_span.file);
+        if let Some(pcv) = info.primary_ctor_visibility
+            && matches!(pcv, Visibility::Private) && !same_file {
                 self.diagnostics.emit(
                     Diagnostic::error(
                         format!("Cannot access `{name}`: primary constructor is private"),
@@ -132,17 +130,15 @@ impl<'r> Checker<'r> {
                 );
                 return;
             }
-        }
         if matches!(info.decl_visibility, Visibility::Public | Visibility::Internal) {
             return;
         }
         match info.decl_visibility {
             Visibility::Private if same_file => return,
-            Visibility::Protected => {
-                if self.protected_access_allowed(name, None) {
+            Visibility::Protected
+                if self.protected_access_allowed(name, None) => {
                     return;
                 }
-            }
             _ => {}
         }
         let kind = match info.decl_visibility {
@@ -340,8 +336,8 @@ impl<'r> Checker<'r> {
                 }
             }
         }
-        if !found {
-            if let Some(lhs) = args.first() {
+        if !found
+            && let Some(lhs) = args.first() {
                 let lhs_class = self.expr_class.get(&lhs.span()).cloned();
                 if let Some(cn) = lhs_class {
                     let mut seen: HashSet<String> = HashSet::new();
@@ -408,7 +404,6 @@ impl<'r> Checker<'r> {
                     }
                 }
             }
-        }
         if any && !found {
             self.diagnostics.emit(
                 Diagnostic::error(

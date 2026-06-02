@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{PathBuf, DiagFormat, ExitCode, SourceMap, DiagnosticSink, Lexer, Parser, render, Severity};
 
 use crate::pack_cache::load_installed_packs;
 
@@ -144,7 +144,7 @@ pub(crate) fn run_module_files(paths: &[PathBuf]) -> ExitCode {
 }
 
 /// Run a single source file through `klio-interp-ir`'s Vm. The
-/// pipeline is parse → typecheck → klio_interp_ir::build::build_module
+/// pipeline is parse → typecheck → `klio_interp_ir::build::build_module`
 /// → `Vm::run`. No code path goes through `klio-interp` — the new
 /// Vm owns module construction end-to-end.
 pub(crate) fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {

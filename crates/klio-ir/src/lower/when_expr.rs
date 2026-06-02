@@ -28,7 +28,7 @@ pub(super) fn collect_switch_arms(
                 _ => return None,
             };
             let const_id = match value_expr {
-                Expr::IntLit { value, .. } if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 => {
+                Expr::IntLit { value, .. } if i32::try_from(*value).is_ok() => {
                     b.module.intern_const(Const::Int(*value as i32))
                 }
                 Expr::IntLit { value, .. } => b.module.intern_const(Const::Long(*value)),
@@ -63,21 +63,18 @@ pub(super) fn lower_when(
     let subject_r = subject.map(|s| lower_expr(b, s));
     let join = b.alloc_block();
     let result = b.alloc_reg();
-    if let Some(subj) = subject_r {
-        if let Some(arms) = collect_switch_arms(b, branches) {
+    if let Some(subj) = subject_r
+        && let Some(arms) = collect_switch_arms(b, branches) {
             let (cases, default_blk, body_block_for_branch) = arms;
-            let default = match default_blk {
-                Some(blk) => blk,
-                None => {
-                    let dflt = b.alloc_block();
-                    let saved = b.cur;
-                    b.switch_to(dflt);
-                    let u = b.emit_const(Const::Unit);
-                    b.push(Inst::Move { dst: result, src: u });
-                    b.terminate(Terminator::Goto(join));
-                    b.switch_to(saved);
-                    dflt
-                }
+            let default = if let Some(blk) = default_blk { blk } else {
+                let dflt = b.alloc_block();
+                let saved = b.cur;
+                b.switch_to(dflt);
+                let u = b.emit_const(Const::Unit);
+                b.push(Inst::Move { dst: result, src: u });
+                b.terminate(Terminator::Goto(join));
+                b.switch_to(saved);
+                dflt
             };
             b.terminate(Terminator::Switch { reg: subj, arms: cases, default });
             for (branch, body_blk) in branches.iter().zip(body_block_for_branch.iter()) {
@@ -91,7 +88,6 @@ pub(super) fn lower_when(
             b.switch_to(join);
             return result;
         }
-    }
     for branch in branches {
         let body_blk = b.alloc_block();
         let next_blk = b.alloc_block();
@@ -182,12 +178,9 @@ pub(super) fn lower_when(
                 }).collect()
             }),
             (None, patterns) => or_chain(b, |b| {
-                patterns.iter().map(|p| match &p.kind {
-                    klio_ast::WhenPatternKind::Value(e) => lower_expr(b, e),
-                    _ => {
-                        b.push(Inst::Trace { span: p.span });
-                        b.emit_const(Const::Bool(false))
-                    }
+                patterns.iter().map(|p| if let klio_ast::WhenPatternKind::Value(e) = &p.kind { lower_expr(b, e) } else {
+                    b.push(Inst::Trace { span: p.span });
+                    b.emit_const(Const::Bool(false))
                 }).collect()
             }),
         };

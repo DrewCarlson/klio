@@ -221,7 +221,7 @@ fun main() {
 //    invoke path together.
 #[test]
 fn member_expr_body_with_inline_ext_on_this() {
-    let src = r#"
+    let src = r"
 inline fun <T, R> T.also2(action: (T) -> Unit): T { action(this); return this }
 
 class Counter {
@@ -234,7 +234,7 @@ fun main() {
     val c = Counter().bump().bump().bump()
     println(c.value())
 }
-"#;
+";
     assert_klio("member_expr_body_inline_ext", src, "3\n");
 }
 

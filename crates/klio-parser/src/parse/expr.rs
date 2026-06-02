@@ -1,6 +1,6 @@
-use super::*;
+use super::{Parser, Expr, TokenKind, BinOp, Keyword, is_valid_infix_name, Ident, UnOp, TypeRef, PostfixOp, is_trailing_lambda_callable};
 
-impl<'src, 'tok> Parser<'src, 'tok> {
+impl Parser<'_, '_> {
     pub fn parse_expr(&mut self) -> Option<Expr> {
         self.parse_disjunction()
     }
@@ -251,19 +251,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         }
         let next = self.tokens.get(i).map(|t| &t.kind);
         match next {
-            None
-            | Some(TokenKind::Newline)
-            | Some(TokenKind::Semicolon)
-            | Some(TokenKind::Eof)
-            | Some(TokenKind::RBrace)
-            | Some(TokenKind::RParen)
-            | Some(TokenKind::RBracket)
-            | Some(TokenKind::Comma)
-            | Some(TokenKind::Eq)
-            | Some(TokenKind::Colon)
-            | Some(TokenKind::Arrow)
-            | Some(TokenKind::Dot)
-            | Some(TokenKind::QuestionDot) => false,
+            None |
+Some(TokenKind::Newline | TokenKind::Semicolon | TokenKind::Eof |
+TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket | TokenKind::Comma
+| TokenKind::Eq | TokenKind::Colon | TokenKind::Arrow | TokenKind::Dot |
+TokenKind::QuestionDot) => false,
             Some(_) => true,
         }
     }
@@ -406,8 +398,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     if name.name == "class" && !pending_type_args.is_empty() {
                         // Spec §15.1: class literals erase their type
                         // arguments, so writing them is rejected.
-                        let span_first = pending_type_args.first().map(|t| t.span).unwrap_or(name.span);
-                        let span_last = pending_type_args.last().map(|t| t.span).unwrap_or(name.span);
+                        let span_first = pending_type_args.first().map_or(name.span, |t| t.span);
+                        let span_last = pending_type_args.last().map_or(name.span, |t| t.span);
                         self.error(
                             "T0104",
                             "class literal does not take type arguments — type arguments are erased on `::class`.",
@@ -628,10 +620,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         }
         matches!(
             self.tokens.get(i).map(|t| &t.kind),
-            Some(TokenKind::Dot)
-                | Some(TokenKind::QuestionDot)
-                | Some(TokenKind::BangBang)
-                | Some(TokenKind::LBracket)
+            Some(TokenKind::Dot | TokenKind::QuestionDot | TokenKind::BangBang |
+TokenKind::LBracket)
         )
     }
 

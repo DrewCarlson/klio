@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{ObjRef, Value, Env};
 
 use std::sync::{Arc, Mutex};
 
@@ -165,7 +165,7 @@ pub struct MethodDef {
     /// instance found under `field_key` on the receiver, dispatching the
     /// same method name on the delegate.
     pub delegate_field: Option<String>,
-    /// IR FuncId of the lowered method body (with `this` as the
+    /// IR `FuncId` of the lowered method body (with `this` as the
     /// implicit first param). Set by class registration when the
     /// method body has been lowered into the active IR module;
     /// `None` for abstract / SAM-replaced / delegate-forwarder
@@ -253,6 +253,7 @@ impl ClassDef {
     /// whose first declared parameter type name matches `arg_type_name` —
     /// used by operator dispatch to pick `plus(Bag)` over `plus(Int)` when
     /// the argument is a `Bag`. Falls back to the unspecific lookup.
+    #[must_use] 
     pub fn find_method_for_arg(
         self: &Arc<Self>,
         name: &str,
@@ -339,7 +340,7 @@ fn collect_companions_walk(
     seen: &mut Vec<*const ClassDef>,
 ) {
     let ptr = Arc::as_ptr(cls);
-    if seen.iter().any(|p| *p == ptr) || seen.len() > 128 {
+    if seen.contains(&ptr) || seen.len() > 128 {
         return;
     }
     seen.push(ptr);
@@ -368,7 +369,7 @@ fn find_method_for_arg_walk(
     seen: &mut Vec<*const ClassDef>,
 ) -> Option<(MethodDef, Arc<ClassDef>)> {
     let ptr = Arc::as_ptr(cls);
-    if seen.iter().any(|p| *p == ptr) || seen.len() > 128 {
+    if seen.contains(&ptr) || seen.len() > 128 {
         return None;
     }
     seen.push(ptr);
@@ -376,19 +377,17 @@ fn find_method_for_arg_walk(
         m.decl
             .params
             .first()
-            .map(|p| p.ty.name.name == arg_type_name)
-            .unwrap_or(false)
+            .is_some_and(|p| p.ty.name.name == arg_type_name)
     };
     if let Some(m) = cls.methods.iter().find(|m| {
         m.name == name && m.decl.body.is_some() && arg_matches(m)
     }) {
         return Some((m.clone(), Arc::clone(cls)));
     }
-    if let Some(parent) = cls.parent.borrow().clone() {
-        if let Some(found) = find_method_for_arg_walk(&parent, name, arg_type_name, seen) {
+    if let Some(parent) = cls.parent.borrow().clone()
+        && let Some(found) = find_method_for_arg_walk(&parent, name, arg_type_name, seen) {
             return Some(found);
         }
-    }
     for iface in cls.interfaces.borrow().iter() {
         if let Some(found) = find_method_for_arg_walk(iface, name, arg_type_name, seen) {
             return Some(found);
@@ -403,7 +402,7 @@ fn find_method_walk(
     seen: &mut Vec<*const ClassDef>,
 ) -> Option<(MethodDef, Arc<ClassDef>)> {
     let ptr = Arc::as_ptr(cls);
-    if seen.iter().any(|p| *p == ptr) || seen.len() > 128 {
+    if seen.contains(&ptr) || seen.len() > 128 {
         return None;
     }
     seen.push(ptr);
@@ -429,11 +428,10 @@ fn find_method_walk(
     // Walk the parent chain (concrete superclass) before interfaces — a
     // concrete-method inherited from a parent class wins over an interface
     // default with the same signature.
-    if let Some(parent) = cls.parent.borrow().clone() {
-        if let Some(found) = find_method_walk(&parent, name, seen) {
+    if let Some(parent) = cls.parent.borrow().clone()
+        && let Some(found) = find_method_walk(&parent, name, seen) {
             return Some(found);
         }
-    }
     for iface in cls.interfaces.borrow().iter() {
         if let Some(found) = find_method_walk(iface, name, seen) {
             return Some(found);
@@ -453,18 +451,17 @@ fn find_body_property_walk(
     seen: &mut Vec<*const ClassDef>,
 ) -> Option<(PropertyDef, Arc<ClassDef>)> {
     let ptr = Arc::as_ptr(cls);
-    if seen.iter().any(|p| *p == ptr) || seen.len() > 128 {
+    if seen.contains(&ptr) || seen.len() > 128 {
         return None;
     }
     seen.push(ptr);
     if let Some(p) = cls.body_properties.iter().find(|p| p.name == name) {
         return Some((p.clone(), Arc::clone(cls)));
     }
-    if let Some(parent) = cls.parent.borrow().clone() {
-        if let Some(found) = find_body_property_walk(&parent, name, seen) {
+    if let Some(parent) = cls.parent.borrow().clone()
+        && let Some(found) = find_body_property_walk(&parent, name, seen) {
             return Some(found);
         }
-    }
     for iface in cls.interfaces.borrow().iter() {
         if let Some(found) = find_body_property_walk(iface, name, seen) {
             return Some(found);

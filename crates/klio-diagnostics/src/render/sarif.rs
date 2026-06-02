@@ -1,5 +1,5 @@
 //! Minimal SARIF 2.1.0 renderer. Produces a single SARIF run with one
-//! result per diagnostic, suitable for GitHub Code Scanning and CodeQL-
+//! result per diagnostic, suitable for GitHub Code Scanning and `CodeQL`-
 //! style aggregators. Schema reference:
 //! <https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html>.
 
@@ -37,11 +37,10 @@ pub fn to_string(diagnostics: &[Diagnostic], sources: &SourceMap) -> String {
 fn rules_array(diagnostics: &[Diagnostic]) -> String {
     let mut seen: Vec<&'static str> = Vec::new();
     for d in diagnostics {
-        if let Some(code) = d.code() {
-            if !seen.contains(&code) {
+        if let Some(code) = d.code()
+            && !seen.contains(&code) {
                 seen.push(code);
             }
-        }
     }
     let mut s = String::new();
     s.push('[');

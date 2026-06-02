@@ -195,7 +195,7 @@ fun main() {
 //    Comparator.
 #[test]
 fn generic_in_variance_comparator() {
-    let src = r#"
+    let src = r"
 fun interface Comparer<in T> { fun compare(a: T, b: T): Int }
 
 fun <T> pickMax(a: T, b: T, c: Comparer<T>): T = if (c.compare(a, b) >= 0) a else b
@@ -205,7 +205,7 @@ fun main() {
     // Comparer<Number> accepted as Comparer<Int> via `in` variance.
     println(pickMax(3, 7, byNum))
 }
-"#;
+";
     assert_klio("generic_in_variance", src, "7\n");
 }
 

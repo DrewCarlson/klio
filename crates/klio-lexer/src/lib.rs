@@ -188,6 +188,7 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    #[must_use] 
     pub fn tokenize(mut self) -> LexResult {
         let mut tokens = Vec::new();
         loop {
@@ -651,7 +652,7 @@ impl<'src> Lexer<'src> {
         while count < 4 {
             match self.peek_byte(0) {
                 Some(b) if (b as char).is_ascii_hexdigit() => {
-                    value = (value << 4) | u32::from((b as char).to_digit(16).unwrap());
+                    value = (value << 4) | (b as char).to_digit(16).unwrap();
                     self.pos += 1;
                     count += 1;
                 }
@@ -834,21 +835,20 @@ impl<'src> Lexer<'src> {
                     text.push('"');
                     self.pos += 1;
                     continue;
-                } else {
-                    if !text.is_empty() {
-                        tokens.push(Token {
-                            kind: TokenKind::StringText(std::mem::take(&mut text)),
-                            span: Span::new(self.file, segment_start, self.pos),
-                        });
-                    }
-                    self.pos += 1;
-                    tokens.push(Token {
-                        kind: TokenKind::StringQuote { triple: false },
-                        span: Span::new(self.file, self.pos - 1, self.pos),
-                    });
-                    self.modes.pop();
-                    return;
                 }
+                if !text.is_empty() {
+                    tokens.push(Token {
+                        kind: TokenKind::StringText(std::mem::take(&mut text)),
+                        span: Span::new(self.file, segment_start, self.pos),
+                    });
+                }
+                self.pos += 1;
+                tokens.push(Token {
+                    kind: TokenKind::StringQuote { triple: false },
+                    span: Span::new(self.file, self.pos - 1, self.pos),
+                });
+                self.modes.pop();
+                return;
             }
 
             // Newline: error in regular strings, allowed in raw.
@@ -896,8 +896,7 @@ impl<'src> Lexer<'src> {
                 // `$ident` short form.
                 if self
                     .peek_byte(1)
-                    .map(|c| is_ident_start_byte(c))
-                    .unwrap_or(false)
+                    .is_some_and(is_ident_start_byte)
                 {
                     if !text.is_empty() {
                         tokens.push(Token {
@@ -908,7 +907,7 @@ impl<'src> Lexer<'src> {
                     let short_start = self.pos;
                     self.pos += 1; // consume `$`
                     let ident_start = self.pos;
-                    while matches!(self.peek_byte(0), Some(c) if is_ident_cont_byte(c as u32)) {
+                    while matches!(self.peek_byte(0), Some(c) if is_ident_cont_byte(u32::from(c))) {
                         self.pos += 1;
                     }
                     let name = self.src[ident_start as usize..self.pos as usize].to_string();
@@ -1129,25 +1128,25 @@ mod tests {
 
     #[test]
     fn at_ws_variants() {
-        assert!(matches!(find_kind("@foo", |k| k.is_at()), TokenKind::AtNoWs));
-        assert!(matches!(find_kind("@ foo", |k| k.is_at()), TokenKind::AtPostWs));
-        assert!(matches!(find_kind("x @foo", |k| k.is_at()), TokenKind::AtPreWs));
-        assert!(matches!(find_kind("x @ foo", |k| k.is_at()), TokenKind::AtBothWs));
-        assert!(matches!(find_kind("@\nfoo", |k| k.is_at()), TokenKind::AtPostWs));
-        assert!(matches!(find_kind("x\n@foo", |k| k.is_at()), TokenKind::AtPreWs));
+        assert!(matches!(find_kind("@foo", super::TokenKind::is_at), TokenKind::AtNoWs));
+        assert!(matches!(find_kind("@ foo", super::TokenKind::is_at), TokenKind::AtPostWs));
+        assert!(matches!(find_kind("x @foo", super::TokenKind::is_at), TokenKind::AtPreWs));
+        assert!(matches!(find_kind("x @ foo", super::TokenKind::is_at), TokenKind::AtBothWs));
+        assert!(matches!(find_kind("@\nfoo", super::TokenKind::is_at), TokenKind::AtPostWs));
+        assert!(matches!(find_kind("x\n@foo", super::TokenKind::is_at), TokenKind::AtPreWs));
     }
 
     #[test]
     fn question_ws_variants() {
-        assert!(matches!(find_kind("a?b", |k| k.is_question()), TokenKind::QuestNoWs));
-        assert!(matches!(find_kind("a? b", |k| k.is_question()), TokenKind::QuestWs));
-        assert!(matches!(find_kind("a?", |k| k.is_question()), TokenKind::QuestWs));
+        assert!(matches!(find_kind("a?b", super::TokenKind::is_question), TokenKind::QuestNoWs));
+        assert!(matches!(find_kind("a? b", super::TokenKind::is_question), TokenKind::QuestWs));
+        assert!(matches!(find_kind("a?", super::TokenKind::is_question), TokenKind::QuestWs));
     }
 
     #[test]
     fn excl_ws_variants() {
-        assert!(matches!(find_kind("!a", |k| k.is_bang()), TokenKind::ExclNoWs));
-        assert!(matches!(find_kind("! a", |k| k.is_bang()), TokenKind::ExclWs));
+        assert!(matches!(find_kind("!a", super::TokenKind::is_bang), TokenKind::ExclNoWs));
+        assert!(matches!(find_kind("! a", super::TokenKind::is_bang), TokenKind::ExclWs));
     }
 
     #[test]
@@ -1169,7 +1168,7 @@ mod tests {
     fn bang_is_emits_excl_no_ws_before_is() {
         let r = lex("x !is Int");
         let non_trivia: Vec<_> = r.tokens.iter().filter(|t| !matches!(t.kind, TokenKind::Whitespace | TokenKind::Newline | TokenKind::Eof)).map(|t| t.kind.clone()).collect();
-        let i = non_trivia.iter().position(|k| k.is_bang()).unwrap();
+        let i = non_trivia.iter().position(super::TokenKind::is_bang).unwrap();
         assert!(matches!(non_trivia[i], TokenKind::ExclNoWs));
         assert!(matches!(non_trivia[i + 1], TokenKind::Keyword(Keyword::Is)));
     }
@@ -1201,7 +1200,7 @@ mod tests {
         let r = lex("foo #!bar");
         let kinds: Vec<_> = r.tokens.iter().map(|t| t.kind.clone()).collect();
         assert!(kinds.iter().any(|k| matches!(k, TokenKind::Hash)));
-        assert!(kinds.iter().any(|k| k.is_bang()));
+        assert!(kinds.iter().any(super::TokenKind::is_bang));
     }
 
     #[test]

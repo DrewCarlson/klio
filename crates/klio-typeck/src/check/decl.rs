@@ -1,6 +1,6 @@
-use super::*;
+use super::{Checker, Decl, class_name_from_typeref, ExtensionSig, Type, convert_type_ref_lossy, ExtensionPropSig, Binding, ClassInfo, TypeAliasInfo, TypeParam, WhereBound, FnSig, describe_params, Function, convert_type_ref_with_tparams, Class, MemberSig, HashMap, substitute_type_params, MemberFlags, Property, Diagnostic, codes, TypeRef, Span, Visibility, FunctionBody, Block, Stmt, stmt_span, CtorDelegation, is_builtin_overridable, EnumEntry, Expr, is_primitive_type_name, type_display, Accessor, SecondaryCtor, ObjectDecl};
 
-impl<'r> Checker<'r> {
+impl Checker<'_> {
 
     // ---- top-level declaration intake -----------------------------------
 
@@ -35,8 +35,7 @@ impl<'r> Checker<'r> {
                 let ty = p
                     .ty
                     .as_ref()
-                    .map(convert_type_ref_lossy)
-                    .unwrap_or(Type::Unresolved);
+                    .map_or(Type::Unresolved, convert_type_ref_lossy);
                 let cn = p.ty.as_ref().and_then(class_name_from_typeref);
                 if let Some(recv) = &p.receiver_type {
                     self.extension_properties
@@ -58,12 +57,11 @@ impl<'r> Checker<'r> {
                     if let Some(sv) = p.setter_visibility {
                         self.setter_visibility
                             .insert(p.name.name.clone(), (sv, p.name.span.file));
-                    } else if let Some(setter) = &p.setter {
-                        if let Some(sv) = setter.visibility {
+                    } else if let Some(setter) = &p.setter
+                        && let Some(sv) = setter.visibility {
                             self.setter_visibility
                                 .insert(p.name.name.clone(), (sv, p.name.span.file));
                         }
-                    }
                     self.prop_annotations
                         .insert(p.name.name.clone(), p.annotations.clone());
                 }
@@ -178,8 +176,7 @@ impl<'r> Checker<'r> {
         let return_ty = f
             .return_type
             .as_ref()
-            .map(|rt| convert_type_ref_with_tparams(rt, &tparams))
-            .unwrap_or(Type::Unit);
+            .map_or(Type::Unit, |rt| convert_type_ref_with_tparams(rt, &tparams));
         let param_class_names: Vec<Option<String>> =
             f.params.iter().map(|p| class_name_from_typeref(&p.ty)).collect();
         let (type_param_names, type_param_bounds) =
@@ -373,8 +370,7 @@ impl<'r> Checker<'r> {
                     let ty = p
                         .ty
                         .as_ref()
-                        .map(convert_type_ref_lossy)
-                        .unwrap_or(Type::Unresolved);
+                        .map_or(Type::Unresolved, convert_type_ref_lossy);
                     info.member_sigs.insert(
                         p.name.name.clone(),
                         MemberSig::Property {
@@ -433,11 +429,10 @@ impl<'r> Checker<'r> {
                 self.check_assignable(&init_ty, &annot, init.span());
             } else {
                 // Infer from initializer.
-                if let Some(b) = self.frames[0].bindings.get_mut(&p.name.name) {
-                    if matches!(b.ty, Type::Unresolved) {
+                if let Some(b) = self.frames[0].bindings.get_mut(&p.name.name)
+                    && matches!(b.ty, Type::Unresolved) {
                         b.ty = init_ty;
                     }
-                }
             }
         }
         if let Some(d) = &p.delegate {
@@ -519,13 +514,11 @@ impl<'r> Checker<'r> {
             "setValue" => (Some("3 args"), false, false),
             _ => {
                 // componentN: digits after "component"
-                if let Some(rest) = name.strip_prefix("component") {
-                    if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-                        if n != 0 {
+                if let Some(rest) = name.strip_prefix("component")
+                    && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+                        && n != 0 {
                             self.emit_op_sig(f, &format!("`{name}` operator must take no arguments"));
                         }
-                    }
-                }
                 (None, false, false)
             }
         };
@@ -544,22 +537,20 @@ impl<'r> Checker<'r> {
                 );
             }
         }
-        if returns_bool {
-            if let Some(rt) = &f.return_type {
+        if returns_bool
+            && let Some(rt) = &f.return_type {
                 let ty = convert_type_ref_lossy(rt);
                 if !matches!(ty.non_null(), Type::Boolean | Type::Unresolved) {
                     self.emit_op_sig(f, &format!("`{name}` operator must return Boolean"));
                 }
             }
-        }
-        if returns_int {
-            if let Some(rt) = &f.return_type {
+        if returns_int
+            && let Some(rt) = &f.return_type {
                 let ty = convert_type_ref_lossy(rt);
                 if !matches!(ty.non_null(), Type::Int | Type::Unresolved) {
                     self.emit_op_sig(f, &format!("`{name}` operator must return Int"));
                 }
             }
-        }
     }
 
     /// Head name of a type reference — i.e. the top-level classifier name,
@@ -743,8 +734,7 @@ impl<'r> Checker<'r> {
         let declared_return = f
             .return_type
             .as_ref()
-            .map(convert_type_ref_lossy)
-            .unwrap_or(Type::Unit);
+            .map_or(Type::Unit, convert_type_ref_lossy);
         self.fn_return_stack.push(declared_return.clone());
         self.label_stack.push(f.name.name.clone());
         let is_public_inline = f.is_inline && matches!(f.visibility, Visibility::Public);
@@ -814,7 +804,7 @@ impl<'r> Checker<'r> {
                         && !matches!(body_ty, Type::Nothing)
                         && normal_exit_reachable
                     {
-                        let span = b.stmts.last().map(stmt_span).unwrap_or(f.name.span);
+                        let span = b.stmts.last().map_or(f.name.span, stmt_span);
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 "a 'return' expression is required in a function with a block body and a non-`Unit` return type".to_string(),
@@ -988,9 +978,9 @@ impl<'r> Checker<'r> {
                             )
                             .with_code(codes::TYPE_DATA_CLASS_FORBIDS_COPY_OVERRIDE),
                         );
-                    } else if let Some(rest) = n.strip_prefix("component") {
-                        if let Ok(idx) = rest.parse::<usize>() {
-                            if idx >= 1 && idx <= n_props && f.params.is_empty() {
+                    } else if let Some(rest) = n.strip_prefix("component")
+                        && let Ok(idx) = rest.parse::<usize>()
+                            && idx >= 1 && idx <= n_props && f.params.is_empty() {
                                 self.diagnostics.emit(
                                     Diagnostic::error(
                                         format!(
@@ -1005,8 +995,6 @@ impl<'r> Checker<'r> {
                                     ),
                                 );
                             }
-                        }
-                    }
                 }
             }
         }
@@ -1231,8 +1219,7 @@ impl<'r> Checker<'r> {
                         let derived_ret = f.return_type.as_ref().map(convert_type_ref_lossy);
                         let check_ret = derived_ret
                             .as_ref()
-                            .map(|d| !d.is_subtype_of(base_ret))
-                            .unwrap_or(false);
+                            .is_some_and(|d| !d.is_subtype_of(base_ret));
                         if check_ret {
                             let derived_ret = derived_ret.unwrap();
                             self.diagnostics.emit(
@@ -1265,8 +1252,7 @@ impl<'r> Checker<'r> {
                         let derived_ty = p
                             .ty
                             .as_ref()
-                            .map(convert_type_ref_lossy)
-                            .unwrap_or(Type::Unresolved);
+                            .map_or(Type::Unresolved, convert_type_ref_lossy);
                         // T0066: mutability cannot strengthen. var base + val
                         // override is forbidden (val is stronger than var).
                         if *base_mut && !p.mutable {
@@ -1332,13 +1318,12 @@ impl<'r> Checker<'r> {
                 if is_delegated {
                     continue;
                 }
-                if let Some(parent) = self.classes.get(&s.name.name) {
-                    if parent.is_abstract || parent.is_interface {
+                if let Some(parent) = self.classes.get(&s.name.name)
+                    && (parent.is_abstract || parent.is_interface) {
                         for am in &parent.abstract_members {
                             required.push(am.clone());
                         }
                     }
-                }
             }
             if !required.is_empty() {
                 let info = self.classes.get(&c.name.name).cloned().unwrap_or_default();
@@ -1462,40 +1447,37 @@ impl<'r> Checker<'r> {
         // assigned by some primary-ctor path.
         let mut uninitialized_properties: Vec<(String, Span, bool, Span)> = Vec::new();
         for m in &c.members {
-            match m {
-                Decl::Property(p) => {
-                    if let Some(init) = &p.init {
-                        let want = p.ty.as_ref().map(convert_type_ref_lossy);
-                        let ity = self.check_expr(init, want.as_ref());
-                        if let Some(a) = want {
-                            self.check_assignable(&ity, &a, init.span());
-                        }
+            if let Decl::Property(p) = m {
+                if let Some(init) = &p.init {
+                    let want = p.ty.as_ref().map(convert_type_ref_lossy);
+                    let ity = self.check_expr(init, want.as_ref());
+                    if let Some(a) = want {
+                        self.check_assignable(&ity, &a, init.span());
                     }
-                    let has_init = p.init.is_some()
-                        || p.delegate.is_some()
-                        || p.is_lateinit
-                        || p.is_abstract
-                        || p.getter.is_some()
-                        || c.is_interface
-                        || c.is_abstract;
-                    if !has_init {
-                        let pty = p.ty.as_ref().map(convert_type_ref_lossy).unwrap_or(Type::Unresolved);
-                        self.current_frame().bindings.insert(
-                            p.name.name.clone(),
-                            Binding {
-                                ty: pty,
-                                mutable: p.mutable,
-                                decl_span: Some(p.name.span),
-                                class_name: p.ty.as_ref().and_then(class_name_from_typeref),
-                                
-                    decl_type_name: None,
-                            },
-                        );
-                        uninitialized_properties.push((p.name.name.clone(), p.name.span, p.mutable, p.name.span));
-                    }
-                    let _ = self.handle_accessors(p);
                 }
-                _ => {}
+                let has_init = p.init.is_some()
+                    || p.delegate.is_some()
+                    || p.is_lateinit
+                    || p.is_abstract
+                    || p.getter.is_some()
+                    || c.is_interface
+                    || c.is_abstract;
+                if !has_init {
+                    let pty = p.ty.as_ref().map_or(Type::Unresolved, convert_type_ref_lossy);
+                    self.current_frame().bindings.insert(
+                        p.name.name.clone(),
+                        Binding {
+                            ty: pty,
+                            mutable: p.mutable,
+                            decl_span: Some(p.name.span),
+                            class_name: p.ty.as_ref().and_then(class_name_from_typeref),
+                            
+                decl_type_name: None,
+                        },
+                    );
+                    uninitialized_properties.push((p.name.name.clone(), p.name.span, p.mutable, p.name.span));
+                }
+                let () = self.handle_accessors(p);
             }
         }
         // Inheritance-delegation diagnostics: validate each `: I by expr`
@@ -1507,8 +1489,7 @@ impl<'r> Checker<'r> {
             let target_is_interface = self
                 .classes
                 .get(target_name)
-                .map(|info| info.is_interface)
-                .unwrap_or(false);
+                .is_some_and(|info| info.is_interface);
             if !target_is_interface {
                 self.diagnostics.emit(
                     Diagnostic::error(
@@ -1522,9 +1503,9 @@ impl<'r> Checker<'r> {
             }
             let _ = self.check_expr(delegate_expr, None);
             let delegate_class = self.expr_class.get(&delegate_expr.span()).cloned();
-            if target_is_interface {
-                if let Some(dcn) = delegate_class {
-                    if &dcn != target_name && !self.is_subtype_of(&dcn, target_name) {
+            if target_is_interface
+                && let Some(dcn) = delegate_class
+                    && &dcn != target_name && !self.is_subtype_of(&dcn, target_name) {
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 format!(
@@ -1535,8 +1516,6 @@ impl<'r> Checker<'r> {
                             .with_code(codes::TYPE_DELEGATION_TYPE_MISMATCH),
                         );
                     }
-                }
-            }
         }
         // Build the synthetic class-init CFG before walking the
         // init blocks so check_block can consult it for
@@ -1683,8 +1662,7 @@ impl<'r> Checker<'r> {
         let derived_local = self
             .classes
             .get(derived_name)
-            .map(|i| i.is_local_or_anonymous)
-            .unwrap_or(false);
+            .is_some_and(|i| i.is_local_or_anonymous);
         for s in supertypes {
             let name = &s.name.name;
             let Some(parent) = self.classes.get(name) else { continue };
@@ -2209,7 +2187,7 @@ impl<'r> Checker<'r> {
                             self.check_assignable(&ity, &a, init.span());
                         }
                     }
-                    let _ = self.handle_accessors(p);
+                    let () = self.handle_accessors(p);
                 }
                 Decl::Function(f) => self.check_function(f),
                 _ => {}

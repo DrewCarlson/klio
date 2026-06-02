@@ -55,6 +55,7 @@ pub fn set_user_inline_contracts(
 /// Lookup the param names of the user inline fn `name` whose
 /// contract declares `callsInPlace(p, EXACTLY_ONCE)`. Empty when no
 /// user contract is registered for that name.
+#[must_use] 
 pub fn user_exactly_once_params(name: &str) -> Vec<String> {
     USER_INLINE_CONTRACTS.with(|c| c.borrow().get(name).cloned().unwrap_or_default())
 }
@@ -64,7 +65,7 @@ pub fn user_exactly_once_params(name: &str) -> Vec<String> {
 /// post-call path.
 #[must_use]
 pub fn stdlib_contract(name: &str) -> &'static [ContractEffect] {
-    use ContractEffect::*;
+    use ContractEffect::{AssumeNonNull, AssumePredicate};
     // The slice values live in `static` storage so callers can hand
     // them to the lowering without lifetime gymnastics.
     static NONNULL: &[ContractEffect] = &[AssumeNonNull { arg_idx: 0 }];

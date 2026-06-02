@@ -105,7 +105,7 @@ fn threaded_litmus_pending() {
 fn threaded_litmus_suite_is_complete() {
     let mut on_disk: Vec<String> = std::fs::read_dir(litmus_dir())
         .expect("threaded_litmus dir")
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter_map(|e| {
             let p = e.path();
             (p.extension()?.to_str()? == "kt")

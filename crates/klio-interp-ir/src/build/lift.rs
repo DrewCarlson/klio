@@ -1,4 +1,4 @@
-use super::*;
+use super::{Expr, Ident, Decl};
 
 /// Replace every bare `field` identifier in `expr` with
 /// `this.<prop_name>`. Used by accessor-body lowering so the IR
@@ -13,8 +13,8 @@ pub(crate) fn substitute_field_with_this(prop_name: &str, expr: &Expr) -> Expr {
 
 pub(crate) fn walk_field(e: &mut Expr, prop: &str, dummy: klio_span::Span) {
     let mut replace = None;
-    if let Expr::Path { segments, .. } = e {
-        if segments.len() == 1 && segments[0].name == "field" {
+    if let Expr::Path { segments, .. } = e
+        && segments.len() == 1 && segments[0].name == "field" {
             // Rewrite the raw `field` reference to a synthetic member
             // access on `this` that names the backing slot. Vm
             // get_field / set_field detect the `__klio_field__`
@@ -30,7 +30,6 @@ pub(crate) fn walk_field(e: &mut Expr, prop: &str, dummy: klio_span::Span) {
                 span: dummy,
             });
         }
-    }
     if let Some(r) = replace {
         *e = r;
         return;

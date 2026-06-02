@@ -278,13 +278,13 @@ fn pos_protected_member_from_subclass() {
 #[test]
 fn pos_private_member_same_class() {
     use klio_span::SourceMap;
-    let src = r#"
+    let src = r"
         class Box(val n: Int) {
             private fun secret(): Int = n * 2
             fun expose(): Int = secret()
         }
         fun main() { println(Box(3).expose()) }
-    "#;
+    ";
     let mut map = SourceMap::new();
     let id = map.add("pos.kt", src.to_string());
     let owned = map.get(id).source.clone();
@@ -305,11 +305,11 @@ fn pos_private_member_same_class() {
 #[test]
 fn pos_internal_treated_as_public() {
     use klio_span::SourceMap;
-    let src = r#"
+    let src = r"
         internal fun helper(): Int = 7
         internal class Bag(val n: Int)
         fun main() { println(helper() + Bag(3).n) }
-    "#;
+    ";
     let mut map = SourceMap::new();
     let id = map.add("pos.kt", src.to_string());
     let owned = map.get(id).source.clone();
@@ -330,13 +330,13 @@ fn pos_internal_treated_as_public() {
 #[test]
 fn neg_private_top_level_cross_file() {
     use klio_span::SourceMap;
-    let src_a = r#"
+    let src_a = r"
         private fun hidden(): Int = 42
         fun helperA(): Int = hidden()
-    "#;
-    let src_b = r#"
+    ";
+    let src_b = r"
         fun main() { println(hidden()) }
-    "#;
+    ";
     let mut map = SourceMap::new();
     let id_a = map.add("a.kt", src_a.to_string());
     let id_b = map.add("b.kt", src_b.to_string());

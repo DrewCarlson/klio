@@ -1,6 +1,6 @@
-use super::*;
+use super::{Parser, ModifierFlags, Function, TokenKind, Ident, FunctionBody, Expr, Param, Keyword, TypeRef, Property, Accessor, Visibility};
 
-impl<'src, 'tok> Parser<'src, 'tok> {
+impl Parser<'_, '_> {
     pub(crate) fn parse_fun(&mut self, flags: ModifierFlags) -> Option<Function> {
         let kw = self.bump(); // `fun`
         self.skip_nl();
@@ -173,13 +173,12 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         }
         let receiver_ty = if self.looks_like_anon_fun_receiver() {
             let mut ty = self.parse_simple_type();
-            if let Some(t) = ty.as_mut() {
-                if self.peek_kind().is_question() {
+            if let Some(t) = ty.as_mut()
+                && self.peek_kind().is_question() {
                     let q = self.bump();
                     t.nullable = true;
                     t.span = t.span.join(q.span);
                 }
-            }
             self.expect(&TokenKind::Dot, "`.`")?;
             self.skip_nl();
             ty
@@ -226,7 +225,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             return false;
         }
         let mut j = self.pos + 1;
-        if self.tokens.get(j).map(|t| t.kind.is_question()).unwrap_or(false) {
+        if self.tokens.get(j).is_some_and(|t| t.kind.is_question()) {
             j += 1;
         }
         matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::Dot))
@@ -257,7 +256,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 j += 1;
             }
         }
-        if self.tokens.get(j).map(|t| t.kind.is_question()).unwrap_or(false) {
+        if self.tokens.get(j).is_some_and(|t| t.kind.is_question()) {
             j += 1;
         }
         // `T?.foo` lexes the `?.` as a single `QuestionDot` token; treat it
@@ -295,7 +294,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             }
             j += 1;
         }
-        if self.tokens.get(j).map(|t| t.kind.is_question()).unwrap_or(false) {
+        if self.tokens.get(j).is_some_and(|t| t.kind.is_question()) {
             j += 1;
         }
         if matches!(self.tokens.get(j).map(|t| &t.kind), Some(TokenKind::QuestionDot)) {
@@ -324,7 +323,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             // Allow `val`/`var` markers in constructor-like params; ignore.
             if matches!(
                 self.peek_kind(),
-                TokenKind::Keyword(Keyword::Val) | TokenKind::Keyword(Keyword::Var)
+                TokenKind::Keyword(Keyword::Val | Keyword::Var)
             ) {
                 self.bump();
                 self.skip_nl();
@@ -396,7 +395,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 self.skip_nl();
                 default = self.parse_expr();
             }
-            let end = default.as_ref().map_or(ty.span, |d| d.span());
+            let end = default.as_ref().map_or(ty.span, klio_ast::Expr::span);
             params.push(Param {
                 name,
                 ty,
@@ -590,11 +589,10 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 // `private set` (no `(...)`): record visibility on the
                 // Property itself; do NOT synthesize a custom accessor —
                 // the default one stays in effect.
-                if is_set {
-                    if let Some(v) = acc_visibility {
+                if is_set
+                    && let Some(v) = acc_visibility {
                         setter_visibility = Some(v);
                     }
-                }
                 continue;
             }
             self.expect(&TokenKind::LParen, "`(`")?;

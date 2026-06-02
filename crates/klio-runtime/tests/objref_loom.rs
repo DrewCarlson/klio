@@ -13,7 +13,7 @@
 //!
 //! Run with:
 //!   RUSTFLAGS="--cfg loom" cargo test -p klio-runtime --release \
-//!       --test objref_loom
+//!       --test `objref_loom`
 //!
 //! Without `--cfg loom` this file compiles to nothing (the protocol
 //! is exercised by the real-thread stress test instead).

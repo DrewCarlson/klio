@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{DriverWakeup, Arc, SLOT_OWNERS, CooperativeInterceptor, coroutine_time_mode, TimeMode, register_slot_owner, unregister_slot};
 
 impl DriverWakeup {
     pub(crate) fn new() -> Arc<Self> {
@@ -174,14 +174,12 @@ impl CooperativeInterceptor {
             let is_indefinite = self
                 .parked
                 .get(&token)
-                .map(|(_, wake)| *wake == i64::MAX)
-                .unwrap_or(false);
-            if is_indefinite {
-                if let Some((state, _)) = self.parked.remove(&token) {
+                .is_some_and(|(_, wake)| *wake == i64::MAX);
+            if is_indefinite
+                && let Some((state, _)) = self.parked.remove(&token) {
                     self.slot_to_token.remove(&slot);
                     out.push((slot, state));
                 }
-            }
         }
         out
     }
@@ -212,7 +210,7 @@ impl CooperativeInterceptor {
     /// supplied `failure` (a `Value::Result { ok: false, … }` that
     /// the resume path in `klio_ir::eval` routes as a throw at the
     /// suspension point), and the token is queued ready. Indefinite
-    /// parks (wake_at == i64::MAX) such as join/await/channel-receive
+    /// parks (`wake_at` == `i64::MAX`) such as join/await/channel-receive
     /// are not touched.
     pub(crate) fn cancel_timed_parks(&mut self, failure: klio_runtime::Value) {
         let due: Vec<u64> = self

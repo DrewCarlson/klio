@@ -1,6 +1,6 @@
 //! Type-system parity: smart casts after combined conditions,
 //! Any.toString, nullable Comparable, enum methods, sealed-class
-//! with inherited fields, KClass equality, type parameter T.foo
+//! with inherited fields, `KClass` equality, type parameter T.foo
 //! resolution.
 
 use std::io::Write;
@@ -122,12 +122,12 @@ fun main() {
 
 #[test]
 fn nullable_iterable_filter() {
-    let src = r#"
+    let src = r"
 fun main() {
     val xs: List<Int?> = listOf(1, null, 2, null, 3)
     val sum = xs.filterNotNull().sum()
     println(sum)
 }
-"#;
+";
     assert_klio("nullable_iter", src, "6\n");
 }

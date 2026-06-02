@@ -1,6 +1,6 @@
-use super::*;
+use super::{Parser, TypeParam, TokenKind, Variance, Keyword, WhereBound, TypeArg, TypeRef, Ident, FunctionTypeRef, Span, Token};
 
-impl<'src, 'tok> Parser<'src, 'tok> {
+impl Parser<'_, '_> {
     /// Parse a `<T, out U : Foo, reified V>`-style type-parameter list.
     /// Caller has verified the cursor is at `<`. Returns the parsed params;
     /// `reified` is only accepted when `allow_reified` is set (i.e. on
@@ -248,7 +248,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
             // identifier that begins a receiver type — otherwise we'd eat a
             // type literally named `suspend`.
             let next = self.tokens.get(self.pos + 1).map(|t| &t.kind);
-            if matches!(next, Some(TokenKind::LParen) | Some(TokenKind::Ident)) {
+            if matches!(next, Some(TokenKind::LParen | TokenKind::Ident)) {
                 self.bump();
                 self.skip_nl();
                 is_suspend = true;
@@ -338,11 +338,10 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         // was produced. If `suspend` was claimed but no function type
         // materialised, we silently drop it (parity-safe; lambdas don't
         // care).
-        if is_suspend {
-            if let Some(f) = ty.function.as_mut() {
+        if is_suspend
+            && let Some(f) = ty.function.as_mut() {
                 f.is_suspend = true;
             }
-        }
         Some(ty)
     }
 
@@ -578,11 +577,8 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                         let next = self.tokens.get(i + 1).map(|t| &t.kind);
                         return matches!(
                             next,
-                            Some(TokenKind::LParen)
-                                | Some(TokenKind::LBrace)
-                                | Some(TokenKind::Dot)
-                                | Some(TokenKind::QuestionDot)
-                                | Some(TokenKind::ColonColon)
+                            Some(TokenKind::LParen | TokenKind::LBrace | TokenKind::Dot |
+TokenKind::QuestionDot | TokenKind::ColonColon)
                         );
                     }
                 }

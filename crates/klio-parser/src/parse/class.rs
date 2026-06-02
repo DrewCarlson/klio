@@ -1,6 +1,6 @@
-use super::*;
+use super::{Parser, ClassModifiers, Visibility, Annotation, Class, TokenKind, Keyword, Decl, Block, EnumEntry, Ident, ObjectDecl, TypeRef, Expr, SecondaryCtor, CtorDelegation, ClassParam};
 
-impl<'src, 'tok> Parser<'src, 'tok> {
+impl Parser<'_, '_> {
     pub(crate) fn parse_class(
         &mut self,
         mods: ClassModifiers,
@@ -377,11 +377,11 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                     if matches!(self.peek_kind(), TokenKind::Ident) {
                         let save = self.pos;
                         let _ = self.parse_ident("arg label");
-                        if !matches!(self.peek_kind(), TokenKind::Eq) {
-                            self.pos = save;
-                        } else {
+                        if matches!(self.peek_kind(), TokenKind::Eq) {
                             self.bump();
                             self.skip_nl();
+                        } else {
+                            self.pos = save;
                         }
                     }
                     let Some(a) = self.parse_expr() else { break };
@@ -616,7 +616,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
                 self.skip_nl();
                 default = self.parse_expr();
             }
-            let end = default.as_ref().map_or(ty.span, |d| d.span());
+            let end = default.as_ref().map_or(ty.span, klio_ast::Expr::span);
             params.push(ClassParam {
                 property,
                 name,

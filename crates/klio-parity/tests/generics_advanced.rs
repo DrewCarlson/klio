@@ -23,7 +23,7 @@ fn assert_klio(name: &str, src: &str, expected: &str) {
 
 #[test]
 fn covariant_out_producer() {
-    let src = r#"
+    let src = r"
 interface Producer<out T> { fun produce(): T }
 class IntP : Producer<Int> { override fun produce(): Int = 42 }
 fun useAny(p: Producer<Any>): String = p.produce().toString()
@@ -31,7 +31,7 @@ fun main() {
     val ip: Producer<Int> = IntP()
     println(useAny(ip))
 }
-"#;
+";
     assert_klio("covariant_out", src, "42\n");
 }
 

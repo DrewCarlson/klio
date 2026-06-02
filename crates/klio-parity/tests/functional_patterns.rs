@@ -36,7 +36,7 @@ fun main() {
 
 #[test]
 fn collection_pipeline_long() {
-    let src = r#"
+    let src = r"
 fun main() {
     val r = (1..20)
         .filter { it % 2 == 0 }
@@ -46,7 +46,7 @@ fun main() {
         .sum()
     println(r)
 }
-"#;
+";
     // 36 + 64 + 100 = 200
     assert_klio("pipeline", src, "200\n");
 }
@@ -67,13 +67,13 @@ fun main() {
 
 #[test]
 fn recursive_list_sum() {
-    let src = r#"
+    let src = r"
 fun sumRec(xs: List<Int>): Int =
     if (xs.isEmpty()) 0 else xs.first() + sumRec(xs.drop(1))
 fun main() {
     println(sumRec(listOf(1, 2, 3, 4, 5)))
 }
-"#;
+";
     assert_klio("recursive_sum", src, "15\n");
 }
 

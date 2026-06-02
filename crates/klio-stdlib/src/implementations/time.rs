@@ -1,4 +1,4 @@
-use super::*;
+use super::{CallCtx, Value, RuntimeError};
 
 /// Wall-clock time in milliseconds since the Unix epoch. Backs the
 /// `systemClockNow()` / `serializedInstant` klio `actual`s for the
@@ -6,8 +6,7 @@ use super::*;
 pub(crate) fn time_system_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis() as i64);
     Ok(Value::Long(millis))
 }
 

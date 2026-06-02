@@ -8,7 +8,7 @@
 
 use std::io::Write;
 
-const SRC: &str = r#"package demo
+const SRC: &str = r"package demo
 
 import demo.Box.Factory.UNIT
 
@@ -25,7 +25,7 @@ fun main() {
     println(pick(3))
     println(UNIT)
 }
-"#;
+";
 
 #[test]
 fn import_named_companion_member_is_byte_identical() {

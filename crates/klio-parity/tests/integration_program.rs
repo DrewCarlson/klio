@@ -169,7 +169,7 @@ fun main() {
 // 4. Compose-style pipeline: `(f andThen g)(x)` style.
 #[test]
 fn fn_composition_extension() {
-    let src = r#"
+    let src = r"
 infix fun <A, B, C> ((A) -> B).andThen(g: (B) -> C): (A) -> C = { a -> g(this(a)) }
 
 fun main() {
@@ -179,6 +179,6 @@ fun main() {
     // inc(5)=6, dbl(6)=12, 12-3=9
     println(p(5))
 }
-"#;
+";
     assert_klio("fn_compose_ext", src, "9\n");
 }

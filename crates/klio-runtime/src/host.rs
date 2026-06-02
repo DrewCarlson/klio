@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{Value, RuntimeError, Output, ToI64};
 
 /// Function pointer signature for a Rust-native stdlib intrinsic.
 ///
@@ -307,6 +307,7 @@ pub struct InProcessScheduler {
 }
 
 impl InProcessScheduler {
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }

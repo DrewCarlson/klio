@@ -1,4 +1,4 @@
-use super::*;
+use super::{FuncBuilder, Inst, widen_numeric_literal, lower_expr_as_param_thunk, lower_expr_as_param_thunk_scoped, compute_boxed_vars, lower_block, lower_expr, Terminator};
 
 /// Lower an arbitrary expression as a 0-arg synthetic function whose
 /// body returns the expression's value. The synthetic function is
@@ -16,7 +16,7 @@ pub fn bind_params(b: &mut FuncBuilder<'_>, names: &[&str]) {
 /// Lower a Kotlin class declaration into an IR Class. Methods are
 /// lowered as Funcs with a synthetic `<receiver>` first parameter
 /// (the constructor params are lifted onto the Class's
-/// primary_params for instance construction). The Class becomes
+/// `primary_params` for instance construction). The Class becomes
 /// reachable through `module.class_id` so Path-callees that name
 /// the class lower to `NewInstance`.
 pub fn lower_class(module: &mut crate::Module, c: &klio_ast::Class) -> crate::ClassId {
@@ -84,7 +84,7 @@ pub fn set_lower_anon_captures(
 
 pub(crate) fn is_lower_anon_capture(name: &str) -> bool {
     LOWER_ANON_CAPTURES
-        .with(|c| c.borrow().as_ref().map(|s| s.contains(name)).unwrap_or(false))
+        .with(|c| c.borrow().as_ref().is_some_and(|s| s.contains(name)))
 }
 
 /// Same as `lower_class_with_file` but mixes an additional set of
@@ -204,17 +204,16 @@ pub fn lower_class_with_extras(
     // bodies (e.g. `TrafficLight.State.RED` reachable as
     // `State.RED` from a TrafficLight method).
     for m in &c.members {
-        if let klio_ast::Decl::Class(inner) = m {
-            if !inner.is_companion {
+        if let klio_ast::Decl::Class(inner) = m
+            && !inner.is_companion {
                 own_member_names.insert(inner.name.name.clone());
             }
-        }
     }
     // Companion-object members are visible under their bare
     // names inside this class's method bodies.
     for m in &c.members {
-        if let klio_ast::Decl::Class(inner) = m {
-            if inner.is_companion {
+        if let klio_ast::Decl::Class(inner) = m
+            && inner.is_companion {
                 for cm in &inner.members {
                     match cm {
                         klio_ast::Decl::Function(f) => {
@@ -232,7 +231,6 @@ pub fn lower_class_with_extras(
                     }
                 }
             }
-        }
     }
     let mut methods: Vec<crate::FuncId> = Vec::new();
     // Track private methods lowered so far in declaration order so a
@@ -352,7 +350,7 @@ pub fn lower_function_with_file(
 
 /// Lower a function body without registering it in `module.func_index`.
 /// Used by the interpreter's pre-pass-then-fill driver so a function's
-/// FuncId is reserved before its body is lowered (enabling forward
+/// `FuncId` is reserved before its body is lowered (enabling forward
 /// references and mutual recursion).
 pub fn lower_function_body_into(
     module: &mut crate::Module,
@@ -442,7 +440,7 @@ pub(crate) fn lower_function_body(
 /// not the top-level fn namespace, so a top-level Path-callee
 /// lookup must not surface a class method.
 /// Record a class method's per-parameter default-arg thunks under its
-/// body FuncId, so a call that omits trailing defaulted args
+/// body `FuncId`, so a call that omits trailing defaulted args
 /// (`A().g(5)` for `fun g(x, y = 10)`) gets them filled — the same
 /// padding top-level / local functions already get. Methods carry an
 /// implicit leading `this`, so default slots are offset by one.
@@ -621,16 +619,16 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
         }
     }
     if let Some(owner) = owner_class {
-        let _ = b.set_owner_class(owner.to_string());
+        let () = b.set_owner_class(owner.to_string());
     }
     if let Some(set) = own_members {
-        let _ = b.set_own_members(set.clone());
+        let () = b.set_own_members(set.clone());
     }
     if let Some(map) = private_method_fids {
         b.set_private_method_fids(map.clone());
     }
     if f.is_tailrec {
-        let _ = b.set_tailrec_self(f.name.name.clone());
+        let () = b.set_tailrec_self(f.name.name.clone());
     }
     b.set_inline(f.is_inline);
     if let Some(klio_ast::FunctionBody::Block(blk)) = &f.body {
@@ -680,17 +678,15 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
     // runtime overload resolution can pick the right receiver
     // overload (`fun Int.f()` vs `fun Long.f()`) instead of falling
     // back to declaration order.
-    if let Some(rt) = &f.receiver_type {
-        if let Some(first) = func.params.first_mut() {
-            if first.name == "this" {
+    if let Some(rt) = &f.receiver_type
+        && let Some(first) = func.params.first_mut()
+            && first.name == "this" {
                 first.ty = crate::TypeRef {
                     name: lowered_type_name(rt),
                     nullable: rt.nullable,
                     args: Vec::new(),
                 };
             }
-        }
-    }
     func.is_suspend = f.is_suspend;
     func
 }

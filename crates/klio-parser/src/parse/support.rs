@@ -1,4 +1,4 @@
-use super::*;
+use super::{Parser, FileId, Token, TokenKind, DiagnosticSink, Span, Diagnostic, Ident, Keyword};
 
 impl<'src, 'tok> Parser<'src, 'tok> {
     #[must_use]
@@ -13,7 +13,7 @@ impl<'src, 'tok> Parser<'src, 'tok> {
         // ignored `{` mis-softened newlines inside such nested blocks.
         let mut nl_soft = Vec::with_capacity(tokens.len());
         let mut stack: Vec<u8> = Vec::new();
-        let soft = |s: &[u8]| matches!(s.last(), Some(b'(') | Some(b'['));
+        let soft = |s: &[u8]| matches!(s.last(), Some(b'(' | b'['));
         for t in tokens {
             match t.kind {
                 TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
@@ -176,15 +176,9 @@ impl<'src, 'tok> Parser<'src, 'tok> {
     pub(crate) fn recover_to_top_level(&mut self) {
         while !matches!(
             self.peek_kind(),
-            TokenKind::Eof
-                | TokenKind::Keyword(Keyword::Fun)
-                | TokenKind::Keyword(Keyword::Val)
-                | TokenKind::Keyword(Keyword::Var)
-                | TokenKind::Keyword(Keyword::Class)
-                | TokenKind::Keyword(Keyword::Object)
-                | TokenKind::Keyword(Keyword::Interface)
-                | TokenKind::Keyword(Keyword::Package)
-                | TokenKind::Keyword(Keyword::Import)
+            TokenKind::Eof |
+TokenKind::Keyword(Keyword::Fun | Keyword::Val | Keyword::Var | Keyword::Class
+| Keyword::Object | Keyword::Interface | Keyword::Package | Keyword::Import)
         ) {
             self.bump();
         }

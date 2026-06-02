@@ -146,7 +146,7 @@ fun main() {
 // 6. `Sequence` lazy chain (terminal operator drives evaluation).
 #[test]
 fn sequence_lazy_chain() {
-    let src = r#"
+    let src = r"
 fun main() {
     val s = generateSequence(1) { it + 1 }
         .map { it * it }
@@ -155,7 +155,7 @@ fun main() {
         .toList()
     println(s)
 }
-"#;
+";
     // squares of 1..n that are even: 4,16,36,64 (squares of 2,4,6,8)
     assert_klio("sequence_lazy_chain", src, "[4, 16, 36, 64]\n");
 }

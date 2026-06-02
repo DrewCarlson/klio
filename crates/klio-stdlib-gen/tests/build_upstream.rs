@@ -28,7 +28,7 @@ fn mines_upstream_stdlib() {
     let tmp = env::temp_dir().join("klio-stdlib-gen-test");
     let _ = std::fs::remove_dir_all(&tmp);
     let written = emit_generated(&tmp, &files).expect("emit failed");
-    assert!(written > 500, "expected > 500 symbols written, got {}", written);
+    assert!(written > 500, "expected > 500 symbols written, got {written}");
 
     // The generated artefact is now a postcard byte stream. Round-trip
     // it through klio_pack::schema to verify the encoded shape matches

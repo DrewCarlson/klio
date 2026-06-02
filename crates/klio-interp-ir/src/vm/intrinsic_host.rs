@@ -1,6 +1,6 @@
-use crate::*;
+use crate::{VmIntrinsicHost, Output, VmHost, Arc, with_coro, CooperativeInterceptor, ActiveScopeGuard, is_cancellation_exception, PERSISTED_PARKED, lookup_slot_owner, active_coro_scope, member_is_property, pad_args_with_defaults, with_outer_this, with_receiver_labels, AtomicOrdering, SendableVmSeed, coroutine_time_mode, set_coroutine_time_mode, ThreadEntry, DispatchGate, io_gate, default_gate, DriverWakeup};
 
-impl<'a> VmIntrinsicHost<'a> {
+impl VmIntrinsicHost<'_> {
     /// Build a transient `VmHost` over the same shared state, bound
     /// to `out` for the duration of one delegated evaluation.
     pub(crate) fn vm_host<'s>(&'s mut self, out: &'s mut dyn Output) -> VmHost<'s> {
@@ -54,7 +54,7 @@ impl<'a> VmIntrinsicHost<'a> {
         <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, args)
     }
 
-    /// Evaluate an `IrClosure` and return the *raw* EvalError so the
+    /// Evaluate an `IrClosure` and return the *raw* `EvalError` so the
     /// coroutine driver can observe `Suspended`. Mirrors the
     /// closure-setup half of `invoke_callable` (capture env, param
     /// fill, write-back) without flattening errors.
@@ -115,13 +115,11 @@ impl<'a> VmIntrinsicHost<'a> {
             } else {
                 info.captures.borrow().clone()
             };
-        if let Some(t) = this {
-            if let Some(idx) = info.capture_names.iter().position(|n| n == "this") {
-                if idx < capture_values.len() {
+        if let Some(t) = this
+            && let Some(idx) = info.capture_names.iter().position(|n| n == "this")
+                && idx < capture_values.len() {
                     capture_values[idx] = t.clone();
                 }
-            }
-        }
         let scoped_env = klio_runtime::ObjRef::new(klio_runtime::Env::with_parent(
             self.globals.clone(),
         ));
@@ -161,7 +159,7 @@ impl<'a> VmIntrinsicHost<'a> {
         result
     }
 
-    /// Resume a parked activation with `value`, raw EvalError out.
+    /// Resume a parked activation with `value`, raw `EvalError` out.
     pub(crate) fn resume_raw(
         &mut self,
         state: klio_ir::eval::SuspendState,
@@ -373,7 +371,7 @@ impl<'a> VmIntrinsicHost<'a> {
     }
 }
 
-impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
+impl klio_runtime::IntrinsicHost for VmIntrinsicHost<'_> {
     fn run_blocking(
         &mut self,
         block: &klio_runtime::Value,
@@ -538,7 +536,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             let launched: Vec<klio_runtime::Value> = with_coro(|s| {
                 s.borrow_mut()
                     .last_mut()
-                    .map(|i| i.drain_launched())
+                    .map(super::super::CooperativeInterceptor::drain_launched)
                     .unwrap_or_default()
             });
             let progressed = !launched.is_empty();
@@ -569,7 +567,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             let next_ready = with_coro(|s| {
                 s.borrow_mut()
                     .last_mut()
-                    .and_then(|i| i.next_ready())
+                    .and_then(super::super::CooperativeInterceptor::next_ready)
             });
             if let Some(tok) = next_ready {
                 let entry = with_coro(|s| {
@@ -611,8 +609,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
             let advanced = with_coro(|s| {
                 s.borrow_mut()
                     .last_mut()
-                    .map(|i| i.advance_time())
-                    .unwrap_or(false)
+                    .is_some_and(super::super::CooperativeInterceptor::advance_time)
             });
             if advanced {
                 continue;
@@ -788,8 +785,8 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
         // A class value used as a function is a constructor
         // reference (`::Box`, `Outer::Nested`, passed to `map`/`fold`
         // etc.) — invoking it builds an instance.
-        if let klio_runtime::Value::Class(def) = callable {
-            if let Some(class_id) = self.module.class_id(&def.name) {
+        if let klio_runtime::Value::Class(def) = callable
+            && let Some(class_id) = self.module.class_id(&def.name) {
                 return self.construct(class_id, args, out)
                 .map_err(|e| match e {
                     klio_ir::eval::EvalError::Throw(v) => {
@@ -801,7 +798,6 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     other => klio_runtime::RuntimeError::Type(format!("{other}")),
                 });
             }
-        }
         if let klio_runtime::Value::Intrinsic { func, .. } = callable {
             let mut child = self.child_host();
             let mut ctx = klio_runtime::CallCtx {
@@ -901,7 +897,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     && args.len() < info.n_params
                 {
                     all.push(this.clone());
-                    for a in args.iter() {
+                    for a in args {
                         all.push(a.clone());
                     }
                 } else {
@@ -922,9 +918,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                 // resolve against the range via the enclosing
                 // fallback.
                 let pushed_outer = match &prior_this {
-                    None
-                    | Some(klio_runtime::Value::Null)
-                    | Some(klio_runtime::Value::Unit) => false,
+                    None | Some(klio_runtime::Value::Null | klio_runtime::Value::Unit) => false,
                     Some(klio_runtime::Value::Instance(a)) => !matches!(
                         this,
                         klio_runtime::Value::Instance(b)
@@ -932,11 +926,10 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     ),
                     Some(_) => true,
                 };
-                if pushed_outer {
-                    if let Some(p) = &prior_this {
+                if pushed_outer
+                    && let Some(p) = &prior_this {
                         with_outer_this(|s| s.borrow_mut().push(p.clone()));
                     }
-                }
                 // The new receiver is bound to the lambda's captured
                 // `this` slot above. The member-extension visibility
                 // filter consults the runtime enclosing-this stack, not
@@ -963,7 +956,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     .and_then(|f| f.implicit_label.clone());
                 if let Some(label) = &pushed_label {
                     with_receiver_labels(|s| {
-                        s.borrow_mut().push((label.clone(), this.clone()))
+                        s.borrow_mut().push((label.clone(), this.clone()));
                     });
                 }
                 let result = self.invoke_callable(callable, &all, out);
@@ -989,14 +982,12 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
                     .capture_names
                     .iter()
                     .position(|n| n == "this")
-                {
-                    if let Some(prior) = prior_this {
+                    && let Some(prior) = prior_this {
                         let mut cap = info.captures.borrow_mut();
                         if idx < cap.len() {
                             cap[idx] = prior;
                         }
                     }
-                }
                 return result;
             }
             return self.invoke_callable(callable, args, out);
@@ -1169,14 +1160,14 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
 
         self.threads
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, ThreadEntry { handle: Some(handle) });
         Ok(id)
     }
 
     fn join_os_thread(&mut self, id: u64) -> Result<(), klio_runtime::RuntimeError> {
         let handle = {
-            let mut g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.get_mut(&id).and_then(|e| e.handle.take())
         };
         let Some(handle) = handle else {
@@ -1192,9 +1183,9 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
     }
 
     fn os_thread_alive(&mut self, id: u64) -> bool {
-        let g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match g.get(&id) {
-            Some(e) => e.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false),
+            Some(e) => e.handle.as_ref().is_some_and(|h| !h.is_finished()),
             None => false,
         }
     }
@@ -1288,7 +1279,7 @@ impl<'a> klio_runtime::IntrinsicHost for VmIntrinsicHost<'a> {
 
         self.threads
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, ThreadEntry { handle: Some(handle) });
         Ok(id)
     }

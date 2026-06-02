@@ -1,15 +1,15 @@
-use super::*;
+use super::{FuncBuilder, Expr, Reg, Inst, lower_expr, Const, AstBinOp, BinOp};
 
 /// Bind function parameters into the current scope. Each param is
 /// loaded into a fresh register via `Inst::LoadParam` so subsequent
 /// `Path { name }` reads route through the same register.
 /// Materialise a contiguous run of argument registers for a Call /
-/// CallMember / CallValue / NewInstance instruction.
+/// `CallMember` / `CallValue` / `NewInstance` instruction.
 ///
 /// The lowering pass otherwise produces non-contiguous register
 /// numbering when sub-expressions allocate intermediate temporaries.
 /// We reserve `args.len()` contiguous registers up front (so the
-/// run [args_start, args_start + n_args) is dense), lower each arg
+/// run [`args_start`, `args_start` + `n_args`) is dense), lower each arg
 /// into its own scratch reg, then `Move` the scratch into the
 /// matching arg slot. Returns `(args_start, n_args)`.
 /// Treat a path segment as a package-root identifier when it starts
@@ -17,7 +17,7 @@ use super::*;
 /// roots for packages (`kotlin`, `kotlinx`, `java`, …) and capital
 /// initials for class / object names. Limiting FQN-flattening to
 /// lowercase heads keeps `Status.Active` / `Foo.Companion` member
-/// access routed through GetField on the actual class value.
+/// access routed through `GetField` on the actual class value.
 /// True when `arg` is a lambda whose body assigns to a name that
 /// the IR's current scope shadows or knows as an outer capture.
 /// True when `e` is `expr as Any` (or transitively wraps one through
@@ -45,11 +45,10 @@ pub(crate) fn lambda_mutated_outer_vars(b: &FuncBuilder<'_>, arg: &Expr) -> Vec<
     ) {
         match stmt {
             klio_ast::Stmt::Assign { target, .. } => {
-                if let Expr::Path { segments, .. } = target {
-                    if segments.len() == 1 && visible.contains(&segments[0].name) {
+                if let Expr::Path { segments, .. } = target
+                    && segments.len() == 1 && visible.contains(&segments[0].name) {
                         out.insert(segments[0].name.clone());
                     }
-                }
             }
             klio_ast::Stmt::Expr(e) => walk_expr(e, visible, out),
             _ => {}
@@ -60,11 +59,10 @@ pub(crate) fn lambda_mutated_outer_vars(b: &FuncBuilder<'_>, arg: &Expr) -> Vec<
         visible: &std::collections::HashSet<String>,
         out: &mut std::collections::BTreeSet<String>,
     ) {
-        if let Expr::Path { segments, .. } = e {
-            if segments.len() == 1 && visible.contains(&segments[0].name) {
+        if let Expr::Path { segments, .. } = e
+            && segments.len() == 1 && visible.contains(&segments[0].name) {
                 out.insert(segments[0].name.clone());
             }
-        }
     }
     fn walk_expr(
         e: &Expr,
@@ -123,11 +121,10 @@ pub(crate) fn lambda_writes_outer_var(b: &FuncBuilder<'_>, arg: &Expr) -> bool {
     fn walk(stmt: &klio_ast::Stmt, visible: &std::collections::HashSet<String>) -> bool {
         match stmt {
             klio_ast::Stmt::Assign { target, .. } => {
-                if let Expr::Path { segments, .. } = target {
-                    if segments.len() == 1 && visible.contains(&segments[0].name) {
+                if let Expr::Path { segments, .. } = target
+                    && segments.len() == 1 && visible.contains(&segments[0].name) {
                         return true;
                     }
-                }
                 false
             }
             klio_ast::Stmt::Expr(e) => walk_expr(e, visible),
@@ -164,13 +161,13 @@ pub(crate) fn lambda_writes_outer_var(b: &FuncBuilder<'_>, arg: &Expr) -> bool {
             Expr::If { cond, then_branch, else_branch, .. } => {
                 walk_expr(cond, visible)
                     || walk_expr(then_branch, visible)
-                    || else_branch.as_ref().map_or(false, |e| walk_expr(e, visible))
+                    || else_branch.as_ref().is_some_and(|e| walk_expr(e, visible))
             }
             Expr::While { cond, body, .. } => {
                 walk_expr(cond, visible) || walk_expr(body, visible)
             }
             Expr::DoWhile { body, cond, .. } => {
-                body.as_ref().map_or(false, |b| walk_expr(b, visible))
+                body.as_ref().is_some_and(|b| walk_expr(b, visible))
                     || walk_expr(cond, visible)
             }
             Expr::For { body, .. } => walk_expr(body, visible),
@@ -182,7 +179,7 @@ pub(crate) fn lambda_writes_outer_var(b: &FuncBuilder<'_>, arg: &Expr) -> bool {
                         .any(|c| c.body.stmts.iter().any(|s| walk(s, visible)))
                     || finally
                         .as_ref()
-                        .map_or(false, |b| b.stmts.iter().any(|s| walk(s, visible)))
+                        .is_some_and(|b| b.stmts.iter().any(|s| walk(s, visible)))
             }
             _ => false,
         }
@@ -255,13 +252,13 @@ pub(crate) fn lower_arg_run(b: &mut FuncBuilder<'_>, args: &[Expr]) -> (Reg, u8)
 }
 
 /// Intern an `arg_names` slice into a parallel `Vec<Option<ConstId>>`
-/// suitable for Inst::Call / CallMember / CallValue / NewInstance.
+/// suitable for `Inst::Call` / `CallMember` / `CallValue` / `NewInstance`.
 /// Returns an empty vec when every entry is None (positional-only).
 pub(crate) fn intern_arg_names(
     module: &mut crate::Module,
     arg_names: &[Option<String>],
 ) -> Vec<Option<crate::ConstId>> {
-    if arg_names.iter().all(|o| o.is_none()) {
+    if arg_names.iter().all(std::option::Option::is_none) {
         return Vec::new();
     }
     arg_names

@@ -72,7 +72,7 @@ fn severity_word(sev: Severity) -> &'static str {
 fn source_line(file: &SourceFile, span: Span) -> Option<String> {
     let (line, _) = file.line_col(span.start);
     let mut iter = file.source.split('\n');
-    iter.nth((line - 1) as usize).map(|s| s.to_string())
+    iter.nth((line - 1) as usize).map(std::string::ToString::to_string)
 }
 
 fn caret_underline(file: &SourceFile, span: Span) -> String {

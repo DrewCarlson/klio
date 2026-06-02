@@ -1,6 +1,6 @@
-use super::*;
+use super::{Checker, Frame, Binding, Span, Type, Class, Block, Stmt, Property, Expr, Decl, Resolution, WhenBranch, WhenPatternKind, Diagnostic, codes};
 
-impl<'r> Checker<'r> {
+impl Checker<'_> {
     // ---- env helpers ----------------------------------------------------
 
     pub(crate) fn push_frame(&mut self) {
@@ -85,19 +85,17 @@ impl<'r> Checker<'r> {
                     } else {
                         None
                     };
-                    if let Some(declared) = bound {
-                        if declared.is_nullable() {
+                    if let Some(declared) = bound
+                        && declared.is_nullable() {
                             return Some(declared.non_null().clone());
                         }
-                    }
                 }
             }
-            if let klio_cfa::Place::Local(sym) = &place {
-                if let Some(next) = lowered.aliases.get(sym) {
+            if let klio_cfa::Place::Local(sym) = &place
+                && let Some(next) = lowered.aliases.get(sym) {
                     place = next.clone();
                     continue;
                 }
-            }
             break;
         }
         None
@@ -157,11 +155,10 @@ impl<'r> Checker<'r> {
                 if declared_arg.is_star {
                     continue;
                 }
-                if let Type::TypeParam(tp_name) = &declared_arg.ty {
-                    if !matches!(super_arg, Type::TypeParam(_) | Type::Unresolved) {
+                if let Type::TypeParam(tp_name) = &declared_arg.ty
+                    && !matches!(super_arg, Type::TypeParam(_) | Type::Unresolved) {
                         subst.entry(tp_name.clone()).or_insert_with(|| super_arg.clone());
                     }
-                }
             }
         }
         subst
@@ -353,17 +350,15 @@ impl<'r> Checker<'r> {
         let state = states.get(pos)?;
         let mut place = klio_cfa::Place::Local(klio_cfa::Symbol(name.to_string()));
         for _ in 0..8 {
-            if let Some(fact) = state.map.get(&place) {
-                if let Some(cn) = fact.narrowed_class.clone() {
+            if let Some(fact) = state.map.get(&place)
+                && let Some(cn) = fact.narrowed_class.clone() {
                     return Some(cn);
                 }
-            }
-            if let klio_cfa::Place::Local(sym) = &place {
-                if let Some(next) = lowered.aliases.get(sym) {
+            if let klio_cfa::Place::Local(sym) = &place
+                && let Some(next) = lowered.aliases.get(sym) {
                     place = next.clone();
                     continue;
                 }
-            }
             break;
         }
         None
@@ -438,15 +433,11 @@ impl<'r> Checker<'r> {
             let mut covered = false;
             'b: for br in branches {
                 for p in &br.patterns {
-                    match &p.kind {
-                        WhenPatternKind::IsType(t) => {
-                            if self.is_class_or_subclass(leaf, &t.name.name) {
-                                covered = true;
-                                break 'b;
-                            }
+                    if let WhenPatternKind::IsType(t) = &p.kind
+                        && self.is_class_or_subclass(leaf, &t.name.name) {
+                            covered = true;
+                            break 'b;
                         }
-                        _ => {}
-                    }
                 }
             }
             if !covered {

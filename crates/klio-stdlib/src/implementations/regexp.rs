@@ -1,4 +1,4 @@
-use super::*;
+use super::{Value, Arc, RuntimeError, make_exception, CallCtx, make_sequence, char, char_unit_to_string, BufRead, make_list};
 
 // ============================================================
 // Regex / MatchResult / MatchGroup
@@ -250,8 +250,7 @@ pub(crate) fn expand_kotlin_replacement(
         groups
             .get(idx)
             .and_then(|g| g.as_ref())
-            .map(|g| g.value.as_str())
-            .unwrap_or("")
+            .map_or("", |g| g.value.as_str())
     };
     let chars: Vec<char> = template.chars().collect();
     let mut out = String::with_capacity(template.len());
@@ -534,15 +533,14 @@ pub(crate) fn match_result_next(ctx: &mut CallCtx) -> Result<Value, RuntimeError
     let mut start = m.end_byte;
     // Avoid infinite loops on zero-width matches: advance one char.
     let g0 = m.groups.first().and_then(|g| g.as_ref());
-    if let Some(g) = g0 {
-        if g.end_inclusive < g.start {
+    if let Some(g) = g0
+        && g.end_inclusive < g.start {
             if let Some((next_b, _)) = m.input[start..].char_indices().nth(1) {
                 start += next_b;
             } else {
                 start = m.input.len();
             }
         }
-    }
     if start > m.input.len() {
         return Ok(Value::Null);
     }

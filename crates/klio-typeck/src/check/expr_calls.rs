@@ -1,6 +1,6 @@
-use super::*;
+use super::{Checker, Expr, TypeRef, Span, Type, FnSig, annotations_include, lub, Diagnostic, codes, Stmt, scan_lambda_stmts_for_return, pick_msc, describe_params, widen_score, InferenceSession, substitute_type_params, expected_changed, array_element_type, primitive_array_elem_by_name, BinOp, equality_types_compatible, type_label, is_numeric, numeric_lub, GenericArg, Variance, Block, Binding};
 
-impl<'r> Checker<'r> {
+impl Checker<'_> {
     pub(crate) fn check_call(
         &mut self,
         callee: &Expr,
@@ -11,8 +11,8 @@ impl<'r> Checker<'r> {
     ) -> Type {
         // Direct named-callable case: `foo(args)` where `foo` is a known
         // user fn or class. Otherwise fall back to tolerant typing.
-        if let Expr::Path { segments, span: callee_span } = callee {
-            if segments.len() == 1 {
+        if let Expr::Path { segments, span: callee_span } = callee
+            && segments.len() == 1 {
                 let name = &segments[0].name;
                 self.enforce_dsl_scope_for_member(name, *callee_span);
                 if !self.fns.contains_key(name) && !self.classes.contains_key(name) {
@@ -33,8 +33,7 @@ impl<'r> Checker<'r> {
                     // shape we care about.
                     let looks_like_builder = args
                         .last()
-                        .map(|a| matches!(a, Expr::Lambda { .. } | Expr::AnonFun { .. }))
-                        .unwrap_or(false);
+                        .is_some_and(|a| matches!(a, Expr::Lambda { .. } | Expr::AnonFun { .. }));
                     if looks_like_builder {
                         let ext_sig: Option<FnSig> = self
                             .extensions
@@ -69,8 +68,7 @@ impl<'r> Checker<'r> {
                     let is_builder = self
                         .fn_annotations
                         .get(name)
-                        .map(|list| list.iter().any(|anns| annotations_include(anns, "BuilderInference")))
-                        .unwrap_or(false);
+                        .is_some_and(|list| list.iter().any(|anns| annotations_include(anns, "BuilderInference")));
                     let prev_bi = self.builder_inference_active;
                     if is_builder {
                         self.builder_inference_active = true;
@@ -120,17 +118,15 @@ impl<'r> Checker<'r> {
                     return Type::Unresolved;
                 }
             }
-        }
         // Stdlib chain methods on a `List<T>` seeded by `listOf` /
         // `mutableListOf` flow the element type through `map` / `filter` /
         // `fold` / `forEach` so the lambdas they take get a concrete
         // expected parameter type.
         if let Expr::Member { receiver, name, .. } = callee {
-            if matches!(name.name.as_str(), "let" | "run" | "apply" | "also") {
-                if let Some(ty) = self.check_member_contract_call(receiver, &name.name, args) {
+            if matches!(name.name.as_str(), "let" | "run" | "apply" | "also")
+                && let Some(ty) = self.check_member_contract_call(receiver, &name.name, args) {
                     return ty;
                 }
-            }
             let recv_ty = self.check_expr(receiver, None);
             let _ = recv_ty;
             if let Some(elem) = self.list_elem.get(&receiver.span()).cloned() {
@@ -194,21 +190,18 @@ impl<'r> Checker<'r> {
             // For a nullable receiver `s: T?`, expr_class is typically not
             // set. Derive the head-class name from the receiver type so
             // extension lookup against `T?.foo` extensions still works.
-            let class_from_ty: Option<String> = match self.expr_class.get(&receiver.span()).cloned() {
-                Some(cn) => Some(cn),
-                None => {
-                    let recv_ty = self.check_expr(receiver, None);
-                    match recv_ty.non_null() {
-                        Type::Generic { name, .. } => Some(name.clone()),
-                        Type::String => Some("String".to_string()),
-                        Type::Int => Some("Int".to_string()),
-                        Type::Long => Some("Long".to_string()),
-                        Type::Boolean => Some("Boolean".to_string()),
-                        Type::Char => Some("Char".to_string()),
-                        Type::Double => Some("Double".to_string()),
-                        Type::Float => Some("Float".to_string()),
-                        _ => None,
-                    }
+            let class_from_ty: Option<String> = if let Some(cn) = self.expr_class.get(&receiver.span()).cloned() { Some(cn) } else {
+                let recv_ty = self.check_expr(receiver, None);
+                match recv_ty.non_null() {
+                    Type::Generic { name, .. } => Some(name.clone()),
+                    Type::String => Some("String".to_string()),
+                    Type::Int => Some("Int".to_string()),
+                    Type::Long => Some("Long".to_string()),
+                    Type::Boolean => Some("Boolean".to_string()),
+                    Type::Char => Some("Char".to_string()),
+                    Type::Double => Some("Double".to_string()),
+                    Type::Float => Some("Float".to_string()),
+                    _ => None,
                 }
             };
             if let Some(cn) = class_from_ty {
@@ -221,7 +214,11 @@ impl<'r> Checker<'r> {
                 if let Some((sig, return_class)) =
                     self.lookup_extension(&cn, name.name.as_str(), args)
                 {
-                    if !sig.params.is_empty() {
+                    if sig.params.is_empty() {
+                        for a in args {
+                            self.check_expr(a, None);
+                        }
+                    } else {
                         let _ = self.check_overloaded_call(
                             std::slice::from_ref(&sig),
                             args,
@@ -229,10 +226,6 @@ impl<'r> Checker<'r> {
                             type_args,
                             call_span,
                         );
-                    } else {
-                        for a in args {
-                            self.check_expr(a, None);
-                        }
                     }
                     if let Some(cn) = return_class {
                         self.expr_class.insert(call_span, cn);
@@ -321,15 +314,12 @@ impl<'r> Checker<'r> {
         }
         let mut next_pos: usize = 0;
         for (i, arg) in args.iter().enumerate() {
-            let param_idx = match arg_names.get(i).and_then(|n| n.as_ref()) {
-                Some(name) => sigs
-                    .iter()
-                    .find_map(|s| s.param_names.iter().position(|p| p == name)),
-                None => {
-                    let idx = next_pos;
-                    next_pos += 1;
-                    Some(idx)
-                }
+            let param_idx = if let Some(name) = arg_names.get(i).and_then(|n| n.as_ref()) { sigs
+            .iter()
+            .find_map(|s| s.param_names.iter().position(|p| p == name)) } else {
+                let idx = next_pos;
+                next_pos += 1;
+                Some(idx)
             };
             let Some(idx) = param_idx else { continue };
             let is_crossinline_here = sigs
@@ -338,8 +328,8 @@ impl<'r> Checker<'r> {
             if !is_crossinline_here {
                 continue;
             }
-            if let Expr::Lambda { body, span, .. } = arg {
-                if Self::lambda_body_has_nonlocal_return(&body.stmts) {
+            if let Expr::Lambda { body, span, .. } = arg
+                && Self::lambda_body_has_nonlocal_return(&body.stmts) {
                     self.diagnostics.emit(
                         Diagnostic::error(
                             "non-local `return` is not allowed inside a lambda passed to a `crossinline` parameter"
@@ -349,7 +339,6 @@ impl<'r> Checker<'r> {
                         .with_code(codes::TYPE_CROSSINLINE_PARAM_LEAK),
                     );
                 }
-            }
         }
     }
 
@@ -409,9 +398,9 @@ impl<'r> Checker<'r> {
                 );
             }
             for (i, n) in arg_names.iter().enumerate() {
-                if let Some(name) = n {
-                    if !sigs.iter().any(|s| s.param_names.iter().any(|p| p == name)) {
-                        let sp = args.get(i).map(|a| a.span()).unwrap_or(call_span);
+                if let Some(name) = n
+                    && !sigs.iter().any(|s| s.param_names.iter().any(|p| p == name)) {
+                        let sp = args.get(i).map_or(call_span, klio_ast::Expr::span);
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 format!("No parameter named `{name}` on any candidate"),
@@ -420,7 +409,6 @@ impl<'r> Checker<'r> {
                             .with_code(codes::TYPE_NAMED_PARAMETER_NOT_FOUND),
                         );
                     }
-                }
             }
             filtered = sigs.iter().collect();
         }
@@ -659,14 +647,13 @@ impl<'r> Checker<'r> {
             if let Err(_e) = session.cs.solve_to_fixpoint() {
                 if !self.builder_inference_active {
                     let mut msg = "type inference failed for this call".to_string();
-                    if let Some((_err, prov)) = session.cs.last_error() {
-                        if let Provenance::CallSite { arg_idx, .. } = prov {
+                    if let Some((_err, prov)) = session.cs.last_error()
+                        && let Provenance::CallSite { arg_idx, .. } = prov {
                             msg = format!(
                                 "type inference failed for this call; argument {} does not satisfy the inferred parameter type",
                                 arg_idx + 1
                             );
                         }
-                    }
                     self.diagnostics
                         .emit(Diagnostic::error(msg, call_span).with_code(codes::TYPE_INFERENCE_FAILED));
                 }
@@ -681,11 +668,10 @@ impl<'r> Checker<'r> {
             for (i, name) in sig.type_param_names.iter().enumerate() {
                 if let Some(v) = vars.get(i) {
                     let pick = staged.get(v).or_else(|| legacy.get(v));
-                    if let Some(t) = pick {
-                        if !matches!(t, Type::Nothing) {
+                    if let Some(t) = pick
+                        && !matches!(t, Type::Nothing) {
                             final_subst.insert(name.clone(), t.clone());
                         }
-                    }
                 }
             }
         }
@@ -712,13 +698,10 @@ impl<'r> Checker<'r> {
                     Type::Function { return_type: r_expected, .. },
                     Type::Function { return_type: r_refined, .. },
                 ) = (&expected, &refined)
-                {
-                    if let Type::TypeParam(name) = r_expected.as_ref() {
-                        if !matches!(**r_refined, Type::Unresolved | Type::Nothing) {
+                    && let Type::TypeParam(name) = r_expected.as_ref()
+                        && !matches!(**r_refined, Type::Unresolved | Type::Nothing) {
                             final_subst.insert(name.clone(), (**r_refined).clone());
                         }
-                    }
-                }
             }
             returned = substitute_type_params(&sig.return_ty, &final_subst);
         }
@@ -831,15 +814,15 @@ impl<'r> Checker<'r> {
                     let spread_ty = self.check_expr(expr, None);
                     // §8.21.5: spread expression's element type must be a
                     // subtype of the vararg parameter's element type.
-                    if is_va {
-                        if let Some(param_elem) = sig.params.get(target_param) {
+                    if is_va
+                        && let Some(param_elem) = sig.params.get(target_param) {
                             let spread_elem = array_element_type(&spread_ty).or_else(|| {
                                 self.expr_class
                                     .get(&expr.span())
                                     .and_then(|cn| primitive_array_elem_by_name(cn))
                             });
-                            if let Some(spread_elem) = spread_elem {
-                                if !spread_elem.is_subtype_of(param_elem) {
+                            if let Some(spread_elem) = spread_elem
+                                && !spread_elem.is_subtype_of(param_elem) {
                                     self.diagnostics.emit(
                                         Diagnostic::error(
                                             format!(
@@ -850,9 +833,7 @@ impl<'r> Checker<'r> {
                                         .with_code(codes::TYPE_SPREAD_TYPE_MISMATCH),
                                     );
                                 }
-                            }
                         }
-                    }
                 }
                 continue;
             }
@@ -940,8 +921,8 @@ impl<'r> Checker<'r> {
             } else {
                 None
             };
-            if let Some(other) = null_other {
-                if !matches!(other, Type::Nullable(_) | Type::Unresolved | Type::Nothing) {
+            if let Some(other) = null_other
+                && !matches!(other, Type::Nullable(_) | Type::Unresolved | Type::Nothing) {
                     let result = matches!(op, BinOp::Neq | BinOp::IdentNeq);
                     self.diagnostics.emit(
                         Diagnostic::warning(
@@ -954,7 +935,6 @@ impl<'r> Checker<'r> {
                         ),
                     );
                 }
-            }
         }
         // Spec §8.9.1 / §8.9.2: an equality between two definitely-distinct
         // types unrelated by subtyping is a compile-time error. Skip when
@@ -1331,10 +1311,10 @@ impl<'r> Checker<'r> {
             match s {
                 Stmt::Expr(e) => self.walk_builder_expr(e, target_name, arg_idx, acc),
                 Stmt::Assign { value, .. } => {
-                    self.walk_builder_expr(value, target_name, arg_idx, acc)
+                    self.walk_builder_expr(value, target_name, arg_idx, acc);
                 }
                 Stmt::DestructuringDecl { init, .. } => {
-                    self.walk_builder_expr(init, target_name, arg_idx, acc)
+                    self.walk_builder_expr(init, target_name, arg_idx, acc);
                 }
                 Stmt::Decl(_) => {}
             }
@@ -1355,15 +1335,14 @@ impl<'r> Checker<'r> {
                 }
                 _ => None,
             };
-            if name.as_deref() == Some(target_name) {
-                if let Some(a) = args.get(arg_idx) {
+            if name.as_deref() == Some(target_name)
+                && let Some(a) = args.get(arg_idx) {
                     let t = self.check_expr(a, None);
                     *acc = Some(match acc.take() {
                         Some(prev) => lub(&prev, &t),
                         None => t,
                     });
                 }
-            }
             for a in args {
                 self.walk_builder_expr(a, target_name, arg_idx, acc);
             }
@@ -1460,7 +1439,7 @@ impl<'r> Checker<'r> {
                 (ps, r, *is_suspend)
             }
             _ => (
-                std::iter::repeat(Type::Unresolved).take(params.len().max(1)).collect(),
+                std::iter::repeat_n(Type::Unresolved, params.len().max(1)).collect(),
                 Type::Unresolved,
                 false,
             ),

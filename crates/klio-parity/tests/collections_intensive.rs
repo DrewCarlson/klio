@@ -133,7 +133,7 @@ fun main() {
 
 #[test]
 fn map_filter_chain() {
-    let src = r#"
+    let src = r"
 fun main() {
     val xs = (1..20)
         .map { it * it }
@@ -141,6 +141,6 @@ fun main() {
         .take(4)
     println(xs)
 }
-"#;
+";
     assert_klio("chain", src, "[4, 16, 36, 64]\n");
 }

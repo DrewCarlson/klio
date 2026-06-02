@@ -109,13 +109,13 @@ fun main() {
 
 #[test]
 fn closure_propagates_through_collect() {
-    let src = r#"
+    let src = r"
 fun main() {
     var s = 0
     listOf(1,2,3,4).forEach { s += it * it }
     println(s)
 }
-"#;
+";
     assert_klio("collect_var", src, "30\n");
 }
 
@@ -165,7 +165,7 @@ fun main() {
 
 #[test]
 fn apply_lambda_writes_member_property() {
-    let src = r#"
+    let src = r"
 class Counter {
     var n = 0
     fun bump() { apply { n += 1 } }
@@ -175,13 +175,13 @@ fun main() {
     c.bump(); c.bump(); c.bump()
     println(c.n)
 }
-"#;
+";
     assert_klio("apply_writes_member", src, "3\n");
 }
 
 #[test]
 fn operator_inc_via_apply_returns_modified_self() {
-    let src = r#"
+    let src = r"
 class Counter {
     var n = 0
     operator fun inc(): Counter = apply { n += 1 }
@@ -192,7 +192,7 @@ fun main() {
     c++; c++; c++; c--
     println(c.n)
 }
-"#;
+";
     assert_klio("operator_inc_apply", src, "2\n");
 }
 

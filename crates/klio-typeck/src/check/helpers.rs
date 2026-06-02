@@ -1,4 +1,4 @@
-use super::*;
+use super::{TypeRef, Type, builtin_by_name, convert_type_ref_lossy, Stmt, Expr, Span, Decl, Accessor, FunctionBody, Block, AssignOp, HashMap, ClassInfo, HashSet, FnSig, WhenPatternKind};
 
 pub(crate) fn type_ref_uses(t: &TypeRef, name: &str) -> bool {
     // `@UnsafeVariance` annotation on the TypeRef itself suppresses the
@@ -15,11 +15,10 @@ pub(crate) fn type_ref_uses(t: &TypeRef, name: &str) -> bool {
         }
     }
     if let Some(f) = &t.function {
-        if let Some(r) = &f.receiver {
-            if type_ref_uses(r, name) {
+        if let Some(r) = &f.receiver
+            && type_ref_uses(r, name) {
                 return true;
             }
-        }
         for p in &f.params {
             if type_ref_uses(p, name) {
                 return true;
@@ -36,8 +35,7 @@ pub(crate) fn has_unsafe_variance(anns: &[klio_ast::Annotation]) -> bool {
     anns.iter().any(|a| {
         a.path
             .last()
-            .map(|seg| seg.name == "UnsafeVariance")
-            .unwrap_or(false)
+            .is_some_and(|seg| seg.name == "UnsafeVariance")
     })
 }
 
@@ -45,8 +43,7 @@ pub(crate) fn annotations_include(anns: &[klio_ast::Annotation], simple_name: &s
     anns.iter().any(|a| {
         a.path
             .last()
-            .map(|seg| seg.name == simple_name)
-            .unwrap_or(false)
+            .is_some_and(|seg| seg.name == simple_name)
     })
 }
 
@@ -54,8 +51,7 @@ pub(crate) fn has_published_api(anns: &[klio_ast::Annotation]) -> bool {
     anns.iter().any(|a| {
         a.path
             .last()
-            .map(|seg| seg.name == "PublishedApi")
-            .unwrap_or(false)
+            .is_some_and(|seg| seg.name == "PublishedApi")
     })
 }
 
@@ -207,8 +203,7 @@ pub(crate) fn scan_lambda_stmts_for_return(stmts: &[Stmt]) -> bool {
         Stmt::Decl(klio_ast::Decl::Property(p)) => p
             .init
             .as_ref()
-            .map(scan_lambda_expr_for_return)
-            .unwrap_or(false),
+            .is_some_and(scan_lambda_expr_for_return),
         _ => false,
     })
 }
@@ -221,20 +216,20 @@ pub(crate) fn scan_lambda_expr_for_return(e: &Expr) -> bool {
         Expr::If { cond, then_branch, else_branch, .. } => {
             scan_lambda_expr_for_return(cond)
                 || scan_lambda_expr_for_return(then_branch)
-                || else_branch.as_ref().map(|e| scan_lambda_expr_for_return(e)).unwrap_or(false)
+                || else_branch.as_ref().is_some_and(|e| scan_lambda_expr_for_return(e))
         }
         Expr::While { cond, body, .. } => {
             scan_lambda_expr_for_return(cond) || scan_lambda_expr_for_return(body)
         }
         Expr::DoWhile { body, cond, .. } => {
-            body.as_ref().map(|b| scan_lambda_expr_for_return(b)).unwrap_or(false)
+            body.as_ref().is_some_and(|b| scan_lambda_expr_for_return(b))
                 || scan_lambda_expr_for_return(cond)
         }
         Expr::For { iter, body, .. } => {
             scan_lambda_expr_for_return(iter) || scan_lambda_expr_for_return(body)
         }
         Expr::When { subject, branches, .. } => {
-            subject.as_ref().map(|s| scan_lambda_expr_for_return(s)).unwrap_or(false)
+            subject.as_ref().is_some_and(|s| scan_lambda_expr_for_return(s))
                 || branches.iter().any(|br| scan_lambda_expr_for_return(&br.body))
         }
         Expr::Try { body, catches, finally, .. } => {
@@ -242,8 +237,7 @@ pub(crate) fn scan_lambda_expr_for_return(e: &Expr) -> bool {
                 || catches.iter().any(|c| scan_lambda_stmts_for_return(&c.body.stmts))
                 || finally
                     .as_ref()
-                    .map(|fb| scan_lambda_stmts_for_return(&fb.stmts))
-                    .unwrap_or(false)
+                    .is_some_and(|fb| scan_lambda_stmts_for_return(&fb.stmts))
         }
         Expr::Labeled { expr, .. }
         | Expr::Unary { expr, .. }
@@ -327,7 +321,7 @@ pub(crate) fn block_uses_field(b: &Block) -> bool {
     b.stmts.iter().any(|s| match s {
         Stmt::Expr(e) => expr_uses_field(e),
         Stmt::Assign { target, value, .. } => expr_uses_field(target) || expr_uses_field(value),
-        Stmt::Decl(Decl::Property(p)) => p.init.as_ref().map_or(false, expr_uses_field),
+        Stmt::Decl(Decl::Property(p)) => p.init.as_ref().is_some_and(expr_uses_field),
         _ => false,
     })
 }
@@ -342,11 +336,10 @@ pub(crate) fn collect_property_reads(
 ) {
     match e {
         Expr::Path { segments, .. } => {
-            if let Some(first) = segments.first() {
-                if let Some(&idx) = by_name.get(&first.name) {
+            if let Some(first) = segments.first()
+                && let Some(&idx) = by_name.get(&first.name) {
                     out.insert(idx);
                 }
-            }
         }
         Expr::Member { receiver, .. } => collect_property_reads(receiver, by_name, out),
         Expr::Call { callee, args, .. } => {
@@ -493,10 +486,10 @@ pub(crate) fn expr_uses_field(e: &Expr) -> bool {
         Expr::If { cond, then_branch, else_branch, .. } => {
             expr_uses_field(cond)
                 || expr_uses_field(then_branch)
-                || else_branch.as_ref().map_or(false, |e| expr_uses_field(e))
+                || else_branch.as_ref().is_some_and(|e| expr_uses_field(e))
         }
         Expr::When { subject, branches, .. } => {
-            subject.as_ref().map_or(false, |s| expr_uses_field(s))
+            subject.as_ref().is_some_and(|s| expr_uses_field(s))
                 || branches.iter().any(|b| expr_uses_field(&b.body))
         }
         Expr::Call { callee, args, .. } => {
@@ -509,7 +502,7 @@ pub(crate) fn expr_uses_field(e: &Expr) -> bool {
         Expr::Binary { lhs, rhs, .. } => expr_uses_field(lhs) || expr_uses_field(rhs),
         Expr::Unary { expr, .. } => expr_uses_field(expr),
         Expr::Postfix { expr, .. } => expr_uses_field(expr),
-        Expr::Return { value, .. } => value.as_ref().map_or(false, |e| expr_uses_field(e)),
+        Expr::Return { value, .. } => value.as_ref().is_some_and(|e| expr_uses_field(e)),
         Expr::As { expr, .. } => expr_uses_field(expr),
         Expr::IsCheck { expr, .. } => expr_uses_field(expr),
         Expr::Spread { expr, .. } => expr_uses_field(expr),
@@ -547,11 +540,10 @@ pub(crate) fn dot_path_key(e: &Expr) -> Option<String> {
 }
 
 pub(crate) fn single_path_name(e: &Expr) -> Option<String> {
-    if let Expr::Path { segments, .. } = e {
-        if segments.len() == 1 {
+    if let Expr::Path { segments, .. } = e
+        && segments.len() == 1 {
             return Some(segments[0].name.clone());
         }
-    }
     None
 }
 
@@ -838,11 +830,10 @@ pub(crate) fn at_least_as_applicable(
             if let (Some(xn), Some(yn)) = (
                 f1.param_class_names.get(k).and_then(|n| n.as_deref()),
                 f2.param_class_names.get(k).and_then(|n| n.as_deref()),
-            ) {
-                if !class_is_subtype_of(classes, xn, yn) {
+            )
+                && !class_is_subtype_of(classes, xn, yn) {
                     return false;
                 }
-            }
         } else if !x.is_subtype_of(y) {
             return false;
         }

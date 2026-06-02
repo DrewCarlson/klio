@@ -57,7 +57,7 @@ fn corpus_cfgs_run_every_analysis() {
         let r = klio_resolver::resolve(&ast);
         let tc = klio_typeck::typecheck(&ast, &r);
         total_files += 1;
-        for (_span, cfg) in &tc.cfgs {
+        for cfg in tc.cfgs.values() {
             total_cfgs += 1;
             // Reachability: every block reachable from entry; the
             // entry itself is always reachable.

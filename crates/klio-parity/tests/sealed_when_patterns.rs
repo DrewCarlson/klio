@@ -135,7 +135,7 @@ fun main() {
 
 #[test]
 fn when_inside_lambda_body() {
-    let src = r#"
+    let src = r"
 sealed class Op { class Add(val n: Int) : Op(); class Mul(val n: Int) : Op() }
 fun main() {
     val ops = listOf<Op>(Op.Add(3), Op.Mul(2), Op.Add(7), Op.Mul(10))
@@ -147,7 +147,7 @@ fun main() {
     }
     println(result)
 }
-"#;
+";
     // 1+3=4; 4*2=8; 8+7=15; 15*10=150
     assert_klio("when_lambda", src, "150\n");
 }

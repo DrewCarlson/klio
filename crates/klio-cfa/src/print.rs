@@ -19,7 +19,7 @@ pub fn print_cfg(cfg: &Cfg) -> String {
         let _ = writeln!(out, "exits: {exits}");
     }
     for blk in &cfg.blocks {
-        let _ = writeln!(out, "");
+        let _ = writeln!(out);
         let _ = writeln!(out, "b{}:", blk.id.0);
         if !blk.preds.is_empty() {
             let p = blk
@@ -40,7 +40,7 @@ pub fn print_cfg(cfg: &Cfg) -> String {
 
 fn format_edge(e: &Edge) -> String {
     let label = match &e.kind {
-        EdgeKind::Normal => "".to_string(),
+        EdgeKind::Normal => String::new(),
         EdgeKind::True => "(T)".to_string(),
         EdgeKind::False => "(F)".to_string(),
         EdgeKind::Exception { ty } => match ty {

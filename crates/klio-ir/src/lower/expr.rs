@@ -1,4 +1,4 @@
-use super::*;
+use super::{FuncBuilder, Expr, Reg, Const, Inst, callee_label, AstBinOp, is_boxed_to_any_form, is_any_typed_path, BinOp, Terminator, ast_binop, AstUnOp, UnOp, boxed_cell_reg, is_package_head, is_pkg_root, collect_dotted_fqn, lower_arg_run, inline_fn_ast, try_inline_call_with_type_args, intern_arg_names, lambda_writes_outer_var, lambda_mutated_outer_vars, intern_type_args, splice_inline_lambda, arg_lambda_has_nonlocal_return, resolve_capture, FuncId, Func, expr_span, is_lower_anon_capture, lower_when, BlockId, lower_lambda_body_capturing, lower_for, lower_for_labeled, lower_lambda_body_capturing_kind, AstBlock, Stmt, collect_path_idents_stmt, collect_path_idents, lower_stmt};
 
 /// Lower one expression into the current block. Returns the
 /// register holding the result. Statements that do not produce a
@@ -12,8 +12,8 @@ use super::*;
 /// — unlike the same Path in value position, which resolves to the
 /// companion object. Everything else defers to `lower_expr`.
 pub fn lower_receiver(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
-    if let Expr::Path { segments, .. } = expr {
-        if segments.len() == 1 {
+    if let Expr::Path { segments, .. } = expr
+        && segments.len() == 1 {
             let n = &segments[0].name;
             if b.resolve(n).is_none()
                 && !b.knows_outer(n)
@@ -25,7 +25,6 @@ pub fn lower_receiver(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 return dst;
             }
         }
-    }
     lower_expr(b, expr)
 }
 
@@ -47,7 +46,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 klio_ast::IntLitKind::UInt => b.emit_const(Const::UInt(*value as u32)),
                 klio_ast::IntLitKind::ULong => b.emit_const(Const::ULong(*value as u64)),
                 klio_ast::IntLitKind::Int => {
-                    if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 {
+                    if i32::try_from(*value).is_ok() {
                         b.emit_const(Const::Int(*value as i32))
                     } else {
                         b.emit_const(Const::Long(*value))
@@ -83,7 +82,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 _ => unreachable!(),
             };
             b.push(Inst::BinOp { dst, op: ir_op, lhs: l, rhs: r });
-            return dst;
+            dst
         }
         Expr::Binary { op, lhs, rhs, .. } => {
             // `x in haystack` / `x !in haystack` desugar to
@@ -215,7 +214,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 && matches!(
                     expr.as_ref(),
                     Expr::IntLit { value, kind: klio_ast::IntLitKind::Int, .. }
-                        if *value == (i32::MAX as i64 + 1)
+                        if *value == (i64::from(i32::MAX) + 1)
                 ) =>
         {
             // `-2147483648` parses as Neg(IntLit(2147483648)); the
@@ -335,16 +334,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // (relevant when the companion `object Default : Outer(…)`
             // inherits the outer class and the outer's ctor reads a
             // companion const before the Default singleton is ready).
-            if segments.len() == 1 {
-                if let Some(owner) = b.owner_class().map(str::to_string) {
-                    if b.resolve(&segments[0].name).is_none() {
+            if segments.len() == 1
+                && let Some(owner) = b.owner_class().map(str::to_string)
+                    && b.resolve(&segments[0].name).is_none() {
                         let key = (owner, segments[0].name.clone());
                         if let Some(c) = b.module.registry.class_const_inits.get(&key).cloned() {
                             return b.emit_const(c);
                         }
                     }
-                }
-            }
             // Nested-object alias rewrite: when inside an outer class
             // whose lift renamed a `private object Inner` to
             // `Outer$Inner` (to avoid colliding with a same-named user
@@ -358,8 +355,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     .get(&owner)
                     .and_then(|m| m.get(&segments[0].name))
                     .cloned();
-                if let Some(renamed) = renamed {
-                    if b.resolve(&segments[0].name).is_none() {
+                if let Some(renamed) = renamed
+                    && b.resolve(&segments[0].name).is_none() {
                         let mut new_segs = segments.clone();
                         new_segs[0] = klio_ast::Ident {
                             name: renamed,
@@ -368,7 +365,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         let rewritten = Expr::Path { segments: new_segs, span: *span };
                         return lower_expr(b, &rewritten);
                     }
-                }
             }
             if segments.len() == 1 {
                 // Bare `Unit` is the Unit singleton value (`fun
@@ -436,8 +432,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // unrelated interface/class of the same name (e.g.
                     // a `companion object Key` vs `CoroutineContext.Key`)
                     // does not shadow the class's own companion.
-                    if b.is_param_thunk() {
-                        if let Some(owner) = b.owner_class().map(str::to_string) {
+                    if b.is_param_thunk()
+                        && let Some(owner) = b.owner_class().map(str::to_string) {
                             let cls = b.alloc_reg();
                             let on =
                                 b.module.intern_const(Const::String(owner));
@@ -453,7 +449,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             });
                             return dst;
                         }
-                    }
                 }
                 // A bare name that is a known class is a class
                 // reference (`Segment.SIZE`, `Segment.new()`), not an
@@ -525,8 +520,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // Kotlin) and lower that. Only fires when the import
                 // path names a class the module actually declares, so
                 // a coincidental same-named local/global is untouched.
-                if b.resolve(&segments[0].name).is_none() {
-                    if let Some(rewrite) = b
+                if b.resolve(&segments[0].name).is_none()
+                    && let Some(rewrite) = b
                         .module
                         .registry
                         .import_aliases
@@ -550,9 +545,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         };
                         return lower_expr(b, &qualified);
                     }
-                }
-                if !b.is_param_thunk() {
-                if let Some(this_reg) = b.resolve("this") {
+                if !b.is_param_thunk()
+                && let Some(this_reg) = b.resolve("this") {
                     // A bare name that resolves to a known top-level
                     // function is a value-position function reference,
                     // not an implicit `this.<name>` field read. Skip
@@ -577,7 +571,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         });
                         return dst;
                     }
-                }
                 }
                 let this_idx = b.record_capture("this");
                 let dst = b.alloc_reg();
@@ -759,9 +752,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // an overriding getter, e.g. `override val isActive get()
             // = super.isActive`, and recurse forever). Mirrors the
             // `super.method(...)` CallSuper path.
-            if let Expr::Super { qualifier, label, .. } = receiver.as_ref() {
-                if let Some(this_reg) = b.resolve("this") {
-                    if let Some(owner) = b.owner_class().map(|s| s.to_string()) {
+            if let Expr::Super { qualifier, label, .. } = receiver.as_ref()
+                && let Some(this_reg) = b.resolve("this")
+                    && let Some(owner) = b.owner_class().map(std::string::ToString::to_string) {
                         let dst = b.alloc_reg();
                         let nm = b.module.intern_const(Const::String(name.name.clone()));
                         let oc = b.module.intern_const(Const::String(owner));
@@ -786,16 +779,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         });
                         return dst;
                     }
-                }
-            }
             // Flatten chains like `kotlin.math.PI` into a single FQN
             // lookup against the host when the head is an unresolved
             // identifier (i.e. not a local). Stdlib package roots
             // (`kotlin`, `kotlinx`, etc.) aren't real values, so the
             // chained-GetField fallback would fail at `kotlin` itself.
-            if let Some(fqn) = collect_dotted_fqn(expr) {
-                if let Some(head) = fqn.split('.').next() {
-                    if is_package_head(head)
+            if let Some(fqn) = collect_dotted_fqn(expr)
+                && let Some(head) = fqn.split('.').next()
+                    && is_package_head(head)
                         // Only a genuine package root (`kotlin`,
                         // `kotlinx`, …) flattens inside a lambda body:
                         // there `this` is a captured outer (not
@@ -819,8 +810,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         b.push(Inst::LoadGlobal { dst, name: n });
                         return dst;
                     }
-                }
-            }
             let recv = lower_receiver(b, receiver);
             let dst = b.alloc_reg();
             let field = b.module.intern_const(Const::String(name.name.clone()));
@@ -861,11 +850,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 && matches!(callee.as_ref(), Expr::Member { safe: false, .. })
                 && match callee.as_ref() {
                     Expr::Member { name, .. } => inline_fn_ast(&name.name)
-                        .map(|f| {
+                        .is_some_and(|f| {
                             f.receiver_type.is_some()
                                 && f.type_params.iter().any(|tp| tp.is_reified)
                         })
-                        .unwrap_or(false)
                         && !b.inline_in_progress(&name.name),
                     _ => false,
                 } =>
@@ -898,7 +886,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 n_args,
                 arg_names,
             });
-            return dst;
+            dst
         }
         // `repeat(n) { … }` — inline-desugar to a counted loop so
         // the body runs in the caller's eval frame. This must win
@@ -945,7 +933,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.push(Inst::Move { dst, src: v });
             b.terminate(Terminator::Goto(join));
             b.switch_to(join);
-            return dst;
+            dst
         }
         Expr::Call { callee, args, is_infix, .. }
             if !*is_infix
@@ -973,9 +961,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.switch_to(body_blk);
             b.push_scope();
             let pname = params
-                .first()
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| "it".to_string());
+                .first().map_or_else(|| "it".to_string(), |p| p.name.clone());
             b.bind(pname, i_reg);
             b.push_loop(None, header, exit);
             let _ = lower_block(b, body);
@@ -1054,7 +1040,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     b.push(Inst::WritebackCaptures { lambda: lambda_reg, names, dsts });
                 }
             }
-            return dst;
+            dst
         }
         Expr::Call { callee, args, arg_names: ast_arg_names, type_args: ast_type_args, .. }
             if args.iter().any(|a| lambda_writes_outer_var(b, a))
@@ -1076,16 +1062,15 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // otherwise the args shift by one and a lambda argument
             // lands in a value parameter.
             let mut run_regs: Vec<Reg> = Vec::with_capacity(arg_regs.len() + 1);
-            if let Expr::Path { segments, .. } = callee.as_ref() {
-                if segments.len() == 1 {
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1 {
                     let needs_this = b
                         .module
                         .func_id(&segments[0].name)
                         .and_then(|fid| b.module.funcs.get(fid.0 as usize))
-                        .map(|f| {
-                            f.params.first().map(|p| p.name == "this").unwrap_or(false)
-                        })
-                        .unwrap_or(false);
+                        .is_some_and(|f| {
+                            f.params.first().is_some_and(|p| p.name == "this")
+                        });
                     if needs_this {
                         let this_reg = b.resolve("this").or_else(|| {
                             if b.knows_outer("this") || b.is_lambda_body() {
@@ -1103,7 +1088,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         }
                     }
                 }
-            }
             run_regs.extend_from_slice(&arg_regs);
             let n_args = run_regs.len() as u8;
             let args_start = if run_regs.is_empty() {
@@ -1193,7 +1177,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     b.push(Inst::WritebackCaptures { lambda: lambda_reg, names, dsts });
                 }
             }
-            return dst;
+            dst
         }
         Expr::Call { callee, args, arg_names: ast_arg_names, .. }
             if args.iter().any(|a| matches!(a, Expr::Spread { .. })) =>
@@ -1205,15 +1189,12 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let callee_reg = lower_expr(b, callee);
             let mut parts: Vec<crate::SpreadPart> = Vec::with_capacity(args.len());
             for a in args {
-                match a {
-                    Expr::Spread { expr: inner, .. } => {
-                        let r = lower_expr(b, inner);
-                        parts.push(crate::SpreadPart { reg: r, is_spread: true });
-                    }
-                    _ => {
-                        let r = lower_expr(b, a);
-                        parts.push(crate::SpreadPart { reg: r, is_spread: false });
-                    }
+                if let Expr::Spread { expr: inner, .. } = a {
+                    let r = lower_expr(b, inner);
+                    parts.push(crate::SpreadPart { reg: r, is_spread: true });
+                } else {
+                    let r = lower_expr(b, a);
+                    parts.push(crate::SpreadPart { reg: r, is_spread: false });
                 }
             }
             let arg_names = intern_arg_names(b.module, ast_arg_names);
@@ -1234,9 +1215,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // `suspendCoroutineUninterceptedOrReturn` captures the
             // caller's continuation. Any unsafe shape falls back to a
             // normal call via `None`.
-            if !*is_infix {
-                if let Expr::Path { segments, .. } = callee.as_ref() {
-                    if segments.len() == 1 {
+            if !*is_infix
+                && let Expr::Path { segments, .. } = callee.as_ref()
+                    && segments.len() == 1 {
                         let nm = &segments[0].name;
                         if let Some(lam) = b.inline_lambda_for(nm) {
                             return splice_inline_lambda(b, &lam, args);
@@ -1260,8 +1241,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             let needs_inline = f.is_suspend
                                 || arg_lambda_has_nonlocal_return(args)
                                 || has_reified;
-                            if needs_inline {
-                                if let Some(r) = try_inline_call_with_type_args(
+                            if needs_inline
+                                && let Some(r) = try_inline_call_with_type_args(
                                     b,
                                     nm,
                                     args,
@@ -1271,17 +1252,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                 ) {
                                     return r;
                                 }
-                            }
                         }
                     }
-                }
-            }
             // Infix call `a fn b` lowers as `a.fn(b)` — the
             // dispatch site is a member call on the receiver
             // even when `fn` is a top-level extension.
-            if *is_infix && args.len() == 2 {
-                if let Expr::Path { segments, .. } = callee.as_ref() {
-                    if segments.len() == 1 {
+            if *is_infix && args.len() == 2
+                && let Expr::Path { segments, .. } = callee.as_ref()
+                    && segments.len() == 1 {
                         let recv = lower_expr(b, &args[0]);
                         let (args_start, count) = lower_arg_run(b, &args[1..]);
                         let arg_names = intern_arg_names(b.module, ast_arg_names);
@@ -1299,40 +1277,36 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         });
                         return dst;
                     }
-                }
-            }
             // `suspend { … }` builder — the `suspend` keyword in
             // expression position is just a marker that the lambda
             // is suspending. Lower the lambda as-is; the IR's
             // existing lambda evaluator handles suspend bodies.
-            if let Expr::Path { segments, .. } = callee.as_ref() {
-                if segments.len() == 1
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1
                     && segments[0].name == "suspend"
                     && args.len() == 1
                     && matches!(args[0], Expr::Lambda { .. })
                 {
                     return lower_expr(b, &args[0]);
                 }
-            }
             // `contract { … }` (kotlin.contracts) is a compile-time
             // marker with no runtime effect. Its lambda is a DSL of
             // `returns()/implies(...)` calls that must NOT execute, so
             // drop the whole call and yield Unit.
-            if let Expr::Path { segments, .. } = callee.as_ref() {
-                if segments.len() == 1
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1
                     && segments[0].name == "contract"
                     && args.len() == 1
                     && matches!(args[0], Expr::Lambda { .. })
                 {
                     return b.emit_const(Const::Unit);
                 }
-            }
             // Self-call inside a tailrec fn → TailJump terminator
             // instead of a regular Call. Re-binds params and
             // restarts the function's entry block.
-            if let Expr::Path { segments, .. } = callee.as_ref() {
-                if segments.len() == 1
-                    && b.tailrec_self().map_or(false, |n| n == segments[0].name)
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1
+                    && b.tailrec_self().is_some_and(|n| n == segments[0].name)
                 {
                     let (args_start, count) = lower_arg_run(b, args);
                     b.terminate(Terminator::TailJump { args: args_start, n_args: count });
@@ -1342,15 +1316,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     b.switch_to(dead);
                     return b.emit_const(Const::Unit);
                 }
-            }
             // A single-name callee that resolves to a local binding
             // or parameter is a value invocation — the local
             // shadows any same-named top-level function — a lambda
             // parameter named `yield` (or any other top-level fn name)
             // must bind to the parameter at the call site, not to the
             // global function.
-            if let Expr::Path { segments, .. } = callee.as_ref() {
-                if segments.len() == 1 {
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1 {
                     // Kotlin keeps the function and property namespaces
                     // separate: in call position `name(args)` resolves
                     // to a member function of the enclosing class (own
@@ -1369,7 +1342,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             .and_then(|oc| {
                                 b.module.registry.hierarchy_methods.get(oc)
                             })
-                            .map_or(false, |s| s.contains(n));
+                            .is_some_and(|s| s.contains(n));
                         // Only intervene when a value/param actually
                         // shadows the method name — otherwise the
                         // normal member/function dispatch below is
@@ -1519,10 +1492,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         return dst;
                     }
                 }
-            }
             // Path-callee with a registered top-level fn → Call{func}.
-            if let Expr::Path { segments, .. } = callee.as_ref() {
-                if segments.len() == 1 {
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1 {
                     // When a class and a top-level function share
                     // this name (a class plus a same-named factory
                     // function), the call is a constructor
@@ -1550,15 +1522,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             .module
                             .func_id(&segments[0].name)
                             .and_then(|fid| b.module.funcs.get(fid.0 as usize))
-                            .map(|f| {
+                            .is_some_and(|f| {
                                 let last_vararg = f
                                     .params
                                     .last()
-                                    .map(|p| p.is_vararg)
-                                    .unwrap_or(false);
+                                    .is_some_and(|p| p.is_vararg);
                                 !last_vararg && args.len() > f.params.len()
-                            })
-                            .unwrap_or(false);
+                            });
                     // A bound local / parameter / captured outer of
                     // this name shadows a same-named top-level function
                     // (Kotlin scoping). e.g. a Flow operator's
@@ -1666,8 +1636,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             .module
                             .funcs
                             .get(func_id.0 as usize)
-                            .map(|f| f.params.first().map(|p| p.name == "this").unwrap_or(false))
-                            .unwrap_or(false);
+                            .is_some_and(|f| f.params.first().is_some_and(|p| p.name == "this"));
                         if !needs_this {
                             let (args_start, count) = lower_arg_run(b, args);
                             let arg_names = intern_arg_names(b.module, ast_arg_names);
@@ -1697,7 +1666,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         .funcs_by_simple_name(&segments[0].name)
                         .to_vec();
                     let user_params = |f: &Func| {
-                        if f.params.first().map_or(false, |p| p.name == "this") {
+                        if f.params.first().is_some_and(|p| p.name == "this") {
                             f.params.len() - 1
                         } else {
                             f.params.len()
@@ -1707,7 +1676,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         b.module
                             .funcs
                             .get(fid.0 as usize)
-                            .map_or(false, |f| {
+                            .is_some_and(|f| {
                                 // A bodyless `expect` decl can't be
                                 // called directly — its actual lives
                                 // in the host's intrinsic table.
@@ -1721,11 +1690,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         b.module
                             .funcs
                             .get(fid.0 as usize)
-                            .map_or(false, |f| {
+                            .is_some_and(|f| {
                                 f.params
                                     .first()
-                                    .map(|p| p.name != "this")
-                                    .unwrap_or(true)
+                                    .is_none_or(|p| p.name != "this")
                             })
                     };
                     // Names known to be backed by an intrinsic /
@@ -1826,8 +1794,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             .module
                             .funcs
                             .get(func_id.0 as usize)
-                            .map(|f| f.params.first().map(|p| p.name == "this").unwrap_or(false))
-                            .unwrap_or(false);
+                            .is_some_and(|f| f.params.first().is_some_and(|p| p.name == "this"));
                         if needs_this {
                             // Resolve a `this` reg even from a lambda
                             // body that hasn't bound it locally — fall
@@ -1898,7 +1865,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                 if !target_params.is_empty()
                                     && user_arg_count >= 1
                                     && (1 + user_arg_count) < target_params.len()
-                                    && ast_arg_names.iter().all(|n| n.is_none())
+                                    && ast_arg_names.iter().all(std::option::Option::is_none)
                                     && trailing_lambda_call
                                 {
                                     // Synthesise arg_names: positional for
@@ -1942,7 +1909,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                         < target_params.len()
                                     && ast_arg_names
                                         .iter()
-                                        .all(|n| n.is_none())
+                                        .all(std::option::Option::is_none)
                                     && trailing_lambda_call;
                                 if !synth_names_needed {
                                     // Kotlin: a member of the
@@ -2030,9 +1997,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             .module
                             .funcs
                             .get(func_id.0 as usize)
-                            .map_or(false, |f| f.is_tailrec)
+                            .is_some_and(|f| f.is_tailrec)
                             || b.module.tailrec_fn_names.iter().any(|n| n == &segments[0].name);
-                        if b.tailrec_self().is_some() && callee_is_tailrec && ast_arg_names.iter().all(|n| n.is_none()) {
+                        if b.tailrec_self().is_some() && callee_is_tailrec && ast_arg_names.iter().all(std::option::Option::is_none) {
                             let (args_start, count) = lower_arg_run(b, args);
                             b.terminate(Terminator::TailCallFunc {
                                 func: func_id,
@@ -2058,11 +2025,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         return dst;
                     }
                 }
-            }
             // Path-callee with a registered class name → NewInstance.
-            if let Expr::Path { segments, .. } = callee.as_ref() {
-                if segments.len() == 1 {
-                    if let Some(class_id) = b.module.class_id(&segments[0].name) {
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1
+                    && let Some(class_id) = b.module.class_id(&segments[0].name) {
                         let (args_start, count) = lower_arg_run(b, args);
                         let arg_names = intern_arg_names(b.module, ast_arg_names);
                         let dst = b.alloc_reg();
@@ -2075,8 +2041,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         });
                         return dst;
                     }
-                }
-            }
             // Inside a method/extension body: unqualified `name(...)`
             // that didn't match a local / top-level fn / class is
             // most likely a method call on `this`. Emit
@@ -2105,8 +2069,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // property); otherwise it's a global call
                     // and the normal CallValue path should fire.
                     && b.has_own_member(&segments[0].name)
-                {
-                    if let Some(this_reg) = b.resolve("this") {
+                    && let Some(this_reg) = b.resolve("this") {
                         // Private own-class methods bind statically:
                         // a `private fun` is invisible to subclasses,
                         // so a bare call to one must reach the
@@ -2166,7 +2129,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         });
                         return dst;
                     }
-                }
             }
             // Unresolved bare-name call. Inside a lambda body that
             // may be invoked with a this-binding, dispatch through
@@ -2175,8 +2137,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // (or lambdas not this-bound) the captured this is
             // Null and the inst falls back to a regular global
             // call.
-            if let Expr::Path { segments, .. } = callee.as_ref() {
-                if segments.len() == 1
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1
                     && b.resolve(&segments[0].name).is_none()
                     && !b.knows_outer(&segments[0].name)
                     && b.module.class_id(&segments[0].name).is_none()
@@ -2231,8 +2193,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             | "toUByte"
                             | "toUShort"
                     );
-                    if is_primitive_conv {
-                        if let Some(this_reg) = b.resolve("this") {
+                    if is_primitive_conv
+                        && let Some(this_reg) = b.resolve("this") {
                             let (args_start, count) = lower_arg_run(b, args);
                             let arg_names = intern_arg_names(b.module, ast_arg_names);
                             let dst = b.alloc_reg();
@@ -2249,7 +2211,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             });
                             return dst;
                         }
-                    }
                     let this_idx = b.record_capture("this");
                     let (args_start, count) = lower_arg_run(b, args);
                     let arg_names = intern_arg_names(b.module, ast_arg_names);
@@ -2265,7 +2226,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     });
                     return dst;
                 }
-            }
             // Built-in stdlib companion shortcuts: `Result.success(x)`,
             // `Result.failure(e)`, etc. The callee parses as
             // Member { Path("Result"), "success" }; rewrite to a
@@ -2276,9 +2236,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // would otherwise be skipped, causing the call to fall
             // through to a member-dispatch path that doesn't know
             // about the Companion.
-            if let Expr::Member { receiver: recv_box, name: mname, .. } = callee.as_ref() {
-                if let Expr::Path { segments, .. } = recv_box.as_ref() {
-                    if segments.len() == 1
+            if let Expr::Member { receiver: recv_box, name: mname, .. } = callee.as_ref()
+                && let Expr::Path { segments, .. } = recv_box.as_ref()
+                    && segments.len() == 1
                         && b.resolve(&segments[0].name).is_none()
                         && !b.knows_outer(&segments[0].name)
                     {
@@ -2306,8 +2266,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             }
                         }
                     }
-                }
-            }
             // Package-qualified call to a user / pack top-level
             // function. `func_index` is keyed by simple name (the
             // package prefix lives on the decl's `fqn`), so resolve
@@ -2316,9 +2274,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // selects the right shape by runtime arg types. Only
             // fires when the tail names a module function, so
             // intrinsic FQNs still take the LoadGlobal path below.
-            if let Expr::Member { .. } = callee.as_ref() {
-                if let Some(fqn) = collect_dotted_fqn(callee) {
-                    if let (Some(head), Some(tail)) =
+            if let Expr::Member { .. } = callee.as_ref()
+                && let Some(fqn) = collect_dotted_fqn(callee)
+                    && let (Some(head), Some(tail)) =
                         (fqn.split('.').next(), fqn.rsplit('.').next())
                     {
                         // A real package root (`kotlin.…`, `kotlinx.…`,
@@ -2378,8 +2336,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                         let first_is_this = f
                                             .params
                                             .first()
-                                            .map(|p| p.name == "this")
-                                            .unwrap_or(false);
+                                            .is_some_and(|p| p.name == "this");
                                         !first_is_this && f.params.len() == want
                                     })
                                 })
@@ -2403,15 +2360,13 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             }
                         }
                     }
-                }
-            }
             // Fully-qualified callee like `kotlin.math.abs(x)` →
             // resolve the FQN as a global and CallValue against the
             // resulting intrinsic / function value. Avoids the
             // chained-GetField that would fail at `kotlin` itself.
-            if let Expr::Member { .. } = callee.as_ref() {
-                if let Some(fqn) = collect_dotted_fqn(callee) {
-                    if let Some(head) = fqn.split('.').next() {
+            if let Expr::Member { .. } = callee.as_ref()
+                && let Some(fqn) = collect_dotted_fqn(callee)
+                    && let Some(head) = fqn.split('.').next() {
                         let head_is_real_pkg = is_pkg_root(head);
                         if is_package_head(head)
                             && (head_is_real_pkg || !b.is_lambda_body())
@@ -2444,246 +2399,239 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             return dst;
                         }
                     }
-                }
-            }
             // Lower the callee's receiver / value separately so the
             // dispatcher knows whether to emit CallMember or
             // CallValue.
-            match callee.as_ref() {
-                Expr::Member { receiver, name, .. } => {
-                    // Receiver-typed lambda invocation: `list.block()`
-                    // where `block: T.() -> R` is a local. Lower
-                    // as CallValueWithThis so the host binds the
-                    // receiver as `this` inside the lambda body.
-                    // Gated tight so stdlib member calls like
-                    // `xs.sorted()` aren't hijacked by a shared
-                    // name.
-                    // Only fire when the local name is bound AND
-                    // the local has a function-like type. We
-                    // can't check types at IR-lowering time, but
-                    // most class methods aren't shadowed by
-                    // locals — gate the arm narrowly on "name is
-                    // a known param of the enclosing fn".
-                    // A bound local named `name` shadows any member:
-                    // `recv.name(args)` invokes that local. This
-                    // covers a local extension function (`fun
-                    // List<T>.mid() = …`, whose closure takes the
-                    // receiver as its implicit `this` param) and a
-                    // receiver-typed lambda parameter (`block: T.() ->
-                    // R`). In both cases the receiver is the first
-                    // positional argument (the closure's param 0 is
-                    // `this`), so a plain CallValue suffices and we
-                    // avoid the unsupported call_value_with_this.
-                    // Only a local *function* (or function-typed
-                    // param like `block: T.() -> R`) shadows
-                    // `recv.name()` — a local `val`/`var` of the same
-                    // name must NOT hijack a stdlib/member call
-                    // (`val sorted = …; xs.sorted()` is the member).
-                    // A captured outer name that holds a callable
-                    // (e.g. a `Sink.(Int) -> Unit` parameter closed
-                    // over by a returned lambda, invoked as
-                    // `sink.g(v)`) shadows a member exactly like a
-                    // local param/fn. CallMemberOrValue still tries
-                    // the receiver's member first, so a captured
-                    // non-callable can't hijack a real member call.
-                    let anon_cap = is_lower_anon_capture(&name.name)
-                        && b.resolve(&name.name).is_none()
-                        && !b.is_local_fn(&name.name)
-                        && !b.is_param(&name.name)
-                        && !b.knows_outer(&name.name);
-                    let local_callable = b.is_local_fn(&name.name)
-                        || b.is_param(&name.name)
-                        || b.knows_outer(&name.name)
-                        || anon_cap;
-                    if local_callable {
-                        // For an anon-object method a captured name
-                        // reaches the body as a lexical capture: record
-                        // it and emit `LoadCapture` so it reads this
-                        // instance's snapshot (a captured closure keeps
-                        // its own captures and cannot collide with a
-                        // same-named capture of an enclosing anon
-                        // method). Otherwise capture on demand.
-                        let local_reg = if anon_cap {
-                            let idx = b.record_capture(&name.name);
-                            let r = b.alloc_reg();
-                            b.push(Inst::LoadCapture { dst: r, idx });
-                            r
-                        } else {
-                            resolve_capture(b, &name.name)
-                        };
-                        // `recv.name(args)` where `name` is also a
-                        // callable local/param. Kotlin dispatches the
-                        // member when `recv`'s type has it, and only
-                        // the local (a local extension fn, or a
-                        // `T.() -> R` param invoked as `recv.block()`)
-                        // when it does not. That needs the receiver's
-                        // runtime type, so emit CallMemberOrValue: the
-                        // member wins if present, else the local is
-                        // invoked with `recv` prepended.
-                        let recv = lower_receiver(b, receiver);
-                        let (args_start, count) = lower_arg_run(b, args);
-                        let arg_names = intern_arg_names(b.module, ast_arg_names);
-                        let nm =
-                            b.module.intern_const(Const::String(name.name.clone()));
-                        let dst = b.alloc_reg();
-                        b.push(Inst::CallMemberOrValue {
-                            dst,
-                            receiver: recv,
-                            name: nm,
-                            fallback: local_reg,
-                            args: args_start,
-                            n_args: count,
-                            arg_names,
-                        });
-                        return dst;
-                    }
-                    // `super.method(...)` — emit `CallSuper` so the
-                    // host walks the parent class chain rather
-                    // than re-entering the leaf class's override.
-                    // `super<Klazz>.method()` passes Klazz so the
-                    // host dispatches against that specific
-                    // supertype.
-                    if let Expr::Super { qualifier, label, .. } = receiver.as_ref() {
-                        if let Some(this_reg) = b.resolve("this") {
-                            if let Some(owner) = b.owner_class().map(|s| s.to_string()) {
-                                let (args_start, count) = lower_arg_run(b, args);
-                                let arg_names = intern_arg_names(b.module, ast_arg_names);
-                                let dst = b.alloc_reg();
-                                let nm = b.module.intern_const(Const::String(name.name.clone()));
-                                let oc = b.module.intern_const(Const::String(owner));
-                                // `super<Q>` uses `qualifier` (type
-                                // ref); `super@Q` uses `label` (an
-                                // identifier).
-                                let qual_const = qualifier
-                                    .as_ref()
-                                    .map(|t| {
-                                        b.module.intern_const(Const::String(t.name.name.clone()))
-                                    })
-                                    .or_else(|| {
-                                        label.as_ref().map(|id| {
-                                            b.module
-                                                .intern_const(Const::String(id.name.clone()))
-                                        })
-                                    });
-                                b.push(Inst::CallSuper {
-                                    dst,
-                                    receiver: this_reg,
-                                    owner_class: oc,
-                                    qualifier: qual_const,
-                                    name: nm,
-                                    args: args_start,
-                                    n_args: count,
-                                    arg_names,
-                                });
-                                return dst;
-                            }
-                        }
-                    }
-                    // Statically rebind `(e as T).f(args)` to the `f`
-                    // overload whose first-param type is `T`. Upstream
-                    // bodies (`String.padStart` → `(this as CharSequence).
-                    // padStart(...).toString()`) rely on JVM-style
-                    // static-receiver dispatch; klio dispatches by
-                    // the runtime value's type, so without this the
-                    // call rebinds to the `String` overload and
-                    // recurses. Only fires for non-safe `as`-casts —
-                    // safe `as?` semantics need a null branch.
-                    if let Expr::As { ty: cast_ty, safe: false, .. } =
-                        receiver.as_ref()
-                    {
-                        let want_user = args.len();
-                        let chosen = b
-                            .module
-                            .funcs_by_simple_name(&name.name)
-                            .iter()
-                            .filter_map(|fid| {
-                                let f = b.module.funcs.get(fid.0 as usize)?;
-                                if f.blocks.is_empty() {
-                                    return None;
-                                }
-                                let p0 = f.params.first()?;
-                                if p0.name != "this" || p0.ty.name != cast_ty.name.name {
-                                    return None;
-                                }
-                                let user = f.params.len() - 1;
-                                let arity_ok = user == want_user
-                                    || (want_user < user
-                                        && f.params[(1 + want_user)..]
-                                            .iter()
-                                            .all(|p| p.default.is_some() || p.is_vararg))
-                                    || (want_user > user
-                                        && f.params
-                                            .last()
-                                            .map_or(false, |p| p.is_vararg));
-                                if arity_ok { Some(*fid) } else { None }
-                            })
-                            .next();
-                        if let Some(func_id) = chosen {
-                            // Build a contiguous arg run: receiver at
-                            // slot 0, user args following. lower the
-                            // receiver expression (the `as`-cast is a
-                            // no-op on klio runtime values, but the
-                            // emitted `Inst::Cast` keeps the schema
-                            // honest), then lower each user arg.
-                            let recv_reg = lower_receiver(b, receiver);
-                            let mut arg_regs: Vec<Reg> =
-                                Vec::with_capacity(args.len() + 1);
-                            arg_regs.push(recv_reg);
-                            for a in args {
-                                arg_regs.push(lower_expr(b, a));
-                            }
-                            let n = arg_regs.len() as u8;
-                            let start = b.alloc_reg();
-                            b.push(Inst::Move { dst: start, src: arg_regs[0] });
-                            for r in &arg_regs[1..] {
-                                let slot = b.alloc_reg();
-                                b.push(Inst::Move { dst: slot, src: *r });
-                            }
-                            let arg_names =
-                                intern_arg_names(b.module, ast_arg_names);
-                            let type_args =
-                                intern_type_args(b.module, ast_type_args);
-                            let dst = b.alloc_reg();
-                            b.push(Inst::Call {
-                                dst,
-                                func: func_id,
-                                args: start,
-                                n_args: n,
-                                arg_names,
-                                type_args,
-                            });
-                            return dst;
-                        }
-                    }
+            if let Expr::Member { receiver, name, .. } = callee.as_ref() {
+                // Receiver-typed lambda invocation: `list.block()`
+                // where `block: T.() -> R` is a local. Lower
+                // as CallValueWithThis so the host binds the
+                // receiver as `this` inside the lambda body.
+                // Gated tight so stdlib member calls like
+                // `xs.sorted()` aren't hijacked by a shared
+                // name.
+                // Only fire when the local name is bound AND
+                // the local has a function-like type. We
+                // can't check types at IR-lowering time, but
+                // most class methods aren't shadowed by
+                // locals — gate the arm narrowly on "name is
+                // a known param of the enclosing fn".
+                // A bound local named `name` shadows any member:
+                // `recv.name(args)` invokes that local. This
+                // covers a local extension function (`fun
+                // List<T>.mid() = …`, whose closure takes the
+                // receiver as its implicit `this` param) and a
+                // receiver-typed lambda parameter (`block: T.() ->
+                // R`). In both cases the receiver is the first
+                // positional argument (the closure's param 0 is
+                // `this`), so a plain CallValue suffices and we
+                // avoid the unsupported call_value_with_this.
+                // Only a local *function* (or function-typed
+                // param like `block: T.() -> R`) shadows
+                // `recv.name()` — a local `val`/`var` of the same
+                // name must NOT hijack a stdlib/member call
+                // (`val sorted = …; xs.sorted()` is the member).
+                // A captured outer name that holds a callable
+                // (e.g. a `Sink.(Int) -> Unit` parameter closed
+                // over by a returned lambda, invoked as
+                // `sink.g(v)`) shadows a member exactly like a
+                // local param/fn. CallMemberOrValue still tries
+                // the receiver's member first, so a captured
+                // non-callable can't hijack a real member call.
+                let anon_cap = is_lower_anon_capture(&name.name)
+                    && b.resolve(&name.name).is_none()
+                    && !b.is_local_fn(&name.name)
+                    && !b.is_param(&name.name)
+                    && !b.knows_outer(&name.name);
+                let local_callable = b.is_local_fn(&name.name)
+                    || b.is_param(&name.name)
+                    || b.knows_outer(&name.name)
+                    || anon_cap;
+                if local_callable {
+                    // For an anon-object method a captured name
+                    // reaches the body as a lexical capture: record
+                    // it and emit `LoadCapture` so it reads this
+                    // instance's snapshot (a captured closure keeps
+                    // its own captures and cannot collide with a
+                    // same-named capture of an enclosing anon
+                    // method). Otherwise capture on demand.
+                    let local_reg = if anon_cap {
+                        let idx = b.record_capture(&name.name);
+                        let r = b.alloc_reg();
+                        b.push(Inst::LoadCapture { dst: r, idx });
+                        r
+                    } else {
+                        resolve_capture(b, &name.name)
+                    };
+                    // `recv.name(args)` where `name` is also a
+                    // callable local/param. Kotlin dispatches the
+                    // member when `recv`'s type has it, and only
+                    // the local (a local extension fn, or a
+                    // `T.() -> R` param invoked as `recv.block()`)
+                    // when it does not. That needs the receiver's
+                    // runtime type, so emit CallMemberOrValue: the
+                    // member wins if present, else the local is
+                    // invoked with `recv` prepended.
                     let recv = lower_receiver(b, receiver);
                     let (args_start, count) = lower_arg_run(b, args);
                     let arg_names = intern_arg_names(b.module, ast_arg_names);
+                    let nm =
+                        b.module.intern_const(Const::String(name.name.clone()));
                     let dst = b.alloc_reg();
-                    let nm = b.module.intern_const(Const::String(name.name.clone()));
-                    b.push(Inst::CallMember {
+                    b.push(Inst::CallMemberOrValue {
                         dst,
                         receiver: recv,
                         name: nm,
+                        fallback: local_reg,
                         args: args_start,
                         n_args: count,
                         arg_names,
                     });
-                    dst
+                    return dst;
                 }
-                _ => {
-                    let callee_r = lower_expr(b, callee);
-                    let (args_start, count) = lower_arg_run(b, args);
-                    let arg_names = intern_arg_names(b.module, ast_arg_names);
-                    let dst = b.alloc_reg();
-                    b.push(Inst::CallValue {
-                        dst,
-                        callee: callee_r,
-                        args: args_start,
-                        n_args: count,
-                        arg_names,
-                    });
-                    dst
+                // `super.method(...)` — emit `CallSuper` so the
+                // host walks the parent class chain rather
+                // than re-entering the leaf class's override.
+                // `super<Klazz>.method()` passes Klazz so the
+                // host dispatches against that specific
+                // supertype.
+                if let Expr::Super { qualifier, label, .. } = receiver.as_ref()
+                    && let Some(this_reg) = b.resolve("this")
+                        && let Some(owner) = b.owner_class().map(std::string::ToString::to_string) {
+                            let (args_start, count) = lower_arg_run(b, args);
+                            let arg_names = intern_arg_names(b.module, ast_arg_names);
+                            let dst = b.alloc_reg();
+                            let nm = b.module.intern_const(Const::String(name.name.clone()));
+                            let oc = b.module.intern_const(Const::String(owner));
+                            // `super<Q>` uses `qualifier` (type
+                            // ref); `super@Q` uses `label` (an
+                            // identifier).
+                            let qual_const = qualifier
+                                .as_ref()
+                                .map(|t| {
+                                    b.module.intern_const(Const::String(t.name.name.clone()))
+                                })
+                                .or_else(|| {
+                                    label.as_ref().map(|id| {
+                                        b.module
+                                            .intern_const(Const::String(id.name.clone()))
+                                    })
+                                });
+                            b.push(Inst::CallSuper {
+                                dst,
+                                receiver: this_reg,
+                                owner_class: oc,
+                                qualifier: qual_const,
+                                name: nm,
+                                args: args_start,
+                                n_args: count,
+                                arg_names,
+                            });
+                            return dst;
+                        }
+                // Statically rebind `(e as T).f(args)` to the `f`
+                // overload whose first-param type is `T`. Upstream
+                // bodies (`String.padStart` → `(this as CharSequence).
+                // padStart(...).toString()`) rely on JVM-style
+                // static-receiver dispatch; klio dispatches by
+                // the runtime value's type, so without this the
+                // call rebinds to the `String` overload and
+                // recurses. Only fires for non-safe `as`-casts —
+                // safe `as?` semantics need a null branch.
+                if let Expr::As { ty: cast_ty, safe: false, .. } =
+                    receiver.as_ref()
+                {
+                    let want_user = args.len();
+                    let chosen = b
+                        .module
+                        .funcs_by_simple_name(&name.name)
+                        .iter()
+                        .filter_map(|fid| {
+                            let f = b.module.funcs.get(fid.0 as usize)?;
+                            if f.blocks.is_empty() {
+                                return None;
+                            }
+                            let p0 = f.params.first()?;
+                            if p0.name != "this" || p0.ty.name != cast_ty.name.name {
+                                return None;
+                            }
+                            let user = f.params.len() - 1;
+                            let arity_ok = user == want_user
+                                || (want_user < user
+                                    && f.params[(1 + want_user)..]
+                                        .iter()
+                                        .all(|p| p.default.is_some() || p.is_vararg))
+                                || (want_user > user
+                                    && f.params
+                                        .last()
+                                        .is_some_and(|p| p.is_vararg));
+                            if arity_ok { Some(*fid) } else { None }
+                        })
+                        .next();
+                    if let Some(func_id) = chosen {
+                        // Build a contiguous arg run: receiver at
+                        // slot 0, user args following. lower the
+                        // receiver expression (the `as`-cast is a
+                        // no-op on klio runtime values, but the
+                        // emitted `Inst::Cast` keeps the schema
+                        // honest), then lower each user arg.
+                        let recv_reg = lower_receiver(b, receiver);
+                        let mut arg_regs: Vec<Reg> =
+                            Vec::with_capacity(args.len() + 1);
+                        arg_regs.push(recv_reg);
+                        for a in args {
+                            arg_regs.push(lower_expr(b, a));
+                        }
+                        let n = arg_regs.len() as u8;
+                        let start = b.alloc_reg();
+                        b.push(Inst::Move { dst: start, src: arg_regs[0] });
+                        for r in &arg_regs[1..] {
+                            let slot = b.alloc_reg();
+                            b.push(Inst::Move { dst: slot, src: *r });
+                        }
+                        let arg_names =
+                            intern_arg_names(b.module, ast_arg_names);
+                        let type_args =
+                            intern_type_args(b.module, ast_type_args);
+                        let dst = b.alloc_reg();
+                        b.push(Inst::Call {
+                            dst,
+                            func: func_id,
+                            args: start,
+                            n_args: n,
+                            arg_names,
+                            type_args,
+                        });
+                        return dst;
+                    }
                 }
+                let recv = lower_receiver(b, receiver);
+                let (args_start, count) = lower_arg_run(b, args);
+                let arg_names = intern_arg_names(b.module, ast_arg_names);
+                let dst = b.alloc_reg();
+                let nm = b.module.intern_const(Const::String(name.name.clone()));
+                b.push(Inst::CallMember {
+                    dst,
+                    receiver: recv,
+                    name: nm,
+                    args: args_start,
+                    n_args: count,
+                    arg_names,
+                });
+                dst
+            } else {
+                let callee_r = lower_expr(b, callee);
+                let (args_start, count) = lower_arg_run(b, args);
+                let arg_names = intern_arg_names(b.module, ast_arg_names);
+                let dst = b.alloc_reg();
+                b.push(Inst::CallValue {
+                    dst,
+                    callee: callee_r,
+                    args: args_start,
+                    n_args: count,
+                    arg_names,
+                });
+                dst
             }
         }
         Expr::DoWhile { body, cond, .. } => {
@@ -2704,17 +2652,14 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.emit_const(Const::Unit)
         }
         Expr::Return { value, label, .. } => {
-            let r = match value {
-                Some(e) => Some(lower_expr(b, e)),
-                None => None,
-            };
+            let r = value.as_ref().map(|e| lower_expr(b, e));
             // An unlabeled `return` inside an inlined body returns
             // from that inline fn — which, inlined, is the call's
             // value. Spliced lambda-arg bodies clear the inline-return
             // target, so their non-local `return` falls through to
             // the caller path below (Kotlin non-local semantics).
-            if label.is_none() {
-                if let Some((res, join)) = b.inline_active_return() {
+            if label.is_none()
+                && let Some((res, join)) = b.inline_active_return() {
                     if let Some(rr) = r {
                         b.push(Inst::Move { dst: res, src: rr });
                     }
@@ -2742,11 +2687,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     b.switch_to(dead);
                     return b.emit_const(Const::Unit);
                 }
-            }
             // `return@<inlineFnName>` inside a spliced inline-argument
             // lambda is a local return from that lambda invocation.
-            if let Some(lbl) = label.as_ref() {
-                if let Some((res, end)) = b.inline_lambda_ret_for(&lbl.name) {
+            if let Some(lbl) = label.as_ref()
+                && let Some((res, end)) = b.inline_lambda_ret_for(&lbl.name) {
                     if let Some(rr) = r {
                         b.push(Inst::Move { dst: res, src: rr });
                     }
@@ -2755,7 +2699,6 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     b.switch_to(dead);
                     return b.emit_const(Const::Unit);
                 }
-            }
             if let Some(lbl) = label.as_ref() {
                 if b.current_inline_fn().is_some() {
                     // Inside a spliced inline body: a plain `Return`
@@ -2926,11 +2869,10 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // Record the implicit label (the enclosing call's simple name,
             // re-armed by `lower_arg_run`) so `this@<label>` inside the
             // lambda resolves to the receiver it is invoked with.
-            if let Some(label) = b.pending_lambda_label.take() {
-                if let Some(f) = b.module.funcs.get_mut(body_func.0 as usize) {
+            if let Some(label) = b.pending_lambda_label.take()
+                && let Some(f) = b.module.funcs.get_mut(body_func.0 as usize) {
                     f.implicit_label = Some(label);
                 }
-            }
             let captures: Vec<Reg> = captured_names
                 .iter()
                 .map(|n| resolve_capture(b, n))

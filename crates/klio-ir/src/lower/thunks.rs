@@ -111,10 +111,10 @@ pub fn lower_expr_as_param_thunk_scoped(
     bind_params(&mut b, params);
     b.set_param_thunk(true);
     if let Some(owner) = owner_class {
-        let _ = b.set_owner_class(owner.to_string());
+        let () = b.set_owner_class(owner.to_string());
     }
     if let Some(set) = own_members {
-        let _ = b.set_own_members(set.clone());
+        let () = b.set_own_members(set.clone());
     }
     let v = lower_expr(&mut b, expr);
     b.terminate(Terminator::Return(Some(v)));
@@ -136,8 +136,8 @@ pub fn lower_init_block_with_params(
     name: &str,
 ) -> crate::FuncId {
     let mut b = FuncBuilder::new(module);
-    let _ = b.set_owner_class(owner_class.to_string());
-    let _ = b.set_own_members(own_members.clone());
+    let () = b.set_owner_class(owner_class.to_string());
+    let () = b.set_own_members(own_members.clone());
     bind_params(&mut b, params);
     let v = lower_block(&mut b, block);
     b.terminate(Terminator::Return(Some(v)));
@@ -177,8 +177,8 @@ pub fn lower_init_block(
     name: &str,
 ) -> crate::FuncId {
     let mut b = FuncBuilder::new(module);
-    let _ = b.set_owner_class(owner_class.to_string());
-    let _ = b.set_own_members(own_members.clone());
+    let () = b.set_owner_class(owner_class.to_string());
+    let () = b.set_own_members(own_members.clone());
     bind_params(&mut b, &["this"]);
     let v = lower_block(&mut b, block);
     b.terminate(Terminator::Return(Some(v)));
@@ -200,8 +200,8 @@ pub fn lower_accessor_expr(
     name: &str,
 ) -> crate::FuncId {
     let mut b = FuncBuilder::new(module);
-    let _ = b.set_owner_class(owner_class.to_string());
-    let _ = b.set_own_members(own_members.clone());
+    let () = b.set_owner_class(owner_class.to_string());
+    let () = b.set_own_members(own_members.clone());
     bind_params(&mut b, params);
     let v = lower_expr(&mut b, expr);
     b.terminate(Terminator::Return(Some(v)));
@@ -239,8 +239,8 @@ pub fn lower_accessor_block(
     name: &str,
 ) -> crate::FuncId {
     let mut b = FuncBuilder::new(module);
-    let _ = b.set_owner_class(owner_class.to_string());
-    let _ = b.set_own_members(own_members.clone());
+    let () = b.set_owner_class(owner_class.to_string());
+    let () = b.set_own_members(own_members.clone());
     bind_params(&mut b, params);
     let v = lower_block(&mut b, block);
     b.terminate(Terminator::Return(Some(v)));

@@ -1,6 +1,6 @@
-use crate::*;
+use crate::{VmHost, member_is_property, AtomicOrdering, Arc, simple_literal, pad_args_with_defaults, VmIntrinsicHost};
 
-impl<'a> VmHost<'a> {
+impl VmHost<'_> {
     pub(crate) fn call_value(
         &mut self,
         callee: &klio_runtime::Value,
@@ -113,11 +113,10 @@ impl<'a> VmHost<'a> {
         }
         // `propRef(receiver)` — invoking a Value::PropertyRef as a
         // callable reads the named field from the first arg.
-        if let klio_runtime::Value::PropertyRef { name } = callee {
-            if args.len() == 1 {
+        if let klio_runtime::Value::PropertyRef { name } = callee
+            && args.len() == 1 {
                 return self.get_field(&args[0], name);
             }
-        }
         // Bound method/property reference: synthetic instance
         // carrying a receiver + method name. Invocation forwards
         // through the captured receiver (or reads the property on

@@ -154,7 +154,7 @@ fun main() {
 
 #[test]
 fn plus_assign_operator() {
-    let src = r#"
+    let src = r"
 class Counter {
     var n: Int = 0
     operator fun plusAssign(k: Int) { n += k }
@@ -164,7 +164,7 @@ fun main() {
     c += 5; c += 3
     println(c.n)
 }
-"#;
+";
     assert_klio("plus_assign", src, "8\n");
 }
 

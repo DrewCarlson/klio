@@ -1,6 +1,6 @@
-use crate::*;
+use crate::{VmHost, is_builtin_throwable_fqn, AtomicOrdering, Arc, with_ctor_guard, default_value_for_primary, with_inner_outer_hint, simple_literal};
 
-impl<'a> VmHost<'a> {
+impl VmHost<'_> {
     pub(crate) fn new_instance_named(
         &mut self,
         class: klio_ir::ClassId,
@@ -46,14 +46,13 @@ impl<'a> VmHost<'a> {
                     args.first(),
                     Some(klio_runtime::Value::Array { .. })
                 ) && fqn != "kotlin.String";
-                if !first_is_array {
-                    if let Some(intrinsic) = self.lookup_intrinsic(fqn) {
+                if !first_is_array
+                    && let Some(intrinsic) = self.lookup_intrinsic(fqn) {
                         return self.dispatch_intrinsic(intrinsic, args);
                     }
-                }
             }
         }
-        if arg_names.iter().all(|n| n.is_none()) {
+        if arg_names.iter().all(std::option::Option::is_none) {
             return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
         }
         let ir_class = self.module.classes.get(class.0 as usize).ok_or_else(|| {
@@ -66,26 +65,23 @@ impl<'a> VmHost<'a> {
         let mut reordered: Vec<Option<klio_runtime::Value>> = vec![None; params.len()];
         let mut next_pos = 0usize;
         for (i, v) in args.iter().enumerate() {
-            match arg_names.get(i).and_then(|n| n.clone()) {
-                Some(nm) => {
-                    let Some(idx) = params.iter().position(|p| p.name == nm) else {
-                        // Named arg doesn't match any primary param —
-                        // a secondary constructor or runtime ClassDef
-                        // owns the binding. Fall back to positional.
-                        return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
-                    };
-                    reordered[idx] = Some(v.clone());
-                }
-                None => {
-                    while next_pos < reordered.len() && reordered[next_pos].is_some() {
-                        next_pos += 1;
-                    }
-                    if next_pos >= reordered.len() {
-                        return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
-                    }
-                    reordered[next_pos] = Some(v.clone());
+            if let Some(nm) = arg_names.get(i).and_then(std::clone::Clone::clone) {
+                let Some(idx) = params.iter().position(|p| p.name == nm) else {
+                    // Named arg doesn't match any primary param —
+                    // a secondary constructor or runtime ClassDef
+                    // owns the binding. Fall back to positional.
+                    return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
+                };
+                reordered[idx] = Some(v.clone());
+            } else {
+                while next_pos < reordered.len() && reordered[next_pos].is_some() {
                     next_pos += 1;
                 }
+                if next_pos >= reordered.len() {
+                    return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
+                }
+                reordered[next_pos] = Some(v.clone());
+                next_pos += 1;
             }
         }
         // Fill missing slots with Null; defaults are applied inside
@@ -118,11 +114,10 @@ impl<'a> VmHost<'a> {
         // real Instance and chains up through the normal ctor path.
         {
             let fqn = ir_class.fqn.clone();
-            if is_builtin_throwable_fqn(&fqn) {
-                if let Some(intrinsic) = self.lookup_intrinsic(&fqn) {
+            if is_builtin_throwable_fqn(&fqn)
+                && let Some(intrinsic) = self.lookup_intrinsic(&fqn) {
                     return self.dispatch_intrinsic(intrinsic, args);
                 }
-            }
         }
         let mut class_def = self.classes.borrow().get(&ir_class.name).cloned().ok_or_else(|| {
             klio_ir::eval::EvalError::Unimplemented(format!(
@@ -200,7 +195,7 @@ impl<'a> VmHost<'a> {
             && self.prog
                 .secondary_ctors
                 .get(&class_def.name)
-                .map_or(false, |v| v.iter().any(|e| e.param_count == args.len()));
+                .is_some_and(|v| v.iter().any(|e| e.param_count == args.len()));
         let shell_guarded = with_ctor_guard(|g| g.borrow().iter().any(|n| n == &class_def.name));
         if !shell_guarded && (args.len() != n_primary || zero_primary_secondary) {
             let entries = self.prog
@@ -374,15 +369,14 @@ impl<'a> VmHost<'a> {
                     shell?
                 };
                 // Body block — evaluate with `[this, ctor_params...]`.
-                if let Some(body_fid) = entry.body {
-                    if let Some(body_func) = module.funcs.get(body_fid.0 as usize).cloned() {
+                if let Some(body_fid) = entry.body
+                    && let Some(body_func) = module.funcs.get(body_fid.0 as usize).cloned() {
                         let mut all: Vec<klio_runtime::Value> =
                             Vec::with_capacity(1 + args.len());
                         all.push(inst_v.clone());
                         all.extend_from_slice(args);
                         klio_ir::eval::eval_with(&module, &body_func, all, self)?;
                     }
-                }
                 return Ok(inst_v);
             }
         }
@@ -433,8 +427,7 @@ impl<'a> VmHost<'a> {
                             || f
                                 .params
                                 .last()
-                                .map(|p| p.is_vararg)
-                                .unwrap_or(false))
+                                .is_some_and(|p| p.is_vararg))
                 })
                 .map(|(fid, _)| fid);
             if let Some(fid) = factory {
@@ -496,8 +489,8 @@ impl<'a> VmHost<'a> {
                 // registered for it. Evaluate this class's
                 // parent-ctor-arg thunks to recover the `super(...)`
                 // message/cause and bind them on the leaf.
-                if is_throwable_name {
-                    if let Some(thunks) = self.prog.parent_ctor_args.get(&cur_class).cloned() {
+                if is_throwable_name
+                    && let Some(thunks) = self.prog.parent_ctor_args.get(&cur_class).cloned() {
                         for (idx, fid) in thunks.iter().enumerate() {
                             if let Some(func) =
                                 self.module.funcs.get(fid.0 as usize).cloned()
@@ -516,7 +509,6 @@ impl<'a> VmHost<'a> {
                             }
                         }
                     }
-                }
             }
         }
         while let Some(thunks) = self.prog.parent_ctor_args.get(&cur_class).cloned() {
@@ -527,7 +519,7 @@ impl<'a> VmHost<'a> {
             let Some(parent_name) = parent_name else { break };
             // Resolve to a non-interface parent for ctor chaining.
             let parent_def = self.classes.borrow().get(&parent_name).cloned();
-            if parent_def.as_ref().map_or(true, |d| d.is_interface) {
+            if parent_def.as_ref().is_none_or(|d| d.is_interface) {
                 break;
             }
             let mut parent_args: Vec<klio_runtime::Value> = Vec::with_capacity(thunks.len());
@@ -557,11 +549,10 @@ impl<'a> VmHost<'a> {
                         // `Long` field's declared type, matching Kotlin's
                         // literal typing (`C(n = 1)` with `n: Long`).
                         let mut field_value = value.clone();
-                        if param.declared_type.as_deref() == Some("Long") {
-                            if let klio_runtime::Value::Int(n) = field_value {
+                        if param.declared_type.as_deref() == Some("Long")
+                            && let klio_runtime::Value::Int(n) = field_value {
                                 field_value = klio_runtime::Value::Long(i64::from(n));
                             }
-                        }
                         fields.retain(|(n, _)| n != &param.name);
                         fields.push((param.name.clone(), field_value));
                     }
@@ -577,15 +568,14 @@ impl<'a> VmHost<'a> {
         {
             let mut cur = Some(Arc::clone(&class_def));
             while let Some(c) = cur {
-                for p in c.body_properties.iter() {
+                for p in &c.body_properties {
                     if p.init.is_some() || p.getter.is_some() || p.delegate.is_some() {
                         continue;
                     }
-                    if let Some(v) = p.primitive_zero.clone() {
-                        if !fields.iter().any(|(n, _)| n == &p.name) {
+                    if let Some(v) = p.primitive_zero.clone()
+                        && !fields.iter().any(|(n, _)| n == &p.name) {
                             fields.push((p.name.clone(), v));
                         }
-                    }
                 }
                 cur = c.parent.borrow().clone();
             }
@@ -605,24 +595,22 @@ impl<'a> VmHost<'a> {
         // Attach a stored default-outer if the class was
         // registered inside a method body via Inst::RegisterClass —
         // lets `this@Outer.X` and outer-field reads resolve.
-        if inst.borrow().outer.is_none() {
-            if let Some(default_outer) =
+        if inst.borrow().outer.is_none()
+            && let Some(default_outer) =
                 self.class_default_outer.borrow().get(&class_def.name).cloned()
             {
                 inst.borrow_mut().outer = Some(default_outer);
             }
-        }
         // Inner-class allocation: the caller's `Inst::NewInstance`
         // handler stashed the active `this` so init bodies can resolve
         // outer-class members through the outer-chain walk in
         // `get_field`. Wire it on the instance before init runs.
-        if class_def.is_inner && inst.borrow().outer.is_none() {
-            if let Some(hint) =
+        if class_def.is_inner && inst.borrow().outer.is_none()
+            && let Some(hint) =
                 with_inner_outer_hint(|s| s.borrow().last().cloned())
             {
                 inst.borrow_mut().outer = Some(hint);
             }
-        }
         // Publish object / companion singletons into globals *before*
         // their body-property initialisers and init blocks run, so a
         // companion whose initialiser (transitively) references the
@@ -721,24 +709,21 @@ impl<'a> VmHost<'a> {
                 if self.module.registry
                     .delegated_body_props
                     .contains(&(cls.name.clone(), p.name.clone()))
-                {
-                    if let klio_runtime::Value::Instance(ref dinst) = v {
+                    && let klio_runtime::Value::Instance(ref dinst) = v {
                         let dcls_name = dinst.borrow().class.name.clone();
                         let has_provide = self
                             .module
                             .classes
                             .iter()
                             .find(|c| c.name == dcls_name)
-                            .map(|c| {
+                            .is_some_and(|c| {
                                 c.methods.iter().any(|fid| {
                                     self.module
                                         .funcs
                                         .get(fid.0 as usize)
-                                        .map(|f| f.name == "provideDelegate")
-                                        .unwrap_or(false)
+                                        .is_some_and(|f| f.name == "provideDelegate")
                                 })
-                            })
-                            .unwrap_or(false);
+                            });
                         if has_provide {
                             let prop_ref = klio_runtime::Value::PropertyRef {
                                 name: Arc::new(p.name.clone()),
@@ -753,7 +738,6 @@ impl<'a> VmHost<'a> {
                             }
                         }
                     }
-                }
                 inst.borrow_mut().define(&p.name, v);
             } else if let Some(init_expr) = p.init.as_ref() {
                 // Runtime-registered class (no lowered thunk):

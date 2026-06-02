@@ -42,7 +42,7 @@ mod vm {
 /// here is mutated after construction, so sharing it across threads
 /// needs no synchronization.
 pub struct ProgramImage {
-    /// Top-level property name → 0-arg initializer FuncId. Mirrors
+    /// Top-level property name → 0-arg initializer `FuncId`. Mirrors
     /// `Vm::top_level_props` so a `VmHost` can drive a property's
     /// initializer on demand when it is read before the in-order
     /// startup pass reaches it.
@@ -81,11 +81,11 @@ impl SharedClosures {
         Self(Arc::new(Mutex::new(Vec::new())))
     }
     fn get(&self, id: usize) -> Option<ClosureInfo> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id).cloned()
     }
     /// Append `info`, returning its stable id.
     fn push(&self, info: ClosureInfo) -> u64 {
-        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = g.len() as u64;
         g.push(info);
         id
@@ -119,15 +119,15 @@ impl DispatchGate {
     }
     /// Block until a permit is free, then take it.
     fn acquire(&self) {
-        let mut avail = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut avail = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         while *avail == 0 {
-            avail = self.cv.wait(avail).unwrap_or_else(|e| e.into_inner());
+            avail = self.cv.wait(avail).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         *avail -= 1;
     }
     /// Return a permit and wake one waiter.
     fn release(&self) {
-        let mut avail = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut avail = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *avail += 1;
         self.cv.notify_one();
     }
@@ -141,8 +141,7 @@ fn default_gate() -> &'static DispatchGate {
     static GATE: std::sync::OnceLock<DispatchGate> = std::sync::OnceLock::new();
     GATE.get_or_init(|| {
         let cap = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+            .map_or(4, std::num::NonZero::get);
         DispatchGate::new(cap)
     })
 }
@@ -167,7 +166,7 @@ pub struct Vm {
     /// Per-class runtime metadata produced by `build::build_module`.
     /// Shared by handle with spawned threads.
     classes: klio_runtime::ObjRef<std::collections::HashMap<String, Arc<klio_runtime::ClassDef>>>,
-    /// Top-level property initialiser FuncIds. Run at Vm::run start
+    /// Top-level property initialiser `FuncIds`. Run at `Vm::run` start
     /// so globals see the initial values.
     top_level_props: Vec<(String, klio_ir::FuncId)>,
     /// Enum-entry ctor-arg thunks to evaluate at startup.
@@ -233,6 +232,7 @@ impl SendableVmSeed {
     /// closure table, id counter, and stdout sink; it gets its own
     /// fresh cooperative scheduler (coroutine state is `thread_local`
     /// already).
+    #[must_use] 
     pub fn materialize(self) -> Vm {
         Vm {
             module: self.module,
@@ -267,10 +267,10 @@ struct ClosureInfo {
     /// name back to the captured value index.
     capture_names: Vec<String>,
     /// Live capture values. Stored behind a shared interior-mutable
-    /// handle so the lambda body's StoreGlobal writes propagate (the
+    /// handle so the lambda body's `StoreGlobal` writes propagate (the
     /// dispatch path layers each captured name into a per-call env,
     /// then reads back into this vec). The outer-frame
-    /// WritebackCaptures Inst observes the updated values via
+    /// `WritebackCaptures` Inst observes the updated values via
     /// `read_lambda_capture`.
     captures: klio_runtime::ObjRef<Vec<klio_runtime::Value>>,
 }
@@ -289,15 +289,13 @@ impl From<klio_ir::eval::EvalError> for VmError {
         // Format Throw variants with the thrown exception's
         // fqn + message so the user-facing diagnostic is
         // actionable rather than the trait's generic phrase.
-        if let klio_ir::eval::EvalError::Throw(v) = &e {
-            if let klio_runtime::Value::Exception { fqn, message, .. } = v {
+        if let klio_ir::eval::EvalError::Throw(v) = &e
+            && let klio_runtime::Value::Exception { fqn, message, .. } = v {
                 let msg = message
                     .as_deref()
-                    .map(|s| s.as_str())
-                    .unwrap_or("<no message>");
+                    .map_or("<no message>", std::string::String::as_str);
                 return VmError::Eval(format!("uncaught {fqn}: {msg}"));
             }
-        }
         VmError::Eval(e.to_string())
     }
 }
@@ -364,7 +362,7 @@ fn member_is_property(
 /// never rejects a legitimately-bound overload, only flags a body
 /// bound to the wrong type-specialized sibling.
 fn primitive_param_accepts(type_name: &str, v: &klio_runtime::Value) -> bool {
-    use klio_runtime::Value::*;
+    use klio_runtime::Value::{Int, Long, Short, Byte, UInt, ULong, UShort, UByte, Double, Float, Char, Bool, String};
     let arg_is_primitive = matches!(
         v,
         Int(_) | Long(_) | Short(_) | Byte(_)
@@ -519,14 +517,13 @@ fn pack_vararg_args(
     func: &klio_ir::Func,
     args: Vec<klio_runtime::Value>,
 ) -> Vec<klio_runtime::Value> {
-    if let Some(last) = func.params.last() {
-        if last.is_vararg {
+    if let Some(last) = func.params.last()
+        && last.is_vararg {
             let fixed = func.params.len().saturating_sub(1);
-            if args.len() == func.params.len() {
-                if matches!(args.last(), Some(klio_runtime::Value::Array { .. })) {
+            if args.len() == func.params.len()
+                && matches!(args.last(), Some(klio_runtime::Value::Array { .. })) {
                     return args;
                 }
-            }
             let mut out: Vec<klio_runtime::Value> = Vec::with_capacity(func.params.len());
             for v in args.iter().take(fixed) {
                 out.push(v.clone());
@@ -539,7 +536,6 @@ fn pack_vararg_args(
             });
             return out;
         }
-    }
     args
 }
 
@@ -602,10 +598,10 @@ fn pad_args_with_defaults<H: klio_ir::eval::Host>(
             // param. Seed the capture slot with the receiver so the
             // bare `size` resolves through it instead of failing as
             // an unresolved global.
-            let captures: Vec<klio_runtime::Value> = if !call_args.is_empty() {
-                vec![call_args[0].clone()]
-            } else {
+            let captures: Vec<klio_runtime::Value> = if call_args.is_empty() {
                 Vec::new()
+            } else {
+                vec![call_args[0].clone()]
             };
             let v = klio_ir::eval::eval_with_captures(
                 module,
@@ -631,16 +627,16 @@ fn pad_args_with_defaults<H: klio_ir::eval::Host>(
 /// allocated without bound (OOM). Instances are handled by their own
 /// identity/override path and are not routed here.
 fn kotlin_hash_code(v: &klio_runtime::Value) -> i32 {
-    use klio_runtime::Value::*;
+    use klio_runtime::Value::{Null, Bool, Char, Byte, Short, Int, UByte, UShort, UInt, Long, ULong, Float, Double, String, List, Set, Map, Array, Range};
     match v {
         Null => 0,
         Bool(b) => if *b { 1231 } else { 1237 },
-        Char(c) => *c as i32,
-        Byte(x) => *x as i32,
-        Short(x) => *x as i32,
+        Char(c) => i32::from(*c),
+        Byte(x) => i32::from(*x),
+        Short(x) => i32::from(*x),
         Int(x) => *x,
-        UByte(x) => *x as i32,
-        UShort(x) => *x as i32,
+        UByte(x) => i32::from(*x),
+        UShort(x) => i32::from(*x),
         UInt(x) => *x as i32,
         Long(l) => (*l ^ (((*l as u64) >> 32) as i64)) as i32,
         ULong(u) => (*u ^ (*u >> 32)) as i32,
@@ -654,7 +650,7 @@ fn kotlin_hash_code(v: &klio_runtime::Value) -> i32 {
         String(s) => {
             let mut h: i32 = 0;
             for ch in s.encode_utf16() {
-                h = h.wrapping_mul(31).wrapping_add(ch as i32);
+                h = h.wrapping_mul(31).wrapping_add(i32::from(ch));
             }
             h
         }
@@ -708,7 +704,7 @@ fn kotlin_hash_code(v: &klio_runtime::Value) -> i32 {
 }
 
 fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
-    use klio_runtime::Value::*;
+    use klio_runtime::Value::{Unit, Null, Bool, Char, Int, Long, Short, Byte, UInt, ULong, UShort, UByte, Float, Double, String};
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     match v {
@@ -716,14 +712,14 @@ fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
         Null => 1i32.hash(&mut h),
         Bool(b) => { 2i32.hash(&mut h); b.hash(&mut h); }
         Char(c) => { 3i32.hash(&mut h); c.hash(&mut h); }
-        Int(i) => { 4i32.hash(&mut h); (*i as i64).hash(&mut h); }
+        Int(i) => { 4i32.hash(&mut h); i64::from(*i).hash(&mut h); }
         Long(l) => { 4i32.hash(&mut h); l.hash(&mut h); }
-        Short(s) => { 4i32.hash(&mut h); (*s as i64).hash(&mut h); }
-        Byte(b) => { 4i32.hash(&mut h); (*b as i64).hash(&mut h); }
-        UInt(u) => { 4i32.hash(&mut h); (*u as i64).hash(&mut h); }
+        Short(s) => { 4i32.hash(&mut h); i64::from(*s).hash(&mut h); }
+        Byte(b) => { 4i32.hash(&mut h); i64::from(*b).hash(&mut h); }
+        UInt(u) => { 4i32.hash(&mut h); i64::from(*u).hash(&mut h); }
         ULong(u) => { 4i32.hash(&mut h); u.hash(&mut h); }
-        UShort(u) => { 4i32.hash(&mut h); (*u as i64).hash(&mut h); }
-        UByte(u) => { 4i32.hash(&mut h); (*u as i64).hash(&mut h); }
+        UShort(u) => { 4i32.hash(&mut h); i64::from(*u).hash(&mut h); }
+        UByte(u) => { 4i32.hash(&mut h); i64::from(*u).hash(&mut h); }
         Float(f) => { 5i32.hash(&mut h); f.to_bits().hash(&mut h); }
         Double(d) => { 5i32.hash(&mut h); d.to_bits().hash(&mut h); }
         String(s) => { 6i32.hash(&mut h); s.hash(&mut h); }
@@ -744,7 +740,7 @@ fn value_structural_hash(v: &klio_runtime::Value) -> i32 {
 fn default_value_for_primary(
     e: &klio_ast::Expr,
 ) -> Option<klio_runtime::Value> {
-    use klio_ast::Expr::*;
+    use klio_ast::Expr::{Call, Path};
     if let Some(v) = simple_literal(e) {
         return Some(v);
     }
@@ -752,8 +748,8 @@ fn default_value_for_primary(
         if !args.is_empty() {
             return None;
         }
-        if let Path { segments, .. } = callee.as_ref() {
-            if segments.len() == 1 {
+        if let Path { segments, .. } = callee.as_ref()
+            && segments.len() == 1 {
                 match segments[0].name.as_str() {
                     "mutableListOf" | "arrayListOf" | "ArrayList" | "ArrayDeque" => {
                         return Some(klio_runtime::Value::List {
@@ -796,13 +792,12 @@ fn default_value_for_primary(
                     _ => {}
                 }
             }
-        }
     }
     None
 }
 
 fn simple_literal(e: &klio_ast::Expr) -> Option<klio_runtime::Value> {
-    use klio_ast::Expr::*;
+    use klio_ast::Expr::{IntLit, FloatLit, BoolLit, NullLit, CharLit, StringTemplate};
     match e {
         IntLit { value, .. } => Some(klio_runtime::Value::new_int(*value)),
         FloatLit { value, .. } => Some(klio_runtime::Value::Double(*value)),
@@ -998,7 +993,7 @@ struct CooperativeInterceptor {
     started: Option<std::time::Instant>,
     next_token: u64,
     virtual_now: i64,
-    /// token → (parked activation, virtual-time wakeup; i64::MAX =
+    /// token → (parked activation, virtual-time wakeup; `i64::MAX` =
     /// indefinite — only an explicit ready entry resumes it).
     parked: std::collections::HashMap<u64, (klio_ir::eval::SuspendState, i64)>,
     /// FIFO of tokens whose wakeup is due (timer fired or yielded).
@@ -1055,7 +1050,7 @@ struct ExecState {
     outer_this: RefCell<Vec<klio_runtime::Value>>,
     /// Outer-`this` candidates for inner-class allocation. Pushed by
     /// the IR's `Inst::NewInstance` handler before each inner-class
-    /// new_instance call so init blocks can read the soon-to-be
+    /// `new_instance` call so init blocks can read the soon-to-be
     /// `outer` field through the runtime's outer-chain walk.
     inner_outer_hint: RefCell<Vec<klio_runtime::Value>>,
     /// Active receiver-lambda labels: each entry is the lambda's

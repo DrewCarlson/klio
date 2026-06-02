@@ -1,6 +1,6 @@
-use super::*;
+use super::{Checker, Block, Type, stmt_span, Diagnostic, codes, Stmt, Binding, Decl, convert_type_ref_lossy, class_name_from_typeref, single_path_name, ClassInfo, Expr, AssignOp, Span, Visibility, type_has_compound_assign, StringPart, substitute_type_params, dot_path_key, UnOp, is_numeric, PostfixOp, lub, is_labelable_target, WhenPatternKind, FunctionBody, ExtensionPropSig, HashSet, FnSig};
 
-impl<'r> Checker<'r> {
+impl Checker<'_> {
     // ---- statements & blocks --------------------------------------------
 
     pub(crate) fn check_block(&mut self, block: &Block, expected: Option<&Type>) -> Type {
@@ -85,11 +85,10 @@ impl<'r> Checker<'r> {
                     self.check_assignable(&init_ty, &a, init.span());
                 }
                 let mut cn = p.ty.as_ref().and_then(class_name_from_typeref);
-                if cn.is_none() {
-                    if let Some(init) = &p.init {
+                if cn.is_none()
+                    && let Some(init) = &p.init {
                         cn = self.expr_class.get(&init.span()).cloned();
                     }
-                }
                 self.current_frame().bindings.insert(
                     p.name.name.clone(),
                     Binding {
@@ -108,23 +107,20 @@ impl<'r> Checker<'r> {
                 // Spec §14.1.5: tie `val b = a` to its source for bound
                 // smart-cast propagation. Only immutable locals participate
                 // (mutable bindings can be reassigned, breaking the alias).
-                if !p.mutable {
-                    if let Some(init) = &p.init {
-                        if let Some(src) = single_path_name(init) {
+                if !p.mutable
+                    && let Some(init) = &p.init
+                        && let Some(src) = single_path_name(init) {
                             // Require the source to be an immutable binding
                             // in some scope. Otherwise the alias may not
                             // hold (the source can be reassigned).
                             let src_is_stable = self
                                 .lookup(&src)
-                                .map(|b| !b.mutable)
-                                .unwrap_or(false);
+                                .is_some_and(|b| !b.mutable);
                             // Bound smart-cast aliasing lives in the
                             // CFG lowering's `aliases` map; consulted
                             // by cfg_narrowed_at when chasing chains.
                             let _ = src_is_stable;
                         }
-                    }
-                }
             }
             Decl::Function(f) => {
                 let sig = self.signature_of(f);
@@ -168,14 +164,14 @@ impl<'r> Checker<'r> {
             self.check_compound_assign_ambiguity(target, op, span);
         }
         // Reassignment-of-val check for the simple identifier case.
-        if let Expr::Path { segments, span } = target {
-            if segments.len() == 1 {
+        if let Expr::Path { segments, span } = target
+            && segments.len() == 1 {
                 let name = &segments[0].name;
                 // Spec §4.6: per-accessor visibility on `var x; private set`.
                 // Reject the write when use site is outside the setter's
                 // declared scope.
-                if let Some((sv, decl_file)) = self.setter_visibility.get(name).copied() {
-                    if matches!(sv, Visibility::Private) && span.file != decl_file {
+                if let Some((sv, decl_file)) = self.setter_visibility.get(name).copied()
+                    && matches!(sv, Visibility::Private) && span.file != decl_file {
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 format!(
@@ -187,7 +183,6 @@ impl<'r> Checker<'r> {
                             .with_code(codes::TYPE_INVISIBLE_REFERENCE),
                         );
                     }
-                }
                 let info = self
                     .lookup(name)
                     .map(|b| (b.ty.clone(), b.mutable));
@@ -226,7 +221,6 @@ impl<'r> Checker<'r> {
                     return;
                 }
             }
-        }
         let _ = self.check_expr(target, None);
         let _ = self.check_expr(value, None);
     }
@@ -254,8 +248,8 @@ impl<'r> Checker<'r> {
                     klio_ast::IntLitKind::ULong => return Type::ULong,
                     klio_ast::IntLitKind::Int => {}
                 }
-                if let Some(t) = expected {
-                    if matches!(
+                if let Some(t) = expected
+                    && matches!(
                         t.non_null(),
                         Type::Long
                             | Type::Short
@@ -268,18 +262,16 @@ impl<'r> Checker<'r> {
                     ) {
                         return t.non_null().clone();
                     }
-                }
                 Type::Int
             }
             Expr::FloatLit { kind, .. } => {
                 if matches!(kind, klio_ast::FloatLitKind::Float) {
                     return Type::Float;
                 }
-                if let Some(t) = expected {
-                    if matches!(t.non_null(), Type::Float | Type::Double) {
+                if let Some(t) = expected
+                    && matches!(t.non_null(), Type::Float | Type::Double) {
                         return t.non_null().clone();
                     }
-                }
                 Type::Double
             }
             Expr::BoolLit { .. } => Type::Boolean,
@@ -396,20 +388,19 @@ impl<'r> Checker<'r> {
                 )
             }
             Expr::Call { callee, args, arg_names, type_args, span, is_infix, .. } => {
-                if let Expr::Path { segments, .. } = callee.as_ref() {
-                    if segments.len() == 1 {
+                if let Expr::Path { segments, .. } = callee.as_ref()
+                    && segments.len() == 1 {
                         let name = &segments[0].name;
                         if self.classes.contains_key(name) {
                             self.expr_class.insert(*span, name.clone());
                         }
                     }
-                }
                 // Spec §11.2.2: `super.f(...)` with no `<Qualifier>` must
                 // resolve to a member from exactly one direct supertype.
                 // Two or more contributing supertypes require the caller
                 // to disambiguate via `super<Type>.f(...)`.
-                if let Expr::Member { receiver, name, .. } = callee.as_ref() {
-                    if let Expr::Super { qualifier, span: super_span, .. } =
+                if let Expr::Member { receiver, name, .. } = callee.as_ref()
+                    && let Expr::Super { qualifier, span: super_span, .. } =
                         receiver.as_ref()
                     {
                         match qualifier {
@@ -421,7 +412,6 @@ impl<'r> Checker<'r> {
                             }
                         }
                     }
-                }
                 // Spec §4.2: implicit lambda label — bind the call's
                 // callee simple name as a label visible inside any lambda
                 // argument so `xs.forEach { return@forEach }` checks.
@@ -562,8 +552,8 @@ impl<'r> Checker<'r> {
                     let expected = self.fn_return_stack.last().cloned();
                     let _ = self.check_expr(v, expected.as_ref());
                 }
-                if let Some(l) = label {
-                    if !self.label_stack.iter().any(|x| x == &l.name) {
+                if let Some(l) = label
+                    && !self.label_stack.iter().any(|x| x == &l.name) {
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 format!("label `{}` is not bound here", l.name),
@@ -572,12 +562,11 @@ impl<'r> Checker<'r> {
                             .with_code(codes::TYPE_UNRESOLVED_LABEL),
                         );
                     }
-                }
                 Type::Nothing
             }
             Expr::Break { label, span } | Expr::Continue { label, span } => {
-                if let Some(l) = label {
-                    if !self.label_stack.iter().any(|x| x == &l.name) {
+                if let Some(l) = label
+                    && !self.label_stack.iter().any(|x| x == &l.name) {
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 format!("label `{}` is not bound here", l.name),
@@ -586,7 +575,6 @@ impl<'r> Checker<'r> {
                             .with_code(codes::TYPE_UNRESOLVED_LABEL),
                         );
                     }
-                }
                 Type::Nothing
             }
             Expr::Labeled { label, expr, .. } => {
@@ -626,8 +614,8 @@ impl<'r> Checker<'r> {
                 // whose declared type names a non-reified type parameter,
                 // the static type is erased at runtime and the throw is
                 // unsafe.
-                if let Expr::Path { segments, .. } = value.as_ref() {
-                    if segments.len() == 1 {
+                if let Expr::Path { segments, .. } = value.as_ref()
+                    && segments.len() == 1 {
                         let name = &segments[0].name;
                         let decl_ty_name = self
                             .frames
@@ -657,7 +645,6 @@ impl<'r> Checker<'r> {
                             }
                         }
                     }
-                }
                 Type::Nothing
             }
             Expr::Try { body, catches, finally, .. } => {
@@ -745,8 +732,8 @@ impl<'r> Checker<'r> {
                 // LHS of `::class`. Type parameters are permitted only
                 // when `reified`.
                 if name.name == "class" {
-                    if let Expr::Path { segments, .. } = receiver.as_ref() {
-                        if segments.len() == 1 {
+                    if let Expr::Path { segments, .. } = receiver.as_ref()
+                        && segments.len() == 1 {
                             let tname = &segments[0].name;
                             let is_type_param = self
                                 .type_params_in_scope
@@ -774,7 +761,6 @@ impl<'r> Checker<'r> {
                                 return Type::Unresolved;
                             }
                         }
-                    }
                     let rty = self.check_expr(receiver, None);
                     if matches!(rty, Type::Nullable(_)) {
                         self.diagnostics.emit(
@@ -935,7 +921,7 @@ impl<'r> Checker<'r> {
                 {
                     self.diagnostics.emit(
                         Diagnostic::warning(
-                            format!("No cast needed: `{}` is already `{}`", subj_ty, target_ty),
+                            format!("No cast needed: `{subj_ty}` is already `{target_ty}`"),
                             *span,
                         )
                         .with_code(codes::WARN_USELESS_CAST)
@@ -996,7 +982,7 @@ impl<'r> Checker<'r> {
                 }
                 // `expr as T` narrowing is handled by the CFG via the
                 // AssumeIs node the lowering emits for the cast.
-                let _ = ();
+                let () = ();
                 if *safe {
                     target.as_nullable()
                 } else {
@@ -1025,8 +1011,7 @@ impl<'r> Checker<'r> {
                 }
                 let ret_expected = return_ty
                     .as_ref()
-                    .map(convert_type_ref_lossy)
-                    .unwrap_or(Type::Unresolved);
+                    .map_or(Type::Unresolved, convert_type_ref_lossy);
                 if let Some(b) = body.as_deref() {
                     match b {
                         FunctionBody::Block(blk) => {
@@ -1173,14 +1158,13 @@ impl<'r> Checker<'r> {
             }
             self.check_member_visibility(class, name, Some(class), member_span);
         }
-        if !found_as_member {
-            if let Some(ep) = self.lookup_extension_property(recv_ty, recv_class, name) {
+        if !found_as_member
+            && let Some(ep) = self.lookup_extension_property(recv_ty, recv_class, name) {
                 result = ep.ty.clone();
                 if let Some(cn) = ep.return_class.clone() {
                     self.expr_class.insert(member_span, cn);
                 }
             }
-        }
         if safe {
             result.as_nullable()
         } else {
@@ -1226,11 +1210,10 @@ impl<'r> Checker<'r> {
             Type::Generic { name, .. } => Some(name.clone()),
             _ => None,
         };
-        if let Some(h) = head {
-            if !keys.iter().any(|k| k == &h) {
+        if let Some(h) = head
+            && !keys.iter().any(|k| k == &h) {
                 keys.push(h);
             }
-        }
         keys.push("Any".to_string());
         for key in &keys {
             let Some(list) = self.extension_properties.get(key) else { continue };

@@ -1404,6 +1404,6 @@ mod tests {
             &[Value::String(Arc::new("bad".into()))],
         ) else { panic!() };
         assert_eq!(*fqn, "kotlin.IllegalArgumentException");
-        assert_eq!(message.as_deref().map(|s| s.as_str()), Some("bad"));
+        assert_eq!(message.as_deref().map(std::string::String::as_str), Some("bad"));
     }
 }

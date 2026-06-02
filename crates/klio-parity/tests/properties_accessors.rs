@@ -23,7 +23,7 @@ fn assert_klio(name: &str, src: &str, expected: &str) {
 
 #[test]
 fn custom_getter_setter_with_backing_field() {
-    let src = r#"
+    let src = r"
 class Counter {
     private var _value: Int = 0
     var value: Int
@@ -37,7 +37,7 @@ fun main() {
     c.value = 10
     println(c.value)
 }
-"#;
+";
     assert_klio("custom_get_set", src, "10\n");
 }
 
@@ -72,7 +72,7 @@ fun main() {
 
 #[test]
 fn backing_field_field_keyword() {
-    let src = r#"
+    let src = r"
 class Box {
     var x: Int = 0
         set(v) { field = if (v >= 0) v else 0 }
@@ -83,7 +83,7 @@ fun main() {
     b.x = -3
     println(b.x)
 }
-"#;
+";
     assert_klio("field_keyword", src, "0\n");
 }
 

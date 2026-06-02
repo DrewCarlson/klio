@@ -68,7 +68,7 @@ pub(super) fn lower_lambda_body_capturing_kind_with(
         b.set_outer_names_without_lambda(outer);
     }
     if let Some(name) = tailrec_self {
-        let _ = b.set_tailrec_self(name.to_string());
+        let () = b.set_tailrec_self(name.to_string());
     }
     let mut boxed = compute_boxed_vars(&body.stmts);
     if !outer_boxed.is_empty() {

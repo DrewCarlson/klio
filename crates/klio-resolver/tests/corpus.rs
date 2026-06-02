@@ -19,9 +19,7 @@ fn render(src: &str) -> String {
     out.push_str("# symbols\n");
     for s in &r.symbols {
         let span = s
-            .decl_span
-            .map(|sp| format!("@{}..{}", sp.start, sp.end))
-            .unwrap_or_else(|| "@builtin".into());
+            .decl_span.map_or_else(|| "@builtin".into(), |sp| format!("@{}..{}", sp.start, sp.end));
         out.push_str(&format!(
             "  [{idx}] {kind:?} {name} {span}\n",
             idx = s.id.0,

@@ -1,6 +1,6 @@
-use crate::*;
+use crate::{VmHost, IN_PROGRESS, Arc, VmIntrinsicHost, receiver_compatible_with_param};
 
-impl<'a> VmHost<'a> {
+impl VmHost<'_> {
     /// Drive a top-level property's initializer on demand when it is
     /// read before the in-order startup pass has reached it (an
     /// earlier top-level initializer constructs a class whose body
@@ -56,7 +56,7 @@ impl<'a> VmHost<'a> {
     /// already established. `fence_and_publish` marks the boundary.
     pub(crate) fn join_spawned(&mut self, id: u64) -> Result<(), klio_runtime::RuntimeError> {
         let handle = {
-            let mut g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.get_mut(&id).and_then(|e| e.handle.take())
         };
         let Some(handle) = handle else {
@@ -71,9 +71,9 @@ impl<'a> VmHost<'a> {
 
     /// Whether spawned thread `id` is still running.
     pub(crate) fn thread_alive(&self, id: u64) -> bool {
-        let g = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+        let g = self.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match g.get(&id) {
-            Some(e) => e.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false),
+            Some(e) => e.handle.as_ref().is_some_and(|h| !h.is_finished()),
             None => false,
         }
     }
@@ -138,7 +138,7 @@ impl<'a> VmHost<'a> {
         // Numeric widening: Int → Long, Int → Double, Long → Double.
         match (nm, v_ty) {
             ("Long", "Int") => return Some(40),
-            ("Double", "Int") | ("Double", "Long") | ("Float", "Int") => return Some(30),
+            ("Double" | "Float", "Int") | ("Double", "Long") => return Some(30),
             _ => {}
         }
         // A callable argument (lambda / closure / bound method)
@@ -161,15 +161,14 @@ impl<'a> VmHost<'a> {
             // functional parameter's shape are disambiguated; a
             // mismatch still scores (low) rather than disqualifying,
             // to stay tolerant of receiver-style function types.
-            if let Some(expected) = nm.strip_prefix("Function") {
-                if let Ok(want) = expected.parse::<usize>() {
+            if let Some(expected) = nm.strip_prefix("Function")
+                && let Ok(want) = expected.parse::<usize>() {
                     return Some(match arg_arity {
                         Some(got) if got == want => 90,
                         Some(_) => 2,
                         None => 15,
                     });
                 }
-            }
             return Some(15);
         }
         // Subtype: an instance argument whose class transitively
@@ -358,16 +357,10 @@ impl<'a> VmHost<'a> {
             // (`CoroutineContext.plus(CoroutineContext)`), instead of
             // dispatching a non-applicable narrowing overload.
             let f = &candidates[0];
-            let params_skip = if f
+            let params_skip = usize::from(f
                 .params
                 .first()
-                .map(|p| p.name == "this")
-                .unwrap_or(false)
-            {
-                1
-            } else {
-                0
-            };
+                .is_some_and(|p| p.name == "this"));
             let effective = &f.params[params_skip..];
             for (p, a) in effective.iter().zip(args.iter()) {
                 if self.arg_definitely_not_param_type(&p.ty, a) {
@@ -380,7 +373,7 @@ impl<'a> VmHost<'a> {
         for (i, f) in candidates.iter().enumerate() {
             // Method params include the implicit `this` slot first;
             // skip it when scoring against the caller's args.
-            let params_skip = if f.params.first().map(|p| p.name == "this").unwrap_or(false) { 1 } else { 0 };
+            let params_skip = usize::from(f.params.first().is_some_and(|p| p.name == "this"));
             let effective: &[klio_ir::Param] = &f.params[params_skip..];
             // Accept an exact-arity match, or a call that supplies
             // fewer args when every unsupplied trailing parameter has
@@ -395,8 +388,7 @@ impl<'a> VmHost<'a> {
                 let all_defaulted = (args.len()..effective.len()).all(|k| {
                     defaults
                         .and_then(|d| d.get(params_skip + k))
-                        .map(|slot| slot.is_some())
-                        .unwrap_or(false)
+                        .is_some_and(std::option::Option::is_some)
                 });
                 if !all_defaulted {
                     continue;
@@ -405,12 +397,9 @@ impl<'a> VmHost<'a> {
             let mut total: i32 = 0;
             let mut ok = true;
             for (p, a) in effective.iter().zip(args.iter()) {
-                match self.overload_score_arg(&p.ty, a) {
-                    Some(s) => total += s,
-                    None => {
-                        ok = false;
-                        break;
-                    }
+                if let Some(s) = self.overload_score_arg(&p.ty, a) { total += s } else {
+                    ok = false;
+                    break;
                 }
             }
             // Prefer an exact-arity overload over one relying on
@@ -418,7 +407,7 @@ impl<'a> VmHost<'a> {
             if ok && args.len() == effective.len() {
                 total += 5;
             }
-            if ok && best.map(|(_, s)| total > s).unwrap_or(true) {
+            if ok && best.is_none_or(|(_, s)| total > s) {
                 best = Some((i, total));
             }
         }
@@ -445,11 +434,10 @@ impl<'a> VmHost<'a> {
             if *cand == seed_func {
                 continue;
             }
-            if let Some(total) = self.overload_score(module, *cand, args) {
-                if best.map(|(_, s)| total > s).unwrap_or(true) {
+            if let Some(total) = self.overload_score(module, *cand, args)
+                && best.is_none_or(|(_, s)| total > s) {
                     best = Some((*cand, total));
                 }
-            }
         }
         best.map(|(id, _)| id)
     }
@@ -466,7 +454,7 @@ impl<'a> VmHost<'a> {
         args: &[klio_runtime::Value],
     ) -> Option<i32> {
         let f = module.funcs.get(cand.0 as usize)?;
-        let last_vararg = f.params.last().map(|p| p.is_vararg).unwrap_or(false);
+        let last_vararg = f.params.last().is_some_and(|p| p.is_vararg);
         if f.params.len() < args.len() && !last_vararg {
             return None;
         }
@@ -475,8 +463,7 @@ impl<'a> VmHost<'a> {
             let all_defaulted = (args.len()..f.params.len()).all(|i| {
                 defaults
                     .and_then(|d| d.get(i))
-                    .map(|slot| slot.is_some())
-                    .unwrap_or(false)
+                    .is_some_and(std::option::Option::is_some)
             });
             if !all_defaulted {
                 return None;
@@ -581,7 +568,7 @@ impl<'a> VmHost<'a> {
             // Only genuine extension fns (synthetic `this` first param)
             // are candidates for member-call resolution; a plain
             // top-level fn sharing the name is not an extension.
-            .filter(|(_fid, f)| f.params.first().map_or(false, |p| p.name == "this"))
+            .filter(|(_fid, f)| f.params.first().is_some_and(|p| p.name == "this"))
             .collect();
         // Receiver-type filter: drop candidates whose declared
         // receiver type can't accept the actual receiver. If every
@@ -612,7 +599,7 @@ impl<'a> VmHost<'a> {
         if candidates.len() <= 1 {
             return candidates.into_iter().next().map(|(fid, _)| fid);
         }
-        let has_names = arg_names.iter().any(|n| n.is_some());
+        let has_names = arg_names.iter().any(std::option::Option::is_some);
         // Default-/named-arg-aware applicability + scoring. A
         // candidate is viable only if every user parameter
         // (params[1..]) that is left unbound after slotting the
@@ -631,32 +618,27 @@ impl<'a> VmHost<'a> {
             let upar = np - 1; // user-facing params (excl. `this`)
             let mut filled = vec![false; upar];
             let mut score: i64 =
-                self.overload_score_arg(&f.params[0].ty, receiver)
-                    .unwrap_or(-2) as i64;
+                i64::from(self.overload_score_arg(&f.params[0].ty, receiver)
+                    .unwrap_or(-2));
             let mut viable = true;
             // Named args bind by parameter name.
             for (i, an) in arg_names.iter().enumerate() {
                 if let Some(nm) = an {
-                    match f.params[1..]
+                    if let Some(slot) = f.params[1..]
                         .iter()
-                        .position(|p| &p.name == nm)
-                    {
-                        Some(slot) => {
-                            filled[slot] = true;
-                            if let Some(a) = args.get(i) {
-                                score += self
-                                    .overload_score_arg(
-                                        &f.params[slot + 1].ty,
-                                        a,
-                                    )
-                                    .unwrap_or(-2)
-                                    as i64;
-                            }
+                        .position(|p| &p.name == nm) {
+                        filled[slot] = true;
+                        if let Some(a) = args.get(i) {
+                            score += i64::from(self
+                                .overload_score_arg(
+                                    &f.params[slot + 1].ty,
+                                    a,
+                                )
+                                .unwrap_or(-2));
                         }
-                        None => {
-                            viable = false; // unknown named arg
-                            break;
-                        }
+                    } else {
+                        viable = false; // unknown named arg
+                        break;
                     }
                 }
             }
@@ -678,12 +660,12 @@ impl<'a> VmHost<'a> {
                 }
                 filled[next] = true;
                 if let Some(a) = args.get(i) {
-                    score += self
+                    score += i64::from(self
                         .overload_score_arg(
                             &f.params[next + 1].ty,
                             a,
                         )
-                        .unwrap_or(-2) as i64;
+                        .unwrap_or(-2));
                 }
                 next += 1;
             }
@@ -696,8 +678,7 @@ impl<'a> VmHost<'a> {
                 if !*done {
                     let has_default = defaults
                         .and_then(|d| d.get(slot + 1))
-                        .map(|s| s.is_some())
-                        .unwrap_or(false);
+                        .is_some_and(std::option::Option::is_some);
                     if !has_default {
                         viable = false;
                         break;
@@ -714,7 +695,7 @@ impl<'a> VmHost<'a> {
             if has_names {
                 score += 1;
             }
-            if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+            if best.as_ref().is_none_or(|(_, s)| score > *s) {
                 best = Some((*fid, score));
             }
         }
@@ -746,7 +727,7 @@ impl<'a> VmHost<'a> {
             if f.params.len() == want {
                 score += 5;
             }
-            if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+            if best.as_ref().is_none_or(|(_, s)| score > *s) {
                 best = Some((fid, score));
             }
         }
@@ -754,7 +735,7 @@ impl<'a> VmHost<'a> {
     }
 }
 
-impl<'a> VmHost<'a> {
+impl VmHost<'_> {
     /// Run the chain of secondary-constructor bodies for `class_name`
     /// with arity matching `args.len()` on an existing `leaf`
     /// instance. Resolves `: this(...)` delegation by recursing on
@@ -810,20 +791,19 @@ impl<'a> VmHost<'a> {
                 self.run_super_ctor_chain(leaf, &p, &next_args)?;
             }
         }
-        if let Some(body_fid) = entry.body {
-            if let Some(body_func) = module.funcs.get(body_fid.0 as usize).cloned() {
+        if let Some(body_fid) = entry.body
+            && let Some(body_func) = module.funcs.get(body_fid.0 as usize).cloned() {
                 let mut all: Vec<klio_runtime::Value> =
                     Vec::with_capacity(1 + args.len());
                 all.push(leaf.clone());
                 all.extend_from_slice(args);
                 klio_ir::eval::eval_with(&module, &body_func, all, self)?;
             }
-        }
         Ok(())
     }
 
-    /// Drain a user-Instance iterable into a Value::List by invoking
-    /// its iterator() / hasNext() / next() members. Used by the
+    /// Drain a user-Instance iterable into a `Value::List` by invoking
+    /// its `iterator()` / `hasNext()` / `next()` members. Used by the
     /// Iterable-extension fallback in `call_member`. Stops after
     /// 1,000,000 items to avoid runaway iterators.
     pub(crate) fn drain_iterable_to_list(

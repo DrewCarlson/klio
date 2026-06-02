@@ -46,9 +46,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn bench_cache_dir() -> PathBuf {
-    let target = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root().join("target"));
+    let target = env::var_os("CARGO_TARGET_DIR").map_or_else(|| workspace_root().join("target"), PathBuf::from);
     target.join("bench-cache")
 }
 
@@ -138,7 +136,7 @@ fn install_kotlinc_jvm(version: &str, cache: &Path, dest: &Path) -> Result<(), R
         .arg(&tmp)
         .arg(&url)
         .status();
-    let ok = curl.map(|s| s.success()).unwrap_or(false);
+    let ok = curl.is_ok_and(|s| s.success());
     if !ok {
         let _ = fs::remove_file(&tmp);
         return Err(RefError::Install(format!("download failed: {url}")));

@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{ObjRef, Env, StdlibFn, InstanceData, MethodDef, ClassDef, char_unit_to_string, kotlin_double_to_string, kotlin_float_to_string};
 
 use std::fmt;
 use std::sync::Arc;
@@ -392,7 +392,7 @@ pub struct SuspendState {
     pub resume_target: Option<String>,
     /// Statements to execute in order. The interpreter walks these
     /// against the frame's locals + captured env. If an expression
-    /// in here suspends (returns Value::CoroutineSuspended), the
+    /// in here suspends (returns `Value::CoroutineSuspended`), the
     /// frame is saved at this state and the suspension bubbles up.
     pub stmts: Vec<klio_ast::Stmt>,
     /// What to do after the last stmt finishes.
@@ -1227,15 +1227,13 @@ impl Value {
                 // hide arity, so they only match the base `Function`.
                 if let Some(stripped) =
                     name.strip_prefix("Function").or_else(|| name.strip_prefix("kotlin.Function"))
-                {
-                    if let Ok(n) = stripped.parse::<usize>() {
+                    && let Ok(n) = stripped.parse::<usize>() {
                         return match self {
                             Value::Lambda { params, .. } => params.len() == n,
                             Value::Function { decl, .. } => decl.params.len() == n,
                             _ => false,
                         };
                     }
-                }
                 false
             }
             Value::Exception { fqn, .. } => {
@@ -1259,11 +1257,10 @@ impl Value {
                 // Qualified nested-class type (`Outer.Inner`) — match against
                 // the trailing simple name when the dotted prefix names an
                 // enclosing classifier of this instance's class.
-                if let Some((_outer, simple)) = name.rsplit_once('.') {
-                    if inst.class.is_subtype_of(simple) {
+                if let Some((_outer, simple)) = name.rsplit_once('.')
+                    && inst.class.is_subtype_of(simple) {
                         return true;
                     }
-                }
                 false
             }
             Value::Delegate(_) => matches!(name, "Any"),
@@ -1333,7 +1330,7 @@ impl Value {
     /// `listOf(1) == listOf(1L)` evaluates to `false`). Non-numeric,
     /// non-collection values fall back to the structural rules.
     pub fn structural_eq_boxed(a: &Value, b: &Value) -> bool {
-        use Value::*;
+        use Value::{Double, Float, Int, Long, Short, Byte, UInt, ULong, UShort, UByte, List, Set, Map, Pair, Triple, MapEntry};
         match (a, b) {
             (Double(x), Double(y)) => x.to_bits() == y.to_bits(),
             (Float(x), Float(y)) => x.to_bits() == y.to_bits(),
@@ -1383,8 +1380,9 @@ impl Value {
         }
     }
 
+    #[must_use] 
     pub fn structural_eq(a: &Value, b: &Value) -> bool {
-        use Value::*;
+        use Value::{Int, Long, Short, Byte, UInt, ULong, UShort, UByte, Double, Float, Bool, String, Char, Null, Unit, CoroutineSuspended, Range, List, Set, Map, Pair, Triple, MapEntry, Result, Class, Lambda, IrClosure, BoundMethod, Instance};
         // Numeric `equals` matches Kotlin's boxed `Number` semantics: each
         // type only equals its own type (`1 != 1L`, `1 != 1.0`). Valid Kotlin
         // only compares same-typed numerics with `==` (or boxes both to a
@@ -1509,7 +1507,7 @@ impl Value {
     /// an `equals` / `plus` override cannot recurse into itself.
     #[must_use]
     pub fn reference_eq(a: &Value, b: &Value) -> bool {
-        use Value::*;
+        use Value::{Instance, Cell, List, Set, Map, Array, Intrinsic, CoroutineSuspended};
         match (a, b) {
             (Instance(x), Instance(y)) => ObjRef::ptr_eq(x, y),
             (Cell(x), Cell(y)) => ObjRef::ptr_eq(x, y),

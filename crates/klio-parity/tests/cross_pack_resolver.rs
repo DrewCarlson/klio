@@ -29,7 +29,7 @@ impl Output for Capture {
 }
 
 fn parse(map: &mut SourceMap, name: &str, src: &str) -> KotlinFile {
-    let id = map.add(&PathBuf::from(name), src.to_string());
+    let id = map.add(PathBuf::from(name), src.to_string());
     let owned = map.get(id).source.clone();
     let lexed = Lexer::new(id, &owned).tokenize();
     assert!(
@@ -76,24 +76,24 @@ fn cross_pack_inline_fn_explicit_import_picks_imported_pkg() {
     let out = run_multi(&[
         (
             "pack_b.kt",
-            r#"
+            r"
             package pack_b
             public inline fun probe(): Int = 2
-            "#,
+            ",
         ),
         (
             "pack_a.kt",
-            r#"
+            r"
             package pack_a
             public inline fun probe(): Int = 1
-            "#,
+            ",
         ),
         (
             "user.kt",
-            r#"
+            r"
             import pack_a.probe
             fun main() { println(probe()) }
-            "#,
+            ",
         ),
     ]);
     assert_eq!(out, "1\n");
@@ -121,10 +121,10 @@ fn cross_pack_class_explicit_import_picks_imported_pkg() {
         ),
         (
             "user.kt",
-            r#"
+            r"
             import pack_a.Data
             fun main() { println(Data(7).tag() + Data(7).v) }
-            "#,
+            ",
         ),
     ]);
     assert_eq!(out, "A7\n");
@@ -153,10 +153,10 @@ fn cross_pack_toplevel_fn_explicit_import_picks_imported_pkg() {
         ),
         (
             "user.kt",
-            r#"
+            r"
             import pack_a.greet
             fun main() { println(greet()) }
-            "#,
+            ",
         ),
     ]);
     assert_eq!(out, "hello-a\n");

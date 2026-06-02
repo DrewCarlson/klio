@@ -1,4 +1,4 @@
-use super::*;
+use super::{Checker, Resolution, HashMap, DiagnosticSink, Frame, HashSet, KotlinFile, Class, collect_all_classes, annotation_simple_name, collect_annotation_classes, collect_enum_classes, PhaseFScope, Decl, Span, FunctionBody, Block, Stmt, Expr, Diagnostic, codes, Property, collect_property_reads, Function, tailrec_walk_block, tailrec_collect_all_block, tailrec_walk_expr, tailrec_collect_all_expr, Accessor, WhenPatternKind, collect_aliased_names, accessor_uses_field, Visibility, Param, is_const_capable_type_name, StringPart, UnOp, BinOp, Type, is_annotation_param_type, OptInMarker, parse_requires_opt_in, collect_required_opt_ins, collect_opt_in_diagnostics, DeprecationInfo, collect_deprecation_info, collect_deprecation_diagnostics, AnnotationMeta, AnnotationTarget, extract_annotation_targets, AnnotationWalker, annotation_reaches_self, TypeRef, type_ref_uses};
 
 impl<'a> Checker<'a> {
     pub(crate) fn new(resolution: &'a Resolution) -> Self {
@@ -289,9 +289,9 @@ impl<'a> Checker<'a> {
     ) {
         match e {
             Expr::Path { segments, .. } => {
-                if let Some(first) = segments.first() {
-                    if segments.len() == 1 && !local.contains(&first.name) {
-                        if non_prop.contains_key(&first.name) {
+                if let Some(first) = segments.first()
+                    && segments.len() == 1 && !local.contains(&first.name)
+                        && non_prop.contains_key(&first.name) {
                             self.diagnostics.emit(
                                 Diagnostic::error(
                                     format!(
@@ -303,8 +303,6 @@ impl<'a> Checker<'a> {
                                 .with_code(codes::TYPE_NON_PROPERTY_CTOR_PARAM_OUT_OF_SCOPE),
                             );
                         }
-                    }
-                }
             }
             Expr::Member { receiver, .. } => self.check_ctor_param_in_expr(receiver, non_prop, local),
             Expr::Call { callee, args, .. } => {
@@ -374,7 +372,7 @@ impl<'a> Checker<'a> {
                             }
                         }
                         klio_ast::StringPart::Interp(e) => {
-                            self.check_ctor_param_in_expr(e, non_prop, local)
+                            self.check_ctor_param_in_expr(e, non_prop, local);
                         }
                         klio_ast::StringPart::Text(_) => {}
                     }
@@ -432,13 +430,12 @@ impl<'a> Checker<'a> {
         let mut props: Vec<(&Property, usize)> = Vec::new();
         let mut by_name: HashMap<String, usize> = HashMap::new();
         for d in &file.decls {
-            if let Decl::Property(p) = d {
-                if p.init.is_some() {
+            if let Decl::Property(p) = d
+                && p.init.is_some() {
                     let idx = props.len();
                     by_name.insert(p.name.name.clone(), idx);
                     props.push((p, idx));
                 }
-            }
         }
         if props.is_empty() {
             return;
@@ -588,9 +585,7 @@ impl<'a> Checker<'a> {
         if tail_sites.is_empty() {
             self.diagnostics.emit(
                 Diagnostic::warning(
-                    format!(
-                        "a function is marked `tailrec` but no tail calls are found"
-                    ),
+                    "a function is marked `tailrec` but no tail calls are found".to_string(),
                     f.name.span,
                 )
                 .with_code(codes::TYPE_NO_TAIL_CALLS_FOUND),
@@ -758,8 +753,8 @@ impl<'a> Checker<'a> {
             Decl::Object(o) => {
                 if o.is_data {
                     for m in &o.members {
-                        if let Decl::Function(f) = m {
-                            if f.name.name == "equals" || f.name.name == "hashCode" {
+                        if let Decl::Function(f) = m
+                            && (f.name.name == "equals" || f.name.name == "hashCode") {
                                 self.diagnostics.emit(
                                     Diagnostic::error(
                                         format!(
@@ -771,7 +766,6 @@ impl<'a> Checker<'a> {
                                     .with_code(codes::TYPE_DATA_OBJECT_FORBIDS_EQUALS_HASHCODE),
                                 );
                             }
-                        }
                     }
                 }
                 for m in &o.members {
@@ -845,8 +839,8 @@ impl<'a> Checker<'a> {
         has_backing_field: bool,
         prop_name: &str,
     ) {
-        if let Expr::Path { segments, .. } = e {
-            if segments.len() == 1 && segments[0].name == "field" {
+        if let Expr::Path { segments, .. } = e
+            && segments.len() == 1 && segments[0].name == "field" {
                 if !in_accessor {
                     self.diagnostics.emit(
                         Diagnostic::error(
@@ -870,7 +864,6 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
-        }
         // Recurse through children that may contain `field` references.
         match e {
             Expr::Block(b) => self.walk_block_for_phase_j(b, in_accessor, has_backing_field, prop_name),
@@ -1098,7 +1091,7 @@ impl<'a> Checker<'a> {
                 let span = self.aliases[&n].name_span;
                 self.diagnostics.emit(
                     Diagnostic::error(
-                        format!("recursive typealias `{}` expands to itself", n),
+                        format!("recursive typealias `{n}` expands to itself"),
                         span,
                     )
                     .with_code(codes::TYPE_RECURSIVE_TYPEALIAS),
@@ -1229,10 +1222,10 @@ impl<'a> Checker<'a> {
         if let Some(body) = &f.body {
             match body {
                 FunctionBody::Block(b) => {
-                    self.walk_block_for_inline_escape(b, &inline_params, &crossinline_params)
+                    self.walk_block_for_inline_escape(b, &inline_params, &crossinline_params);
                 }
                 FunctionBody::Expr(e) => {
-                    self.walk_expr_for_inline_escape(e, &inline_params, &crossinline_params, true)
+                    self.walk_expr_for_inline_escape(e, &inline_params, &crossinline_params, true);
                 }
             }
         }
@@ -1421,8 +1414,8 @@ impl<'a> Checker<'a> {
                 .with_code(codes::TYPE_CONST_VAL_NON_CONST_INIT),
             );
         }
-        if let Some(ty) = &p.ty {
-            if !is_const_capable_type_name(&ty.name.name) || ty.nullable {
+        if let Some(ty) = &p.ty
+            && (!is_const_capable_type_name(&ty.name.name) || ty.nullable) {
                 self.diagnostics.emit(
                     Diagnostic::error(
                         format!(
@@ -1434,7 +1427,6 @@ impl<'a> Checker<'a> {
                     .with_code(codes::TYPE_CONST_VAL_NON_CONST_INIT),
                 );
             }
-        }
         match &p.init {
             None => {
                 self.diagnostics.emit(
@@ -1493,13 +1485,12 @@ impl<'a> Checker<'a> {
                 }
                 // Spec §8.2: access expressions to enum entries are
                 // constant expressions. Recognize `EnumClass.ENTRY`.
-                if let Expr::Path { segments, .. } = receiver.as_ref() {
-                    if segments.len() == 1 {
-                        if let Some(info) = self.classes.get(&segments[0].name) {
-                            if info.is_enum {
+                if let Expr::Path { segments, .. } = receiver.as_ref()
+                    && segments.len() == 1 {
+                        if let Some(info) = self.classes.get(&segments[0].name)
+                            && info.is_enum {
                                 return true;
                             }
-                        }
                         // Builtin primitive companion constants
                         // (`Long.MAX_VALUE`, `Int.MIN_VALUE`,
                         // `Double.POSITIVE_INFINITY`, `*.SIZE_BITS`,
@@ -1513,7 +1504,6 @@ impl<'a> Checker<'a> {
                             return true;
                         }
                     }
-                }
                 self.is_const_initializer(receiver) && self.is_const_ref(&name.name)
             }
             Expr::Unary { op, expr, .. } => {
@@ -1608,8 +1598,8 @@ impl<'a> Checker<'a> {
     }
 
     pub(crate) fn is_const_ref(&self, name: &str) -> bool {
-        if let Some(b) = self.frames[0].bindings.get(name) {
-            if !b.mutable {
+        if let Some(b) = self.frames[0].bindings.get(name)
+            && !b.mutable {
                 return matches!(
                     b.ty,
                     Type::Int
@@ -1623,7 +1613,6 @@ impl<'a> Checker<'a> {
                         | Type::String
                 );
             }
-        }
         false
     }
 
@@ -1659,7 +1648,7 @@ impl<'a> Checker<'a> {
             emit(self, format!("`value class {}` cannot have `init` blocks", c.name.name));
         }
         for sc in &c.secondary_ctors {
-            if sc.body.as_ref().map_or(false, |b| !b.stmts.is_empty()) {
+            if sc.body.as_ref().is_some_and(|b| !b.stmts.is_empty()) {
                 emit(
                     self,
                     format!(
@@ -1707,8 +1696,8 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                Decl::Function(f) => {
-                    if f.is_override && (f.name.name == "equals" || f.name.name == "hashCode") {
+                Decl::Function(f)
+                    if f.is_override && (f.name.name == "equals" || f.name.name == "hashCode") => {
                         emit(
                             self,
                             format!(
@@ -1717,13 +1706,12 @@ impl<'a> Checker<'a> {
                             ),
                         );
                     }
-                }
                 _ => {}
             }
         }
         for s in &c.supertypes {
-            if let Some(info) = self.classes.get(&s.name.name) {
-                if !info.is_interface {
+            if let Some(info) = self.classes.get(&s.name.name)
+                && !info.is_interface {
                     emit(
                         self,
                         format!(
@@ -1732,7 +1720,6 @@ impl<'a> Checker<'a> {
                         ),
                     );
                 }
-            }
         }
     }
 
@@ -1810,8 +1797,8 @@ impl<'a> Checker<'a> {
             );
         }
         for p in &c.primary_params {
-            if let Some(default) = &p.default {
-                if !self.is_annotation_param_default_const(default) {
+            if let Some(default) = &p.default
+                && !self.is_annotation_param_default_const(default) {
                     self.diagnostics.emit(
                         Diagnostic::error(
                             format!(
@@ -1823,7 +1810,6 @@ impl<'a> Checker<'a> {
                         .with_code(codes::TYPE_ANNOTATION_PARAM_DEFAULT_NOT_CONST),
                     );
                 }
-            }
             let head = &p.ty.name.name;
             let allowed_head = is_annotation_param_type(head)
                 || self.annotation_class_names.contains(head)
@@ -1929,7 +1915,7 @@ impl<'a> Checker<'a> {
         for c in classes {
             let mut m = AnnotationMeta::default();
             for a in &c.annotations {
-                let leaf = a.path.last().map(|s| s.name.as_str()).unwrap_or("");
+                let leaf = a.path.last().map_or("", |s| s.name.as_str());
                 if leaf == "Repeatable" {
                     m.repeatable = true;
                 } else if leaf == "Target" {
@@ -1966,14 +1952,13 @@ impl<'a> Checker<'a> {
                 let head = &p.ty.name.name;
                 if name_set.contains(head) {
                     out.push(head.clone());
-                } else if head == "Array" {
-                    if let Some(arg) = p.ty.type_args.first() {
+                } else if head == "Array"
+                    && let Some(arg) = p.ty.type_args.first() {
                         let inner = &arg.ty.name.name;
                         if name_set.contains(inner) {
                             out.push(inner.clone());
                         }
                     }
-                }
             }
             deps.insert(c.name.name.clone(), out);
         }
@@ -1985,8 +1970,7 @@ impl<'a> Checker<'a> {
                 self.diagnostics.emit(
                     Diagnostic::error(
                         format!(
-                            "annotation class `{}` cannot reference itself, directly or transitively",
-                            start
+                            "annotation class `{start}` cannot reference itself, directly or transitively"
                         ),
                         span,
                     )
@@ -2135,11 +2119,10 @@ impl<'a> Checker<'a> {
                 if let Some(s) = subject {
                     self.walk_expr_for_dnn(s, tp_scope);
                 }
-                if let Some(b) = subject_binding {
-                    if let Some(t) = &b.ty {
+                if let Some(b) = subject_binding
+                    && let Some(t) = &b.ty {
                         self.check_dnn_typeref(t, tp_scope);
                     }
-                }
                 for br in branches {
                     for p in &br.patterns {
                         match &p.kind {
@@ -2312,8 +2295,8 @@ impl<'a> Checker<'a> {
                 }
             }
             klio_ast::Variance::In => {
-                if let Some(rt) = &f.return_type {
-                    if type_ref_uses(rt, param) {
+                if let Some(rt) = &f.return_type
+                    && type_ref_uses(rt, param) {
                         self.diagnostics.emit(
                             Diagnostic::error(
                                 format!(
@@ -2325,7 +2308,6 @@ impl<'a> Checker<'a> {
                             .with_code(codes::TYPE_DECLARATION_VARIANCE_VIOLATION),
                         );
                     }
-                }
             }
             klio_ast::Variance::Invariant => {}
         }

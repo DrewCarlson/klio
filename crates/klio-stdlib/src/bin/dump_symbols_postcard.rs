@@ -19,12 +19,9 @@ fn main() {
     let index = SymbolIndex { entries };
     let bytes = encode(&index).expect("encode SymbolIndex");
 
-    let out: PathBuf = match std::env::args().nth(1) {
-        Some(p) => PathBuf::from(p),
-        None => {
-            let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            crate_root.join("src").join("generated").join("symbols.postcard")
-        }
+    let out: PathBuf = if let Some(p) = std::env::args().nth(1) { PathBuf::from(p) } else {
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        crate_root.join("src").join("generated").join("symbols.postcard")
     };
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).expect("create generated dir");

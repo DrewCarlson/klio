@@ -69,13 +69,13 @@ fun main() {
 
 #[test]
 fn char_range_iteration() {
-    let src = r#"
+    let src = r"
 fun main() {
     val sb = StringBuilder()
     for (c in 'a'..'e') sb.append(c)
     println(sb)
 }
-"#;
+";
     assert_klio("char_range", src, "abcde\n");
 }
 

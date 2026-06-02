@@ -581,6 +581,7 @@ fn try_balance_angles(bytes: &[u8], start: usize, line0: u32, col0: u32) -> Opti
     None
 }
 
+#[must_use] 
 pub fn parse_file(src: &str) -> ParsedFile {
     let scrubbed = scrub(src);
     let toks = tokenize(&scrubbed);
@@ -631,14 +632,12 @@ impl<'a> Parser<'a> {
     fn parse_top(&mut self) {
         // Look for `package <dotted>`.
         self.skip_annotations_and_newlines();
-        if let Some(t) = self.peek() {
-            if let Tok::Ident(s) = &t.tok {
-                if s == "package" {
+        if let Some(t) = self.peek()
+            && let Tok::Ident(s) = &t.tok
+                && s == "package" {
                     self.pos += 1;
                     self.package = self.read_dotted_name();
                 }
-            }
-        }
         self.parse_decls(None);
     }
 
@@ -700,13 +699,12 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_annotations_and_newlines();
             let Some(t) = self.peek() else { return false };
-            if let Tok::Ident(s) = &t.tok {
-                if let Some(bit) = modifier_bit(s) {
+            if let Tok::Ident(s) = &t.tok
+                && let Some(bit) = modifier_bit(s) {
                     modifiers |= bit;
                     self.pos += 1;
                     continue;
                 }
-            }
             break;
         }
 
@@ -784,11 +782,10 @@ impl<'a> Parser<'a> {
 
     fn parse_fun(&mut self, modifiers: u32, line: u32, col: u32, parent: Option<&str>) -> bool {
         // Optional `<T, ...>` generic params.
-        if let Some(t) = self.peek() {
-            if matches!(t.tok, Tok::Angle(_)) {
+        if let Some(t) = self.peek()
+            && matches!(t.tok, Tok::Angle(_)) {
                 self.pos += 1;
             }
-        }
         // Optional receiver. Format: `ReceiverType.name(...)` or `ReceiverType<T>.name(...)`.
         // We look ahead: read an ident, possibly followed by `<...>` / `.` / `?` chunks
         // until we see `.<name>(`, treating the leading run as the receiver.
@@ -810,7 +807,7 @@ impl<'a> Parser<'a> {
         };
         // Skip the rest of the signature up to either a function body `{...}`,
         // an `= expr` (eaten to newline), or just newline / next decl.
-        let _ = self.skip_signature_tail();
+        let () = self.skip_signature_tail();
         self.skip_optional_body();
 
         let fqn = match parent {
@@ -829,9 +826,9 @@ impl<'a> Parser<'a> {
         let mut signature = String::new();
         write!(&mut signature, "fun ").ok();
         if let Some(r) = &receiver {
-            write!(&mut signature, "{}.", r).ok();
+            write!(&mut signature, "{r}.").ok();
         }
-        write!(&mut signature, "{}", name).ok();
+        write!(&mut signature, "{name}").ok();
 
         self.decls.push(Decl {
             kind: DeclKind::Function,
@@ -857,11 +854,10 @@ impl<'a> Parser<'a> {
         is_var: bool,
     ) -> bool {
         // Optional `<T>` generic params.
-        if let Some(t) = self.peek() {
-            if matches!(t.tok, Tok::Angle(_)) {
+        if let Some(t) = self.peek()
+            && matches!(t.tok, Tok::Angle(_)) {
                 self.pos += 1;
             }
-        }
         let pre = self.pos;
         let (receiver, name) = self.read_optional_receiver_and_name();
         let Some(name) = name else {
@@ -882,11 +878,10 @@ impl<'a> Parser<'a> {
             match &t.tok {
                 Tok::Ident(s) if s == "get" || s == "set" => {
                     self.pos += 1;
-                    if let Some(t) = self.peek() {
-                        if matches!(t.tok, Tok::Paren(_)) {
+                    if let Some(t) = self.peek()
+                        && matches!(t.tok, Tok::Paren(_)) {
                             self.pos += 1;
                         }
-                    }
                     self.skip_signature_tail();
                     self.skip_optional_body();
                 }
@@ -909,11 +904,11 @@ impl<'a> Parser<'a> {
             ),
         };
         let mut signature = String::new();
-        write!(&mut signature, "{} ", kind_word).ok();
+        write!(&mut signature, "{kind_word} ").ok();
         if let Some(r) = &receiver {
-            write!(&mut signature, "{}.", r).ok();
+            write!(&mut signature, "{r}.").ok();
         }
-        write!(&mut signature, "{}", name).ok();
+        write!(&mut signature, "{name}").ok();
         self.decls.push(Decl {
             kind: DeclKind::Property,
             name,
@@ -951,17 +946,15 @@ impl<'a> Parser<'a> {
             None => return false,
         };
         // Optional `<T,...>`.
-        if let Some(t) = self.peek() {
-            if matches!(t.tok, Tok::Angle(_)) {
+        if let Some(t) = self.peek()
+            && matches!(t.tok, Tok::Angle(_)) {
                 self.pos += 1;
             }
-        }
         // Optional primary constructor `(...)`.
-        if let Some(t) = self.peek() {
-            if matches!(t.tok, Tok::Paren(_)) {
+        if let Some(t) = self.peek()
+            && matches!(t.tok, Tok::Paren(_)) {
                 self.pos += 1;
             }
-        }
         // Skip until `{` or end of decl (newline at brace depth 0).
         self.skip_signature_tail();
 
@@ -1000,12 +993,11 @@ impl<'a> Parser<'a> {
 
         // Optional body.
         self.skip_newlines();
-        if let Some(t) = self.peek() {
-            if matches!(t.tok, Tok::Op('{')) {
+        if let Some(t) = self.peek()
+            && matches!(t.tok, Tok::Op('{')) {
                 self.pos += 1;
                 self.parse_decls(Some(&name));
             }
-        }
         true
     }
 
@@ -1022,11 +1014,10 @@ impl<'a> Parser<'a> {
             },
             None => return false,
         };
-        if let Some(t) = self.peek() {
-            if matches!(t.tok, Tok::Angle(_)) {
+        if let Some(t) = self.peek()
+            && matches!(t.tok, Tok::Angle(_)) {
                 self.pos += 1;
             }
-        }
         self.skip_signature_tail();
         let fqn = match parent {
             Some(p) => format!(
@@ -1041,7 +1032,7 @@ impl<'a> Parser<'a> {
                 name
             ),
         };
-        let signature = format!("typealias {}", name);
+        let signature = format!("typealias {name}");
         self.decls.push(Decl {
             kind: DeclKind::TypeAlias,
             name,
@@ -1084,7 +1075,7 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Angle(s) => {
                     if let Some(last) = pieces.last_mut() {
-                        *last = format!("{}<{}>", last, s);
+                        *last = format!("{last}<{s}>");
                     }
                     self.pos += 1;
                 }
@@ -1096,12 +1087,12 @@ impl<'a> Parser<'a> {
         }
         // The "name" is the last non-dot piece. Build receiver from earlier pieces.
         // Drop trailing dot if any.
-        while pieces.last().map_or(false, |s| s == ".") {
+        while pieces.last().is_some_and(|s| s == ".") {
             pieces.pop();
         }
         let name = pieces.pop();
         // Drop trailing dot between receiver and name.
-        if pieces.last().map_or(false, |s| s == ".") {
+        if pieces.last().is_some_and(|s| s == ".") {
             pieces.pop();
         }
         let receiver = if pieces.is_empty() {
@@ -1184,11 +1175,10 @@ impl<'a> Parser<'a> {
 
     fn skip_optional_body(&mut self) {
         self.skip_newlines();
-        if let Some(t) = self.peek() {
-            if matches!(t.tok, Tok::Op('{')) {
+        if let Some(t) = self.peek()
+            && matches!(t.tok, Tok::Op('{')) {
                 self.skip_brace_block();
             }
-        }
     }
 
     fn skip_brace_block(&mut self) {

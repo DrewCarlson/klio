@@ -1,4 +1,4 @@
-use super::*;
+use super::{FuncBuilder, Stmt, Reg, lower_expr, Const, Inst, widen_numeric_literal, collect_path_idents_stmt, lower_lambda_body_capturing_kind_with, resolve_capture, lower_expr_as_param_thunk, Expr, BinOp, Terminator, boxed_cell_reg, lower_receiver, expr_span};
 
 pub(crate) fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
     match stmt {
@@ -58,11 +58,10 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             // time and can skip the slot.
             // Track `: Any` annotations so subsequent `==` against
             // this var routes through the boxed-equality path.
-            if let Some(ty) = &p.ty {
-                if ty.name.name == "Any" {
+            if let Some(ty) = &p.ty
+                && ty.name.name == "Any" {
                     b.mark_any_typed(&p.name.name);
                 }
-            }
             if b.is_boxed(&p.name.name) {
                 // Captured `var` — box into a shared cell so writes
                 // from a nested closure / coroutine are visible
@@ -272,7 +271,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             b.switch_to(skip);
             b.terminate(Terminator::Goto(join));
             b.switch_to(join);
-            return None;
+            None
         }
         Stmt::Assign { target, op, value, .. }
             if matches!(target, Expr::Member { safe: true, .. }) =>
@@ -311,7 +310,7 @@ pub(crate) fn lower_stmt(b: &mut FuncBuilder<'_>, stmt: &Stmt) -> Option<Reg> {
             b.switch_to(skip);
             b.terminate(Terminator::Goto(join));
             b.switch_to(join);
-            return None;
+            None
         }
         Stmt::Assign { target, op, value, .. } => {
             let v = lower_expr(b, value);

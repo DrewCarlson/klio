@@ -43,7 +43,7 @@ fn decl_to_record(d: &Decl, rel: &str) -> SymbolRecord {
         DeclKind::Object => SymbolKind::Object,
         DeclKind::TypeAlias => SymbolKind::TypeAlias,
     };
-    let package = d.fqn.rsplit_once('.').map(|(p, _)| p).unwrap_or("").to_string();
+    let package = d.fqn.rsplit_once('.').map_or("", |(p, _)| p).to_string();
     SymbolRecord {
         fqn: d.fqn.clone(),
         package,

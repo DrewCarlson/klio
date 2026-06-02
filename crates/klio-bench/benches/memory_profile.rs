@@ -25,18 +25,18 @@ fun main() {
     while (i < 2000) { s = s + "x"; i += 1 }
     println(s.length)
 }"#);
-    let churn_lists = synth("churn_lists", r#"
+    let churn_lists = synth("churn_lists", r"
 fun main() {
     var xs: List<Int> = emptyList()
     var i = 0
     while (i < 500) { xs = xs + i; i += 1 }
     println(xs.size)
-}"#);
-    let boxed_arith = synth("boxed_arith", r#"
+}");
+    let boxed_arith = synth("boxed_arith", r"
 fun main() {
     val xs = (1..10000).toList()
     println(xs.sum())
-}"#);
+}");
 
     let mut group = c.benchmark_group("memory_profile");
     group.sample_size(15);

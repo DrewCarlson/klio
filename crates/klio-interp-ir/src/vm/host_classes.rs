@@ -1,6 +1,6 @@
-use crate::*;
+use crate::{VmHost, Arc, AtomicOrdering, simple_literal, with_outer_this, receiver_for_label};
 
-impl<'a> VmHost<'a> {
+impl VmHost<'_> {
     pub(crate) fn register_class(
         &mut self,
         class: &klio_ast::Class,
@@ -220,7 +220,7 @@ impl<'a> VmHost<'a> {
         let capture_pairs: Vec<(String, klio_runtime::Value)> = captured_names
             .iter()
             .cloned()
-            .zip(captures.into_iter())
+            .zip(captures)
             .collect();
         if capture_pairs.is_empty() {
             return Ok(());
@@ -253,7 +253,7 @@ impl<'a> VmHost<'a> {
         let capture_pairs: Vec<(String, klio_runtime::Value)> = captured_names
             .iter()
             .cloned()
-            .zip(captures.into_iter())
+            .zip(captures)
             .collect();
         // Minimal anonymous-object support: synthesise an
         // InstanceData backed by a fresh ClassDef from the AST's
@@ -294,7 +294,7 @@ impl<'a> VmHost<'a> {
                     for p in &pdef.body_properties {
                         own_members.insert(p.name.clone());
                     }
-                    for me in pdef.methods.iter() {
+                    for me in &pdef.methods {
                         own_members.insert(me.name.clone());
                     }
                 }
@@ -317,7 +317,7 @@ impl<'a> VmHost<'a> {
                         for p in &cls.body_properties {
                             own_members.insert(p.name.clone());
                         }
-                        for me in cls.methods.iter() {
+                        for me in &cls.methods {
                             own_members.insert(me.name.clone());
                         }
                     }
@@ -392,12 +392,11 @@ impl<'a> VmHost<'a> {
             {
                 let classes = self.classes.borrow();
                 for n in &supertype_names {
-                    if let Some(def) = classes.get(n).cloned() {
-                        if !def.is_interface {
+                    if let Some(def) = classes.get(n).cloned()
+                        && !def.is_interface {
                             anon_parent = Some(def);
                             break;
                         }
-                    }
                 }
             }
             let class_def = Arc::new(klio_runtime::ClassDef {
@@ -496,21 +495,18 @@ impl<'a> VmHost<'a> {
                 if let Some(v) = simple_literal(expr) {
                     return v;
                 }
-                if let klio_ast::Expr::Path { segments, .. } = expr {
-                    if segments.len() == 1 {
+                if let klio_ast::Expr::Path { segments, .. } = expr
+                    && segments.len() == 1 {
                         let nm = &segments[0].name;
                         if let Some((_, v)) = capture_pairs.iter().find(|(n, _)| n == nm) {
                             return v.clone();
                         }
                         if let Some((_, klio_runtime::Value::Instance(i))) =
                             capture_pairs.iter().find(|(n, _)| n == "this")
-                        {
-                            if let Some(v) = i.borrow().get(nm) {
+                            && let Some(v) = i.borrow().get(nm) {
                                 return v;
                             }
-                        }
                     }
-                }
                 klio_runtime::Value::Null
             };
             // Populate parent's primary-param fields from
@@ -528,7 +524,7 @@ impl<'a> VmHost<'a> {
                     _ => continue,
                 };
                 let vals: Vec<klio_runtime::Value> =
-                    arg_exprs.iter().map(|e| eval_super_arg(e)).collect();
+                    arg_exprs.iter().map(&eval_super_arg).collect();
                 let parent_def = self.classes.borrow().get(&sup.name.name).cloned();
                 if let Some(pdef) = parent_def {
                     for (param, val) in pdef.primary_params.iter().zip(vals.iter()) {
@@ -586,7 +582,7 @@ impl<'a> VmHost<'a> {
             for cls in parent_chain.iter().rev() {
                 let cls_args: Vec<klio_runtime::Value> =
                     super_args_by_class.get(&cls.name).cloned().unwrap_or_default();
-                for p in cls.body_properties.iter() {
+                for p in &cls.body_properties {
                     let Some(fid) = self
                         .prog
                         .body_prop_inits
@@ -613,9 +609,7 @@ impl<'a> VmHost<'a> {
             }
             return Ok(inst_value);
         }
-        Err(klio_ir::eval::EvalError::Type(format!(
-            "Vm::build_object: not an ObjectExpr AST node"
-        )))
+        Err(klio_ir::eval::EvalError::Type("Vm::build_object: not an ObjectExpr AST node".to_string()))
     }
 
     pub(crate) fn call_super(
@@ -675,8 +669,8 @@ impl<'a> VmHost<'a> {
                 .cloned();
             if let Some(cls_ir) = cls_ir {
                 for fid in &cls_ir.methods {
-                    if let Some(func) = self.module.funcs.get(fid.0 as usize).cloned() {
-                        if func.name == name {
+                    if let Some(func) = self.module.funcs.get(fid.0 as usize).cloned()
+                        && func.name == name {
                             let mut all: Vec<klio_runtime::Value> =
                                 Vec::with_capacity(args.len() + 1);
                             all.push(receiver.clone());
@@ -684,7 +678,6 @@ impl<'a> VmHost<'a> {
                             let module = Arc::clone(&self.module);
                             return klio_ir::eval::eval_with(&module, &func, all, self);
                         }
-                    }
                 }
             }
             // `super.<prop>` (a property read, lowered as a 0-arg
@@ -693,14 +686,13 @@ impl<'a> VmHost<'a> {
             // the overriding subclass's getter, so `override val x
             // get() = super.x` reads the base getter instead of
             // recursing into itself.
-            if args.is_empty() {
-                if let Some(fid) = self
+            if args.is_empty()
+                && let Some(fid) = self
                     .prog
                     .instance_prop_getters
                     .get(&(cname.clone(), name.to_string()))
                     .copied()
-                {
-                    if let Some(func) =
+                    && let Some(func) =
                         self.module.funcs.get(fid.0 as usize).cloned()
                     {
                         let module = Arc::clone(&self.module);
@@ -711,8 +703,6 @@ impl<'a> VmHost<'a> {
                             self,
                         );
                     }
-                }
-            }
             // Step to the next non-interface supertype.
             let next: Option<String> = self
                 .classes
@@ -724,13 +714,11 @@ impl<'a> VmHost<'a> {
         // `super.<prop>` where the base property has no custom getter
         // (a stored val/var): read the backing field off the receiver
         // instance directly rather than failing.
-        if args.is_empty() {
-            if let klio_runtime::Value::Instance(inst) = receiver {
-                if let Some(v) = inst.borrow().get(name) {
+        if args.is_empty()
+            && let klio_runtime::Value::Instance(inst) = receiver
+                && let Some(v) = inst.borrow().get(name) {
                     return Ok(v);
                 }
-            }
-        }
         // The chain bottomed out at a builtin (`Any` / `Throwable`),
         // which declares no IR method. Supply the inherited
         // `Any`/`Throwable` semantics so `override fun toString() =
@@ -877,11 +865,10 @@ impl<'a> VmHost<'a> {
         // `with(n) { sb.apply { this@with } }` resolve `this@with` to `n`
         // rather than the inner `apply` receiver. Only consulted for
         // non-class qualifiers so `this@ClassName` keeps binding the class.
-        if !known_class {
-            if let Some(v) = receiver_for_label(qualifier) {
+        if !known_class
+            && let Some(v) = receiver_for_label(qualifier) {
                 return Ok(v);
             }
-        }
         if !known_class && !matches!(receiver, klio_runtime::Value::Null) {
             // `this@<fn-label>` — the qualifier is an extension/fn
             // label, not a class. Inside a receiver lambda whose own
@@ -902,8 +889,8 @@ impl<'a> VmHost<'a> {
             // stack held an unrelated instance from the sort driver.
             let receiver_is_bound_instance =
                 !matches!(receiver, klio_runtime::Value::Null | klio_runtime::Value::Unit);
-            if !receiver_is_bound_instance {
-                if let Some(encl) = enclosing {
+            if !receiver_is_bound_instance
+                && let Some(encl) = enclosing {
                     let same = match (&encl, receiver) {
                         (
                             klio_runtime::Value::Instance(a),
@@ -920,7 +907,6 @@ impl<'a> VmHost<'a> {
                         return Ok(encl);
                     }
                 }
-            }
             return Ok(receiver.clone());
         }
         Err(klio_ir::eval::EvalError::Type(format!(
@@ -950,10 +936,10 @@ impl<'a> VmHost<'a> {
         // legitimate `is Foo` check where `Foo` happens to be
         // registered as a global would recurse forever resolving
         // its own name.
-        if self.module.class_id(&ty.name).is_none() {
-            if let Some(bound) = self.lookup_global(&ty.name) {
-                if let klio_runtime::Value::Class(cls) = bound {
-                    if cls.name != ty.name {
+        if self.module.class_id(&ty.name).is_none()
+            && let Some(bound) = self.lookup_global(&ty.name)
+                && let klio_runtime::Value::Class(cls) = bound
+                    && cls.name != ty.name {
                         let resolved = klio_ir::TypeRef {
                             name: cls.name.clone(),
                             nullable: ty.nullable,
@@ -961,9 +947,6 @@ impl<'a> VmHost<'a> {
                         };
                         return self.instance_of(value, &resolved);
                     }
-                }
-            }
-        }
         // `Any` is the universal supertype for non-null values.
         if ty.name == "Any" {
             return true;
@@ -1025,11 +1008,10 @@ impl<'a> VmHost<'a> {
         // surfaced as "cast to `Array` failed". Mutable views match the
         // Mutable* supertypes only when the value is actually mutable.
         match value {
-            klio_runtime::Value::Array { .. } => {
-                if ty.name == "Array" {
+            klio_runtime::Value::Array { .. }
+                if ty.name == "Array" => {
                     return true;
                 }
-            }
             // The read-only/mutable distinction is erased on the JVM (both map
             // to java.util.List/Set/Map), so kotlinc reports `listOf(…) is
             // MutableList` as true. Match that — our parity oracle is JVM
@@ -1105,17 +1087,16 @@ impl<'a> VmHost<'a> {
             if ty.name == "Function" {
                 return true;
             }
-            if let Some(rest) = ty.name.strip_prefix("Function") {
-                if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
+            if let Some(rest) = ty.name.strip_prefix("Function")
+                && rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
                     return true;
                 }
-            }
         }
         // Dotted nested-class names (`S.A`, `Outer.Inner`) — match
         // by the last segment, which corresponds to the lifted
         // top-level class name in our module table.
-        if ty.name.contains('.') {
-            if let Some(last) = ty.name.rsplit('.').next() {
+        if ty.name.contains('.')
+            && let Some(last) = ty.name.rsplit('.').next() {
                 let alt = klio_ir::TypeRef {
                     name: last.to_string(),
                     nullable: ty.nullable,
@@ -1123,7 +1104,6 @@ impl<'a> VmHost<'a> {
                 };
                 return self.instance_of(value, &alt);
             }
-        }
         // Generic type-parameter casts (`x as T`) are erased at
         // runtime — Kotlin matches them unchecked. Single-letter
         // (or short uppercase) type names are conventionally
@@ -1166,26 +1146,16 @@ impl<'a> VmHost<'a> {
             // case here is the immediate parent.
             if matches!(
                 (tail, ty.name.as_str()),
-                ("IllegalArgumentException", "RuntimeException")
-                    | ("IllegalStateException", "RuntimeException")
-                    | ("IndexOutOfBoundsException", "RuntimeException")
-                    | ("ArrayIndexOutOfBoundsException", "IndexOutOfBoundsException")
-                    | ("ArrayIndexOutOfBoundsException", "RuntimeException")
-                    | ("StringIndexOutOfBoundsException", "IndexOutOfBoundsException")
-                    | ("StringIndexOutOfBoundsException", "RuntimeException")
-                    | ("NullPointerException", "RuntimeException")
-                    | ("ArithmeticException", "RuntimeException")
-                    | ("ClassCastException", "RuntimeException")
-                    | ("NoSuchElementException", "RuntimeException")
-                    | ("NumberFormatException", "RuntimeException")
-                    | ("UnsupportedOperationException", "RuntimeException")
-                    | ("UninitializedPropertyAccessException", "RuntimeException")
-                    | ("ConcurrentModificationException", "RuntimeException")
-                    | ("NoWhenBranchMatchedException", "RuntimeException")
-                    | ("AssertionError", "Error")
-                    | ("RuntimeException", "Exception")
-                    | ("Error", "Throwable")
-                    | ("Exception", "Throwable")
+                ("IllegalArgumentException" | "IllegalStateException" |
+"IndexOutOfBoundsException" | "ArrayIndexOutOfBoundsException" |
+"StringIndexOutOfBoundsException" | "NullPointerException" |
+"ArithmeticException" | "ClassCastException" | "NoSuchElementException" |
+"NumberFormatException" | "UnsupportedOperationException" |
+"UninitializedPropertyAccessException" | "ConcurrentModificationException" |
+"NoWhenBranchMatchedException", "RuntimeException") |
+("ArrayIndexOutOfBoundsException" | "StringIndexOutOfBoundsException",
+"IndexOutOfBoundsException") | ("AssertionError", "Error") |
+("RuntimeException", "Exception") | ("Error" | "Exception", "Throwable")
             ) {
                 return true;
             }

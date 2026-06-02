@@ -1,4 +1,4 @@
-use super::*;
+use super::{Value, ObjRef, RuntimeError, CallCtx, make_exception, char_units_to_string, Arc, char_unit_to_string, utf16_len, utf16_unit_at};
 
 // ============================================================
 // StringBuilder
@@ -21,7 +21,7 @@ pub(crate) fn string_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         None => String::new(),
         // CharArray is a Value::Array, but some producers (e.g. toCharArray)
         // yield a Value::List of chars — accept either.
-        Some(Value::Array { items, .. }) | Some(Value::List { items, .. }) => {
+        Some(Value::Array { items, .. } | Value::List { items, .. }) => {
             let chars = items.borrow();
             let (start, count) = if ctx.args.len() >= 3 {
                 let off = ctx.args[1].as_i64().unwrap_or(0).max(0) as usize;

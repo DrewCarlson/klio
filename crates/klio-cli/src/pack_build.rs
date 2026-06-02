@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{PackCmd, ExitCode, PathBuf, SourceMap};
 
 use crate::pack_cache::{
     install_pack_into_cache, inspect_pack, list_cache_packs, merged_host_bindings,
@@ -147,7 +147,7 @@ pub(crate) fn run_pack(cmd: PackCmd) -> ExitCode {
     }
 }
 
-/// Re-encode a pack against the currently-supported FORMAT_VERSION.
+/// Re-encode a pack against the currently-supported `FORMAT_VERSION`.
 ///
 /// Today the writer only knows how to emit one version, so a
 /// successful migrate is a no-op round-trip that validates the
@@ -234,9 +234,7 @@ fn publish_to_registry(
     std::fs::copy(pack, &dest).map_err(|e| format!("copy: {e}"))?;
 
     let relative = dest
-        .strip_prefix(&root)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| dest.to_string_lossy().into_owned());
+        .strip_prefix(&root).map_or_else(|_| dest.to_string_lossy().into_owned(), |p| p.to_string_lossy().into_owned());
     let mut index = read_registry_index(&root)?;
     index.retain(|e| !(e.library_id == manifest.library_id && e.version == manifest.library_version));
     index.push(RegistryEntry {
@@ -281,7 +279,7 @@ fn fetch_from_registry(
     let candidate = entries
         .iter()
         .filter(|e| e.library_id == library_id)
-        .filter(|e| version.map_or(true, |v| e.version == v))
+        .filter(|e| version.is_none_or(|v| e.version == v))
         .max_by(|a, b| a.version.cmp(&b.version))
         .ok_or_else(|| format!("no registry entry for `{library_id}`"))?;
     let src = root.join(&candidate.relative_path);
@@ -334,11 +332,11 @@ fn scaffold_library(dir: &std::path::Path, id_override: Option<&str>) -> Result<
         return Err(format!("{} already exists", dir.display()));
     }
     let id = id_override
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .or_else(|| {
             dir.file_name()
                 .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
+                .map(std::string::ToString::to_string)
         })
         .ok_or_else(|| "could not derive library id from path".to_string())?;
     let src_dir = dir.join("src").join("main").join("kotlin");
@@ -371,7 +369,7 @@ fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, String> {
 /// Parse every source file at pack-build time. Files that fail to lex
 /// or parse are dropped from the returned bundle; the loader falls
 /// back to the `sources` section to re-parse them later. Spans inside
-/// the bundle carry SourceMap FileIds allocated during the build,
+/// the bundle carry `SourceMap` `FileIds` allocated during the build,
 /// which the loader rebases when it ingests the AST.
 fn build_ast_bundle(files: &[klio_pack::schema::SourceFile]) -> klio_pack::schema::AstBundle {
     use klio_pack::schema::{AstBundle, AstFile};
@@ -420,7 +418,7 @@ struct LibraryToml {
     library: LibraryHeader,
     #[serde(default)]
     deps: Vec<DepEntry>,
-    /// Map of FQN -> host_symbol. Each entry is registered as a
+    /// Map of FQN -> `host_symbol`. Each entry is registered as a
     /// `BindingKind::Function` with the FQN as both the key and the
     /// host symbol when the value omits the colon-shaped explicit
     /// form.
@@ -503,7 +501,7 @@ pub(crate) fn collect_pack_sources(
                 continue;
             }
             let p = entry.path();
-            if !p.extension().map(|e| e == "kt").unwrap_or(false) {
+            if p.extension().is_none_or(|e| e != "kt") {
                 continue;
             }
             let rel_to_root = p
@@ -548,7 +546,7 @@ struct LibraryHeader {
     /// `["src"]`.
     #[serde(default)]
     source_roots: Vec<String>,
-    /// When true, every host_symbol in `merged_host_bindings`
+    /// When true, every `host_symbol` in `merged_host_bindings`
     /// whose FQN starts with one of the prefixes in
     /// `binding_auto_prefixes` (or with `<id>.` when the prefix
     /// list is empty) is included in the emitted binding

@@ -15,6 +15,11 @@
 //! `schubfach` crate's translation; reimplemented here in safe Rust with
 //! no external dependencies.
 
+// The power-of-ten significand tables below are verbatim algorithm
+// constants; grouping their digits would only obscure the match with the
+// reference implementation.
+#![allow(clippy::unreadable_literal)]
+
 /// Smallest `k` in [`POW10`]; entry `i` is `10^(POW10_MIN_K + i)` rounded
 /// up to a 128-bit `(hi, lo)` significand (see Schubfach §9).
 const POW10_MIN_K: i32 = -292;
@@ -656,11 +661,11 @@ fn pow10_f64(k: i32) -> (u64, u64) {
 /// product had any set bits below the top word past the first.
 #[inline]
 fn round_to_odd_128(g: (u64, u64), cp: u64) -> u64 {
-    let x = (cp as u128) * (g.1 as u128);
-    let y = (cp as u128) * (g.0 as u128) + (x >> 64);
+    let x = u128::from(cp) * u128::from(g.1);
+    let y = u128::from(cp) * u128::from(g.0) + (x >> 64);
     let y0 = y as u64;
     let y1 = (y >> 64) as u64;
-    y1 | ((y0 > 1) as u64)
+    y1 | u64::from(y0 > 1)
 }
 
 #[inline]
@@ -714,7 +719,7 @@ fn schubfach_f64(bits: u64) -> (u64, i32) {
 
     let lower_boundary_is_closer = ieee_fraction == 0 && ieee_exponent > 1;
 
-    let cbl = 4 * c - 2 + lower_boundary_is_closer as u64;
+    let cbl = 4 * c - 2 + u64::from(lower_boundary_is_closer);
     let cb = 4 * c;
     let cbr = 4 * c + 2;
 
@@ -747,7 +752,7 @@ fn schubfach_f64(bits: u64) -> (u64, i32) {
 
     let mid = 4 * s + 2;
     let round_up = vb > mid || (vb == mid && (s & 1) != 0);
-    (s + round_up as u64, k + dk)
+    (s + u64::from(round_up), k + dk)
 }
 
 /// Render `(neg, digits, exponent)` (value = `±digits·10^exponent`) into
@@ -757,7 +762,7 @@ fn schubfach_f64(bits: u64) -> (u64, i32) {
 fn layout_kotlin(neg: bool, mut digits: u64, mut exponent: i32) -> String {
     // Strip trailing zeros — Schubfach may return e.g. `10·10^k`, which is
     // one significant digit (`1·10^(k+1)`), and the layout counts digits.
-    while digits >= 10 && digits % 10 == 0 {
+    while digits >= 10 && digits.is_multiple_of(10) {
         digits /= 10;
         exponent += 1;
     }
@@ -765,7 +770,7 @@ fn layout_kotlin(neg: bool, mut digits: u64, mut exponent: i32) -> String {
     let num_digits = digit_str.len() as i32;
     let decimal_point = num_digits + exponent;
     let sci_exp = decimal_point - 1;
-    let scientific = sci_exp < -3 || sci_exp >= 7;
+    let scientific = !(-3..7).contains(&sci_exp);
 
     let mut out = String::with_capacity(num_digits as usize + 8);
     if neg {
@@ -844,24 +849,24 @@ fn schubfach_f32(bits: u32) -> (u64, i32) {
     let dk: i32;
     if ieee_exponent != 0 {
         dk = 0;
-        c = (HIDDEN_BIT | ieee_fraction) as u64;
+        c = u64::from(HIDDEN_BIT | ieee_fraction);
         q = ieee_exponent - EXPONENT_BIAS;
         if 0 < -q && -q < SIGNIFICAND_SIZE && multiple_of_pow2(c, -q) {
             return (c >> -q, 0);
         }
     } else if ieee_fraction < C_TINY {
         dk = -1;
-        c = (ieee_fraction * 10) as u64;
+        c = u64::from(ieee_fraction * 10);
         q = 1 - EXPONENT_BIAS;
     } else {
         dk = 0;
-        c = ieee_fraction as u64;
+        c = u64::from(ieee_fraction);
         q = 1 - EXPONENT_BIAS;
     }
 
     let lower_boundary_is_closer = ieee_fraction == 0 && ieee_exponent > 1;
 
-    let cbl = 4 * c - 2 + lower_boundary_is_closer as u64;
+    let cbl = 4 * c - 2 + u64::from(lower_boundary_is_closer);
     let cb = 4 * c;
     let cbr = 4 * c + 2;
 
@@ -894,7 +899,7 @@ fn schubfach_f32(bits: u32) -> (u64, i32) {
 
     let mid = 4 * s + 2;
     let round_up = vb > mid || (vb == mid && (s & 1) != 0);
-    (s + round_up as u64, k + dk)
+    (s + u64::from(round_up), k + dk)
 }
 
 /// `kotlin.Float.toString` — see module docs.
@@ -950,6 +955,9 @@ mod tests {
         assert_eq!(double_to_string(f64::NEG_INFINITY), "-Infinity");
     }
 
+    // `3.14159` below is a representative value fed to the formatter, not an
+    // intended use of `PI`.
+    #[allow(clippy::approx_constant)]
     #[test]
     fn float_matches_jvm() {
         let cases: &[(u32, &str)] = &[

@@ -1,4 +1,4 @@
-use super::*;
+use super::{Value, RuntimeError, char, CallCtx, Arc, char_unit_to_string, make_exception};
 
 // ============================================================
 // Char members
@@ -180,7 +180,7 @@ pub(crate) fn char_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 }
 /// The radix argument of `digitToInt(radix)` / `digitToIntOrNull(radix)`,
 /// validated to Kotlin's 2..36 range (default 10). Returns the radix or an
-/// IllegalArgumentException.
+/// `IllegalArgumentException`.
 pub(crate) fn char_digit_radix(args: &[Value]) -> Result<u32, RuntimeError> {
     let radix = args.get(1).and_then(Value::as_i64).unwrap_or(10);
     if !(2..=36).contains(&radix) {
@@ -224,10 +224,10 @@ pub(crate) fn char_is_surrogate(ctx: &mut CallCtx) -> Result<Value, RuntimeError
 // Additional Char
 // ============================================================
 
-/// Single-Char case mapping: Kotlin's uppercaseChar()/lowercaseChar() return
+/// Single-Char case mapping: Kotlin's `uppercaseChar()/lowercaseChar()` return
 /// the original char when the full case mapping isn't a single character
-/// (e.g. 'ß'.uppercaseChar() == 'ß', not 'S' — only the multi-char
-/// uppercase() yields "SS").
+/// (e.g. 'ß'.`uppercaseChar()` == 'ß', not 'S' — only the multi-char
+/// `uppercase()` yields "SS").
 pub(crate) fn single_case_char(c: char, mut mapping: impl Iterator<Item = char>) -> char {
     let first = mapping.next().unwrap_or(c);
     if mapping.next().is_some() {
@@ -255,8 +255,7 @@ pub(crate) fn char_digit_to_int_or_null(ctx: &mut CallCtx) -> Result<Value, Runt
     let radix = char_digit_radix(ctx.args)?;
     Ok(char_unit_to_scalar(unit)
         .and_then(|c| c.to_digit(radix))
-        .map(Value::new_int)
-        .unwrap_or(Value::Null))
+        .map_or(Value::Null, Value::new_int))
 }
 
 // ============================================================

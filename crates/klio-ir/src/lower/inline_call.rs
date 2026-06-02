@@ -14,7 +14,7 @@ pub(super) fn arg_lambda_has_nonlocal_return(args: &[Expr]) -> bool {
             Stmt::Assign { target, value, .. } => scan(target) || scan(value),
             Stmt::DestructuringDecl { init, .. } => scan(init),
             Stmt::Decl(klio_ast::Decl::Property(p)) => {
-                p.init.as_ref().map(scan).unwrap_or(false)
+                p.init.as_ref().is_some_and(scan)
             }
             _ => false,
         })
@@ -38,16 +38,16 @@ pub(super) fn arg_lambda_has_nonlocal_return(args: &[Expr]) -> bool {
             Expr::If { cond, then_branch, else_branch, .. } => {
                 scan(cond)
                     || scan(then_branch)
-                    || else_branch.as_ref().map(|e| scan(e)).unwrap_or(false)
+                    || else_branch.as_ref().is_some_and(|e| scan(e))
             }
             Expr::While { cond, body, .. } => scan(cond) || scan(body),
             Expr::DoWhile { body, cond, .. } => {
-                body.as_ref().map(|b| scan(b)).unwrap_or(false) || scan(cond)
+                body.as_ref().is_some_and(|b| scan(b)) || scan(cond)
             }
             Expr::For { iter, body, .. } => scan(iter) || scan(body),
             Expr::Block(b) => scan_stmts(&b.stmts),
             Expr::When { subject, branches, .. } => {
-                subject.as_ref().map(|s| scan(s)).unwrap_or(false)
+                subject.as_ref().is_some_and(|s| scan(s))
                     || branches.iter().any(|br| scan(&br.body))
             }
             Expr::Try { body, catches, finally, .. } => {
@@ -55,8 +55,7 @@ pub(super) fn arg_lambda_has_nonlocal_return(args: &[Expr]) -> bool {
                     || catches.iter().any(|c| scan_stmts(&c.body.stmts))
                     || finally
                         .as_ref()
-                        .map(|fb| scan_stmts(&fb.stmts))
-                        .unwrap_or(false)
+                        .is_some_and(|fb| scan_stmts(&fb.stmts))
             }
             _ => false,
         }
@@ -144,21 +143,18 @@ pub(super) fn try_inline_call_with_type_args(
     let mut ordered: Vec<Option<Expr>> = vec![None; f.params.len()];
     let mut next_pos = 0usize;
     for (i, a) in args.iter().enumerate() {
-        match arg_names.get(i).and_then(|n| n.clone()) {
-            Some(nm) => {
-                let idx = f.params.iter().position(|p| p.name.name == nm)?;
-                ordered[idx] = Some(a.clone());
-            }
-            None => {
-                while next_pos < ordered.len() && ordered[next_pos].is_some() {
-                    next_pos += 1;
-                }
-                if next_pos >= ordered.len() {
-                    return None;
-                }
-                ordered[next_pos] = Some(a.clone());
+        if let Some(nm) = arg_names.get(i).and_then(std::clone::Clone::clone) {
+            let idx = f.params.iter().position(|p| p.name.name == nm)?;
+            ordered[idx] = Some(a.clone());
+        } else {
+            while next_pos < ordered.len() && ordered[next_pos].is_some() {
                 next_pos += 1;
             }
+            if next_pos >= ordered.len() {
+                return None;
+            }
+            ordered[next_pos] = Some(a.clone());
+            next_pos += 1;
         }
     }
     for (i, slot) in ordered.iter_mut().enumerate() {
@@ -226,12 +222,11 @@ pub(super) fn try_inline_call_with_type_args(
         }
     }
     b.push_inline_lambda_frame(lambda_map);
-    if f.receiver_type.is_some() {
-        if let Some(recv) = this_arg {
+    if f.receiver_type.is_some()
+        && let Some(recv) = this_arg {
             let rr = lower_expr(b, recv);
             b.bind("this".to_string(), rr);
         }
-    }
     // Bind each reified type parameter to the resolved class value
     // at the call site. Two bindings are needed:
     //

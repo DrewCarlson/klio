@@ -1,6 +1,6 @@
-use crate::*;
+use crate::VmHost;
 
-impl<'a> klio_ir::eval::Host for VmHost<'a> {
+impl klio_ir::eval::Host for VmHost<'_> {
     fn enclosing_this(&self) -> Option<klio_runtime::Value> {
         Self::enclosing_this(self)
     }
@@ -17,7 +17,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
     }
 
     /// True when the closure captures a `this` slot whose current
-    /// value isn't a usable Instance — used by CallValue to decide
+    /// value isn't a usable Instance — used by `CallValue` to decide
     /// whether to override the slot with the calling frame's `this`
     /// for a receiver-typed lambda invoked bare (`body()` rather
     /// than `this.body()`).
@@ -33,7 +33,7 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
         v: &klio_runtime::Value,
         new_this: &klio_runtime::Value,
     ) {
-        Self::override_closure_this(self, v, new_this)
+        Self::override_closure_this(self, v, new_this);
     }
 
     fn call_member_only(
@@ -51,19 +51,19 @@ impl<'a> klio_ir::eval::Host for VmHost<'a> {
     }
 
     fn push_inner_outer_hint(&mut self, v: &klio_runtime::Value) {
-        Self::push_inner_outer_hint(self, v)
+        Self::push_inner_outer_hint(self, v);
     }
 
     fn pop_inner_outer_hint(&mut self) {
-        Self::pop_inner_outer_hint(self)
+        Self::pop_inner_outer_hint(self);
     }
 
     fn push_access_enclosing(&self, v: &klio_runtime::Value) {
-        Self::push_access_enclosing(self, v)
+        Self::push_access_enclosing(self, v);
     }
 
     fn pop_access_enclosing(&self) {
-        Self::pop_access_enclosing(self)
+        Self::pop_access_enclosing(self);
     }
 
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {

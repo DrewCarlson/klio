@@ -35,14 +35,14 @@ fun main() { println(C().ping()) }
 
 #[test]
 fn fun_interface_lambda_conversion() {
-    let src = r#"
+    let src = r"
 fun interface IntPred { fun test(x: Int): Boolean }
 fun count(xs: List<Int>, p: IntPred): Int = xs.count { p.test(it) }
 fun main() {
     val evens = count(listOf(1,2,3,4,5,6)) { it % 2 == 0 }
     println(evens)
 }
-"#;
+";
     assert_klio("fun_iface", src, "3\n");
 }
 

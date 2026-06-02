@@ -133,14 +133,14 @@ fun main() { val c = C(); println("done:${c.x}${c.y}${c.z}") }
 
 #[test]
 fn override_with_more_specific_generic() {
-    let src = r#"
+    let src = r"
 open class Producer<T> { open fun make(): T? = null }
 class IntP : Producer<Int>() { override fun make(): Int = 42 }
 fun main() {
     val p: Producer<Int> = IntP()
     println(p.make())
 }
-"#;
+";
     assert_klio("override_specific", src, "42\n");
 }
 

@@ -14,6 +14,7 @@ pub enum Format {
 }
 
 impl Format {
+    #[must_use] 
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "plain" => Self::Plain,

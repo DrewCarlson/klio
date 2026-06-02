@@ -124,7 +124,7 @@ impl PackReader {
         let payload_start = dir_end;
         for e in &dir.entries {
             let end = e.offset.checked_add(e.stored_len).ok_or(PackError::Truncated)?;
-            if (payload_start as u64).checked_add(end).map_or(true, |p| p as usize > buf.len()) {
+            if (payload_start as u64).checked_add(end).is_none_or(|p| p as usize > buf.len()) {
                 return Err(PackError::Truncated);
             }
         }

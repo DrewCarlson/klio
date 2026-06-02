@@ -1,4 +1,4 @@
-use super::*;
+use super::{Value, EvalError, TypeRef, Module, FuncId, eval};
 
 /// Pluggable callbacks the evaluator delegates non-trivial dispatch
 /// through. The IR is intentionally agnostic about how user
@@ -7,7 +7,7 @@ use super::*;
 /// class table / dispatch machinery. A default no-op `NullHost`
 /// exists for unit tests.
 pub trait Host {
-    /// Resolve a CallValue invocation against a runtime value.
+    /// Resolve a `CallValue` invocation against a runtime value.
     /// Default rejects so wiring is visible.
     fn call_value(&mut self, _callee: &Value, _args: &[Value]) -> Result<Value, EvalError> {
         Err(EvalError::Unsupported("Host::call_value"))
@@ -22,7 +22,7 @@ pub trait Host {
     ) -> Result<Value, EvalError> {
         self.call_value(callee, args)
     }
-    /// Resolve a CallMember invocation against the receiver.
+    /// Resolve a `CallMember` invocation against the receiver.
     fn call_member(
         &mut self,
         _receiver: &Value,
@@ -49,7 +49,7 @@ pub trait Host {
         false
     }
     /// Construct an instance of a class referenced by ID. The
-    /// implementation looks up the corresponding ClassDef and
+    /// implementation looks up the corresponding `ClassDef` and
     /// invokes the primary constructor with the supplied args.
     fn new_instance(&mut self, _class: crate::ClassId, _args: &[Value]) -> Result<Value, EvalError> {
         Err(EvalError::Unsupported("Host::new_instance"))
@@ -160,7 +160,7 @@ pub trait Host {
     }
 
     /// Synthesise an anonymous-object instance from an `object {
-    /// … }` AST node. Hosts build a fresh ClassDef from the AST's
+    /// … }` AST node. Hosts build a fresh `ClassDef` from the AST's
     /// members, hook up the captured env from `captures`, and
     /// return the resulting `Value::Instance`.
     fn build_object(
@@ -173,7 +173,7 @@ pub trait Host {
     }
 
     /// Materialise a closure value capturing the supplied snapshot
-    /// of register values. `body_func` is a FuncId in the active
+    /// of register values. `body_func` is a `FuncId` in the active
     /// module; concrete hosts build a `Value::Lambda` (or
     /// equivalent) wrapping the body + env so it can be invoked
     /// through `call_value`.
@@ -252,7 +252,7 @@ pub trait Host {
     /// Build a `Value::Lambda`-compatible closure straight from an
     /// AST block. Concrete hosts populate the captured env from
     /// `captures` and produce a Value the tree walker's lambda
-    /// dispatch (call_lambda etc.) can consume directly.
+    /// dispatch (`call_lambda` etc.) can consume directly.
     fn build_ast_lambda(
         &mut self,
         _params: &[String],
@@ -279,9 +279,9 @@ pub trait Host {
         self.build_ast_lambda(params, body, captured_names, captures)
     }
 
-    /// Variant that also receives the lambda body's lowered FuncId
+    /// Variant that also receives the lambda body's lowered `FuncId`
     /// when available. The default ignores it; klio's interp host
-    /// registers the FuncId under the lambda's body pointer so
+    /// registers the `FuncId` under the lambda's body pointer so
     /// later call sites can dispatch through IR.
     fn build_ast_lambda_with_flag_funcid(
         &mut self,
@@ -295,7 +295,7 @@ pub trait Host {
         self.build_ast_lambda_with_flag(params, body, captured_names, captures, absorb_return)
     }
 
-    /// Resolve a function call by FuncId. The default routes
+    /// Resolve a function call by `FuncId`. The default routes
     /// through `eval()` recursively, so a single-module IR program
     /// stays self-contained.
     fn call_func(

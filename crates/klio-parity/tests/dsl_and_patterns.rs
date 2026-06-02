@@ -147,7 +147,7 @@ fun main() { println(Box().set("hi").describe()) }
 //    a custom builder, mutating shared state.
 #[test]
 fn custom_builder_scope_state() {
-    let src = r#"
+    let src = r"
 class L<T> {
     private val items = mutableListOf<T>()
     fun add(x: T) { items.add(x) }
@@ -164,7 +164,7 @@ fun main() {
     val xs = buildL<Int> { add(1); add(2); add(3); for (i in 4..6) add(i) }
     println(xs)
 }
-"#;
+";
     assert_klio("custom_builder_scope", src, "[1, 2, 3, 4, 5, 6]\n");
 }
 
@@ -186,7 +186,7 @@ fun main() {
 //    instance methods.
 #[test]
 fn private_setter_public_getter() {
-    let src = r#"
+    let src = r"
 class Counter {
     var n: Int = 0
         private set
@@ -198,7 +198,7 @@ fun main() {
     c.inc(); c.inc(); c.add(5)
     println(c.n)
 }
-"#;
+";
     assert_klio("private_setter", src, "7\n");
 }
 

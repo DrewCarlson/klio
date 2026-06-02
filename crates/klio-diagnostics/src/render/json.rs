@@ -15,7 +15,7 @@ pub fn render(
         let (el, ec) = file.line_col(d.primary.span.end);
         let mut s = String::new();
         s.push('{');
-        push_field(&mut s, "factory", json_string(d.factory.map(|f| f.name).unwrap_or("")));
+        push_field(&mut s, "factory", json_string(d.factory.map_or("", |f| f.name)));
         push_field(&mut s, "legacy_code", json_string(d.legacy_code.unwrap_or("")));
         push_field(&mut s, "severity", json_string(severity_str(d.severity)));
         push_field(&mut s, "file", json_string(&file.path.to_string_lossy()));

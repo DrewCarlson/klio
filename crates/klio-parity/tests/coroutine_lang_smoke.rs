@@ -1,7 +1,7 @@
 //! kotlin.coroutines **language layer** verification through the real
 //! shipping path: run a deterministic program with the actual `klio`
 //! binary. The pure kotlin.coroutines commonMain types
-//! (CoroutineContext / EmptyCoroutineContext / ContinuationInterceptor
+//! (`CoroutineContext` / `EmptyCoroutineContext` / `ContinuationInterceptor`
 //! / Continuation) are consumed verbatim from the upstream Kotlin
 //! checkout via the embedded stdlib pack's curated SOURCES; klio's
 //! platform layer supplies the intrinsic surface

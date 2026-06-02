@@ -1,4 +1,4 @@
-use super::*;
+use super::{CallCtx, Value, RuntimeError, Arc, range_iter_int, make_list};
 
 // ============================================================
 // Range progressions
@@ -120,7 +120,7 @@ pub(crate) fn as_range_view(v: &Value) -> Option<(i64, i64, i64, klio_runtime::R
                             return Some(i);
                         }
                         if let Value::Char(c) = val {
-                            return Some(c as i64);
+                            return Some(i64::from(c));
                         }
                     }
                 }

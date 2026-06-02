@@ -1,4 +1,4 @@
-use super::*;
+use super::{Value, RuntimeError, CallCtx, Arc, ObjRef, make_exception};
 
 // ===== scope functions =====
 //
@@ -1075,7 +1075,7 @@ pub(crate) fn coll_hash_set_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 
 // ----- List / MutableList helpers -----
 
-pub(crate) fn recv_list_items<'a>(args: &'a [Value], what: &str) -> Result<ObjRef<Vec<Value>>, RuntimeError> {
+pub(crate) fn recv_list_items(args: &[Value], what: &str) -> Result<ObjRef<Vec<Value>>, RuntimeError> {
     match args.first() {
         Some(Value::List { items, .. }) => Ok(items.clone()),
         _ => Err(RuntimeError::Type(format!("{what} requires a List receiver"))),
@@ -1126,7 +1126,7 @@ pub(crate) fn coll_list_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
         return Err(RuntimeError::Arity("indexOf requires an argument".into()));
     };
     let pos = it.borrow().iter().position(|v| Value::structural_eq_boxed(v, needle));
-    Ok(Value::new_int(pos.map(|p| p as i64).unwrap_or(-1)))
+    Ok(Value::new_int(pos.map_or(-1, |p| p as i64)))
 }
 pub(crate) fn coll_iter_index_of_first(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let items = iterable_items(&ctx.args[0], "indexOfFirst")?;
@@ -1156,7 +1156,7 @@ pub(crate) fn coll_iter_index_of_last(ctx: &mut CallCtx) -> Result<Value, Runtim
     Ok(Value::new_int(found))
 }
 /// `foldRight(initial) { elem, acc -> … }` — fold from the end. Upstream uses
-/// a backward ListIterator (hasPrevious) klio doesn't model, so iterate in
+/// a backward `ListIterator` (hasPrevious) klio doesn't model, so iterate in
 /// reverse directly.
 pub(crate) fn coll_list_fold_right(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let items = iterable_items(&ctx.args[0], "foldRight")?;
@@ -1263,7 +1263,7 @@ pub(crate) fn coll_list_last_index_of(ctx: &mut CallCtx) -> Result<Value, Runtim
     };
     let borrow = it.borrow();
     let pos = borrow.iter().rposition(|v| Value::structural_eq_boxed(v, needle));
-    Ok(Value::new_int(pos.map(|p| p as i64).unwrap_or(-1)))
+    Ok(Value::new_int(pos.map_or(-1, |p| p as i64)))
 }
 pub(crate) fn coll_list_join_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let items: Vec<Value> = match ctx.args.first() {
@@ -1507,10 +1507,11 @@ pub(crate) fn coll_mut_list_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
 
 /// Natural order for the Kotlin types we currently support as `Comparable`.
 /// Returns an `Ordering`, or an error when the types can't be compared.
+#[must_use] 
 pub fn primitive_companion_const(ty: &str, name: &str) -> Option<Value> {
     match (ty, name) {
-        ("Int", "MAX_VALUE") => Some(Value::new_int(i32::MAX as i64)),
-        ("Int", "MIN_VALUE") => Some(Value::new_int(i32::MIN as i64)),
+        ("Int", "MAX_VALUE") => Some(Value::new_int(i64::from(i32::MAX))),
+        ("Int", "MIN_VALUE") => Some(Value::new_int(i64::from(i32::MIN))),
         ("Int", "SIZE_BITS") => Some(Value::new_int(32)),
         ("Int", "SIZE_BYTES") => Some(Value::new_int(4)),
         ("Long", "MAX_VALUE") => Some(Value::Long(i64::MAX)),
@@ -1718,11 +1719,10 @@ pub fn materialise_sequence_bounded(
                     if !cont {
                         break;
                     }
-                    if let Some(m) = max {
-                        if output.len() >= m {
+                    if let Some(m) = max
+                        && output.len() >= m {
                             break;
                         }
-                    }
                 }
             }
             SequenceSource::Generate { seed, next } => {
@@ -1733,15 +1733,12 @@ pub fn materialise_sequence_bounded(
                     if take_cap_reached(&taken) {
                         break;
                     }
-                    let candidate = match &cur {
-                        Some(v) => v.clone(),
-                        None => {
-                            let r = call(host, next, &[], out)?;
-                            if matches!(r, Value::Null) {
-                                break;
-                            }
-                            r
+                    let candidate = if let Some(v) = &cur { v.clone() } else {
+                        let r = call(host, next, &[], out)?;
+                        if matches!(r, Value::Null) {
+                            break;
                         }
+                        r
                     };
                     produced += 1;
                     if produced > limit {
@@ -1758,11 +1755,10 @@ pub fn materialise_sequence_bounded(
                     if !cont {
                         break;
                     }
-                    if let Some(m) = max {
-                        if output.len() >= m {
+                    if let Some(m) = max
+                        && output.len() >= m {
                             break;
                         }
-                    }
                     let r = call(host, next, std::slice::from_ref(&candidate), out)?;
                     if matches!(r, Value::Null) {
                         break;
@@ -1780,15 +1776,12 @@ pub fn materialise_sequence_bounded(
             let limit = 1024usize;
             let mut cur = seed.as_ref().map(|b| (**b).clone());
             while acc.len() < limit {
-                let candidate = match &cur {
-                    Some(v) => v.clone(),
-                    None => {
-                        let r = call(host, next, &[], out)?;
-                        if matches!(r, Value::Null) {
-                            break;
-                        }
-                        r
+                let candidate = if let Some(v) = &cur { v.clone() } else {
+                    let r = call(host, next, &[], out)?;
+                    if matches!(r, Value::Null) {
+                        break;
                     }
+                    r
                 };
                 acc.push(candidate.clone());
                 let r = call(host, next, std::slice::from_ref(&candidate), out)?;
@@ -1800,7 +1793,7 @@ pub fn materialise_sequence_bounded(
             acc
         }
     };
-    for op in seq.ops.iter() {
+    for op in &seq.ops {
         match op {
             SeqOp::Map(f) => {
                 let mut nx: Vec<Value> = Vec::with_capacity(items.len());
@@ -2035,7 +2028,7 @@ pub(crate) fn kotlin_float_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
 }
 
 pub fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, RuntimeError> {
-    use std::cmp::Ordering::*;
+    
     if a.is_numeric() && b.is_numeric() {
         if a.is_integral() && b.is_integral() {
             return Ok(a.as_i64().unwrap().cmp(&b.as_i64().unwrap()));
@@ -2075,7 +2068,7 @@ pub(crate) fn coll_list_sorted(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
             }
             let ord = if matches!(a, Value::Instance(_)) {
                 match host.invoke_method(a, "compareTo", std::slice::from_ref(b), *out) {
-                    Some(Ok(Value::Int(n))) => i32_to_ordering(n as i32),
+                    Some(Ok(Value::Int(n))) => i32_to_ordering(n),
                     Some(Err(e)) => {
                         err = Some(e);
                         std::cmp::Ordering::Equal
@@ -2097,10 +2090,10 @@ pub(crate) fn coll_list_sorted(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
                     }
                 }
             };
-            if ord != std::cmp::Ordering::Equal {
-                ord
-            } else {
+            if ord == std::cmp::Ordering::Equal {
                 ia.cmp(ib)
+            } else {
+                ord
             }
         });
         if let Some(e) = err {
@@ -2206,7 +2199,7 @@ pub(crate) fn coll_list_average(ctx: &mut CallCtx) -> Result<Value, RuntimeError
     let mut n = 0i64;
     for v in borrow.iter() {
         sum += match v {
-            Value::Int(x) => *x as f64,
+            Value::Int(x) => f64::from(*x),
             Value::Double(x) => *x,
             other => {
                 return Err(RuntimeError::Type(format!(
@@ -2259,13 +2252,12 @@ pub(crate) fn compare_host_aware(
     host: &mut &mut dyn klio_runtime::IntrinsicHost,
     out: &mut dyn klio_runtime::Output,
 ) -> Result<std::cmp::Ordering, RuntimeError> {
-    if matches!(a, Value::Instance(_)) {
-        if let Some(Ok(Value::Int(n))) =
+    if matches!(a, Value::Instance(_))
+        && let Some(Ok(Value::Int(n))) =
             host.invoke_method(a, "compareTo", std::slice::from_ref(b), out)
         {
-            return Ok(i32_to_ordering(n as i32));
+            return Ok(i32_to_ordering(n));
         }
-    }
     compare_values(a, b)
 }
 
@@ -2795,7 +2787,7 @@ pub(crate) fn sync_map_view(receiver: &Value) {
     });
 }
 
-pub(crate) fn recv_set_items<'a>(args: &'a [Value], what: &str) -> Result<ObjRef<Vec<Value>>, RuntimeError> {
+pub(crate) fn recv_set_items(args: &[Value], what: &str) -> Result<ObjRef<Vec<Value>>, RuntimeError> {
     match args.first() {
         Some(Value::Set { items, .. }) => Ok(items.clone()),
         _ => Err(RuntimeError::Type(format!("{what} requires a Set receiver"))),
@@ -2824,7 +2816,7 @@ pub(crate) fn array_slice_impl(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
         RuntimeError::Type("sliceArray requires a receiver".into())
     })?;
     let (items, prim) = match recv {
-        Value::Array { items, prim } => (items.clone(), prim.clone()),
+        Value::Array { items, prim } => (items.clone(), *prim),
         _ => return Err(RuntimeError::Type(
             "sliceArray requires an array receiver".into()
         )),
@@ -2873,7 +2865,7 @@ pub(crate) fn array_sum_impl(ctx: &mut CallCtx, what: &str) -> Result<Value, Run
                     dbl_acc = int_acc as f64;
                     as_double = true;
                 }
-                dbl_acc += *f as f64;
+                dbl_acc += f64::from(*f);
             }
             _ => return Err(RuntimeError::Type(format!(
                 "{what}: non-numeric element"
@@ -2904,7 +2896,7 @@ pub(crate) fn array_average_impl(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
         let n: f64 = match v {
             Value::Int(_) | Value::Long(_) | Value::Short(_) | Value::Byte(_) => v.as_i64().unwrap_or(0) as f64,
             Value::Double(d) => *d,
-            Value::Float(f) => *f as f64,
+            Value::Float(f) => f64::from(*f),
             _ => return Err(RuntimeError::Type(
                 "Array.average: non-numeric element".into()
             )),
@@ -3037,7 +3029,7 @@ pub(crate) fn coll_mut_set_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 pub(crate) fn coll_mut_set_remove_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_set_items(ctx.args, "MutableSet.removeAll")?;
     let other: Vec<Value> = match ctx.args.get(1) {
-        Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
+        Some(Value::List { items, .. } | Value::Set { items, .. }) => items.borrow().clone(),
         Some(Value::Array { items, .. }) => items.borrow().clone(),
         _ => return Err(RuntimeError::Type("removeAll requires a collection".into())),
     };
@@ -3055,7 +3047,7 @@ pub(crate) fn coll_mut_set_remove_all(ctx: &mut CallCtx) -> Result<Value, Runtim
 pub(crate) fn coll_mut_set_retain_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_set_items(ctx.args, "MutableSet.retainAll")?;
     let other: Vec<Value> = match ctx.args.get(1) {
-        Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
+        Some(Value::List { items, .. } | Value::Set { items, .. }) => items.borrow().clone(),
         Some(Value::Array { items, .. }) => items.borrow().clone(),
         _ => return Err(RuntimeError::Type("retainAll requires a collection".into())),
     };
@@ -3073,8 +3065,8 @@ pub(crate) fn coll_mut_set_retain_all(ctx: &mut CallCtx) -> Result<Value, Runtim
 
 // ----- Map helpers -----
 
-pub(crate) fn recv_map_entries<'a>(
-    args: &'a [Value],
+pub(crate) fn recv_map_entries(
+    args: &[Value],
     what: &str,
 ) -> Result<ObjRef<Vec<(Value, Value)>>, RuntimeError> {
     match args.first() {
@@ -3101,8 +3093,7 @@ pub(crate) fn coll_map_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         .borrow()
         .iter()
         .find(|(k, _)| Value::structural_eq_boxed(k, key))
-        .map(|(_, v)| v.clone())
-        .unwrap_or(Value::Null))
+        .map_or(Value::Null, |(_, v)| v.clone()))
 }
 pub(crate) fn coll_map_contains_key(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "Map.containsKey")?;
@@ -3206,7 +3197,7 @@ pub(crate) fn coll_mut_map_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
     Ok(Value::Unit)
 }
 
-/// Shared accessor: the entries ObjRef of a `Value::Map` receiver.
+/// Shared accessor: the entries `ObjRef` of a `Value::Map` receiver.
 pub(crate) fn mut_map_entries_rc(
     recv: &Value,
     who: &str,
@@ -3269,12 +3260,9 @@ pub(crate) fn map_put_if_absent(ctx: &mut CallCtx) -> Result<Value, RuntimeError
     let entries = mut_map_entries_rc(&ctx.args[0].clone(), "putIfAbsent")?;
     let key = ctx.args.get(1).cloned().ok_or_else(|| RuntimeError::Arity("putIfAbsent requires a key".into()))?;
     let value = ctx.args.get(2).cloned().ok_or_else(|| RuntimeError::Arity("putIfAbsent requires a value".into()))?;
-    match map_find(&entries, &key) {
-        Some(old) => Ok(old),
-        None => {
-            map_set(&entries, key, value);
-            Ok(Value::Null)
-        }
+    if let Some(old) = map_find(&entries, &key) { Ok(old) } else {
+        map_set(&entries, key, value);
+        Ok(Value::Null)
     }
 }
 
@@ -3420,7 +3408,7 @@ pub(crate) fn coll_list_unzip(ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
 pub(crate) fn coll_list_contains_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "List.containsAll")?;
     let other = match ctx.args.get(1) {
-        Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
+        Some(Value::List { items, .. } | Value::Set { items, .. }) => items.borrow().clone(),
         _ => return Err(RuntimeError::Type("containsAll requires a collection".into())),
     };
     let me = it.borrow();
@@ -3514,7 +3502,7 @@ pub(crate) fn coll_mut_list_remove(ctx: &mut CallCtx) -> Result<Value, RuntimeEr
 pub(crate) fn coll_mut_list_remove_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "MutableList.removeAll")?;
     let other: Vec<Value> = match ctx.args.get(1) {
-        Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
+        Some(Value::List { items, .. } | Value::Set { items, .. }) => items.borrow().clone(),
         _ => return Err(RuntimeError::Type("removeAll requires a collection".into())),
     };
     let changed = {
@@ -3532,7 +3520,7 @@ pub(crate) fn coll_mut_list_remove_all(ctx: &mut CallCtx) -> Result<Value, Runti
 pub(crate) fn coll_mut_list_retain_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_list_items(ctx.args, "MutableList.retainAll")?;
     let other: Vec<Value> = match ctx.args.get(1) {
-        Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
+        Some(Value::List { items, .. } | Value::Set { items, .. }) => items.borrow().clone(),
         _ => return Err(RuntimeError::Type("retainAll requires a collection".into())),
     };
     let changed = {
@@ -3573,7 +3561,7 @@ pub(crate) fn coll_mut_list_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError
 pub(crate) fn coll_set_contains_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_set_items(ctx.args, "Set.containsAll")?;
     let other = match ctx.args.get(1) {
-        Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
+        Some(Value::List { items, .. } | Value::Set { items, .. }) => items.borrow().clone(),
         _ => return Err(RuntimeError::Type("containsAll requires a collection".into())),
     };
     let me = it.borrow();
@@ -3616,7 +3604,7 @@ pub(crate) fn coll_set_with_index(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
 pub(crate) fn coll_mut_set_add_all(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let it = recv_set_items(ctx.args, "MutableSet.addAll")?;
     let to_add: Vec<Value> = match ctx.args.get(1) {
-        Some(Value::List { items, .. }) | Some(Value::Set { items, .. }) => items.borrow().clone(),
+        Some(Value::List { items, .. } | Value::Set { items, .. }) => items.borrow().clone(),
         _ => return Err(RuntimeError::Type("addAll requires a collection".into())),
     };
     let mut b = it.borrow_mut();
@@ -3645,9 +3633,7 @@ pub(crate) fn coll_map_get_or_default(ctx: &mut CallCtx) -> Result<Value, Runtim
     Ok(entries
         .borrow()
         .iter()
-        .find(|(k, _)| Value::structural_eq_boxed(k, key))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_else(|| default.clone()))
+        .find(|(k, _)| Value::structural_eq_boxed(k, key)).map_or_else(|| default.clone(), |(_, v)| v.clone()))
 }
 
 pub(crate) fn coll_map_get_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

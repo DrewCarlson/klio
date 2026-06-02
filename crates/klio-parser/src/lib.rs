@@ -197,14 +197,14 @@ mod tests {
     #[test]
     fn import_wildcard_with_alias_is_rejected() {
         let (_file, diags) = parse("import kotlin.collections.* as col\n");
-        let codes: Vec<_> = diags.diagnostics().iter().filter_map(|d| d.code()).collect();
+        let codes: Vec<_> = diags.diagnostics().iter().filter_map(klio_diagnostics::Diagnostic::code).collect();
         assert!(codes.contains(&"P0044"), "expected P0044, got {codes:?}");
     }
 
     #[test]
     fn class_literal_with_type_arguments_is_rejected() {
         let (_file, diags) = parse("fun main() { val k = Box<Int>::class }\n");
-        let codes: Vec<_> = diags.diagnostics().iter().filter_map(|d| d.code()).collect();
+        let codes: Vec<_> = diags.diagnostics().iter().filter_map(klio_diagnostics::Diagnostic::code).collect();
         assert!(codes.contains(&"T0104"), "expected T0104, got {codes:?}");
     }
 
@@ -264,17 +264,17 @@ mod tests {
 
     #[test]
     fn if_else_chain() {
-        let (file, diags) = parse(r#"
+        let (_file, diags) = parse(r"
             fun f(x: Int): Int {
                 return if (x < 0) -1 else if (x == 0) 0 else 1
             }
-        "#);
+        ");
         assert!(!diags.has_errors());
     }
 
     #[test]
     fn while_with_break_and_continue() {
-        let (file, diags) = parse(r#"
+        let (file, diags) = parse(r"
             fun f() {
                 var i = 0
                 while (i < 10) {
@@ -283,7 +283,7 @@ mod tests {
                     i = i + 1
                 }
             }
-        "#);
+        ");
         assert!(!diags.has_errors());
         let _ = file;
     }
@@ -313,7 +313,7 @@ mod tests {
         assert!(diags.has_errors());
     }
 
-    fn property_type<'a>(file: &'a klio_ast::KotlinFile) -> &'a klio_ast::TypeRef {
+    fn property_type(file: &klio_ast::KotlinFile) -> &klio_ast::TypeRef {
         let klio_ast::Decl::Property(p) = &file.decls[0] else { panic!("expected property") };
         p.ty.as_ref().expect("property type annotation")
     }
@@ -757,7 +757,7 @@ mod tests {
 
     #[test]
     fn continue_with_label() {
-        let (file, diags) = parse("fun main() { outer@ for (i in 1..3) { continue@outer } }\n");
+        let (_file, diags) = parse("fun main() { outer@ for (i in 1..3) { continue@outer } }\n");
         assert!(!diags.has_errors());
     }
 
@@ -811,8 +811,8 @@ mod tests {
         let (file, diags) = parse("inline class Boxed(val n: Int)\n");
         let klio_ast::Decl::Class(c) = &file.decls[0] else { panic!() };
         assert!(c.is_value);
-        let codes: Vec<_> = diags.diagnostics().iter().filter_map(|d| d.code()).collect();
-        assert!(codes.iter().any(|c| *c == "W0001"), "expected deprecation warning: {codes:?}");
+        let codes: Vec<_> = diags.diagnostics().iter().filter_map(klio_diagnostics::Diagnostic::code).collect();
+        assert!(codes.contains(&"W0001"), "expected deprecation warning: {codes:?}");
     }
 
     #[test]

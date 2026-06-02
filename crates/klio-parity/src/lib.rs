@@ -42,15 +42,14 @@ pub fn start_memory_watchdog() {
             .name("klio-parity-memguard".into())
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(100));
-                if let Some(rss) = current_rss_kb(pid) {
-                    if rss > cap_kb {
+                if let Some(rss) = current_rss_kb(pid)
+                    && rss > cap_kb {
                         eprintln!(
                             "[klio-parity] RSS {rss}KB exceeded cap {cap_kb}KB — aborting \
                              to avoid system OOM (raise KLIO_PARITY_RSS_CAP_KB if intentional)"
                         );
                         std::process::abort();
                     }
-                }
             })
             .ok();
     });
@@ -144,10 +143,10 @@ pub const TARGET_VERSION: &str = "2.3.21";
 /// Which Kotlin compiler distribution to download/locate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KotlincKind {
-    /// JVM `kotlinc` (`kotlin-compiler-<v>.zip` from JetBrains GitHub).
+    /// JVM `kotlinc` (`kotlin-compiler-<v>.zip` from `JetBrains` GitHub).
     Jvm,
     /// `kotlinc-native` (`kotlin-native-prebuilt-<slug>-<v>.tar.gz` from the
-    /// JetBrains CDN, extracted under `~/.konan/`).
+    /// `JetBrains` CDN, extracted under `~/.konan/`).
     Native,
 }
 
@@ -181,9 +180,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn parity_cache_dir() -> PathBuf {
-    let target = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root().join("target"));
+    let target = env::var_os("CARGO_TARGET_DIR").map_or_else(|| workspace_root().join("target"), PathBuf::from);
     target.join("parity-cache")
 }
 
@@ -483,8 +480,7 @@ fn download(url: &str, dest: &Path) -> Result<(), ParityError> {
                 .arg(&tmp)
                 .arg(url)
                 .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
+                .is_ok_and(|s| s.success())
         }
     };
     if !ok {
@@ -522,7 +518,7 @@ fn extract_archive(archive: &Path, into: &Path, ext: &str) -> Result<(), ParityE
     Ok(())
 }
 
-/// Best-effort cross-process advisory lock implemented via O_CREAT|O_EXCL on a
+/// Best-effort cross-process advisory lock implemented via `O_CREAT|O_EXCL` on a
 /// sentinel file. Stale locks older than 1h are reclaimed.
 struct InstallLock {
     path: PathBuf,
@@ -544,7 +540,7 @@ impl InstallLock {
                         && SystemTime::now()
                             .duration_since(modified)
                             .unwrap_or_default()
-                            > Duration::from_secs(60 * 60)
+                            > Duration::from_hours(1)
                     {
                         let _ = fs::remove_file(path);
                         continue;
@@ -787,7 +783,7 @@ pub fn default_jobs() -> usize {
     if let Some(j) = env::var("KLIO_PARITY_JOBS").ok().and_then(|v| v.parse::<usize>().ok()) {
         return j.max(1);
     }
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     cores.min(6).max(1)
 }
 
@@ -1113,7 +1109,7 @@ fn sanitize_pkg_segment(stem: &str) -> String {
         "public", "short", "static", "strictfp", "switch", "synchronized", "throws",
         "transient", "void", "volatile",
     ];
-    if RESERVED.iter().any(|w| *w == stem) {
+    if RESERVED.contains(&stem) {
         format!("{stem}_")
     } else {
         stem.to_string()
@@ -1447,7 +1443,7 @@ fn walk_kt(dir: &Path, base: &Path, out: &mut Vec<(String, PathBuf)>) {
         let p = e.path();
         if p.is_dir() {
             walk_kt(&p, base, out);
-        } else if p.extension().map(|x| x == "kt").unwrap_or(false) {
+        } else if p.extension().is_some_and(|x| x == "kt") {
             let rel = p
                 .strip_prefix(base)
                 .unwrap_or(&p)
@@ -1865,9 +1861,7 @@ pub fn check(file: &Path) -> Result<ParityReport, ParityError> {
     // klio's own output (the `assert_klio` half of every test) is
     // already enough signal.
     if env::var("KLIO_SKIP_KOTLINC_PARITY")
-        .ok()
-        .filter(|v| !v.is_empty() && v != "0")
-        .is_some()
+        .ok().as_ref().is_some_and(|v| !v.is_empty() && v != "0")
     {
         return Err(ParityError::NoKotlinc);
     }

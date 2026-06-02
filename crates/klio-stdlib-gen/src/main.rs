@@ -83,7 +83,7 @@ fn build(stdlib: Option<PathBuf>, out: Option<PathBuf>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("emit failed: {}", e);
+            eprintln!("emit failed: {e}");
             ExitCode::from(1)
         }
     }

@@ -1,4 +1,4 @@
-use super::*;
+use super::{Value, Arc, ObjRef, CallCtx, RuntimeError, materialise_sequence, recv_list_items, recv_set_items, recv_string, range_iter_int, make_list, make_set, materialise_sequence_bounded};
 
 // ============================================================
 // Sequence (eager; same observable output as List)
@@ -15,17 +15,16 @@ pub(crate) fn make_sequence(items: Vec<Value>) -> Value {
 
 /// `sequence { yield(...) ; yieldAll(...) }` builder. klio runs the
 /// `suspend SequenceScope<T>.() -> Unit` block eagerly: a host
-/// SequenceScope instance carries a shared mutable buffer that the
+/// `SequenceScope` instance carries a shared mutable buffer that the
 /// `yield`/`yieldAll` intrinsics append to; the collected items become
 /// a `Value::Sequence`. Faithful for finite builders (the common case);
 /// an unbounded `while (true) { yield(..) }` would grow the buffer and
 /// is bounded by the dev memory guard rather than truly lazy.
 pub(crate) fn seq_scope_buffer(scope: &Value) -> Option<ObjRef<Vec<Value>>> {
-    if let Value::Instance(inst) = scope {
-        if let Some(Value::List { items, .. }) = inst.borrow().get("__seq_buffer") {
+    if let Value::Instance(inst) = scope
+        && let Some(Value::List { items, .. }) = inst.borrow().get("__seq_buffer") {
             return Some(items);
         }
-    }
     None
 }
 
@@ -77,10 +76,8 @@ pub(crate) fn seq_scope_yield_all(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
     let buffer = seq_scope_buffer(&ctx.args[0])
         .ok_or_else(|| RuntimeError::Type("yieldAll: not a SequenceScope".into()))?;
     let elems: Vec<Value> = match ctx.args.get(1) {
-        Some(Value::List { items, .. })
-        | Some(Value::Set { items, .. })
-        | Some(Value::Array { items, .. })
-        | Some(Value::Iterator { items, .. }) => items.borrow().clone(),
+        Some(Value::List { items, .. } | Value::Set { items, .. } | Value::Array {
+items, .. } | Value::Iterator { items, .. }) => items.borrow().clone(),
         Some(Value::Sequence(_)) => {
             let seq = ctx.args[1].clone();
             let CallCtx { out, host, .. } = ctx;

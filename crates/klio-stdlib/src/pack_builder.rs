@@ -327,7 +327,7 @@ pub fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, PackError> {
         if !seen.insert(fqn.to_string()) {
             continue;
         }
-        let arity = param_names(fqn).map(<[&str]>::len).unwrap_or(0);
+        let arity = param_names(fqn).map_or(0, <[&str]>::len);
         let max_arity: u8 = u8::try_from(arity).unwrap_or(u8::MAX);
         bindings.push(Binding {
             fqn: fqn.to_string(),

@@ -105,6 +105,7 @@ pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
 /// bare names are stdlib top-level entities): take the lowercase
 /// entries (functions, not types/exceptions) and exclude the few
 /// that genuinely are receiver/infix extensions.
+#[must_use] 
 pub fn is_toplevel_function(name: &str) -> bool {
     // `to`, `downTo`, `step`, `until` are infix extensions on a
     // receiver — they legitimately dispatch with a receiver.
@@ -113,7 +114,7 @@ pub fn is_toplevel_function(name: &str) -> bool {
         return false;
     }
     IMPLICIT_ALIASES.iter().any(|(alias, _)| {
-        *alias == name && alias.chars().next().is_some_and(|c| c.is_lowercase())
+        *alias == name && alias.chars().next().is_some_and(char::is_lowercase)
     })
 }
 
@@ -147,7 +148,7 @@ pub const IMPLICITLY_IMPORTED_PACKAGES: &[&str] = &[
 /// packages (an exact match against [`IMPLICITLY_IMPORTED_PACKAGES`]).
 #[must_use]
 pub fn is_implicitly_imported_package(package_path: &str) -> bool {
-    IMPLICITLY_IMPORTED_PACKAGES.iter().any(|p| *p == package_path)
+    IMPLICITLY_IMPORTED_PACKAGES.contains(&package_path)
 }
 
 /// Curated stdlib sources that PARSE but are not yet *consumed* (loaded /
@@ -186,8 +187,7 @@ pub fn is_known_package(package_path: &str) -> bool {
     if EXTRA_KNOWN_PACKAGES
         .get_or_init(Default::default)
         .lock()
-        .map(|s| s.contains(package_path))
-        .unwrap_or(false)
+        .is_ok_and(|s| s.contains(package_path))
     {
         return true;
     }
@@ -203,7 +203,7 @@ pub fn is_known_package(package_path: &str) -> bool {
     // one such intrinsic is just as real as a mined one.
     implementations::all_fqns().any(|fqn| {
         fqn.rsplit_once('.')
-            .map_or(false, |(pkg, _)| pkg == package_path)
+            .is_some_and(|(pkg, _)| pkg == package_path)
             || fqn.starts_with(&prefix)
     })
 }

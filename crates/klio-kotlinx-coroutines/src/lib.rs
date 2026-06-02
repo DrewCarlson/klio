@@ -2,7 +2,7 @@
 //!
 //! This crate is a *client* of the Layer-1 core suspend engine
 //! (`klio_ir::eval`): the high-level API (Dispatchers,
-//! CoroutineScope, Job, Channel, builders) lives in the Kotlin
+//! `CoroutineScope`, Job, Channel, builders) lives in the Kotlin
 //! shim, and the few host hooks here only translate library calls
 //! into Layer-1 suspension. `delay`/`yield` raise a suspension
 //! carrying an opaque resume directive; the default cooperative
@@ -30,7 +30,7 @@ struct ChannelState {
     /// Slot ids of `receive()` callers currently parked because the
     /// buffer was empty. The next `send` resumes the head waiter.
     receive_waiters: VecDeque<i64>,
-    /// Iterator-style waiters: a parked `for (v in ch)` hasNext()
+    /// Iterator-style waiters: a parked `for (v in ch)` `hasNext()`
     /// caller plus a handle to its iterator instance, so the next
     /// send can stash the value in `__pending__` on the iterator
     /// and resume hasNext with `Bool(true)` (instead of the value).
@@ -158,7 +158,7 @@ klio_stdlib::host_bindings! {
 }
 
 /// Job.cancel(...) — wake every parked timed activation (delay /
-/// withTimeout suspension) with a CancellationException so user
+/// withTimeout suspension) with a `CancellationException` so user
 /// `try { … } catch (e: CancellationException)` arms fire and
 /// `withTimeoutOrNull` observes the timeout. Indefinite parks
 /// (job-join, channel rendezvous) aren't touched.
@@ -173,7 +173,7 @@ fn channel_create(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     // ship `0` (RENDEZVOUS) and `-1` (UNLIMITED) as sentinel ints.
     let cap_arg = ctx.args.first().cloned().unwrap_or(Value::new_int(0));
     let capacity: i64 = match cap_arg {
-        Value::Int(n) => n as i64,
+        Value::Int(n) => i64::from(n),
         Value::Long(n) => n,
         _ => 0,
     };
@@ -471,7 +471,7 @@ fn channel_is_closed_for_send(ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
     let id = channel_id(&recv).ok_or_else(|| {
         RuntimeError::Type("isClosedForSend: bad receiver".into())
     })?;
-    let closed = with_reg(|r| r.channels.get(&id).map(|s| s.closed).unwrap_or(true));
+    let closed = with_reg(|r| r.channels.get(&id).is_none_or(|s| s.closed));
     Ok(Value::Bool(closed))
 }
 
@@ -487,8 +487,7 @@ fn channel_is_closed_for_receive(
     let drained_closed = with_reg(|r| {
         r.channels
             .get(&id)
-            .map(|s| s.closed && s.buffer.is_empty())
-            .unwrap_or(true)
+            .is_none_or(|s| s.closed && s.buffer.is_empty())
     });
     Ok(Value::Bool(drained_closed))
 }
@@ -541,11 +540,10 @@ fn channel_iter_has_next(
     // Already have a cached pending value? Report true without
     // touching the channel.
     let pending = iter_inst.borrow().get("__pending__");
-    if let Some(c) = pending {
-        if !matches!(c, Value::Null) {
+    if let Some(c) = pending
+        && !matches!(c, Value::Null) {
             return Ok(Value::Bool(true));
         }
-    }
     // Try a synchronous pull. If the buffer holds a value, cache it
     // and return true; if the channel is drained-and-closed, return
     // false; otherwise queue an iterator-style waiter and suspend.
@@ -592,13 +590,12 @@ fn channel_iter_next(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         _ => return Err(RuntimeError::Type("next: bad receiver".into())),
     };
     let pending = inst.borrow().get("__pending__");
-    if let Some(v) = pending {
-        if !matches!(v, Value::Null) {
+    if let Some(v) = pending
+        && !matches!(v, Value::Null) {
             inst.borrow_mut()
                 .define("__pending__", Value::Null);
             return Ok(v);
         }
-    }
     Err(RuntimeError::Thrown(Value::Exception {
         fqn: std::sync::Arc::new(
             "kotlin.NoSuchElementException".into(),
@@ -620,8 +617,7 @@ fn channel_is_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let empty = with_reg(|r| {
         r.channels
             .get(&id)
-            .map(|s| s.buffer.is_empty())
-            .unwrap_or(true)
+            .is_none_or(|s| s.buffer.is_empty())
     });
     Ok(Value::Bool(empty))
 }
@@ -706,7 +702,7 @@ fn delay_top_level(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn delay_millis(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let ms = match ctx.args.first() {
         Some(Value::Long(l)) => *l,
-        Some(Value::Int(i)) => *i as i64,
+        Some(Value::Int(i)) => i64::from(*i),
         _ => {
             return Err(RuntimeError::Type(
                 "kotlinx.coroutines.delay: argument must be Long".into(),
@@ -719,8 +715,7 @@ fn delay_millis(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn current_time_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_millis() as i64);
     Ok(Value::Long(t))
 }
 
@@ -736,7 +731,7 @@ fn token_create(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn token_cancel(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let id = match ctx.args.first() {
         Some(Value::Long(l)) => *l,
-        Some(Value::Int(i)) => *i as i64,
+        Some(Value::Int(i)) => i64::from(*i),
         _ => return Err(RuntimeError::Type("tokenCancel: argument must be Long".into())),
     };
     with_reg(|r| r.cancelled_tokens.insert(id));
@@ -746,7 +741,7 @@ fn token_cancel(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn token_is_cancelled(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let id = match ctx.args.first() {
         Some(Value::Long(l)) => *l,
-        Some(Value::Int(i)) => *i as i64,
+        Some(Value::Int(i)) => i64::from(*i),
         _ => return Ok(Value::Bool(false)),
     };
     if id == 0 {
@@ -759,7 +754,7 @@ fn token_is_cancelled(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn scheduler_enqueue(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let h = match ctx.args.first() {
         Some(Value::Long(l)) => *l,
-        Some(Value::Int(i)) => *i as i64,
+        Some(Value::Int(i)) => i64::from(*i),
         _ => return Err(RuntimeError::Type("schedulerEnqueue: argument must be Long".into())),
     };
     with_reg(|r| r.sched_queue.push(h));
@@ -784,11 +779,10 @@ fn kxco_system_prop(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         return Ok(Value::String(std::sync::Arc::new(v)));
     }
     let alias: String = key.chars().map(|c| if c == '.' { '_' } else { c }).collect();
-    if alias != key {
-        if let Ok(v) = std::env::var(&alias) {
+    if alias != key
+        && let Ok(v) = std::env::var(&alias) {
             return Ok(Value::String(std::sync::Arc::new(v)));
         }
-    }
     Ok(Value::Null)
 }
 
@@ -848,7 +842,7 @@ fn dispatch_coroutine_io(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn join_dispatched(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let id = match ctx.args.first() {
         Some(Value::Long(l)) => *l,
-        Some(Value::Int(i)) => *i as i64,
+        Some(Value::Int(i)) => i64::from(*i),
         _ => {
             return Err(RuntimeError::Type(
                 "__kxco_joinDispatched: argument must be Long".into(),
@@ -900,7 +894,7 @@ fn new_slot(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn park_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let slot = match ctx.args.first() {
         Some(Value::Long(l)) => *l,
-        Some(Value::Int(i)) => *i as i64,
+        Some(Value::Int(i)) => i64::from(*i),
         _ => {
             return Err(RuntimeError::Type(
                 "__kxco_parkSlot: argument must be Long".into(),
@@ -918,7 +912,7 @@ fn park_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 fn resume_slot(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let slot = match ctx.args.first() {
         Some(Value::Long(l)) => *l,
-        Some(Value::Int(i)) => *i as i64,
+        Some(Value::Int(i)) => i64::from(*i),
         _ => {
             return Err(RuntimeError::Type(
                 "__kxco_resumeSlot: argument must be Long".into(),
@@ -935,5 +929,5 @@ fn scheduler_drain_count(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         r.sched_queue.clear();
         n
     });
-    Ok(Value::new_int(count as i64))
+    Ok(Value::new_int(i64::from(count)))
 }

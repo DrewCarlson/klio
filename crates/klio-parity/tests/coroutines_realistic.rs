@@ -39,14 +39,14 @@ fun main() = runBlocking {
 
 #[test]
 fn async_await_value() {
-    let src = r#"
+    let src = r"
 import kotlinx.coroutines.*
 fun main() = runBlocking {
     val a = async { delay(5); 6 }
     val b = async { delay(3); 7 }
     println(a.await() * b.await())
 }
-"#;
+";
     assert_klio("async_await", src, "42\n");
 }
 
@@ -72,7 +72,7 @@ fun main() = runBlocking {
     let raw = klio_parity::run_with_packs(&file).expect("run");
     let trimmed = raw.trim();
     let mut parts: Vec<&str> = trimmed.split(';').filter(|s| !s.is_empty()).collect();
-    parts.sort();
+    parts.sort_unstable();
     let joined = parts.join(";");
     assert_eq!(joined, "c1;c2;p", "got `{trimmed}`");
 }
@@ -111,7 +111,7 @@ fun main() = runBlocking {
 
 #[test]
 fn nested_runBlocking_returns_value() {
-    let src = r#"
+    let src = r"
 import kotlinx.coroutines.*
 fun compute(): Int = runBlocking {
     delay(2)
@@ -119,13 +119,13 @@ fun compute(): Int = runBlocking {
     n.await() * 2
 }
 fun main() { println(compute()) }
-"#;
+";
     assert_klio("nested_run_blocking", src, "42\n");
 }
 
 #[test]
 fn coroutine_scope_block() {
-    let src = r#"
+    let src = r"
 import kotlinx.coroutines.*
 fun main() = runBlocking {
     val r = coroutineScope {
@@ -135,7 +135,7 @@ fun main() = runBlocking {
     }
     println(r)
 }
-"#;
+";
     assert_klio("co_scope", src, "3\n");
 }
 

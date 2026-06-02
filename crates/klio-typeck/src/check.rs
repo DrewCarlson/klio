@@ -789,7 +789,7 @@ pub(crate) struct Checker<'a> {
     /// type machinery never sees an alias name.
     aliases: HashMap<String, TypeAliasInfo>,
     /// Stack of "is the enclosing function `public inline`?" flags. Used by
-    /// the J6 @PublishedApi visibility check: inside a public-inline body,
+    /// the J6 @`PublishedApi` visibility check: inside a public-inline body,
     /// references to `internal` declarations are forbidden unless the
     /// target carries `@PublishedApi`.
     public_inline_stack: Vec<bool>,
@@ -836,7 +836,7 @@ pub(crate) struct Checker<'a> {
     /// dataflow consumers.
     cfgs: HashMap<Span, klio_cfa::Cfg>,
     /// Full lowering output per function: CFG + side tables. The
-    /// smart-cast / VIA / reachability queries need span_to_pos and
+    /// smart-cast / VIA / reachability queries need `span_to_pos` and
     /// aliases, which the CFG itself doesn't carry.
     lowerings: HashMap<Span, std::rc::Rc<klio_cfa::lower::Lowered>>,
     /// Stack of currently-active function spans so per-expression
@@ -1201,10 +1201,10 @@ mod tests {
     #[test]
     fn user_class_call_type_checks() {
         let tc = check_src(
-            r#"
+            r"
             class Box(val x: Int)
             fun main() { val b = Box(3); println(b.x) }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1230,10 +1230,10 @@ mod tests {
     #[test]
     fn abstract_member_not_implemented() {
         let tc = check_src(
-            r#"
+            r"
             abstract class Shape { abstract fun area(): Int }
             class Square : Shape()
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_ABSTRACT_MEMBER_NOT_IMPLEMENTED));
     }
@@ -1241,13 +1241,13 @@ mod tests {
     #[test]
     fn delegate_with_operator_modifier_ok() {
         let tc = check_src(
-            r#"
+            r"
             class D {
                 operator fun getValue(thisRef: Any?, prop: Any?): Int = 1
                 operator fun setValue(thisRef: Any?, prop: Any?, value: Int) {}
             }
             var x: Int by D()
-            "#,
+            ",
         );
         assert!(
             !codes(&tc).contains(&codes::TYPE_DELEGATE_OPERATOR_REQUIRED),
@@ -1259,12 +1259,12 @@ mod tests {
     #[test]
     fn delegate_missing_operator_on_get_value_flagged() {
         let tc = check_src(
-            r#"
+            r"
             class D {
                 fun getValue(thisRef: Any?, prop: Any?): Int = 1
             }
             val x: Int by D()
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_DELEGATE_OPERATOR_REQUIRED));
     }
@@ -1272,13 +1272,13 @@ mod tests {
     #[test]
     fn delegate_missing_operator_on_set_value_flagged() {
         let tc = check_src(
-            r#"
+            r"
             class D {
                 operator fun getValue(thisRef: Any?, prop: Any?): Int = 1
                 fun setValue(thisRef: Any?, prop: Any?, value: Int) {}
             }
             var x: Int by D()
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_DELEGATE_OPERATOR_REQUIRED));
     }
@@ -1314,12 +1314,12 @@ mod tests {
         // Rectangle overrides Shape.area; Square inherits from Rectangle.
         // No diamond: Rectangle <: Shape, so Rectangle's default shadows.
         let tc = check_src(
-            r#"
+            r"
             open class Shape { open fun area(): Int = 0 }
             open class Rectangle : Shape() { override fun area(): Int = 1 }
             class Square : Rectangle()
             fun main() { println(Square().area()) }
-            "#,
+            ",
         );
         assert!(!codes(&tc).contains(&codes::TYPE_DIAMOND_CONFLICT));
     }
@@ -1327,10 +1327,10 @@ mod tests {
     #[test]
     fn lateinit_var_string_ok() {
         let tc = check_src(
-            r#"
+            r"
             class Box { lateinit var s: String }
             fun main() { println(Box()) }
-            "#,
+            ",
         );
         let cs = codes(&tc);
         assert!(!cs.contains(&codes::TYPE_LATEINIT_VAL));
@@ -1342,10 +1342,10 @@ mod tests {
     #[test]
     fn lateinit_val_flagged() {
         let tc = check_src(
-            r#"
+            r"
             class Box { lateinit val s: String }
             fun main() { println(Box()) }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_LATEINIT_VAL));
     }
@@ -1353,10 +1353,10 @@ mod tests {
     #[test]
     fn lateinit_primitive_flagged() {
         let tc = check_src(
-            r#"
+            r"
             class Box { lateinit var n: Int }
             fun main() { println(Box()) }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_LATEINIT_PRIMITIVE));
     }
@@ -1375,10 +1375,10 @@ mod tests {
     #[test]
     fn lateinit_nullable_flagged() {
         let tc = check_src(
-            r#"
+            r"
             class Box { lateinit var s: String? }
             fun main() { println(Box()) }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_LATEINIT_NULLABLE));
     }
@@ -1386,13 +1386,13 @@ mod tests {
     #[test]
     fn accessor_return_type_match_ok() {
         let tc = check_src(
-            r#"
+            r"
             class Box {
                 val x: Int
                     get(): Int = 1
             }
             fun main() { println(Box().x) }
-            "#,
+            ",
         );
         assert!(!codes(&tc).contains(&codes::TYPE_ACCESSOR_RETURN_TYPE_MISMATCH));
     }
@@ -1414,13 +1414,13 @@ mod tests {
     #[test]
     fn member_access_resolves_through_class_table() {
         let tc = check_src(
-            r#"
+            r"
             class Box(val n: Int)
             fun main() {
                 val b = Box(3)
                 val y: Int = b.n
             }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1428,14 +1428,14 @@ mod tests {
     #[test]
     fn member_access_chains_propagate_class() {
         let tc = check_src(
-            r#"
+            r"
             class Inner(val value: Int)
             class Outer(val inner: Inner)
             fun main() {
                 val o = Outer(Inner(7))
                 val n: Int = o.inner.value
             }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1464,7 +1464,7 @@ mod tests {
         // inference this annotation would not match a fold whose
         // return is Unresolved.
         let tc = check_src(
-            r#"
+            r"
             fun main() {
                 val r: Int = listOf(1, 2, 3)
                     .map { it * 2 }
@@ -1472,7 +1472,7 @@ mod tests {
                     .fold(0) { acc, x -> acc + x }
                 println(r)
             }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1498,13 +1498,13 @@ mod tests {
         // but Widen() makes Int the preferred candidate. The variable type
         // annotation forces the chosen return type to be observable.
         let tc = check_src(
-            r#"
+            r"
             fun f(x: Int): Int = x
             fun f(x: Short): Short = x
             fun main() {
                 val a: Int = f(2)
             }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1530,11 +1530,11 @@ mod tests {
     #[test]
     fn named_arg_unknown_param_reports_t0089() {
         let tc = check_src(
-            r#"
+            r"
             fun f(x: Int): Int = x
             fun f(y: Int): Int = y
             fun main() { val _r = f(z = 1) }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_NAMED_PARAMETER_NOT_FOUND));
     }
@@ -1543,11 +1543,11 @@ mod tests {
     fn type_arg_count_filters_overloads() {
         // Spec §11.2.8: `f<Int>(...)` filters OCS by exact tp-count.
         let tc = check_src(
-            r#"
+            r"
             fun <T> f(x: T): T = x
             fun <T, U> f(x: T, y: U): T = x
             fun main() { val r: Int = f<Int>(1) }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1574,11 +1574,11 @@ mod tests {
         // Spec §11.4.2 case 3 tiebreaker: a non-generic candidate wins
         // over a generic one when applicability is otherwise equal.
         let tc = check_src(
-            r#"
+            r"
             fun f(x: Int): Int = x
             fun <T> f(x: T): Int = 0
             fun main() { val _r: Int = f(1) }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1589,10 +1589,10 @@ mod tests {
         // shape (one parameter, identical erased type), so any call site
         // would be ambiguous. Detect at declaration time.
         let tc = check_src(
-            r#"
+            r"
             fun f(x: Int): Int = x
             fun f(y: Int): Int = y
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_CONFLICTING_OVERLOADS));
     }
@@ -1600,10 +1600,10 @@ mod tests {
     #[test]
     fn distinct_overloads_no_conflict() {
         let tc = check_src(
-            r#"
+            r"
             fun f(x: Int): Int = x
             fun f(x: String): String = x
-            "#,
+            ",
         );
         assert!(!codes(&tc).contains(&codes::TYPE_CONFLICTING_OVERLOADS),
             "{:?}", tc.diagnostics.diagnostics());
@@ -1614,13 +1614,13 @@ mod tests {
         // Spec §11.2.2: both supertypes define `f`, basic `super.f` is
         // ambiguous; require `super<TypeName>.f`.
         let tc = check_src(
-            r#"
+            r"
             interface A { fun f(): Int }
             interface B { fun f(): Int }
             class C : A, B {
                 override fun f(): Int = super.f() + 1
             }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_AMBIGUOUS_SUPER));
     }
@@ -1628,13 +1628,13 @@ mod tests {
     #[test]
     fn super_qualified_unambiguous_ok() {
         let tc = check_src(
-            r#"
+            r"
             interface A { fun f(): Int { return 1 } }
             interface B { fun f(): Int { return 2 } }
             class C : A, B {
                 override fun f(): Int = super<A>.f() + super<B>.f()
             }
-            "#,
+            ",
         );
         let cs = codes(&tc);
         assert!(!cs.contains(&codes::TYPE_AMBIGUOUS_SUPER), "{:?}", tc.diagnostics.diagnostics());
@@ -1665,26 +1665,26 @@ mod tests {
         // unrelated types fit the literal `Any?` slot), no tiebreaker
         // distinguishes them, so emit T0091.
         let tc = check_src(
-            r#"
+            r"
             class A
             class B
             fun f(a: A): Int = 1
             fun f(b: B): Int = 2
             fun g(x: Any): Int = 0
             fun main() { val _r: Int = g(1) ; val _s: Int = f(A()) }
-            "#,
+            ",
         );
         // Sanity: the call to f(A()) above is unambiguous. We need an
         // actually-ambiguous pair. Force ambiguity via unrelated supers.
         let tc2 = check_src(
-            r#"
+            r"
             interface I
             interface J
             class Both : I, J
             fun f(x: I): Int = 1
             fun f(x: J): Int = 2
             fun main() { val _r: Int = f(Both()) }
-            "#,
+            ",
         );
         let _ = tc;
         assert!(codes(&tc2).contains(&codes::TYPE_OVERLOAD_RESOLUTION_AMBIGUITY),
@@ -1698,11 +1698,11 @@ mod tests {
         // it must not report T0091 (regression: upstream
         // kotlinx.atomicfu `atomic(...)` was flagged `(T), (T)`).
         let tc = check_src(
-            r#"
+            r"
             expect fun mk(x: Int): Int
             actual fun mk(x: Int): Int = x
             fun main() { val _r: Int = mk(1) }
-            "#,
+            ",
         );
         assert!(
             !codes(&tc).contains(&codes::TYPE_OVERLOAD_RESOLUTION_AMBIGUITY),
@@ -1714,11 +1714,11 @@ mod tests {
     #[test]
     fn msc_no_vararg_beats_vararg() {
         let tc = check_src(
-            r#"
+            r"
             fun f(x: Int): Int = x
             fun f(vararg xs: Int): Int = 0
             fun main() { val _r: Int = f(1) }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1727,11 +1727,11 @@ mod tests {
     fn none_applicable_reports_t0090() {
         // Spec §11.3: no candidate accepts 3 args.
         let tc = check_src(
-            r#"
+            r"
             fun f(x: Int): Int = x
             fun f(x: Int, y: Int): Int = x + y
             fun main() { val _r = f(1, 2, 3) }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_NONE_APPLICABLE));
     }
@@ -1739,10 +1739,10 @@ mod tests {
     #[test]
     fn type_arg_count_mismatch_reports_t0092() {
         let tc = check_src(
-            r#"
+            r"
             fun f(x: Int): Int = x
             fun main() { val _r = f<Int>(1) }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_TYPE_ARGUMENT_COUNT_MISMATCH));
     }
@@ -1750,13 +1750,13 @@ mod tests {
     #[test]
     fn overload_picks_int_over_long_per_widen() {
         let tc = check_src(
-            r#"
+            r"
             fun f(x: Int): Int = x
             fun f(x: Long): Long = x
             fun main() {
                 val a: Int = f(2)
             }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1764,7 +1764,7 @@ mod tests {
     #[test]
     fn smart_cast_narrows_val_member_chain() {
         let tc = check_src(
-            r#"
+            r"
             open class Shape
             class Circle(val radius: Int) : Shape()
             class Wrapper(val shape: Shape)
@@ -1774,7 +1774,7 @@ mod tests {
                 }
                 return 0
             }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1821,13 +1821,13 @@ mod tests {
     #[test]
     fn useless_cast_same_type() {
         let tc = check_src(
-            r#"
+            r"
             fun main() {
                 val x: Int = 5
                 val y = x as Int
                 println(y)
             }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::WARN_USELESS_CAST));
     }
@@ -1835,13 +1835,13 @@ mod tests {
     #[test]
     fn useless_elvis_nonnull_lhs() {
         let tc = check_src(
-            r#"
+            r"
             fun main() {
                 val x: Int = 5
                 val y = x ?: 0
                 println(y)
             }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::WARN_USELESS_ELVIS));
     }
@@ -1885,7 +1885,7 @@ mod tests {
     #[test]
     fn class_val_property_uninit_in_init_block() {
         let tc = check_src(
-            r#"
+            r"
             class Foo(b: Boolean) {
                 val x: Int
                 init {
@@ -1893,7 +1893,7 @@ mod tests {
                 }
             }
             fun main() { println(Foo(true).x) }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_VAR_NOT_DEFINITELY_ASSIGNED));
     }
@@ -1901,7 +1901,7 @@ mod tests {
     #[test]
     fn class_val_property_initialized_in_all_init_branches() {
         let tc = check_src(
-            r#"
+            r"
             class Foo(b: Boolean) {
                 val x: Int
                 init {
@@ -1909,7 +1909,7 @@ mod tests {
                 }
             }
             fun main() { println(Foo(true).x) }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1948,13 +1948,13 @@ mod tests {
     #[test]
     fn contract_run_initializes_val() {
         let tc = check_src(
-            r#"
+            r"
             fun main() {
                 val x: Int
                 run { x = 4 }
                 println(x)
             }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -1962,14 +1962,14 @@ mod tests {
     #[test]
     fn contract_check_introduces_smartcast() {
         let tc = check_src(
-            r#"
+            r"
             fun main() {
                 val x: Any = 42
                 check(x is Int)
                 val y: Int = x + 1
                 println(y)
             }
-            "#,
+            ",
         );
         assert!(!tc.diagnostics.has_errors(), "{:?}", tc.diagnostics.diagnostics());
     }
@@ -2008,7 +2008,7 @@ mod tests {
 
     #[test]
     fn opt_in_marker_propagates() {
-        let src = r#"
+        let src = r"
             @RequiresOptIn
             annotation class Experimental
 
@@ -2019,11 +2019,11 @@ mod tests {
 
             @OptIn(Experimental::class)
             fun safe(): Int = risky()
-        "#;
+        ";
         let tc = check_src(src);
         let cs = codes(&tc);
         let opt_in_errors = cs.iter().filter(|c| **c == codes::TYPE_OPT_IN_REQUIRED).count();
-        assert_eq!(opt_in_errors, 1, "expected one T0112 for `unsafe`, got: {:?}", cs);
+        assert_eq!(opt_in_errors, 1, "expected one T0112 for `unsafe`, got: {cs:?}");
     }
 
     #[test]
@@ -2065,23 +2065,23 @@ mod tests {
     #[test]
     fn suspend_call_from_suspend_ok() {
         let tc = check_src(
-            r#"
+            r"
             suspend fun a() {}
             suspend fun b() { a() }
             fun main() {}
-            "#,
+            ",
         );
         let cs = codes(&tc);
-        assert!(!cs.contains(&codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND), "{:?}", cs);
+        assert!(!cs.contains(&codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND), "{cs:?}");
     }
 
     #[test]
     fn suspend_call_from_non_suspend_flagged() {
         let tc = check_src(
-            r#"
+            r"
             suspend fun a() {}
             fun main() { a() }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND));
     }
@@ -2095,13 +2095,13 @@ mod tests {
         // `suspend (…) -> R` slots requires the `{…}` initializer to be
         // parsed as a lambda — tracked separately.)
         let tc = check_src(
-            r#"
+            r"
             suspend fun a() {}
             fun outer() {
                 val f = fun() { a() }
                 f()
             }
-            "#,
+            ",
         );
         assert!(codes(&tc).contains(&codes::TYPE_SUSPEND_CALL_FROM_NON_SUSPEND));
     }

@@ -22,6 +22,7 @@ pub struct FileDecls {
 
 /// Walk the curated stdlib roots under `stdlib_root` and return all parsed
 /// declarations. `stdlib_root` is expected to be `kotlin/libraries/stdlib`.
+#[must_use] 
 pub fn collect_decls(stdlib_root: &Path) -> (Vec<FileDecls>, CollectStats) {
     let mut out = Vec::new();
     let mut stats = CollectStats::default();

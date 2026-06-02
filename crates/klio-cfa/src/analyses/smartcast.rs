@@ -40,6 +40,7 @@ pub enum Nullability {
 }
 
 impl SmartCastFact {
+    #[must_use] 
     pub fn unknown() -> Self {
         Self {
             narrowed: None,
@@ -51,7 +52,7 @@ impl SmartCastFact {
 
     /// Compose `self` with an `is T` narrowing. Intersection-on-rhs
     /// when both are non-trivial; otherwise the more specific one
-    /// wins by direct replacement (Type::intersect normalises). The
+    /// wins by direct replacement (`Type::intersect` normalises). The
     /// optional `class_name` is recorded alongside for user-class
     /// narrowings whose Type is `Unresolved`.
     pub fn assume_is(&mut self, ty: Type, class_name: Option<String>) {
@@ -204,28 +205,26 @@ pub struct SmartCastTransfer<'a> {
     pub declared_types: Option<&'a HashMap<Place, Type>>,
 }
 
-impl<'a> SmartCastTransfer<'a> {
+impl SmartCastTransfer<'_> {
     fn fact_or_declared(&self, place: &Place, state: &SmartCastLattice) -> SmartCastFact {
         let mut fact = state
             .map
             .get(place)
             .cloned()
             .unwrap_or_else(SmartCastFact::unknown);
-        if fact.narrowed.is_none() {
-            if let Some(decl_map) = self.declared_types {
-                if let Some(t) = decl_map.get(place) {
+        if fact.narrowed.is_none()
+            && let Some(decl_map) = self.declared_types
+                && let Some(t) = decl_map.get(place) {
                     fact.narrowed = Some(t.clone());
                     // Nullable declared types get no automatic
                     // nullability axis — the explicit AssumeNull
                     // nodes carry that signal.
                 }
-            }
-        }
         fact
     }
 }
 
-impl<'a> ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'a> {
+impl ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'_> {
     fn transfer_node(&mut self, node: &Node, state: &mut SmartCastLattice) {
         match node {
             Node::AssumeIs { reg, ty, class_name, polarity, .. } => {
@@ -282,6 +281,7 @@ impl<'a> ForwardTransfer<SmartCastLattice> for SmartCastTransfer<'a> {
 /// Run the smart-cast analysis to fixpoint. Returns per-block in-
 /// states; the caller queries facts at the entry of the block
 /// containing a given AST span.
+#[must_use] 
 pub fn solve(cfg: &Cfg, reg_to_place: &HashMap<Reg, Place>) -> Vec<SmartCastLattice> {
     solve_with_declared(cfg, reg_to_place, None)
 }
@@ -289,6 +289,7 @@ pub fn solve(cfg: &Cfg, reg_to_place: &HashMap<Reg, Place>) -> Vec<SmartCastLatt
 /// Like `solve`, but also seeded with a per-place declared-type map
 /// that `AssumeRefEq` consults to bridge cross-variable narrowings
 /// when neither side has a prior fact.
+#[must_use] 
 pub fn solve_with_declared(
     cfg: &Cfg,
     reg_to_place: &HashMap<Reg, Place>,
@@ -303,6 +304,7 @@ pub fn solve_with_declared(
 
 /// Reproduce the per-node in-state walk inside a block. Mirrors
 /// `analyses::via::states_within_block` for ad-hoc lookups.
+#[must_use] 
 pub fn states_within_block(
     cfg: &Cfg,
     block: crate::ir::BlockId,
@@ -312,6 +314,7 @@ pub fn states_within_block(
     states_within_block_with_declared(cfg, block, entry, reg_to_place, None)
 }
 
+#[must_use] 
 pub fn states_within_block_with_declared(
     cfg: &Cfg,
     block: crate::ir::BlockId,

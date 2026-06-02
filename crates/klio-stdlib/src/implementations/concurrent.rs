@@ -1,4 +1,4 @@
-use super::*;
+use super::{Arc, CallCtx, Value, RuntimeError, thread_handle_stub};
 
 /// State of one reentrant monitor: which thread (if any) currently
 /// owns it and how deep its nesting is.
@@ -18,7 +18,7 @@ pub(crate) fn monitor_for(key: usize) -> Arc<(std::sync::Mutex<MonitorState>, st
     >;
     static REGISTRY: OnceLock<Reg> = OnceLock::new();
     let reg = REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut g = reg.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = reg.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     g.entry(key)
         .or_insert_with(|| {
             Arc::new((
@@ -52,7 +52,7 @@ pub fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
     // Acquire (reentrant): block until the monitor is free or already
     // owned by this thread, then take/deepen ownership.
     {
-        let mut st = mon.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = mon.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             match st.owner {
                 Some(o) if o == me => {
@@ -65,7 +65,7 @@ pub fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
                     break;
                 }
                 Some(_) => {
-                    st = mon.1.wait(st).unwrap_or_else(|e| e.into_inner());
+                    st = mon.1.wait(st).unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
             }
         }
@@ -78,7 +78,7 @@ pub fn concurrent_synchronized(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
     klio_runtime::fence_and_publish(); // monitor exit
     // Release one level; wake a waiter when fully released.
     {
-        let mut st = mon.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = mon.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if st.depth > 0 {
             st.depth -= 1;
         }

@@ -1,4 +1,4 @@
-use super::*;
+use super::{Value, Arc, RuntimeError, char_unit_to_string, char_unit_to_scalar, char_units_to_string, CallCtx, make_exception, make_list, perform_regex_replace, recv_int_radix, make_sequence, BufRead, char};
 
 // ============================================================
 // String members (receiver in args[0])
@@ -139,7 +139,7 @@ pub(crate) fn string_substring(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
 /// impls so the call doesn't route to upstream's `String.padStart =
 /// (this as CharSequence).padStart(...)`, whose explicit upcast klio
 /// ignores in overload selection — it re-dispatches to `String.padStart`
-/// and recurses forever, allocating a StringBuilder each level (OOM).
+/// and recurses forever, allocating a `StringBuilder` each level (OOM).
 pub(crate) fn string_pad(ctx: &mut CallCtx, at_start: bool, who: &str) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, who)?;
     let cur_len = utf16_len(s) as i64;
@@ -167,7 +167,7 @@ pub(crate) fn string_pad(ctx: &mut CallCtx, at_start: bool, who: &str) -> Result
         return Ok(Value::String(Arc::clone(s)));
     }
     let pad_count = (length - cur_len) as usize;
-    let padding: String = char_units_to_string(std::iter::repeat(pad).take(pad_count));
+    let padding: String = char_units_to_string(std::iter::repeat_n(pad, pad_count));
     let out = if at_start {
         format!("{padding}{s}")
     } else {
@@ -443,7 +443,7 @@ pub(crate) fn string_trim_generic(
     // `keep[i]` = char i is NOT trimmable.
     let keep: Vec<bool> = if extra.is_empty() {
         cs.iter()
-            .map(|&c| !char_unit_to_scalar(c).is_some_and(|c| c.is_whitespace()))
+            .map(|&c| !char_unit_to_scalar(c).is_some_and(char::is_whitespace))
             .collect()
     } else if extra.iter().all(|v| matches!(v, Value::Char(_))) {
         let set: Vec<u16> = extra
@@ -473,7 +473,7 @@ pub(crate) fn string_trim_generic(
         0
     };
     let hi = if trim_end {
-        keep.iter().rposition(|&k| k).map(|p| p + 1).unwrap_or(0)
+        keep.iter().rposition(|&k| k).map_or(0, |p| p + 1)
     } else {
         cs.len()
     };
@@ -532,9 +532,9 @@ pub(crate) fn string_to_int(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Some(format!("radix {radix} was not in valid range 2..36")),
         )));
     }
-    parse_int_radix(&s, radix as u32)
+    parse_int_radix(s, radix as u32)
         .ok()
-        .filter(|v| (i32::MIN as i64..=i32::MAX as i64).contains(v))
+        .filter(|v| (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(v))
         .map(Value::new_int)
         .ok_or_else(|| {
             RuntimeError::Thrown(make_exception(
@@ -555,11 +555,10 @@ pub(crate) fn string_to_int_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeE
     }
     // Bounds-check against the Int range: a value that fits i64 but overflows
     // i32 must return null, not a truncated Int.
-    Ok(parse_int_radix(&s, radix as u32)
+    Ok(parse_int_radix(s, radix as u32)
         .ok()
-        .filter(|v| (i32::MIN as i64..=i32::MAX as i64).contains(v))
-        .map(Value::new_int)
-        .unwrap_or(Value::Null))
+        .filter(|v| (i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(v))
+        .map_or(Value::Null, Value::new_int))
 }
 
 pub(crate) fn parse_int_radix(s: &str, radix: u32) -> Result<i64, ()> {
@@ -580,8 +579,8 @@ pub(crate) fn parse_int_radix(s: &str, radix: u32) -> Result<i64, ()> {
     let mut acc: i64 = 0;
     for ch in body.chars() {
         let d = ch.to_digit(radix).ok_or(())?;
-        acc = acc.checked_mul(radix as i64).ok_or(())?;
-        acc = acc.checked_add(d as i64).ok_or(())?;
+        acc = acc.checked_mul(i64::from(radix)).ok_or(())?;
+        acc = acc.checked_add(i64::from(d)).ok_or(())?;
     }
     if negative { acc = acc.checked_neg().ok_or(())?; }
     Ok(acc)
@@ -630,7 +629,7 @@ pub(crate) fn string_split_items(ctx: &mut CallCtx, who: &str) -> Result<Vec<Val
     let mut delims: Vec<String> = Vec::new();
     let mut ignore_case = false;
     let mut limit = 0i64;
-    let mut push_delim = |v: &Value, delims: &mut Vec<String>| -> bool {
+    let push_delim = |v: &Value, delims: &mut Vec<String>| -> bool {
         match v {
             Value::String(d) => {
                 delims.push((**d).clone());
@@ -676,7 +675,7 @@ pub(crate) fn string_split_items(ctx: &mut CallCtx, who: &str) -> Result<Vec<Val
             "String.split requires at least one delimiter".into(),
         ));
     }
-    Ok(split_on_any(&s, &delims, ignore_case, limit))
+    Ok(split_on_any(s, &delims, ignore_case, limit))
 }
 
 /// Split `s` on any of `delims` (left-to-right, non-overlapping), honoring a
@@ -947,10 +946,10 @@ pub(crate) fn string_trim_indent(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
         })
         .collect();
     // Trim leading and trailing blank lines.
-    while out_lines.first().map_or(false, |l| l.is_empty()) {
+    while out_lines.first().is_some_and(std::string::String::is_empty) {
         out_lines.remove(0);
     }
-    while out_lines.last().map_or(false, |l| l.is_empty()) {
+    while out_lines.last().is_some_and(std::string::String::is_empty) {
         out_lines.pop();
     }
     Ok(Value::String(Arc::new(out_lines.join("\n"))))
@@ -967,7 +966,7 @@ pub(crate) fn string_trim_margin(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
     let lines: Vec<&str> = s.split('\n').collect();
     let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
     for l in &lines {
-        let trimmed_start = l.trim_start_matches(|c: char| c == ' ' || c == '\t');
+        let trimmed_start = l.trim_start_matches([' ', '\t']);
         if let Some(rest) = trimmed_start.strip_prefix(&prefix) {
             out_lines.push(rest.to_string());
         } else {
@@ -975,10 +974,10 @@ pub(crate) fn string_trim_margin(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
         }
     }
     // Trim a single leading/trailing blank line (matching Kotlin behavior).
-    if out_lines.first().map_or(false, |l| l.chars().all(char::is_whitespace) && l.is_empty()) {
+    if out_lines.first().is_some_and(|l| l.chars().all(char::is_whitespace) && l.is_empty()) {
         out_lines.remove(0);
     }
-    if out_lines.last().map_or(false, |l| l.chars().all(char::is_whitespace) && l.is_empty()) {
+    if out_lines.last().is_some_and(|l| l.chars().all(char::is_whitespace) && l.is_empty()) {
         out_lines.pop();
     }
     Ok(Value::String(Arc::new(out_lines.join("\n"))))
@@ -1009,7 +1008,7 @@ pub(crate) fn string_to_long(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Some(format!("radix {radix} was not in valid range 2..36")),
         )));
     }
-    parse_int_radix(&s, radix as u32).map(Value::Long).map_err(|_| {
+    parse_int_radix(s, radix as u32).map(Value::Long).map_err(|()| {
         RuntimeError::Thrown(make_exception(
             "kotlin.NumberFormatException",
             Some(format!("For input string: \"{s}\"")),
@@ -1026,12 +1025,12 @@ pub(crate) fn string_to_long_or_null(ctx: &mut CallCtx) -> Result<Value, Runtime
     if !(2..=36).contains(&radix) {
         return Ok(Value::Null);
     }
-    Ok(parse_int_radix(&s, radix as u32).map(Value::Long).unwrap_or(Value::Null))
+    Ok(parse_int_radix(s, radix as u32).map_or(Value::Null, Value::Long))
 }
 
 pub(crate) fn string_to_double_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toDoubleOrNull")?;
-    Ok(s.parse::<f64>().map(Value::Double).unwrap_or(Value::Null))
+    Ok(s.parse::<f64>().map_or(Value::Null, Value::Double))
 }
 
 pub(crate) fn string_to_boolean(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -1187,14 +1186,14 @@ pub(crate) fn pad_spec(body: &str, width: Option<usize>, left: bool, zero: bool)
     }
     let pad = w - cur;
     let ch = if zero { '0' } else { ' ' };
-    let pad_str: String = std::iter::repeat(ch).take(pad).collect();
+    let pad_str: String = std::iter::repeat_n(ch, pad).collect();
     if zero {
         // Zero-pad after any sign / prefix.
         if let Some(rest) = body.strip_prefix('-') {
-            return format!("-{}{rest}", pad_str);
+            return format!("-{pad_str}{rest}");
         }
         if let Some(rest) = body.strip_prefix('+') {
-            return format!("+{}{rest}", pad_str);
+            return format!("+{pad_str}{rest}");
         }
     }
     if left {
@@ -1342,7 +1341,7 @@ pub(crate) fn as_long_for_format(v: &Value) -> Result<i64, RuntimeError> {
     }
     match v {
         Value::Char(c) => Ok(i64::from(u32::from(*c))),
-        Value::Bool(b) => Ok(if *b { 1 } else { 0 }),
+        Value::Bool(b) => Ok(i64::from(*b)),
         _ => Err(RuntimeError::Type(format!(
             "integer format spec requires Int-like, got {v:?}"
         ))),
@@ -1352,7 +1351,7 @@ pub(crate) fn as_long_for_format(v: &Value) -> Result<i64, RuntimeError> {
 pub(crate) fn as_double_for_format(v: &Value) -> Result<f64, RuntimeError> {
     match v {
         Value::Double(d) => Ok(*d),
-        Value::Int(n) => Ok(*n as f64),
+        Value::Int(n) => Ok(f64::from(*n)),
         _ => Err(RuntimeError::Type(format!(
             "float format spec requires Number, got {v:?}"
         ))),
@@ -1363,7 +1362,7 @@ pub(crate) fn fmt_with_commas(n: i64) -> String {
     let s = n.unsigned_abs().to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);

@@ -40,7 +40,7 @@ impl Severity {
 
 /// A stable diagnostic identifier paired with its default severity and
 /// message template. Names mirror the upstream Kotlin compiler so existing
-/// IDE infrastructure (IntelliJ inspections, quick-fix dispatchers, etc.)
+/// IDE infrastructure (`IntelliJ` inspections, quick-fix dispatchers, etc.)
 /// recognizes them without translation.
 #[derive(Debug, Clone, Copy)]
 pub struct DiagnosticFactory {

@@ -261,7 +261,7 @@ pub enum Inst {
     PropertyRef { dst: Reg, name: ConstId },
     /// `Receiver::name` — bind a callable reference to the
     /// receiver value. The host resolves the right shape
-    /// (BoundMethod, intrinsic, PropertyRef) from the receiver's
+    /// (`BoundMethod`, intrinsic, `PropertyRef`) from the receiver's
     /// class table.
     MemberRef { dst: Reg, receiver: Reg, name: ConstId },
     /// Binary primitive operation. Operands are guaranteed to be
@@ -359,7 +359,7 @@ pub enum Inst {
     /// name. Used so tree-walker-style dispatch paths (`repeat`,
     /// `let`, `with`, `Result.map`, …) that pattern-match on
     /// `Value::Lambda` can call IR-lowered lambdas without each
-    /// site needing a separate IrClosure branch.
+    /// site needing a separate `IrClosure` branch.
     AstLambda {
         dst: Reg,
         params: Vec<String>,
@@ -372,10 +372,10 @@ pub enum Inst {
         /// lambdas — the enclosing function is the return target.
         #[serde(default)]
         absorb_return: bool,
-        /// FuncId of the IR-lowered body. The lambda lowering also
+        /// `FuncId` of the IR-lowered body. The lambda lowering also
         /// emits an IR Func for the body in parallel with the AST
         /// snapshot; call sites that recognise IR-lowered lambdas
-        /// can dispatch through this FuncId without going through
+        /// can dispatch through this `FuncId` without going through
         /// the tree walker. `None` for legacy emissions that
         /// haven't been migrated.
         #[serde(default)]
@@ -431,7 +431,7 @@ pub enum Terminator {
     /// calls between two `tailrec` functions so mutual recursion stays
     /// in a single host frame.
     TailCallFunc { func: FuncId, args: Reg, n_args: u8 },
-    /// Non-local return — propagates an EvalError::NonLocalReturn
+    /// Non-local return — propagates an `EvalError::NonLocalReturn`
     /// up through enclosing lambda frames until a non-lambda fn
     /// catches it and converts it into a normal return value.
     NonLocalReturn(Option<Reg>),
@@ -485,7 +485,7 @@ pub struct Block {
     #[serde(default)]
     pub finally_done: Option<BlockId>,
     /// When this block IS the post-finally sentinel for some
-    /// try-region, this carries the BlockId of that region's body
+    /// try-region, this carries the `BlockId` of that region's body
     /// entry — the matching key for the [`crate::eval::TryFrame::body`]
     /// the eval popped. Set on the sentinel itself rather than the
     /// body so the eval can detect "I just left a finally region"
@@ -577,11 +577,11 @@ pub struct Module {
     pub consts: Vec<Const>,
     /// Top-level (file-scope) function ids, in declaration order.
     pub top_level: Vec<FuncId>,
-    /// Top-level class declarations by simple name → ClassId. The
+    /// Top-level class declarations by simple name → `ClassId`. The
     /// lowering pass populates this so `Foo(args)` Calls become
     /// `NewInstance` instructions when `Foo` resolves to a class.
     pub class_index: Vec<(String, ClassId)>,
-    /// Top-level function declarations by simple name → FuncId.
+    /// Top-level function declarations by simple name → `FuncId`.
     /// Lowering routes Path-callees that match a registered name
     /// to `Inst::Call { func }` instead of LoadGlobal+CallValue.
     pub func_index: Vec<(String, FuncId)>,
@@ -764,7 +764,7 @@ impl Module {
     pub fn funcs_by_simple_name(&self, name: &str) -> &[FuncId] {
         self.func_name_index
             .get(name)
-            .map(|v| v.as_slice())
+            .map(std::vec::Vec::as_slice)
             .unwrap_or(&[])
     }
 

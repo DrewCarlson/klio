@@ -1,6 +1,6 @@
-use crate::*;
+use crate::{VmHost, primitive_param_accepts, is_function_type, value_is_callable, pack_vararg_args, ext_decl_recv_is_user_class, value_is_builtin, ClosureInfo, Arc};
 
-impl<'a> VmHost<'a> {
+impl VmHost<'_> {
     pub(crate) fn call_func(
         &mut self,
         module: &klio_ir::Module,
@@ -35,18 +35,17 @@ impl<'a> VmHost<'a> {
         // unchanged.
         if !f.blocks.is_empty() && !args.is_empty() {
             let user_offset = usize::from(
-                f.params.first().map_or(false, |p| p.name == "this"),
+                f.params.first().is_some_and(|p| p.name == "this"),
             );
             let mismatch = args.iter().enumerate().any(|(i, v)| {
                 f.params
                     .get(user_offset + i)
-                    .map_or(false, |p| !p.is_vararg && !primitive_param_accepts(&p.ty.name, v))
+                    .is_some_and(|p| !p.is_vararg && !primitive_param_accepts(&p.ty.name, v))
             });
-            if mismatch {
-                if let Some(intrinsic) = self.lookup_intrinsic(&f.fqn) {
+            if mismatch
+                && let Some(intrinsic) = self.lookup_intrinsic(&f.fqn) {
                     return self.dispatch_intrinsic(intrinsic, &args);
                 }
-            }
         }
         // Bodyless `expect` decl: redirect to a same-name same-arity
         // sibling with a body. Source files are lowered in order, so
@@ -70,14 +69,14 @@ impl<'a> VmHost<'a> {
                     let g_user_params = if g
                         .params
                         .first()
-                        .map_or(false, |p| p.name == "this")
+                        .is_some_and(|p| p.name == "this")
                     {
                         g_params - 1
                     } else {
                         g_params
                     };
                     if g_user_params != want
-                        && !g.params.last().map_or(false, |p| p.is_vararg)
+                        && !g.params.last().is_some_and(|p| p.is_vararg)
                     {
                         continue;
                     }
@@ -125,19 +124,18 @@ impl<'a> VmHost<'a> {
         // param; the gap params fall back to their defaults. Without
         // this the lambda would slot into the first (defaulted)
         // param and the real last param would be left unbound.
-        if args.len() < f.params.len() && args.len() >= 1 {
+        if args.len() < f.params.len() && !args.is_empty() {
             let last_is_fn = f
                 .params
                 .last()
-                .map(|p| is_function_type(&p.ty))
-                .unwrap_or(false);
+                .is_some_and(|p| is_function_type(&p.ty));
             let trailing_is_callable =
-                args.last().map(value_is_callable).unwrap_or(false);
+                args.last().is_some_and(value_is_callable);
             if last_is_fn && trailing_is_callable {
                 let lead = args.len() - 1;
                 let last_param = f.params.len() - 1;
-                if lead < last_param {
-                    if let Some(defaults) = self.prog.func_defaults.get(&func).cloned() {
+                if lead < last_param
+                    && let Some(defaults) = self.prog.func_defaults.get(&func).cloned() {
                         let trailing = args.pop().unwrap();
                         for idx in lead..last_param {
                             if let Some(Some(default_fid)) = defaults.get(idx) {
@@ -165,11 +163,10 @@ impl<'a> VmHost<'a> {
                         }
                         args.push(trailing);
                     }
-                }
             }
         }
-        if args.len() < f.params.len() {
-            if let Some(defaults) = self.prog.func_defaults.get(&func).cloned() {
+        if args.len() < f.params.len()
+            && let Some(defaults) = self.prog.func_defaults.get(&func).cloned() {
                 for idx in args.len()..f.params.len() {
                     if let Some(Some(default_fid)) = defaults.get(idx) {
                         let dfid = *default_fid;
@@ -192,10 +189,10 @@ impl<'a> VmHost<'a> {
                         // as a capture, not a param — seed capture[0]
                         // with the receiver so a bare member read like
                         // `size` resolves through it.
-                        let captures: Vec<klio_runtime::Value> = if !args.is_empty() {
-                            vec![args[0].clone()]
-                        } else {
+                        let captures: Vec<klio_runtime::Value> = if args.is_empty() {
                             Vec::new()
+                        } else {
+                            vec![args[0].clone()]
                         };
                         let v = klio_ir::eval::eval_with_captures(
                             module, &dfunc, args.clone(), captures, self,
@@ -206,7 +203,6 @@ impl<'a> VmHost<'a> {
                     }
                 }
             }
-        }
         let args = pack_vararg_args(&f, args);
         klio_ir::eval::eval_with(module, &f, args, self)
     }
@@ -221,8 +217,8 @@ impl<'a> VmHost<'a> {
         // Reorder named args against the target function's
         // declared parameter list. Positional args fill the next
         // free slot; named args slot by name.
-        if arg_names.iter().any(|n| n.is_some()) {
-            if let Some(f) = module.funcs.get(func.0 as usize) {
+        if arg_names.iter().any(std::option::Option::is_some)
+            && let Some(f) = module.funcs.get(func.0 as usize) {
                 let params = &f.params;
                 let mut slots: Vec<Option<klio_runtime::Value>> = vec![None; params.len()];
                 // Bind named arguments first so a following positional
@@ -234,13 +230,12 @@ impl<'a> VmHost<'a> {
                 // instead overwrite the named slot and shift every
                 // later argument (dropping the last one).
                 for (i, a) in args.iter().enumerate() {
-                    if let Some(Some(arg_name)) = arg_names.get(i) {
-                        if let Some(pos) =
+                    if let Some(Some(arg_name)) = arg_names.get(i)
+                        && let Some(pos) =
                             params.iter().position(|p| &p.name == arg_name)
                         {
                             slots[pos] = Some(a.clone());
                         }
-                    }
                 }
                 // Vararg-aware positional walk: positional args that
                 // land on the vararg slot (and every subsequent
@@ -355,7 +350,6 @@ impl<'a> VmHost<'a> {
                 }
                 return self.call_func(module, func, reordered);
             }
-        }
         self.call_func(module, func, args)
     }
 
@@ -382,8 +376,8 @@ impl<'a> VmHost<'a> {
         // class. Re-dispatch as a member call so the builtin member
         // wins. Instance / Class receivers never trip this, so
         // interface- and subtype-receiver extensions are unaffected.
-        if let Some(f) = module.funcs.get(func.0 as usize) {
-            if f.params.first().map(|p| p.name == "this").unwrap_or(false)
+        if let Some(f) = module.funcs.get(func.0 as usize)
+            && f.params.first().is_some_and(|p| p.name == "this")
                 && !args.is_empty()
                 && ext_decl_recv_is_user_class(&f.params[0].ty.name)
                 && value_is_builtin(&args[0])
@@ -393,7 +387,6 @@ impl<'a> VmHost<'a> {
                 let rest = args[1..].to_vec();
                 return self.call_member(&recv, &fname, &rest);
             }
-        }
         // Bind each call-site type-arg name to a synth
         // `Value::Class` global for the duration of the call so
         // reified type-param reads (`T::class`) resolve. We

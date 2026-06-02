@@ -3,15 +3,15 @@
 //! (the non-loom path) across genuine threads.
 //!
 //! Runs under plain `cargo test`. It is also written to be clean
-//! under ThreadSanitizer; the CI invocation is:
+//! under `ThreadSanitizer`; the CI invocation is:
 //!
 //!   RUSTFLAGS="-Zsanitizer=thread" \
-//!     cargo +nightly test -p klio-runtime --test objref_threads \
+//!     cargo +nightly test -p klio-runtime --test `objref_threads` \
 //!     --target <host-triple>
 //!
-//! (TSan needs a nightly toolchain and an explicit `--target`; when
+//! (`TSan` needs a nightly toolchain and an explicit `--target`; when
 //! those are unavailable locally the test still passes on stable and
-//! TSan is run in CI.)
+//! `TSan` is run in CI.)
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -89,12 +89,12 @@ fun main() {
 // 5. Lambda returning lambda chain, currying-style.
 #[test]
 fn curried_lambda_chain() {
-    let src = r#"
+    let src = r"
 fun main() {
     val add: (Int) -> (Int) -> (Int) -> Int = { a -> { b -> { c -> a + b + c } } }
     println(add(1)(2)(3))
 }
-"#;
+";
     assert_klio("curried", src, "6\n");
 }
 
@@ -130,14 +130,14 @@ fun main() {
 // 8. Captured `it` in nested let-blocks doesn't bleed across.
 #[test]
 fn nested_let_it_scoping() {
-    let src = r#"
+    let src = r"
 fun main() {
     val a = 3.let { outer ->
         4.let { inner -> outer * inner }
     }
     println(a)
 }
-"#;
+";
     assert_klio("let_it_scoping", src, "12\n");
 }
 
@@ -161,13 +161,13 @@ fun main() = runBlocking {
 //     observed across the boundary.
 #[test]
 fn primitive_box_observability() {
-    let src = r#"
+    let src = r"
 fun main() {
     var counter = 0
     val tick: () -> Int = { counter += 1; counter }
     repeat(5) { tick() }
     println(counter)
 }
-"#;
+";
     assert_klio("box_obs", src, "5\n");
 }

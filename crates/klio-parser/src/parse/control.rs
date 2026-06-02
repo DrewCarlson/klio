@@ -1,6 +1,6 @@
-use super::*;
+use super::{Parser, Expr, TokenKind, AssignOp, Stmt, Block, Keyword, Ident, Catch, WhenBinding, WhenBranch, WhenPattern, WhenPatternKind, Span};
 
-impl<'src, 'tok> Parser<'src, 'tok> {
+impl Parser<'_, '_> {
     /// Parses a `controlStructureBody` per the spec: a statement (which
     /// may be an assignment) wrapped as a single-statement block, or an
     /// expression. Used for `if` / `else` / `while` / `for` / `do-while`

@@ -27,7 +27,7 @@ mod env;
 pub use env::*;
 
 mod gc_traverse;
-pub(crate) use gc_traverse::*;
+pub(crate) use gc_traverse::{publish_value, publish_env};
 
 /// The whole point of the value-model migration: a `Value` (and the
 /// interpreter state reachable through it) can be sent and shared

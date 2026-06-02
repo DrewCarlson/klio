@@ -294,10 +294,10 @@ impl<'a> Printer<'a> {
                                         p.nest(|p| p.expr(e));
                                     }
                                     klio_ast::WhenPatternKind::IsType(t) => {
-                                        p.line(&format!("is {}", render_type(t)))
+                                        p.line(&format!("is {}", render_type(t)));
                                     }
                                     klio_ast::WhenPatternKind::NotIsType(t) => {
-                                        p.line(&format!("!is {}", render_type(t)))
+                                        p.line(&format!("!is {}", render_type(t)));
                                     }
                                 }
                             }

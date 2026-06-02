@@ -38,7 +38,7 @@ fun main() = runBlocking {
 
 #[test]
 fn suspend_in_lambda() {
-    let src = r#"
+    let src = r"
 import kotlinx.coroutines.*
 fun main() = runBlocking {
     val results = mutableListOf<Int>()
@@ -52,7 +52,7 @@ fun main() = runBlocking {
     results.sort()
     println(results)
 }
-"#;
+";
     assert_klio("suspend_lambda", src, "[10, 20, 30]\n");
 }
 
@@ -106,7 +106,7 @@ fun main() = runBlocking {
 
 #[test]
 fn coroutine_returns_through_runBlocking() {
-    let src = r#"
+    let src = r"
 import kotlinx.coroutines.*
 fun compute(): Int = runBlocking {
     val a = async { delay(1); 100 }
@@ -114,6 +114,6 @@ fun compute(): Int = runBlocking {
     a.await() + b.await()
 }
 fun main() { println(compute()) }
-"#;
+";
     assert_klio("rb_returns", src, "300\n");
 }

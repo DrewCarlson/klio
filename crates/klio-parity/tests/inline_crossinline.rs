@@ -84,7 +84,7 @@ fun main() {
 // 3. `noinline` keeps a lambda as an ordinary closure (storable).
 #[test]
 fn noinline_storable() {
-    let src = r#"
+    let src = r"
 fun later(): MutableList<() -> Int> = mutableListOf()
 
 inline fun setup(noinline produce: () -> Int, eager: () -> Int): Int {
@@ -97,7 +97,7 @@ fun main() {
     val r = setup({ 7 }, { 5 })
     println(r)
 }
-"#;
+";
     assert_klio("noinline_storable", src, "12\n");
 }
 
