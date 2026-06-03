@@ -9,6 +9,40 @@ use crate::{
 type ScoredCandidate = ((klio_ir::FuncId, klio_ir::Func), (i32, i32, i32));
 
 impl VmHost<'_> {
+    /// Default-arg thunk slots for `method` as declared (with defaults)
+    /// on a supertype of the receiver — walking the supertype chain via
+    /// the runtime class table. Used to fill omitted trailing args for
+    /// an anonymous-object override, which carries no defaults of its
+    /// own (the build-time interface→override default fold only covers
+    /// methods in `module.classes`, not the per-object synthetic class).
+    /// Slots are indexed by lowered params (slot 0 = the implicit
+    /// `this`), matching `func_defaults` / `pad_args_with_defaults`.
+    pub(crate) fn inherited_member_defaults(
+        &self,
+        supertypes: &[String],
+        method: &str,
+    ) -> Option<Vec<Option<klio_ir::FuncId>>> {
+        let amd = &self.module.registry.abstract_member_defaults;
+        let mut queue: Vec<String> = supertypes.to_vec();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(cn) = queue.pop() {
+            if !seen.insert(cn.clone()) {
+                continue;
+            }
+            let simple = cn.rsplit('.').next().unwrap_or(&cn).to_string();
+            if let Some(slots) = amd
+                .get(&(cn.clone(), method.to_string()))
+                .or_else(|| amd.get(&(simple, method.to_string())))
+            {
+                return Some(slots.clone());
+            }
+            if let Some(def) = self.classes.borrow().get(&cn) {
+                queue.extend(def.supertype_names.iter().cloned());
+            }
+        }
+        None
+    }
+
     // single dispatch over every built-in member; one match keeps receiver kinds together.
     // casts implement Kotlin numeric/index conversions; receiver arms repeat small bodies.
     #[allow(
@@ -1689,6 +1723,29 @@ impl VmHost<'_> {
                 let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
                 all.push(receiver.clone());
                 all.extend_from_slice(args);
+                // An anon-object override carries no default-arg thunks of
+                // its own — a call omitting trailing args must fill them
+                // from the supertype (interface/abstract) declaration's
+                // recorded defaults. Regular class methods get this via
+                // the build-time fold into `func_defaults`; anon methods
+                // live in a per-object sub-module the fold never sees.
+                let all = if all.len() < func.params.len() {
+                    let supertypes = inst.borrow().class.supertype_names.clone();
+                    if let Some(defaults) = self.inherited_member_defaults(&supertypes, name) {
+                        let main = Arc::clone(&self.module);
+                        pad_args_with_defaults(
+                            &main,
+                            func.params.len(),
+                            &all,
+                            Some(&defaults),
+                            self,
+                        )?
+                    } else {
+                        all
+                    }
+                } else {
+                    all
+                };
                 let all = pack_vararg_args(&func, all);
                 // Layer captured outer-env names onto globals for the
                 // duration of the method call so the body's

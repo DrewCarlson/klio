@@ -2541,6 +2541,38 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
             step: 1,
             kind: klio_runtime::RangeKind::Long,
         }),
+        (BinOp::RangeTo, Int(a), Long(b)) => Ok(Value::Range {
+            start: i64::from(*a),
+            end: *b,
+            step: 1,
+            kind: klio_runtime::RangeKind::Long,
+        }),
+        (BinOp::RangeTo, Long(a), Int(b)) => Ok(Value::Range {
+            start: *a,
+            end: i64::from(*b),
+            step: 1,
+            kind: klio_runtime::RangeKind::Long,
+        }),
+        // `RangeUntil` (`..<`) for `Long` endpoints and the mixed
+        // Int/Long promotions, mirroring the `RangeTo` cases above.
+        (BinOp::RangeUntil, Long(a), Long(b)) => Ok(Value::Range {
+            start: *a,
+            end: *b - 1,
+            step: 1,
+            kind: klio_runtime::RangeKind::Long,
+        }),
+        (BinOp::RangeUntil, Int(a), Long(b)) => Ok(Value::Range {
+            start: i64::from(*a),
+            end: *b - 1,
+            step: 1,
+            kind: klio_runtime::RangeKind::Long,
+        }),
+        (BinOp::RangeUntil, Long(a), Int(b)) => Ok(Value::Range {
+            start: *a,
+            end: i64::from(*b) - 1,
+            step: 1,
+            kind: klio_runtime::RangeKind::Long,
+        }),
         (BinOp::StringConcat, a, b) => {
             let mut s = render_value(a);
             s.push_str(&render_value(b));

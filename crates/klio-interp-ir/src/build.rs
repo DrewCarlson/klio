@@ -703,6 +703,20 @@ fn build_module_with_overrides(
             _ => None,
         })
         .collect();
+    // An `actual val`/`actual var` supersedes a matching bodyless
+    // `expect val`/`expect var`. Unlike classes/funs/objects, a
+    // top-level property has no overload key, so a same-name expect and
+    // actual would both lower to a global init — the bodyless expect
+    // (no initializer) racing the actual's real init, leaving the
+    // global at its null/zero default depending on lowering order.
+    // Collecting actual property names lets the retain drop the expect.
+    let actual_prop_names_set: std::collections::HashSet<String> = all_decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Property(p) if p.is_actual => Some(p.name.name.clone()),
+            _ => None,
+        })
+        .collect();
     // Drop superseded `expect` decls so every downstream pass sees
     // only the active definition for each name.
     all_decls.retain(|d| match d {
@@ -856,6 +870,7 @@ fn build_module_with_overrides(
             // call routes through klio's dispatch.
             false
         }
+        Decl::Property(p) => !(p.is_expect && actual_prop_names_set.contains(&p.name.name)),
         _ => true,
     });
     let decls: &[Decl] = &all_decls;
