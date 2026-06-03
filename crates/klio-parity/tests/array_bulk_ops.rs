@@ -184,6 +184,31 @@ fun main() {
 }
 
 #[test]
+fn kotlinx_io_read_byte_array() {
+    // readByteArray / readTo(ByteArray) bottom out on the extension
+    // `Source.readTo(ByteArray, ...)`; the member `Buffer.readTo(RawSink,
+    // byteCount)` must not shadow it (it's inapplicable by arity).
+    let src = r#"
+import kotlinx.io.Buffer
+import kotlinx.io.readByteArray
+import kotlinx.io.readTo
+
+fun main() {
+    val b = Buffer()
+    b.write(byteArrayOf(65, 66, 67))
+    println(b.readByteArray().joinToString(","))
+
+    val c = Buffer()
+    c.write(byteArrayOf(72, 105))
+    val dst = ByteArray(2)
+    c.readTo(dst)
+    println(dst.joinToString(","))
+}
+"#;
+    assert_klio("kxio_read_byte_array", src, "65,66,67\n72,105\n");
+}
+
+#[test]
 fn kotlinx_io_bytestring_encode_decode() {
     let src = r#"
 import kotlinx.io.bytestring.encodeToByteString

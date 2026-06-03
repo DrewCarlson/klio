@@ -375,6 +375,26 @@ impl VmHost<'_> {
             let f = &candidates[0];
             let params_skip = usize::from(f.params.first().is_some_and(|p| p.name == "this"));
             let effective = &f.params[params_skip..];
+            // A lone same-named member must also be applicable by
+            // *arity*: when fewer args are supplied than it declares and
+            // an unsupplied parameter is neither defaulted nor a vararg,
+            // it can't bind (dispatch would pad the slot with Unit).
+            // Decline so an applicable extension overload wins — e.g.
+            // `buffer.readTo(byteArray)` falls through the member
+            // `Buffer.readTo(RawSink, byteCount: Long)` to the extension
+            // `Source.readTo(ByteArray, startIndex = 0, endIndex = size)`.
+            if args.len() < effective.len() {
+                let defaults = self.prog.func_defaults.get(&f.id);
+                let satisfiable = (args.len()..effective.len()).all(|k| {
+                    effective[k].is_vararg
+                        || defaults
+                            .and_then(|d| d.get(params_skip + k))
+                            .is_some_and(std::option::Option::is_some)
+                });
+                if !satisfiable {
+                    return None;
+                }
+            }
             for (p, a) in effective.iter().zip(args.iter()) {
                 if self.arg_definitely_not_param_type(&p.ty, a) {
                     return None;
