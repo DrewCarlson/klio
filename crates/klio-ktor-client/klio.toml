@@ -1,13 +1,18 @@
 [library]
-id = "io.ktor.client"
+# Umbrella id for the whole ktor surface this pack ships
+# (`io.ktor.client.*`, `io.ktor.server.*`, `io.ktor.http.*`,
+# `io.ktor.serialization.*`). A pack is selected when a user import
+# prefix-matches its id, so the umbrella lets a server-only program
+# (which never imports `io.ktor.client.*`) still load the pack.
+id = "io.ktor"
 version = "3.2.0"
 abi = 1
 implicit_packages = []
 source_roots = ["shim"]
 auto_bindings = true
-# ktor's engine helpers live under io.ktor.client.engine — that
-# subpackage matches `<id>.` so the auto-binding prefix derived
-# from `id` picks them up.
+# Default auto-binding prefix is `io.ktor.`, covering both the client
+# (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
+# native engine helpers.
 
 [[deps]]
 id = "stdlib"

@@ -22,6 +22,9 @@ klio_stdlib::host_bindings! {
         "io.ktor.client.engine.__kktor_get"       => get,
         "io.ktor.client.engine.__kktor_post"      => post,
         "io.ktor.client.engine.__kktor_setHeader" => set_header,
+        // Server engine: bind a socket and dispatch each request back
+        // into the interpreter's routing lambda.
+        "io.ktor.server.engine.__kktor_serve"     => serve,
     }
 }
 
@@ -176,6 +179,131 @@ fn post(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 #[allow(clippy::unnecessary_wraps)]
 fn set_header(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Unit)
+}
+
+// ----- Server engine -----
+
+/// Read one HTTP/1.1 request off `stream`: returns `(method, path, body)`.
+/// Headers other than `Content-Length` are skipped; the body is read to
+/// the declared length. Returns `None` on a closed / malformed stream.
+fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String)> {
+    use std::io::{BufRead, BufReader, Read};
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).ok()? == 0 {
+        return None;
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            break;
+        }
+        let t = line.trim_end();
+        if t.is_empty() {
+            break;
+        }
+        if let Some(v) = t.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = v.trim().parse().unwrap_or(0);
+        }
+    }
+    let body = if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        reader.read_exact(&mut buf).ok()?;
+        String::from_utf8_lossy(&buf).into_owned()
+    } else {
+        String::new()
+    };
+    Some((method, path, body))
+}
+
+fn reason_phrase(status: i64) -> &'static str {
+    match status {
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        // 200 and any unmapped code use the generic OK phrase.
+        _ => "OK",
+    }
+}
+
+fn write_response(stream: &mut std::net::TcpStream, status: i64, content_type: &str, body: &str) {
+    use std::io::Write;
+    let resp = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+        reason = reason_phrase(status),
+        len = body.len(),
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
+/// `__kktor_serve(port, dispatch)`: bind `127.0.0.1:port` and serve
+/// forever. Each request is handed to `dispatch` — a Kotlin lambda
+/// `(Array<String>) -> Array<String>` taking `[method, path, body]` and
+/// returning `[status, contentType, body]` — run on this thread. The
+/// interpreter is single-threaded, so connections are handled
+/// sequentially, which is sufficient for the blocking `start(wait=true)`
+/// model.
+fn serve(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let port: u16 = match ctx.args.first() {
+        Some(Value::Int(p)) => u16::try_from(*p).unwrap_or(0),
+        Some(Value::Long(p)) => u16::try_from(*p).unwrap_or(0),
+        _ => return Err(RuntimeError::Type("__kktor_serve: port must be Int".into())),
+    };
+    let dispatch = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Type("__kktor_serve: missing dispatch lambda".into()))?;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| RuntimeError::Type(format!("__kktor_serve: bind {port} failed: {e}")))?;
+    for incoming in listener.incoming() {
+        let Ok(mut stream) = incoming else { continue };
+        let Some((method, path, body)) = read_request(&mut stream) else {
+            continue;
+        };
+        let req = Value::Array {
+            items: klio_runtime::ObjRef::new(vec![
+                Value::String(Arc::new(method)),
+                Value::String(Arc::new(path)),
+                Value::String(Arc::new(body)),
+            ]),
+            prim: None,
+        };
+        let out: &mut dyn klio_runtime::Output = ctx.out;
+        let resp = ctx.host.invoke_callable(&dispatch, &[req], out)?;
+        let (status, content_type, rbody) = decode_response(&resp);
+        write_response(&mut stream, status, &content_type, &rbody);
+    }
+    Ok(Value::Unit)
+}
+
+/// Pull `[status, contentType, body]` out of the dispatch lambda's
+/// returned `Array<String>`, with lenient fallbacks.
+fn decode_response(v: &Value) -> (i64, String, String) {
+    if let Value::Array { items, .. } | Value::List { items, .. } = v {
+        let items = items.borrow();
+        let status = match items.first() {
+            Some(Value::String(s)) => s.parse().unwrap_or(200),
+            Some(Value::Int(i)) => i64::from(*i),
+            Some(Value::Long(l)) => *l,
+            _ => 200,
+        };
+        let str_at = |i: usize| match items.get(i) {
+            Some(Value::String(s)) => (**s).clone(),
+            _ => String::new(),
+        };
+        return (status, str_at(1), str_at(2));
+    }
+    (500, "text/plain".into(), String::new())
 }
 
 // Bring `PrimitiveArrayKind` into the import group for forward-compat
