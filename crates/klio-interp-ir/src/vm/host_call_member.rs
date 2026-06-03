@@ -2077,6 +2077,23 @@ impl VmHost<'_> {
             }
             found
         };
+        // The primitive-array constructors (`byteArrayOf`, `intArrayOf`,
+        // …) are top-level global factories — never a member or
+        // extension of any receiver, and with no receiver-typed variant
+        // (`kotlin.collections.byteArrayOf` does not exist). A bare call
+        // inside an extension body reaches member dispatch with the
+        // enclosing receiver bound; the speculative receiver-prepend
+        // probe below would inject `this` as the first array element
+        // (`byteArrayOf(this, …)`). Dispatch the global intrinsic
+        // directly with the original args. Skipped (so a real same-named
+        // member still wins) when the receiver genuinely carries the
+        // member.
+        if klio_stdlib::is_array_builder(name)
+            && !self.host_has_member(receiver, name)
+            && let Some(func) = self.lookup_intrinsic(&format!("kotlin.{name}"))
+        {
+            return self.dispatch_intrinsic(func, args);
+        }
         if !member_shadows_stdlib
             && !user_member_ext_shadows
             && !klio_stdlib::is_toplevel_function(name)

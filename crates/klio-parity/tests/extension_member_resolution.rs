@@ -112,3 +112,27 @@ fun main() {
 "#;
     assert_klio("forward_ref_overload", src, "default:5\ncustom:5\n");
 }
+
+// A top-level array-constructor builder (`byteArrayOf`, `intArrayOf`, …)
+// called bare inside an extension function body must resolve to the
+// global builder, NOT be probed as `receiver.byteArrayOf(...)` (which
+// prepended the extension receiver into the constructed array).
+#[test]
+fn toplevel_array_builder_in_extension_not_member() {
+    let src = r#"
+class Holder(val tag: Int)
+fun Holder.bytes(): ByteArray = byteArrayOf(10, 20, 30, 40, 50)
+fun Holder.ints(): IntArray = intArrayOf(1, 2, 3)
+fun main() {
+    val h = Holder(99)
+    println(h.bytes().joinToString(","))
+    println("size=${h.bytes().size}")
+    println(h.ints().joinToString(","))
+}
+"#;
+    assert_klio(
+        "toplevel_array_builder_in_ext",
+        src,
+        "10,20,30,40,50\nsize=5\n1,2,3\n",
+    );
+}

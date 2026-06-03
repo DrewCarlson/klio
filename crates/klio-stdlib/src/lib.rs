@@ -120,6 +120,30 @@ pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
 /// bare names are stdlib top-level entities): take the lowercase
 /// entries (functions, not types/exceptions) and exclude the few
 /// that genuinely are receiver/infix extensions.
+/// The primitive-array constructor builders. Each is a top-level global
+/// factory (`byteArrayOf(vararg Byte): ByteArray`, …) with no
+/// receiver-typed variant — never a member or extension of any receiver.
+/// Member dispatch uses this to resolve a bare call inside an extension
+/// body to the global intrinsic instead of prepending the receiver.
+#[must_use]
+pub fn is_array_builder(name: &str) -> bool {
+    matches!(
+        name,
+        "byteArrayOf"
+            | "ubyteArrayOf"
+            | "shortArrayOf"
+            | "ushortArrayOf"
+            | "intArrayOf"
+            | "uintArrayOf"
+            | "longArrayOf"
+            | "ulongArrayOf"
+            | "charArrayOf"
+            | "floatArrayOf"
+            | "doubleArrayOf"
+            | "booleanArrayOf"
+    )
+}
+
 #[must_use]
 pub fn is_toplevel_function(name: &str) -> bool {
     // `to`, `downTo`, `step`, `until` are infix extensions on a
