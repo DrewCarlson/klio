@@ -22,7 +22,7 @@ include-list) *and* Rust host bindings (`src/lib.rs`).
 
 | Pack | Verified coverage | Biggest gap | Headline |
 |------|------------------:|-------------|----------|
-| `kotlinx.io` | ~45% | No filesystem layer; every ByteArray<->Segment copy is a no-op | Core string read/write works; bulk-byte I/O, line scanning, decimal/hex parsing all hang or silently drop data; `files/` package entirely absent |
+| `kotlinx.io` | ~80% | A few `files/` edges (`Path(dir, name)` builder, `list`) hit separate dispatch bugs; named-arg to an anon-object override | Buffer/Source/Sink read+write+scan (`readString`/`readLine`/byte ops/decimal/hex), ByteString, and the `files/` package (Path + SystemFileSystem create/write/read/append/metadata/delete/mkdirs) all work |
 | `io.ktor.client` | ~35% | No plugin/`install` system; no `body<T>()`/ContentNegotiation; HttpStatusCode/ContentType/Headers types missing | Basic `get`/`post(String)` round-trips, but the idiomatic builder DSL (`get(url){ header(...) }`), typed JSON, and all customization are unreachable |
 | `kotlinx.coroutines` | ~55% | StateFlow/SharedFlow `collect` and the whole `ChannelFlow` family crash; structured-concurrency exception isolation broken | Launch/async/await/delay/Channel suspend-send/Mutex/Flow basics solid; hot flows, `produce`/`channelFlow`, `select`, supervisor scopes, ChannelResult all broken |
 | `kotlinx.datetime` | ~30% | Every `expect` arithmetic/`until`/companion-factory has no actual → returns `Unit`; no `kotlin.time` subsystem | Construction + property access + tz conversion work; date arithmetic, `parse`, `daysUntil`/`periodUntil`, formatting, and the `Month`-enum constructor all stub out |
@@ -156,6 +156,30 @@ Still open (needs careful design, not a quick patch):
   guard preferring a matching user extension over-fires. The right fix is
   compile-time extension resolution (target the FuncId in the IR) or
   receiver-category-aware probes.
+
+**`kotlinx.io.files` implemented.** `Path` + `SystemFileSystem` backed by
+host `std::fs` (`__kxio_*` bindings). create/write/read/append/metadata/
+delete/mkdirs/exists/readLine all work through the real binary + installed
+pack. Implementing it surfaced and fixed three general interpreter gaps:
+mixed Int/Long ranges, `expect val` supersession by an `actual`, and
+interface-declared default args filled for an anonymous-object override.
+Three edge bugs remain (each general, not files-specific):
+- **`Path(base: Path, vararg parts)` builder.** Its body `Path(base.toString(),
+  *parts)` — the pack-lowered `base.toString()` returns the default
+  `Type@hash` rather than the `actual` override, although `base.toString()`
+  in user code and inside other klioMain methods dispatches correctly. So
+  `Path(dir, name)` drops the dir's real text. Workaround in the `list`
+  override (build via `Path(dir.toString(), name)`); user code should use
+  `Path("$dir/$name")` until fixed.
+- **`SystemFileSystem.list`.** A `copyCount` field-read on a `String`
+  surfaces (the io pack's `KlioCopyTracker` / Segment copy-tracker), a
+  Segment-sharing bug triggered by list's `map`-over-host-`List<String>`
+  after a sink. Other list-free file ops are unaffected.
+- **Named arg to an anonymous-object override.** `fs.sink(p, append=true)`
+  drops the named value before the anon dispatch (arrives as `[p]`, not
+  `[p, true]`); positional `fs.sink(p, true)` works. The anon method lives
+  in a per-object sub-module that `call_member_named`'s class-hierarchy
+  reorder walk does not cover.
 
 Re-verifying the top blockers against `target/release/klio` corrected
 two of them and root-caused a third.
