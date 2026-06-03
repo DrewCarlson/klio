@@ -81,11 +81,14 @@ Still open (needs careful design, not a quick patch):
   hid behind `Buffer.require(byteCount > size)` (throws EOFException) and
   the kotlinx.io read fallbacks. Now resolved from the current class's
   parent; `require(>size)` throws + is catchable, EOFException builds.
-- **Multi-level exception *message* is `null`** (single-level + builtin
-  messages are fine). The `super(message)` argument isn't propagated to
-  the builtin Throwable's `message` field across 2+ hops (separate from
-  the recursion fix; the primary-ctor vs secondary-ctor super paths bind
-  differently). Narrow.
+- **Exception messages through `super(...)` — FIXED (all paths).**
+  Primary-ctor chains (`NotFound : AppError : RuntimeException`),
+  secondary-ctor chains (`constructor(m) : super(m)`), and kotlinx.io's
+  `IOException` / `EOFException` now all carry their message. Root: a
+  kotlin-builtin Throwable's ctors are bodyless expect shells that drop
+  the super-args; bind message/cause directly when the chain (primary
+  parent-ctor walk *and* `run_super_ctor_chain`) reaches a builtin
+  Throwable. Verified byte-identical to kotlinc.
 - **kotlinx.io `readString(byteCount)` / `readLine` still hang.** Every
   sub-piece works in isolation (`forEachSegment`, `withData`, non-local
   return through both, `skip(partial)`, `min`, `require`), and
@@ -94,7 +97,13 @@ Still open (needs careful design, not a quick patch):
   (EOFException no longer overflows, yet it still hangs). The fault is
   the `commonReadUtf8` lambda composition — `skip(byteCount)` mutating
   the very segment list the enclosing inline `forEachSegment` is walking,
-  then a non-local `return`. Needs an instrumented eval-loop trace.
+  then a non-local `return`. Instrumented (per-frame block-loop counter,
+  global `eval_with_captures` / `call_func` / `call_member` counters):
+  the hang fires with NONE of them tripping — `readString(3L)` never
+  reaches `call_func`, `call_member`, or any interpreted body, while
+  `readString()` makes 300 `call_member` calls. So the loop is in a Vm
+  execution path below those entry points (a `CallValue` / Inst-exec
+  cycle); needs a trace at the Vm instruction-dispatch level.
 - **`recv.name(args)` where a user/pack extension's name collides with a
   stdlib intrinsic registered for a *different* receiver** (e.g.
   `LocalDate.until` / `String.until` vs `kotlin.ranges.until`). klio
