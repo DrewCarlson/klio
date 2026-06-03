@@ -10,8 +10,12 @@
 //> next=2024-06-17
 //> parse=2024-06-15
 //> epoch0=1970-01-01
+//> tparse=14:30:00
+//> dtparse=2024-06-15T14:30:00
 
 import kotlinx.datetime.LocalDate
+import kotlinx.datetime.LocalTime
+import kotlinx.datetime.LocalDateTime
 import kotlinx.datetime.DatePeriod
 import kotlinx.datetime.DateTimeUnit
 import kotlinx.datetime.DayOfWeek
@@ -32,4 +36,6 @@ fun main() {
     println("next=" + LocalDate(2024, 6, 12).nextOrSame(DayOfWeek.MONDAY))
     println("parse=" + LocalDate.parse("2024-06-15"))
     println("epoch0=" + LocalDate.fromEpochDays(0))
+    println("tparse=" + LocalTime.parse("14:30:00"))
+    println("dtparse=" + LocalDateTime.parse("2024-06-15T14:30:00"))
 }

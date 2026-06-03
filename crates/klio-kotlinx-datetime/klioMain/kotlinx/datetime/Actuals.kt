@@ -278,6 +278,31 @@ actual class LocalTime(
         return hour == other.hour && minute == other.minute && second == other.second && nanosecond == other.nanosecond
     }
     override fun hashCode(): Int = (((hour * 60 + minute) * 60 + second) * 1_000_000_000) + nanosecond
+
+    companion object {
+        // ISO-8601 `HH:mm[:ss[.fff…]]`.
+        fun parse(input: CharSequence): LocalTime {
+            val parts = input.toString().split(":")
+            if (parts.size < 2) {
+                throw IllegalArgumentException("Invalid ISO-8601 time: $input")
+            }
+            val hour = parts[0].toInt()
+            val minute = parts[1].toInt()
+            var second = 0
+            var nanos = 0
+            if (parts.size >= 3) {
+                val sec = parts[2]
+                val dot = sec.indexOf('.')
+                if (dot >= 0) {
+                    second = sec.substring(0, dot).toInt()
+                    nanos = sec.substring(dot + 1).padEnd(9, '0').substring(0, 9).toInt()
+                } else {
+                    second = sec.toInt()
+                }
+            }
+            return LocalTime(hour, minute, second, nanos)
+        }
+    }
 }
 
 // `actual` for upstream `expect class LocalDateTime` (LocalDateTime.kt).
@@ -313,6 +338,18 @@ actual class LocalDateTime(
         return date == other.date && time == other.time
     }
     override fun hashCode(): Int = date.hashCode() * 31 + time.hashCode()
+
+    companion object {
+        // ISO-8601 `<date>T<time>`.
+        fun parse(input: CharSequence): LocalDateTime {
+            val s = input.toString()
+            val t = s.indexOf('T')
+            if (t < 0) {
+                throw IllegalArgumentException("Invalid ISO-8601 date-time: $input")
+            }
+            return LocalDateTime(LocalDate.parse(s.substring(0, t)), LocalTime.parse(s.substring(t + 1)))
+        }
+    }
 }
 
 // --- TimeZone ----------------------------------------------------
