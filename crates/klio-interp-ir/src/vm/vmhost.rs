@@ -803,16 +803,18 @@ impl VmHost<'_> {
         if entry.is_this {
             self.run_super_ctor_chain(leaf, class_name, &next_args)?;
         } else if entry.is_super {
-            let parent_name = if let klio_runtime::Value::Instance(inst) = leaf {
-                inst.borrow()
-                    .class
-                    .parent
-                    .borrow()
-                    .clone()
-                    .map(|p| p.name.clone())
-            } else {
-                None
-            };
+            // The `super(...)` target is the parent of the class whose
+            // constructor we're *currently* running (`class_name`), not
+            // the leaf instance's immediate parent. Using the leaf's
+            // parent re-dispatched the leaf's immediate parent forever
+            // for a 2+-level chain (`EOFException : IOException :
+            // Exception` overflowed the stack).
+            let parent_name = self
+                .classes
+                .borrow()
+                .get(class_name)
+                .and_then(|d| d.parent.borrow().clone())
+                .map(|p| p.name.clone());
             if let Some(p) = parent_name {
                 self.run_super_ctor_chain(leaf, &p, &next_args)?;
             }
