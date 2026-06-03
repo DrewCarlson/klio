@@ -8,10 +8,9 @@ auto_bindings = true
 # Real upstream kotlinx-io 0.9.0 commonMain, consumed directly from
 # the in-pack git submodule at `upstream/` (no vendored copies). The
 # curated `include` set is exactly the common sources klio's
-# `klioMain` actuals satisfy; the rest of the upstream tree
-# (filesystem `files/`, platform source sets, tests) is excluded by
-# omission. Bumping the version = updating the submodule + reviewing
-# this list.
+# `klioMain` actuals satisfy; the rest of the upstream tree (platform
+# source sets, tests) is excluded by omission. Bumping the version =
+# updating the submodule + reviewing this list.
 
 [[source]]
 root = "upstream/core/common/src"
@@ -37,6 +36,8 @@ include = [
     "Utf8.kt",
     "internal/-Utf8.kt",
     "unsafe/UnsafeBufferOperations.kt",
+    "files/FileSystem.kt",
+    "files/Paths.kt",
 ]
 
 [[source]]

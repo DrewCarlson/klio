@@ -19,7 +19,161 @@ klio_stdlib::host_bindings! {
         "kotlinx.io.decodeBase64" => base64_decode,
         "kotlinx.io.encodeHex"    => hex_encode,
         "kotlinx.io.decodeHex"    => hex_decode,
+        // `kotlinx.io.files` filesystem primitives. The Kotlin actuals
+        // (klioMain/kotlinx/io/files/Actuals.kt) own the policy/exception
+        // logic; these are thin `std::fs` I/O primitives.
+        "kotlinx.io.files.__kxio_readAllBytes"      => fs_read_all_bytes,
+        "kotlinx.io.files.__kxio_writeBytes"        => fs_write_bytes,
+        "kotlinx.io.files.__kxio_exists"            => fs_exists,
+        "kotlinx.io.files.__kxio_delete"            => fs_delete,
+        "kotlinx.io.files.__kxio_createDirectories" => fs_create_directories,
+        "kotlinx.io.files.__kxio_atomicMove"        => fs_atomic_move,
+        "kotlinx.io.files.__kxio_metadata"          => fs_metadata,
+        "kotlinx.io.files.__kxio_resolve"           => fs_resolve,
+        "kotlinx.io.files.__kxio_list"              => fs_list,
+        "kotlinx.io.files.__kxio_tempDir"           => fs_temp_dir,
     }
+}
+
+fn arg_bool(ctx: &CallCtx, idx: usize) -> Result<bool, RuntimeError> {
+    match ctx.args.get(idx) {
+        Some(Value::Bool(b)) => Ok(*b),
+        _ => Err(RuntimeError::Type(format!(
+            "kotlinx.io.files: argument {idx} must be a Boolean"
+        ))),
+    }
+}
+
+// A Kotlin `ByteArray` from raw bytes (u8 reinterpreted as signed Byte).
+#[allow(clippy::cast_possible_wrap)]
+fn bytes_value(bytes: Vec<u8>) -> Value {
+    Value::Array {
+        items: klio_runtime::ObjRef::new(bytes.into_iter().map(|b| Value::Byte(b as i8)).collect()),
+        prim: Some(PrimitiveArrayKind::Byte),
+    }
+}
+
+// A thrown `kotlinx.io.IOException` the Kotlin `try/catch` can catch.
+fn io_error(msg: impl Into<String>) -> RuntimeError {
+    RuntimeError::Thrown(Value::Exception {
+        fqn: Arc::new("kotlinx.io.IOException".to_string()),
+        message: Some(Arc::new(msg.into())),
+        cause: None,
+    })
+}
+
+fn fs_read_all_bytes(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let path = arg_string(ctx, 0)?;
+    let bytes = std::fs::read(&path).map_err(|e| io_error(format!("read {path}: {e}")))?;
+    Ok(bytes_value(bytes))
+}
+
+fn fs_write_bytes(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    use std::io::Write as _;
+    let path = arg_string(ctx, 0)?;
+    let data = arg_bytes(ctx, 1)?;
+    let append = arg_bool(ctx, 2)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if append {
+        opts.append(true);
+    } else {
+        opts.truncate(true);
+    }
+    let mut f = opts
+        .open(&path)
+        .map_err(|e| io_error(format!("open {path} for write: {e}")))?;
+    f.write_all(&data)
+        .map_err(|e| io_error(format!("write {path}: {e}")))?;
+    Ok(Value::Unit)
+}
+
+fn fs_exists(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let path = arg_string(ctx, 0)?;
+    Ok(Value::Bool(std::path::Path::new(&path).exists()))
+}
+
+fn fs_delete(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let path = arg_string(ctx, 0)?;
+    let p = std::path::Path::new(&path);
+    let res = if p.is_dir() {
+        std::fs::remove_dir(p)
+    } else {
+        std::fs::remove_file(p)
+    };
+    Ok(Value::Bool(res.is_ok()))
+}
+
+// 0 = created, 1 = already a directory, 2 = exists as a file, 3 = failed.
+fn fs_create_directories(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let path = arg_string(ctx, 0)?;
+    let p = std::path::Path::new(&path);
+    if p.is_file() {
+        return Ok(Value::new_int(2));
+    }
+    if p.is_dir() {
+        return Ok(Value::new_int(1));
+    }
+    Ok(Value::new_int(if std::fs::create_dir_all(p).is_ok() {
+        0
+    } else {
+        3
+    }))
+}
+
+fn fs_atomic_move(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let src = arg_string(ctx, 0)?;
+    let dst = arg_string(ctx, 1)?;
+    Ok(Value::Bool(std::fs::rename(&src, &dst).is_ok()))
+}
+
+// `[kind, size]`: kind 0 = absent, 1 = regular file, 2 = directory.
+// size is the file length for a regular file, else -1.
+#[allow(clippy::cast_possible_wrap)]
+fn fs_metadata(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let path = arg_string(ctx, 0)?;
+    let (kind, size): (i64, i64) = match std::fs::metadata(&path) {
+        Ok(m) if m.is_dir() => (2, -1),
+        Ok(m) => (1, m.len() as i64),
+        Err(_) => (0, -1),
+    };
+    Ok(Value::Array {
+        items: klio_runtime::ObjRef::new(vec![Value::Long(kind), Value::Long(size)]),
+        prim: Some(PrimitiveArrayKind::Long),
+    })
+}
+
+fn fs_resolve(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let path = arg_string(ctx, 0)?;
+    let canon =
+        std::fs::canonicalize(&path).map_err(|e| io_error(format!("resolve {path}: {e}")))?;
+    Ok(Value::String(Arc::new(
+        canon.to_string_lossy().into_owned(),
+    )))
+}
+
+fn fs_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let path = arg_string(ctx, 0)?;
+    let rd = std::fs::read_dir(&path).map_err(|e| io_error(format!("list {path}: {e}")))?;
+    let mut names: Vec<Value> = Vec::new();
+    for entry in rd.flatten() {
+        names.push(Value::String(Arc::new(
+            entry.file_name().to_string_lossy().into_owned(),
+        )));
+    }
+    Ok(Value::List {
+        items: klio_runtime::ObjRef::new(names),
+        mutable: false,
+        enum_class: None,
+        backing: None,
+    })
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn fs_temp_dir(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::String(Arc::new(
+        std::env::temp_dir().to_string_lossy().into_owned(),
+    )))
 }
 
 fn arg_string(ctx: &CallCtx, idx: usize) -> Result<String, RuntimeError> {
