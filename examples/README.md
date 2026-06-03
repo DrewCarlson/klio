@@ -82,6 +82,7 @@ cargo run -p klio-cli -- run examples/<name>.kt
 | `stdlib_taste.kt`, `stdlib_broad.kt` | `kotlin.math`, String/Int members, conversions.      |
 | `collections.kt`           | List/Set/Map builders, `map`/`filter`/`fold`/`reduce`, iteration, indexing. |
 | `arrays.kt`                | `Array` and primitive arrays.                                  |
+| `array_bytes.kt`           | Bulk array ops (`copyInto`, `copyOf`, `copyOfRange`, `fill`) and `String` <-> `ByteArray` UTF-8 round-trips (`encodeToByteArray`/`toByteArray`/`decodeToString`). |
 | `string_builder.kt`, `string_ordering.kt` | `StringBuilder`, string comparison.             |
 | `char_unicode.kt`          | `Char` and Unicode handling.                                   |
 | `utf16_surrogates.kt`      | `Char` as a UTF-16 code unit: astral `String` length/indexing/iteration, surrogate pairs, `isHighSurrogate`/`isLowSurrogate`, `Char.MIN/MAX_VALUE`, `Int`→`Char` narrowing. |

@@ -1892,6 +1892,7 @@ fn run_with_packs_inner(file: &Path) -> Result<String, String> {
     let pack_dirs = [
         ws.join("crates/klio-kotlinx-coroutines"),
         ws.join("crates/klio-kotlinx-atomicfu"),
+        ws.join("crates/klio-kotlinx-io"),
     ];
 
     let mut map = SourceMap::new();

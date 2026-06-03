@@ -82,6 +82,63 @@ pub(crate) fn string_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
     Ok(Value::String(s))
 }
 
+/// `String.encodeToByteArray()` and `String.toByteArray()` — the
+/// receiver's UTF-8 bytes as a Kotlin signed `ByteArray`. Upstream
+/// declares these `expect`/intrinsic with no body for the platform to
+/// supply; an explicit charset argument is treated as UTF-8.
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) fn string_to_byte_array(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.toByteArray")?;
+    let items: Vec<Value> = s.as_bytes().iter().map(|b| Value::Byte(*b as i8)).collect();
+    Ok(Value::Array {
+        items: klio_runtime::ObjRef::new(items),
+        prim: Some(klio_runtime::PrimitiveArrayKind::Byte),
+    })
+}
+
+/// `ByteArray.decodeToString(startIndex = 0, endIndex = size,
+/// throwOnInvalidSequence = false)` — decode the byte range as UTF-8.
+/// Malformed sequences become U+FFFD, matching Kotlin's default
+/// (non-throwing) behaviour.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+pub(crate) fn byte_array_decode_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let bytes: Vec<u8> = match ctx.args.first() {
+        Some(Value::Array { items, .. }) => items
+            .borrow()
+            .iter()
+            .map(|v| match v {
+                Value::Byte(b) => *b as u8,
+                Value::UByte(b) => *b,
+                Value::Int(i) => *i as u8,
+                Value::Long(l) => *l as u8,
+                _ => 0,
+            })
+            .collect(),
+        _ => {
+            return Err(RuntimeError::Type(
+                "decodeToString requires a ByteArray receiver".into(),
+            ));
+        }
+    };
+    let len = bytes.len() as i64;
+    let start = ctx.args.get(1).and_then(Value::as_i64).unwrap_or(0);
+    let end = ctx.args.get(2).and_then(Value::as_i64).unwrap_or(len);
+    if start < 0 || end > len || start > end {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IndexOutOfBoundsException",
+            Some(format!(
+                "decodeToString: [{start}, {end}) out of bounds for length {len}"
+            )),
+        )));
+    }
+    let s = String::from_utf8_lossy(&bytes[start as usize..end as usize]).into_owned();
+    Ok(Value::String(Arc::new(s)))
+}
+
 pub(crate) fn string_uppercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.uppercase")?;
     Ok(Value::String(Arc::new(s.to_uppercase())))

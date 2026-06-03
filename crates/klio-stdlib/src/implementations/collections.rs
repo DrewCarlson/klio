@@ -3274,6 +3274,216 @@ pub(crate) fn array_slice_impl(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
     })
 }
 
+/// Zero value for a primitive-array element kind — the padding that
+/// `copyOf(newSize)` writes beyond the original length, matching the
+/// default each `*Array(size)` constructor uses.
+fn array_prim_default(prim: Option<klio_runtime::PrimitiveArrayKind>) -> Value {
+    use klio_runtime::PrimitiveArrayKind as P;
+    match prim {
+        Some(P::Int) => Value::Int(0),
+        Some(P::Long) => Value::Long(0),
+        Some(P::Double) => Value::Double(0.0),
+        Some(P::Float) => Value::Float(0.0),
+        Some(P::Short) => Value::Short(0),
+        Some(P::Byte) => Value::Byte(0),
+        Some(P::Boolean) => Value::Bool(false),
+        Some(P::Char) => Value::Char(0),
+        Some(P::UInt) => Value::UInt(0),
+        Some(P::ULong) => Value::ULong(0),
+        Some(P::UShort) => Value::UShort(0),
+        Some(P::UByte) => Value::UByte(0),
+        None => Value::Null,
+    }
+}
+
+/// Optional `Int` index argument with a default when the caller omitted
+/// it (these array ops carry default values for the trailing indices).
+fn array_opt_index(
+    ctx: &CallCtx,
+    idx: usize,
+    default: i64,
+    what: &str,
+) -> Result<i64, RuntimeError> {
+    match ctx.args.get(idx) {
+        None => Ok(default),
+        Some(v) => v
+            .as_i64()
+            .ok_or_else(|| RuntimeError::Type(format!("{what}: index argument must be an Int"))),
+    }
+}
+
+fn index_oob(msg: String) -> RuntimeError {
+    RuntimeError::Thrown(make_exception(
+        "kotlin.IndexOutOfBoundsException",
+        Some(msg),
+    ))
+}
+
+/// `Array<T>.copyInto(destination, destinationOffset = 0, startIndex = 0,
+/// endIndex = size): destination` and the primitive-array variants.
+/// Copies `this[startIndex, endIndex)` into `destination` starting at
+/// `destinationOffset`, then returns `destination`. The source range is
+/// snapshotted before any write so `this === destination` overlap is
+/// well defined and the same backing store is never borrowed mutably and
+/// immutably at once.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn array_copy_into(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let src = match ctx.args.first() {
+        Some(Value::Array { items, .. }) => items.clone(),
+        _ => {
+            return Err(RuntimeError::Type(
+                "copyInto requires an array receiver".into(),
+            ));
+        }
+    };
+    let dest_val = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("copyInto expects (destination, ...)".into()))?;
+    let dest = match &dest_val {
+        Value::Array { items, .. } => items.clone(),
+        _ => {
+            return Err(RuntimeError::Type(
+                "copyInto destination must be an array".into(),
+            ));
+        }
+    };
+    let src_len = src.borrow().len() as i64;
+    let dest_offset = array_opt_index(ctx, 2, 0, "copyInto")?;
+    let start = array_opt_index(ctx, 3, 0, "copyInto")?;
+    let end = array_opt_index(ctx, 4, src_len, "copyInto")?;
+    if start < 0 || end > src_len || start > end {
+        return Err(index_oob(format!(
+            "copyInto: source range [{start}, {end}) out of bounds for length {src_len}"
+        )));
+    }
+    let count = end - start;
+    let dest_len = dest.borrow().len() as i64;
+    if dest_offset < 0 || dest_offset + count > dest_len {
+        return Err(index_oob(format!(
+            "copyInto: destination range [{dest_offset}, {}) out of bounds for length {dest_len}",
+            dest_offset + count
+        )));
+    }
+    let slice: Vec<Value> = src.borrow()[start as usize..end as usize].to_vec();
+    {
+        let mut d = dest.borrow_mut();
+        let base = dest_offset as usize;
+        for (i, v) in slice.into_iter().enumerate() {
+            d[base + i] = v;
+        }
+    }
+    Ok(dest_val)
+}
+
+/// `Array<T>.copyOf()` and `Array<T>.copyOf(newSize)` (and primitive
+/// variants). Both overloads share one host symbol; the no-argument form
+/// copies at the current length, the sized form truncates or pads with
+/// the element kind's zero value.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn array_copy_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (items, prim) = match ctx.args.first() {
+        Some(Value::Array { items, prim }) => (items.clone(), *prim),
+        _ => {
+            return Err(RuntimeError::Type(
+                "copyOf requires an array receiver".into(),
+            ));
+        }
+    };
+    let cur = items.borrow();
+    let new_size = array_opt_index(ctx, 1, cur.len() as i64, "copyOf")?;
+    if new_size < 0 {
+        return Err(RuntimeError::Type(format!(
+            "copyOf: negative new size {new_size}"
+        )));
+    }
+    let new_size = new_size as usize;
+    let default = array_prim_default(prim);
+    let mut out = Vec::with_capacity(new_size);
+    for i in 0..new_size {
+        out.push(cur.get(i).cloned().unwrap_or_else(|| default.clone()));
+    }
+    Ok(Value::Array {
+        items: ObjRef::new(out),
+        prim,
+    })
+}
+
+/// `Array<T>.copyOfRange(fromIndex, toIndex)` — a fresh array holding
+/// `this[fromIndex, toIndex)`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn array_copy_of_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let (items, prim) = match ctx.args.first() {
+        Some(Value::Array { items, prim }) => (items.clone(), *prim),
+        _ => {
+            return Err(RuntimeError::Type(
+                "copyOfRange requires an array receiver".into(),
+            ));
+        }
+    };
+    let cur = items.borrow();
+    let len = cur.len() as i64;
+    let from = array_opt_index(ctx, 1, 0, "copyOfRange")?;
+    let to = array_opt_index(ctx, 2, len, "copyOfRange")?;
+    if from < 0 || to > len || from > to {
+        return Err(index_oob(format!(
+            "copyOfRange: [{from}, {to}) out of bounds for length {len}"
+        )));
+    }
+    let out: Vec<Value> = cur[from as usize..to as usize].to_vec();
+    Ok(Value::Array {
+        items: ObjRef::new(out),
+        prim,
+    })
+}
+
+/// `Array<T>.fill(element, fromIndex = 0, toIndex = size)` — overwrites
+/// the range in place and returns `Unit`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn array_fill(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = match ctx.args.first() {
+        Some(Value::Array { items, .. }) => items.clone(),
+        _ => return Err(RuntimeError::Type("fill requires an array receiver".into())),
+    };
+    let element = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("fill expects (element, ...)".into()))?;
+    let len = items.borrow().len() as i64;
+    let from = array_opt_index(ctx, 2, 0, "fill")?;
+    let to = array_opt_index(ctx, 3, len, "fill")?;
+    if from < 0 || to > len || from > to {
+        return Err(index_oob(format!(
+            "fill: [{from}, {to}) out of bounds for length {len}"
+        )));
+    }
+    {
+        let mut d = items.borrow_mut();
+        for slot in d.iter_mut().take(to as usize).skip(from as usize) {
+            *slot = element.clone();
+        }
+    }
+    Ok(Value::Unit)
+}
+
 // Kotlin Long.toDouble() loses precision past 2^53.
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn array_sum_impl(ctx: &mut CallCtx, what: &str) -> Result<Value, RuntimeError> {

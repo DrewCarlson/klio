@@ -105,6 +105,16 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String.get", string_get),
     ("kotlin.String.indexOf", string_index_of),
     ("kotlin.String.toString", string_to_string),
+    // String <-> ByteArray (UTF-8). Upstream declares these without a
+    // klio-runnable body; without them every `encodeToByteArray` /
+    // `toByteArray` returns the receiver and ByteString construction
+    // silently no-ops.
+    ("kotlin.String.toByteArray", string_to_byte_array),
+    ("kotlin.String.encodeToByteArray", string_to_byte_array),
+    (
+        "kotlin.ByteArray.decodeToString",
+        byte_array_decode_to_string,
+    ),
     ("kotlin.String.lastIndexOf", string_last_index_of),
     ("kotlin.String.length", string_length),
     ("kotlin.String.lowercase", string_lowercase),
@@ -485,6 +495,61 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.ByteArray.sliceArray", array_slice_impl),
     ("kotlin.CharArray.sliceArray", array_slice_impl),
     ("kotlin.BooleanArray.sliceArray", array_slice_impl),
+    // Bulk array copy / fill. Upstream declares these `expect` with no
+    // body for klio to supply; without these actuals every ByteArray
+    // copy (and kotlinx-io's segment data path) silently no-ops.
+    ("kotlin.Array.copyInto", array_copy_into),
+    ("kotlin.IntArray.copyInto", array_copy_into),
+    ("kotlin.LongArray.copyInto", array_copy_into),
+    ("kotlin.DoubleArray.copyInto", array_copy_into),
+    ("kotlin.FloatArray.copyInto", array_copy_into),
+    ("kotlin.ShortArray.copyInto", array_copy_into),
+    ("kotlin.ByteArray.copyInto", array_copy_into),
+    ("kotlin.CharArray.copyInto", array_copy_into),
+    ("kotlin.BooleanArray.copyInto", array_copy_into),
+    ("kotlin.UIntArray.copyInto", array_copy_into),
+    ("kotlin.ULongArray.copyInto", array_copy_into),
+    ("kotlin.UShortArray.copyInto", array_copy_into),
+    ("kotlin.UByteArray.copyInto", array_copy_into),
+    ("kotlin.Array.copyOf", array_copy_of),
+    ("kotlin.IntArray.copyOf", array_copy_of),
+    ("kotlin.LongArray.copyOf", array_copy_of),
+    ("kotlin.DoubleArray.copyOf", array_copy_of),
+    ("kotlin.FloatArray.copyOf", array_copy_of),
+    ("kotlin.ShortArray.copyOf", array_copy_of),
+    ("kotlin.ByteArray.copyOf", array_copy_of),
+    ("kotlin.CharArray.copyOf", array_copy_of),
+    ("kotlin.BooleanArray.copyOf", array_copy_of),
+    ("kotlin.UIntArray.copyOf", array_copy_of),
+    ("kotlin.ULongArray.copyOf", array_copy_of),
+    ("kotlin.UShortArray.copyOf", array_copy_of),
+    ("kotlin.UByteArray.copyOf", array_copy_of),
+    ("kotlin.Array.copyOfRange", array_copy_of_range),
+    ("kotlin.IntArray.copyOfRange", array_copy_of_range),
+    ("kotlin.LongArray.copyOfRange", array_copy_of_range),
+    ("kotlin.DoubleArray.copyOfRange", array_copy_of_range),
+    ("kotlin.FloatArray.copyOfRange", array_copy_of_range),
+    ("kotlin.ShortArray.copyOfRange", array_copy_of_range),
+    ("kotlin.ByteArray.copyOfRange", array_copy_of_range),
+    ("kotlin.CharArray.copyOfRange", array_copy_of_range),
+    ("kotlin.BooleanArray.copyOfRange", array_copy_of_range),
+    ("kotlin.UIntArray.copyOfRange", array_copy_of_range),
+    ("kotlin.ULongArray.copyOfRange", array_copy_of_range),
+    ("kotlin.UShortArray.copyOfRange", array_copy_of_range),
+    ("kotlin.UByteArray.copyOfRange", array_copy_of_range),
+    ("kotlin.Array.fill", array_fill),
+    ("kotlin.IntArray.fill", array_fill),
+    ("kotlin.LongArray.fill", array_fill),
+    ("kotlin.DoubleArray.fill", array_fill),
+    ("kotlin.FloatArray.fill", array_fill),
+    ("kotlin.ShortArray.fill", array_fill),
+    ("kotlin.ByteArray.fill", array_fill),
+    ("kotlin.CharArray.fill", array_fill),
+    ("kotlin.BooleanArray.fill", array_fill),
+    ("kotlin.UIntArray.fill", array_fill),
+    ("kotlin.ULongArray.fill", array_fill),
+    ("kotlin.UShortArray.fill", array_fill),
+    ("kotlin.UByteArray.fill", array_fill),
     ("kotlin.IntArray.withIndex", coll_array_with_index),
     ("kotlin.LongArray.withIndex", coll_array_with_index),
     ("kotlin.DoubleArray.withIndex", coll_array_with_index),
@@ -1725,6 +1790,191 @@ mod tests {
     fn string_length_counts_chars_not_bytes() {
         let s = Value::String(Arc::new("héllo".to_string()));
         assert!(matches!(call(string_length, &[s]), Ok(Value::Int(5))));
+    }
+
+    fn byte_array(bytes: &[i8]) -> Value {
+        Value::Array {
+            items: ObjRef::new(bytes.iter().map(|b| Value::Byte(*b)).collect()),
+            prim: Some(klio_runtime::PrimitiveArrayKind::Byte),
+        }
+    }
+    fn int_array(ints: &[i32]) -> Value {
+        Value::Array {
+            items: ObjRef::new(ints.iter().map(|i| Value::Int(*i)).collect()),
+            prim: Some(klio_runtime::PrimitiveArrayKind::Int),
+        }
+    }
+    fn array_ints(v: &Value) -> Vec<i32> {
+        match v {
+            Value::Array { items, .. } => items
+                .borrow()
+                .iter()
+                .map(|e| match e {
+                    Value::Int(i) => *i,
+                    Value::Byte(b) => i32::from(*b),
+                    _ => -1,
+                })
+                .collect(),
+            _ => panic!("not an array"),
+        }
+    }
+
+    #[test]
+    fn array_copy_into_copies_range_in_place() {
+        let src = byte_array(&[1, 2, 3, 4, 5]);
+        let dst = byte_array(&[0, 0, 0, 0, 0]);
+        let Value::Array { items: dst_ref, .. } = &dst else {
+            unreachable!()
+        };
+        let dst_ref = dst_ref.clone();
+        let ret = call(
+            array_copy_into,
+            &[src, dst, Value::Int(1), Value::Int(0), Value::Int(3)],
+        )
+        .expect("copyInto");
+        // Returns the destination, and mutated it in place.
+        assert!(matches!(ret, Value::Array { .. }));
+        let got: Vec<i8> = dst_ref
+            .borrow()
+            .iter()
+            .map(|v| match v {
+                Value::Byte(b) => *b,
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(got, vec![0, 1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn array_copy_into_handles_self_overlap() {
+        let arr = int_array(&[1, 2, 3, 4, 5]);
+        let Value::Array { items: r, .. } = &arr else {
+            unreachable!()
+        };
+        let r = r.clone();
+        // copy [0,3) onto offset 2 — overlapping forward.
+        call(
+            array_copy_into,
+            &[
+                arr.clone(),
+                arr,
+                Value::Int(2),
+                Value::Int(0),
+                Value::Int(3),
+            ],
+        )
+        .expect("copyInto overlap");
+        let got: Vec<i32> = r
+            .borrow()
+            .iter()
+            .map(|v| match v {
+                Value::Int(i) => *i,
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(got, vec![1, 2, 1, 2, 3]);
+    }
+
+    #[test]
+    fn array_copy_into_out_of_bounds_throws() {
+        let src = byte_array(&[1, 2, 3]);
+        let dst = byte_array(&[0, 0]);
+        assert!(matches!(
+            call(
+                array_copy_into,
+                &[src, dst, Value::Int(0), Value::Int(0), Value::Int(3)]
+            ),
+            Err(RuntimeError::Thrown(_))
+        ));
+    }
+
+    #[test]
+    fn array_copy_of_same_size_and_grow_pads_zero() {
+        assert_eq!(
+            array_ints(&call(array_copy_of, &[int_array(&[7, 8, 9])]).unwrap()),
+            vec![7, 8, 9]
+        );
+        assert_eq!(
+            array_ints(&call(array_copy_of, &[int_array(&[7, 8]), Value::Int(4)]).unwrap()),
+            vec![7, 8, 0, 0]
+        );
+        assert_eq!(
+            array_ints(&call(array_copy_of, &[int_array(&[7, 8, 9]), Value::Int(2)]).unwrap()),
+            vec![7, 8]
+        );
+    }
+
+    #[test]
+    fn array_copy_of_range_slices() {
+        assert_eq!(
+            array_ints(
+                &call(
+                    array_copy_of_range,
+                    &[int_array(&[1, 2, 3, 4]), Value::Int(1), Value::Int(3)]
+                )
+                .unwrap()
+            ),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn array_fill_overwrites_range_and_returns_unit() {
+        let arr = int_array(&[0, 0, 0, 0]);
+        let Value::Array { items: r, .. } = &arr else {
+            unreachable!()
+        };
+        let r = r.clone();
+        let ret = call(
+            array_fill,
+            &[arr, Value::Int(9), Value::Int(1), Value::Int(3)],
+        )
+        .unwrap();
+        assert!(matches!(ret, Value::Unit));
+        let got: Vec<i32> = r
+            .borrow()
+            .iter()
+            .map(|v| match v {
+                Value::Int(i) => *i,
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(got, vec![0, 9, 9, 0]);
+    }
+
+    #[test]
+    fn string_to_byte_array_is_utf8() {
+        let s = Value::String(Arc::new("Hé".to_string()));
+        let Ok(Value::Array { items, prim }) = call(string_to_byte_array, &[s]) else {
+            panic!("expected ByteArray")
+        };
+        assert_eq!(prim, Some(klio_runtime::PrimitiveArrayKind::Byte));
+        let got: Vec<u8> = items
+            .borrow()
+            .iter()
+            .map(|v| match v {
+                Value::Byte(b) => b.cast_unsigned(),
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(got, "Hé".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn byte_array_decode_to_string_round_trips_and_slices() {
+        let bytes = byte_array(&[72, 105, 33]);
+        let Ok(Value::String(s)) = call(byte_array_decode_to_string, &[bytes]) else {
+            panic!("expected String")
+        };
+        assert_eq!(s.as_str(), "Hi!");
+        let bytes = byte_array(&[72, 105, 33]);
+        let Ok(Value::String(s)) = call(
+            byte_array_decode_to_string,
+            &[bytes, Value::Int(0), Value::Int(2)],
+        ) else {
+            panic!("expected String")
+        };
+        assert_eq!(s.as_str(), "Hi");
     }
 
     #[test]
