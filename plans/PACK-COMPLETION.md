@@ -74,16 +74,27 @@ Still open (needs careful design, not a quick patch):
   `byteCount` with Unit) instead of the extension `Source.readTo(
   ByteArray, …)`. Now a lone member is declined when an unsupplied param
   is neither defaulted nor vararg, so the extension wins.
-- **kotlinx.io `readString(byteCount)` / `readLine` still hang.** Narrowed
-  hard: every sub-piece works in isolation (`forEachSegment`, `withData`,
-  non-local return through both, `skip`, `min`, `require(n<=size)`), and
-  `readString()` (no-arg → `commonReadUtf8(size)`) works — but
-  `commonReadUtf8(byteCount)` hangs whenever `byteCount < segment.size`.
-  The fault is the *composition* in `commonReadUtf8`'s lambda
-  (`skip(byteCount)` side-effect followed by a non-local `return` out of
-  the nested inline `forEachSegment { withData { … } }`); needs an
-  instrumented trace, not source reading. Separately, `Buffer.require(
-  byteCount > size)` loops instead of throwing `EOFException`.
+- **Multi-level exception hierarchies — FIXED.** `run_super_ctor_chain`
+  resolved each `super(...)` from the *leaf*'s immediate parent, so
+  `EOFException : IOException : Exception` (and any 2-level user
+  exception) recursed forever and overflowed the stack. That crash also
+  hid behind `Buffer.require(byteCount > size)` (throws EOFException) and
+  the kotlinx.io read fallbacks. Now resolved from the current class's
+  parent; `require(>size)` throws + is catchable, EOFException builds.
+- **Multi-level exception *message* is `null`** (single-level + builtin
+  messages are fine). The `super(message)` argument isn't propagated to
+  the builtin Throwable's `message` field across 2+ hops (separate from
+  the recursion fix; the primary-ctor vs secondary-ctor super paths bind
+  differently). Narrow.
+- **kotlinx.io `readString(byteCount)` / `readLine` still hang.** Every
+  sub-piece works in isolation (`forEachSegment`, `withData`, non-local
+  return through both, `skip(partial)`, `min`, `require`), and
+  `readString()` (full size) works — but `commonReadUtf8(byteCount)`
+  hangs whenever `byteCount < segment.size`. Confirmed NOT the EOF path
+  (EOFException no longer overflows, yet it still hangs). The fault is
+  the `commonReadUtf8` lambda composition — `skip(byteCount)` mutating
+  the very segment list the enclosing inline `forEachSegment` is walking,
+  then a non-local `return`. Needs an instrumented eval-loop trace.
 - **`recv.name(args)` where a user/pack extension's name collides with a
   stdlib intrinsic registered for a *different* receiver** (e.g.
   `LocalDate.until` / `String.until` vs `kotlin.ranges.until`). klio
