@@ -174,7 +174,14 @@ const CURATED_UPSTREAM_SOURCES: &[&str] = &[
     "common/src/kotlin/JvmAnnotationsH.kt",
     "src/kotlin/annotations/NativeAnnotations.kt",
     "src/kotlin/annotations/NativeConcurrentAnnotations.kt",
-    "src/kotlin/concurrent/atomics/AtomicArrays.common.kt",
+    // `AtomicArrays.common.kt` (AtomicIntArray / AtomicLongArray /
+    // AtomicArray) is omitted: these are `@ExperimentalAtomicApi`
+    // `expect class`es with no klio actual, nothing in the stdlib or
+    // shipped packs uses the array types (Uuid.kt uses only the scalar
+    // AtomicLong from Atomics.common.kt), and their bare simple names
+    // collided with `kotlinx.atomicfu.AtomicIntArray` — a user import of
+    // the atomicfu type ambiguated with the bodyless stdlib expect and
+    // failed at runtime. The scalar atomics stay.
     "src/kotlin/concurrent/atomics/Atomics.common.kt",
     "src/kotlin/util/Lazy.kt",
     "common/src/kotlin/KotlinH.kt",
