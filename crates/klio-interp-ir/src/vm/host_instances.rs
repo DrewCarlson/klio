@@ -62,52 +62,132 @@ impl VmHost<'_> {
                 class.0
             ))
         })?;
-        let params = &ir_class.primary_params;
-        let mut reordered: Vec<Option<klio_runtime::Value>> = vec![None; params.len()];
-        let mut next_pos = 0usize;
-        for (i, v) in args.iter().enumerate() {
-            if let Some(nm) = arg_names.get(i).and_then(std::clone::Clone::clone) {
-                let Some(idx) = params.iter().position(|p| p.name == nm) else {
-                    // Named arg doesn't match any primary param —
-                    // a secondary constructor or runtime ClassDef
-                    // owns the binding. Fall back to positional.
-                    return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
-                };
-                reordered[idx] = Some(v.clone());
-            } else {
-                while next_pos < reordered.len() && reordered[next_pos].is_some() {
+        let class_name = ir_class.name.clone();
+        let primary_names: Vec<String> = ir_class
+            .primary_params
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let supplied_names: Vec<String> = arg_names.iter().flatten().cloned().collect();
+        let class_def = self.classes.borrow().get(&class_name).cloned();
+        // Prefer the primary signature only when every named argument
+        // names a primary parameter *and* every parameter the caller
+        // omitted has a default — otherwise a secondary constructor whose
+        // own defaults cover the gap is the real target (`DatePeriod(days
+        // = 5)` skips `years`/`months`; the private primary has no
+        // defaults for them). new_instance's trailing-only default pass
+        // can't recover a non-trailing omitted slot once materialized, so
+        // supply the defaults here.
+        if supplied_names
+            .iter()
+            .all(|nm| primary_names.iter().any(|p| p == nm))
+        {
+            let n = primary_names.len();
+            let mut reordered: Vec<Option<klio_runtime::Value>> = vec![None; n];
+            let mut next_pos = 0usize;
+            let mut overflow = false;
+            for (i, v) in args.iter().enumerate() {
+                if let Some(nm) = arg_names.get(i).and_then(std::clone::Clone::clone) {
+                    if let Some(idx) = primary_names.iter().position(|p| *p == nm) {
+                        reordered[idx] = Some(v.clone());
+                    }
+                } else {
+                    while next_pos < n && reordered[next_pos].is_some() {
+                        next_pos += 1;
+                    }
+                    if next_pos >= n {
+                        overflow = true;
+                        break;
+                    }
+                    reordered[next_pos] = Some(v.clone());
                     next_pos += 1;
                 }
-                if next_pos >= reordered.len() {
-                    return <Self as klio_ir::eval::Host>::new_instance(self, class, args);
-                }
-                reordered[next_pos] = Some(v.clone());
-                next_pos += 1;
+            }
+            let primary_satisfiable = !overflow
+                && reordered.iter().enumerate().all(|(idx, slot)| {
+                    slot.is_some()
+                        || class_def
+                            .as_ref()
+                            .and_then(|d| d.primary_params.get(idx))
+                            .is_some_and(|p| p.default.is_some())
+                });
+            if primary_satisfiable {
+                let final_args: Vec<klio_runtime::Value> = reordered
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, slot)| {
+                        slot.unwrap_or_else(|| {
+                            class_def
+                                .as_ref()
+                                .and_then(|d| d.primary_params.get(idx))
+                                .and_then(|p| p.default.as_ref())
+                                .and_then(|e| default_value_for_primary(e))
+                                .unwrap_or(klio_runtime::Value::Null)
+                        })
+                    })
+                    .collect();
+                return <Self as klio_ir::eval::Host>::new_instance(self, class, &final_args);
             }
         }
-        // Fill omitted slots with the parameter's default value. A
-        // named call can skip a *non-trailing* defaulted param
-        // (`C(b = 9)` skipping `a`), which new_instance's trailing-only
-        // default path can't recover once every slot is materialized; so
-        // resolve each missing slot's default here (the same
-        // `default_value_for_primary` new_instance uses), falling back to
-        // Null only when there is no default to apply.
-        let class_def = self.classes.borrow().get(&ir_class.name).cloned();
-        let final_args: Vec<klio_runtime::Value> = reordered
-            .into_iter()
-            .enumerate()
-            .map(|(idx, slot)| {
-                slot.unwrap_or_else(|| {
-                    class_def
-                        .as_ref()
-                        .and_then(|d| d.primary_params.get(idx))
-                        .and_then(|p| p.default.as_ref())
-                        .and_then(|e| default_value_for_primary(e))
-                        .unwrap_or(klio_runtime::Value::Null)
-                })
-            })
-            .collect();
-        <Self as klio_ir::eval::Host>::new_instance(self, class, &final_args)
+        // A named argument names a *secondary*-constructor parameter.
+        // Reorder against the secondary ctor whose parameter names cover
+        // every supplied name, fill its omitted slots from the per-param
+        // default thunks, and dispatch the full positional list (whose
+        // arity then selects that same secondary ctor in new_instance).
+        let entries = self
+            .prog
+            .secondary_ctors
+            .get(&class_name)
+            .cloned()
+            .unwrap_or_default();
+        let chosen = entries.into_iter().find(|e| {
+            e.param_count >= args.len()
+                && supplied_names
+                    .iter()
+                    .all(|nm| e.param_names.iter().any(|p| p == nm))
+        });
+        if let Some(entry) = chosen {
+            let mut slots: Vec<Option<klio_runtime::Value>> = vec![None; entry.param_count];
+            let mut next_pos = 0usize;
+            for (i, v) in args.iter().enumerate() {
+                if let Some(nm) = arg_names.get(i).and_then(std::clone::Clone::clone) {
+                    if let Some(idx) = entry.param_names.iter().position(|p| *p == nm) {
+                        slots[idx] = Some(v.clone());
+                    }
+                } else {
+                    while next_pos < slots.len() && slots[next_pos].is_some() {
+                        next_pos += 1;
+                    }
+                    if next_pos < slots.len() {
+                        slots[next_pos] = Some(v.clone());
+                        next_pos += 1;
+                    }
+                }
+            }
+            let module = Arc::clone(&self.module);
+            let mut full: Vec<klio_runtime::Value> = Vec::with_capacity(entry.param_count);
+            for (idx, slot) in slots.into_iter().enumerate() {
+                if let Some(v) = slot {
+                    full.push(v);
+                    continue;
+                }
+                if let Some(dfid) = entry.default_arg_thunks.get(idx).copied().flatten() {
+                    let func = module.funcs.get(dfid.0 as usize).cloned().ok_or_else(|| {
+                        klio_ir::eval::EvalError::Type(format!(
+                            "secondary ctor default FuncId {} out of range",
+                            dfid.0
+                        ))
+                    })?;
+                    let mut targs = full.clone();
+                    targs.resize(entry.param_count, klio_runtime::Value::Null);
+                    full.push(klio_ir::eval::eval_with(&module, &func, targs, self)?);
+                } else {
+                    full.push(klio_runtime::Value::Null);
+                }
+            }
+            return <Self as klio_ir::eval::Host>::new_instance(self, class, &full);
+        }
+        <Self as klio_ir::eval::Host>::new_instance(self, class, args)
     }
 
     // Core constructor pipeline; one tightly-coupled allocation flow.
@@ -235,8 +315,45 @@ impl VmHost<'_> {
                 .get(&class_def.name)
                 .cloned()
                 .unwrap_or_default();
-            if let Some(entry) = entries.iter().find(|e| e.param_count == args.len()) {
+            let chosen = entries
+                .iter()
+                .find(|e| e.param_count == args.len())
+                .or_else(|| {
+                    // No exact-arity ctor: accept one with more
+                    // parameters when every one the caller omitted has a
+                    // default to supply.
+                    entries.iter().find(|e| {
+                        e.param_count > args.len()
+                            && e.default_arg_thunks
+                                .iter()
+                                .skip(args.len())
+                                .all(std::option::Option::is_some)
+                    })
+                });
+            if let Some(entry) = chosen {
                 let module = Arc::clone(&self.module);
+                // Materialize the full positional argument list, filling
+                // trailing parameters the caller omitted from their
+                // default thunks (each evaluated against the arguments
+                // resolved so far; padded so the thunk sees its arity).
+                let mut full_args: Vec<klio_runtime::Value> = args.to_vec();
+                for idx in args.len()..entry.param_count {
+                    let dfid = entry.default_arg_thunks[idx].ok_or_else(|| {
+                        klio_ir::eval::EvalError::Type(format!(
+                            "secondary ctor param {idx} has no default to apply"
+                        ))
+                    })?;
+                    let func = module.funcs.get(dfid.0 as usize).cloned().ok_or_else(|| {
+                        klio_ir::eval::EvalError::Type(format!(
+                            "secondary ctor default FuncId {} out of range",
+                            dfid.0
+                        ))
+                    })?;
+                    let mut thunk_args = full_args.clone();
+                    thunk_args.resize(entry.param_count, klio_runtime::Value::Null);
+                    let v = klio_ir::eval::eval_with(&module, &func, thunk_args, self)?;
+                    full_args.push(v);
+                }
                 let mut target_args: Vec<klio_runtime::Value> =
                     Vec::with_capacity(entry.delegation_arg_thunks.len());
                 for fid in &entry.delegation_arg_thunks {
@@ -246,7 +363,7 @@ impl VmHost<'_> {
                             fid.0
                         ))
                     })?;
-                    let v = klio_ir::eval::eval_with(&module, &func, args.to_vec(), self)?;
+                    let v = klio_ir::eval::eval_with(&module, &func, full_args.clone(), self)?;
                     target_args.push(v);
                 }
                 // For `: this(...)` recurse via new_instance with
@@ -377,9 +494,9 @@ impl VmHost<'_> {
                 if let Some(body_fid) = entry.body
                     && let Some(body_func) = module.funcs.get(body_fid.0 as usize).cloned()
                 {
-                    let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(1 + args.len());
+                    let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(1 + full_args.len());
                     all.push(inst_v.clone());
-                    all.extend_from_slice(args);
+                    all.extend_from_slice(&full_args);
                     klio_ir::eval::eval_with(&module, &body_func, all, self)?;
                 }
                 return Ok(inst_v);

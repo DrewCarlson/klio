@@ -142,6 +142,10 @@ pub struct BuiltModule {
 #[derive(Clone)]
 pub struct SecondaryCtorEntry {
     pub param_count: usize,
+    /// Declared parameter names, in order — lets a named call
+    /// (`DatePeriod(months = 1)`) reorder against this constructor's own
+    /// signature rather than the primary's.
+    pub param_names: Vec<String>,
     pub is_super: bool,
     /// `true` for an explicit `: this(...)` delegation. Distinguishes
     /// it from `CtorDelegation::None` (implicit `super()`), which also
@@ -149,6 +153,11 @@ pub struct SecondaryCtorEntry {
     /// rather than re-dispatch a sibling constructor.
     pub is_this: bool,
     pub delegation_arg_thunks: Vec<klio_ir::FuncId>,
+    /// Per-parameter default-value thunks (one slot per declared param;
+    /// `None` when the param has no default). Each is lowered over the
+    /// full param list so a default may reference an earlier parameter;
+    /// the dispatcher evaluates the trailing ones a caller omitted.
+    pub default_arg_thunks: Vec<Option<klio_ir::FuncId>>,
     /// Optional body block lowered as a 1-arg fn taking `this`.
     pub body: Option<klio_ir::FuncId>,
 }
@@ -1785,6 +1794,21 @@ fn build_module_with_overrides(
                     );
                     arg_fids.push(fid);
                 }
+                let default_arg_thunks: Vec<Option<klio_ir::FuncId>> = sc
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(p_idx, p)| {
+                        p.default.as_ref().map(|e| {
+                            klio_ir::lower::lower_expr_as_param_thunk(
+                                &mut module,
+                                &param_refs,
+                                e,
+                                &format!("__sec_ctor_{}_{sc_idx}_def{p_idx}", c.name.name),
+                            )
+                        })
+                    })
+                    .collect();
                 let body_fid = sc.body.as_ref().map(|blk| {
                     let mut locals: Vec<&str> = Vec::with_capacity(1 + param_refs.len());
                     locals.push("this");
@@ -1800,9 +1824,11 @@ fn build_module_with_overrides(
                 });
                 entries.push(SecondaryCtorEntry {
                     param_count: sc.params.len(),
+                    param_names: param_names.clone(),
                     is_super,
                     is_this,
                     delegation_arg_thunks: arg_fids,
+                    default_arg_thunks,
                     body: body_fid,
                 });
             }
