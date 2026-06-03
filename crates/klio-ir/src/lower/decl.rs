@@ -464,6 +464,19 @@ pub(crate) fn lower_function_body(
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             collect_recv_members(parent_cls, file_classes, &mut members, &mut seen);
         }
+        // The receiver type is usually declared in another file (a pack
+        // declares the interface in one file and its extensions in
+        // another — `Source` in Source.kt, `Source.readString` in
+        // Utf8.kt). The module registry carries each type's transitive
+        // member-function names regardless of declaring file, so a bare
+        // call to a receiver member inside the extension body resolves to
+        // that member (Kotlin: an implicit-receiver member shadows a
+        // same-named top-level function) rather than mis-binding to the
+        // top-level function — e.g. `require(byteCount)` reaching
+        // `Source.require(Long)`, not `kotlin.require(Boolean)`.
+        if let Some(hm) = module.registry.hierarchy_methods.get(&recv.name.name) {
+            members.extend(hm.iter().cloned());
+        }
         lower_function_body_with_implicit_owner(module, f, &["this"], None, Some(&members))
     } else {
         lower_function_body_with_implicit_owner(module, f, &[], None, None)

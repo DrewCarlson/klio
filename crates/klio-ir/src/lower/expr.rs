@@ -2011,7 +2011,36 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     segments[0].name.as_str(),
                     "compareValues" | "compareValuesBy"
                 );
-                let bare_func_id: Option<FuncId> = if intrinsic_owns_all {
+                // Declared user-param arity recorded by the driver in the
+                // stub pass — available even for a sibling overload whose
+                // body has not been lowered yet (a forward reference).
+                // `funcs_by_simple_name` only returns top-level FuncIds, so
+                // every candidate has a `decl_user_params` entry.
+                let decl_arity = |fid: &FuncId| -> Option<u32> {
+                    b.module.decl_user_params.get(&fid.0).copied()
+                };
+                // Kotlin resolves an unqualified call against the members
+                // of the enclosing/implicit receiver before the top-level
+                // function scope: a member function shadows a same-named
+                // top-level function. When the call names a member of the
+                // current receiver (own class member or — via the merged
+                // `own_members` — an extension receiver's member) and no
+                // local value/function shadows it, decline the top-level
+                // bind so the member-call fallback below dispatches it on
+                // `this`. The `require`/`check` contract calls that carry a
+                // trailing lazy-message lambda are the stdlib intrinsics,
+                // not a receiver member, so they stay on the top-level path.
+                let contract_with_msg = matches!(
+                    segments[0].name.as_str(),
+                    "require" | "check" | "checkNotNull"
+                ) && matches!(args.last(), Some(Expr::Lambda { .. }));
+                let prefer_member = b.resolve("this").is_some()
+                    && b.has_own_member(&segments[0].name)
+                    && b.resolve(&segments[0].name).is_none()
+                    && !b.is_local_fn(&segments[0].name)
+                    && !b.is_local_ext_fn(&segments[0].name)
+                    && !contract_with_msg;
+                let bare_func_id: Option<FuncId> = if intrinsic_owns_all || prefer_member {
                     None
                 } else {
                     cands
@@ -2028,7 +2057,44 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             if name_is_alias {
                                 None
                             } else {
-                                b.module.func_id(&segments[0].name)
+                                // No fully-lowered overload fits the call's
+                                // arity. The legacy fallback returns the
+                                // first same-named overload regardless of
+                                // arity, which mis-binds a forward
+                                // reference (e.g. the 1-arg `require(value)`
+                                // delegating to the 2-arg
+                                // `require(value) { … }` declared below it,
+                                // baking an infinite self-call). When that
+                                // fallback's declared arity does not fit,
+                                // prefer a candidate whose *declared* arity
+                                // does — using the stub-pass arity table so
+                                // a not-yet-lowered sibling still resolves.
+                                let fallback = b.module.func_id(&segments[0].name);
+                                #[allow(clippy::cast_possible_truncation)]
+                                let want_u32 = want as u32;
+                                let fallback_fits = fallback
+                                    .and_then(|fid| decl_arity(&fid))
+                                    .is_none_or(|n| n == want_u32);
+                                if fallback_fits {
+                                    fallback
+                                } else {
+                                    cands
+                                        .iter()
+                                        .find(|fid| {
+                                            non_ext(fid) && decl_arity(fid) == Some(want_u32)
+                                        })
+                                        .copied()
+                                        .or_else(|| {
+                                            cands
+                                                .iter()
+                                                .find(|fid| {
+                                                    !non_ext(fid)
+                                                        && decl_arity(fid) == Some(want_u32)
+                                                })
+                                                .copied()
+                                        })
+                                        .or(fallback)
+                                }
                             }
                         })
                 };

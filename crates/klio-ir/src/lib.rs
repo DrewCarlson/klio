@@ -686,6 +686,14 @@ pub struct Module {
     /// keeps the Vm's state focused on per-run frames.
     #[serde(default)]
     pub registry: ModuleRegistry,
+    /// Declared user-parameter count (excluding an implicit extension
+    /// `this`) per top-level `FuncId`, keyed by `FuncId.0`. Populated by
+    /// the driver in the stub pass — before any body is lowered — so a
+    /// bare call to an overload declared *later* in the same file can be
+    /// resolved by arity even though that sibling is still a body-less
+    /// stub. Lowering-only; not serialized into packs.
+    #[serde(skip)]
+    pub decl_user_params: std::collections::HashMap<u32, u32>,
 }
 
 /// Module-scoped side tables consumed by the Vm at dispatch time.

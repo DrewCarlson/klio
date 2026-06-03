@@ -1104,6 +1104,11 @@ fn build_module_with_overrides(
             if f.is_tailrec {
                 module.tailrec_fn_names.push(f.name.name.clone());
             }
+            // Record the declared user-param arity so call-site lowering
+            // can resolve a forward reference to a later-declared overload
+            // by arity while that sibling is still a body-less stub.
+            #[allow(clippy::cast_possible_truncation)]
+            module.decl_user_params.insert(id.0, f.params.len() as u32);
             stub_ids.push(id);
         }
     }
