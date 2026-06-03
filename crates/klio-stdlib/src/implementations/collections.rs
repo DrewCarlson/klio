@@ -502,6 +502,16 @@ pub(crate) fn coll_mut_list_sort(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
     Ok(Value::Unit)
 }
 
+/// `MutableList.reverse()` — reverse the list in place, returns `Unit`.
+/// Upstream `Array<T>.reversed()` / `IntArray.sortedDescending()` build
+/// on this via `toMutableList().reverse()`, so without it those return
+/// elements in their original order.
+pub(crate) fn coll_mut_list_reverse(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let it = recv_list_items(ctx.args, "MutableList.reverse")?;
+    it.borrow_mut().reverse();
+    Ok(Value::Unit)
+}
+
 /// Dispatch `comparator.compare(a, b)` for a non-intrinsic Comparator
 /// value (an interpreted object / SAM). Returns the `Int` result as an
 /// `i64`. Used by the sorting intrinsics so an interpreted Comparator
@@ -3481,6 +3491,175 @@ pub(crate) fn array_fill(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             *slot = element.clone();
         }
     }
+    Ok(Value::Unit)
+}
+
+/// `Array<T>.sort()` / `sort(fromIndex = 0, toIndex = size)` and the
+/// primitive-array variants — sorts the range in place by natural order
+/// and returns `Unit`. `Array<T>` elements that are user instances are
+/// ordered through their `compareTo` (the same host-aware path
+/// `List.sorted` uses); the sort is stable. Upstream declares these
+/// `expect` with no klio-runnable body, so without this actual every
+/// `sort()` silently no-opped (and `sortedArray` / `sortDescending`,
+/// which delegate to it, returned unsorted data).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn array_sort(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = match ctx.args.first() {
+        Some(Value::Array { items, .. }) => items.clone(),
+        _ => return Err(RuntimeError::Type("sort requires an array receiver".into())),
+    };
+    let len = items.borrow().len() as i64;
+    let from = array_opt_index(ctx, 1, 0, "sort")?;
+    let to = array_opt_index(ctx, 2, len, "sort")?;
+    if from < 0 || to > len || from > to {
+        return Err(index_oob(format!(
+            "sort: range [{from}, {to}) out of bounds for length {len}"
+        )));
+    }
+    let (from, to) = (from as usize, to as usize);
+    let mut buf: Vec<Value> = items.borrow().clone();
+    let needs_host = buf[from..to]
+        .iter()
+        .any(|v| matches!(v, Value::Instance(_)));
+    let mut err: Option<RuntimeError> = None;
+    if needs_host {
+        let CallCtx { out, host, .. } = ctx;
+        // Stable, index-aware ordering that defers to a user-declared
+        // `compareTo` for instance elements (mirrors `List.sorted`).
+        let mut indexed: Vec<(usize, Value)> = buf[from..to].iter().cloned().enumerate().collect();
+        indexed.sort_by(|(ia, a), (ib, b)| {
+            if err.is_some() {
+                return ia.cmp(ib);
+            }
+            let ord = if matches!(a, Value::Instance(_)) {
+                match host.invoke_method(a, "compareTo", std::slice::from_ref(b), *out) {
+                    Some(Ok(Value::Int(n))) => i32_to_ordering(n),
+                    Some(Err(e)) => {
+                        err = Some(e);
+                        std::cmp::Ordering::Equal
+                    }
+                    _ => match compare_values(a, b) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            err = Some(e);
+                            std::cmp::Ordering::Equal
+                        }
+                    },
+                }
+            } else {
+                match compare_values(a, b) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        err = Some(e);
+                        std::cmp::Ordering::Equal
+                    }
+                }
+            };
+            if ord == std::cmp::Ordering::Equal {
+                ia.cmp(ib)
+            } else {
+                ord
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        for (slot, (_, v)) in buf[from..to].iter_mut().zip(indexed) {
+            *slot = v;
+        }
+    } else {
+        buf[from..to].sort_by(|a, b| {
+            if err.is_some() {
+                return std::cmp::Ordering::Equal;
+            }
+            match compare_values(a, b) {
+                Ok(o) => o,
+                Err(e) => {
+                    err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+    }
+    *items.borrow_mut() = buf;
+    Ok(Value::Unit)
+}
+
+/// `Array<T>.sortWith(comparator, fromIndex = 0, toIndex = size)` —
+/// in-place stable sort ordered by the supplied `Comparator` (klio's
+/// `Value::Comparator`, an interpreted SAM, or a bare callable), returns
+/// `Unit`. Like `sort`, this is the missing actual that `sortedWith` /
+/// `sortedArrayWith` and the `*Descending` reverse-order variants
+/// delegate to.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn array_sort_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = match ctx.args.first() {
+        Some(Value::Array { items, .. }) => items.clone(),
+        _ => {
+            return Err(RuntimeError::Type(
+                "sortWith requires an array receiver".into(),
+            ));
+        }
+    };
+    let comparator = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("sortWith expects (comparator, ...)".into()))?;
+    let len = items.borrow().len() as i64;
+    let from = array_opt_index(ctx, 2, 0, "sortWith")?;
+    let to = array_opt_index(ctx, 3, len, "sortWith")?;
+    if from < 0 || to > len || from > to {
+        return Err(index_oob(format!(
+            "sortWith: range [{from}, {to}) out of bounds for length {len}"
+        )));
+    }
+    let (from, to) = (from as usize, to as usize);
+    let mut buf: Vec<Value> = items.borrow().clone();
+    let mut err: Option<RuntimeError> = None;
+    {
+        let CallCtx { out, host, .. } = ctx;
+        // Stable, index-aware sort so equal elements keep input order
+        // and a comparator error short-circuits deterministically.
+        let mut indexed: Vec<(usize, Value)> = buf[from..to].iter().cloned().enumerate().collect();
+        indexed.sort_by(|(ia, a), (ib, b)| {
+            if err.is_some() {
+                return ia.cmp(ib);
+            }
+            match invoke_comparator_compare(*host, &comparator, a, b, *out) {
+                Ok(n) => {
+                    let ord = i64::cmp(&n, &0);
+                    if ord == std::cmp::Ordering::Equal {
+                        ia.cmp(ib)
+                    } else {
+                        ord
+                    }
+                }
+                Err(e) => {
+                    err = Some(e);
+                    ia.cmp(ib)
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        for (slot, (_, v)) in buf[from..to].iter_mut().zip(indexed) {
+            *slot = v;
+        }
+    }
+    *items.borrow_mut() = buf;
     Ok(Value::Unit)
 }
 

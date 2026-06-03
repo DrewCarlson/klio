@@ -64,6 +64,20 @@ two of them and root-caused a third.
   `array_bulk_copy` corpus entry, and `examples/array_bytes.kt` (the
   corpus + example are byte-identical to `kotlinc`).
 
+- **B8 follow-on: array `sort` / `reverse` family fixed.** The same
+  `expect`-with-no-`actual` no-op class hid the entire in-place sort
+  surface: `Array<T>.sort()` / primitive `sort()` / `sort(from, to)` and
+  `Array<T>.sortWith(comparator)` all silently no-opped, and
+  `MutableList.reverse()` did nothing — which in turn broke the
+  interpreted `Array.reversed()` / `IntArray.sortedDescending()` bodies
+  (`copyOf().apply { sort() }.reversed()`). Added host actuals for
+  `array.sort`/`sortWith` (natural order + user `Comparable` via the
+  host-aware `compareTo` path that `List.sorted` uses) and
+  `MutableList.reverse`. One fix each cascaded to `sortedArray`,
+  `sortDescending`, `sortedArrayDescending`, `reversed`, and
+  `sortedDescending`. Covered by unit + parity tests and the
+  `array_bulk_copy` corpus entry (byte-identical to `kotlinc`).
+
 New, narrower gaps surfaced while landing B8 (next, not yet fixed):
 
 - **Named arguments no-op on intrinsic / `expect` calls.** `copyInto(b,

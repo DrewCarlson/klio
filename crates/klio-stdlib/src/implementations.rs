@@ -550,6 +550,26 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.ULongArray.fill", array_fill),
     ("kotlin.UShortArray.fill", array_fill),
     ("kotlin.UByteArray.fill", array_fill),
+    // In-place natural-order sort (no-arg and (fromIndex, toIndex)).
+    // Also an unimplemented `expect`; without it `sort()` no-ops and
+    // `sortedArray`/`sortDescending`, which delegate to it, are wrong.
+    ("kotlin.Array.sort", array_sort),
+    ("kotlin.IntArray.sort", array_sort),
+    ("kotlin.LongArray.sort", array_sort),
+    ("kotlin.DoubleArray.sort", array_sort),
+    ("kotlin.FloatArray.sort", array_sort),
+    ("kotlin.ShortArray.sort", array_sort),
+    ("kotlin.ByteArray.sort", array_sort),
+    ("kotlin.CharArray.sort", array_sort),
+    ("kotlin.UIntArray.sort", array_sort),
+    ("kotlin.ULongArray.sort", array_sort),
+    ("kotlin.UShortArray.sort", array_sort),
+    ("kotlin.UByteArray.sort", array_sort),
+    // Comparator-ordered in-place sort. Only Array<T> has sortWith in
+    // the stdlib (primitive arrays take a natural order); register the
+    // generic form plus the typed-name klio may resolve it under.
+    ("kotlin.Array.sortWith", array_sort_with),
+    ("kotlin.collections.Array.sortWith", array_sort_with),
     ("kotlin.IntArray.withIndex", coll_array_with_index),
     ("kotlin.LongArray.withIndex", coll_array_with_index),
     ("kotlin.DoubleArray.withIndex", coll_array_with_index),
@@ -1288,6 +1308,10 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ),
     ("kotlin.collections.MutableList.sort", coll_mut_list_sort),
     (
+        "kotlin.collections.MutableList.reverse",
+        coll_mut_list_reverse,
+    ),
+    (
         "kotlin.collections.MutableList.sortedByDescending",
         coll_iter_sorted_by_desc,
     ),
@@ -1806,7 +1830,7 @@ mod tests {
     }
     fn array_ints(v: &Value) -> Vec<i32> {
         match v {
-            Value::Array { items, .. } => items
+            Value::Array { items, .. } | Value::List { items, .. } => items
                 .borrow()
                 .iter()
                 .map(|e| match e {
@@ -1815,7 +1839,7 @@ mod tests {
                     _ => -1,
                 })
                 .collect(),
-            _ => panic!("not an array"),
+            _ => panic!("not an array or list"),
         }
     }
 
@@ -1940,6 +1964,25 @@ mod tests {
             })
             .collect();
         assert_eq!(got, vec![0, 9, 9, 0]);
+    }
+
+    #[test]
+    fn array_sort_orders_in_place_and_range() {
+        let arr = int_array(&[3, 1, 2]);
+        call(array_sort, std::slice::from_ref(&arr)).unwrap();
+        assert_eq!(array_ints(&arr), vec![1, 2, 3]);
+        // Range [1,4) of [5,4,3,2,1] sorts only the middle.
+        let arr = int_array(&[5, 4, 3, 2, 1]);
+        call(array_sort, &[arr.clone(), Value::Int(1), Value::Int(4)]).unwrap();
+        assert_eq!(array_ints(&arr), vec![5, 2, 3, 4, 1]);
+    }
+
+    #[test]
+    fn mutable_list_reverse_in_place() {
+        let list = make_list(vec![Value::Int(1), Value::Int(2), Value::Int(3)], true);
+        let ret = call(coll_mut_list_reverse, std::slice::from_ref(&list)).unwrap();
+        assert!(matches!(ret, Value::Unit));
+        assert_eq!(array_ints(&list), vec![3, 2, 1]);
     }
 
     #[test]

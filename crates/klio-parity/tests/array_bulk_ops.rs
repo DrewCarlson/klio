@@ -83,6 +83,69 @@ fun main() {
 }
 
 #[test]
+fn array_sort_family_in_place_and_copies() {
+    let src = r#"
+fun main() {
+    val a = intArrayOf(3, 1, 4, 1, 5, 9, 2, 6)
+    a.sort()
+    println(a.joinToString(","))
+    val b = intArrayOf(5, 4, 3, 2, 1)
+    b.sort(1, 4)
+    println(b.joinToString(","))
+    val c = intArrayOf(3, 1, 2)
+    println(c.sortedArray().joinToString(",") + " | " + c.joinToString(","))
+    val d = intArrayOf(1, 3, 2)
+    d.sortDescending()
+    println(d.joinToString(","))
+    val e = arrayOf("banana", "apple", "cherry")
+    e.sort()
+    println(e.joinToString(","))
+}
+"#;
+    assert_klio(
+        "array_sort",
+        src,
+        "1,1,2,3,4,5,6,9\n5,2,3,4,1\n1,2,3 | 3,1,2\n3,2,1\napple,banana,cherry\n",
+    );
+}
+
+#[test]
+fn array_sort_with_comparator_and_user_comparable() {
+    let src = r#"
+data class Person(val name: String, val age: Int) : Comparable<Person> {
+    override fun compareTo(other: Person): Int = age - other.age
+}
+fun main() {
+    val people = arrayOf(Person("A", 30), Person("B", 20), Person("C", 25))
+    people.sort()
+    println(people.joinToString(",") { it.name })
+    people.sortWith(compareByDescending { it.age })
+    println(people.joinToString(",") { it.name })
+}
+"#;
+    assert_klio("array_sort_with", src, "B,C,A\nA,C,B\n");
+}
+
+#[test]
+fn array_and_mutable_list_reversed() {
+    let src = r#"
+fun main() {
+    println(intArrayOf(1, 2, 3, 4).reversed())
+    println(arrayOf("a", "b", "c").reversed())
+    val m = mutableListOf(1, 2, 3)
+    m.reverse()
+    println(m)
+    println(intArrayOf(5, 1, 4, 2).sortedDescending())
+}
+"#;
+    assert_klio(
+        "array_reversed",
+        src,
+        "[4, 3, 2, 1]\n[c, b, a]\n[3, 2, 1]\n[5, 4, 2, 1]\n",
+    );
+}
+
+#[test]
 fn string_byte_array_utf8_round_trip() {
     let src = r#"
 fun main() {
