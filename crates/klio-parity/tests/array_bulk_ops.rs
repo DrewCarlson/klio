@@ -170,6 +170,20 @@ fun main() {
 // same copyInto-backed byte path through the harness.
 
 #[test]
+fn string_from_byte_array_decodes_utf8() {
+    let src = r#"
+fun main() {
+    println(String(byteArrayOf(72, 105, 33)))
+    println(String(byteArrayOf(65, 66, 67, 68), 1, 2))
+    println(String("café".encodeToByteArray()))
+    // CharArray constructor must still build from code units.
+    println(String(charArrayOf('h', 'i')))
+}
+"#;
+    assert_klio("string_from_bytes", src, "Hi!\nBC\ncafé\nhi\n");
+}
+
+#[test]
 fn kotlinx_io_bytestring_encode_decode() {
     let src = r#"
 import kotlinx.io.bytestring.encodeToByteString

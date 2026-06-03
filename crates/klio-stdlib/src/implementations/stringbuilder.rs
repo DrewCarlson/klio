@@ -26,29 +26,64 @@ pub(crate) fn string_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
         None => String::new(),
         // CharArray is a Value::Array, but some producers (e.g. toCharArray)
         // yield a Value::List of chars — accept either.
-        Some(Value::Array { items, .. } | Value::List { items, .. }) => {
-            let chars = items.borrow();
+        Some(arr @ (Value::Array { .. } | Value::List { .. })) => {
+            let (items, prim_is_byte) = match arr {
+                Value::Array { items, prim } => (
+                    items,
+                    matches!(
+                        prim,
+                        Some(
+                            klio_runtime::PrimitiveArrayKind::Byte
+                                | klio_runtime::PrimitiveArrayKind::UByte
+                        )
+                    ),
+                ),
+                Value::List { items, .. } => (items, false),
+                _ => unreachable!(),
+            };
+            let elems = items.borrow();
             let (start, count) = if ctx.args.len() >= 3 {
                 let off = ctx.args[1].as_i64().unwrap_or(0).max(0) as usize;
                 let cnt = ctx.args[2].as_i64().unwrap_or(0).max(0) as usize;
                 (off, cnt)
             } else {
-                (0, chars.len())
+                (0, elems.len())
             };
-            let end = start.saturating_add(count).min(chars.len());
-            if start > chars.len() || end > chars.len() {
+            let end = start.saturating_add(count).min(elems.len());
+            if start > elems.len() || end > elems.len() {
                 return Err(RuntimeError::Thrown(make_exception(
                     "kotlin.IndexOutOfBoundsException",
                     Some(format!(
                         "offset {start}, count {count}, size {}",
-                        chars.len()
+                        elems.len()
                     )),
                 )));
             }
-            char_units_to_string(chars[start..end].iter().map(|v| match v {
-                Value::Char(c) => *c,
-                _ => 0u16,
-            }))
+            // `String(ByteArray[, offset, length][, charset])` decodes
+            // bytes as UTF-8; `String(CharArray[, offset, count])` builds
+            // from UTF-16 code units. `byteArrayOf` tags its array
+            // `prim = Byte` even though the literal elements arrive as
+            // `Int`, so key off the array kind (with an element-kind
+            // fallback) rather than reading every slot as a NUL char.
+            let is_bytes =
+                prim_is_byte || matches!(elems.first(), Some(Value::Byte(_) | Value::UByte(_)));
+            if is_bytes {
+                let bytes: Vec<u8> = elems[start..end]
+                    .iter()
+                    .map(|v| match v {
+                        Value::Byte(b) => *b as u8,
+                        Value::UByte(b) => *b,
+                        Value::Int(i) => *i as u8,
+                        _ => 0,
+                    })
+                    .collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            } else {
+                char_units_to_string(elems[start..end].iter().map(|v| match v {
+                    Value::Char(c) => *c,
+                    _ => 0u16,
+                }))
+            }
         }
         Some(Value::String(s)) => (**s).clone(),
         Some(Value::StringBuilder(sb)) => sb.borrow().clone(),
