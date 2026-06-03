@@ -67,10 +67,23 @@ Still open (needs careful design, not a quick patch):
   call lowers to `CallMemberOrGlobal`, and somewhere on that path the
   receiver reaches the 1-arg `println(Any?)` form. Minor (only the
   no-arg form), but lives in the same sensitive bare-call dispatch.
-- **kotlinx.io `readByteArray` / `readLine` / decimal+hex scanners** hang
-  or return `Unit` — they bottom out on `Source.request(byteCount)`
-  dispatching such that `byteCount` arrives `Unit` (virtual dispatch over
-  the `Source`/`Buffer` hierarchy), not a missing intrinsic.
+- **kotlinx.io `readByteArray` / `readTo(ByteArray)` — FIXED.** Root was
+  overload resolution: `pick_method_overload` accepted a lone same-named
+  member without an arity check, so `buffer.readTo(byteArray)` bound the
+  inapplicable member `Buffer.readTo(RawSink, byteCount: Long)` (padding
+  `byteCount` with Unit) instead of the extension `Source.readTo(
+  ByteArray, …)`. Now a lone member is declined when an unsupplied param
+  is neither defaulted nor vararg, so the extension wins.
+- **kotlinx.io `readString(byteCount)` / `readLine` still hang.** Narrowed
+  hard: every sub-piece works in isolation (`forEachSegment`, `withData`,
+  non-local return through both, `skip`, `min`, `require(n<=size)`), and
+  `readString()` (no-arg → `commonReadUtf8(size)`) works — but
+  `commonReadUtf8(byteCount)` hangs whenever `byteCount < segment.size`.
+  The fault is the *composition* in `commonReadUtf8`'s lambda
+  (`skip(byteCount)` side-effect followed by a non-local `return` out of
+  the nested inline `forEachSegment { withData { … } }`); needs an
+  instrumented trace, not source reading. Separately, `Buffer.require(
+  byteCount > size)` loops instead of throwing `EOFException`.
 - **`recv.name(args)` where a user/pack extension's name collides with a
   stdlib intrinsic registered for a *different* receiver** (e.g.
   `LocalDate.until` / `String.until` vs `kotlin.ranges.until`). klio
