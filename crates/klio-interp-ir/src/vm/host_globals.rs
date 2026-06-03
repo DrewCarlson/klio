@@ -271,36 +271,29 @@ impl VmHost<'_> {
         // Probe stdlib by FQN for known package surfaces. Covers
         // bare references to `IntArray`, `compareBy`, `buildList`,
         // `naturalOrder`, `PI`, etc. that aren't in IMPLICIT_ALIASES.
+        // A bare (receiverless) reference can only bind a *top-level*
+        // function — a receiver-extension (`kotlin.collections.min`,
+        // an `Iterable.min()`) needs a receiver, so binding one here
+        // would consume the first positional argument as `this`
+        // (`min(a, b)` mis-dispatched as `a.min(b)`). Probe the
+        // top-level packages (`math`, `comparisons`, `io`) before the
+        // receiver-extension packages (`collections`, `text`, `ranges`)
+        // so `min`/`max` resolve to `kotlin.math.min` rather than the
+        // collection extension of the same name.
         let direct_probes: [String; 12] = [
             name.to_string(),
             format!("kotlin.{name}"),
+            format!("kotlin.math.{name}"),
+            format!("kotlin.comparisons.{name}"),
+            format!("kotlin.io.{name}"),
             format!("kotlin.collections.{name}"),
             format!("kotlin.text.{name}"),
             format!("kotlin.ranges.{name}"),
-            format!("kotlin.math.{name}"),
-            format!("kotlin.comparisons.{name}"),
             format!("kotlin.concurrent.{name}"),
             format!("kotlin.coroutines.{name}"),
             format!("kotlin.coroutines.intrinsics.{name}"),
             format!("kotlin.internal.{name}"),
-            format!("kotlin.io.{name}"),
         ];
-        // Loaded packs register their FQNs in `installed_bindings`.
-        // For a bare-name reference, scan the overlay for a key that
-        // ends with `.{name}` so user code can call an imported
-        // function by simple name without having to teach
-        // `direct_probes` about every pack's package.
-        {
-            let suffix = format!(".{name}");
-            let entry: Option<(&'static str, klio_runtime::StdlibFn)> = self
-                .prog
-                .installed_bindings
-                .entries()
-                .find(|(k, _)| k.ends_with(&suffix));
-            if let Some((fqn, func)) = entry {
-                return Some(klio_runtime::Value::Intrinsic { fqn, func });
-            }
-        }
         for fqn in &direct_probes {
             if let Some(func) = self.lookup_intrinsic(fqn) {
                 // Property-style intrinsic: a 0-arg constant whose
@@ -319,6 +312,28 @@ impl VmHost<'_> {
                     return Some(v);
                 }
                 return Some(klio_runtime::Value::Intrinsic { fqn: leaked, func });
+            }
+        }
+        // Loaded packs register their FQNs in `installed_bindings`. For
+        // a bare-name reference, scan the overlay for a key that ends
+        // with `.{name}` so user code can call an imported function by
+        // simple name without teaching `direct_probes` about every
+        // pack's package. Runs *after* the `direct_probes` so a
+        // top-level `kotlin.*` function (e.g. `kotlin.math.min`) wins
+        // over a same-named receiver-extension whose FQN merely ends in
+        // `.min` (`kotlin.DoubleArray.min`) — the `installed_bindings`
+        // overlay carries the stdlib defaults too, and an arbitrary
+        // `.min` match there would consume the first positional argument
+        // as a receiver.
+        {
+            let suffix = format!(".{name}");
+            let entry: Option<(&'static str, klio_runtime::StdlibFn)> = self
+                .prog
+                .installed_bindings
+                .entries()
+                .find(|(k, _)| k.ends_with(&suffix));
+            if let Some((fqn, func)) = entry {
+                return Some(klio_runtime::Value::Intrinsic { fqn, func });
             }
         }
         // `Thread` static surface — a synthetic intrinsic value that
