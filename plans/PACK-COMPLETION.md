@@ -101,9 +101,15 @@ Still open (needs careful design, not a quick patch):
   global `eval_with_captures` / `call_func` / `call_member` counters):
   the hang fires with NONE of them tripping — `readString(3L)` never
   reaches `call_func`, `call_member`, or any interpreted body, while
-  `readString()` makes 300 `call_member` calls. So the loop is in a Vm
-  execution path below those entry points (a `CallValue` / Inst-exec
-  cycle); needs a trace at the Vm instruction-dispatch level.
+  `readString()` makes 300 `call_member` calls. Extended the trace to
+  `call_value` and confirmed it's a *runtime* (not build/lower) hang —
+  yet it bypasses `call_func`, `call_member`, `call_value`,
+  `eval_with_captures`, and the per-frame block-loop guard, while every
+  sub-piece (`skip`, `min`, `withData`, `forEachSegment`, non-local
+  return, partial `decodeToString`) works standalone. It is in a Vm
+  path beneath all standard dispatch entry points; cracking it needs a
+  debugger or instrumentation of the Vm core run loop, not source
+  reading.
 - **`recv.name(args)` where a user/pack extension's name collides with a
   stdlib intrinsic registered for a *different* receiver** (e.g.
   `LocalDate.until` / `String.until` vs `kotlin.ranges.until`). klio
