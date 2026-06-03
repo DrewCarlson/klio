@@ -17,5 +17,20 @@ auto_bindings = true
 [[deps]]
 id = "stdlib"
 
-[[deps]]
-id = "kotlinx.serialization"
+# Cargo-style features mirroring ktor's Gradle module structure. The
+# core (io.ktor.http types under shim/core) is ungated and always loads;
+# everything else is opt-in via `--feature io.ktor/<name>`. The
+# *-serialization features pull the kotlinx.serialization pack only when
+# enabled, so a plain client/server program needs no serializer.
+[features]
+default = []
+# ktor-client-core: HttpClient + request/response builder DSL.
+client = { sources = ["shim/client"] }
+# ktor-server-core: embeddedServer + routing + respondText.
+server = { sources = ["shim/server"] }
+# ktor-client-content-negotiation + ktor-serialization-kotlinx-json:
+# typed body<T>() / setBody<T>() and ContentNegotiation { json() }.
+client-serialization = { sources = ["shim/client-serialization"], deps = ["kotlinx.serialization"], requires = ["client"] }
+# ktor-server-content-negotiation + ktor-serialization-kotlinx-json:
+# typed respond<T>() / receive<T>() and ContentNegotiation { json() }.
+server-serialization = { sources = ["shim/server-serialization"], deps = ["kotlinx.serialization"], requires = ["server"] }

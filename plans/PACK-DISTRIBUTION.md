@@ -205,6 +205,25 @@ native-free, so bundling is Kotlin/IR only).
 
 ## Phase 15 — Workspace packs and features
 
+**Status: feature selection landed (15.2 + CLI); workspace members (15.1)
+still open.** A pack's `klio.toml` now carries a `[features]` table:
+`default = [...]` plus named features `{ sources, deps, requires }`.
+`PackManifest` gained `default_features` + `features`; `PackDependency`
+gained `features` + `default_features`. Feature-gated `[[source]]` roots
+(by path prefix) load only when active — the pack's ungated files are the
+always-loaded core. A consumer selects features with `klio run --feature
+<pack>/<name>` (repeatable, also on `klio check`); an active feature's
+`deps` pull in their packs and `requires` expand transitively. An import
+of a gated package that isn't enabled prints an actionable
+`--feature <pack>/<name>` hint, and `klio pack inspect` lists the
+features. The on-disk format bumped to v2 (postcard is sequential, so
+older packs are rejected on read and must be rebuilt). The ktor pack is
+split along its Gradle modules: core (`io.ktor.http`) is default;
+`client`, `server`, `client-serialization`, `server-serialization` are
+opt-in. Still open: 15.1 workspace members / one-command multi-artifact
+builds (`--workspace`), and requesting a dependency's features when the
+dependency loads before its dependent.
+
 **Goal.** Manage kotlinx-style multi-module libraries (e.g.
 `serialization-core` + `serialization-json`) as independent artifacts
 under one project, with cargo-style feature selection downstream.

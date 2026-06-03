@@ -155,9 +155,13 @@ fun main() {{
     let file = dir.join("server.kt");
     std::fs::write(&file, src).unwrap();
 
+    // The typed-body server lives in ktor's opt-in server-serialization
+    // feature (mirroring ktor-server-content-negotiation +
+    // ktor-serialization-kotlinx-json); enable it explicitly.
     let mut child = Command::new(klio_bin())
         .arg("run")
         .arg(&file)
+        .args(["--feature", "io.ktor/server-serialization"])
         .spawn()
         .expect("spawn klio server");
 

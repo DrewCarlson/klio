@@ -120,9 +120,13 @@ fn handle_conn(mut stream: std::net::TcpStream) {
 }
 
 fn run_via_binary(file: &Path) -> String {
+    // The typed-body client lives in ktor's opt-in client-serialization
+    // feature (mirroring ktor-client-content-negotiation +
+    // ktor-serialization-kotlinx-json); enable it explicitly.
     let o = Command::new(klio_bin())
         .arg("run")
         .arg(file)
+        .args(["--feature", "io.ktor/client-serialization"])
         .output()
         .expect("spawn klio run");
     assert!(
