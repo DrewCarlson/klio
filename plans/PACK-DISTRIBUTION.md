@@ -220,7 +220,12 @@ features. The on-disk format bumped to v2 (postcard is sequential, so
 older packs are rejected on read and must be rebuilt). The ktor pack is
 split along its Gradle modules: core (`io.ktor.http`) is default;
 `client`, `server`, `client-serialization`, `server-serialization` are
-opt-in. Still open: 15.1 workspace members / one-command multi-artifact
+opt-in. The kotlinx.serialization pack is likewise split: the reflective
+serialization-core is the default; the JSON format is the opt-in `json`
+feature. A feature's `deps` entry takes a `lib/feature` suffix so an
+active feature can request features of the pack it pulls (ktor's
+serialization layers activate `kotlinx.serialization/json` transitively).
+Still open: 15.1 workspace members / one-command multi-artifact
 builds (`--workspace`), and requesting a dependency's features when the
 dependency loads before its dependent.
 
