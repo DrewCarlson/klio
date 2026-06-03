@@ -47,13 +47,26 @@ instance's `toString()`, kotlinx.datetime `LocalDate` arithmetic
 navigators), and **named + defaulted constructor arguments** for primary
 *and* secondary constructors (was: named/omitted params left Null).
 
-Still open (interpreter-level, surfaced this session):
-- **`LocalDate.until(other, unit)`** binds to the stdlib `Int.until`
-  intrinsic instead of the datetime extension — overload resolution
-  prefers the stdlib symbol (same shape as the atomicfu B7 collision).
-- **`LocalDate.Companion.parse` / `fromEpochDays`** — the klioMain actual
-  class has no companion, so companion factories hit `Vm::call_member on
-  KClass`.
+Resolution/dispatch fixes since: **B7 atomicfu arrays** — dropped the
+unused `kotlin.concurrent.atomics` array `expect`s so they stop
+ambiguating `kotlinx.atomicfu.AtomicIntArray` / `atomicArrayOfNulls`;
+**companion-on-actual-class** — an `expect class` superseded by an
+`actual` was lifted before the supersession retain, so its bodyless
+companion collided with the actual's; now skipped, and
+`LocalDate.parse` / `fromEpochDays` work.
+
+Still open (needs careful design, not a quick patch):
+- **`recv.name(args)` where a user/pack extension's name collides with a
+  stdlib intrinsic registered for a *different* receiver** (e.g.
+  `LocalDate.until` / `String.until` vs `kotlin.ranges.until`). klio
+  dispatches member/extension calls at runtime via `call_member`, which
+  probes intrinsics speculatively by `kotlin.{ranges,collections,text}.
+  {name}` for *any* receiver. A runtime guard preferring a matching user
+  extension is unsafe: loose receiver-compat over-fires (hijacks
+  `string[i]`), and even an exact-type-name guard perturbs the
+  kotlinx.io String/ByteString surface. The right fix is compile-time
+  extension resolution (target the FuncId in the IR) or making the
+  speculative probes receiver-category-aware; both are larger.
 
 Re-verifying the top blockers against `target/release/klio` corrected
 two of them and root-caused a third.
