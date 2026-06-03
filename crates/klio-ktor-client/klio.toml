@@ -11,3 +11,6 @@ auto_bindings = true
 
 [[deps]]
 id = "stdlib"
+
+[[deps]]
+id = "kotlinx.serialization"

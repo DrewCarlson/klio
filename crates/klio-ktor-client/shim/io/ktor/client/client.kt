@@ -16,6 +16,10 @@ class HttpClientConfig {
     var timeoutMillis: Long = 60_000L
     var connectTimeoutMillis: Long = -1L
     var tlsInsecure: Boolean = false
+    // Set when `install(ContentNegotiation) { … }` runs. The typed
+    // body helpers route through JSON regardless; this records the
+    // registration so client setup matches ktor's shape.
+    var contentNegotiation: io.ktor.client.plugins.contentnegotiation.ContentNegotiationConfig? = null
 }
 
 class HttpClient(val config: HttpClientConfig) {
