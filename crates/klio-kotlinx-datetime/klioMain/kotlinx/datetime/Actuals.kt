@@ -142,6 +142,92 @@ internal fun daysInMonth(year: Int, month: Int): Int = when (month) {
     else -> if (isLeapYear(year)) 29 else 28
 }
 
+// Inverse of LocalDate.toEpochDays: the proleptic-Gregorian date for a
+// count of days since 1970-01-01 (Howard Hinnant's civil-from-days).
+internal fun dateFromEpochDays(epochDays: Long): LocalDate {
+    val z = epochDays + 719468L
+    val era = (if (z >= 0) z else z - 146096) / 146097
+    val doe = z - era * 146097
+    val yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    val y = yoe + era * 400
+    val doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    val mp = (5 * doy + 2) / 153
+    val d = (doy - (153 * mp + 2) / 5 + 1).toInt()
+    val m = (if (mp < 10) mp + 3 else mp - 9).toInt()
+    val year = (if (m <= 2) y + 1L else y).toInt()
+    return LocalDate(year, m, d)
+}
+
+// Add a (possibly negative) number of calendar months, clamping the day
+// of month to the resulting month's length (2024-01-31 + 1 month =
+// 2024-02-29).
+internal fun localDatePlusMonths(date: LocalDate, monthsToAdd: Long): LocalDate {
+    val total = date.year.toLong() * 12 + (date.monthNumber - 1) + monthsToAdd
+    var y = total / 12
+    var m0 = total % 12
+    if (m0 < 0) {
+        m0 += 12
+        y -= 1
+    }
+    val newYear = y.toInt()
+    val newMonth = (m0 + 1).toInt()
+    val maxDay = daysInMonth(newYear, newMonth)
+    val newDay = if (date.day > maxDay) maxDay else date.day
+    return LocalDate(newYear, newMonth, newDay)
+}
+
+// Signed count of whole calendar months between two dates, day-aware
+// (the partial trailing month is dropped, like java.time).
+internal fun localDateMonthsBetween(start: LocalDate, end: LocalDate): Long {
+    var months = (end.year.toLong() * 12 + (end.monthNumber - 1)) -
+        (start.year.toLong() * 12 + (start.monthNumber - 1))
+    if (months > 0 && end.day < start.day) {
+        months -= 1
+    } else if (months < 0 && end.day > start.day) {
+        months += 1
+    }
+    return months
+}
+
+// `actual` implementations for the `expect` date-arithmetic operators
+// and `until` helpers declared in upstream LocalDate.kt. Pure
+// proleptic-Gregorian math over toEpochDays / dateFromEpochDays, so they
+// need no host calls and stay timezone-independent.
+actual operator fun LocalDate.plus(period: DatePeriod): LocalDate {
+    val shifted = localDatePlusMonths(this, period.years.toLong() * 12 + period.months)
+    return dateFromEpochDays(shifted.toEpochDays() + period.days)
+}
+
+actual fun LocalDate.plus(value: Long, unit: DateTimeUnit.DateBased): LocalDate = when (unit) {
+    is DateTimeUnit.DayBased -> dateFromEpochDays(toEpochDays() + value * unit.days)
+    is DateTimeUnit.MonthBased -> localDatePlusMonths(this, value * unit.months)
+    else -> throw IllegalArgumentException("Unsupported DateTimeUnit: $unit")
+}
+
+actual fun LocalDate.plus(unit: DateTimeUnit.DateBased): LocalDate = plus(1L, unit)
+
+actual fun LocalDate.daysUntil(other: LocalDate): Int =
+    (other.toEpochDays() - toEpochDays()).toInt()
+
+actual fun LocalDate.monthsUntil(other: LocalDate): Int =
+    localDateMonthsBetween(this, other).toInt()
+
+actual fun LocalDate.yearsUntil(other: LocalDate): Int =
+    (localDateMonthsBetween(this, other) / 12).toInt()
+
+actual fun LocalDate.until(other: LocalDate, unit: DateTimeUnit.DateBased): Long = when (unit) {
+    is DateTimeUnit.DayBased -> (other.toEpochDays() - toEpochDays()) / unit.days
+    is DateTimeUnit.MonthBased -> localDateMonthsBetween(this, other) / unit.months
+    else -> throw IllegalArgumentException("Unsupported DateTimeUnit: $unit")
+}
+
+actual fun LocalDate.periodUntil(other: LocalDate): DatePeriod {
+    val months = localDateMonthsBetween(this, other)
+    val afterMonths = localDatePlusMonths(this, months)
+    val days = (other.toEpochDays() - afterMonths.toEpochDays()).toInt()
+    return DatePeriod((months / 12).toInt(), (months % 12).toInt(), days)
+}
+
 // `actual` for upstream `expect class LocalTime` (LocalTime.kt).
 actual class LocalTime(
     val hour: Int,

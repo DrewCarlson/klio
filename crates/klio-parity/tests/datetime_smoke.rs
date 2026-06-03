@@ -113,6 +113,21 @@ fn datetime_smoke_litmus() {
     assert_eq!(run_via_binary(&file), want, "dt_smoke.kt stdout mismatch");
 }
 
+/// LocalDate arithmetic — the `expect` operators / `until` helpers whose
+/// actuals are klio-supplied calendar math (daysUntil / plus(DatePeriod)
+/// / plus(value, unit) / periodUntil / minus / navigators).
+#[test]
+fn datetime_arithmetic_litmus() {
+    install_packs();
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("datetime_smoke")
+        .join("dt_arith.kt");
+    let want = expected_from_litmus(&file);
+    assert!(!want.is_empty(), "no //> expected lines");
+    assert_eq!(run_via_binary(&file), want, "dt_arith.kt stdout mismatch");
+}
+
 /// The shipped kotlinx demo (the only consumer of the datetime pack),
 /// pinned byte-for-byte through the real binary path.
 const KOTLINX_DEMO_EXPECTED: &str = "\
