@@ -452,6 +452,21 @@ fn build_module_with_overrides(
             _ => None,
         })
         .collect();
+    // An `actual class Foo` supersedes a matching `expect class Foo`.
+    // Collected up front so the superseded `expect` is skipped *before*
+    // lifting: otherwise its (bodyless) companion is lifted alongside the
+    // actual's real companion, the two `Foo$Companion$Companion` decls
+    // collide, and the bodyless one can win — `Foo.parse(...)` then hits
+    // `Vm::call_member on KClass`. The later all_decls retain drops the
+    // expect class itself, so skipping its lift is consistent.
+    let actual_class_names: std::collections::HashSet<String> = file
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Class(c) if c.is_actual => Some(c.name.name.clone()),
+            _ => None,
+        })
+        .collect();
     // A `private` top-level `object` declared in a pack package (e.g.
     // `private object State` in kotlin.collections/AbstractIterator.kt)
     // is file-private upstream, but klio publishes every top-level
@@ -540,6 +555,13 @@ fn build_module_with_overrides(
                 all_decls.push(Decl::Class(synthesize_class_from_object(o)));
             }
             Decl::Class(c) => {
+                if c.is_expect && actual_class_names.contains(&c.name.name) {
+                    // Superseded by an `actual class`; don't lift it (its
+                    // bodyless companion would collide with the actual's
+                    // real one). The retain below drops the expect class
+                    // regardless, so omitting it here is equivalent.
+                    continue;
+                }
                 lift_class_recursive(
                     c,
                     &[],

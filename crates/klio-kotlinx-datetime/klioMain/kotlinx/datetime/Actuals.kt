@@ -131,6 +131,27 @@ actual class LocalDate(
         return year == other.year && monthNumber == other.monthNumber && day == other.day
     }
     override fun hashCode(): Int = year * 10000 + monthNumber * 100 + day
+
+    companion object {
+        // ISO-8601 `yyyy-MM-dd` (with an optional leading `-` for a
+        // negative proleptic year). The format-DSL overload's
+        // `DateTimeFormat` parameter is intentionally unsupported; this
+        // covers the common `LocalDate.parse("2024-06-15")` shape.
+        fun parse(input: CharSequence): LocalDate {
+            val s = input.toString()
+            val neg = s.startsWith("-")
+            val body = if (neg) s.substring(1) else s
+            val parts = body.split("-")
+            if (parts.size != 3) {
+                throw IllegalArgumentException("Invalid ISO-8601 date: $input")
+            }
+            val year = parts[0].toInt() * (if (neg) -1 else 1)
+            return LocalDate(year, parts[1].toInt(), parts[2].toInt())
+        }
+
+        fun fromEpochDays(epochDays: Long): LocalDate = dateFromEpochDays(epochDays)
+        fun fromEpochDays(epochDays: Int): LocalDate = dateFromEpochDays(epochDays.toLong())
+    }
 }
 
 internal fun isLeapYear(year: Int): Boolean =

@@ -8,6 +8,8 @@
 //> period=1y 2m 5d
 //> minusP=2023-04-12
 //> next=2024-06-17
+//> parse=2024-06-15
+//> epoch0=1970-01-01
 
 import kotlinx.datetime.LocalDate
 import kotlinx.datetime.DatePeriod
@@ -28,4 +30,6 @@ fun main() {
     println("period=${p.years}y ${p.months}m ${p.days}d")
     println("minusP=" + LocalDate(2024, 6, 15).minus(DatePeriod(years = 1, months = 2, days = 3)))
     println("next=" + LocalDate(2024, 6, 12).nextOrSame(DayOfWeek.MONDAY))
+    println("parse=" + LocalDate.parse("2024-06-15"))
+    println("epoch0=" + LocalDate.fromEpochDays(0))
 }
