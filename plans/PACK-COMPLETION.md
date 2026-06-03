@@ -53,9 +53,24 @@ ambiguating `kotlinx.atomicfu.AtomicIntArray` / `atomicArrayOfNulls`;
 **companion-on-actual-class** — an `expect class` superseded by an
 `actual` was lifted before the supersession retain, so its bodyless
 companion collided with the actual's; now skipped, and
-`LocalDate.parse` / `fromEpochDays` work.
+`LocalDate.parse` / `fromEpochDays` work. Also added **LocalTime /
+LocalDateTime parse companions** (riding the same fix) and the
+**`kotlinx.atomicfu.locks`** package (ReentrantLock / SynchronizedObject
+/ synchronized / SynchronousMutex — trivial uncontended shims, no host
+bindings, since the runtime is single-threaded).
 
 Still open (needs careful design, not a quick patch):
+- **bare 0-arg `println()` inside a receiver lambda prints the receiver**
+  (`runBlocking { println() }` → `GlobalScope`). Specific to a host
+  *intrinsic* with a 1-arg overload (a module function with the same
+  shape resolves correctly): `println` has no module `func_id`, so the
+  call lowers to `CallMemberOrGlobal`, and somewhere on that path the
+  receiver reaches the 1-arg `println(Any?)` form. Minor (only the
+  no-arg form), but lives in the same sensitive bare-call dispatch.
+- **kotlinx.io `readByteArray` / `readLine` / decimal+hex scanners** hang
+  or return `Unit` — they bottom out on `Source.request(byteCount)`
+  dispatching such that `byteCount` arrives `Unit` (virtual dispatch over
+  the `Source`/`Buffer` hierarchy), not a missing intrinsic.
 - **`recv.name(args)` where a user/pack extension's name collides with a
   stdlib intrinsic registered for a *different* receiver** (e.g.
   `LocalDate.until` / `String.until` vs `kotlin.ranges.until`). klio
