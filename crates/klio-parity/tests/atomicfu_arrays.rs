@@ -51,6 +51,24 @@ fun main() {
 }
 
 #[test]
+fn locks_run_uncontended() {
+    let src = r#"
+import kotlinx.atomicfu.locks.reentrantLock
+import kotlinx.atomicfu.locks.withLock
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
+import kotlinx.atomicfu.locks.SynchronousMutex
+fun main() {
+    val lock = reentrantLock()
+    println(lock.withLock { 42 })
+    println(synchronized(SynchronizedObject()) { "ok" })
+    println(SynchronousMutex().withLock { "done" })
+}
+"#;
+    assert_klio("atomicfu_locks", src, "42\nok\ndone\n");
+}
+
+#[test]
 fn scalar_atomic_still_works() {
     let src = r#"
 import kotlinx.atomicfu.atomic
