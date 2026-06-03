@@ -167,17 +167,53 @@ impl VmHost<'_> {
             // Instance receiver. `kotlin.io.use` / `kotlin.AutoCloseable.use`
             // are bound on the stdlib side; let the call site reach
             // them by name when the user class hasn't shadowed them.
-            let any_probes = [
-                format!("kotlin.io.{name}"),
-                format!("kotlin.AutoCloseable.{name}"),
-                format!("kotlin.Any.{name}"),
-            ];
-            for p in &any_probes {
-                if let Some(func) = self.lookup_intrinsic(p) {
-                    let mut all_args: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
-                    all_args.push(receiver.clone());
-                    all_args.extend_from_slice(args);
-                    return self.dispatch_intrinsic(func, &all_args);
+            //
+            // A genuine user/source extension on the receiver's type
+            // chain (`fun Source.readLine()` for a `Buffer` receiver)
+            // must win over a same-named top-level `kotlin.io` function
+            // that is NOT an extension (`kotlin.io.readLine`, the console
+            // reader). Probing the latter here would prepend the
+            // receiver and then ignore it — `b.readLine()` would read
+            // empty stdin and return null instead of a line. Defer to
+            // the extension-fn dispatch below when such an extension
+            // exists for this receiver type.
+            let recv_chain: std::collections::HashSet<String> = {
+                let classes = self.classes.borrow();
+                let snap = inst.borrow();
+                let mut stack = vec![snap.class.name.clone(), snap.class.fqn.clone()];
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                while let Some(cn) = stack.pop() {
+                    if !seen.insert(cn.clone()) {
+                        continue;
+                    }
+                    if let Some(d) = classes.get(&cn) {
+                        stack.extend(d.supertype_names.iter().cloned());
+                    }
+                }
+                seen
+            };
+            let has_recv_ext = self.module.funcs_by_simple_name(name).iter().any(|fid| {
+                self.module.funcs.get(fid.0 as usize).is_some_and(|f| {
+                    !f.blocks.is_empty()
+                        && f.params
+                            .first()
+                            .is_some_and(|p| p.name == "this" && recv_chain.contains(&p.ty.name))
+                })
+            });
+            if !has_recv_ext {
+                let any_probes = [
+                    format!("kotlin.io.{name}"),
+                    format!("kotlin.AutoCloseable.{name}"),
+                    format!("kotlin.Any.{name}"),
+                ];
+                for p in &any_probes {
+                    if let Some(func) = self.lookup_intrinsic(p) {
+                        let mut all_args: Vec<klio_runtime::Value> =
+                            Vec::with_capacity(args.len() + 1);
+                        all_args.push(receiver.clone());
+                        all_args.extend_from_slice(args);
+                        return self.dispatch_intrinsic(func, &all_args);
+                    }
                 }
             }
         }

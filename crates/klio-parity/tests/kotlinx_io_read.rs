@@ -68,3 +68,25 @@ fun main() {
 "#;
     assert_eq!(run("bare_min_max_corpus", src), "3\n5\n2\n9\n",);
 }
+
+// `b.readLine()` dispatches the `Source.readLine()` extension, not the
+// top-level `kotlin.io.readLine` console reader (which the member probe
+// matched via `kotlin.io.{name}` and would have run against empty stdin,
+// returning null). A genuine source extension on the receiver's type
+// chain outranks a same-named non-extension top-level io function.
+#[test]
+fn read_line_dispatches_source_extension_not_console() {
+    let src = r#"
+import kotlinx.io.Buffer
+import kotlinx.io.readLine
+import kotlinx.io.writeString
+fun main() {
+    val b = Buffer()
+    b.writeString("line1\nline2\n")
+    println(b.readLine())
+    println(b.readLine())
+    println(b.readLine())
+}
+"#;
+    assert_eq!(run("read_line_source_ext", src), "line1\nline2\nnull\n",);
+}
