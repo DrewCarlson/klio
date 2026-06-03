@@ -1802,14 +1802,52 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // factory beside `sealed class DateTimePeriod`).
                 // Only treat the call as a constructor when the
                 // function genuinely cannot take that many args.
-                let shadowed_by_class = b.module.class_id(&segments[0].name).is_some()
-                    && b.module
-                        .func_id(&segments[0].name)
-                        .and_then(|fid| b.module.funcs.get(fid.0 as usize))
-                        .is_some_and(|f| {
-                            let last_vararg = f.params.last().is_some_and(|p| p.is_vararg);
-                            !last_vararg && args.len() > f.params.len()
-                        });
+                let shadowed_by_class = b.module.class_id(&segments[0].name).is_some() && {
+                    let name = &segments[0].name;
+                    let nargs = args.len();
+                    if matches!(args.last(), Some(Expr::Lambda { .. })) {
+                        // A trailing lambda (`Widget { … }`) routes to a
+                        // same-named factory function that has a
+                        // function-typed parameter to receive it. Only
+                        // when no such factory fits is the call a
+                        // constructor. Without this, an all-default
+                        // `Widget()` beside the builder factory would
+                        // misread the lambda call as the constructor.
+                        let factory_takes_lambda = b
+                            .module
+                            .func_index
+                            .iter()
+                            .filter(|(n, _)| n == name)
+                            .filter_map(|(_, fid)| b.module.funcs.get(fid.0 as usize))
+                            .any(|f| {
+                                let last_vararg =
+                                    f.params.last().is_some_and(|p| p.is_vararg);
+                                let arity_ok = last_vararg || nargs <= f.params.len();
+                                arity_ok
+                                    && f.params
+                                        .iter()
+                                        .any(|p| p.ty.name.starts_with("Function"))
+                            });
+                        !factory_takes_lambda
+                    } else {
+                        // No lambda: a factory function is applicable
+                        // whenever it can accept the supplied positional
+                        // count (trailing params default, e.g. the
+                        // all-default `DateTimePeriod(years=0, …)` factory
+                        // beside `sealed class DateTimePeriod`). Only treat
+                        // the call as a constructor when the factory
+                        // genuinely cannot take that many args — so a
+                        // `Widget(Conf())` reaches the constructor.
+                        b.module
+                            .func_id(name)
+                            .and_then(|fid| b.module.funcs.get(fid.0 as usize))
+                            .is_some_and(|f| {
+                                let last_vararg =
+                                    f.params.last().is_some_and(|p| p.is_vararg);
+                                !last_vararg && nargs > f.params.len()
+                            })
+                    }
+                };
                 // A bound local / parameter / captured outer of
                 // this name shadows a same-named top-level function
                 // (Kotlin scoping). e.g. a Flow operator's

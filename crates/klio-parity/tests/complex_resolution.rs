@@ -521,3 +521,39 @@ fun main() {
 "#;
     assert_klio("matrix_ops", src, "11,22|33,44\n70,100|150,220\n");
 }
+
+// A class with same-named top-level factory functions — including a
+// no-arg one beside a builder-lambda one (the `HttpClient { … }` shape).
+// A trailing-lambda call must resolve to the lambda-taking factory, not
+// the primary constructor, even though a no-arg factory is also present.
+#[test]
+fn class_with_factory_function_overloads() {
+    let src = r#"
+class Conf {
+    var size: Int = 0
+    var name: String = "default"
+}
+class Widget(val conf: Conf)
+
+fun Widget(): Widget = Widget(Conf())
+fun Widget(build: Conf.() -> Unit): Widget {
+    val c = Conf()
+    c.build()
+    return Widget(c)
+}
+
+fun main() {
+    val a = Widget()                                  // no-arg factory
+    val b = Widget { size = 7; name = "b" }           // builder factory
+    val c = Widget(Conf())                            // primary constructor
+    println("${a.conf.size}/${a.conf.name}")
+    println("${b.conf.size}/${b.conf.name}")
+    println("${c.conf.size}/${c.conf.name}")
+}
+"#;
+    assert_klio(
+        "class_with_factory_function_overloads",
+        src,
+        "0/default\n7/b\n0/default\n",
+    );
+}
