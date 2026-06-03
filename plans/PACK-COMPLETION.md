@@ -36,6 +36,25 @@ reach without hitting a verified gap", anchored to the probe logs.
 
 ## 1b. Progress & corrections (verified against the binary)
 
+Landed (all on `main`, each verified through the binary / kotlinc-diff
+corpus): array `copyInto`/`copyOf`/`copyOfRange`/`fill`, array
+`sort`/`sortWith` + `MutableList.reverse` (cascading to `sortedArray` /
+`sortDescending` / `reversed` / `sortedDescending`), `String`↔`ByteArray`
+UTF-8 (`encodeToByteArray`/`toByteArray`/`decodeToString` + the
+`String(ByteArray)` constructor), string concatenation dispatching an
+instance's `toString()`, kotlinx.datetime `LocalDate` arithmetic
+(`plus`/`minus`/`daysUntil`/`monthsUntil`/`yearsUntil`/`periodUntil` +
+navigators), and **named + defaulted constructor arguments** for primary
+*and* secondary constructors (was: named/omitted params left Null).
+
+Still open (interpreter-level, surfaced this session):
+- **`LocalDate.until(other, unit)`** binds to the stdlib `Int.until`
+  intrinsic instead of the datetime extension — overload resolution
+  prefers the stdlib symbol (same shape as the atomicfu B7 collision).
+- **`LocalDate.Companion.parse` / `fromEpochDays`** — the klioMain actual
+  class has no companion, so companion factories hit `Vm::call_member on
+  KClass`.
+
 Re-verifying the top blockers against `target/release/klio` corrected
 two of them and root-caused a third.
 
