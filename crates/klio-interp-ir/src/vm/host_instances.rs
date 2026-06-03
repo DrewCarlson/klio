@@ -637,11 +637,10 @@ impl VmHost<'_> {
             let Some(parent_name) = parent_name else {
                 break;
             };
-            // Resolve to a non-interface parent for ctor chaining.
-            let parent_def = self.classes.borrow().get(&parent_name).cloned();
-            if parent_def.as_ref().is_none_or(|d| d.is_interface) {
-                break;
-            }
+            // Evaluate this level's `super(...)` arguments (against the
+            // current level's args) up front — needed to recover a
+            // builtin-Throwable ancestor's message/cause even when that
+            // ancestor has no user ClassDef to chain into.
             let mut parent_args: Vec<klio_runtime::Value> = Vec::with_capacity(thunks.len());
             for fid in &thunks {
                 let func = self
@@ -658,6 +657,45 @@ impl VmHost<'_> {
                 let module = Arc::clone(&self.module);
                 let v = klio_ir::eval::eval_with(&module, &func, cur_args.clone(), self)?;
                 parent_args.push(v);
+            }
+            // A builtin Throwable ancestor (any number of levels up) holds
+            // message/cause through these super-args. The direct-parent
+            // pass above only checks the immediate parent, so a
+            // multi-level hierarchy (`NotFound : AppError :
+            // RuntimeException`) would otherwise lose its message.
+            let parent_is_throwable = matches!(
+                parent_name.as_str(),
+                "Throwable"
+                    | "Exception"
+                    | "RuntimeException"
+                    | "Error"
+                    | "IOException"
+                    | "EOFException"
+                    | "IllegalArgumentException"
+                    | "IllegalStateException"
+                    | "IndexOutOfBoundsException"
+                    | "NullPointerException"
+                    | "ClassCastException"
+                    | "ArithmeticException"
+                    | "NumberFormatException"
+                    | "NoSuchElementException"
+                    | "ConcurrentModificationException"
+                    | "UnsupportedOperationException"
+                    | "CancellationException"
+            );
+            if parent_is_throwable {
+                if throwable_message.is_none() {
+                    throwable_message = parent_args.first().cloned();
+                }
+                if throwable_cause.is_none() {
+                    throwable_cause = parent_args.get(1).cloned();
+                }
+                break;
+            }
+            // Resolve to a non-interface parent for ctor chaining.
+            let parent_def = self.classes.borrow().get(&parent_name).cloned();
+            if parent_def.as_ref().is_none_or(|d| d.is_interface) {
+                break;
             }
             chain.push((parent_name.clone(), parent_args.clone()));
             cur_class = parent_name;

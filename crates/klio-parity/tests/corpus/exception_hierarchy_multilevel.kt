@@ -18,6 +18,9 @@ fun main() {
     try {
         throw NotFound("boom")
     } catch (e: AppError) {
-        println("caught-as-AppError")
+        println("caught-as-AppError msg=${e.message}")
     }
+    // message survives the multi-level super(...) chain.
+    println(NotFound("not here").message)
+    println(Timeout().message)
 }
