@@ -50,3 +50,12 @@ root = "klioMain"
 
 [[deps]]
 id = "stdlib"
+
+# Cargo-style features mirroring kotlinx-serialization's Gradle modules.
+# The reflective serialization-core (annotations, KSerializer,
+# descriptors, encoding) is the ungated core, always loaded. The JSON
+# format (kotlinx-serialization-json: `Json`, encodeToString /
+# decodeFromString) is opt-in via `--feature kotlinx.serialization/json`.
+[features]
+default = []
+json = { sources = ["klioMain/kotlinx/serialization/json"] }

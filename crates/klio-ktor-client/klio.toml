@@ -29,8 +29,9 @@ client = { sources = ["shim/client"] }
 # ktor-server-core: embeddedServer + routing + respondText.
 server = { sources = ["shim/server"] }
 # ktor-client-content-negotiation + ktor-serialization-kotlinx-json:
-# typed body<T>() / setBody<T>() and ContentNegotiation { json() }.
-client-serialization = { sources = ["shim/client-serialization"], deps = ["kotlinx.serialization"], requires = ["client"] }
+# typed body<T>() / setBody<T>() and ContentNegotiation { json() }. Pulls
+# the serialization pack's `json` feature (its core alone has no Json).
+client-serialization = { sources = ["shim/client-serialization"], deps = ["kotlinx.serialization/json"], requires = ["client"] }
 # ktor-server-content-negotiation + ktor-serialization-kotlinx-json:
 # typed respond<T>() / receive<T>() and ContentNegotiation { json() }.
-server-serialization = { sources = ["shim/server-serialization"], deps = ["kotlinx.serialization"], requires = ["server"] }
+server-serialization = { sources = ["shim/server-serialization"], deps = ["kotlinx.serialization/json"], requires = ["server"] }

@@ -175,7 +175,7 @@ fn load_pack_candidate(
     merged: &klio_stdlib::HostBindings,
     active_features: &std::collections::HashSet<String>,
     user_imports: &std::collections::HashSet<String>,
-    feature_hints: &mut Vec<(String, String)>,
+    feature_hints: &mut Vec<(String, String, String)>,
     source_map: &mut SourceMap,
     out_asts: &mut Vec<klio_ast::KotlinFile>,
     out_bindings: &mut klio_stdlib::HostBindings,
@@ -227,7 +227,7 @@ fn load_pack_candidate(
                     && let Some(pkg) = package_of_source(&sf.bytes)
                     && user_imports.iter().any(|imp| import_matches_package(imp, &pkg))
                 {
-                    feature_hints.push((lib_id.to_string(), feat.to_string()));
+                    feature_hints.push((lib_id.to_string(), feat.to_string(), pkg));
                 }
                 continue;
             }
@@ -541,9 +541,10 @@ pub(crate) fn load_installed_packs(
     // each loaded pack asks of its own dependencies. A pack loads once,
     // with whatever features are known when it becomes wanted.
     let mut feature_reqs: RequestedFeatures = requested_features.clone();
-    // (lib_id, feature) pairs the user's imports need but that aren't
-    // enabled — surfaced as a hint after loading.
-    let mut feature_hints: Vec<(String, String)> = Vec::new();
+    // (lib_id, feature, package) the user's imports touch but that a
+    // gated feature provides — surfaced as a hint after loading, unless
+    // the package turns out to be provided by something that did load.
+    let mut feature_hints: Vec<(String, String, String)> = Vec::new();
     loop {
         let mut progressed = false;
         let mut new_imports: Vec<String> = Vec::new();
@@ -565,11 +566,25 @@ pub(crate) fn load_installed_packs(
             progressed = true;
             let active = resolve_active_features(&c.manifest, feature_reqs.get(lib_id));
             // An active feature can pull in dependency packs (the
-            // kotlinx Gradle-module shape) and ask features of them.
+            // kotlinx Gradle-module shape) and ask features of them. A
+            // dep entry is `lib` or `lib/feat[,feat2]` — the suffix
+            // requests features on that dependency (e.g. ktor's
+            // serialization layer asking `kotlinx.serialization/json`).
             for f in &c.manifest.features {
                 if active.contains(&f.name) {
                     for dep in &f.deps {
-                        new_prefixes.push(dep.clone());
+                        if let Some((lib, feats)) = dep.split_once('/') {
+                            new_prefixes.push(lib.to_string());
+                            let set = feature_reqs.entry(lib.to_string()).or_default();
+                            for feat in feats.split(',') {
+                                let feat = feat.trim();
+                                if !feat.is_empty() {
+                                    set.insert(feat.to_string());
+                                }
+                            }
+                        } else {
+                            new_prefixes.push(dep.clone());
+                        }
                     }
                 }
             }
@@ -613,10 +628,29 @@ pub(crate) fn load_installed_packs(
         &mut out_bindings,
     );
     // Tell the user how to enable any feature their imports need but that
-    // wasn't requested — turns a bare "unresolved" into an actionable fix.
-    feature_hints.sort();
-    feature_hints.dedup();
-    for (lib, feat) in &feature_hints {
+    // wasn't requested — turns a bare "unresolved" into an actionable
+    // fix. Drop hints for packages something else already provided (e.g.
+    // a client and server feature sharing a package): only a genuinely
+    // unprovided import should prompt a feature.
+    let loaded_pkgs: std::collections::HashSet<String> = out_asts
+        .iter()
+        .filter_map(|f| f.package.as_ref())
+        .map(|p| {
+            p.path
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .collect();
+    let mut shown: Vec<(String, String)> = feature_hints
+        .into_iter()
+        .filter(|(_, _, pkg)| !loaded_pkgs.contains(pkg))
+        .map(|(lib, feat, _)| (lib, feat))
+        .collect();
+    shown.sort();
+    shown.dedup();
+    for (lib, feat) in &shown {
         eprintln!(
             "note: an import requires feature `{feat}` of pack `{lib}`; enable it with `--feature {lib}/{feat}`"
         );

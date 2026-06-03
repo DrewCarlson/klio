@@ -70,13 +70,15 @@ fn install_packs() {
     }
 }
 
-/// Run `file` through the real `klio` binary, returning stdout.
-fn run_via_binary(file: &Path) -> String {
-    let o = Command::new(klio_bin())
-        .arg("run")
-        .arg(file)
-        .output()
-        .expect("spawn klio run");
+/// Run `file` through the real `klio` binary with optional pack
+/// features, returning stdout.
+fn run_via_binary(file: &Path, features: &[&str]) -> String {
+    let mut cmd = Command::new(klio_bin());
+    cmd.arg("run").arg(file);
+    for f in features {
+        cmd.args(["--feature", f]);
+    }
+    let o = cmd.output().expect("spawn klio run");
     assert!(
         o.status.success(),
         "klio run {} failed: {}",
@@ -104,7 +106,7 @@ fn expected_from_litmus(file: &Path) -> String {
     out
 }
 
-fn litmus(name: &str) {
+fn litmus(name: &str, features: &[&str]) {
     install_packs();
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -112,19 +114,21 @@ fn litmus(name: &str) {
         .join(name);
     let want = expected_from_litmus(&file);
     assert!(!want.is_empty(), "no //> expected lines");
-    assert_eq!(run_via_binary(&file), want, "{name} stdout mismatch");
+    assert_eq!(run_via_binary(&file, features), want, "{name} stdout mismatch");
 }
 
 #[test]
 fn serialization_smoke_litmus() {
-    litmus("ser_smoke.kt");
+    // Reflective serialization-core: needs no feature.
+    litmus("ser_smoke.kt", &[]);
 }
 
 /// `Json.encodeToString` / `decodeFromString` over primitives, a nested
 /// `@Serializable`, `List<@Serializable>`, `Map<String, @Serializable>`,
 /// an enum field, and a nullable field — plus declaration-order keys and
-/// the `prettyPrint` / `ignoreUnknownKeys` builder options.
+/// the `prettyPrint` / `ignoreUnknownKeys` builder options. The JSON
+/// format is the opt-in `json` feature (kotlinx-serialization-json).
 #[test]
 fn json_smoke_litmus() {
-    litmus("json_smoke.kt");
+    litmus("json_smoke.kt", &["kotlinx.serialization/json"]);
 }
