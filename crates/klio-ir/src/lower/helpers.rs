@@ -299,12 +299,16 @@ pub(crate) fn lower_arg_run(b: &mut FuncBuilder<'_>, args: &[Expr]) -> (Reg, u8)
     // argument list. Re-arm it before each argument so a trailing lambda
     // records it, then clear it so it never leaks past this run.
     let call_label = b.pending_lambda_label.take();
+    // Arguments are not in the call's tail position, so the enclosing
+    // expected-type hint must not reach a reified inline call here.
+    let prev_expected = b.push_expected(None);
     for (slot, arg) in slots.iter().zip(args.iter()) {
         b.pending_lambda_label.clone_from(&call_label);
         let r = lower_expr(b, arg);
         b.pending_lambda_label = None;
         b.push(Inst::Move { dst: *slot, src: r });
     }
+    b.restore_expected(prev_expected);
     (first, n as u8)
 }
 

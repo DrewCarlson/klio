@@ -12,6 +12,7 @@
 //> attrs.home=LA/90001
 //> nick=null
 //> roundtrip=true
+//> inferred=Al/NYC
 //> pretty-first={
 //> ignore-unknown=Pt(7, 8)
 
@@ -62,6 +63,11 @@ fun main() {
     println("attrs.home=${d.attrs["home"]?.city}/${d.attrs["home"]?.zip}")
     println("nick=${d.nick}")
     println("roundtrip=${Json.encodeToString(d) == s}")
+
+    // Inferred type argument: no explicit <User>, decoded from the
+    // declared `val` type (the idiomatic ktor `val u: User = ...` form).
+    val d2: User = Json.decodeFromString(s)
+    println("inferred=${d2.name}/${d2.addr.city}")
 
     val pretty = Json { prettyPrint = true }
     println("pretty-first=${pretty.encodeToString(Pt(1, 2)).lines().first()}")

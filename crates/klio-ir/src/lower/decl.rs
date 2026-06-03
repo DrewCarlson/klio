@@ -633,6 +633,7 @@ pub(crate) fn lower_function_body_with_implicit_owner(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn lower_function_body_with_implicit_owner_priv(
     module: &mut crate::Module,
     f: &klio_ast::Function,
@@ -695,12 +696,21 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
         let () = b.set_tailrec_self(f.name.name.clone());
     }
     b.set_inline(f.is_inline);
+    // The declared return type is the expected type for both an
+    // expression body (`fun f(): T = …`) and a `return …` inside a
+    // block body, so a reified inline call can infer its type argument.
+    b.set_declared_return(f.return_type.clone());
     if let Some(klio_ast::FunctionBody::Block(blk)) = &f.body {
         b.set_boxed_vars(compute_boxed_vars(&blk.stmts));
     }
     let result = match &f.body {
         Some(klio_ast::FunctionBody::Block(blk)) => Some(lower_block(&mut b, blk)),
-        Some(klio_ast::FunctionBody::Expr(e)) => Some(lower_expr(&mut b, e)),
+        Some(klio_ast::FunctionBody::Expr(e)) => {
+            let prev = b.push_expected(f.return_type.clone());
+            let r = lower_expr(&mut b, e);
+            b.restore_expected(prev);
+            Some(r)
+        }
         None => None,
     };
     b.terminate(Terminator::Return(result));

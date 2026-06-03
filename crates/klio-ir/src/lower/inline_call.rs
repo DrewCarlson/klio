@@ -133,12 +133,83 @@ pub(super) fn splice_inline_lambda(b: &mut FuncBuilder<'_>, lam: &Expr, arg_expr
     result
 }
 
+/// Build the effective per-type-parameter argument list for an inline
+/// call: each explicit `<…>` argument is kept; any reified parameter
+/// left unspecified is inferred by unifying the function's declared
+/// return type with the call's expected (tail-position) type. Non-reified
+/// parameters and parameters that cannot be inferred stay `None`.
+fn infer_reified_type_args(
+    f: &klio_ast::Function,
+    explicit: &[klio_ast::TypeRef],
+    expected: Option<&klio_ast::TypeRef>,
+) -> Vec<Option<klio_ast::TypeRef>> {
+    let mut out: Vec<Option<klio_ast::TypeRef>> = f
+        .type_params
+        .iter()
+        .enumerate()
+        .map(|(i, _)| explicit.get(i).cloned())
+        .collect();
+    let needs_infer = f
+        .type_params
+        .iter()
+        .enumerate()
+        .any(|(i, tp)| tp.is_reified && out[i].is_none());
+    if !needs_infer {
+        return out;
+    }
+    let (Some(expected), Some(ret)) = (expected, f.return_type.as_ref()) else {
+        return out;
+    };
+    let tp_names: std::collections::HashSet<&str> = f
+        .type_params
+        .iter()
+        .map(|tp| tp.name.name.as_str())
+        .collect();
+    let mut subst: std::collections::HashMap<String, klio_ast::TypeRef> =
+        std::collections::HashMap::new();
+    unify_type_param(ret, expected, &tp_names, &mut subst);
+    for (i, tp) in f.type_params.iter().enumerate() {
+        if out[i].is_none()
+            && let Some(t) = subst.get(&tp.name.name)
+        {
+            out[i] = Some(t.clone());
+        }
+    }
+    out
+}
+
+/// Unify a declared type (which may mention type parameters) against a
+/// concrete actual type, recording each type parameter's solution. When
+/// the declared type *is* a bare type parameter, it binds to the whole
+/// actual type; otherwise matching heads recurse positionally through
+/// generic arguments (`Box<T>` vs `Box<Int>` solves `T = Int`).
+fn unify_type_param(
+    decl: &klio_ast::TypeRef,
+    actual: &klio_ast::TypeRef,
+    tp_names: &std::collections::HashSet<&str>,
+    subst: &mut std::collections::HashMap<String, klio_ast::TypeRef>,
+) {
+    if decl.type_args.is_empty() && tp_names.contains(decl.name.name.as_str()) {
+        subst
+            .entry(decl.name.name.clone())
+            .or_insert_with(|| actual.clone());
+        return;
+    }
+    for (d, a) in decl.type_args.iter().zip(actual.type_args.iter()) {
+        if !d.is_star && !a.is_star {
+            unify_type_param(&d.ty, &a.ty, tp_names, subst);
+        }
+    }
+}
+
 /// Expand a call to a `suspend inline fun` by splicing its body into
 /// the caller. `type_args` carries the call-site `<T = SomeType>` for
 /// reified type parameters so the splice can bind each reified
 /// parameter's name to the resolved class value before lowering the
 /// body — `T::class` and `is T` reads inside the spliced body then
-/// resolve to the call site's type.
+/// resolve to the call site's type. `expected` carries the call's
+/// tail-position type so a reified parameter with no explicit `<…>`
+/// argument can be inferred from context.
 pub(super) fn try_inline_call_with_type_args(
     b: &mut FuncBuilder<'_>,
     fname: &str,
@@ -146,6 +217,7 @@ pub(super) fn try_inline_call_with_type_args(
     arg_names: &[Option<String>],
     this_arg: Option<&Expr>,
     type_args: &[klio_ast::TypeRef],
+    expected: Option<&klio_ast::TypeRef>,
 ) -> Option<Reg> {
     let f = inline_fn_ast(fname)?;
     if b.inline_in_progress(fname) {
@@ -258,11 +330,16 @@ pub(super) fn try_inline_call_with_type_args(
     // type-arg binding in non-inline calls. A nested splice
     // overwrites it; a later restore happens implicitly when the
     // enclosing call returns.
+    // Explicit `<…>` type arguments win; any reified parameter left
+    // unspecified is inferred by unifying the function's declared return
+    // type against the call's expected (tail-position) type, so
+    // `val u: User = resp.body()` binds `T = User` with no `<User>`.
+    let effective_type_args = infer_reified_type_args(&f, type_args, expected);
     for (tp_idx, tp) in f.type_params.iter().enumerate() {
         if !tp.is_reified {
             continue;
         }
-        let Some(arg) = type_args.get(tp_idx) else {
+        let Some(arg) = effective_type_args.get(tp_idx).and_then(Option::as_ref) else {
             continue;
         };
         let cls_reg = b.alloc_reg();

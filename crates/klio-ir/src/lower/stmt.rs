@@ -75,7 +75,13 @@ fn lower_property_decl(b: &mut FuncBuilder<'_>, p: &klio_ast::Property) -> Optio
         match &p.init {
             Some(e) => {
                 let widened = p.ty.as_ref().and_then(|ty| widen_numeric_literal(e, ty));
-                lower_expr(b, widened.as_ref().unwrap_or(e))
+                // A type-annotated initializer puts its declared type in
+                // tail position so a reified inline call (`val u: User =
+                // resp.body()`) can infer its type argument.
+                let prev = b.push_expected(p.ty.clone());
+                let r = lower_expr(b, widened.as_ref().unwrap_or(e));
+                b.restore_expected(prev);
+                r
             }
             None => b.emit_const(Const::Unit),
         }

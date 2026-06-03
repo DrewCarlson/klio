@@ -104,3 +104,67 @@ fn inline_fn_with_default_lambda_arg_does_not_break() {
         "#);
     assert_eq!(out, "z!\n");
 }
+
+// A reified inline fn whose return type is the type parameter can have
+// that parameter inferred from the call's context — no explicit `<T>`.
+// `build()` reads `T::class`, so a wrong/absent binding misbuilds or
+// crashes; the assertions pin the inferred type.
+const REIFIED_INFER_SRC: &str = r#"
+    class Box(val label: String)
+    class Gift(val label: String)
+
+    inline fun <reified T> build(): T {
+        val n = T::class.simpleName
+        return when (n) {
+            "Box" -> Box("b") as T
+            "Gift" -> Gift("g") as T
+            else -> error("unknown $n")
+        }
+    }
+
+    // Forwards its own reified T into `build<T>()`.
+    inline fun <reified T> build2(): T = build<T>()
+"#;
+
+#[test]
+fn reified_type_arg_inferred_from_val_type() {
+    let out = run(&format!(
+        "{REIFIED_INFER_SRC}\nfun main() {{ val b: Box = build(); val g: Gift = build(); println(b.label + g.label) }}"
+    ));
+    assert_eq!(out, "bg\n");
+}
+
+#[test]
+fn reified_type_arg_inferred_from_expression_body_return() {
+    let out = run(&format!(
+        "{REIFIED_INFER_SRC}\nfun mk(): Box = build()\nfun main() {{ println(mk().label) }}"
+    ));
+    assert_eq!(out, "b\n");
+}
+
+#[test]
+fn reified_type_arg_inferred_from_block_return() {
+    let out = run(&format!(
+        "{REIFIED_INFER_SRC}\nfun mk(): Gift {{ return build() }}\nfun main() {{ println(mk().label) }}"
+    ));
+    assert_eq!(out, "g\n");
+}
+
+#[test]
+fn reified_type_arg_inferred_through_forwarding_inline_fn() {
+    // `build2()` infers T from the `val` type, then forwards it into
+    // `build<T>()`; both splices must bind the reified parameter.
+    let out = run(&format!(
+        "{REIFIED_INFER_SRC}\nfun main() {{ val b: Box = build2(); println(b.label) }}"
+    ));
+    assert_eq!(out, "b\n");
+}
+
+#[test]
+fn explicit_reified_type_arg_still_wins() {
+    // An explicit `<Gift>` overrides any context type.
+    let out = run(&format!(
+        "{REIFIED_INFER_SRC}\nfun main() {{ val g = build<Gift>(); println(g.label) }}"
+    ));
+    assert_eq!(out, "g\n");
+}

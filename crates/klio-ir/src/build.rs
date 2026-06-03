@@ -166,6 +166,17 @@ pub struct FuncBuilder<'a> {
     /// gets `implicit_label = "with"`). Set per call and re-armed per
     /// argument by `lower_arg_run`; consumed by `Expr::Lambda` lowering.
     pub pending_lambda_label: Option<String>,
+    /// Expected type for the expression currently in tail position of a
+    /// typed context (a `val x: T = …` initializer, a `fun f(): T = …`
+    /// expression body, or `return …`). Lets an inline `reified` call
+    /// with no explicit `<…>` infer its type argument from the context,
+    /// matching Kotlin's `val u: User = response.body()`. Cleared when
+    /// lowering descends into a non-tail position (call arguments, a
+    /// member receiver) so it never mis-binds an inner call.
+    pending_expected: Option<klio_ast::TypeRef>,
+    /// Declared return type of the function being lowered, used to infer
+    /// the type argument of a reified inline call in `return …` position.
+    declared_return: Option<klio_ast::TypeRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,7 +230,32 @@ impl<'a> FuncBuilder<'a> {
             inline_lambda_subst: Vec::new(),
             inline_lambda_ret: Vec::new(),
             pending_lambda_label: None,
+            pending_expected: None,
+            declared_return: None,
         }
+    }
+
+    /// Set the expected (tail-position) type, returning the previous
+    /// value so the caller can restore it after lowering the expression.
+    pub fn push_expected(
+        &mut self,
+        ty: Option<klio_ast::TypeRef>,
+    ) -> Option<klio_ast::TypeRef> {
+        std::mem::replace(&mut self.pending_expected, ty)
+    }
+    pub fn restore_expected(&mut self, prev: Option<klio_ast::TypeRef>) {
+        self.pending_expected = prev;
+    }
+    #[must_use]
+    pub fn peek_expected(&self) -> Option<&klio_ast::TypeRef> {
+        self.pending_expected.as_ref()
+    }
+    pub fn set_declared_return(&mut self, ty: Option<klio_ast::TypeRef>) {
+        self.declared_return = ty;
+    }
+    #[must_use]
+    pub fn declared_return(&self) -> Option<klio_ast::TypeRef> {
+        self.declared_return.clone()
     }
 
     #[must_use]

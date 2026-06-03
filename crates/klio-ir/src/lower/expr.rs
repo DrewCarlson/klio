@@ -32,7 +32,12 @@ pub fn lower_receiver(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             return dst;
         }
     }
-    lower_expr(b, expr)
+    // A receiver is not in the call's tail position; drop the
+    // expected-type hint so it does not reach a reified inline call here.
+    let prev_expected = b.push_expected(None);
+    let r = lower_expr(b, expr);
+    b.restore_expected(prev_expected);
+    r
 }
 
 /// Lower one expression into the current block, returning the register
@@ -1033,8 +1038,8 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             is_infix,
             ..
         } if !*is_infix
-            && !ast_type_args.is_empty()
             && matches!(callee.as_ref(), Expr::Member { safe: false, .. })
+            && (!ast_type_args.is_empty() || b.peek_expected().is_some())
             && match callee.as_ref() {
                 Expr::Member { name, .. } => {
                     inline_fn_ast(&name.name).is_some_and(|f| {
@@ -1047,6 +1052,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let Expr::Member { receiver, name, .. } = callee.as_ref() else {
                 unreachable!()
             };
+            // Capture the expected type before the splice lowers the
+            // receiver / arguments (which clear the hint).
+            let expected = b.peek_expected().cloned();
             if let Some(r) = try_inline_call_with_type_args(
                 b,
                 &name.name,
@@ -1054,6 +1062,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 ast_arg_names,
                 Some(receiver.as_ref()),
                 ast_type_args,
+                expected.as_ref(),
             ) {
                 return r;
             }
@@ -1507,6 +1516,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     let has_reified = f.type_params.iter().any(|tp| tp.is_reified);
                     let needs_inline =
                         f.is_suspend || arg_lambda_has_nonlocal_return(args) || has_reified;
+                    let expected = b.peek_expected().cloned();
                     if needs_inline
                         && let Some(r) = try_inline_call_with_type_args(
                             b,
@@ -1515,6 +1525,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             ast_arg_names,
                             None,
                             ast_type_args,
+                            expected.as_ref(),
                         )
                     {
                         return r;
@@ -2952,7 +2963,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             b.emit_const(Const::Unit)
         }
         Expr::Return { value, label, .. } => {
-            let r = value.as_ref().map(|e| lower_expr(b, e));
+            let r = value.as_ref().map(|e| {
+                // `return …` puts the function's declared return type in
+                // tail position for reified-inline type inference. Only a
+                // bare `return` (no label) targets the enclosing fn; a
+                // labeled return goes to a lambda and keeps no hint.
+                let prev = if label.is_none() {
+                    Some(b.push_expected(b.declared_return()))
+                } else {
+                    None
+                };
+                let lowered = lower_expr(b, e);
+                if let Some(prev) = prev {
+                    b.restore_expected(prev);
+                }
+                lowered
+            });
             // An unlabeled `return` inside an inlined body returns
             // from that inline fn — which, inlined, is the call's
             // value. Spliced lambda-arg bodies clear the inline-return
