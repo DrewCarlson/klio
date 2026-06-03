@@ -33,6 +33,15 @@ pub struct PackManifest {
     /// Other packs this pack depends on, by `library_id`. Loader walks
     /// these in topological order.
     pub dependencies: Vec<PackDependency>,
+    /// Features active when a consumer requests none (cargo-style
+    /// `default = [...]`). Empty means everything not gated by a feature
+    /// (the "core") loads and no feature-gated source loads by default.
+    pub default_features: Vec<String>,
+    /// Named features this pack provides. A source file is gated when its
+    /// `rel_path` matches some feature's `sources`; such a file loads only
+    /// when that feature is active. Files matched by no feature are core
+    /// (always loaded).
+    pub features: Vec<FeatureDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +49,26 @@ pub struct PackDependency {
     pub library_id: String,
     /// Optional minimum semantic version. Empty when any version is OK.
     pub min_version: String,
+    /// Features of the dependency to activate (cargo-style
+    /// `features = [...]`).
+    pub features: Vec<String>,
+    /// Whether the dependency's `default_features` are also activated.
+    pub default_features: bool,
+}
+
+/// One named feature: the source-path prefixes it gates, the other packs
+/// it pulls in when active, and the sibling features it transitively
+/// enables. Mirrors a cargo feature / a kotlinx Gradle member module.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeatureDef {
+    pub name: String,
+    /// `rel_path` prefix patterns (matched like `[[source]]` includes)
+    /// for the source files this feature gates.
+    pub sources: Vec<String>,
+    /// `library_id`s pulled in only when this feature is active.
+    pub deps: Vec<String>,
+    /// Sibling features this one transitively activates.
+    pub requires: Vec<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -274,6 +303,8 @@ mod tests {
             abi_version: 1,
             implicit_packages: vec!["kotlin".into(), "kotlin.collections".into()],
             dependencies: vec![],
+            default_features: vec![],
+            features: vec![],
         };
         let bytes = encode(&manifest).unwrap();
         let mut w = PackWriter::new();

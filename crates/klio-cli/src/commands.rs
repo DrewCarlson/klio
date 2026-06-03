@@ -2,9 +2,13 @@ use crate::{
     DiagFormat, DiagnosticSink, ExitCode, Lexer, Parser, PathBuf, Severity, SourceMap, render,
 };
 
-use crate::pack_cache::load_installed_packs;
+use crate::pack_cache::{RequestedFeatures, load_installed_packs};
 
-pub(crate) fn run_check(files: &[PathBuf], format: DiagFormat) -> ExitCode {
+pub(crate) fn run_check(
+    files: &[PathBuf],
+    format: DiagFormat,
+    features: &RequestedFeatures,
+) -> ExitCode {
     if files.is_empty() {
         eprintln!("usage: klio check <file.kt> [--format=plain|json|sarif]");
         return ExitCode::from(2);
@@ -34,7 +38,7 @@ pub(crate) fn run_check(files: &[PathBuf], format: DiagFormat) -> ExitCode {
     // suspend …)`). Pack declarations participate in resolution +
     // type inference, but only diagnostics anchored in a user file
     // are surfaced — pack shims are trusted.
-    let (pack_asts, _pack_bindings) = load_installed_packs(&user_asts, &mut map);
+    let (pack_asts, _pack_bindings) = load_installed_packs(&user_asts, &mut map, features);
     let mut combined: Vec<klio_ast::KotlinFile> =
         Vec::with_capacity(pack_asts.len() + user_asts.len());
     combined.extend(pack_asts);
@@ -120,7 +124,7 @@ pub(crate) fn run_parse(path: &std::path::Path) -> ExitCode {
     }
 }
 
-pub(crate) fn run_module_files(paths: &[PathBuf]) -> ExitCode {
+pub(crate) fn run_module_files(paths: &[PathBuf], features: &RequestedFeatures) -> ExitCode {
     let mut map = SourceMap::new();
     let mut asts: Vec<klio_ast::KotlinFile> = Vec::with_capacity(paths.len());
     for path in paths {
@@ -140,7 +144,7 @@ pub(crate) fn run_module_files(paths: &[PathBuf]) -> ExitCode {
         }
         asts.push(ast);
     }
-    let (pack_asts, pack_bindings) = load_installed_packs(&asts, &mut map);
+    let (pack_asts, pack_bindings) = load_installed_packs(&asts, &mut map, features);
     // Pack ASTs first so the user's main wins when build_module_files
     // picks a `main` declaration.
     let mut all_asts: Vec<klio_ast::KotlinFile> = Vec::with_capacity(pack_asts.len() + asts.len());
@@ -168,7 +172,7 @@ pub(crate) fn run_module_files(paths: &[PathBuf]) -> ExitCode {
 /// pipeline is parse → typecheck → `klio_interp_ir::build::build_module`
 /// → `Vm::run`. No code path goes through `klio-interp` — the new
 /// Vm owns module construction end-to-end.
-pub(crate) fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
+pub(crate) fn run_file_ir_vm(path: &std::path::Path, features: &RequestedFeatures) -> ExitCode {
     let mut map = SourceMap::new();
     let Some(id) = load(&mut map, path) else {
         return ExitCode::FAILURE;
@@ -185,7 +189,7 @@ pub(crate) fn run_file_ir_vm(path: &std::path::Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let user_asts = vec![ast];
-    let (pack_asts, pack_bindings) = load_installed_packs(&user_asts, &mut map);
+    let (pack_asts, pack_bindings) = load_installed_packs(&user_asts, &mut map, features);
     // Unified build path: a script (single user file, no packs)
     // and a pack-using program both flow through
     // `build_module_files`. Eliminates the divergence where a script

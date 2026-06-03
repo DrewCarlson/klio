@@ -464,6 +464,10 @@ struct LibraryToml {
     /// after `source_roots`; see `SourceRoot`.
     #[serde(default)]
     source: Vec<SourceRoot>,
+    /// Optional `[features]` table — cargo-style feature definitions
+    /// gating source roots and pulling in dependency packs.
+    #[serde(default)]
+    features: FeaturesToml,
 }
 
 /// One source root with optional include/exclude filtering, used by
@@ -605,6 +609,33 @@ struct DepEntry {
     id: String,
     #[serde(default)]
     min_version: String,
+    /// Features of the dependency to activate (cargo-style).
+    #[serde(default)]
+    features: Vec<String>,
+    /// Whether the dependency's default features are also activated.
+    #[serde(default = "default_true")]
+    default_features: bool,
+}
+
+/// `[features]` table: the special `default` key lists the features
+/// active when a consumer requests none; every other key is a feature
+/// definition (`{ sources, deps, requires }`).
+#[derive(serde::Deserialize, Debug, Default)]
+struct FeaturesToml {
+    #[serde(default)]
+    default: Vec<String>,
+    #[serde(flatten)]
+    defs: std::collections::BTreeMap<String, FeatureTomlDef>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct FeatureTomlDef {
+    #[serde(default)]
+    sources: Vec<String>,
+    #[serde(default)]
+    deps: Vec<String>,
+    #[serde(default)]
+    requires: Vec<String>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -740,6 +771,17 @@ fn build_library_pack(
     let files = collect_pack_sources(dir, &effective)?;
 
     // Manifest.
+    let features: Vec<klio_pack::schema::FeatureDef> = cfg
+        .features
+        .defs
+        .into_iter()
+        .map(|(name, d)| klio_pack::schema::FeatureDef {
+            name,
+            sources: d.sources,
+            deps: d.deps,
+            requires: d.requires,
+        })
+        .collect();
     let manifest = PackManifest {
         library_id: cfg.library.id.clone(),
         library_version: cfg.library.version.clone(),
@@ -751,8 +793,12 @@ fn build_library_pack(
             .map(|d| PackDependency {
                 library_id: d.id,
                 min_version: d.min_version,
+                features: d.features,
+                default_features: d.default_features,
             })
             .collect(),
+        default_features: cfg.features.default,
+        features,
     };
     let manifest_bytes = encode(&manifest).map_err(|e| e.to_string())?;
 

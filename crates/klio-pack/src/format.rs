@@ -26,8 +26,11 @@ use serde::{Deserialize, Serialize};
 pub const MAGIC: &[u8; 4] = b"KPK\0";
 
 /// Pack format version. Bumped when the on-disk layout or the
-/// `SectionDirectory` schema changes incompatibly.
-pub const FORMAT_VERSION: u32 = 1;
+/// `SectionDirectory` schema changes incompatibly. v2 added pack
+/// features (`PackManifest.default_features`/`features`, per-dependency
+/// `features`/`default_features`); postcard is sequential, so old packs
+/// are rejected on read and must be rebuilt.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Length of the blake3 pack hash, in bytes.
 pub const HASH_LEN: usize = 32;

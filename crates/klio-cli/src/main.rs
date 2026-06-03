@@ -40,6 +40,12 @@ enum Cmd {
         /// default wall-clock.
         #[arg(long = "virtual-time")]
         virtual_time: bool,
+        /// Enable a pack feature (cargo style). Format `<pack>/<feature>`
+        /// (e.g. `--feature io.ktor/server`). Repeatable. A pack ships
+        /// its core by default; feature-gated source roots load only
+        /// when their feature is enabled here.
+        #[arg(long = "feature", value_name = "PACK/FEATURE")]
+        features: Vec<String>,
     },
     /// Type-check `.kt` files and emit diagnostics. Exit 1 on any error.
     Check {
@@ -47,6 +53,9 @@ enum Cmd {
         /// Output format for the diagnostics.
         #[arg(long = "format", value_enum, default_value_t = DiagFormat::Plain)]
         format: DiagFormat,
+        /// Enable a pack feature (cargo style), `<pack>/<feature>`. Repeatable.
+        #[arg(long = "feature", value_name = "PACK/FEATURE")]
+        features: Vec<String>,
     },
     /// Start an interactive REPL.
     Repl,
@@ -209,10 +218,12 @@ fn main_inner() -> ExitCode {
             files,
             ir_vm: _,
             virtual_time,
+            features,
         } => {
             if virtual_time {
                 klio_interp_ir::set_coroutine_time_mode(klio_interp_ir::TimeMode::Virtual);
             }
+            let requested = parse_requested_features(&features);
             match files.as_slice() {
                 [] => {
                     eprintln!("usage: klio run <file.kt> [<file2.kt> ...]");
@@ -220,14 +231,37 @@ fn main_inner() -> ExitCode {
                 }
                 // The IR-native Vm is the only `run` path now. The
                 // legacy `--ir-vm` flag is accepted but ignored.
-                [single] => run_file_ir_vm(single),
-                many => run_module_files(many),
+                [single] => run_file_ir_vm(single, &requested),
+                many => run_module_files(many, &requested),
             }
         }
-        Cmd::Check { files, format } => run_check(&files, format),
+        Cmd::Check {
+            files,
+            format,
+            features,
+        } => run_check(&files, format, &parse_requested_features(&features)),
         Cmd::Repl => run_repl(),
         Cmd::Pack { cmd } => run_pack(cmd),
     }
+}
+
+/// Parse `--feature <pack>/<feature>` specs into a per-pack requested
+/// feature map. A bare spec with no `/` can't say which pack to enable
+/// the feature on, so it is reported and skipped.
+fn parse_requested_features(specs: &[String]) -> pack_cache::RequestedFeatures {
+    let mut out: pack_cache::RequestedFeatures = std::collections::HashMap::new();
+    for spec in specs {
+        if let Some((pack, feat)) = spec.split_once('/') {
+            out.entry(pack.trim().to_string())
+                .or_default()
+                .insert(feat.trim().to_string());
+        } else {
+            eprintln!(
+                "warning: --feature `{spec}` ignored; use `<pack>/<feature>` (e.g. io.ktor/server)"
+            );
+        }
+    }
+    out
 }
 
 mod commands;

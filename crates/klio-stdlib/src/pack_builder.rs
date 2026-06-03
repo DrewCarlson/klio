@@ -315,6 +315,8 @@ pub fn build_stdlib_pack(compress_symbols: bool) -> Result<Vec<u8>, PackError> {
             .map(|s| (*s).to_string())
             .collect(),
         dependencies: vec![],
+        default_features: vec![],
+        features: vec![],
     };
     let manifest_bytes = encode(&manifest)?;
 

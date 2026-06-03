@@ -168,10 +168,14 @@ struct PackCandidate {
 /// sources (or fall back to the frozen AST bundle), and wire up its
 /// bindings. Imports discovered in the pack's files are appended to
 /// `new_imports` so the fixpoint loop can pull in transitive packs.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn load_pack_candidate(
     c: &PackCandidate,
     lib_id: &str,
     merged: &klio_stdlib::HostBindings,
+    active_features: &std::collections::HashSet<String>,
+    user_imports: &std::collections::HashSet<String>,
+    feature_hints: &mut Vec<(String, String)>,
     source_map: &mut SourceMap,
     out_asts: &mut Vec<klio_ast::KotlinFile>,
     out_bindings: &mut klio_stdlib::HostBindings,
@@ -210,6 +214,21 @@ fn load_pack_candidate(
             // interpreted bodies conflict with klio's intrinsics
             // until integrated; not consumed yet.
             if klio_stdlib::is_consumption_deferred_source(&sf.rel_path) {
+                continue;
+            }
+            // Feature gating: a source under an inactive feature's roots
+            // is skipped, so the pack's core loads by default and a
+            // consumer opts into the rest via requested features. If a
+            // user import targets that gated package, record a hint so we
+            // can tell them which feature to enable.
+            if !source_is_active(&sf.rel_path, &c.manifest, active_features) {
+                if let Some((feat, _prefix)) =
+                    inactive_gate(&sf.rel_path, &c.manifest, active_features)
+                    && let Some(pkg) = package_of_source(&sf.bytes)
+                    && user_imports.iter().any(|imp| import_matches_package(imp, &pkg))
+                {
+                    feature_hints.push((lib_id.to_string(), feat.to_string()));
+                }
                 continue;
             }
             let text = String::from_utf8_lossy(&sf.bytes).into_owned();
@@ -341,6 +360,115 @@ fn collect_pack_candidates(entries: std::fs::ReadDir) -> Vec<PackCandidate> {
     candidates
 }
 
+/// Per-`library_id` set of feature names a consumer requested (cargo
+/// style). Seeds the loader's feature resolution; default features are
+/// added on top unless a request opts out.
+pub(crate) type RequestedFeatures =
+    std::collections::HashMap<String, std::collections::HashSet<String>>;
+
+/// Does `rel_path` fall under any of `sources` (each a path prefix
+/// relative to the pack root, e.g. `shim/io/ktor/server`)?
+fn source_in_feature(rel_path: &str, sources: &[String]) -> bool {
+    sources.iter().any(|pat| {
+        let pat = pat.trim_end_matches('/');
+        rel_path == pat || rel_path.starts_with(&format!("{pat}/"))
+    })
+}
+
+/// Compute a pack's active feature set: its default features (unless the
+/// request opted out) plus any explicitly requested features, expanded
+/// transitively over each feature's `requires`.
+fn resolve_active_features(
+    manifest: &klio_pack::schema::PackManifest,
+    requested: Option<&std::collections::HashSet<String>>,
+) -> std::collections::HashSet<String> {
+    let mut active: std::collections::HashSet<String> = std::collections::HashSet::new();
+    active.extend(manifest.default_features.iter().cloned());
+    if let Some(req) = requested {
+        active.extend(req.iter().cloned());
+    }
+    // Transitively pull in `requires` until the set stops growing.
+    loop {
+        let mut added = false;
+        for f in &manifest.features {
+            if active.contains(&f.name) {
+                for r in &f.requires {
+                    if active.insert(r.clone()) {
+                        added = true;
+                    }
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    active
+}
+
+/// True when `rel_path` should load given the pack's features and the
+/// active set: a file gated by some feature loads only if an active
+/// feature gates it; an ungated (core) file always loads.
+fn source_is_active(
+    rel_path: &str,
+    manifest: &klio_pack::schema::PackManifest,
+    active: &std::collections::HashSet<String>,
+) -> bool {
+    let mut gated = false;
+    for f in &manifest.features {
+        if source_in_feature(rel_path, &f.sources) {
+            gated = true;
+            if active.contains(&f.name) {
+                return true;
+            }
+        }
+    }
+    !gated
+}
+
+/// For an inactive gated file, return `(feature_name, source_prefix)` of
+/// the first feature gating it. Used to hint the user which feature to
+/// enable. `None` when the file is core or already active.
+fn inactive_gate<'a>(
+    rel_path: &str,
+    manifest: &'a klio_pack::schema::PackManifest,
+    active: &std::collections::HashSet<String>,
+) -> Option<(&'a str, &'a str)> {
+    if source_is_active(rel_path, manifest, active) {
+        return None;
+    }
+    for f in &manifest.features {
+        for pat in &f.sources {
+            let p = pat.trim_end_matches('/');
+            if rel_path == p || rel_path.starts_with(&format!("{p}/")) {
+                return Some((f.name.as_str(), p));
+            }
+        }
+    }
+    None
+}
+
+/// The Kotlin package declared in a source file, for the feature hint.
+/// Scans for the first `package a.b.c` statement; `None` if absent.
+fn package_of_source(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("package ") {
+            return Some(rest.trim().trim_end_matches(';').trim().to_string());
+        }
+    }
+    None
+}
+
+/// Does a user import prefix-match a (possibly gated) package?
+fn import_matches_package(import: &str, pkg: &str) -> bool {
+    !pkg.is_empty()
+        && (import == pkg
+            || import.starts_with(&format!("{pkg}."))
+            || pkg.starts_with(&format!("{import}.")))
+}
+
 /// Walk the local pack cache, parse each pack's AST bundle, and
 /// build a `HostBindings` populated with the Rust-side bindings each
 /// pack declares. The caller prepends `pack_asts` to the user's AST
@@ -349,9 +477,15 @@ fn collect_pack_candidates(entries: std::fs::ReadDir) -> Vec<PackCandidate> {
 /// appear in the user's source are loaded — keeps unused-pack
 /// declarations out of the module + cuts startup time when no
 /// kotlinx import is present.
+///
+/// `requested_features` maps a `library_id` to the feature names the
+/// consumer asked for (cargo style); a pack's feature-gated source roots
+/// load only when their feature is active.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn load_installed_packs(
     user_asts: &[klio_ast::KotlinFile],
     source_map: &mut SourceMap,
+    requested_features: &RequestedFeatures,
 ) -> (Vec<klio_ast::KotlinFile>, klio_stdlib::HostBindings) {
     let mut out_asts: Vec<klio_ast::KotlinFile> = Vec::new();
     let mut out_bindings = klio_stdlib::HostBindings::new();
@@ -403,9 +537,17 @@ pub(crate) fn load_installed_packs(
     let candidates = collect_pack_candidates(entries);
     let mut known_prefixes = user_import_prefixes.clone();
     let mut loaded_lib_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Feature requests accumulate across passes: the CLI seed plus what
+    // each loaded pack asks of its own dependencies. A pack loads once,
+    // with whatever features are known when it becomes wanted.
+    let mut feature_reqs: RequestedFeatures = requested_features.clone();
+    // (lib_id, feature) pairs the user's imports need but that aren't
+    // enabled — surfaced as a hint after loading.
+    let mut feature_hints: Vec<(String, String)> = Vec::new();
     loop {
         let mut progressed = false;
         let mut new_imports: Vec<String> = Vec::new();
+        let mut new_prefixes: Vec<String> = Vec::new();
         for c in &candidates {
             let lib_id = &c.manifest.library_id;
             if loaded_lib_ids.contains(lib_id) {
@@ -421,10 +563,31 @@ pub(crate) fn load_installed_packs(
             }
             loaded_lib_ids.insert(lib_id.clone());
             progressed = true;
+            let active = resolve_active_features(&c.manifest, feature_reqs.get(lib_id));
+            // An active feature can pull in dependency packs (the
+            // kotlinx Gradle-module shape) and ask features of them.
+            for f in &c.manifest.features {
+                if active.contains(&f.name) {
+                    for dep in &f.deps {
+                        new_prefixes.push(dep.clone());
+                    }
+                }
+            }
+            for dep in &c.manifest.dependencies {
+                if !dep.features.is_empty() {
+                    feature_reqs
+                        .entry(dep.library_id.clone())
+                        .or_default()
+                        .extend(dep.features.iter().cloned());
+                }
+            }
             load_pack_candidate(
                 c,
                 lib_id,
                 &merged,
+                &active,
+                &user_import_prefixes,
+                &mut feature_hints,
                 source_map,
                 &mut out_asts,
                 &mut out_bindings,
@@ -439,6 +602,9 @@ pub(crate) fn load_installed_packs(
                 known_prefixes.insert(imp);
             }
         }
+        for p in new_prefixes {
+            known_prefixes.insert(p);
+        }
     }
     load_embedded_stdlib_sources(
         &known_prefixes,
@@ -446,6 +612,15 @@ pub(crate) fn load_installed_packs(
         &mut out_asts,
         &mut out_bindings,
     );
+    // Tell the user how to enable any feature their imports need but that
+    // wasn't requested — turns a bare "unresolved" into an actionable fix.
+    feature_hints.sort();
+    feature_hints.dedup();
+    for (lib, feat) in &feature_hints {
+        eprintln!(
+            "note: an import requires feature `{feat}` of pack `{lib}`; enable it with `--feature {lib}/{feat}`"
+        );
+    }
     (out_asts, out_bindings)
 }
 
@@ -649,6 +824,19 @@ pub(crate) fn inspect_pack(path: &std::path::Path) -> Result<(), String> {
             "manifest: library={} version={} abi={} implicit={:?}",
             m.library_id, m.library_version, m.abi_version, m.implicit_packages,
         );
+        if !m.features.is_empty() {
+            println!("default-features: {:?}", m.default_features);
+            for f in &m.features {
+                let mut tail = String::new();
+                if !f.requires.is_empty() {
+                    tail.push_str(&format!(" requires={:?}", f.requires));
+                }
+                if !f.deps.is_empty() {
+                    tail.push_str(&format!(" deps={:?}", f.deps));
+                }
+                println!("  feature {}: sources={:?}{tail}", f.name, f.sources);
+            }
+        }
     }
     if let Some(payload) = reader
         .read_section(section_names::SYMBOLS)
