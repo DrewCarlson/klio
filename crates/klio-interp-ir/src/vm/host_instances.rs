@@ -4,6 +4,7 @@ use crate::{
 };
 
 impl VmHost<'_> {
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn new_instance_named(
         &mut self,
         class: klio_ir::ClassId,
