@@ -151,13 +151,27 @@ pub(crate) fn string_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
 
 pub(crate) fn string_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     use std::fmt::Write;
-    let s = recv_string(ctx.args, "String.plus")?;
+    let s = recv_string(ctx.args, "String.plus")?.clone();
     let other = ctx
         .args
         .get(1)
+        .cloned()
         .ok_or_else(|| RuntimeError::Arity("String.plus requires one argument".into()))?;
     let mut joined = String::with_capacity(s.len());
-    joined.push_str(s);
+    joined.push_str(&s);
+    // An instance operand must stringify through its (possibly
+    // overridden) `toString()` so `"x=" + obj` matches the string
+    // template `"x=$obj"`; the `Display` impl only knows the default
+    // `Class@hash` form.
+    if matches!(other, Value::Instance(_)) {
+        let CallCtx { out, host, .. } = ctx;
+        if let Some(r) = host.invoke_method(&other, "toString", &[], *out)
+            && let Value::String(t) = r?
+        {
+            joined.push_str(&t);
+            return Ok(Value::String(Arc::new(joined)));
+        }
+    }
     write!(joined, "{other}").unwrap();
     Ok(Value::String(Arc::new(joined)))
 }
