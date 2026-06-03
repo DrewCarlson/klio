@@ -85,11 +85,27 @@ impl VmHost<'_> {
                 next_pos += 1;
             }
         }
-        // Fill missing slots with Null; defaults are applied inside
-        // new_instance based on the runtime ClassDef metadata.
+        // Fill omitted slots with the parameter's default value. A
+        // named call can skip a *non-trailing* defaulted param
+        // (`C(b = 9)` skipping `a`), which new_instance's trailing-only
+        // default path can't recover once every slot is materialized; so
+        // resolve each missing slot's default here (the same
+        // `default_value_for_primary` new_instance uses), falling back to
+        // Null only when there is no default to apply.
+        let class_def = self.classes.borrow().get(&ir_class.name).cloned();
         let final_args: Vec<klio_runtime::Value> = reordered
             .into_iter()
-            .map(|s| s.unwrap_or(klio_runtime::Value::Null))
+            .enumerate()
+            .map(|(idx, slot)| {
+                slot.unwrap_or_else(|| {
+                    class_def
+                        .as_ref()
+                        .and_then(|d| d.primary_params.get(idx))
+                        .and_then(|p| p.default.as_ref())
+                        .and_then(|e| default_value_for_primary(e))
+                        .unwrap_or(klio_runtime::Value::Null)
+                })
+            })
             .collect();
         <Self as klio_ir::eval::Host>::new_instance(self, class, &final_args)
     }
