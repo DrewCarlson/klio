@@ -778,6 +778,61 @@ impl VmHost<'_> {
         class_name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<(), klio_ir::eval::EvalError> {
+        // The chain reached a kotlin-builtin Throwable. Its constructors
+        // are registered as bodyless `expect`-style shells that never
+        // store message/cause, so recursing into them silently drops the
+        // `super(...)` arguments. Bind the conventional `(message[,
+        // cause])` directly onto the leaf and stop. IOException /
+        // EOFException are *not* listed here: they are real klioMain
+        // classes whose own ctors chain up to Exception, where this
+        // binding then fires.
+        let is_builtin_throwable = matches!(
+            class_name,
+            "Throwable"
+                | "Exception"
+                | "RuntimeException"
+                | "Error"
+                | "IllegalArgumentException"
+                | "IllegalStateException"
+                | "IndexOutOfBoundsException"
+                | "NullPointerException"
+                | "ClassCastException"
+                | "ArithmeticException"
+                | "NumberFormatException"
+                | "NoSuchElementException"
+                | "ConcurrentModificationException"
+                | "UnsupportedOperationException"
+                | "CancellationException"
+        );
+        if is_builtin_throwable {
+            if let klio_runtime::Value::Instance(inst) = leaf {
+                let mut i = inst.borrow_mut();
+                match args {
+                    [only] => {
+                        let key = if matches!(only, klio_runtime::Value::Instance(_)) {
+                            "cause"
+                        } else {
+                            "message"
+                        };
+                        if !i
+                            .fields
+                            .iter()
+                            .any(|(n, v)| n == key && !matches!(v, klio_runtime::Value::Null))
+                        {
+                            i.fields.retain(|(n, _)| n != key);
+                            i.fields.push((key.to_string(), only.clone()));
+                        }
+                    }
+                    [msg, cause, ..] => {
+                        i.fields.retain(|(n, _)| n != "message" && n != "cause");
+                        i.fields.push(("message".to_string(), msg.clone()));
+                        i.fields.push(("cause".to_string(), cause.clone()));
+                    }
+                    [] => {}
+                }
+            }
+            return Ok(());
+        }
         let entries = self
             .prog
             .secondary_ctors

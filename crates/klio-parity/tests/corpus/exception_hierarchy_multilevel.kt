@@ -4,6 +4,12 @@ open class AppError(msg: String) : RuntimeException(msg)
 class NotFound(msg: String) : AppError(msg)
 class Timeout : AppError("timeout")
 
+// Secondary-constructor `super(...)` delegation (vs the primary-ctor
+// delegation above) must also carry the message to the builtin Throwable.
+class Wrapped : RuntimeException {
+    constructor(m: String) : super(m)
+}
+
 fun classify(e: Throwable): String = when (e) {
     is NotFound -> "notfound"
     is Timeout -> "timeout"
@@ -23,4 +29,6 @@ fun main() {
     // message survives the multi-level super(...) chain.
     println(NotFound("not here").message)
     println(Timeout().message)
+    // and through a secondary-constructor super(...) delegation.
+    println(Wrapped("wrapped-msg").message)
 }
