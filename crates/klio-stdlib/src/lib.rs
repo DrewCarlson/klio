@@ -120,16 +120,20 @@ pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
 /// bare names are stdlib top-level entities): take the lowercase
 /// entries (functions, not types/exceptions) and exclude the few
 /// that genuinely are receiver/infix extensions.
-/// The primitive-array constructor builders. Each is a top-level global
-/// factory (`byteArrayOf(vararg Byte): ByteArray`, …) with no
-/// receiver-typed variant — never a member or extension of any receiver.
-/// Member dispatch uses this to resolve a bare call inside an extension
-/// body to the global intrinsic instead of prepending the receiver.
+/// The array constructor builders. Each is a top-level global factory
+/// (`arrayOf(vararg T): Array<T>`, `byteArrayOf(vararg Byte): ByteArray`,
+/// …) with no receiver-typed variant — never a member or extension of any
+/// receiver. Member dispatch uses this to resolve a bare call inside a
+/// method / lambda body to the global intrinsic instead of prepending the
+/// enclosing receiver as a spurious first element.
 #[must_use]
 pub fn is_array_builder(name: &str) -> bool {
     matches!(
         name,
-        "byteArrayOf"
+        "arrayOf"
+            | "arrayOfNulls"
+            | "emptyArray"
+            | "byteArrayOf"
             | "ubyteArrayOf"
             | "shortArrayOf"
             | "ushortArrayOf"

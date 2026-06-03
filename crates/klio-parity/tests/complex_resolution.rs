@@ -557,3 +557,32 @@ fun main() {
         "0/default\n7/b\n0/default\n",
     );
 }
+
+// A bare `arrayOf(...)` inside a method / lambda body is the top-level
+// global factory, never a member of the enclosing receiver. The
+// speculative receiver-prepend probe must not inject `this` as a spurious
+// first element (which would make `make().size` report one too many).
+#[test]
+fn array_builder_in_method_does_not_prepend_receiver() {
+    let src = r#"
+class Builder(val tag: String) {
+    fun direct(): Array<String> = arrayOf("a", "b", "c")
+    fun viaLambda(): Array<String> {
+        val produce = { arrayOf(tag, "x") }
+        return produce()
+    }
+}
+fun main() {
+    val b = Builder("t")
+    val d = b.direct()
+    println("${d.size}:${d.joinToString(",")}")
+    val l = b.viaLambda()
+    println("${l.size}:${l.joinToString(",")}")
+}
+"#;
+    assert_klio(
+        "array_builder_in_method_does_not_prepend_receiver",
+        src,
+        "3:a,b,c\n2:t,x\n",
+    );
+}
