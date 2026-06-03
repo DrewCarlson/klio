@@ -120,28 +120,31 @@ Still open (needs careful design, not a quick patch):
   Regression test: `extension_member_resolution.rs`. With both fixes the
   OOM hang is gone; `readString(3L)` now runs (errors/segfaults on the
   *next* bugs below instead of exhausting memory).
-- **(remaining #3) Top-level array constructors prepend the receiver inside
-  an extension.** `byteArrayOf(…)` (and `intArrayOf`, … — pure intrinsics
-  with no IR func) called bare inside an extension body lower to
-  `CallMemberOrGlobal`; the runtime member-probe `call_member_only(recv,
-  "byteArrayOf", args)` resolves the *top-level* `kotlin.byteArrayOf`
-  intrinsic with `recv` prepended, producing `[recv, …bytes]`. Minimal
-  repro: `class C; fun C.f() = byteArrayOf(1,2,3)` → 4-element array.
-  `commonReadUtf8` hits this via `min(limit, …)` reading a mis-built
-  array. Tried adding the `*ArrayOf` family to
-  `klio_stdlib::is_toplevel_function` (which gates the speculative
-  receiver-prepend probe) — but that makes the call skip the probe and
-  fall through to a self-recursing upstream shim, crashing
-  `kotlinx_io_bytestring_encode_decode`. Reverted. The correct fix must
-  distinguish a receiver-typed intrinsic (`kotlin.IntArray.min`, prepend
-  OK) from a top-level one (`kotlin.byteArrayOf`, no prepend) at the
-  member-probe, OR give these builders an IR decl so they resolve as
-  globals — without regressing the bytestring path that currently relies
-  on the probe.
-- **(remaining #4) `readString` downstream segfault.** With #1/#2 fixed
-  and a local #3 patch, `readString(3L)`/`readString()` reach a deeper
-  stack overflow (signal 11) in the `commonReadUtf8` / `skip` /
-  `commonToUtf8String` composition — a distinct bug not yet isolated.
+  `readString(byteCount)`, `readString()`, and `readLine()` all run
+  correctly now (regression tests in `kotlinx_io_read.rs`). Three further
+  dispatch bugs surfaced once the hang was gone, each fixed in turn:
+- **Array constructors prepended the receiver inside an extension —
+  FIXED.** `byteArrayOf(…)` (a pure intrinsic with no IR func) called bare
+  inside an extension body reached the runtime member-probe, which
+  resolved the *top-level* `kotlin.byteArrayOf` with the receiver
+  prepended (`byteArrayOf(this, …)`). Fixed: these builders
+  (`klio_stdlib::is_array_builder`) dispatch the global intrinsic directly
+  with the original args, before the receiver-prepend probe, when the
+  receiver does not declare the member.
+- **Bare `min`/`max` bound a receiver-extension under the full corpus —
+  FIXED.** `lookup_global` suffix-scanned the installed-bindings overlay
+  for any key ending in `.{name}` *before* the package-ordered probes;
+  with the stdlib defaults in the overlay, bare `min` matched
+  `kotlin.DoubleArray.min` and ran `min(a, b)` as `a.min(b)`. Fixed: the
+  suffix-scan now runs after `direct_probes`, and the probes order the
+  top-level packages (`math`, `comparisons`, `io`) before the
+  receiver-extension packages.
+- **`b.readLine()` bound the console reader — FIXED.** Member dispatch
+  probed `kotlin.io.{name}`, matching the top-level `kotlin.io.readLine`
+  (console, not an extension) and dispatching it against the buffer (→
+  empty-stdin null). Fixed: those probes are skipped when a genuine
+  extension named `name` exists on the receiver's own type chain
+  (`fun Source.readLine()` for a `Buffer`).
 - **`recv.name(args)` where a user/pack extension's name collides with a
   stdlib intrinsic registered for a *different* receiver** (e.g.
   `LocalDate.until` / `String.until` vs `kotlin.ranges.until`). The
