@@ -89,38 +89,70 @@ Still open (needs careful design, not a quick patch):
   the super-args; bind message/cause directly when the chain (primary
   parent-ctor walk *and* `run_super_ctor_chain`) reaches a builtin
   Throwable. Verified byte-identical to kotlinc.
-- **kotlinx.io `readString(byteCount)` / `readLine` still hang.** Every
-  sub-piece works in isolation (`forEachSegment`, `withData`, non-local
-  return through both, `skip(partial)`, `min`, `require`), and
-  `readString()` (full size) works — but `commonReadUtf8(byteCount)`
-  hangs whenever `byteCount < segment.size`. Confirmed NOT the EOF path
-  (EOFException no longer overflows, yet it still hangs). The fault is
-  the `commonReadUtf8` lambda composition — `skip(byteCount)` mutating
-  the very segment list the enclosing inline `forEachSegment` is walking,
-  then a non-local `return`. Instrumented (per-frame block-loop counter,
-  global `eval_with_captures` / `call_func` / `call_member` counters):
-  the hang fires with NONE of them tripping — `readString(3L)` never
-  reaches `call_func`, `call_member`, or any interpreted body, while
-  `readString()` makes 300 `call_member` calls. Extended the trace to
-  `call_value` and confirmed it's a *runtime* (not build/lower) hang —
-  yet it bypasses `call_func`, `call_member`, `call_value`,
-  `eval_with_captures`, and the per-frame block-loop guard, while every
-  sub-piece (`skip`, `min`, `withData`, `forEachSegment`, non-local
-  return, partial `decodeToString`) works standalone. It is in a Vm
-  path beneath all standard dispatch entry points; cracking it needs a
-  debugger or instrumentation of the Vm core run loop, not source
-  reading.
+- **kotlinx.io `readString(byteCount)` / `readLine` hang — ROOT-CAUSED and
+  the catastrophic part FIXED (commit `resolve unqualified calls against
+  receiver members and by declared arity`).** The earlier "bypasses all
+  dispatch entry points" note was a measurement error: the depth counter
+  never decremented, so it measured cumulative calls, not recursion depth.
+  Instrumenting the *global allocator* (custom `GlobalAlloc`, dump
+  backtrace past a live/churn threshold) showed the truth — a runaway of
+  deep recursion through `call_func → eval_with → run_frame → exec_inst →
+  call_func`, each level cloning a `Func`, exhausting memory (RSS, not a
+  CPU spin). Two chained root causes:
+  1. **Extension-receiver member resolution.** `Source.readString(byteCount:
+     Long)` calls `require(byteCount)`. The `Long` argument is incompatible
+     with `kotlin.require(value: Boolean)`, so Kotlin binds the receiver
+     member `Source.require(Long)`. klio bound the top-level
+     `kotlin.require` instead (unqualified calls did not consider the
+     extension receiver's members). Fixed: an unqualified call inside an
+     extension now resolves against the receiver's members first (merged
+     cross-file via `registry.hierarchy_methods`), declining the top-level
+     bind so the member-call fallback dispatches on `this`.
+  2. **Forward-reference overload resolution.** The stdlib 1-arg
+     `require(value)` delegates to the 2-arg `require(value) { … }`
+     declared *below* it. At body-lowering the 2-arg sibling was still a
+     body-less stub with empty params, so arity matching failed and the
+     call bound to the *first* same-named overload — the 1-arg `require`
+     itself — baking an infinite self-call. Fixed: the driver records each
+     decl's user-param arity in a stub-pass side table
+     (`Module::decl_user_params`); the bare-call resolver prefers an
+     arity-correct overload over the arity-blind `func_id` fallback.
+  Regression test: `extension_member_resolution.rs`. With both fixes the
+  OOM hang is gone; `readString(3L)` now runs (errors/segfaults on the
+  *next* bugs below instead of exhausting memory).
+- **(remaining #3) Top-level array constructors prepend the receiver inside
+  an extension.** `byteArrayOf(…)` (and `intArrayOf`, … — pure intrinsics
+  with no IR func) called bare inside an extension body lower to
+  `CallMemberOrGlobal`; the runtime member-probe `call_member_only(recv,
+  "byteArrayOf", args)` resolves the *top-level* `kotlin.byteArrayOf`
+  intrinsic with `recv` prepended, producing `[recv, …bytes]`. Minimal
+  repro: `class C; fun C.f() = byteArrayOf(1,2,3)` → 4-element array.
+  `commonReadUtf8` hits this via `min(limit, …)` reading a mis-built
+  array. Tried adding the `*ArrayOf` family to
+  `klio_stdlib::is_toplevel_function` (which gates the speculative
+  receiver-prepend probe) — but that makes the call skip the probe and
+  fall through to a self-recursing upstream shim, crashing
+  `kotlinx_io_bytestring_encode_decode`. Reverted. The correct fix must
+  distinguish a receiver-typed intrinsic (`kotlin.IntArray.min`, prepend
+  OK) from a top-level one (`kotlin.byteArrayOf`, no prepend) at the
+  member-probe, OR give these builders an IR decl so they resolve as
+  globals — without regressing the bytestring path that currently relies
+  on the probe.
+- **(remaining #4) `readString` downstream segfault.** With #1/#2 fixed
+  and a local #3 patch, `readString(3L)`/`readString()` reach a deeper
+  stack overflow (signal 11) in the `commonReadUtf8` / `skip` /
+  `commonToUtf8String` composition — a distinct bug not yet isolated.
 - **`recv.name(args)` where a user/pack extension's name collides with a
   stdlib intrinsic registered for a *different* receiver** (e.g.
-  `LocalDate.until` / `String.until` vs `kotlin.ranges.until`). klio
-  dispatches member/extension calls at runtime via `call_member`, which
-  probes intrinsics speculatively by `kotlin.{ranges,collections,text}.
-  {name}` for *any* receiver. A runtime guard preferring a matching user
-  extension is unsafe: loose receiver-compat over-fires (hijacks
-  `string[i]`), and even an exact-type-name guard perturbs the
-  kotlinx.io String/ByteString surface. The right fix is compile-time
-  extension resolution (target the FuncId in the IR) or making the
-  speculative probes receiver-category-aware; both are larger.
+  `LocalDate.until` / `String.until` vs `kotlin.ranges.until`). The
+  extension-*receiver*-member case is now handled at lowering (see above);
+  the remaining hard case is a qualified `recv.name(args)` where `name` is
+  a user extension colliding with a same-name intrinsic on another
+  receiver category. klio probes intrinsics speculatively by
+  `kotlin.{ranges,collections,text}.{name}` for *any* receiver; a runtime
+  guard preferring a matching user extension over-fires. The right fix is
+  compile-time extension resolution (target the FuncId in the IR) or
+  receiver-category-aware probes.
 
 Re-verifying the top blockers against `target/release/klio` corrected
 two of them and root-caused a third.
