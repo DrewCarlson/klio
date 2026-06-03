@@ -104,14 +104,27 @@ fn expected_from_litmus(file: &Path) -> String {
     out
 }
 
-#[test]
-fn serialization_smoke_litmus() {
+fn litmus(name: &str) {
     install_packs();
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("serialization_smoke")
-        .join("ser_smoke.kt");
+        .join(name);
     let want = expected_from_litmus(&file);
     assert!(!want.is_empty(), "no //> expected lines");
-    assert_eq!(run_via_binary(&file), want, "ser_smoke.kt stdout mismatch");
+    assert_eq!(run_via_binary(&file), want, "{name} stdout mismatch");
+}
+
+#[test]
+fn serialization_smoke_litmus() {
+    litmus("ser_smoke.kt");
+}
+
+/// `Json.encodeToString` / `decodeFromString` over primitives, a nested
+/// `@Serializable`, `List<@Serializable>`, `Map<String, @Serializable>`,
+/// an enum field, and a nullable field — plus declaration-order keys and
+/// the `prettyPrint` / `ignoreUnknownKeys` builder options.
+#[test]
+fn json_smoke_litmus() {
+    litmus("json_smoke.kt");
 }

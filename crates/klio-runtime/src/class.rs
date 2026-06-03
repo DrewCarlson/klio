@@ -145,6 +145,42 @@ pub struct ClassParamDef {
     /// primitive type, matching Kotlin's literal typing, so `C(n = 1)`
     /// with `n: Long` stores a `Long`, not an `Int`.
     pub declared_type: Option<String>,
+    /// The full declared-type shape, including generic arguments and
+    /// nullability (e.g. `List<Item>`, `Map<String, Item>`, `Item?`).
+    /// `declared_type` keeps only the head name; reflective consumers
+    /// (such as the JSON decoder) need the element/value types that the
+    /// bare name discards.
+    pub declared_shape: Option<TypeShape>,
+}
+
+/// A structural view of a declared type retained for reflection: the head
+/// type name, whether it is nullable, and its generic arguments (each a
+/// `TypeShape` in turn, so arbitrarily nested types like
+/// `Map<String, List<Item>>` are fully represented). Star projections and
+/// function types collapse to a name with no arguments.
+#[derive(Debug, Clone)]
+pub struct TypeShape {
+    pub name: String,
+    pub nullable: bool,
+    pub args: Vec<TypeShape>,
+}
+
+impl TypeShape {
+    /// Build a `TypeShape` from a parsed AST type reference, recursing into
+    /// generic arguments and skipping star projections.
+    #[must_use]
+    pub fn from_type_ref(t: &klio_ast::TypeRef) -> Self {
+        TypeShape {
+            name: t.name.name.clone(),
+            nullable: t.nullable,
+            args: t
+                .type_args
+                .iter()
+                .filter(|a| !a.is_star)
+                .map(|a| TypeShape::from_type_ref(&a.ty))
+                .collect(),
+        }
+    }
 }
 
 // The flags are independent member modifiers read individually across the crate.

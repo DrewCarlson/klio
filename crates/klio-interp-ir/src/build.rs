@@ -1392,6 +1392,7 @@ fn build_module_with_overrides(
                     name: p.name.name.clone(),
                     default: p.default.as_ref().map(|e| std::sync::Arc::new(e.clone())),
                     declared_type: Some(p.ty.name.name.clone()),
+                    declared_shape: Some(klio_runtime::TypeShape::from_type_ref(&p.ty)),
                 })
                 .collect();
             let body_properties: Vec<PropertyDef> = c

@@ -976,7 +976,13 @@ impl klio_runtime::IntrinsicHost for VmIntrinsicHost<'_> {
     }
 
     fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
-        self.globals.borrow().lookup(name)
+        if let Some(v) = self.globals.borrow().lookup(name) {
+            return Some(v);
+        }
+        self.classes
+            .borrow()
+            .get(name)
+            .map(|def| klio_runtime::Value::Class(def.clone()))
     }
 
     fn alloc_instance_id(&mut self) -> u64 {
