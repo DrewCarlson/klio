@@ -369,6 +369,49 @@ impl VmHost<'_> {
                         tbl.insert((synth_class_name.clone(), f.name.name.clone()), entry);
                     }
                     klio_ast::Decl::Property(p) => {
+                        // A getter-only property (`override val context get()
+                        // = context`) is lowered as a 0-arg anon method under
+                        // the property name, *inside* the capture window, so a
+                        // read invokes it with the closed-over names in scope
+                        // (the `Continuation(ctx) { … }` factory's `context`).
+                        if let Some(getter) = &p.getter {
+                            let thunk = klio_ast::Function {
+                                name: p.name.clone(),
+                                receiver_type: None,
+                                type_params: Vec::new(),
+                                where_bounds: Vec::new(),
+                                params: Vec::new(),
+                                return_type: getter.return_type.clone(),
+                                body: Some(getter.body.clone()),
+                                is_open: false,
+                                is_override: p.is_override,
+                                is_abstract: false,
+                                is_operator: false,
+                                is_inline: false,
+                                is_infix: false,
+                                is_tailrec: false,
+                                is_suspend: false,
+                                is_expect: false,
+                                is_actual: false,
+                                visibility: klio_ast::Visibility::Public,
+                                annotations: Vec::new(),
+                                span: p.name.span,
+                            };
+                            let mut sub_module = klio_ir::Module::default();
+                            let func = klio_ir::lower::lower_method(
+                                &mut sub_module,
+                                &thunk,
+                                &synth_class_name,
+                                &own_members,
+                            );
+                            let fid = func.id;
+                            let entry = (Arc::new(sub_module), fid, capture_pairs.clone());
+                            let mut tbl = self.anon_methods.borrow_mut();
+                            tbl.insert(
+                                (synth_class_name.clone(), format!("$get${}", p.name.name)),
+                                entry,
+                            );
+                        }
                         let Some(init) = &p.init else { continue };
                         let is_bare_path = matches!(
                             init,

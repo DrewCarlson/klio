@@ -319,3 +319,29 @@ fun main() {
         "15\n42\n",
     );
 }
+
+// An object expression's custom getter that reads a captured outer of the
+// same name (`override val context get() = context`) must return the
+// capture, not the absent backing field. Same shape as the
+// `Continuation(ctx) { … }` factory's `context` property. A normal anon
+// getter over a captured value (different name) must keep working too.
+#[test]
+fn anon_object_getter_reads_captured_same_named_param() {
+    let src = r#"
+interface Box { val tag: Int; val doubled: Int }
+fun mk(tag: Int): Box = object : Box {
+    override val tag: Int get() = tag
+    override val doubled: Int get() = tag * 2
+}
+fun main() {
+    val b = mk(21)
+    println(b.tag)
+    println(b.doubled)
+}
+"#;
+    assert_klio(
+        "anon_object_getter_reads_captured_same_named_param",
+        src,
+        "21\n42\n",
+    );
+}

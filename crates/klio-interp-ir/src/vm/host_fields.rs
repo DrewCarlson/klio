@@ -120,6 +120,20 @@ impl VmHost<'_> {
             }
             return Ok(klio_runtime::Value::Null);
         }
+        // Anon-object custom getter: a property declared with `get() =
+        // …` on an object expression is lowered (within the capture
+        // window) as a `$get$<name>` anon method. Invoking it through
+        // `call_member` layers the closed-over names, so a getter that
+        // reads a captured outer (`override val context get() = context`)
+        // resolves correctly instead of returning the (absent) backing
+        // field's Null.
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let cls = inst.borrow().class.name.clone();
+            let getter_key = (cls, format!("$get${name}"));
+            if self.anon_methods.borrow().contains_key(&getter_key) {
+                return self.call_member(receiver, &format!("$get${name}"), &[]);
+            }
+        }
         // `Thread` handle property reads (`t.name`, `t.isAlive`).
         // Mirrors the member-call interception in `call_member`.
         if let klio_runtime::Value::BoundMethod {
