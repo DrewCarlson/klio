@@ -163,6 +163,23 @@ impl VmHost<'_> {
             if let Some(intrinsic) = self.prog.installed_bindings.resolve(&func.fqn) {
                 return self.dispatch_intrinsic(intrinsic, args);
             }
+            // Value-style invocation of a receiver lambda
+            // (`block.invoke(receiver, p)` / `block(receiver, p)` for a
+            // `R.(P) -> T`): the lambda's value params are `[p]`, so being
+            // called with exactly one *extra* leading arg means arg0 is the
+            // extension receiver. Route through `call_value_with_this` so the
+            // receiver is bound as `this` (and pushed for member-extension /
+            // bare-member resolution), matching the member-style
+            // `receiver.block(p)` path. Valid Kotlin never calls a
+            // non-receiver lambda with surplus args, so the `+1` arity is an
+            // unambiguous signal. (Vararg targets, which legitimately take
+            // surplus args, are excluded.)
+            let last_vararg = func.params.last().is_some_and(|p| p.is_vararg);
+            if !last_vararg && !args.is_empty() && args.len() == info.n_params + 1 {
+                let receiver = args[0].clone();
+                let rest: Vec<klio_runtime::Value> = args[1..].to_vec();
+                return self.call_value_with_this(callee, &receiver, &rest, &[]);
+            }
             // Fill missing positional args from the target's
             // registered default-arg thunks (an implicit-`it` lambda
             // invoked with zero args still gets its slot as Null).
