@@ -75,14 +75,18 @@ General interpreter fixes landed along the way (each helps all programs):
   (the Map analogue of the iterable fallback) — `StringValues` does
   `values.forEach { }` over a custom map.
 
+More fixes landed: anonymous-object property initializers over captures are
+now evaluated (`val inner = src.iterator()`), so `DelegatingMutableSet`'s
+anonymous iterator constructs; and `entries`/`size` over the wrapper work.
+
 ## Open blockers (next, in order)
 
-1. **Custom-collection iterator stack.** ktor's `Headers` sits on
-   `CaseInsensitiveMap` → `DelegatingMutableSet` → an anonymous
-   `MutableIterator` whose `val delegateIterator = delegate.iterator()`
-   property-initializer isn't materialized (drain hits `hasNext on Nothing`).
-   Needs anonymous-object captured-property-init support; the same stack
-   recurs for the keys/entries/values views.
+1. **Enclosing receiver-lambda-property invoked extension-style.**
+   `DelegatingMutableSet.next()` does `delegateIterator.next().convertTo()`,
+   where `convertTo: From.() -> To` is the wrapper's captured lambda property
+   invoked with the entry as receiver. klio mis-resolves it (`get_field length
+   on Function`). The keys/entries/values transforms all use this shape, so it
+   gates iterating the wrapper views.
 2. **ktor-http remainder** — `Headers`/`Parameters`/`Url`/`URLBuilder`/codecs,
    once (1) lands.
 3. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
