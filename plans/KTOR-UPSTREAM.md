@@ -484,15 +484,17 @@ upstream and delete the request-member shims.
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.
 
-## URL layer consumed — query params the last gap
+## URL layer consumed from upstream (incl. query params)
 
-The full URL stack now loads and parses from real upstream: `Query.kt`,
+The full URL stack loads and parses from real upstream: `Query.kt`,
 `UrlDecodedParametersBuilder.kt`, `URLUtils.kt`, `URLProtocol.kt`,
 `URLBuilder.kt`, `URLParser.kt`, `Url.kt`, plus the posix `origin` actual
 (`URLBuilderPosix.kt`). `Url("http://localhost:8080/path?q=1")` resolves
-`protocol`, `host`, `port`, `encodedPath`, and `fragment` correctly. Getting
-there landed a stack of general interpreter/stdlib fixes, each with a
-kotlinc-parity corpus test:
+`protocol`, `host`, `port`, `encodedPath`, `encodedQuery` (case-insensitive
+multi-value `Parameters`), and `fragment` correctly — verified end-to-end by
+`tests/ktor_http_value_types.rs::ktor_url_parsing_from_upstream`. Getting there
+landed a stack of general interpreter/stdlib fixes, each with a kotlinc-parity
+corpus test:
 
 - non-literal primary-ctor defaults (`Parameters.Empty`) evaluated via lowered
   thunks (`ctor_default_object_ref.kt`);
@@ -507,30 +509,28 @@ kotlinc-parity corpus test:
 - `String.indexOf(_, startIndex)` honouring its start index (`index_of_start.kt`);
 - a vararg function no longer matched by exact arg count, so `mutableListOf("x")`
   reaches the intrinsic instead of binding the unpacked vararg body
-  (`vararg_single_arg.kt`).
+  (`vararg_single_arg.kt`);
+- an extension's receiver type dominating argument types in overload scoring, so
+  `caseInsensitiveMap()[k] = v` reaches `MutableMap.set` → `put` instead of an
+  unrelated `io.ktor.http.set(URLBuilder, …)` whose `String` args out-scored the
+  generic `K`/`V` — this was dropping every query param
+  (`extension_receiver_outscores_args.kt`).
 
-**Remaining gap — query parameters.** `parseQueryString` populates a
-`ParametersBuilder`, whose backing `StringValuesBuilderImpl.values` is a
-`CaseInsensitiveMap` (pack-consumed `class CaseInsensitiveMap<V> :
-MutableMap<String, V>`). `map.put(k, v)` on it works, but `map[k] = v` /
-`map.set(k, v)` does not store: a user-program `MutableMap` of the identical
-shape dispatches `set` through the `MutableMap.set` operator extension to its
-`put` and works, but the pack-consumed `CaseInsensitiveMap` instead routes `set`
-into the read-only Map fallback (materialise entries → builtin `Value::Map` →
-`dispatch_intrinsic`), which mutates a snapshot and leaves the instance
-unchanged — so every query param is dropped and `encodedQuery` is empty. The fix
-is in `set`/operator dispatch for a pack-consumed class implementing
-`MutableMap`: its generic `MutableMap` supertype isn't matched by the
-operator-extension receiver test, so the call falls through to the materialising
-fallback (which must never run a *mutating* op). A program-defined class with
-the same shape resolves correctly, so it is specific to how a pack class's
-generic supertype is recorded/matched.
+**Load-time serialization dependency (known).** `Url` is
+`@Serializable(with = UrlSerializer::class)`, and `UrlSerializer` is an `object`
+whose `descriptor = PrimitiveSerialDescriptor(…, PrimitiveKind.STRING)`. klio
+initializes objects eagerly at pack load, so loading the ktor pack with the URL
+files pulls the kotlinx-serialization stack (and its `kotlinx.io` / `atomicfu`
+deps) — the `ktor_http_value_types` test installs them. A plain `Url` program
+that never serializes therefore needs the serialization pack present; the proper
+fix is lazy object initialization (Kotlin initializes an `object` on first
+access), so an unused serializer object never forces its dependencies. Tracked
+as a follow-up.
 
 ## Status
 
-The protocol foundation is consuming real upstream and the general fixes are
-landing. URL value types now parse from upstream end-to-end except query params.
-Remaining program, in order: the `CaseInsensitiveMap.set` / pack-class
-`MutableMap` operator dispatch (for query params), then the Pipeline runtime for
-the cores. The shim stays in place so client/server keep working until each
-layer's upstream replacement is validated.
+The protocol foundation and the full URL layer are consuming real upstream.
+Remaining program, in order: lazy `object` initialization (so `Url`'s unused
+`UrlSerializer` doesn't force the serialization stack at load), then the
+Pipeline runtime for the cores. The shim stays in place so client/server keep
+working until each layer's upstream replacement is validated.

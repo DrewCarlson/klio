@@ -27,37 +27,55 @@ fn klio_bin() -> PathBuf {
     ws_root().join("target/release/klio")
 }
 
-/// Build + install the ktor pack. Idempotent.
+/// Build + install the ktor pack exactly once per test process. Tests in
+/// this file run on parallel threads; building/installing the pack to a
+/// shared path concurrently corrupts the install (`pack hash mismatch`), so
+/// gate it behind a `Once`.
 fn install_ktor_pack() {
-    let bin = klio_bin();
-    assert!(
-        bin.exists(),
-        "target/release/klio missing — run `cargo build -p klio-cli --release` first"
-    );
-    let dir = ws_root().join("crates").join("klio-ktor-client");
-    let out = std::env::temp_dir().join("klio-ktor-http-value-types.klio-pack");
-    let b = Command::new(&bin)
-        .args(["pack", "build"])
-        .arg(&dir)
-        .arg("--out")
-        .arg(&out)
-        .output()
-        .expect("spawn klio pack build");
-    assert!(
-        b.status.success(),
-        "pack build failed: {}",
-        String::from_utf8_lossy(&b.stderr)
-    );
-    let i = Command::new(&bin)
-        .args(["pack", "install"])
-        .arg(&out)
-        .output()
-        .expect("spawn klio pack install");
-    assert!(
-        i.status.success(),
-        "pack install failed: {}",
-        String::from_utf8_lossy(&i.stderr)
-    );
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let bin = klio_bin();
+        assert!(
+            bin.exists(),
+            "target/release/klio missing — run `cargo build -p klio-cli --release` first"
+        );
+        // The ktor pack's `Url` is `@Serializable` and ships the
+        // `UrlSerializer` object (`descriptor = PrimitiveSerialDescriptor(…,
+        // PrimitiveKind.STRING)`), which klio initializes eagerly at pack
+        // load — so the serialization stack (and its `kotlinx.io` /
+        // `atomicfu` deps) must be installed first. Then the ktor pack.
+        for crate_dir in [
+            "klio-kotlinx-atomicfu",
+            "klio-kotlinx-io",
+            "klio-kotlinx-serialization",
+            "klio-ktor-client",
+        ] {
+            let dir = ws_root().join("crates").join(crate_dir);
+            let out = std::env::temp_dir().join(format!("{crate_dir}.klio-pack"));
+            let b = Command::new(&bin)
+                .args(["pack", "build"])
+                .arg(&dir)
+                .arg("--out")
+                .arg(&out)
+                .output()
+                .expect("spawn klio pack build");
+            assert!(
+                b.status.success(),
+                "pack build {crate_dir} failed: {}",
+                String::from_utf8_lossy(&b.stderr)
+            );
+            let i = Command::new(&bin)
+                .args(["pack", "install"])
+                .arg(&out)
+                .output()
+                .expect("spawn klio pack install");
+            assert!(
+                i.status.success(),
+                "pack install {crate_dir} failed: {}",
+                String::from_utf8_lossy(&i.stderr)
+            );
+        }
+    });
 }
 
 fn run(file: &Path) -> String {
@@ -124,5 +142,51 @@ fun main() {
          a b c\n\
          café\n",
         "ktor header value-type output drifted"
+    );
+}
+
+#[test]
+fn ktor_url_parsing_from_upstream() {
+    install_ktor_pack();
+
+    // `Url` / `URLBuilder` / `URLParser` / `URLProtocol` / `Query` consumed
+    // verbatim from upstream commonMain (klio supplies only the posix
+    // `URLBuilder.Companion.origin` actual). Parsing resolves protocol, host,
+    // port, encoded path, encoded query (case-insensitive `Parameters`), and
+    // fragment across URL shapes.
+    let src = r#"
+import io.ktor.http.*
+
+fun line(s: String) {
+    val u = Url(s)
+    println("${u.protocol.name}|${u.host}|${u.port}|${u.encodedPath}|${u.encodedQuery}|${u.fragment}")
+}
+
+fun main() {
+    line("http://localhost:8080/path?q=1")
+    line("https://example.com/a/b?x=1&y=2#frag")
+    line("https://example.com")
+    line("ws://10.0.0.1/socket")
+    val u = Url("https://host/p?a=1&b=2&a=3")
+    println(u.parameters.getAll("a"))
+    println(u.parameters["b"])
+}
+"#;
+
+    let dir = std::env::temp_dir().join("klio_ktor_url_parsing");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.kt");
+    std::fs::write(&file, src).unwrap();
+
+    let got = run(&file);
+    assert_eq!(
+        got,
+        "http|localhost|8080|/path|q=1|\n\
+         https|example.com|443|/a/b|x=1&y=2|frag\n\
+         https|example.com|443|||\n\
+         ws|10.0.0.1|80|/socket||\n\
+         [1, 3]\n\
+         2\n",
+        "ktor URL parsing output drifted"
     );
 }
