@@ -261,6 +261,31 @@ impl VmHost<'_> {
             ));
         }
         if class_def.is_interface {
+            // `List(size) { init }` / `MutableList(size) { init }` share the
+            // interface's simple name with a top-level factory function. The
+            // Kotlin factory is `inline`, so a pack consumer sees only a
+            // bodyless stub and the bare call resolves to this interface,
+            // landing here. Build the list directly by invoking
+            // `init(0)…init(size-1)`, matching the factory's semantics.
+            if matches!(class_def.name.as_str(), "List" | "MutableList")
+                && args.len() == 2
+                && let Some(size) = args[0].as_i64()
+            {
+                let init = args[1].clone();
+                let mut items: Vec<klio_runtime::Value> =
+                    Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+                for i in 0..size {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let idx = klio_runtime::Value::Int(i as i32);
+                    items.push(self.call_value(&init, &[idx])?);
+                }
+                return Ok(klio_runtime::Value::List {
+                    items: klio_runtime::ObjRef::new(items),
+                    mutable: class_def.name == "MutableList",
+                    enum_class: None,
+                    backing: None,
+                });
+            }
             // SAM conversion: `FunInterface(lambda)` direct-call
             // path wraps the callable in a synthetic instance whose
             // `__sam_target__` field captures the lambda; method

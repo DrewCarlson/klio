@@ -2272,6 +2272,22 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> Result<Value, EvalError> {
         let nr = promote(r).unwrap_or_else(|| r.clone());
         return apply_binop(op, &nl, &nr);
     }
+    // Float *comparisons* (same-type or mixed with Int/Long/Double) widen
+    // the Float operand to Double and re-dispatch: f32 → f64 is lossless so
+    // the ordering is preserved, and Kotlin already promotes Float to Double
+    // in a mixed Float/Double comparison. Gated to comparison ops — Float
+    // arithmetic stays Float and is handled by the explicit arms below.
+    if matches!(
+        op,
+        BinOp::Less | BinOp::LessEq | BinOp::Greater | BinOp::GreaterEq
+    ) && (matches!(l, Value::Float(_)) || matches!(r, Value::Float(_)))
+    {
+        let widen = |v: &Value| match v {
+            Value::Float(f) => Double(f64::from(*f)),
+            other => other.clone(),
+        };
+        return apply_binop(op, &widen(l), &widen(r));
+    }
     match (op, l, r) {
         (BinOp::Add, Int(a), Int(b)) => Ok(Int(a.wrapping_add(*b))),
         (BinOp::Sub, Int(a), Int(b)) => Ok(Int(a.wrapping_sub(*b))),

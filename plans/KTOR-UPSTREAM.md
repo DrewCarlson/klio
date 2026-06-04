@@ -206,23 +206,66 @@ the cooperative `drive_root` without regressing `runBlocking`/`launch`.
 `pipelineStartCoroutineUninterceptedOrReturn` actuals; switch the cores onto
 upstream and delete the request-member shims.
 
+## Landed (general fixes that unblock upstream consumption)
+
+- **Inline builders from a pack consumer.** `buildString`/`buildList`/
+  `buildSet`/`buildMap` are `inline fun`s in the stdlib; a pack consumer sees
+  only a bodyless forward stub at lower time, so an arity-aware bind is
+  unavailable and the bare-name path picked the 1-arg overload's body and
+  invoked the `capacity` argument. They are now in the implicit-alias set so a
+  bare reference resolves to the host intrinsic actual (`buildString(capacity,
+  block)` accepted). `Text.kt`'s `escapeHTML`/`toLowerCasePreservingASCIIRules`
+  depend on this.
+- **`StringBuilder.append(CharSequence, startIndex, endIndex)`** appended its
+  three args in turn instead of the subrange; routed to the range append.
+- **`List(size){init}` / `MutableList(size){init}` factories.** `List` is also
+  a registered interface, so a bare `List(n){…}` lowered to `NewInstance(List)`
+  and threw "Cannot create an instance of an interface". `new_instance` now
+  builds the list directly when the interface name is `List`/`MutableList` and
+  the args are `(Int, (Int)->T)`. `StringValuesImpl.init` needs this.
+- **Floating-point range membership.** `x in lo..hi` with a range *literal*
+  lowers to `lo <= x && x <= hi` (`< hi` for `..<`) — kotlinc's `in` intrinsic
+  form — which supports `Double`/`Float` endpoints that the integer
+  `Value::Range` cannot represent (`HeaderValue.quality`'s `it in 0.0..1.0`).
+  `Float` comparisons widen to `Double` (lossless) since only `Float`
+  *arithmetic* had explicit arms.
+- **Consumed verbatim:** `io.ktor.util.Text.kt`. The util collection layer
+  (`Collections.kt` + a klio `unmodifiable` actual, `DelegatingMutableSet.kt`,
+  `CaseInsensitiveMap.kt`, `StringValues.kt`) and the http header/content-type
+  layer (`HttpHeaderValueParser.kt`, `HeaderValueWithParameters.kt`,
+  `ContentTypes.kt`) load and the full `ContentType` API runs (parse /
+  withParameter / match / charset / parseHeaderValue), but consuming them is
+  blocked on (1) and (2) below — held back from `klio.toml` until fixed.
+
 ## Open blockers (next, in order)
 
-1. **Receiver-lambda *property* invoked extension-style.**
+1. **`ContentType.Application` nested object collides with the server's
+   `class Application`.** Consuming `ContentTypes.kt` (which declares nested
+   `object Application`/`Audio`/`Text`/… inside `ContentType`) makes the server
+   program's `embeddedServer { … }` module-receiver type `Application` resolve
+   to `io.ktor.http.ContentType.Application` instead of
+   `io.ktor.server.application.Application` — so the `Application.routing`
+   extension is unresolved ("unresolved global `routing`"). klio is registering
+   a nested object/class under its bare simple name in the global type table; a
+   bare type name must resolve to the imported/top-level type, not a nested one
+   reachable only via qualification. Per CLAUDE.md this must be fixed in
+   resolution, never by renaming the upstream type. Gates `ContentTypes.kt`.
+2. **Receiver-lambda *property* invoked extension-style.**
    `DelegatingMutableSet.next()` does `delegateIterator.next().convertTo()`,
    where `convertTo: From.() -> To` is the wrapper's lambda property invoked
-   with the entry as receiver. A broad `call_member` fallback for this
-   misrouted coroutine method calls to same-named captured lambdas (broke
+   with the entry as receiver. Iterating a `CaseInsensitiveMap`/`StringValues`
+   view (`entries`/`keys`/`values`) hangs. A broad `call_member` fallback for
+   this misrouted coroutine method calls to same-named captured lambdas (broke
    mm9/mm10 conformance) and was reverted — it needs a precise resolution
    (the lambda is the *enclosing* instance's property, reached via the anon
    object's outer `this`; resolve at lowering or with the current method's
    `this` in scope, not via a blanket global-lambda lookup). Gates iterating
-   the wrapper views (keys/entries/values all use the same shape).
-2. **ktor-http remainder** — `Headers`/`Parameters`/`Url`/`URLBuilder`/codecs,
-   once (1) lands.
-3. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
+   the wrapper views.
+3. **ktor-http remainder** — `Headers`/`Parameters`/`Url`/`URLBuilder`/codecs,
+   once (1)+(2) land.
+4. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
-4. **Cores on upstream**, engine staying klio-side.
+5. **Cores on upstream**, engine staying klio-side.
 
 ## Status
 

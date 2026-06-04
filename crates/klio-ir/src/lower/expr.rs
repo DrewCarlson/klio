@@ -125,6 +125,56 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // `haystack.contains(x)` (negated for !in). The right
             // operand is the haystack so dispatch through CallMember.
             if matches!(op, AstBinOp::In | AstBinOp::NotIn) {
+                // `x in lo..hi` / `x in lo..<hi` with a range *literal*
+                // on the right is the `in` range intrinsic: lower it to
+                // `lo <= x && x <= hi` (`x < hi` for `..<`), the same
+                // comparison form kotlinc emits. This covers every
+                // Comparable endpoint type and — unlike building a range
+                // value — supports floating-point ranges (`it in 0.0..1.0`)
+                // that klio's integer `Value::Range` cannot represent.
+                if let Expr::Binary {
+                    op: r_op @ (AstBinOp::Range | AstBinOp::RangeUntil),
+                    lhs: lo,
+                    rhs: hi,
+                    ..
+                } = rhs.as_ref()
+                {
+                    let x = lower_expr(b, lhs);
+                    let lo_r = lower_expr(b, lo);
+                    let hi_r = lower_expr(b, hi);
+                    let ge = b.alloc_reg();
+                    b.push(Inst::BinOp {
+                        dst: ge,
+                        op: BinOp::LessEq,
+                        lhs: lo_r,
+                        rhs: x,
+                    });
+                    let upper = if matches!(r_op, AstBinOp::RangeUntil) {
+                        BinOp::Less
+                    } else {
+                        BinOp::LessEq
+                    };
+                    let le = b.alloc_reg();
+                    b.push(Inst::BinOp {
+                        dst: le,
+                        op: upper,
+                        lhs: x,
+                        rhs: hi_r,
+                    });
+                    let both = b.alloc_reg();
+                    b.push(Inst::BinOp {
+                        dst: both,
+                        op: BinOp::And,
+                        lhs: ge,
+                        rhs: le,
+                    });
+                    if matches!(op, AstBinOp::NotIn) {
+                        let dst = b.alloc_reg();
+                        b.push(Inst::Not { dst, src: both });
+                        return dst;
+                    }
+                    return both;
+                }
                 let recv = lower_expr(b, rhs);
                 let arg_slot = b.alloc_reg();
                 let l = lower_expr(b, lhs);
