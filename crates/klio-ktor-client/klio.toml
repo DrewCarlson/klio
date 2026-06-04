@@ -133,11 +133,15 @@ include = [
 ]
 
 # Client-core foundation (cores stage 1 — engine boundary). `EmptyContent` is
-# the request-body default; the rest of the client core builds on it.
+# the request-body default; `HttpClientEngineConfig` is the engine config base.
+# (`HttpClientEngineCapability` is deferred: its eager `DEFAULT_CAPABILITIES`
+# references the timeout plugin's `HttpTimeoutCapability`, pulling the plugin
+# layer.)
 [[source]]
 root = "upstream/ktor-client/ktor-client-core/common/src"
 include = [
     "io/ktor/client/utils/Content.kt",
+    "io/ktor/client/engine/HttpClientEngineConfig.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)

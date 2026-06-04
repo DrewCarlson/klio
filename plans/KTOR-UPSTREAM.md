@@ -718,12 +718,21 @@ validated, then the corresponding shim file is deleted):
    `HttpClientEngineConfig` / `HttpRequestData` / `HttpResponseData` +
    `EmptyContent`; write the klio engine `actual` (build an `HttpResponseData`
    from `__kktor_request`'s bytes via a read-side `ByteReadChannel`).
-   *In progress:* `EmptyContent` (the request-body default) and
-   `io.ktor.util.date.GMTDate` (response timestamps) are consumed — klio
-   supplies the UTC calendar-math `GMTDate` actuals + a `getTimeMillis` clock
-   intrinsic (verified by `ktor_date_and_empty_content_from_upstream`). Next in
-   this stage: `HttpRequestData`/`HttpResponseData` + the engine interfaces +
-   the klio engine `actual`.
+   *In progress:* `EmptyContent`, `io.ktor.util.date.GMTDate` (klio UTC
+   calendar-math actuals + `getTimeMillis` intrinsic), and
+   `HttpClientEngineConfig` are consumed (verified by
+   `ktor_date_and_empty_content_from_upstream`). **Loading finding:** klio
+   tolerates an *unresolved type reference* in a consumed file (a field/param
+   annotation or unused method body — e.g. `HttpClientEngineConfig.proxy:
+   ProxyConfig?` with `ProxyConfig` not yet consumed), but an *eager top-level
+   `val`* that references an unconsumed symbol breaks the whole pack load
+   (`HttpClientEngineCapability`'s `DEFAULT_CAPABILITIES = setOf(
+   HttpTimeoutCapability)` → must consume/stub the timeout plugin first). So
+   the consumption order is: pull each file, then satisfy only its
+   *eager-init* references (types-in-signatures resolve lazily). Next:
+   `HttpRequestData`/`HttpResponseData` + `HttpClientEngine`/`Base` + the klio
+   engine `actual`, satisfying the eager-init refs (`ENGINE_CAPABILITIES_KEY`,
+   `DEFAULT_CAPABILITIES`) as they surface.
 2. **Call + statement** — `HttpClientCall`, `HttpRequest`/`HttpResponse`,
    `DefaultHttpRequest`/`DefaultHttpResponse`, `HttpStatement`.
 3. **Pipelines + `HttpClient`** — `HttpRequestPipeline`/`HttpSendPipeline`/

@@ -102,6 +102,7 @@ fn ktor_date_and_empty_content_from_upstream() {
     let src = r#"
 import io.ktor.util.date.*
 import io.ktor.client.utils.*
+import io.ktor.client.engine.*
 import io.ktor.http.content.*
 
 fun show(d: GMTDate) {
@@ -117,6 +118,10 @@ fun main() {
 
     val e: OutgoingContent = EmptyContent
     println("${e.contentLength}|${e.isEmpty()}|${e is OutgoingContent.NoContent}")
+
+    val cfg = HttpClientEngineConfig()
+    cfg.pipelining = true
+    println("${cfg.pipelining}|${cfg.proxy}")
 }
 "#;
 
@@ -132,7 +137,8 @@ fun main() {
          2021-JANUARY-1|0:0:0|FRIDAY|0\n\
          2020-DECEMBER-25|12:15:30|FRIDAY|359\n\
          true\n\
-         0|true|true\n",
+         0|true|true\n\
+         true|null\n",
         "ktor date / EmptyContent output drifted"
     );
 }
