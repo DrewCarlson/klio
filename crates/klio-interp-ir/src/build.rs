@@ -1148,6 +1148,7 @@ fn build_module_with_overrides(
                     default: None,
                     is_property: false,
                     is_vararg: false,
+                    has_default: false,
                 }]
             } else {
                 Vec::new()
@@ -1179,6 +1180,18 @@ fn build_module_with_overrides(
             // by arity while that sibling is still a body-less stub.
             #[allow(clippy::cast_possible_truncation)]
             module.decl_user_params.insert(id.0, f.params.len() as u32);
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                let has_vararg = f.params.last().is_some_and(|p| p.is_vararg);
+                let required = f
+                    .params
+                    .iter()
+                    .filter(|p| p.default.is_none() && !p.is_vararg)
+                    .count() as u32;
+                module
+                    .decl_user_arity
+                    .insert(id.0, (required, f.params.len() as u32, has_vararg));
+            }
             stub_ids.push(id);
         }
     }

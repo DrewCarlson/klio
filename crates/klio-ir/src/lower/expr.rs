@@ -1981,40 +1981,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     return dst;
                 }
             }
-            // Path-callee with a registered top-level fn → Call{func}.
-            if let Expr::Path { segments, .. } = callee.as_ref()
-                && segments.len() == 1
-            {
-                // When a class and a top-level function share
-                // this name (a class plus a same-named factory
-                // function), the call is a constructor
-                // invocation whenever the function isn't
-                // applicable to the supplied argument count.
-                // Defer to the NewInstance path below so the
-                // Vm's ctor overload resolution picks the right
-                // (possibly private/secondary) constructor.
-                // Only kicks in on the class+function name
-                // clash, so ordinary default/vararg calls are
-                // unaffected.
-                // The factory function is applicable whenever it
-                // can accept the supplied positional count —
-                // fewer args than params is fine (trailing params
-                // are defaulted, e.g. the all-default
-                // `fun DateTimePeriod(years=0, months=0, …)`
-                // factory beside `sealed class DateTimePeriod`).
-                // Only treat the call as a constructor when the
-                // function genuinely cannot take that many args.
-                let shadowed_by_class = b.module.class_id(&segments[0].name).is_some() && {
+            // Whether a single-segment class-name call resolves to the
+            // constructor rather than a same-named factory function.
+            // Hoisted so both the direct-`Call` path and the
+            // class-`NewInstance` path below share one decision (see the
+            // detailed rationale at each `else` branch).
+            let shadowed_by_class = match callee.as_ref() {
+                Expr::Path { segments, .. }
+                    if segments.len() == 1
+                        && b.module.class_id(&segments[0].name).is_some() =>
+                {
                     let name = &segments[0].name;
                     let nargs = args.len();
                     if matches!(args.last(), Some(Expr::Lambda { .. })) {
                         // A trailing lambda (`Widget { … }`) routes to a
-                        // same-named factory function that has a
-                        // function-typed parameter to receive it. Only
-                        // when no such factory fits is the call a
-                        // constructor. Without this, an all-default
-                        // `Widget()` beside the builder factory would
-                        // misread the lambda call as the constructor.
+                        // same-named factory with a function-typed param to
+                        // receive it; only when none fits is it a ctor.
                         let factory_takes_lambda = b
                             .module
                             .func_index
@@ -2022,34 +2004,49 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             .filter(|(n, _)| n == name)
                             .filter_map(|(_, fid)| b.module.funcs.get(fid.0 as usize))
                             .any(|f| {
-                                let last_vararg =
-                                    f.params.last().is_some_and(|p| p.is_vararg);
+                                let last_vararg = f.params.last().is_some_and(|p| p.is_vararg);
                                 let arity_ok = last_vararg || nargs <= f.params.len();
                                 arity_ok
-                                    && f.params
-                                        .iter()
-                                        .any(|p| p.ty.name.starts_with("Function"))
+                                    && f.params.iter().any(|p| p.ty.name.starts_with("Function"))
                             });
                         !factory_takes_lambda
                     } else {
-                        // No lambda: a factory function is applicable
-                        // whenever it can accept the supplied positional
-                        // count (trailing params default, e.g. the
-                        // all-default `DateTimePeriod(years=0, …)` factory
-                        // beside `sealed class DateTimePeriod`). Only treat
-                        // the call as a constructor when the factory
-                        // genuinely cannot take that many args — so a
-                        // `Widget(Conf())` reaches the constructor.
-                        b.module
+                        // No lambda — treat as a constructor when either the
+                        // canonical same-named factory can't take that many
+                        // args, OR no same-named factory is applicable to the
+                        // supplied positional count at all (the too-few-args
+                        // case, e.g. zero-arg `URLBuilder()` against factories
+                        // that each need one arg). `decl_user_arity` (stub
+                        // pass) reflects source defaults the lowered `Param`s
+                        // drop, and resolves even for a body-less stub sibling.
+                        let canonical_cant_take = b
+                            .module
                             .func_id(name)
                             .and_then(|fid| b.module.funcs.get(fid.0 as usize))
                             .is_some_and(|f| {
-                                let last_vararg =
-                                    f.params.last().is_some_and(|p| p.is_vararg);
+                                let last_vararg = f.params.last().is_some_and(|p| p.is_vararg);
                                 !last_vararg && nargs > f.params.len()
-                            })
+                            });
+                        let any_factory_applicable = b
+                            .module
+                            .func_index
+                            .iter()
+                            .filter(|(n, _)| n == name)
+                            .filter_map(|(_, fid)| b.module.decl_user_arity.get(&fid.0).copied())
+                            .any(|(required, total, vararg)| {
+                                let n = nargs as u32;
+                                n >= required && (vararg || n <= total)
+                            });
+                        canonical_cant_take || !any_factory_applicable
                     }
-                };
+                }
+                _ => false,
+            };
+            // Path-callee with a registered top-level fn → Call{func}.
+            if let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1
+            {
+                // When a class and a top-level function share
                 // A bound local / parameter / captured outer of
                 // this name shadows a same-named top-level function
                 // (Kotlin scoping). e.g. a Flow operator's
@@ -2613,7 +2610,16 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     return dst;
                 }
             }
-            // Path-callee with a registered class name → NewInstance.
+            // Path-callee with a registered class name. When the call is a
+            // constructor (`shadowed_by_class`) build the instance. When a
+            // same-named factory should handle it instead but no single
+            // `func_id` was resolved above (overloaded — `bare_func_id` was
+            // `None`, so the direct-`Call` path was skipped), route through
+            // `CallMemberOrGlobal` so runtime overload resolution picks the
+            // right factory by argument types. Without this an overloaded
+            // factory like `URLBuilder(urlString)` / `URLBuilder(url)` /
+            // `URLBuilder(builder)` fell through to `NewInstance` and the
+            // argument was bound to the constructor's first param.
             if let Expr::Path { segments, .. } = callee.as_ref()
                 && segments.len() == 1
                 && let Some(class_id) = b.module.class_id(&segments[0].name)
@@ -2621,13 +2627,28 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let (args_start, count) = lower_arg_run(b, args);
                 let arg_names = intern_arg_names(b.module, ast_arg_names);
                 let dst = b.alloc_reg();
-                b.push(Inst::NewInstance {
-                    dst,
-                    class: class_id,
-                    args: args_start,
-                    n_args: count,
-                    arg_names,
-                });
+                if shadowed_by_class {
+                    b.push(Inst::NewInstance {
+                        dst,
+                        class: class_id,
+                        args: args_start,
+                        n_args: count,
+                        arg_names,
+                    });
+                } else {
+                    let this_idx = b.record_capture("this");
+                    let nmc = b
+                        .module
+                        .intern_const(Const::String(segments[0].name.clone()));
+                    b.push(Inst::CallMemberOrGlobal {
+                        dst,
+                        this_idx,
+                        name: nmc,
+                        args: args_start,
+                        n_args: count,
+                        arg_names,
+                    });
+                }
                 return dst;
             }
             // Inside a method/extension body: unqualified `name(...)`

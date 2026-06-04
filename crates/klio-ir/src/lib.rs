@@ -629,6 +629,15 @@ pub struct Param {
     /// array before binding.
     #[serde(default)]
     pub is_vararg: bool,
+    /// True when the parameter declares a default value. The lowered
+    /// default expression lives in a separate thunk (so `default` above
+    /// stays `None`), but the flag is needed at lower time to decide
+    /// whether a same-named factory function is applicable to a given
+    /// argument count — e.g. `ParametersBuilder()` calls the factory
+    /// `ParametersBuilder(size: Int = 8)` (0 args fit), while
+    /// `URLBuilder()` builds the class (no zero-arg factory exists).
+    #[serde(default)]
+    pub has_default: bool,
 }
 
 /// Class declaration.
@@ -694,6 +703,15 @@ pub struct Module {
     /// stub. Lowering-only; not serialized into packs.
     #[serde(skip)]
     pub decl_user_params: std::collections::HashMap<u32, u32>,
+    /// Per top-level `FuncId` (keyed by `FuncId.0`): the declared user
+    /// parameters' `(required, total, trailing_vararg)` — `required`
+    /// excludes defaulted and vararg params. Populated in the stub pass
+    /// (before bodies lower) so call-site lowering can tell whether a
+    /// same-named factory is *applicable* to a given positional arg
+    /// count, even for a sibling overload still a body-less stub.
+    /// Lowering-only; not serialized.
+    #[serde(skip)]
+    pub decl_user_arity: std::collections::HashMap<u32, (u32, u32, bool)>,
 }
 
 /// Module-scoped side tables consumed by the Vm at dispatch time.

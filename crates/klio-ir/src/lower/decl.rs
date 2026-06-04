@@ -271,6 +271,7 @@ pub fn lower_class_with_extras(
             default: None,
             is_property: p.property.is_some(),
             is_vararg: p.is_vararg,
+            has_default: p.default.is_some(),
         })
         .collect();
     // Register the class shell first so the class name resolves
@@ -741,6 +742,7 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
             default: None,
             is_property: false,
             is_vararg: false,
+            has_default: false,
         })
         .collect();
     params.extend(f.params.iter().map(|p| crate::Param {
@@ -753,6 +755,7 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
         default: None,
         is_property: false,
         is_vararg: p.is_vararg,
+        has_default: p.default.is_some(),
     }));
     func.params = params;
     // An extension fn's synthetic receiver param (`this`) carries

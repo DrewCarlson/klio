@@ -132,6 +132,7 @@ pub(super) fn lower_lambda_body_capturing_kind_with(
             default: None,
             is_property: false,
             is_vararg: false,
+            has_default: false,
         })
         .collect();
     module.funcs.push(placed);

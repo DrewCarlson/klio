@@ -194,6 +194,7 @@ fn accessor_params(params: &[&str]) -> Vec<crate::Param> {
             default: None,
             is_property: false,
             is_vararg: false,
+            has_default: false,
         })
         .collect()
 }

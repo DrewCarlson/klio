@@ -589,36 +589,87 @@ impl VmHost<'_> {
         let n_primary = class_def.primary_params.len();
         let mut effective_args: Vec<klio_runtime::Value> = args.to_vec();
         // A same-named top-level factory function wins over the class
-        // constructor when the primary ctor cannot be satisfied with the
-        // supplied args — i.e. a missing param has no default. Kotlin's
-        // `fun Url(urlString: String): Url = URLBuilder(urlString).build()`
-        // sits beside the 10-param `class Url internal constructor(...)`;
-        // `Url("…")` must call the factory, not bind the string to the first
-        // ctor param and pad the rest with `Null`. Only intervenes when the
-        // ctor is genuinely unsatisfiable AND a factory matches the supplied
-        // arity, so it doesn't disturb classes that rely on lenient padding.
-        if effective_args.len() < n_primary {
+        // constructor when the primary ctor *definitely cannot* take the
+        // supplied args. Kotlin lets a factory sit beside a class:
+        //   fun Url(urlString: String): Url = URLBuilder(urlString).build()
+        //   class Url internal constructor(protocol: URLProtocol?, …)  // no defaults
+        //   fun URLBuilder(urlString: String) = URLBuilder().takeFrom(urlString)
+        //   class URLBuilder(protocol: URLProtocol? = null, …)         // all defaults
+        // Call lowering routes a class-name call with arguments through
+        // `NewInstance`, so the ctor-vs-factory choice lands here. The ctor
+        // is unsatisfiable when too many args are supplied, a required
+        // (no-default) param is left unfilled, or a supplied arg's type
+        // cannot bind its ctor param (`URLBuilder("http://…")`: the String
+        // can't bind `protocol: URLProtocol?`). In that case dispatch the
+        // same-named factory whose params cleanly type-match the args —
+        // and only then, so a class whose ctor *does* accept the args
+        // (`PrimitiveSerialDescriptor(name, kind)` beside a same-named
+        // factory) still constructs normally rather than recursing into
+        // its factory.
+        {
             let provided = effective_args.len();
-            let missing_required = (provided..n_primary).any(|idx| {
-                class_def
-                    .primary_params
-                    .get(idx)
-                    .is_some_and(|p| p.default.is_none())
-            });
-            if missing_required {
+            let ctor_unsatisfiable = provided > n_primary
+                || (provided..n_primary).any(|idx| {
+                    class_def
+                        .primary_params
+                        .get(idx)
+                        .is_some_and(|p| p.default.is_none())
+                })
+                || effective_args.iter().enumerate().any(|(i, a)| {
+                    class_def
+                        .primary_params
+                        .get(i)
+                        .and_then(|p| p.declared_type.as_ref())
+                        .is_some_and(|t| {
+                            self.overload_score_arg(
+                                &klio_ir::TypeRef {
+                                    name: t.clone(),
+                                    nullable: true,
+                                    args: Vec::new(),
+                                },
+                                a,
+                            )
+                            .is_none()
+                        })
+                });
+            if ctor_unsatisfiable {
                 let module = Arc::clone(&self.module);
-                let factory = module
-                    .funcs_by_simple_name(&class_def.name)
-                    .iter()
-                    .filter_map(|fid| module.funcs.get(fid.0 as usize).map(|f| (*fid, f)))
-                    .find(|(_, f)| {
-                        !f.blocks.is_empty()
-                            && f.params.first().is_none_or(|p| p.name != "this")
-                            && (f.params.len() == provided
-                                || f.params.last().is_some_and(|p| p.is_vararg))
-                    })
-                    .map(|(fid, _)| fid);
-                if let Some(fid) = factory {
+                let mut best: Option<(klio_ir::FuncId, i32)> = None;
+                for fid in module.funcs_by_simple_name(&class_def.name) {
+                    let Some(f) = module.funcs.get(fid.0 as usize) else {
+                        continue;
+                    };
+                    // Genuine top-level factory only (no `this` receiver),
+                    // with a body, whose arity accepts the supplied count.
+                    if f.blocks.is_empty()
+                        || f.params.first().is_some_and(|p| p.name == "this")
+                    {
+                        continue;
+                    }
+                    let arity_ok = f.params.len() == provided
+                        || f.params.last().is_some_and(|p| p.is_vararg);
+                    if !arity_ok {
+                        continue;
+                    }
+                    // Every supplied arg must cleanly type-match its param.
+                    let mut score = 0i32;
+                    let mut clean = true;
+                    for (i, a) in effective_args.iter().enumerate() {
+                        if let Some(p) = f.params.get(i) {
+                            match self.overload_score_arg(&p.ty, a) {
+                                Some(s) => score += s,
+                                None => {
+                                    clean = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if clean && best.is_none_or(|(_, b)| score > b) {
+                        best = Some((*fid, score));
+                    }
+                }
+                if let Some((fid, _)) = best {
                     return self.call_func(&module, fid, effective_args.clone());
                 }
             }
