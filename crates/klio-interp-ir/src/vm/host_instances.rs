@@ -351,6 +351,48 @@ impl VmHost<'_> {
                 });
                 return Ok(klio_runtime::Value::Instance(inst));
             }
+            // An interface cannot be constructed, so `Interface(args)` is a
+            // same-named top-level factory function (Kotlin's factory
+            // pattern: `interface ParametersBuilder` beside
+            // `fun ParametersBuilder(size: Int = 8): ParametersBuilder =
+            // ParametersBuilderImpl(size)`). Call lowering normally routes
+            // such a call to the factory, but an `inline fun` whose body was
+            // lowered before that factory's stub was registered (e.g.
+            // `Parameters.Companion.build`'s `ParametersBuilder()`) can land
+            // here. Dispatch the factory — applicable when its arity (with
+            // default padding) accepts the supplied count; `call_func` fills
+            // the omitted defaulted params.
+            {
+                let module = Arc::clone(&self.module);
+                let provided = args.len();
+                let factory = module
+                    .funcs_by_simple_name(&class_def.name)
+                    .iter()
+                    .filter_map(|fid| module.funcs.get(fid.0 as usize).map(|f| (*fid, f)))
+                    .find(|(fid, f)| {
+                        if f.blocks.is_empty()
+                            || f.params.first().is_some_and(|p| p.name == "this")
+                        {
+                            return false;
+                        }
+                        if f.params.last().is_some_and(|p| p.is_vararg) {
+                            return true;
+                        }
+                        // Exact arity, or omitted trailing params all default.
+                        provided <= f.params.len()
+                            && (provided..f.params.len()).all(|idx| {
+                                self.prog
+                                    .func_defaults
+                                    .get(fid)
+                                    .and_then(|slots| slots.get(idx).copied().flatten())
+                                    .is_some()
+                            })
+                    })
+                    .map(|(fid, _)| fid);
+                if let Some(fid) = factory {
+                    return self.call_func(&module, fid, args.to_vec());
+                }
+            }
             return Err(klio_ir::eval::EvalError::Throw(
                 klio_runtime::Value::Exception {
                     fqn: std::sync::Arc::new("kotlin.InstantiationError".to_string()),
