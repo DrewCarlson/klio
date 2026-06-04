@@ -270,36 +270,50 @@ upstream and delete the request-member shims.
   params. Net: ktor's `CaseInsensitiveMap` `keys`/`entries` views iterate fully
   (`sorted`/`toList`/`map`). Covered by `corpus/user_collection_ops.kt` +
   `corpus/user_collection_sorted.kt`.
+- **Destructuring a user-defined `Map.Entry`.** `val (k, v) = entry` /
+  `forEach { (k, v) -> }` lowers to `component1()`/`component2()`, which matched
+  only the native `Value::MapEntry`; on a user instance they fell to the
+  `Map.Entry.componentN` extension, which cast the instance to a native map
+  (`cast to Map failed`). Resolve `component1`/`component2` on an instance
+  implementing `Entry`/`MutableEntry` to its `key`/`value`. Completes
+  case-insensitive `StringValues` (`CaseInsensitiveMap`). Covered by
+  `corpus/user_map_entry_destructure.kt`.
+- **Parent-ctor chaining picks the superclass, not a leading interface.** A
+  class may list interfaces before its superclass
+  (`HeadersImpl : Headers, StringValuesImpl(...)`); `new_instance` chose the
+  parent via `supertype_names.first()` (the interface), so the superclass's
+  `super(...)` args were applied to the ctor-less interface and its
+  primary-param fields stayed unset (a later init reading such a field saw the
+  wrong value — `non-bool in branch`). Select the first non-interface supertype.
+  Covered by `corpus/interface_then_superclass.kt`.
 - **Consumed verbatim:** `io.ktor.util.Text.kt`, the util collection layer
   (`Collections.kt` + a klio `unmodifiable` actual, `DelegatingMutableSet.kt`,
-  `CaseInsensitiveMap.kt`, `StringValues.kt`), and the http header/content-type
-  layer (`HttpHeaderValueParser.kt`, `HeaderValueWithParameters.kt`,
-  `ContentTypes.kt`). The hand-written `shim/.../ContentType.kt` is deleted; the
-  full upstream `ContentType` API runs (parse / withParameter / match / charset
-  / parseHeaderValue) and the client+server smokes pass. `Charset`/`Charsets`
-  (the `io.ktor.utils.io.charsets` surface `ContentTypes.kt` needs) is a klio
-  actual; byte-level encode/decode is added when the body layer is consumed.
+  `CaseInsensitiveMap.kt`, `StringValues.kt`), and the http layer
+  (`HttpStatusCode`/`HttpMethod`/`HttpProtocolVersion`/`HttpHeaders`,
+  `HttpHeaderValueParser`, `HeaderValueWithParameters`, `ContentTypes`,
+  **`Headers`, `Parameters`**). The hand-written `shim/.../ContentType.kt` is
+  deleted. The upstream `ContentType` API (parse / withParameter / match /
+  charset / parseHeaderValue) and the full `Headers`/`Parameters` API
+  (case-insensitive get / getAll / names / forEach / `headers { }` /
+  `ParametersBuilder`) run; client+server smokes pass. `Charset`/`Charsets` is a
+  klio actual (name + forName); byte-level encode/decode is added with the body
+  layer.
 
 ## Open blockers (next, in order)
 
-1. **Stdlib `Map` operators / `for`-iteration on a *user-defined* `Map`.** The
-   collection (List/Set) side now works (see Landed); the `Map` parallel does
-   not. `CaseInsensitiveMap`-backed `StringValues` (`StringValuesBuilderImpl(true)`)
-   fails in `StringValuesImpl.init`'s `values.forEach { (k, v) -> … }`: `Map.forEach`
-   is consumed from source as `for (element in this) action(element)`, and
-   `for`-iterating a user `Map` value casts the receiver to a native `Map`
-   (`cast to Map failed`). `Map.forEach` has no intrinsic (unlike the Iterable
-   ops), so the existing Map fallback / a `defer_to_map` keyed on a Map intrinsic
-   does not help. Fix: make `for`-iteration over a user `Map` (and `Map.forEach`)
-   drain the map's `entries` via the host instead of casting to a native `Map`
-   — the Map analogue of `materialise_iterable_instance`. `StringValuesBuilderImpl(false)`
-   already works, so only the case-insensitive path is blocked. Gates the
-   `Headers`/`Parameters` layer (case-insensitive `StringValues`).
-2. **ktor-http remainder** — `Headers`/`Parameters`/`Url`/`URLBuilder`/codecs,
-   once (1) lands.
-3. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
+1. **ktor-http remainder — `Url` / `URLBuilder` / `Codecs`.** `URLParser.kt`
+   imports only `io.ktor.util.*` (consumed) and is likely ready. `Codecs.kt`
+   (percent-encoding) imports `io.ktor.utils.io.charsets.*` /
+   `io.ktor.utils.io.core.*` / `kotlinx.io.*` — it needs the byte-level charset
+   **encode/decode** surface (currently the klio `Charset` actual only does
+   name/forName) and the kotlinx-io core. `Url.kt` is `@Serializable` and imports
+   `kotlinx.serialization.*` (descriptors/encoding). So this layer pulls the
+   charset-codec intrinsics + a serializable value type; consume `URLParser` /
+   `URLBuilder` first, then extend the `Charset` actual with encode/decode for
+   `Codecs`.
+2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
-4. **Cores on upstream**, engine staying klio-side.
+3. **Cores on upstream**, engine staying klio-side.
 
 ## Status
 
