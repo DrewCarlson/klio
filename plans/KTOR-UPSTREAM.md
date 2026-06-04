@@ -160,23 +160,33 @@ the synchronous chain. Either context (`SuspendFunctionGun` via the field-
 incdec fix, or `DebugPipelineContext` via `DISABLE_SFG=true`) executes the
 synchronous pipeline.
 
-**Remaining — async interceptor suspension (one precise blocker).** When an
-interceptor suspends at a real point mid-`proceed` (`delay`), the suspension
-crosses the intrinsic-host boundary: `invoke_callable` (and
-`invoke_callable_with_this`, the path `call_value_with_this` uses) maps
-`EvalError::Suspended(state)` through its `other =>` arm to
-`RuntimeError::Type("coroutine suspended …")` — a fatal error — because the
-`IntrinsicHost` trait's `RuntimeError::Suspend(i64)` can't carry the captured
-`SuspendState` frames. So a suspending callback invoked via the intrinsic-host
-path can't park. The fix: invoke the (receiver-bound) interceptor through the
-main `eval_with_captures` path, which propagates `EvalError::Suspended` with
-frames natively (it already drives `runBlocking`/`launch`); i.e. give
-`call_value_with_this` a frame-preserving path that sets up the receiver
-(this-capture + receiver-label, as `invoke_callable_with_this` does) but runs
-on the main evaluator instead of the intrinsic host. Then `DISABLE_SFG=true` +
-the `io.ktor.util` deps let the cores consume upstream.
+**Landed — async interceptor suspension works (pipeline runtime done).** The
+suspending-interceptor blocker was the intrinsic-host boundary: a body
+suspension routed through `call_value_with_this` → `invoke_callable*` mapped
+`EvalError::Suspended(state)` to a fatal `RuntimeError::Type` (the
+`IntrinsicHost` `RuntimeError::Suspend(i64)` can't carry `SuspendState`
+frames). Fixed: the receiver-lambda value-invoke now binds the receiver into a
+fresh closure value's `this` capture and re-runs on the **main
+`eval_with_captures` path**, which propagates `Suspended` with frames natively.
+A `DebugPipelineContext`-shaped runner (plain proceed-nested suspend loop,
+`ic.invoke(this, subject)`) now executes a chain with a **suspending
+interceptor that parks at `delay` and resumes mid-chain**, with post-`proceed`
+continuation work, end to end:
+`A in start → B in start-A → B resumed → C in start-A-B → A out start-A-B-C →
+final=start-A-B-C` (regression test `pipeline_context_smoke`). So the pipeline
+runtime is functional via `DebugPipelineContext` (`DISABLE_SFG=true`) — no
+`SuspendFunctionGun`/undispatched-start needed.
 
-**Undispatched-start semantics (alternative, if keeping `SuspendFunctionGun`).** Root cause:
+**Remaining — consume the upstream Pipeline files (dep plumbing).** With the
+execution engine working, wire the real files in: provide the `DISABLE_SFG`
+actual (`= true`), a `pipelineStartCoroutineUninterceptedOrReturn` actual (so
+`SuspendFunctionGun.kt` still resolves even though unused), the `io.ktor.util`
+deps (`Attributes`, `KtorDsl`, `StackWalkingFailed`) + `kotlinx.atomicfu`
+refs, and `CoroutineScope` (PipelineContext's supertype); then switch the
+cores onto upstream `Pipeline`/`PipelineContext` and delete the request-member
+shims.
+
+**Undispatched-start semantics (only if `SuspendFunctionGun` is ever forced on).** Root cause:
 `SuspendFunctionGun.loop` calls `startCoroutineUninterceptedOrReturn(...)` and
 expects the JVM contract — run the interceptor *up to its first suspension*
 and **return `COROUTINE_SUSPENDED` as a value** (the parked continuation
