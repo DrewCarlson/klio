@@ -612,14 +612,18 @@ representation both cores use. A probe consuming `OutgoingContent` +
   without a custom getter), reading its field instead. `TextContent` now
   reports its real content type. Covered by
   `ctor_param_overrides_base_getter.kt` (kotlinc byte-parity).
-- **Blocker — a concrete class whose simple name equals its nested abstract
-  supertype's hangs.** `class ByteArrayContent : OutgoingContent.ByteArrayContent()`
-  (the concrete content type shares the name of the sealed nested variant it
-  extends) loops on construction/field access — the self-name collision
-  resolves the supertype back to the concrete class. `TextContent` (a
-  distinctly-named subclass) is unaffected. This nested/self-name resolution
-  bug gates `ByteArrayContent`, so the content layer is not yet wired into the
-  pack; fixing it is the next step before the body layer consumes.
+- **Blocker — a top-level class extending a nested class of the same simple
+  name hangs at load.** `class ByteArrayContent : OutgoingContent.ByteArrayContent()`
+  loops during class registration (before `main` runs). Root cause: a class's
+  `supertype_names` keeps only the supertype's simple name (`build.rs`), so the
+  top-level `ByteArrayContent`'s supertype `OutgoingContent.ByteArrayContent`
+  resolves by simple name to the same-named top-level class — itself — making it
+  its own parent. The parent link must resolve a qualified nested supertype
+  (`Outer.Name`) to the mangled nested class (`Outer$Name`), not the
+  simple-name-colliding top-level one. `TextContent` (distinctly named) is
+  unaffected. This gates `ByteArrayContent`, so the content layer is not yet
+  wired into the pack; fixing the qualified-supertype resolution is the next
+  step before the body layer consumes.
 
 ## Status
 
