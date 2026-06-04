@@ -191,6 +191,13 @@ pub(crate) fn char_is_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError
     let s = char_unit_to_scalar(recv_char(ctx.args, "Char.isLowerCase")?);
     Ok(Value::Bool(s.is_some_and(kt_is_lower_case)))
 }
+/// `Char.isISOControl()` — a C0 (`0x00..=0x1F`) or C1 (`0x7F..=0x9F`)
+/// control code unit. A bodyless `expect` otherwise.
+pub(crate) fn char_is_iso_control(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let unit = recv_char(ctx.args, "Char.isISOControl")?;
+    Ok(Value::Bool(unit <= 0x1F || (0x7F..=0x9F).contains(&unit)))
+}
+
 pub(crate) fn char_uppercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let unit = recv_char(ctx.args, "Char.uppercase")?;
     match char_unit_to_scalar(unit) {

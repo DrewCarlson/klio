@@ -1024,6 +1024,69 @@ pub(crate) fn string_to_double(ctx: &mut CallCtx) -> Result<Value, RuntimeError>
     })
 }
 
+fn number_format_error(s: &str) -> RuntimeError {
+    RuntimeError::Thrown(make_exception(
+        "kotlin.NumberFormatException",
+        Some(format!("For input string: \"{s}\"")),
+    ))
+}
+
+pub(crate) fn string_to_float(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.toFloat")?;
+    s.parse::<f32>()
+        .map(Value::Float)
+        .map_err(|_| number_format_error(s))
+}
+
+pub(crate) fn string_to_float_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.toFloatOrNull")?;
+    Ok(s.parse::<f32>().map_or(Value::Null, Value::Float))
+}
+
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn string_to_short(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.toShort")?;
+    let radix = recv_int_radix(ctx.args.get(1), "String.toShort")?;
+    parse_int_radix(s, radix as u32)
+        .ok()
+        .filter(|v| (i64::from(i16::MIN)..=i64::from(i16::MAX)).contains(v))
+        .map(|v| Value::Short(v as i16))
+        .ok_or_else(|| number_format_error(s))
+}
+
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn string_to_byte(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.toByte")?;
+    let radix = recv_int_radix(ctx.args.get(1), "String.toByte")?;
+    parse_int_radix(s, radix as u32)
+        .ok()
+        .filter(|v| (i64::from(i8::MIN)..=i64::from(i8::MAX)).contains(v))
+        .map(|v| Value::Byte(v as i8))
+        .ok_or_else(|| number_format_error(s))
+}
+
+/// Deprecated `String.capitalize()` / `decapitalize()`: upper/lower-case the
+/// first character (locale-independent), leaving the rest unchanged.
+pub(crate) fn string_capitalize(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.capitalize")?;
+    let mut it = s.chars();
+    let out = match it.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + it.as_str(),
+        None => String::new(),
+    };
+    Ok(Value::String(Arc::new(out)))
+}
+
+pub(crate) fn string_decapitalize(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.decapitalize")?;
+    let mut it = s.chars();
+    let out = match it.next() {
+        Some(c) => c.to_lowercase().collect::<String>() + it.as_str(),
+        None => String::new(),
+    };
+    Ok(Value::String(Arc::new(out)))
+}
+
 // ============================================================
 // Additional String members
 // ============================================================

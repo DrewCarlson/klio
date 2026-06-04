@@ -127,6 +127,16 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String.lastIndexOf", string_last_index_of),
     ("kotlin.String.length", string_length),
     ("kotlin.String.lowercase", string_lowercase),
+    // Deprecated case forms delegate to the no-locale uppercase/lowercase;
+    // capitalize/decapitalize touch only the first char.
+    ("kotlin.String.toUpperCase", string_uppercase),
+    ("kotlin.String.toLowerCase", string_lowercase),
+    ("kotlin.String.capitalize", string_capitalize),
+    ("kotlin.String.decapitalize", string_decapitalize),
+    ("kotlin.String.toShort", string_to_short),
+    ("kotlin.String.toByte", string_to_byte),
+    ("kotlin.String.toFloat", string_to_float),
+    ("kotlin.String.toFloatOrNull", string_to_float_or_null),
     ("kotlin.String.plus", string_plus),
     ("kotlin.String.equals", string_equals),
     ("kotlin.String.repeat", string_repeat),
@@ -184,6 +194,12 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Char.lowercase", char_lowercase),
     ("kotlin.Char.toString", char_to_string),
     ("kotlin.Char.uppercase", char_uppercase),
+    // Deprecated case forms (return Char / String, locale-independent) and
+    // ISO-control predicate — bodyless expects otherwise.
+    ("kotlin.Char.toUpperCase", char_uppercase_char),
+    ("kotlin.Char.toLowerCase", char_lowercase_char),
+    ("kotlin.Char.toTitleCase", char_titlecase_char),
+    ("kotlin.Char.isISOControl", char_is_iso_control),
     // ----- Int -----
     ("kotlin.Int.and", int_and),
     ("kotlin.Int.compareTo", int_compare_to),
