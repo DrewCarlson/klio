@@ -386,17 +386,28 @@ upstream and delete the request-member shims.
    The `buildString { coll.forEach { append } }` shape now works (the
    top-level-fn-in-receiver-lambda fix above; `decodeURLPart` works too).
    **Two blockers remain for `Codecs.kt` itself:**
-   - **`Source.forEach` / `takeWhile` resolution.** The encode functions
-     (`encodeURLParameter`, …) iterate `content.forEach { … }` where `content`
-     is the charset-encoder `Buffer` and `forEach` is Codecs' private
-     `Source.forEach`, which calls `takeWhile { buf -> while (buf.canRead())
-     block(buf.readByte()) }`. Consumed as a pack, the encode result is empty:
-     the bare `takeWhile` inside `Source.forEach` binds a stdlib
-     `CharSequence/Iterable.takeWhile` (arity-only `call_named_overload`) rather
-     than the pack's receiver-matching `Source.takeWhile`, so the block never
-     runs. An *explicit* `content.takeWhile { … }` dispatches correctly (by
-     receiver type), so the gap is bare-extension-call receiver-type awareness
-     in `CallMemberOrGlobal`.
+   - **`Source.forEach` / `takeWhile` resolution (bare-ext receiver-type
+     awareness).** The encode functions (`encodeURLParameter`, …) iterate
+     `content.forEach { … }` where `content` is the charset-encoder `Buffer`
+     and `forEach` is Codecs' private `Source.forEach`, which calls
+     `takeWhile { buf -> while (buf.canRead()) block(buf.readByte()) }`.
+     Consumed as a pack, the encode result is empty: the bare `takeWhile`
+     inside `Source.forEach` binds a stdlib `CharSequence/Iterable.takeWhile`
+     (the bare-call resolver picks an extension overload by *arity only*),
+     rather than the pack's receiver-matching `Source.takeWhile`, so the block
+     never runs. An *explicit* `content.takeWhile { … }` dispatches correctly
+     (runtime member dispatch picks by receiver type — verified). Fix needs the
+     bare-call resolver to prefer the extension overload whose receiver type
+     matches the enclosing `this`. **Blocked on:** the enclosing extension
+     receiver type is not available at lower time — `owner_class` is `None` for
+     a top-level `fun Source.forEach` (only set for class methods). A naive
+     "defer to runtime member dispatch when ≥2 candidate receiver types match
+     the arity" rule is **too broad** — it breaks legitimate consumed-stdlib
+     bare-ext calls like `mapTo` inside `fun Iterable<T>.map` (whose static
+     bind to the matching-receiver `Iterable.mapTo` is correct, and which
+     `call_member` cannot re-resolve at runtime). So the proper fix is to
+     thread the enclosing extension-receiver type into the `FuncBuilder` and
+     prefer the candidate whose `this`-param type matches it.
    - **`length` default-arg.** `decodeURLQueryComponent(start = 0, end =
      length, …)` — the default `end = length` (i.e. `this.length` on the String
      receiver) resolves to an `unresolved global length` for a defaulted arg.
