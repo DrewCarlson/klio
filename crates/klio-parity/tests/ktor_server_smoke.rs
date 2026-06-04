@@ -128,6 +128,7 @@ import io.ktor.server.response.*
 import io.ktor.server.request.*
 import io.ktor.server.plugins.contentnegotiation.*
 import io.ktor.serialization.kotlinx.json.*
+import io.ktor.http.HttpStatusCode
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -143,6 +144,10 @@ fun main() {{
             post("/echo") {{
                 val u: User = call.receive()
                 call.respond(u.copy(age = u.age + 1))
+            }}
+            get("/status") {{
+                val s = HttpStatusCode.Created
+                call.respondText(s.value.toString() + " " + s.description)
             }}
         }}
     }}.start(wait = true)
@@ -181,6 +186,11 @@ fun main() {{
         assert_eq!(pb, r#"{"name":"Lin","age":29,"roles":["USER"]}"#);
         let (ms, _) = http(port, "GET", "/missing", None);
         assert_eq!(ms, 404, "GET /missing status");
+        // Real upstream io.ktor.http.HttpStatusCode is consumed from the
+        // vendored submodule (not the shim).
+        let (ss, sb) = http(port, "GET", "/status", None);
+        assert_eq!(ss, 200, "GET /status status");
+        assert_eq!(sb, "201 Created", "HttpStatusCode value/description");
     });
 
     let _ = child.kill();

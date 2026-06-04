@@ -10,6 +10,13 @@ abi = 1
 implicit_packages = []
 source_roots = ["shim"]
 auto_bindings = true
+
+# Real upstream ktor-http value types consumed verbatim from the
+# submodule (the start of the upstream-consumption migration; see
+# plans/KTOR-UPSTREAM.md). These are ungated (core), always available.
+[[source]]
+root = "upstream/ktor-http/common/src"
+include = ["io/ktor/http/HttpStatusCode.kt"]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
 # native engine helpers.
