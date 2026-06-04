@@ -1,0 +1,112 @@
+//! Name- and member-resolution fixes surfaced while making klio consume
+//! real upstream ktor commonMain. Each program prints a deterministic
+//! string; klio's stdout is asserted, and (when `kotlinc` is available)
+//! checked byte-for-byte. Kept in their own file so the in-process
+//! interpreter runs stay within the parity harness's parallel ceiling.
+
+use std::io::Write;
+use std::path::PathBuf;
+
+fn write_src(name: &str, src: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join("klio_interp_resolution_fixes");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let file = dir.join(format!("{name}.kt"));
+    let mut f = std::fs::File::create(&file).expect("create kt");
+    f.write_all(src.as_bytes()).expect("write");
+    file
+}
+
+fn assert_klio(name: &str, src: &str, expected: &str) {
+    let file = write_src(name, src);
+    let got = klio_parity::run_with_packs(&file)
+        .unwrap_or_else(|e| panic!("klio run failed for `{name}`: {e}"));
+    assert_eq!(got, expected, "klio output for `{name}` did not match");
+    if let Ok(report) = klio_parity::check(&file) {
+        assert!(
+            report.matched,
+            "kotlinc parity mismatch for `{name}`\n{}",
+            klio_parity::render_diff(&report)
+        );
+    }
+}
+
+// A bare call `name()` inside a class whose own member `name` is a
+// (non-invokable) property, beside a top-level `fun name()`, must resolve
+// to the function — a property can't satisfy a call. Mirrors ktor's
+// `HttpStatusCode` companion: `val allStatusCodes = allStatusCodes()`.
+#[test]
+fn call_resolves_to_top_level_fn_over_same_named_property() {
+    let src = r#"
+class Reg {
+    companion object {
+        val names: List<String> = names()
+        fun byIndex(i: Int): String = names[i]
+    }
+}
+internal fun names(): List<String> = listOf("alpha", "beta", "gamma")
+fun main() {
+    println(Reg.names.size)
+    println(Reg.byIndex(1))
+}
+"#;
+    assert_klio(
+        "call_resolves_to_top_level_fn_over_same_named_property",
+        src,
+        "3\nbeta\n",
+    );
+}
+
+// `String.equals` returns a Bool — including the kotlin.text 2-arg
+// `ignoreCase` form, with both positional and named arguments (ktor's
+// ContentType.match uses `equals(other, ignoreCase = true)`).
+#[test]
+fn string_equals_with_ignore_case() {
+    let src = r#"
+fun main() {
+    println("Application".equals("application", ignoreCase = true))
+    println("Application".equals("application"))
+    println("AB".equals("ab", true))
+    println("x".equals(null))
+    println(!"A".equals("b", ignoreCase = true))
+}
+"#;
+    assert_klio(
+        "string_equals_with_ignore_case",
+        src,
+        "true\nfalse\ntrue\nfalse\ntrue\n",
+    );
+}
+
+// `key in map` on a user class implementing Map resolves through the
+// stdlib `operator fun Map.contains(key) = containsKey(key)` — it must
+// dispatch the override, not return a non-bool (ktor's StringValues
+// builders do `name in values` over a custom map).
+#[test]
+fn in_operator_on_user_map_uses_contains_key() {
+    let src = r#"
+class FlagMap : MutableMap<String, Int> {
+    override fun containsKey(key: String): Boolean = key.startsWith("known")
+    override val size: Int get() = 0
+    override val keys: MutableSet<String> get() = mutableSetOf()
+    override val values: MutableCollection<Int> get() = mutableListOf()
+    override val entries: MutableSet<MutableMap.MutableEntry<String, Int>> get() = mutableSetOf()
+    override fun isEmpty(): Boolean = true
+    override fun containsValue(value: Int): Boolean = false
+    override fun get(key: String): Int? = null
+    override fun put(key: String, value: Int): Int? = null
+    override fun remove(key: String): Int? = null
+    override fun putAll(from: Map<out String, Int>) {}
+    override fun clear() {}
+}
+fun main() {
+    val m = FlagMap()
+    println("known-x" in m)
+    println("other" in m)
+}
+"#;
+    assert_klio(
+        "in_operator_on_user_map_uses_contains_key",
+        src,
+        "true\nfalse\n",
+    );
+}
