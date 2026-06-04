@@ -320,6 +320,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                 dst: home,
                                 src: dst,
                             });
+                        } else if b.has_own_member(&segments[0].name) && b.resolve("this").is_some()
+                        {
+                            // Method-body `++field` write — route through
+                            // SetField on this so the mutation reaches the
+                            // instance (mirrors the postfix `field++` path).
+                            // Without this a bare-name field inc/dec rebound
+                            // a local and the field never updated (e.g.
+                            // `suspensions[++lastSuspensionIndex]`).
+                            let this_reg = b.resolve("this").unwrap();
+                            let field = b
+                                .module
+                                .intern_const(Const::String(segments[0].name.clone()));
+                            b.push(Inst::SetField {
+                                receiver: this_reg,
+                                field,
+                                value: dst,
+                            });
                         } else if b.knows_outer(&segments[0].name) {
                             let _ = b.record_capture(&segments[0].name);
                             let n = b
