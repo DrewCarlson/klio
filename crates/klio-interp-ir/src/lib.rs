@@ -566,6 +566,47 @@ fn value_is_builtin(v: &klio_runtime::Value) -> bool {
     )
 }
 
+/// Pack a primary constructor's trailing arguments into an array for a
+/// `vararg` last parameter, using the IR class's `Param.is_vararg` (the
+/// runtime `ClassParamDef` does not record varargs). Used when a super-
+/// constructor delegation (`class Sub : Base("a")`) feeds a parent whose
+/// primary ctor is `vararg` — the raw delegation args must be collected into
+/// an array so the parent body's `*phases` / `vararg` reads see an array, not
+/// a bare element.
+fn pack_primary_ctor_varargs(
+    module: &klio_ir::Module,
+    class_name: &str,
+    args: Vec<klio_runtime::Value>,
+) -> Vec<klio_runtime::Value> {
+    let Some(cid) = module.class_id(class_name) else {
+        return args;
+    };
+    let Some(ir_cls) = module.classes.get(cid.0 as usize) else {
+        return args;
+    };
+    let params = &ir_cls.primary_params;
+    let Some(last) = params.last() else {
+        return args;
+    };
+    if !last.is_vararg {
+        return args;
+    }
+    let fixed = params.len().saturating_sub(1);
+    // Already packed (exact arity with a trailing array): leave as-is.
+    if args.len() == params.len()
+        && matches!(args.last(), Some(klio_runtime::Value::Array { .. }))
+    {
+        return args;
+    }
+    let mut out: Vec<klio_runtime::Value> = args.iter().take(fixed).cloned().collect();
+    let rest: Vec<klio_runtime::Value> = args.into_iter().skip(fixed).collect();
+    out.push(klio_runtime::Value::Array {
+        items: klio_runtime::ObjRef::new(rest),
+        prim: None,
+    });
+    out
+}
+
 fn pack_vararg_args(
     func: &klio_ir::Func,
     args: Vec<klio_runtime::Value>,
