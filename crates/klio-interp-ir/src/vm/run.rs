@@ -264,6 +264,17 @@ impl Vm {
         let mut object_names: Vec<String> = self.module.registry.object_names.clone();
         object_names.sort_by_key(|n| n.contains("$Companion$"));
         for obj_name in &object_names {
+            // Skip an object/companion already initialized on demand (a
+            // sibling's eager initializer reached a not-yet-started
+            // companion and constructed it early — see the companion
+            // forwarding in `call_member`). Re-running it here would
+            // discard that instance for a fresh duplicate.
+            if matches!(
+                self.globals.borrow().lookup(obj_name),
+                Some(klio_runtime::Value::Instance(_))
+            ) {
+                continue;
+            }
             let Some(class_id) = module.class_id(obj_name) else {
                 continue;
             };

@@ -2,7 +2,7 @@ use crate::{
     Arc, ITERABLE_FALLBACK_ACTIVE, MAP_FALLBACK_ACTIVE, MEMBER_ONLY_PROBE, VmHost, VmIntrinsicHost,
     kotlin_hash_code,
     materialise_range_items, member_is_property, pack_vararg_args, pad_args_with_defaults,
-    receiver_compatible_with_param, value_structural_hash, with_call_outer_guard,
+    receiver_compatible_with_param, value_structural_hash, with_call_outer_guard, with_ctor_guard,
 };
 
 /// A resolved extension-dispatch candidate paired with its overload
@@ -879,7 +879,34 @@ impl VmHost<'_> {
                 }
             }
             if let Some(comp_name) = comp_name {
-                let singleton = self.globals.borrow().lookup(&comp_name);
+                let mut singleton = self.globals.borrow().lookup(&comp_name);
+                // On-demand companion init: an eager object/companion
+                // initializer may call a sibling class's companion method
+                // before that companion's own startup init has run (startup
+                // initializes non-companion objects first, then companions
+                // in declaration order — so `URLBuilder.Companion`'s
+                // `originUrl = Url(origin)` can reach
+                // `URLProtocol.createOrDefault` before `URLProtocol`'s
+                // companion exists). Construct it now and bind it, mirroring
+                // the startup wiring of the `outer` link to the class.
+                if !matches!(singleton, Some(klio_runtime::Value::Instance(_)))
+                    && let Some(cid) = self.module.class_id(&comp_name)
+                    && !with_ctor_guard(|g| g.borrow().iter().any(|n| n == &comp_name))
+                {
+                    if let Ok(inst @ klio_runtime::Value::Instance(_)) =
+                        <VmHost as klio_ir::eval::Host>::new_instance(self, cid, &[])
+                    {
+                        if let klio_runtime::Value::Instance(i) = &inst
+                            && let Some((outer_name, _)) = comp_name.split_once("$Companion")
+                            && let Some(outer_def) = self.classes.borrow().get(outer_name).cloned()
+                        {
+                            i.borrow_mut().outer =
+                                Some(klio_runtime::Value::Class(outer_def));
+                        }
+                        self.globals.borrow_mut().define(&comp_name, inst.clone());
+                        singleton = Some(inst);
+                    }
+                }
                 if let Some(singleton) = singleton
                     && matches!(singleton, klio_runtime::Value::Instance(_))
                 {
