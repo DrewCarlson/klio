@@ -583,6 +583,41 @@ impl VmHost<'_> {
         }
         let n_primary = class_def.primary_params.len();
         let mut effective_args: Vec<klio_runtime::Value> = args.to_vec();
+        // A same-named top-level factory function wins over the class
+        // constructor when the primary ctor cannot be satisfied with the
+        // supplied args — i.e. a missing param has no default. Kotlin's
+        // `fun Url(urlString: String): Url = URLBuilder(urlString).build()`
+        // sits beside the 10-param `class Url internal constructor(...)`;
+        // `Url("…")` must call the factory, not bind the string to the first
+        // ctor param and pad the rest with `Null`. Only intervenes when the
+        // ctor is genuinely unsatisfiable AND a factory matches the supplied
+        // arity, so it doesn't disturb classes that rely on lenient padding.
+        if effective_args.len() < n_primary {
+            let provided = effective_args.len();
+            let missing_required = (provided..n_primary).any(|idx| {
+                class_def
+                    .primary_params
+                    .get(idx)
+                    .is_some_and(|p| p.default.is_none())
+            });
+            if missing_required {
+                let module = Arc::clone(&self.module);
+                let factory = module
+                    .funcs_by_simple_name(&class_def.name)
+                    .iter()
+                    .filter_map(|fid| module.funcs.get(fid.0 as usize).map(|f| (*fid, f)))
+                    .find(|(_, f)| {
+                        !f.blocks.is_empty()
+                            && f.params.first().is_none_or(|p| p.name != "this")
+                            && (f.params.len() == provided
+                                || f.params.last().is_some_and(|p| p.is_vararg))
+                    })
+                    .map(|(fid, _)| fid);
+                if let Some(fid) = factory {
+                    return self.call_func(&module, fid, effective_args.clone());
+                }
+            }
+        }
         if effective_args.len() < n_primary {
             for idx in effective_args.len()..n_primary {
                 let p = &class_def.primary_params[idx];
