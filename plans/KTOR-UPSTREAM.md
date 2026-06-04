@@ -645,7 +645,7 @@ interpreter fixes got there, each with a kotlinc-parity corpus test:
   `is`-checks resolve, and the hierarchy is correct. Covered by
   `self_named_nested_supertype.kt`.
 
-## Channel streaming subsystem — probed; one fix landed, one deep blocker
+## Channel streaming subsystem — read side in progress
 
 A probe consuming the concrete `ByteChannel` + its read/write operations (the
 streaming layer behind the `ByteReadChannel`/`ByteWriteChannel` interfaces)
@@ -664,24 +664,38 @@ established what is needed and surfaced the gating issue:
   `f.invoke(x)` likewise). `call_value` / `call_member` now call the referenced
   top-level function when a `PropertyRef` names one. Covered by
   `method_fn_ref_default_param.kt` (kotlinc byte-parity).
-- **Deep blocker — `ByteChannel`'s async suspension does not resolve under
-  klio's cooperative driver.** A write→`flushAndClose`→`readRemaining` round
-  trip fails: `_closedCause.value` (an `atomic<CloseToken?>`) reads back a
-  `kotlinx.coroutines.internal.Symbol` sentinel rather than the `CloseToken`,
-  because `readRemaining`'s `awaitContent()` loop suspends through
-  `suspendCancellableCoroutine` and the channel's `Slot` state machine, which
-  klio's driver mishandles. The channel files are *not* wired into the pack
-  pending coroutine-suspension fidelity for this shape (single isolated tests
-  of `atomic` CAS, multiple atomic fields, ctor-/fn-reference defaults, and the
-  `CloseToken` pattern all pass — the failure is specific to the suspending
-  read loop).
+- **The async `ByteChannel` (write side) blocks on coroutine suspension** —
+  a write→`flushAndClose`→`readRemaining` round trip reads a
+  `kotlinx.coroutines.internal.Symbol` from `_closedCause` because
+  `awaitContent()` suspends through `suspendCancellableCoroutine` + the `Slot`
+  state machine, which klio's cooperative driver mishandles. So the write side
+  is deferred; the **read side** (`SourceByteReadChannel` — a fully-buffered,
+  non-suspending channel) is the shape a response body uses and avoids this.
+- **Landed — named-argument overload resolution prefers the type-fitting
+  candidate.** A named-arg call (`buffer.write(byteArray, startIndex = …,
+  endIndex = …)`) mis-resolved to a same-named extension whose first parameter
+  could not bind the positional argument (e.g. `write(ByteString, …)`), because
+  a single extension candidate was returned without a positional-type check and
+  the permissive fallback re-picked it. `resolve_ext_overload` now rejects a
+  candidate whose positional argument definitely can't bind a concrete
+  parameter and declines (so the receiver's own member wins) for named calls.
+  Covered by `named_arg_member_over_extension.kt` (kotlinc byte-parity).
+- **Read-path probe — next gap.** Consuming the read side
+  (`SourceByteReadChannel` + the `ByteReadChannel(bytes/text/source)` factories
+  + `readRemaining`) now loads and resolves the channel construction, but
+  `readRemaining().readByteArray()` hits a `getBackingArrayReference` gap in
+  klio's kotlinx-io (`Buffer`/`ByteString` byte extraction). The channel files
+  remain unwired pending that kotlinx-io fix.
 
 ## Status
 
 The protocol foundation, the full URL layer, `Attributes`, the **Pipeline
 runtime**, and the **body content layer** consume real upstream and execute.
-Next: resolve the channel-suspension blocker to consume the `io.ktor.utils.io`
-streaming subsystem, then switch the client/server **cores** onto upstream
-`Pipeline`/`PipelineContext` — removing the simplified `Application` /
-`ApplicationCall` / `HttpClient` shim redeclarations. The shim stays in place so
-client/server keep working until each layer's upstream replacement is validated.
+Next: finish the channel **read side** (close the `getBackingArrayReference`
+kotlinx-io gap so `ByteReadChannel(bytes).readRemaining().readByteArray()`
+works — the response-body shape), then switch the client/server **cores** onto
+upstream `Pipeline`/`PipelineContext` — removing the simplified `Application` /
+`ApplicationCall` / `HttpClient` shim redeclarations. The async `ByteChannel`
+write side remains gated on coroutine-suspension fidelity. The shim stays in
+place so client/server keep working until each layer's upstream replacement is
+validated.

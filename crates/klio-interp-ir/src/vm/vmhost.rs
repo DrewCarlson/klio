@@ -641,10 +641,14 @@ impl VmHost<'_> {
             }
             candidates
         };
-        if candidates.len() <= 1 {
+        let has_names = arg_names.iter().any(std::option::Option::is_some);
+        // A positional-only call keeps the historical single-candidate
+        // shortcut. A named-arg call falls through to the strict scoring
+        // below so a positional argument that can't bind this candidate's
+        // parameter rejects it (letting a same-named member win).
+        if candidates.len() <= 1 && !has_names {
             return candidates.into_iter().next().map(|(fid, _)| fid);
         }
-        let has_names = arg_names.iter().any(std::option::Option::is_some);
         // Default-/named-arg-aware applicability + scoring. A
         // candidate is viable only if every user parameter
         // (params[1..]) that is left unbound after slotting the
@@ -702,10 +706,29 @@ impl VmHost<'_> {
                 }
                 filled[next] = true;
                 if let Some(a) = args.get(i) {
-                    score += i64::from(
-                        self.overload_score_arg(&f.params[next + 1].ty, a)
-                            .unwrap_or(-2),
-                    );
+                    let pty = &f.params[next + 1].ty;
+                    match self.overload_score_arg(pty, a) {
+                        Some(s) => score += i64::from(s),
+                        None => {
+                            // A positional argument that definitely can't bind
+                            // a concrete (non-generic, non-nullable) parameter
+                            // makes this candidate non-viable, so a same-named
+                            // member/overload that does fit wins — e.g.
+                            // `buffer.write(byteArray, startIndex = …)` must
+                            // not bind the `write(ByteString, …)` extension.
+                            let pn = pty.name.as_str();
+                            let generic = pty.nullable
+                                || matches!(pn, "Any" | "Unit")
+                                || pn.starts_with("Function")
+                                || (pn.len() <= 2 && pn.chars().all(|c| c.is_ascii_uppercase()));
+                            if generic {
+                                score -= 2;
+                            } else {
+                                viable = false;
+                                break;
+                            }
+                        }
+                    }
                 }
                 next += 1;
             }
@@ -741,6 +764,13 @@ impl VmHost<'_> {
         }
         if let Some((fid, _)) = best {
             return Some(fid);
+        }
+        // For a named-arg call the strict scoring is authoritative: no
+        // viable extension means the receiver's own member is the target,
+        // so decline here rather than letting the arity-permissive fallback
+        // re-pick a type-incompatible candidate.
+        if has_names {
+            return None;
         }
         // No viable candidate under the strict rule — fall back to
         // the old arity-permissive pick so non-named / legacy call
