@@ -772,6 +772,38 @@ impl VmHost<'_> {
                 klio_runtime::Value::Null
             )));
         }
+        // `equals` on a builtin scalar/String. Builtins carry no user
+        // override, so resolve it directly to a `Bool` — otherwise the
+        // member call falls through to a `Unit`-returning path. The
+        // 2-arg `String.equals(other, ignoreCase)` form compares without
+        // case when the flag is set.
+        if name == "equals"
+            && matches!(
+                receiver,
+                klio_runtime::Value::String(_)
+                    | klio_runtime::Value::Int(_)
+                    | klio_runtime::Value::Long(_)
+                    | klio_runtime::Value::Short(_)
+                    | klio_runtime::Value::Byte(_)
+                    | klio_runtime::Value::Double(_)
+                    | klio_runtime::Value::Float(_)
+                    | klio_runtime::Value::Bool(_)
+                    | klio_runtime::Value::Char(_)
+            )
+        {
+            if let klio_runtime::Value::String(s) = receiver
+                && matches!(args.get(1), Some(klio_runtime::Value::Bool(true)))
+            {
+                let eq = matches!(args.first(), Some(klio_runtime::Value::String(o))
+                    if s.to_lowercase() == o.to_lowercase());
+                return Ok(klio_runtime::Value::Bool(eq));
+            }
+            if let Some(other) = args.first() {
+                return Ok(klio_runtime::Value::Bool(
+                    klio_runtime::Value::structural_eq(receiver, other),
+                ));
+            }
+        }
         // SAM-instance dispatch: a synthetic `FunInterface { … }`
         // wrapper carries its lambda under `__sam_target__`. Any
         // method call on the receiver invokes the stored callable.

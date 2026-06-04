@@ -612,3 +612,24 @@ fun main() {
         "3\nbeta\n",
     );
 }
+
+// `String.equals` returns a Bool — including the kotlin.text 2-arg
+// `ignoreCase` form, with both positional and named arguments (ktor's
+// ContentType.match uses `equals(other, ignoreCase = true)`).
+#[test]
+fn string_equals_with_ignore_case() {
+    let src = r#"
+fun main() {
+    println("Application".equals("application", ignoreCase = true))
+    println("Application".equals("application"))
+    println("AB".equals("ab", true))
+    println("x".equals(null))
+    println(!"A".equals("b", ignoreCase = true))
+}
+"#;
+    assert_klio(
+        "string_equals_with_ignore_case",
+        src,
+        "true\nfalse\ntrue\nfalse\ntrue\n",
+    );
+}

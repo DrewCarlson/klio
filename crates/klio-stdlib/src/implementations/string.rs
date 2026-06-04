@@ -509,6 +509,25 @@ pub(crate) fn string_none(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Bool(matches!(r, Value::Bool(false))))
 }
 
+/// `String.equals(other, ignoreCase = false)` — the kotlin.text form
+/// with the optional case-insensitivity flag. A `String` compares equal
+/// only to another `String`; with `ignoreCase` the comparison folds case.
+pub(crate) fn string_equals(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = recv_string(ctx.args, "String.equals")?;
+    let ignore_case = matches!(ctx.args.get(2), Some(Value::Bool(true)));
+    let eq = match ctx.args.get(1) {
+        Some(Value::String(o)) => {
+            if ignore_case {
+                s.to_lowercase() == o.to_lowercase()
+            } else {
+                s.as_str() == o.as_str()
+            }
+        }
+        _ => false,
+    };
+    Ok(Value::Bool(eq))
+}
+
 pub(crate) fn string_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.contains")?;
     let needle = arg_as_string(
