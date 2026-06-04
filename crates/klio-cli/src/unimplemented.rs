@@ -140,6 +140,9 @@ impl Scan {
 /// arms in `klio-interp-ir`'s `host_call_member.rs`; kept here as an explicit
 /// list since those arms are not otherwise enumerable.
 const INTERP_BUILTIN_MEMBERS: &[&str] = &[
+    // Reified enum reflection, resolved in `call_func_typed` (not a binding).
+    "enumValues",
+    "enumValueOf",
     "asList",
     "constrainOnce",
     "containsValue",

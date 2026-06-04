@@ -129,6 +129,9 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String.lowercase", string_lowercase),
     // Deprecated case forms delegate to the no-locale uppercase/lowercase;
     // capitalize/decapitalize touch only the first char.
+    ("kotlin.String.elementAt", char_sequence_element_at),
+    ("kotlin.CharSequence.elementAt", char_sequence_element_at),
+    ("kotlin.text.StringBuilder.elementAt", char_sequence_element_at),
     ("kotlin.String.contentEquals", char_sequence_content_equals),
     ("kotlin.CharSequence.contentEquals", char_sequence_content_equals),
     ("kotlin.text.StringBuilder.contentEquals", char_sequence_content_equals),

@@ -556,6 +556,29 @@ pub(crate) fn char_sequence_content_equals(ctx: &mut CallCtx) -> Result<Value, R
     Ok(Value::Bool(eq))
 }
 
+/// `CharSequence.elementAt(index)` — the `Char` (UTF-16 unit) at `index`,
+/// bounds-checked. A bodyless `expect` otherwise.
+pub(crate) fn char_sequence_element_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let s = match ctx.args.first() {
+        Some(Value::StringBuilder(sb)) => sb.borrow().clone(),
+        Some(v) => arg_as_string(v, "elementAt")?,
+        None => return Err(RuntimeError::Type("elementAt requires a receiver".into())),
+    };
+    let index = ctx
+        .args
+        .get(1)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RuntimeError::Type("elementAt index must be an Int".into()))?;
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if index < 0 || (index as usize) >= units.len() {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IndexOutOfBoundsException",
+            Some(format!("index: {index}, length: {}", units.len())),
+        )));
+    }
+    Ok(Value::Char(units[index as usize]))
+}
+
 pub(crate) fn string_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.contains")?;
     let needle = arg_as_string(
