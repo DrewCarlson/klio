@@ -241,6 +241,24 @@ impl Vm {
         // reference a top-level singleton (e.g. `val CURRENT =
         // SomePrivateObject.get()`), so the dependency target must be
         // bound in globals before the companion's init runs.
+        // Top-level `const val`s are compile-time constants; bind them in
+        // globals up front — before the object / companion initializers
+        // below, which run ahead of the top-level property inits and may
+        // read a top-level const. Without this an eager companion init sees
+        // a not-yet-initialized `Null` global (`URLBuilder.Companion`'s
+        // `val originUrl = Url(origin)`, where the URL parser does `port =
+        // DEFAULT_PORT`).
+        let top_level_consts: Vec<(String, klio_runtime::Value)> = self
+            .module
+            .registry
+            .class_const_inits
+            .iter()
+            .filter(|((cls, _), _)| cls.is_empty())
+            .map(|((_, name), c)| (name.clone(), klio_ir::eval::const_to_value(c)))
+            .collect();
+        for (name, v) in top_level_consts {
+            self.globals.borrow_mut().define(&name, v);
+        }
         let mut object_names: Vec<String> = self.module.registry.object_names.clone();
         object_names.sort_by_key(|n| n.contains("$Companion$"));
         for obj_name in &object_names {
