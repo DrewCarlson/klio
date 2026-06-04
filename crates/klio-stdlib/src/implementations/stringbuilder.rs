@@ -139,6 +139,33 @@ pub(crate) fn string_builder_append(ctx: &mut CallCtx) -> Result<Value, RuntimeE
     Ok(Value::StringBuilder(sb))
 }
 
+/// `StringBuilder.set(index, value: Char)` (`sb[i] = c`) — replace the
+/// UTF-16 unit at `index`, in place. A bodyless `expect` otherwise.
+pub(crate) fn string_builder_set(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let sb = sb_arg(ctx.args, "StringBuilder.set")?;
+    let index = ctx
+        .args
+        .get(1)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RuntimeError::Type("StringBuilder.set index must be an Int".into()))?;
+    let Some(Value::Char(unit)) = ctx.args.get(2) else {
+        return Err(RuntimeError::Type(
+            "StringBuilder.set value must be a Char".into(),
+        ));
+    };
+    let mut buf = sb.borrow_mut();
+    let mut units: Vec<u16> = buf.encode_utf16().collect();
+    if index < 0 || (index as usize) >= units.len() {
+        return Err(RuntimeError::Thrown(make_exception(
+            "kotlin.IndexOutOfBoundsException",
+            Some(format!("index: {index}, length: {}", units.len())),
+        )));
+    }
+    units[index as usize] = *unit;
+    *buf = String::from_utf16_lossy(&units);
+    Ok(Value::Unit)
+}
+
 pub(crate) fn string_builder_append_line(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.appendLine")?;
     {

@@ -1536,6 +1536,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.String", string_ctor),
     ("kotlin.text.StringBuilder", string_builder_ctor),
     ("kotlin.StringBuilder", string_builder_ctor),
+    ("kotlin.text.StringBuilder.set", string_builder_set),
     ("kotlin.text.StringBuilder.append", string_builder_append),
     (
         "kotlin.text.StringBuilder.appendLine",
