@@ -580,6 +580,36 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.ULongArray.contentToString", array_content_to_string),
     ("kotlin.UShortArray.contentToString", array_content_to_string),
     ("kotlin.UByteArray.contentToString", array_content_to_string),
+    // Indexed access / concatenation. Also unimplemented `expect`s; a
+    // missing actual made `elementAt` no-op and `plus` fall through to a
+    // raw `BinOp::Add` error.
+    ("kotlin.Array.elementAt", array_element_at),
+    ("kotlin.IntArray.elementAt", array_element_at),
+    ("kotlin.LongArray.elementAt", array_element_at),
+    ("kotlin.DoubleArray.elementAt", array_element_at),
+    ("kotlin.FloatArray.elementAt", array_element_at),
+    ("kotlin.ShortArray.elementAt", array_element_at),
+    ("kotlin.ByteArray.elementAt", array_element_at),
+    ("kotlin.CharArray.elementAt", array_element_at),
+    ("kotlin.BooleanArray.elementAt", array_element_at),
+    ("kotlin.UIntArray.elementAt", array_element_at),
+    ("kotlin.ULongArray.elementAt", array_element_at),
+    ("kotlin.UShortArray.elementAt", array_element_at),
+    ("kotlin.UByteArray.elementAt", array_element_at),
+    ("kotlin.Array.plus", array_plus),
+    ("kotlin.IntArray.plus", array_plus),
+    ("kotlin.LongArray.plus", array_plus),
+    ("kotlin.DoubleArray.plus", array_plus),
+    ("kotlin.FloatArray.plus", array_plus),
+    ("kotlin.ShortArray.plus", array_plus),
+    ("kotlin.ByteArray.plus", array_plus),
+    ("kotlin.CharArray.plus", array_plus),
+    ("kotlin.BooleanArray.plus", array_plus),
+    ("kotlin.UIntArray.plus", array_plus),
+    ("kotlin.ULongArray.plus", array_plus),
+    ("kotlin.UShortArray.plus", array_plus),
+    ("kotlin.UByteArray.plus", array_plus),
+    ("kotlin.Array.plusElement", array_plus_element),
     // In-place natural-order sort (no-arg and (fromIndex, toIndex)).
     // Also an unimplemented `expect`; without it `sort()` no-ops and
     // `sortedArray`/`sortDescending`, which delegate to it, are wrong.

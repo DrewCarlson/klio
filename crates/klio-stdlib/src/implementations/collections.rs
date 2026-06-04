@@ -3381,6 +3381,81 @@ pub(crate) fn array_content_to_string(ctx: &mut CallCtx) -> Result<Value, Runtim
     Ok(Value::String(std::sync::Arc::new(format!("[{body}]"))))
 }
 
+/// The primitive-array kind of an array receiver (so a result array keeps
+/// the same element-type tag), or `None` for a boxed `Array<T>`.
+fn array_prim_of(v: &Value) -> Option<klio_runtime::PrimitiveArrayKind> {
+    match v {
+        Value::Array { prim, .. } => *prim,
+        _ => None,
+    }
+}
+
+/// `Array<T>.elementAt(index)` / primitive-array variants. Upstream
+/// declares these `expect` with no body; without an actual the call
+/// silently returns `Unit`. Bounds-checked, throwing
+/// `IndexOutOfBoundsException` like the JVM actual.
+pub(crate) fn array_element_at(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("elementAt requires a receiver".into()))?;
+    let items = iterable_items(recv, "elementAt")?;
+    let index = array_opt_index(ctx, 1, -1, "elementAt")?;
+    if index < 0 || (index as usize) >= items.len() {
+        return Err(index_oob(format!(
+            "index: {index}, size: {}",
+            items.len()
+        )));
+    }
+    Ok(items[index as usize].clone())
+}
+
+/// `Array<T>.plus(...)` / primitive-array variants: append a single
+/// element, or concatenate another array / collection. The result keeps
+/// the receiver's primitive-array kind. (An `Array`/`Collection` argument
+/// concatenates; any other value is appended as one element — the common,
+/// unambiguous reading.)
+pub(crate) fn array_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("plus requires a receiver".into()))?;
+    let other = ctx
+        .args
+        .get(1)
+        .ok_or_else(|| RuntimeError::Arity("plus expects (element|elements)".into()))?;
+    let mut items = iterable_items(recv, "plus")?;
+    match other {
+        Value::Array { .. } | Value::List { .. } | Value::Set { .. } => {
+            items.extend(iterable_items(other, "plus")?);
+        }
+        _ => items.push(other.clone()),
+    }
+    Ok(Value::Array {
+        items: ObjRef::new(items),
+        prim: array_prim_of(recv),
+    })
+}
+
+/// `Array<T>.plusElement(element)`: always append one element (never
+/// concatenate), keeping the receiver's primitive-array kind.
+pub(crate) fn array_plus_element(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("plusElement requires a receiver".into()))?;
+    let other = ctx
+        .args
+        .get(1)
+        .ok_or_else(|| RuntimeError::Arity("plusElement expects (element)".into()))?;
+    let mut items = iterable_items(recv, "plusElement")?;
+    items.push(other.clone());
+    Ok(Value::Array {
+        items: ObjRef::new(items),
+        prim: array_prim_of(recv),
+    })
+}
+
 /// `Array<T>.copyInto(destination, destinationOffset = 0, startIndex = 0,
 /// endIndex = size): destination` and the primitive-array variants.
 /// Copies `this[startIndex, endIndex)` into `destination` starting at

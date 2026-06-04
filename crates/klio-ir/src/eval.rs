@@ -927,6 +927,13 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<
                 frame.write(*dst, result);
                 return Ok(());
             }
+            // Arrays define `+` (`plus`) — append an element or
+            // concatenate another array/collection — but no `-`.
+            if matches!(*op, BinOp::Add) && matches!(l, Value::Array { .. }) {
+                let result = host.call_member(&l, "plus", std::slice::from_ref(&r))?;
+                frame.write(*dst, result);
+                return Ok(());
+            }
             // Referential identity (`===` / `!==`): pure pointer
             // identity, never a user `equals` dispatch — so a
             // `this === other` guard inside an `equals` / `plus`
