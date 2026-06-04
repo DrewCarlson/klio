@@ -545,16 +545,37 @@ fixes this brought in, each with a kotlinc-parity corpus test:
   reified-type-arg binding leaking into a later non-reified `as T` (which broke
   multi-key `Attributes.getOrNull`) (`erased_type_param_cast.kt`).
 
+## Pipeline runtime — scouted; two prerequisite fixes landed
+
+A scouting pass wired the upstream Pipeline files (`Pipeline`, `PipelineContext`,
+`PipelinePhase`, `PhaseContent`, `PipelinePhaseRelation`, `DebugPipelineContext`,
+`SuspendFunctionGun`, `StackTraceRecover`, `StackWalkingFailed*`) + the
+`io.ktor.util.debug` package + the posix actuals (`PipelineNative`,
+`StackTraceRecoverNative`, `IntellijIdeaDebugDetectorNative`) + a klio
+`DISABLE_SFG = true` actual. The files **load**; two general interpreter bugs it
+surfaced are fixed and committed (kotlinc-parity corpus tests):
+
+- a super-constructor's `vararg` arguments are packed into an array
+  (`class P : Pipeline<…>(SomePhase)` → `Pipeline(vararg phases)`)
+  (`vararg_super_constructor.kt`);
+- a companion member resolves inside a secondary constructor's delegation/body
+  (`PhaseContent`'s `: this(phase, relation, SharedArrayList)`)
+  (`companion_member_in_secondary_ctor.kt`).
+
+The wiring is **reverted for now** (it makes coroutines/atomicfu hard deps of the
+core pack, which the value-type tests don't install) pending the next blocker:
+`pipeline.execute(...)` fails with `get_field size on Unit` inside the
+`DebugPipelineContext`/`Pipeline` interceptor-cache machinery (the
+`by atomic(null)` interceptor list or a phase-content list reads `Unit`). Next:
+trace that, then re-wire Pipeline (likely behind making coroutines/atomicfu core
+deps + adding them to the value-type test installs).
+
 ## Status
 
 The protocol foundation, the full URL layer, and `Attributes` are consuming real
-upstream. Next, in order: the **Pipeline runtime** (`Pipeline` /
-`PipelineContext` / `PipelinePhase` / `PhaseContent`) — its execution engine is
-proven (the `DebugPipelineContext`-shaped runner in `pipeline_context_smoke`);
-remaining plumbing is the `DISABLE_SFG` (= true) and
-`pipelineStartCoroutineUninterceptedOrReturn` actuals, the `io.ktor.util.debug`
-+ atomicfu refs, and `CoroutineScope` (PipelineContext's supertype) — now that
-`Attributes` is available. Then the client/server **cores** onto upstream
-`Pipeline`/`PipelineContext`, which removes the simplified `Application` /
-`ApplicationCall` / `HttpClient` shim redeclarations. The shim stays in place so
-client/server keep working until each layer's upstream replacement is validated.
+upstream; the Pipeline files load (two prerequisite fixes landed) but its
+execution has a remaining `size on Unit` bug. Then the client/server **cores**
+onto upstream `Pipeline`/`PipelineContext`, which removes the simplified
+`Application` / `ApplicationCall` / `HttpClient` shim redeclarations. The shim
+stays in place so client/server keep working until each layer's upstream
+replacement is validated.
