@@ -304,16 +304,26 @@ upstream and delete the request-member shims.
 ## Open blockers (next, in order)
 
 0. **`ContentDisposition.parse` infinite-recurses** (so `ContentDisposition.kt`
-   is held back). Its companion is `fun parse(value: String): ContentDisposition
-   = parse(value) { v, p -> ContentDisposition(v, p) }` — the trailing-lambda
-   2-arg call should bind the inherited `HeaderValueWithParameters.Companion.parse(value,
-   init)`, but klio binds the same-companion 1-arg `parse(value)` and recurses.
-   `ContentType.parse` (block body, same superclass companion) resolves
-   correctly, so it is a subtle companion-overload-resolution difference
-   (expression body and/or the leading `if (value.isBlank()) return Any` guard).
-   A minimal local repro of both block- and expression-body forms recurses, so
-   the local repro does not yet capture ContentType's working path — needs
-   isolation against the consumed `HeaderValueWithParameters` companion.
+   is held back) — **root cause now pinned via lowering instrumentation.** Its
+   companion `fun parse(value) = parse(value) { v, p -> ContentDisposition(v, p) }`
+   should bind the inherited `HeaderValueWithParameters.Companion.parse(value,
+   init)` (2-arg) but binds the same-companion 1-arg `parse(value)` and recurses.
+   The divergence from the working `ContentType.parse` is **the trailing
+   lambda's complexity**, not block-vs-expr: in the bare-call lowering
+   (`lower/expr.rs`), the inner `parse(value){…}` of `ContentDisposition` (a
+   *simple* lambda → `lambda_writes_outer_var == false`) falls to the
+   `prefer_member` branch (`owner=ContentDisposition$Companion$Companion`,
+   `want=2`, `cands=[]`, `prefer_member=true`) → lowered as `this.parse(value,
+   lambda)` (CallMember); at runtime that binds the companion's own 1-arg
+   `parse`, **dropping the trailing lambda** (the same trailing-lambda/arity
+   mis-bind class as the `buildString` fix). `ContentType.parse`'s lambda
+   mutates/captures (`lambda_writes_outer_var == true`), so it takes the
+   writeback `CallMember` arm instead, which resolves the inherited 2-arg parse.
+   The 2-arg parse is **not** in `funcs_by_simple_name("parse")` (`cands=[]`) —
+   it's an inherited companion member. Fix: the `prefer_member`/`CallMember` path
+   must not bind a lower-arity member to a call that carries extra positional
+   args (incl. a trailing lambda); it should resolve the arity-matching inherited
+   companion `parse` (or fall through rather than recurse).
 
 1. **ktor-http remainder — `Url` / `URLBuilder` / `Codecs`.** `URLBuilder`
    hard-depends on `Codecs` (`encodeURLParameter`/`encodeURLQueryComponent`/…), so
