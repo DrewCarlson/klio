@@ -691,14 +691,54 @@ each with a kotlinc-parity corpus test:
   (above) avoids this; the write side needs coroutine-suspension fidelity and
   its locks/`DEVELOPMENT_MODE` actuals.
 
+## Cores consumption — staged plan
+
+The client core is ~13k lines across 86 commonMain files (`io.ktor.client.*`:
+`HttpClient`, `call`, `engine`, `plugins`, `request`, `statement`); the request
+/response data types are entangled with the whole graph (`HttpRequest.kt`
+imports `client.*` / `call.*` / `engine.*` / `plugins.sse.*`), so there is no
+clean foundational slice — the graph consumes together. Removing the
+`shim/client` / `shim/server` redeclarations is therefore a coordinated
+multi-step consumption, not a one-shot edit. The supporting layers it needs are
+now in place (Pipeline runtime, body content, channel read side, `Attributes`).
+
+Execution hypothesis: klio runs the request/response pipelines synchronously
+through `DebugPipelineContext` (already proven for `Pipeline`), and supplies a
+**synchronous `HttpClientEngine` actual** backed by the existing
+`__kktor_request` binding — so the cores should execute without the async
+`ByteChannel` write side or deep coroutine-suspension fidelity (the response
+body is a buffered read-side `ByteReadChannel`). Plugins are the main unknown:
+`HttpClient` installs defaults (`HttpRequestLifecycle`, `BodyProgress`,
+`HttpSend`, …); the staged plan minimizes the installed set first.
+
+Stages (each ends green with the shim still present until its replacement is
+validated, then the corresponding shim file is deleted):
+
+1. **Engine boundary** — consume `HttpClientEngine` / `HttpClientEngineBase` /
+   `HttpClientEngineConfig` / `HttpRequestData` / `HttpResponseData` +
+   `EmptyContent`; write the klio engine `actual` (build an `HttpResponseData`
+   from `__kktor_request`'s bytes via a read-side `ByteReadChannel`).
+2. **Call + statement** — `HttpClientCall`, `HttpRequest`/`HttpResponse`,
+   `DefaultHttpRequest`/`DefaultHttpResponse`, `HttpStatement`.
+3. **Pipelines + `HttpClient`** — `HttpRequestPipeline`/`HttpSendPipeline`/
+   `HttpReceivePipeline`/`HttpResponsePipeline`, then `HttpClient` with a
+   minimal default-plugin set; delete `shim/client/*`.
+4. **Server core** — `Application`/`ApplicationCall`/`ApplicationCallPipeline`,
+   routing, `respondText`; klio engine `actual` over `__kktor_serve`; delete
+   `shim/server/*`.
+
+Each stage proceeds by adding its files, building, and fixing the surfaced
+interpreter/stdlib gaps (the pattern of the prior layers) — every gap fixed
+with a kotlinc-parity corpus test.
+
 ## Status
 
 The protocol foundation, the full URL layer, `Attributes`, the **Pipeline
 runtime**, the **body content layer**, and the **channel read side** consume
-real upstream and execute. Next: switch the client/server **cores** onto
-upstream `Pipeline`/`PipelineContext` (the response body now has a real
-`ByteReadChannel`; klio supplies the engine `actual` over `__kktor_request`) —
-removing the simplified `Application` / `ApplicationCall` / `HttpClient` shim
-redeclarations. The async `ByteChannel` write side remains gated on
-coroutine-suspension fidelity. The shim stays in place so client/server keep
-working until each layer's upstream replacement is validated.
+real upstream and execute. The remaining work is the staged **cores**
+consumption above, which is what removes the simplified `Application` /
+`ApplicationCall` / `HttpClient` shim redeclarations. The async `ByteChannel`
+write side remains gated on coroutine-suspension fidelity (not on the cores'
+critical path under the synchronous-execution hypothesis). The shim stays in
+place so client/server keep working until each layer's upstream replacement is
+validated.
