@@ -153,6 +153,7 @@ impl Parser<'_, '_> {
                         function: None,
                         definitely_non_null: false,
                         annotations: Vec::new(),
+                        qualified_path: None,
                     },
                     span: s.span,
                 });
@@ -216,6 +217,7 @@ impl Parser<'_, '_> {
                     function: None,
                     definitely_non_null: false,
                     annotations: Vec::new(),
+                    qualified_path: None,
                 });
             } else if matches!(self.peek_kind(), TokenKind::Ident)
                 && self.text(self.current_span()) == "_"
@@ -236,6 +238,7 @@ impl Parser<'_, '_> {
                     function: None,
                     definitely_non_null: false,
                     annotations: Vec::new(),
+                    qualified_path: None,
                 });
             } else {
                 if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::In))
@@ -362,6 +365,7 @@ impl Parser<'_, '_> {
                 function: Some(Box::new(func)),
                 definitely_non_null: false,
                 annotations: Vec::new(),
+                qualified_path: None,
             });
         }
         // Propagate `suspend` onto the parens-form function type when one
@@ -380,6 +384,8 @@ impl Parser<'_, '_> {
     pub(crate) fn parse_simple_type(&mut self) -> Option<TypeRef> {
         let first = self.parse_ident("type")?;
         let mut name = first.clone();
+        let mut path = first.name.clone();
+        let mut segments = 1usize;
         let mut type_args = if matches!(self.peek_kind(), TokenKind::Lt) {
             self.parse_type_args()
         } else {
@@ -389,7 +395,9 @@ impl Parser<'_, '_> {
         // its own type arguments, e.g. `Outer<T>.Inner`). klio resolves
         // types by simple name against imports + known packages, so the
         // path collapses to its last segment (the package / outer-class
-        // qualifier is the namespace the resolver already keys on).
+        // qualifier is the namespace the resolver already keys on); the
+        // full dotted path is retained in `qualified_path` for the cases
+        // that need it (a nested supertype vs a same-named top-level class).
         // Stop before `.(` — that is a receiver-function type
         // (`A.B.() -> R`), consumed by `parse_type`.
         while !self.suppress_qualified_path
@@ -401,6 +409,9 @@ impl Parser<'_, '_> {
         {
             self.bump(); // '.'
             name = self.parse_ident("type")?;
+            path.push('.');
+            path.push_str(&name.name);
+            segments += 1;
             type_args = if matches!(self.peek_kind(), TokenKind::Lt) {
                 self.parse_type_args()
             } else {
@@ -416,6 +427,7 @@ impl Parser<'_, '_> {
             function: None,
             definitely_non_null: false,
             annotations: Vec::new(),
+            qualified_path: (segments > 1).then_some(path),
         })
     }
 
@@ -453,6 +465,7 @@ impl Parser<'_, '_> {
             } else {
                 Vec::new()
             };
+            let dotted = new_name.name.clone();
             head = TypeRef {
                 name: new_name,
                 nullable: false,
@@ -461,6 +474,7 @@ impl Parser<'_, '_> {
                 function: None,
                 definitely_non_null: false,
                 annotations: Vec::new(),
+                qualified_path: Some(dotted),
             };
         }
         // Trailing nullable suffix after dotted form: `S.A?`.
@@ -534,6 +548,7 @@ impl Parser<'_, '_> {
                 function: Some(Box::new(func)),
                 definitely_non_null: false,
                 annotations: Vec::new(),
+                qualified_path: None,
             })
         } else if items.len() == 1 && !saw_comma {
             // Parenthesized type.

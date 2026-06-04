@@ -509,6 +509,14 @@ pub struct TypeRef {
     /// receivers; interp treats it as the base T at runtime.
     pub definitely_non_null: bool,
     pub annotations: Vec<Annotation>,
+    /// The full dotted source path when this reference was written
+    /// qualified (`Outer.Inner`, `a.b.C`). `name` keeps only the last
+    /// segment (klio resolves types by simple name), so this preserves
+    /// the qualifier for the cases that need it — chiefly disambiguating
+    /// a nested supertype (`Outer.Inner`) from a same-named top-level
+    /// class. `None` for an unqualified reference.
+    #[serde(default)]
+    pub qualified_path: Option<String>,
 }
 
 /// Function type written as a type annotation, e.g.

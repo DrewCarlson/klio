@@ -595,13 +595,18 @@ interpreter/stdlib bugs, each with a kotlinc-parity corpus test:
   addTo` calls `destination.ensureCapacity(…)` when `destination is ArrayList`.
   Added both as no-op capacity hints (`arraylist_ensure_capacity.kt`).
 
-## Body content layer — probed; one fix landed, one blocker
+## Body content layer — consumed
 
-The `io.ktor.http.content` `OutgoingContent` hierarchy is the body
-representation both cores use. A probe consuming `OutgoingContent` +
-`TextContent` + `ByteArrayContent` (with the `io.ktor.utils.io`
-`ByteReadChannel`/`ByteWriteChannel` interfaces — the streaming `ByteChannel`
-+ operations layer is a separate, larger lift) found:
+The `io.ktor.http.content` `OutgoingContent` hierarchy (the body
+representation both cores use) is consumed from upstream and wired into the
+pack: `OutgoingContent` + `TextContent` + `ByteArrayContent`, with the
+`io.ktor.utils.io` `ByteReadChannel`/`ByteWriteChannel` interfaces (the
+streaming `ByteChannel` + operations layer is a separate, larger lift; the
+interfaces alone satisfy the content types' signatures). Verified by
+`ktor_content_types_from_upstream` — content type / length / bytes, the
+`OutgoingContent.isEmpty()` extension, and `is`-checks against both the sealed
+root and the nested `OutgoingContent.ByteArrayContent` variant. Three
+interpreter fixes got there, each with a kotlinc-parity corpus test:
 
 - **Landed — a ctor-param `override val` over a base `open val … get()` reads
   the override's field, not the inherited getter.** `get_field`'s getter walk
@@ -625,27 +630,29 @@ representation both cores use. A probe consuming `OutgoingContent` +
   stops when the resolved parent equals the current class. Construction now
   terminates and the subclass's own members work. Covered by
   `self_named_nested_supertype.kt` (kotlinc byte-parity).
-- **Remaining blocker — class-table key collision drops the concrete class's
-  fields.** The nested abstract `OutgoingContent.ByteArrayContent` is lifted to
-  top level under its *bare* name (`build/lift.rs` — unlike nested objects,
-  which mangle to `Outer$Name` on collision), colliding with the concrete
-  top-level `ByteArrayContent`. When the nested one wins the simple-name key,
-  the concrete's primary-param fields are never stored, so `b.contentLength`'s
-  `bytes.size` read fails. The fix is to mangle a nested class to `Outer$Name`
-  when its bare name collides with a top-level type and resolve qualified
-  supertype references accordingly. `TextContent` (distinctly named) consumes
-  cleanly today. This gates `ByteArrayContent`, so the content layer is not yet
-  wired into the pack.
+- **Landed — qualified nested supertype resolution.** A top-level class
+  extending a nested class of the same simple name (`class ByteArrayContent :
+  OutgoingContent.ByteArrayContent()`) collided in the simple-name class table:
+  the nested abstract, lifted under its bare name, shadowed the concrete
+  top-level class so its primary-param fields were never stored
+  (`b.contentLength`'s `bytes.size` read failed), and the supertype resolved to
+  the wrong class so `is`-checks were wrong. The parser now retains the full
+  dotted path on a `TypeRef` (`qualified_path`); lift mangles a nested class to
+  `Outer$Name` *only* when some class actually extends it via that qualified
+  path (so a mere simple-name coincidence with an unrelated stdlib type —
+  `TrafficLight.State` vs a stdlib `State` — is left alone), and a post-pass
+  repoints subclass supertype references to the mangled name. Fields store,
+  `is`-checks resolve, and the hierarchy is correct. Covered by
+  `self_named_nested_supertype.kt`.
 
 ## Status
 
-The protocol foundation, the full URL layer, `Attributes`, and the **Pipeline
-runtime** consume real upstream and execute. The body content layer is probed:
-`TextContent` consumes cleanly (after the override + name-collision-hang fixes),
-`ByteArrayContent` is blocked on the nested-class-name table collision. Next:
-resolve that collision to consume the content layer, then the
-`io.ktor.utils.io` channel streaming subsystem, then switch the client/server
-**cores** onto upstream `Pipeline`/`PipelineContext` — removing the simplified
-`Application` / `ApplicationCall` / `HttpClient` shim redeclarations. The shim
+The protocol foundation, the full URL layer, `Attributes`, the **Pipeline
+runtime**, and the **body content layer** consume real upstream and execute.
+Next: the `io.ktor.utils.io` channel streaming subsystem (the `ByteChannel` +
+read/write operations behind the channel interfaces), then switch the
+client/server **cores** onto upstream `Pipeline`/`PipelineContext` — removing
+the simplified `Application` / `ApplicationCall` / `HttpClient` shim
+redeclarations. The shim
 stays in place so client/server keep working until each layer's upstream
 replacement is validated.

@@ -123,6 +123,40 @@ pub(crate) fn rewrite_block_field(block: &klio_ast::Block, prop: &str) -> klio_a
     out
 }
 
+/// Collect the qualified supertype paths used across all declarations
+/// (recursing into nested classes), reduced to their last two segments
+/// (`Outer.Name`). A nested class is mangled on a name collision only when
+/// it is actually extended this way — see the call site.
+pub(crate) fn collect_used_qualified_supertypes(
+    decls: &[Decl],
+) -> std::collections::HashSet<String> {
+    fn last_two(path: &str) -> Option<String> {
+        let segs: Vec<&str> = path.split('.').collect();
+        (segs.len() >= 2).then(|| format!("{}.{}", segs[segs.len() - 2], segs[segs.len() - 1]))
+    }
+    fn walk(c: &klio_ast::Class, out: &mut std::collections::HashSet<String>) {
+        for t in &c.supertypes {
+            if let Some(qp) = t.qualified_path.as_ref()
+                && let Some(key) = last_two(qp)
+            {
+                out.insert(key);
+            }
+        }
+        for m in &c.members {
+            if let Decl::Class(nested) = m {
+                walk(nested, out);
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for d in decls {
+        if let Decl::Class(c) = d {
+            walk(c, &mut out);
+        }
+    }
+    out
+}
+
 /// Recursively walk a class's members and lift companion objects,
 /// plain nested classes, and inner classes to top-level entries in
 /// `out_decls`. Companion singletons are registered with the Vm's
@@ -190,6 +224,15 @@ pub(crate) fn lift_class_recursive(
         std::collections::HashMap<String, String>,
     >,
     top_level_type_names: &std::collections::HashSet<String>,
+    // Maps a nested class's qualified source name (`Outer.Inner`) to the
+    // mangled top-level name it was lifted under (`Outer$Inner`) when its
+    // bare name collided with a top-level type. A post-pass rewrites
+    // subclass supertype references (carrying the `Outer.Inner`
+    // `qualified_path`) to the mangled name so the hierarchy resolves.
+    mangled_nested: &mut std::collections::HashMap<String, String>,
+    // Qualified supertype paths (`Outer.Inner`) some class actually extends;
+    // a nested class is only mangled when extended this way.
+    used_qualified_supertypes: &std::collections::HashSet<String>,
 ) {
     for m in &c.members {
         if let Decl::Object(co) = m {
@@ -286,6 +329,8 @@ pub(crate) fn lift_class_recursive(
                     enclosing_class,
                     nested_object_aliases,
                     top_level_type_names,
+                    mangled_nested,
+                    used_qualified_supertypes,
                 );
                 out_decls.push(Decl::Class(renamed));
                 companion_singletons.insert(c.name.name.clone(), comp_name);
@@ -309,12 +354,35 @@ pub(crate) fn lift_class_recursive(
                 for outer_c in enclosing_chain.iter().rev() {
                     extras.extend(collect_enclosing_member_names(outer_c));
                 }
-                nested_outer_members.insert(nested.name.name.clone(), extras);
-                enclosing_class.insert(nested.name.name.clone(), c.name.name.clone());
+                // A nested class whose bare name collides with a true
+                // top-level type would overwrite it in the simple-name class
+                // table (last writer wins). Mangle it to `Outer$Name` (like
+                // a nested object) and record the `Outer.Name` → `Outer$Name`
+                // map so the post-pass can repoint subclasses that extend it.
+                // Only when some class actually extends `Outer.Name` — a mere
+                // simple-name coincidence with an unrelated (stdlib) type must
+                // not mangle, or bare references to the nested name break.
+                let qualified = format!("{}.{}", c.name.name, nested.name.name);
+                let collides = top_level_type_names.contains(&nested.name.name)
+                    && used_qualified_supertypes.contains(&qualified);
+                let lifted = if collides {
+                    let mangled = format!("{}${}", c.name.name, nested.name.name);
+                    mangled_nested.insert(qualified, mangled.clone());
+                    let mut renamed = nested.clone();
+                    renamed.name = klio_ast::Ident {
+                        name: mangled,
+                        span: nested.name.span,
+                    };
+                    renamed
+                } else {
+                    nested.clone()
+                };
+                nested_outer_members.insert(lifted.name.name.clone(), extras);
+                enclosing_class.insert(lifted.name.name.clone(), c.name.name.clone());
                 let mut next_chain: Vec<klio_ast::Class> = enclosing_chain.to_vec();
                 next_chain.push(c.clone());
                 lift_class_recursive(
-                    nested,
+                    &lifted,
                     &next_chain,
                     out_decls,
                     object_names,
@@ -323,8 +391,10 @@ pub(crate) fn lift_class_recursive(
                     enclosing_class,
                     nested_object_aliases,
                     top_level_type_names,
+                    mangled_nested,
+                    used_qualified_supertypes,
                 );
-                out_decls.push(Decl::Class(nested.clone()));
+                out_decls.push(Decl::Class(lifted));
             }
         }
     }

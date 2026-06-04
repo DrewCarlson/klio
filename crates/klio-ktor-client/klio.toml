@@ -24,6 +24,11 @@ include = [
     "io/ktor/utils/io/Deprecation.kt",
     "io/ktor/utils/io/core/Buffer.kt",
     "io/ktor/utils/io/core/ByteReadPacket.kt",
+    # Channel interface types the `OutgoingContent` body layer references in
+    # its signatures (the streaming `ByteChannel` + operations layer is a
+    # later lift; the interfaces alone suffice for the content types).
+    "io/ktor/utils/io/ByteReadChannel.kt",
+    "io/ktor/utils/io/ByteWriteChannel.kt",
 ]
 
 # Upstream `io.ktor.util` string helpers (escapeHTML / quote /
@@ -97,6 +102,12 @@ include = [
     "io/ktor/http/URLBuilder.kt",
     "io/ktor/http/URLParser.kt",
     "io/ktor/http/Url.kt",
+    # Body content layer (the request/response payload representation both
+    # cores build on): the sealed `OutgoingContent` + the concrete
+    # `TextContent` / `ByteArrayContent`.
+    "io/ktor/http/content/OutgoingContent.kt",
+    "io/ktor/http/content/TextContent.kt",
+    "io/ktor/http/content/ByteArrayContent.kt",
 ]
 
 # Platform `actual`s for the ktor-http `expect`s. The posix variant is pure
@@ -120,6 +131,11 @@ id = "kotlinx.coroutines"
 
 [[deps]]
 id = "kotlinx.atomicfu"
+
+# `io.ktor.utils.io` channel types (`ByteReadChannel`/`ByteWriteChannel`) and
+# the `OutgoingContent` body layer are backed by kotlinx.io `Buffer`/`Source`.
+[[deps]]
+id = "kotlinx.io"
 
 # Cargo-style features mirroring ktor's Gradle module structure. The
 # core (io.ktor.http types under shim/core) is ungated and always loads;

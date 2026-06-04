@@ -424,6 +424,7 @@ impl Parser<'_, '_> {
                     function: None,
                     definitely_non_null: false,
                     annotations: Vec::new(),
+                    qualified_path: None,
                 })
             } else {
                 // No colon and the caller allows it: synthesise an
@@ -439,6 +440,7 @@ impl Parser<'_, '_> {
                     function: None,
                     definitely_non_null: false,
                     annotations: Vec::new(),
+                    qualified_path: None,
                 }
             };
             let mut default = None;

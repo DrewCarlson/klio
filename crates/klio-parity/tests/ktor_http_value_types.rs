@@ -93,6 +93,49 @@ fn run(file: &Path) -> String {
 }
 
 #[test]
+fn ktor_content_types_from_upstream() {
+    install_ktor_pack();
+
+    // The `io.ktor.http.content` body layer consumed from upstream:
+    // `OutgoingContent` (sealed) + `TextContent` / `ByteArrayContent`
+    // (concrete subclasses of the nested `OutgoingContent.ByteArrayContent`).
+    // Exercises the content type / length / bytes, the `OutgoingContent`
+    // extension `isEmpty()`, and `is`-checks against both the sealed root and
+    // the nested variant — the latter needing the qualified-nested-supertype
+    // resolution (a top-level `ByteArrayContent` extending the same-named
+    // nested class).
+    let src = r#"
+import io.ktor.http.*
+import io.ktor.http.content.*
+
+fun main() {
+    val t = TextContent("hello world", ContentType.Text.Plain)
+    println("${t.text}|${t.contentType}|${t.contentLength}|${t.bytes().size}")
+
+    val b = ByteArrayContent(byteArrayOf(1, 2, 3, 4), ContentType.Application.OctetStream)
+    println("${b.contentLength}|${b.bytes().size}|${b.contentType}")
+
+    val c: OutgoingContent = t
+    println("${c.isEmpty()}|${t is OutgoingContent}|${b is OutgoingContent.ByteArrayContent}")
+}
+"#;
+
+    let dir = std::env::temp_dir().join("klio_ktor_content");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.kt");
+    std::fs::write(&file, src).unwrap();
+
+    let got = run(&file);
+    assert_eq!(
+        got,
+        "hello world|text/plain|11|11\n\
+         4|4|application/octet-stream\n\
+         false|true|true\n",
+        "ktor content-type output drifted"
+    );
+}
+
+#[test]
 fn ktor_header_value_types_from_upstream() {
     install_ktor_pack();
 

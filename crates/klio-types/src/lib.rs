@@ -467,6 +467,7 @@ mod tests {
             function: None,
             definitely_non_null: false,
             annotations: Vec::new(),
+            qualified_path: None,
         }
     }
 

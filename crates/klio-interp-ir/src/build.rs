@@ -19,8 +19,8 @@ use klio_runtime::{ClassDef, ClassParamDef, PropertyDef};
 
 mod lift;
 use lift::{
-    lift_class_recursive, rewrite_block_field, substitute_field_with_this,
-    synthesize_class_from_object,
+    collect_used_qualified_supertypes, lift_class_recursive, rewrite_block_field,
+    substitute_field_with_this, synthesize_class_from_object,
 };
 
 /// Result of building an IR module from a single Kotlin file.
@@ -523,6 +523,11 @@ fn build_module_with_overrides(
     // all class names are known: (referencing-class-simple-name,
     // object-simple-name, mangled-name).
     let mut pending_object_aliases: Vec<(String, String, String)> = Vec::new();
+    // Nested classes mangled to `Outer$Name` on a top-level name collision:
+    // qualified source name (`Outer.Name`) → mangled name. A post-pass
+    // rewrites subclass supertype references to the mangled name.
+    let mut mangled_nested: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     // Simple names declared as a true *top-level* class/object anywhere in
     // the (merged) module. A nested `object` lifted to top level under its
     // bare name would overwrite a same-named top-level class in the global
@@ -540,6 +545,13 @@ fn build_module_with_overrides(
             _ => None,
         })
         .collect();
+    // The set of qualified supertype paths actually used (`Outer.Name`, last
+    // two segments). A nested class is only mangled to `Outer$Name` when some
+    // class extends it this way — the self-collision that breaks the class
+    // table. Without this, a nested type whose simple name merely coincides
+    // with an unrelated (e.g. stdlib) type — `TrafficLight.State` vs a
+    // stdlib `State` — would be mangled and its bare references broken.
+    let used_qualified_supertypes = collect_used_qualified_supertypes(&file.decls);
     let mut all_decls: Vec<Decl> = Vec::with_capacity(file.decls.len());
     for d in &file.decls {
         match d {
@@ -599,6 +611,8 @@ fn build_module_with_overrides(
                     &mut enclosing_class,
                     &mut nested_object_aliases,
                     &top_level_type_names,
+                    &mut mangled_nested,
+                    &used_qualified_supertypes,
                 );
                 all_decls.push(d.clone());
             }
@@ -614,6 +628,35 @@ fn build_module_with_overrides(
             .entry(cls)
             .or_default()
             .insert(simple, mangled);
+    }
+    // Repoint supertype references to a nested class that was mangled on a
+    // top-level name collision: a subclass `X : Outer.Inner` parses its
+    // supertype with `qualified_path = "Outer.Inner"`, while `name` kept the
+    // colliding bare `Inner`. Rewrite the bare name to the mangled
+    // `Outer$Inner` so parent resolution, `is`-checks, and ctor chaining
+    // bind the real nested class instead of the same-named top-level one.
+    if !mangled_nested.is_empty() {
+        let resolve = |t: &klio_ast::TypeRef| -> Option<String> {
+            let qp = t.qualified_path.as_ref()?;
+            // Match on the last two segments (`Outer.Inner`); the source may
+            // carry a package prefix the map key omits.
+            let segs: Vec<&str> = qp.split('.').collect();
+            let key = if segs.len() >= 2 {
+                format!("{}.{}", segs[segs.len() - 2], segs[segs.len() - 1])
+            } else {
+                qp.clone()
+            };
+            mangled_nested.get(&key).cloned()
+        };
+        for d in &mut all_decls {
+            if let Decl::Class(c) = d {
+                for t in &mut c.supertypes {
+                    if let Some(mangled) = resolve(t) {
+                        t.name.name = mangled;
+                    }
+                }
+            }
+        }
     }
     // The inline lift loop below has been replaced by
     // `lift_class_recursive`. Disable the original arm so it

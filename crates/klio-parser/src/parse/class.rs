@@ -644,6 +644,7 @@ impl Parser<'_, '_> {
                 function: None,
                 definitely_non_null: false,
                 annotations: Vec::new(),
+                qualified_path: None,
             });
             let mut default = None;
             self.skip_nl();
