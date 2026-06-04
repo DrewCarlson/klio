@@ -46,6 +46,14 @@ include = [
     "io/ktor/http/ContentTypes.kt",
     "io/ktor/http/Headers.kt",
     "io/ktor/http/Parameters.kt",
+    "io/ktor/http/CacheControl.kt",
+    "io/ktor/http/ContentTypeMatcher.kt",
+    "io/ktor/http/HttpMessage.kt",
+    "io/ktor/http/LinkHeader.kt",
+    "io/ktor/http/RequestConnectionPoint.kt",
+    "io/ktor/http/Ranges.kt",
+    "io/ktor/http/ContentRange.kt",
+    "io/ktor/http/RangesSpecifier.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
