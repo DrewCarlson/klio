@@ -2108,7 +2108,7 @@ fn const_matches(module: &Module, id: crate::ConstId, v: &Value) -> bool {
     Value::structural_eq(&lhs, v)
 }
 
-fn const_to_value(c: &Const) -> Value {
+pub fn const_to_value(c: &Const) -> Value {
     match c {
         Const::Unit => Value::Unit,
         Const::Int(i) => Value::Int(*i),

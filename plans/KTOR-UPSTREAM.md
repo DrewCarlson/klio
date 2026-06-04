@@ -413,11 +413,23 @@ upstream and delete the request-member shims.
    URLBuilder.Companion.origin: String` (used by `private val originUrl =
    Url(origin)` in the companion): a klio `actual val
    URLBuilder.Companion.origin get() = "http://localhost"` is not picked up —
-   the bare `origin` inside the companion initializer mis-resolves to
-   `get_field(companion, "origin")` (a missing field) rather than the
-   extension-property getter. Next: resolve a bare reference to an extension
-   *property* on the enclosing companion to its getter (the `extension_props`
-   path doesn't fire for the companion receiver here); then `Url` consumes.
+   the bare `origin` mis-resolved to `get_field(companion, "origin")`. **Fixed
+   (landed):** `get_field` on a companion instance now also probes
+   `extension_props` under the outer class name (the part before `$Companion`),
+   so `URLBuilder.Companion.origin` (registered under `URLBuilder`) resolves.
+   **Then blocked on** the `port = DEFAULT_PORT` primary-ctor default reading
+   `Null` because `URLBuilder.Companion`'s eager `val originUrl = Url(origin)`
+   runs at load before the top-level `const val DEFAULT_PORT` global is set —
+   **also fixed (landed):** a primary-ctor default that is a bare top-level
+   `const val` is resolved from the const registry at construction time.
+   **Current blocker:** pack load still throws `BinOp::LessEq on Int(0) and
+   Null` from `URLBuilder.Companion`'s `val originUrl = Url(origin)` — i.e.
+   constructing `Url("http://localhost")` (the `Url(String)` factory →
+   `URLBuilder(urlString).build()` → parser) yields a `Null` port/specifiedPort
+   for a port-less URL, so `require(specifiedPort in 0..65535)` fails. Next:
+   trace the `Url(String)` / `URLBuilder(String)` parse path and ensure a
+   port-less URL's `specifiedPort` defaults to `DEFAULT_PORT` (0), not `Null`.
+   Then `Url` / `URLBuilder` / `URLParser` consume (serialization not required).
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.

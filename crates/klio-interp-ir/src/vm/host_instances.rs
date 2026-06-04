@@ -118,11 +118,34 @@ impl VmHost<'_> {
                     .enumerate()
                     .map(|(idx, slot)| {
                         slot.unwrap_or_else(|| {
-                            class_def
+                            let dflt = class_def
                                 .as_ref()
                                 .and_then(|d| d.primary_params.get(idx))
-                                .and_then(|p| p.default.as_ref())
-                                .and_then(|e| default_value_for_primary(e))
+                                .and_then(|p| p.default.as_ref());
+                            dflt.and_then(|e| default_value_for_primary(e))
+                                // A primary-ctor default that is a bare
+                                // reference to a top-level `const val`
+                                // (`port: Int = DEFAULT_PORT`) is evaluated
+                                // here from the raw AST; resolve the constant
+                                // from the const registry so it isn't `Null`
+                                // when a companion/object init constructs the
+                                // class at load before the const's global slot
+                                // is set (`URLBuilder.Companion`'s
+                                // `Url(origin)`).
+                                .or_else(|| {
+                                    if let Some(e) = dflt
+                                        && let klio_ast::Expr::Path { segments, .. } = e.as_ref()
+                                        && segments.len() == 1
+                                    {
+                                        return self
+                                            .module
+                                            .registry
+                                            .class_const_inits
+                                            .get(&(String::new(), segments[0].name.clone()))
+                                            .map(klio_ir::eval::const_to_value);
+                                    }
+                                    None
+                                })
                                 .unwrap_or(klio_runtime::Value::Null)
                         })
                     })
@@ -564,7 +587,26 @@ impl VmHost<'_> {
             for idx in effective_args.len()..n_primary {
                 let p = &class_def.primary_params[idx];
                 let v = match &p.default {
-                    Some(e) => default_value_for_primary(e).unwrap_or(klio_runtime::Value::Null),
+                    Some(e) => default_value_for_primary(e)
+                        // A bare top-level `const val` default
+                        // (`port: Int = DEFAULT_PORT`) is resolved from the
+                        // const registry, so it isn't `Null` when a companion
+                        // / object initializer constructs the class at load
+                        // before the const's global slot is set.
+                        .or_else(|| {
+                            if let klio_ast::Expr::Path { segments, .. } = e.as_ref()
+                                && segments.len() == 1
+                            {
+                                return self
+                                    .module
+                                    .registry
+                                    .class_const_inits
+                                    .get(&(String::new(), segments[0].name.clone()))
+                                    .map(klio_ir::eval::const_to_value);
+                            }
+                            None
+                        })
+                        .unwrap_or(klio_runtime::Value::Null),
                     None => klio_runtime::Value::Null,
                 };
                 effective_args.push(v);

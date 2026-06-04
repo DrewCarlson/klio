@@ -932,8 +932,26 @@ fn build_module_with_overrides(
         let mut class_const_inits: std::collections::HashMap<(String, String), klio_ir::Const> =
             std::collections::HashMap::new();
         for d in decls {
-            if let Decl::Class(c) = d {
-                collect_consts(&c.name.name, &c.members, &mut class_const_inits);
+            match d {
+                Decl::Class(c) => {
+                    collect_consts(&c.name.name, &c.members, &mut class_const_inits);
+                }
+                // Top-level `const val` (`public const val DEFAULT_PORT = 0`)
+                // is a compile-time constant; register it under the sentinel
+                // empty-class key so a bare reference inlines the literal
+                // (Kotlin's `const val` semantics). Without inlining, a
+                // reference read as a runtime global is `Null` when an eager
+                // companion/object initializer runs at load before the const's
+                // own slot is set (`URLBuilder.Companion`'s `Url(origin)` reads
+                // `port = DEFAULT_PORT`).
+                Decl::Property(p) if p.is_const => {
+                    if let Some(init) = &p.init
+                        && let Some(c) = literal_to_const(init)
+                    {
+                        class_const_inits.insert((String::new(), p.name.name.clone()), c);
+                    }
+                }
+                _ => {}
             }
         }
         module.registry.class_const_inits = class_const_inits;
