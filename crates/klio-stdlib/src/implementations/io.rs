@@ -1,4 +1,4 @@
-use super::{Arc, BufRead, CallCtx, RuntimeError, Value};
+use super::{Arc, BufRead, CallCtx, RuntimeError, Value, make_exception};
 
 // ============================================================
 // io
@@ -68,5 +68,21 @@ pub(crate) fn io_read_line(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             Ok(Value::String(Arc::new(buf)))
         }
         Err(e) => Err(RuntimeError::Type(format!("readLine failed: {e}"))),
+    }
+}
+
+/// `readlnOrNull()` — identical to `readLine()` (String, or null at EOF).
+pub(crate) fn io_readln_or_null(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    io_read_line(ctx)
+}
+
+/// `readln()` — `readLine()` but throwing `RuntimeException` at EOF.
+pub(crate) fn io_readln(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    match io_read_line(ctx)? {
+        Value::Null => Err(RuntimeError::Thrown(make_exception(
+            "kotlin.RuntimeException",
+            Some("EOF has been reached".to_string()),
+        ))),
+        v => Ok(v),
     }
 }

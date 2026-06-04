@@ -52,6 +52,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.io.print", io_print),
     ("kotlin.io.println", io_println),
     ("kotlin.io.readLine", io_read_line),
+    ("kotlin.io.readln", io_readln),
+    ("kotlin.io.readlnOrNull", io_readln_or_null),
     // ----- math (functions) -----
     ("kotlin.math.abs", math_abs),
     ("kotlin.math.absoluteValue", math_abs),
