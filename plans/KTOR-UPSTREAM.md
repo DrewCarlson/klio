@@ -301,16 +301,28 @@ upstream and delete the request-member shims.
 
 ## Open blockers (next, in order)
 
-1. **ktor-http remainder — `Url` / `URLBuilder` / `Codecs`.** `URLParser.kt`
-   imports only `io.ktor.util.*` (consumed) and is likely ready. `Codecs.kt`
-   (percent-encoding) imports `io.ktor.utils.io.charsets.*` /
-   `io.ktor.utils.io.core.*` / `kotlinx.io.*` — it needs the byte-level charset
-   **encode/decode** surface (currently the klio `Charset` actual only does
-   name/forName) and the kotlinx-io core. `Url.kt` is `@Serializable` and imports
-   `kotlinx.serialization.*` (descriptors/encoding). So this layer pulls the
-   charset-codec intrinsics + a serializable value type; consume `URLParser` /
-   `URLBuilder` first, then extend the `Charset` actual with encode/decode for
-   `Codecs`.
+1. **ktor-http remainder — `Url` / `URLBuilder` / `Codecs`.** `URLBuilder`
+   hard-depends on `Codecs` (`encodeURLParameter`/`encodeURLQueryComponent`/…), so
+   `Codecs.kt` is the gate. Its percent-encoding needs exactly two things (both
+   now scoped precisely from the source):
+   - **`CharsetEncoder.encode(...)`** — `charset.newEncoder().encode(s)` /
+     `encode(s, from, to)` returning a kotlinx.io `Source` of the bytes. The klio
+     `Charset` actual must gain `newEncoder()` + `encode` (UTF-8 / ISO-8859-1),
+     building a kotlinx.io `Buffer`. (Decode needs **no** `CharsetDecoder` —
+     `decodeImpl` uses `ByteArray.decodeToString()`, already an intrinsic.)
+   - **ktor-io `io.ktor.utils.io.core` Buffer/Source layer.** Codecs' own
+     `Source.forEach` calls `source.takeWhile { chunk -> while (chunk.canRead())
+     block(chunk.readByte()) }`. `takeWhile`/`canRead` are *consumable upstream*
+     — they live in ktor-io `common/src/io/ktor/utils/io/core/{ByteReadPacket,Buffer}.kt`
+     (not kotlinx.io). `Source.takeWhile(block: (kotlinx.io.Buffer) -> Boolean)`
+     walks the underlying **kotlinx.io Buffer segments via `segment.length`**,
+     which klio's kotlinx.io Buffer doesn't expose (`Vm::get_field \`length\`
+     on \`<instance>\``; `Buffer.write`/`readByte`/`exhausted` *do* work). So this
+     needs consuming the ktor-io core compat layer **and** the kotlinx.io Buffer
+     segment surface — a distinct subsystem from the charset actual.
+   `Url.kt` is additionally `@Serializable` (imports `kotlinx.serialization.*`).
+   So the gate is three components: the `CharsetEncoder.encode` actual, the
+   ktor-io core Buffer/Source layer, and the kotlinx.io Buffer-segment surface.
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.
