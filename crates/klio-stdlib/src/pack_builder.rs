@@ -236,6 +236,7 @@ const KLIO_STDLIB_ACTUAL_FILES: &[&str] = &[
     "kotlin-collections/CollectionsActuals.kt",
     "kotlin-io/Closeable.kt",
     "kotlin-io/Serializable.kt",
+    "kotlin-io/encoding/Base64Actuals.kt",
     "kotlin-internal/SerializationActuals.kt",
     "kotlin-util/LazyActuals.kt",
 ];
