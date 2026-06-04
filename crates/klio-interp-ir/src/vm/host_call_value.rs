@@ -116,12 +116,31 @@ impl VmHost<'_> {
             });
             return Ok(klio_runtime::Value::Instance(inst));
         }
-        // `propRef(receiver)` — invoking a Value::PropertyRef as a
-        // callable reads the named field from the first arg.
-        if let klio_runtime::Value::PropertyRef { name } = callee
-            && args.len() == 1
-        {
-            return self.get_field(&args[0], name);
+        // Invoking a `Value::PropertyRef` (`::name`). A callable reference
+        // to a top-level function (`::tag`) calls that function with the
+        // args — preferred over the property reading, since a default-arg
+        // thunk lowered before the function was registered records the
+        // reference as a `PropertyRef` rather than a `LoadGlobal`. A
+        // genuine property reference (`::prop`) invoked with one arg reads
+        // the named field from that arg (`KProperty1.get(receiver)`).
+        if let klio_runtime::Value::PropertyRef { name } = callee {
+            let is_fn = self.module.func_id(name).is_some()
+                || matches!(
+                    self.lookup_global(name),
+                    Some(
+                        klio_runtime::Value::Function { .. }
+                            | klio_runtime::Value::IrClosure { .. }
+                            | klio_runtime::Value::Lambda { .. }
+                    )
+                );
+            if is_fn {
+                if let Some(callable) = self.lookup_global(name) {
+                    return self.call_value(&callable, args);
+                }
+            }
+            if args.len() == 1 {
+                return self.get_field(&args[0], name);
+            }
         }
         // Bound method/property reference: synthetic instance
         // carrying a receiver + method name. Invocation forwards

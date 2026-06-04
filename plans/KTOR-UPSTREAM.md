@@ -645,14 +645,43 @@ interpreter fixes got there, each with a kotlinc-parity corpus test:
   `is`-checks resolve, and the hierarchy is correct. Covered by
   `self_named_nested_supertype.kt`.
 
+## Channel streaming subsystem — probed; one fix landed, one deep blocker
+
+A probe consuming the concrete `ByteChannel` + its read/write operations (the
+streaming layer behind the `ByteReadChannel`/`ByteWriteChannel` interfaces)
+established what is needed and surfaced the gating issue:
+
+- klio actuals for the `io.ktor.utils.io.locks` expects (`SynchronizedObject` /
+  `ReentrantLock` / `synchronized` / `withLock` — single-threaded no-ops that
+  still run their block) and `DEVELOPMENT_MODE = false` let the channel files
+  load cleanly. The `BytePacketBuilder` / `buildPacket` core helpers
+  (`Sink`/`Buffer` typealiases) are needed too.
+- **Landed — a member function's function-reference default parameter (`::fn`)
+  now calls the referenced function.** A method's default-arg thunk is lowered
+  before top-level functions are registered, so `::fn` records a `PropertyRef`
+  (not a `LoadGlobal`); invoking that reference previously read a property
+  rather than calling the function (so `f(x)` returned the function value, and
+  `f.invoke(x)` likewise). `call_value` / `call_member` now call the referenced
+  top-level function when a `PropertyRef` names one. Covered by
+  `method_fn_ref_default_param.kt` (kotlinc byte-parity).
+- **Deep blocker — `ByteChannel`'s async suspension does not resolve under
+  klio's cooperative driver.** A write→`flushAndClose`→`readRemaining` round
+  trip fails: `_closedCause.value` (an `atomic<CloseToken?>`) reads back a
+  `kotlinx.coroutines.internal.Symbol` sentinel rather than the `CloseToken`,
+  because `readRemaining`'s `awaitContent()` loop suspends through
+  `suspendCancellableCoroutine` and the channel's `Slot` state machine, which
+  klio's driver mishandles. The channel files are *not* wired into the pack
+  pending coroutine-suspension fidelity for this shape (single isolated tests
+  of `atomic` CAS, multiple atomic fields, ctor-/fn-reference defaults, and the
+  `CloseToken` pattern all pass — the failure is specific to the suspending
+  read loop).
+
 ## Status
 
 The protocol foundation, the full URL layer, `Attributes`, the **Pipeline
 runtime**, and the **body content layer** consume real upstream and execute.
-Next: the `io.ktor.utils.io` channel streaming subsystem (the `ByteChannel` +
-read/write operations behind the channel interfaces), then switch the
-client/server **cores** onto upstream `Pipeline`/`PipelineContext` — removing
-the simplified `Application` / `ApplicationCall` / `HttpClient` shim
-redeclarations. The shim
-stays in place so client/server keep working until each layer's upstream
-replacement is validated.
+Next: resolve the channel-suspension blocker to consume the `io.ktor.utils.io`
+streaming subsystem, then switch the client/server **cores** onto upstream
+`Pipeline`/`PipelineContext` — removing the simplified `Application` /
+`ApplicationCall` / `HttpClient` shim redeclarations. The shim stays in place so
+client/server keep working until each layer's upstream replacement is validated.

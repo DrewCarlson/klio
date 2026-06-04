@@ -1202,6 +1202,24 @@ impl VmHost<'_> {
         // reads the named property from the receiver. `hashCode`
         // and `equals` route to structural equality on the name.
         if let klio_runtime::Value::PropertyRef { name: pname } = receiver {
+            // A callable reference (`::tag`) — `.invoke(args)` / `.call(args)`
+            // calls the referenced top-level function. A default-arg thunk
+            // lowered before the function was registered records `::tag` as a
+            // `PropertyRef`, so route the invocation to the function here.
+            if matches!(name, "invoke" | "call")
+                && (self.module.func_id(pname).is_some()
+                    || matches!(
+                        self.lookup_global(pname),
+                        Some(
+                            klio_runtime::Value::Function { .. }
+                                | klio_runtime::Value::IrClosure { .. }
+                                | klio_runtime::Value::Lambda { .. }
+                        )
+                    ))
+                && let Some(callable) = self.lookup_global(pname)
+            {
+                return self.call_value(&callable, args);
+            }
             match (name, args.len()) {
                 ("get" | "call" | "invoke", 1) => {
                     return self.get_field(&args[0], pname);
