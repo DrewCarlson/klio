@@ -1392,6 +1392,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
         coll_iter_min_by_or_null,
     ),
     ("kotlin.collections.MutableList.sort", coll_mut_list_sort),
+    ("kotlin.collections.MutableList.sortWith", coll_mut_list_sort_with),
+    ("kotlin.collections.MutableList.fill", coll_mut_list_fill),
     (
         "kotlin.collections.MutableList.reverse",
         coll_mut_list_reverse,

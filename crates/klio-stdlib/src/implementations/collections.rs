@@ -502,6 +502,54 @@ pub(crate) fn coll_mut_list_sort(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
     Ok(Value::Unit)
 }
 
+/// `MutableList.sortWith(comparator)` — stable in-place sort by a
+/// comparator value (a `Comparator` / lambda invoked with two elements,
+/// returning the sign of their order). A bodyless `expect` otherwise.
+pub(crate) fn coll_mut_list_sort_with(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let it = recv_list_items(ctx.args, "MutableList.sortWith")?;
+    let cmp = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("sortWith expects (comparator)".into()))?;
+    let mut copy: Vec<Value> = it.borrow().clone();
+    let CallCtx { out, host, .. } = ctx;
+    let mut err: Option<RuntimeError> = None;
+    copy.sort_by(|a, b| {
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match invoke_comparator_compare(*host, &cmp, a, b, *out) {
+            Ok(n) => n.cmp(&0),
+            Err(e) => {
+                err = Some(e);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    *it.borrow_mut() = copy;
+    Ok(Value::Unit)
+}
+
+/// `MutableList.fill(value)` — replace every element with `value`,
+/// in place. A bodyless `expect` otherwise.
+pub(crate) fn coll_mut_list_fill(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let it = recv_list_items(ctx.args, "MutableList.fill")?;
+    let value = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("fill expects (value)".into()))?;
+    let mut buf = it.borrow_mut();
+    for slot in buf.iter_mut() {
+        *slot = value.clone();
+    }
+    Ok(Value::Unit)
+}
+
 /// `MutableList.reverse()` — reverse the list in place, returns `Unit`.
 /// Upstream `Array<T>.reversed()` / `IntArray.sortedDescending()` build
 /// on this via `toMutableList().reverse()`, so without it those return
