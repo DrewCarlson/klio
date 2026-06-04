@@ -128,6 +128,122 @@ pub(crate) fn append_value(buf: &mut String, v: &Value) {
     }
 }
 
+/// The UTF-16 units of a `CharArray` / `CharSequence` / `Char` argument,
+/// for the range ops. Computed before borrowing the receiver so a
+/// self-referential insert can't double-borrow.
+fn value_to_utf16(v: &Value) -> Option<Vec<u16>> {
+    match v {
+        Value::String(s) => Some(s.encode_utf16().collect()),
+        Value::StringBuilder(sb) => Some(sb.borrow().encode_utf16().collect()),
+        Value::Char(u) => Some(vec![*u]),
+        Value::Array { items, .. } => items
+            .borrow()
+            .iter()
+            .map(|e| {
+                if let Value::Char(u) = e {
+                    Some(*u)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+fn range_oob(msg: String) -> RuntimeError {
+    RuntimeError::Thrown(make_exception("kotlin.IndexOutOfBoundsException", Some(msg)))
+}
+
+/// `StringBuilder.setRange(startIndex, endIndex, value: String)` — replace
+/// the UTF-16 units in `[startIndex, endIndex)` with `value`. A bodyless
+/// `expect` otherwise.
+pub(crate) fn string_builder_set_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let sb = sb_arg(ctx.args, "StringBuilder.setRange")?;
+    let start = ctx.args.get(1).and_then(Value::as_i64).unwrap_or(0);
+    let end = ctx.args.get(2).and_then(Value::as_i64).unwrap_or(0);
+    let value = ctx
+        .args
+        .get(3)
+        .and_then(value_to_utf16)
+        .ok_or_else(|| RuntimeError::Type("setRange value must be a String".into()))?;
+    let mut buf = sb.borrow_mut();
+    let mut units: Vec<u16> = buf.encode_utf16().collect();
+    let len = units.len() as i64;
+    if start < 0 || start > len || start > end || end > len {
+        return Err(range_oob(format!(
+            "startIndex: {start}, endIndex: {end}, length: {len}"
+        )));
+    }
+    #[allow(clippy::cast_sign_loss)]
+    units.splice(start as usize..end as usize, value);
+    *buf = String::from_utf16_lossy(&units);
+    drop(buf);
+    Ok(Value::StringBuilder(sb))
+}
+
+/// `StringBuilder.appendRange(value, startIndex, endIndex)` — append
+/// `value[startIndex, endIndex)` (CharArray or CharSequence). A bodyless
+/// `expect` otherwise.
+pub(crate) fn string_builder_append_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let sb = sb_arg(ctx.args, "StringBuilder.appendRange")?;
+    let value = ctx
+        .args
+        .get(1)
+        .and_then(value_to_utf16)
+        .ok_or_else(|| RuntimeError::Type("appendRange value must be a CharArray/CharSequence".into()))?;
+    let start = ctx.args.get(2).and_then(Value::as_i64).unwrap_or(0);
+    let end = ctx.args.get(3).and_then(Value::as_i64).unwrap_or(value.len() as i64);
+    let vlen = value.len() as i64;
+    if start < 0 || start > end || end > vlen {
+        return Err(range_oob(format!(
+            "startIndex: {start}, endIndex: {end}, size: {vlen}"
+        )));
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let slice = &value[start as usize..end as usize];
+    let mut buf = sb.borrow_mut();
+    let mut units: Vec<u16> = buf.encode_utf16().collect();
+    units.extend_from_slice(slice);
+    *buf = String::from_utf16_lossy(&units);
+    drop(buf);
+    Ok(Value::StringBuilder(sb))
+}
+
+/// `StringBuilder.insertRange(index, value, startIndex, endIndex)` — insert
+/// `value[startIndex, endIndex)` at `index`. A bodyless `expect` otherwise.
+pub(crate) fn string_builder_insert_range(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let sb = sb_arg(ctx.args, "StringBuilder.insertRange")?;
+    let index = ctx.args.get(1).and_then(Value::as_i64).unwrap_or(0);
+    let value = ctx
+        .args
+        .get(2)
+        .and_then(value_to_utf16)
+        .ok_or_else(|| RuntimeError::Type("insertRange value must be a CharArray/CharSequence".into()))?;
+    let start = ctx.args.get(3).and_then(Value::as_i64).unwrap_or(0);
+    let end = ctx.args.get(4).and_then(Value::as_i64).unwrap_or(value.len() as i64);
+    let vlen = value.len() as i64;
+    if start < 0 || start > end || end > vlen {
+        return Err(range_oob(format!(
+            "startIndex: {start}, endIndex: {end}, size: {vlen}"
+        )));
+    }
+    let mut buf = sb.borrow_mut();
+    let mut units: Vec<u16> = buf.encode_utf16().collect();
+    let len = units.len() as i64;
+    if index < 0 || index > len {
+        return Err(range_oob(format!("index: {index}, length: {len}")));
+    }
+    #[allow(clippy::cast_sign_loss)]
+    units.splice(
+        index as usize..index as usize,
+        value[start as usize..end as usize].iter().copied(),
+    );
+    *buf = String::from_utf16_lossy(&units);
+    drop(buf);
+    Ok(Value::StringBuilder(sb))
+}
+
 pub(crate) fn string_builder_append(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let sb = sb_arg(ctx.args, "StringBuilder.append")?;
     {
