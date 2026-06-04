@@ -1292,12 +1292,41 @@ impl VmHost<'_> {
         if let klio_runtime::Value::Instance(inst) = receiver {
             if !bypass_setter {
                 let class_name = inst.borrow().class.name.clone();
-                if self
-                    .module
-                    .registry
-                    .delegated_body_props
-                    .contains(&(class_name.clone(), real_name.to_string()))
-                {
+                // Walk the supertype chain for a delegated body
+                // property: a `by`-delegated `var` declared on a base
+                // is written through a subclass instance, so the
+                // `(declaring-class, prop)` key is an ancestor's. The
+                // backing field slot is still present on this instance
+                // (instances inherit superclass body fields), so route
+                // the write through the delegate's `setValue` rather
+                // than overwriting the slot with the raw value.
+                let is_delegated = {
+                    let mut found = false;
+                    let mut cur = Some(class_name.clone());
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    while let Some(cn) = cur.take() {
+                        if !seen.insert(cn.clone()) {
+                            break;
+                        }
+                        if self
+                            .module
+                            .registry
+                            .delegated_body_props
+                            .contains(&(cn.clone(), real_name.to_string()))
+                        {
+                            found = true;
+                            break;
+                        }
+                        cur = self
+                            .classes
+                            .borrow()
+                            .get(&cn)
+                            .and_then(|d| d.supertype_names.first().cloned());
+                    }
+                    found
+                };
+                if is_delegated {
                     let raw = inst.borrow().get(real_name);
                     if let Some(d) = raw {
                         let prop_ref = klio_runtime::Value::PropertyRef {
@@ -1312,12 +1341,35 @@ impl VmHost<'_> {
                         return Ok(());
                     }
                 }
-                if let Some(fid) = self
-                    .prog
-                    .instance_prop_setters
-                    .get(&(class_name, real_name.to_string()))
-                    .copied()
-                {
+                // Probe the instance's class then its supertype chain
+                // for a custom property setter declared on a base.
+                let setter_fid = {
+                    let mut found: Option<klio_ir::FuncId> = None;
+                    let mut cur = Some(class_name.clone());
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    while let Some(cn) = cur.take() {
+                        if !seen.insert(cn.clone()) {
+                            break;
+                        }
+                        if let Some(fid) = self
+                            .prog
+                            .instance_prop_setters
+                            .get(&(cn.clone(), real_name.to_string()))
+                            .copied()
+                        {
+                            found = Some(fid);
+                            break;
+                        }
+                        cur = self
+                            .classes
+                            .borrow()
+                            .get(&cn)
+                            .and_then(|d| d.supertype_names.first().cloned());
+                    }
+                    found
+                };
+                if let Some(fid) = setter_fid {
                     let func = self
                         .module
                         .funcs

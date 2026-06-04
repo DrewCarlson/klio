@@ -562,20 +562,44 @@ surfaced are fixed and committed (kotlinc-parity corpus tests):
   (`PhaseContent`'s `: this(phase, relation, SharedArrayList)`)
   (`companion_member_in_secondary_ctor.kt`).
 
-The wiring is **reverted for now** (it makes coroutines/atomicfu hard deps of the
-core pack, which the value-type tests don't install) pending the next blocker:
-`pipeline.execute(...)` fails with `get_field size on Unit` inside the
-`DebugPipelineContext`/`Pipeline` interceptor-cache machinery (the
-`by atomic(null)` interceptor list or a phase-content list reads `Unit`). Next:
-trace that, then re-wire Pipeline (likely behind making coroutines/atomicfu core
-deps + adding them to the value-type test installs).
+The wiring is now **landed** — coroutines + atomicfu are core deps of the pack
+(the `ktor_http_value_types` install adds coroutines). See the next section.
+
+## Pipeline runtime — consumed and executing
+
+`Pipeline.execute(context, subject)` threads a subject through phase-ordered
+interceptors via `DebugPipelineContext`'s proceed loop, with `proceedWith`
+rewriting the subject between interceptors. `ktor_pipeline_from_upstream`
+verifies a two-phase, multi-interceptor pipeline end to end (`[core]!`, `ABC`).
+The earlier `size on Unit` blocker resolved to three root-cause
+interpreter/stdlib bugs, each with a kotlinc-parity corpus test:
+
+- a `by`-delegated `var` declared on a superclass, written through a subclass
+  instance, overwrote the backing slot with the raw value instead of routing
+  through the delegate's `setValue` — the set path checked
+  `delegated_body_props` only under the instance's own class, not the declaring
+  ancestor. `set_field` now walks the supertype chain for both the delegate and
+  a custom property setter (matching the get path). This is `Pipeline`'s
+  `private var interceptors: …? by atomic(null)`: a stale `Unit` in the slot
+  made `interceptors == null` false, so `cacheInterceptors()` never ran and
+  `DebugPipelineContext` got `Unit` for its interceptor list
+  (`inherited_delegate_setter.kt`).
+- `mutableListOf(vararg)` / `arrayListOf(vararg)` returned `Unit` when called
+  from a member function: a bare call inside a method lowers to
+  `CallMemberOrGlobal`, whose overload path runs the function *body*
+  (`elements.asArrayList()`) rather than the intrinsic, and `asArrayList` — an
+  internal `expect` — had no actual, so it no-opped to `Unit`. Added the
+  `Array.asArrayList()` / `Array.asList()` intrinsics the vararg builders
+  delegate to (`vararg_builder_in_method.kt`).
+- `ArrayList.ensureCapacity` / `trimToSize` were unimplemented; `PhaseContent.
+  addTo` calls `destination.ensureCapacity(…)` when `destination is ArrayList`.
+  Added both as no-op capacity hints (`arraylist_ensure_capacity.kt`).
 
 ## Status
 
-The protocol foundation, the full URL layer, and `Attributes` are consuming real
-upstream; the Pipeline files load (two prerequisite fixes landed) but its
-execution has a remaining `size on Unit` bug. Then the client/server **cores**
-onto upstream `Pipeline`/`PipelineContext`, which removes the simplified
-`Application` / `ApplicationCall` / `HttpClient` shim redeclarations. The shim
-stays in place so client/server keep working until each layer's upstream
-replacement is validated.
+The protocol foundation, the full URL layer, `Attributes`, and the **Pipeline
+runtime** are consuming real upstream and executing. Next: switch the
+client/server **cores** onto upstream `Pipeline`/`PipelineContext`, which
+removes the simplified `Application` / `ApplicationCall` / `HttpClient` shim
+redeclarations. The shim stays in place so client/server keep working until
+each layer's upstream replacement is validated.

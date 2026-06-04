@@ -39,15 +39,33 @@ include = [
     "io/ktor/util/StringValues.kt",
     "io/ktor/util/reflect/Type.kt",
     "io/ktor/util/Attributes.kt",
+    # Pipeline runtime (spine of both cores). Engine = DebugPipelineContext
+    # (klio `DISABLE_SFG = true`); SuspendFunctionGun consumed but unused.
+    "io/ktor/util/debug/plugins/PluginName.kt",
+    "io/ktor/util/debug/plugins/PluginsTrace.kt",
+    "io/ktor/util/debug/IntellijIdeaDebugDetector.kt",
+    "io/ktor/util/debug/ContextUtils.kt",
+    "io/ktor/util/pipeline/PipelinePhase.kt",
+    "io/ktor/util/pipeline/PipelinePhaseRelation.kt",
+    "io/ktor/util/pipeline/PhaseContent.kt",
+    "io/ktor/util/pipeline/StackWalkingFailedFrame.kt",
+    "io/ktor/util/pipeline/StackWalkingFailed.kt",
+    "io/ktor/util/pipeline/StackTraceRecover.kt",
+    "io/ktor/util/pipeline/PipelineContext.kt",
+    "io/ktor/util/pipeline/DebugPipelineContext.kt",
+    "io/ktor/util/pipeline/SuspendFunctionGun.kt",
+    "io/ktor/util/pipeline/Pipeline.kt",
 ]
 
-# Platform `actual`s for the ktor-util reflect `expect`s (`Type`,
-# `KType.platformType`, `Any.instanceOf`). The posix variant is pure common
-# Kotlin (typealias to `KType`, `KClass.isInstance`).
+# Platform `actual`s for the ktor-util reflect + pipeline `expect`s. The posix
+# variants are pure common Kotlin. (`DISABLE_SFG` is supplied klio-side.)
 [[source]]
 root = "upstream/ktor-utils/posix/src"
 include = [
     "io/ktor/util/reflect/TypeInfoNative.kt",
+    "io/ktor/util/debug/IntellijIdeaDebugDetectorNative.kt",
+    "io/ktor/util/pipeline/PipelineNative.kt",
+    "io/ktor/util/pipeline/StackTraceRecoverNative.kt",
 ]
 
 [[source]]
@@ -94,6 +112,14 @@ include = [
 
 [[deps]]
 id = "stdlib"
+
+# Pipeline runtime deps: coroutines (`PipelineContext : CoroutineScope`,
+# suspend `proceed`) and atomicfu (`Pipeline`'s `by atomic(...)`).
+[[deps]]
+id = "kotlinx.coroutines"
+
+[[deps]]
+id = "kotlinx.atomicfu"
 
 # Cargo-style features mirroring ktor's Gradle module structure. The
 # core (io.ktor.http types under shim/core) is ungated and always loads;

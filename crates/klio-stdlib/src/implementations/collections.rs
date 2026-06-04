@@ -1188,6 +1188,27 @@ pub(crate) fn coll_ubyte_array_of(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
 pub(crate) fn coll_mutable_list_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_list(ctx.args.to_vec(), true))
 }
+
+/// `Array<out T>.asArrayList()` / `Array<out T>.asList()` — the internal
+/// stdlib helpers `mutableListOf(vararg)` / `listOf(vararg)` delegate to.
+/// The receiver array's elements back the resulting list. `asArrayList`
+/// yields a mutable list; `asList` a read-only one.
+fn array_recv_items(ctx: &CallCtx, who: &str) -> Result<Vec<Value>, RuntimeError> {
+    match ctx.args.first() {
+        Some(Value::Array { items, .. } | Value::List { items, .. } | Value::Set { items, .. }) => {
+            Ok(items.borrow().clone())
+        }
+        _ => Err(RuntimeError::Type(format!("{who} requires an array receiver"))),
+    }
+}
+pub(crate) fn coll_array_as_array_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = array_recv_items(ctx, "asArrayList")?;
+    Ok(make_list(items, true))
+}
+pub(crate) fn coll_array_as_list(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let items = array_recv_items(ctx, "asList")?;
+    Ok(make_list(items, false))
+}
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn coll_empty_list(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(make_list(Vec::new(), false))
@@ -1895,6 +1916,12 @@ pub(crate) fn coll_mut_list_clear(ctx: &mut CallCtx) -> Result<Value, RuntimeErr
     let it = recv_list_items(ctx.args, "MutableList.clear")?;
     it.borrow_mut().clear();
     sync_map_view(&ctx.args[0]);
+    Ok(Value::Unit)
+}
+
+/// `ArrayList.ensureCapacity` / `ArrayList.trimToSize` — capacity hints
+/// with no observable effect on a growable backing store.
+pub(crate) fn coll_array_list_capacity_noop(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Unit)
 }
 

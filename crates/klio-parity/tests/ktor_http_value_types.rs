@@ -46,6 +46,7 @@ fn install_ktor_pack() {
         // need the serialization stack.
         for crate_dir in [
             "klio-kotlinx-atomicfu",
+            "klio-kotlinx-coroutines",
             "klio-kotlinx-io",
             "klio-ktor-client",
         ] {
@@ -187,6 +188,53 @@ fun main() {
          [1, 3]\n\
          2\n",
         "ktor URL parsing output drifted"
+    );
+}
+
+#[test]
+fn ktor_pipeline_from_upstream() {
+    install_ktor_pack();
+
+    // The `io.ktor.util.pipeline` runtime (`Pipeline`, `PipelinePhase`,
+    // `PipelineContext`, `DebugPipelineContext`, `PhaseContent`) consumed
+    // verbatim from upstream commonMain — the execution spine of both the
+    // client and server cores. klio supplies the `DISABLE_SFG = true` actual
+    // so execution runs through `DebugPipelineContext`'s proceed loop.
+    // Exercises phase-ordered interception, `proceedWith` subject rewriting,
+    // and multiple interceptors in one phase across two pipelines.
+    let src = r#"
+import io.ktor.util.pipeline.*
+import kotlinx.coroutines.*
+
+val Setup = PipelinePhase("Setup")
+val Transform = PipelinePhase("Transform")
+
+class StringPipeline : Pipeline<String, Unit>(Setup, Transform)
+
+fun main() = runBlocking {
+    val p = StringPipeline()
+    p.intercept(Setup) { proceedWith("[" + subject) }
+    p.intercept(Transform) { proceedWith(subject + "]") }
+    p.intercept(Transform) { proceedWith(subject + "!") }
+    println(p.execute(Unit, "core"))
+
+    val q = StringPipeline()
+    q.intercept(Setup) { proceedWith(subject.uppercase()) }
+    println(q.execute(Unit, "abc"))
+}
+"#;
+
+    let dir = std::env::temp_dir().join("klio_ktor_pipeline");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.kt");
+    std::fs::write(&file, src).unwrap();
+
+    let got = run(&file);
+    assert_eq!(
+        got,
+        "[core]!\n\
+         ABC\n",
+        "ktor Pipeline execution output drifted"
     );
 }
 

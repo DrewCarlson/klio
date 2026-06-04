@@ -419,6 +419,8 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.ubyteArrayOf", coll_ubyte_array_of),
     ("kotlin.collections.mapOf", coll_map_of),
     ("kotlin.collections.mutableListOf", coll_mutable_list_of),
+    ("kotlin.collections.asArrayList", coll_array_as_array_list),
+    ("kotlin.collections.asList", coll_array_as_list),
     ("kotlin.collections.mutableMapOf", coll_mutable_map_of),
     ("kotlin.collections.mutableSetOf", coll_mutable_set_of),
     ("kotlin.collections.arrayListOf", coll_mutable_list_of),
@@ -789,6 +791,22 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.collections.List.toString", coll_list_to_string),
     ("kotlin.collections.MutableList.add", coll_mut_list_add),
     ("kotlin.collections.MutableList.clear", coll_mut_list_clear),
+    (
+        "kotlin.collections.MutableList.ensureCapacity",
+        coll_array_list_capacity_noop,
+    ),
+    (
+        "kotlin.collections.MutableList.trimToSize",
+        coll_array_list_capacity_noop,
+    ),
+    (
+        "kotlin.collections.ArrayList.ensureCapacity",
+        coll_array_list_capacity_noop,
+    ),
+    (
+        "kotlin.collections.ArrayList.trimToSize",
+        coll_array_list_capacity_noop,
+    ),
     (
         "kotlin.collections.MutableList.contains",
         coll_list_contains,
