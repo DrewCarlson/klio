@@ -239,17 +239,35 @@ upstream and delete the request-member shims.
 
 ## Open blockers (next, in order)
 
-1. **`ContentType.Application` nested object collides with the server's
-   `class Application`.** Consuming `ContentTypes.kt` (which declares nested
-   `object Application`/`Audio`/`Text`/… inside `ContentType`) makes the server
-   program's `embeddedServer { … }` module-receiver type `Application` resolve
-   to `io.ktor.http.ContentType.Application` instead of
-   `io.ktor.server.application.Application` — so the `Application.routing`
-   extension is unresolved ("unresolved global `routing`"). klio is registering
-   a nested object/class under its bare simple name in the global type table; a
-   bare type name must resolve to the imported/top-level type, not a nested one
-   reachable only via qualification. Per CLAUDE.md this must be fixed in
-   resolution, never by renaming the upstream type. Gates `ContentTypes.kt`.
+1. **Consuming `ContentTypes.kt` breaks the server program's `routing`
+   resolution** ("unresolved global `routing`"). Bisection is exact: adding
+   `ContentTypes.kt` to the pack is the sole trigger (util + `HttpHeaderValueParser`
+   + `HeaderValueWithParameters` all load with `routing` intact; the full
+   `ContentType` API — parse / withParameter / match / charset / parseHeaderValue
+   — runs correctly when invoked directly). The first hypothesis was a bare
+   simple-name collision between the nested `object Application` (inside
+   `ContentType`, `io.ktor.http`) and the server's `class Application`
+   (`io.ktor.server.application`), shadowing the `Application.routing` extension
+   receiver. **That hypothesis is not confirmed:** minimal pack repros — a
+   nested `object Application` beside a top-level `class Application` + a
+   `routing` extension + a `T.()->Unit` builder HOF, even with a companion
+   `object { val Any; fun parse }`, several sibling nested objects, and a
+   `HeaderValueWithParameters` superclass — all resolve `routing` fine, *including*
+   an exact `embeddedServer(engine, port) { … }`-shaped builder. The one
+   structural axis the repros do **not** mirror: ktor splits `Application`
+   (`io.ktor.server.application`), `routing` (`io.ktor.server.routing`),
+   `embeddedServer` (`io.ktor.server.engine`) and `CIO` (`io.ktor.server.cio`)
+   across separate packages and pack *features*, all wildcard-imported by the
+   program, while the repros keep them in one package. A repro that *does* mirror
+   that split (distinct `application`/`routing`/`engine`/`cio` packages in a
+   feature + a core nested `object Application`, all wildcard-imported) **still
+   resolves `routing` correctly**. So structure alone does not trigger it — the
+   cause is specific content in the real 429-line `ContentTypes.kt` (or an
+   interaction with the other loaded real ktor files). Next step: binary-search
+   `ContentTypes.kt` against the real pack (add half its declarations, rebuild,
+   test `routing`) to pin the exact construct, then resolve it. Per CLAUDE.md the
+   eventual fix is in resolution, never by renaming the upstream type. Gates
+   `ContentTypes.kt` (and thus replacing the divergent `shim/.../ContentType.kt`).
 2. **Receiver-lambda *property* invoked extension-style.**
    `DelegatingMutableSet.next()` does `delegateIterator.next().convertTo()`,
    where `convertTo: From.() -> To` is the wrapper's lambda property invoked
