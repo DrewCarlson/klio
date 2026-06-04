@@ -1228,12 +1228,18 @@ pub(crate) fn coll_empty_map(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
 }
 
 pub(crate) fn coll_to_typed_array(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let items = iterable_items(
-        ctx.args
-            .first()
-            .ok_or_else(|| RuntimeError::Type("toTypedArray requires a receiver".into()))?,
-        "toTypedArray",
-    )?;
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("toTypedArray requires a receiver".into()))?
+        .clone();
+    // A user-defined collection (e.g. a `DelegatingMutableSet` view) is drained
+    // via its iterator; native collections take the direct path.
+    let items = if matches!(recv, Value::Instance(_)) {
+        materialise_iterable_instance(&recv, ctx.host, ctx.out)?
+    } else {
+        iterable_items(&recv, "toTypedArray")?
+    };
     Ok(Value::Array {
         items: ObjRef::new(items),
         prim: None,
@@ -1295,15 +1301,59 @@ pub(crate) fn coll_sorted_map_of(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 
 /// `ArrayList()` / `ArrayList(initialCapacity)` — same storage as our
 /// `MutableList`; the capacity arg is accepted and ignored.
+/// Drain any iterable `value` into a `Vec` of its elements. A native
+/// `List`/`Set` is copied directly; a user class implementing
+/// Iterable/Collection (e.g. ktor's `DelegatingMutableSet`) is driven
+/// through its `iterator()`/`hasNext()`/`next()` protocol via the host, so
+/// the stdlib collection builders accept user-defined collections.
+pub(crate) fn materialise_iterable_instance(
+    value: &Value,
+    host: &mut dyn klio_runtime::IntrinsicHost,
+    out: &mut dyn klio_runtime::Output,
+) -> Result<Vec<Value>, RuntimeError> {
+    if let Value::List { items, .. } | Value::Set { items, .. } = value {
+        return Ok(items.borrow().clone());
+    }
+    let iter = host
+        .invoke_method(value, "iterator", &[], out)
+        .ok_or_else(|| RuntimeError::Type("value is not iterable".into()))??;
+    let mut items: Vec<Value> = Vec::new();
+    loop {
+        let has = host
+            .invoke_method(&iter, "hasNext", &[], out)
+            .ok_or_else(|| RuntimeError::Type("iterator is missing hasNext()".into()))??;
+        if !matches!(has, Value::Bool(true)) {
+            break;
+        }
+        let item = host
+            .invoke_method(&iter, "next", &[], out)
+            .ok_or_else(|| RuntimeError::Type("iterator is missing next()".into()))??;
+        items.push(item);
+        if items.len() > 1_000_000 {
+            return Err(RuntimeError::Type(
+                "iterator produced over 1,000,000 items".into(),
+            ));
+        }
+    }
+    Ok(items)
+}
+
 pub(crate) fn coll_array_list_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    match ctx.args {
-        [] => Ok(make_list(Vec::new(), true)),
-        [Value::Int(_n)] => Ok(make_list(Vec::new(), true)),
-        [other] => {
-            // ArrayList(Collection) shape — copy items.
-            match other {
+    match ctx.args.len() {
+        0 => Ok(make_list(Vec::new(), true)),
+        1 => {
+            let arg = ctx.args[0].clone();
+            match &arg {
+                // ArrayList(capacity).
+                Value::Int(_) => Ok(make_list(Vec::new(), true)),
+                // ArrayList(Collection) — copy items (native fast path; a
+                // user-defined collection is drained via its iterator).
                 Value::List { items, .. } | Value::Set { items, .. } => {
                     Ok(make_list(items.borrow().clone(), true))
+                }
+                Value::Instance(_) => {
+                    let items = materialise_iterable_instance(&arg, ctx.host, ctx.out)?;
+                    Ok(make_list(items, true))
                 }
                 _ => Err(RuntimeError::Type(
                     "ArrayList expects no args, an Int capacity, or a Collection".into(),
@@ -1325,14 +1375,25 @@ pub(crate) fn coll_hash_map_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 }
 
 pub(crate) fn coll_hash_set_ctor(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    match ctx.args {
-        [] | [Value::Int(_)] => Ok(make_set(Vec::new(), true)),
-        [Value::List { items, .. } | Value::Set { items, .. }] => {
-            Ok(make_set(items.borrow().clone(), true))
+    match ctx.args.len() {
+        0 => Ok(make_set(Vec::new(), true)),
+        1 => {
+            let arg = ctx.args[0].clone();
+            match &arg {
+                Value::Int(_) => Ok(make_set(Vec::new(), true)),
+                Value::List { items, .. } | Value::Set { items, .. } => {
+                    Ok(make_set(items.borrow().clone(), true))
+                }
+                Value::Instance(_) => {
+                    let items = materialise_iterable_instance(&arg, ctx.host, ctx.out)?;
+                    Ok(make_set(items, true))
+                }
+                _ => Err(RuntimeError::Type(
+                    "HashSet expects no args, an Int capacity, or a Collection".into(),
+                )),
+            }
         }
-        _ => Err(RuntimeError::Type(
-            "HashSet expects no args, an Int capacity, or a Collection".into(),
-        )),
+        _ => Err(RuntimeError::Arity("HashSet expects 0 or 1 args".into())),
     }
 }
 
