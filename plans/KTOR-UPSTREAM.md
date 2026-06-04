@@ -320,8 +320,14 @@ upstream and delete the request-member shims.
      (`write`/`readByte`/`exhausted`/`size`/`buffer` all verified — the earlier
      "`get_field length`" was the *stdlib* `Iterable.takeWhile` mis-resolving
      because ktor-io wasn't loaded, **not** a kotlinx.io segment bug).
-     `ByteReadPacket.kt` does pull `io.ktor.utils.io.pool.ObjectPool` (one
-     `Sink(pool)` overload), so consuming it brings the small ktor-io pool too.
+     `ByteReadPacket.kt` pulls `io.ktor.utils.io.pool.ObjectPool` (one
+     `Sink(pool)` overload), and that pool (`Pool.kt`) imports
+     `kotlinx.atomicfu.*` and declares `expect abstract class DefaultPool` — so
+     consuming the core for `takeWhile` drags in the atomicfu dep + a
+     `DefaultPool` actual. (Codecs uses only `takeWhile`/`canRead`/`readByte`, so
+     an alternative is a tiny klio actual for `Source.takeWhile` + `Buffer.canRead`
+     — but that's a redeclaration; prefer consuming `Buffer.kt`+`ByteReadPacket.kt`
+     + the small pool.)
    - **charset `Encoding.kt`** is the `expect abstract class Charset/CharsetEncoder/
      CharsetDecoder` + `expect fun encodeImpl/encodeToByteArray` surface; either
      consume it and supply klio actuals, or keep klio's concrete
