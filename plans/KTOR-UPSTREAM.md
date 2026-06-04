@@ -128,23 +128,41 @@ captured param instead of self-recursing into the member (was an infinite
 loop). Fixed at lowering for both bare calls and reads of an anon-object
 capture name.
 
-**Next blockers (in order):**
-1. **Anon-object getter capture** — `override val context get() = context`
-   still returns null: an anon object's property getter is lowered lazily,
-   outside the `set_lower_anon_captures` window, so the captured `context`
-   isn't reached and `intercepted()` then casts a null context (→ "cast to
-   Map"). Lower anon getters eagerly with the capture set (like the
-   methods), or run them with the captures layered.
-2. **Low-level manual-continuation primitives** — `startCoroutine` /
-   `Continuation(ctx){}` resume / `suspendCoroutineUninterceptedOrReturn`
-   with a hand-stored-and-resumed continuation must work for the
-   `SuspendFunctionGun` loop. klio's coroutine engine is built for the
-   high-level cooperative scheduler (`runBlocking`/`launch`/`delay`); the
-   manual-continuation API is the gap.
-3. **`io.ktor.util` deps** (`Attributes`, `KtorDsl`, `StackWalkingFailed`)
-   and `kotlinx.atomicfu` references inside the pipeline files.
-4. Then wire `pipelineStartCoroutineUninterceptedOrReturn`'s actual and
-   switch the cores onto upstream, deleting the request-member shims.
+**Landed (continued):**
+- Anon-object getter capture (`override val context get() = context`) — the
+  getter is lowered as a `$get$<name>` anon method inside the capture window
+  and invoked through `call_member` on read, so a getter reading a closed-over
+  outer resolves. This made the `Continuation(ctx){}` factory work, which
+  unblocked the **low-level manual-continuation API**: `startCoroutine`,
+  `Continuation(ctx){}.resumeWith`, `suspendCoroutineUninterceptedOrReturn`
+  with a hand-stored continuation all work now.
+- Receiver-lambda-with-value-param coroutine overloads
+  (`(suspend R.(P) -> T).startCoroutineUninterceptedOrReturn(receiver, p,
+  completion)` / `createCoroutineUnintercepted`) — the `PipelineInterceptor`
+  shape. A faithful `SuspendFunctionGun` port now threads the subject through
+  the interceptor chain correctly (`A got start` / `B got start-A` / …).
+
+**The core remaining blocker — undispatched-start semantics.** A faithful
+`SuspendFunctionGun` port runs the interceptors and threads the subject, but
+its continuation bookkeeping (`lastSuspensionIndex`) underflows. Root cause:
+`SuspendFunctionGun.loop` calls `startCoroutineUninterceptedOrReturn(...)` and
+expects the JVM contract — run the interceptor *up to its first suspension*
+and **return `COROUTINE_SUSPENDED` as a value** (the parked continuation
+resumes `completion` later), or return the result if it completed. klio's
+model instead *parks the whole activation* and unwinds to the nearest driver,
+so a suspending interceptor never returns `COROUTINE_SUSPENDED` to `loop`, and
+the synchronous nesting double-drives the continuation stack. The fix is a new
+host primitive — an **undispatched-start driver** that runs `body()` and
+returns `COROUTINE_SUSPENDED` on first park (persisting the parked activation
+via the existing `PERSISTED_PARKED` path and wiring `completion` to its
+eventual completion), else returns the value. `startBlock` in
+`kotlin-coroutines/Intrinsics.kt` would route to it. This must integrate with
+the cooperative `drive_root` without regressing `runBlocking`/`launch`.
+
+**Then:** `io.ktor.util` deps (`Attributes`, `KtorDsl`, `StackWalkingFailed`)
++ `kotlinx.atomicfu` refs in the pipeline files; the `DISABLE_SFG` and
+`pipelineStartCoroutineUninterceptedOrReturn` actuals; switch the cores onto
+upstream and delete the request-member shims.
 
 ## Open blockers (next, in order)
 
