@@ -527,10 +527,34 @@ fix is lazy object initialization (Kotlin initializes an `object` on first
 access), so an unused serializer object never forces its dependencies. Tracked
 as a follow-up.
 
+## Attributes consumed; lazy object init landed
+
+`io.ktor.util.Attributes` (interface + `AttributeKey`) and
+`io.ktor.util.reflect.Type` (`TypeInfo`/`typeInfo`) are consumed from upstream,
+with the posix reflect actual and a klio `Attributes(concurrent)` factory.
+`Attributes`/`AttributeKey` are the foundation the Pipeline runtime and both
+cores build on. Verified by `ktor_attributes_from_upstream`. Prerequisite klio
+fixes this brought in, each with a kotlinc-parity corpus test:
+
+- lazy `object` initialization — an object initializes on first access, not
+  eagerly at load, so `Url`'s unused `UrlSerializer` no longer forces the
+  serialization stack (`lazy_object_init.kt`);
+- `KClass.isInstance(value)` reflection (`kclass_is_instance.kt`), backing the
+  reflect `Any.instanceOf` actual;
+- `x as T` to an erased type parameter is an unchecked cast — fixes a
+  reified-type-arg binding leaking into a later non-reified `as T` (which broke
+  multi-key `Attributes.getOrNull`) (`erased_type_param_cast.kt`).
+
 ## Status
 
-The protocol foundation and the full URL layer are consuming real upstream.
-Remaining program, in order: lazy `object` initialization (so `Url`'s unused
-`UrlSerializer` doesn't force the serialization stack at load), then the
-Pipeline runtime for the cores. The shim stays in place so client/server keep
-working until each layer's upstream replacement is validated.
+The protocol foundation, the full URL layer, and `Attributes` are consuming real
+upstream. Next, in order: the **Pipeline runtime** (`Pipeline` /
+`PipelineContext` / `PipelinePhase` / `PhaseContent`) — its execution engine is
+proven (the `DebugPipelineContext`-shaped runner in `pipeline_context_smoke`);
+remaining plumbing is the `DISABLE_SFG` (= true) and
+`pipelineStartCoroutineUninterceptedOrReturn` actuals, the `io.ktor.util.debug`
++ atomicfu refs, and `CoroutineScope` (PipelineContext's supertype) — now that
+`Attributes` is available. Then the client/server **cores** onto upstream
+`Pipeline`/`PipelineContext`, which removes the simplified `Application` /
+`ApplicationCall` / `HttpClient` shim redeclarations. The shim stays in place so
+client/server keep working until each layer's upstream replacement is validated.
