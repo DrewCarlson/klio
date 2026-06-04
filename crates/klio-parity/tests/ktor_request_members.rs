@@ -91,7 +91,7 @@ fn serve(n: usize) -> (u16, std::thread::JoinHandle<()>) {
 #[test]
 fn ktor_client_request_members() {
     install_ktor();
-    let (port, handle) = serve(3);
+    let (port, handle) = serve(4);
     let src = format!(
         r#"
 import io.ktor.client.*
@@ -103,6 +103,7 @@ fun main() = runBlocking {{
     println(c.putWith("http://127.0.0.1:{port}/p") {{ parameter("a", "1"); bearerAuth("tok") }}.bodyAsText())
     println(c.delete("http://127.0.0.1:{port}/d").bodyAsText())
     println(c.patch("http://127.0.0.1:{port}/x", "body").bodyAsText())
+    println(c.putWith("http://127.0.0.1:{port}/b") {{ basicAuth("aladdin", "opensesame") }}.bodyAsText())
     c.close()
 }}
 "#
@@ -120,5 +121,9 @@ fun main() = runBlocking {{
     handle.join().ok();
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(o.status.success(), "stderr: {}", String::from_utf8_lossy(&o.stderr));
-    assert_eq!(out, "PUT /p?a=1 auth=Bearer tok\nDELETE /d auth=none\nPATCH /x auth=none\n");
+    assert_eq!(
+        out,
+        "PUT /p?a=1 auth=Bearer tok\nDELETE /d auth=none\nPATCH /x auth=none\n\
+         PUT /b auth=Basic YWxhZGRpbjpvcGVuc2VzYW1l\n"
+    );
 }
