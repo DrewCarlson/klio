@@ -221,7 +221,12 @@ impl VmHost<'_> {
         class: klio_ir::ClassId,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        let ir_class = self.module.classes.get(class.0 as usize).ok_or_else(|| {
+        // Bind `ir_class` through a locally-owned `Arc<Module>` clone so
+        // it does not hold an immutable borrow of `self` — the default
+        // -value thunk eval below needs `&mut self` while `ir_class`
+        // (used for `name`/`fqn`) is still live.
+        let prog_module = Arc::clone(&self.module);
+        let ir_class = prog_module.classes.get(class.0 as usize).ok_or_else(|| {
             klio_ir::eval::EvalError::Type(format!(
                 "Vm::new_instance: ClassId {} not found in module",
                 class.0
@@ -619,30 +624,64 @@ impl VmHost<'_> {
             }
         }
         if effective_args.len() < n_primary {
+            // Lowered default-value thunks for this class's primary
+            // ctor (one slot per param). Evaluating the thunk handles
+            // any default expression — an object/companion reference
+            // (`Parameters.Empty`), a call, or a reference to an
+            // earlier param — not just literals. The thunk is lowered
+            // over `[this, params...]`; the instance shell isn't built
+            // yet, so `this` is `Null` (ctor defaults never read it).
+            let default_thunks = self
+                .prog
+                .primary_ctor_default_thunks
+                .get(&class_def.name)
+                .cloned();
             for idx in effective_args.len()..n_primary {
                 let p = &class_def.primary_params[idx];
-                let v = match &p.default {
-                    Some(e) => default_value_for_primary(e)
-                        // A bare top-level `const val` default
-                        // (`port: Int = DEFAULT_PORT`) is resolved from the
-                        // const registry, so it isn't `Null` when a companion
-                        // / object initializer constructs the class at load
-                        // before the const's global slot is set.
-                        .or_else(|| {
-                            if let klio_ast::Expr::Path { segments, .. } = e.as_ref()
-                                && segments.len() == 1
-                            {
-                                return self
-                                    .module
-                                    .registry
-                                    .class_const_inits
-                                    .get(&(String::new(), segments[0].name.clone()))
-                                    .map(klio_ir::eval::const_to_value);
-                            }
-                            None
-                        })
-                        .unwrap_or(klio_runtime::Value::Null),
-                    None => klio_runtime::Value::Null,
+                // Cheap path first: a literal / empty-collection default,
+                // or a bare top-level `const val` (`port: Int =
+                // DEFAULT_PORT`) resolved from the const registry — so it
+                // isn't `Null` when a companion / object initializer
+                // constructs the class at load before the const's global
+                // slot is set.
+                let literal = p.default.as_ref().and_then(|e| {
+                    default_value_for_primary(e).or_else(|| {
+                        if let klio_ast::Expr::Path { segments, .. } = e.as_ref()
+                            && segments.len() == 1
+                        {
+                            return self
+                                .module
+                                .registry
+                                .class_const_inits
+                                .get(&(String::new(), segments[0].name.clone()))
+                                .map(klio_ir::eval::const_to_value);
+                        }
+                        None
+                    })
+                });
+                let v = if let Some(v) = literal {
+                    v
+                } else if let Some(Some(dfid)) =
+                    default_thunks.as_ref().and_then(|slots| slots.get(idx).copied())
+                {
+                    // A non-literal default (`Parameters.Empty`, a call,
+                    // a reference to an earlier param): evaluate the
+                    // lowered thunk. The instance shell isn't built yet,
+                    // so `this` is `Null` (ctor defaults never read it).
+                    let module = Arc::clone(&self.module);
+                    match module.funcs.get(dfid.0 as usize).cloned() {
+                        Some(func) => {
+                            let mut thunk_args: Vec<klio_runtime::Value> =
+                                Vec::with_capacity(n_primary + 1);
+                            thunk_args.push(klio_runtime::Value::Null); // `this`
+                            thunk_args.extend_from_slice(&effective_args);
+                            thunk_args.resize(n_primary + 1, klio_runtime::Value::Null);
+                            klio_ir::eval::eval_with(&module, &func, thunk_args, self)?
+                        }
+                        None => klio_runtime::Value::Null,
+                    }
+                } else {
+                    klio_runtime::Value::Null
                 };
                 effective_args.push(v);
             }

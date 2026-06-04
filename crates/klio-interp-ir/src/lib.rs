@@ -69,6 +69,8 @@ pub struct ProgramImage {
     extension_props: std::collections::HashMap<(String, String), klio_ir::FuncId>,
     extension_prop_setters: std::collections::HashMap<(String, String), klio_ir::FuncId>,
     secondary_ctors: std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
+    primary_ctor_default_thunks:
+        std::collections::HashMap<String, Vec<Option<klio_ir::FuncId>>>,
     class_delegates: std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
     func_defaults: std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     installed_bindings: Arc<klio_stdlib::HostBindings>,

@@ -95,6 +95,16 @@ pub struct BuiltModule {
     /// class's list when `new_instance` is called with an arity
     /// that doesn't match the primary constructor's signature.
     pub secondary_ctors: std::collections::HashMap<String, Vec<SecondaryCtorEntry>>,
+    /// Per-class primary-constructor default-value thunks: one
+    /// `Option<FuncId>` slot per primary param (`Some` when the param
+    /// declares a default). Each thunk is lowered over `[this,
+    /// primary-params…]` so a default may reference an earlier
+    /// parameter; `new_instance` evaluates the slot for any param a
+    /// caller omits, so a non-literal default (`parameters:
+    /// Parameters = Parameters.Empty`, `port: Int = DEFAULT_PORT`)
+    /// produces its real value rather than `Null`.
+    pub primary_ctor_default_thunks:
+        std::collections::HashMap<String, Vec<Option<klio_ir::FuncId>>>,
     /// Class delegation entries: `class W(g: Greeter) : Greeter by g`.
     /// Each tuple is `(supertype simple name, thunk FuncId taking
     /// primary-ctor params)`. The Vm evaluates these at construction
@@ -1270,6 +1280,10 @@ fn build_module_with_overrides(
         std::collections::HashMap::new();
     let mut delegated_body_props: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
+    let mut primary_ctor_default_thunks: std::collections::HashMap<
+        String,
+        Vec<Option<klio_ir::FuncId>>,
+    > = std::collections::HashMap::new();
     for d in decls {
         if let Decl::Class(c) = d {
             // Collect own-member names so accessor bodies' bare
@@ -1303,6 +1317,31 @@ fn build_module_with_overrides(
             prop_init_params.push("this");
             for n in &ctor_param_names {
                 prop_init_params.push(n.as_str());
+            }
+            // Lower each primary-ctor param default over the same
+            // `[this, ctor_param_names...]` shape so a default may read
+            // an earlier param; `new_instance` evaluates the thunk for
+            // an omitted param. Only recorded when at least one param
+            // has a default (so the lookup stays cheap for the common
+            // no-default class).
+            if c.primary_params.iter().any(|p| p.default.is_some()) {
+                let slots: Vec<Option<klio_ir::FuncId>> = c
+                    .primary_params
+                    .iter()
+                    .map(|p| {
+                        p.default.as_ref().map(|e| {
+                            klio_ir::lower::lower_accessor_expr(
+                                &mut module,
+                                &c.name.name,
+                                &own_members,
+                                &prop_init_params,
+                                e,
+                                &format!("__ctor_default_{}_{}", c.name.name, p.name.name),
+                            )
+                        })
+                    })
+                    .collect();
+                primary_ctor_default_thunks.insert(c.name.name.clone(), slots);
             }
             for m in &c.members {
                 if let Decl::Property(p) = m {
@@ -2268,6 +2307,7 @@ fn build_module_with_overrides(
         companion_singletons,
         enum_entry_arg_inits,
         secondary_ctors,
+        primary_ctor_default_thunks,
         class_delegates,
         func_defaults,
         enclosing_class,
