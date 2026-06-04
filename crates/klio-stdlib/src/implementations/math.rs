@@ -7,13 +7,12 @@ use super::{
 // ============================================================
 
 pub(crate) fn as_double(v: &Value, what: &str) -> Result<f64, RuntimeError> {
-    match v {
-        Value::Double(d) => Ok(*d),
-        Value::Int(n) => Ok(f64::from(*n)),
-        other => Err(RuntimeError::Type(format!(
-            "{what} requires a number, got {other:?}"
-        ))),
-    }
+    // Accept every numeric type (Float/Long/Short/Byte too), each widening
+    // to f64 like Kotlin's numeric conversions, so math intrinsics aren't
+    // limited to `Double`/`Int` operands.
+    numeric_as_f64(v).ok_or_else(|| {
+        RuntimeError::Type(format!("{what} requires a number, got {v:?}"))
+    })
 }
 
 pub(crate) fn math_abs(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
@@ -160,6 +159,44 @@ pub(crate) fn double_pow(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let base = recv_double(ctx.args, "Double.pow")?;
     let exp = as_double(&ctx.args[1], "Double.pow")?;
     Ok(Value::Double(base.powf(exp)))
+}
+
+/// `Float.pow(Float)` / `Float.pow(Int)` — like `Double.pow` but keeping a
+/// `Float` result.
+pub(crate) fn float_pow(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    if ctx.args.len() != 2 {
+        return Err(RuntimeError::Arity("Float.pow expects 1 argument".into()));
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let base = recv_double(ctx.args, "Float.pow")? as f32;
+    #[allow(clippy::cast_possible_truncation)]
+    let exp = as_double(&ctx.args[1], "Float.pow")? as f32;
+    Ok(Value::Float(base.powf(exp)))
+}
+
+pub(crate) fn math_sinh(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "sinh")?, "sinh")?.sinh()))
+}
+pub(crate) fn math_cosh(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "cosh")?, "cosh")?.cosh()))
+}
+pub(crate) fn math_tanh(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "tanh")?, "tanh")?.tanh()))
+}
+pub(crate) fn math_asinh(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "asinh")?, "asinh")?.asinh()))
+}
+pub(crate) fn math_acosh(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "acosh")?, "acosh")?.acosh()))
+}
+pub(crate) fn math_atanh(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "atanh")?, "atanh")?.atanh()))
+}
+pub(crate) fn math_expm1(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "expm1")?, "expm1")?.exp_m1()))
+}
+pub(crate) fn math_ln1p(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(as_double(arg1(ctx, "ln1p")?, "ln1p")?.ln_1p()))
 }
 
 pub(crate) fn math_sin(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

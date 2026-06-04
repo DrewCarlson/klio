@@ -279,11 +279,16 @@ pub(crate) fn run_check_unimplemented(
         {
             continue;
         }
-        // …or one indexed by (owner, name) / top-level name.
-        match &e.owner {
-            Some(o) if intrinsic_owner_name.contains(&(o.clone(), e.name.clone())) => continue,
-            None if intrinsic_top_name.contains(&e.name) => continue,
-            _ => {}
+        // …or one indexed by (owner, name). A top-level intrinsic of the
+        // same name also serves an extension (`kotlin.math.absoluteValue`
+        // backs the `Double.absoluteValue` property), so accept that too.
+        if let Some(o) = &e.owner {
+            if intrinsic_owner_name.contains(&(o.clone(), e.name.clone())) {
+                continue;
+            }
+        }
+        if intrinsic_top_name.contains(&e.name) {
+            continue;
         }
         // …or a core interpreter builtin serves it directly.
         if INTERP_BUILTIN_MEMBERS.contains(&e.name.as_str()) {
