@@ -586,3 +586,29 @@ fun main() {
         "3:a,b,c\n2:t,x\n",
     );
 }
+
+// A bare call `name()` inside a class whose own member `name` is a
+// (non-invokable) property, beside a top-level `fun name()`, must resolve
+// to the function — a property can't satisfy a call. Mirrors ktor's
+// `HttpStatusCode` companion: `val allStatusCodes = allStatusCodes()`.
+#[test]
+fn call_resolves_to_top_level_fn_over_same_named_property() {
+    let src = r#"
+class Reg {
+    companion object {
+        val names: List<String> = names()
+        fun byIndex(i: Int): String = names[i]
+    }
+}
+internal fun names(): List<String> = listOf("alpha", "beta", "gamma")
+fun main() {
+    println(Reg.names.size)
+    println(Reg.byIndex(1))
+}
+"#;
+    assert_klio(
+        "call_resolves_to_top_level_fn_over_same_named_property",
+        src,
+        "3\nbeta\n",
+    );
+}

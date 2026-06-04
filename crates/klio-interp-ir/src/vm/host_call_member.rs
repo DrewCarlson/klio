@@ -2864,6 +2864,21 @@ impl VmHost<'_> {
                 }
             }
         }
+        // A bare `name(args)` inside a class lowers to `this.name(args)`.
+        // If the receiver has no such *method* but a top-level function
+        // `name` exists — e.g. a companion `val allStatusCodes` property
+        // beside the top-level `fun allStatusCodes()` — Kotlin resolves
+        // the call to the function: a non-invokable property can't
+        // satisfy a call. Fall back to the global function here.
+        if let klio_runtime::Value::Instance(_) = receiver
+            && let Some(g) = self.lookup_global(name)
+            && matches!(
+                g,
+                klio_runtime::Value::Function { .. } | klio_runtime::Value::IrClosure { .. }
+            )
+        {
+            return self.call_value(&g, args);
+        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()
