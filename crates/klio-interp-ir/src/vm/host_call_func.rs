@@ -397,20 +397,33 @@ impl VmHost<'_> {
         // Only intercept genuine overload sets: a single top-level
         // function keeps the plain global-value path (which carries
         // default-arg + vararg packing the IrClosure branch handles).
-        let mut first: Option<klio_ir::FuncId> = None;
-        let mut count = 0usize;
-        for (n, id) in &module.func_index {
-            if n == name {
-                count += 1;
-                if first.is_none() {
-                    first = Some(*id);
-                }
-            }
-        }
-        if count < 2 {
+        let candidates: Vec<klio_ir::FuncId> = module
+            .func_index
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+            .collect();
+        if candidates.len() < 2 {
             return Ok(None);
         }
-        let func = first.expect("count >= 2 implies a first candidate");
+        // Pick the best *body-carrying* overload by runtime arg types.
+        // `overload_score` declines bodyless `expect` declarations, so
+        // when every applicable candidate is a bodyless expect (e.g. the
+        // primitive `minOf`/`maxOf` overloads, whose real implementation
+        // is a host intrinsic) this finds nothing and we return `None` —
+        // letting the caller fall through to the intrinsic / global path
+        // instead of dispatching an empty expect.
+        let mut best: Option<(klio_ir::FuncId, i32)> = None;
+        for cand in &candidates {
+            if let Some(score) = self.overload_score(module, *cand, args)
+                && best.is_none_or(|(_, s)| score > s)
+            {
+                best = Some((*cand, score));
+            }
+        }
+        let Some((func, _)) = best else {
+            return Ok(None);
+        };
         let result = self.call_func_typed(module, func, args.to_vec(), arg_names, &[])?;
         Ok(Some(result))
     }

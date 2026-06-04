@@ -490,6 +490,14 @@ impl VmHost<'_> {
         args: &[klio_runtime::Value],
     ) -> Option<i32> {
         let f = module.funcs.get(cand.0 as usize)?;
+        // A bodyless `expect` declaration (an upstream `expect fun` with
+        // no klio actual, e.g. the primitive `minOf`/`maxOf` overloads)
+        // is not interpretable and must never be selected over a
+        // body-carrying sibling or the host intrinsic that backs the
+        // name. Mirrors `Module::func_id`'s body-over-expect preference.
+        if f.blocks.is_empty() {
+            return None;
+        }
         let last_vararg = f.params.last().is_some_and(|p| p.is_vararg);
         if f.params.len() < args.len() && !last_vararg {
             return None;

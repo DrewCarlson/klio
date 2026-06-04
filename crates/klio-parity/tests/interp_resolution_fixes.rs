@@ -260,3 +260,27 @@ fun main() {
         "10,20,30,-1\n6\n6\n",
     );
 }
+
+// A bare `minOf` / `maxOf` call inside a class member must resolve to the
+// numeric intrinsic, not a bodyless `expect` overload. The primitive
+// `minOf(Int, Int)` etc. are `expect inline` declarations with no klio
+// actual; selecting one ran an empty body (or a wrong comparator
+// overload). `kotlin.io.encoding.Base64` calls `minOf` inside
+// `encodeIntoByteArrayImpl`, so this also gates Base64 for inputs of 3+
+// bytes.
+#[test]
+fn min_max_of_resolve_in_member_context() {
+    let src = r#"
+class Grid(val w: Int, val h: Int) {
+    fun area(cap: Int): Int = minOf(w * h, cap)
+    fun longest(): Int = maxOf(w, h)
+}
+fun main() {
+    val g = Grid(4, 6)
+    println(g.area(20))     // minOf(24, 20) = 20
+    println(g.area(100))    // minOf(24, 100) = 24
+    println(g.longest())    // maxOf(4, 6) = 6
+}
+"#;
+    assert_klio("min_max_of_resolve_in_member_context", src, "20\n24\n6\n");
+}
