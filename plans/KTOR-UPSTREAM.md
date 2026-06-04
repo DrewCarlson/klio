@@ -65,15 +65,24 @@ General interpreter fixes landed along the way (each helps all programs):
 - `String.equals` returns `Bool`, incl. the `ignoreCase` form, named or positional;
 - `key in map` over a user `Map` type routes to `containsKey`.
 
+## More general fixes landed (toward ktor-http Headers)
+
+- **Map key equality honors the key's `equals`/`hashCode`.** get/containsKey/put/
+  remove invoke the key's `equals` for instance keys (builtin keys keep the fast
+  structural path) — ktor's `CaseInsensitiveString` header keys now match.
+- **Stdlib Map extensions over user Map types.** `forEach`/`any`/`map`/… on a
+  user class implementing `Map` materialize via its `entries` and re-dispatch
+  (the Map analogue of the iterable fallback) — `StringValues` does
+  `values.forEach { }` over a custom map.
+
 ## Open blockers (next, in order)
 
-1. **Map key equality must honor the key's `equals`/`hashCode`.** klio compares
-   Map keys structurally (by fields/identity), but Kotlin uses the key's
-   `equals`/`hashCode`. ktor's `Headers`/`Parameters` store entries in a
-   `CaseInsensitiveMap` keyed by `CaseInsensitiveString` (custom case-folding
-   `equals`), so lookups currently miss. This is a core Map-semantics change
-   (get/containsKey/put/remove invoking the key's `equals` for instance keys) and
-   gates the ktor-http header/URL surface.
+1. **Custom-collection iterator stack.** ktor's `Headers` sits on
+   `CaseInsensitiveMap` → `DelegatingMutableSet` → an anonymous
+   `MutableIterator` whose `val delegateIterator = delegate.iterator()`
+   property-initializer isn't materialized (drain hits `hasNext on Nothing`).
+   Needs anonymous-object captured-property-init support; the same stack
+   recurs for the keys/entries/values views.
 2. **ktor-http remainder** — `Headers`/`Parameters`/`Url`/`URLBuilder`/codecs,
    once (1) lands.
 3. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
