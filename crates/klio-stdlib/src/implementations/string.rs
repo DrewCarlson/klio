@@ -1321,10 +1321,14 @@ pub(crate) fn string_lines(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
 
 pub(crate) fn string_to_char_array(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.toCharArray")?;
-    Ok(make_list(
-        s.encode_utf16().map(Value::Char).collect(),
-        false,
-    ))
+    // `toCharArray()` returns a `CharArray` (`Value::Array { prim: Char }`),
+    // not a `List<Char>` — overload resolution distinguishes them (a `List`
+    // arg to `CharSequence.indexOfAny(chars: CharArray, …)` otherwise binds
+    // the `Collection<String>` overload, which reads `.length` on a `Char`).
+    Ok(Value::Array {
+        items: klio_runtime::ObjRef::new(s.encode_utf16().map(Value::Char).collect()),
+        prim: Some(klio_runtime::PrimitiveArrayKind::Char),
+    })
 }
 
 // radix is validated to 2..=36 before the conversion to u32.
