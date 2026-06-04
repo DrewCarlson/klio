@@ -2748,7 +2748,25 @@ impl VmHost<'_> {
                     let recv_score = self
                         .overload_score_arg(&f.params[0].ty, receiver)
                         .unwrap_or(-1);
-                    let mut score = recv_score;
+                    // The receiver type is the dominant signal for an
+                    // extension: a candidate whose declared receiver the
+                    // actual receiver matches must outrank one whose value
+                    // arguments merely happen to score higher. Without this
+                    // weight `caseInsensitiveMap()[k] = v` picked ktor's
+                    // `io.ktor.http.set(URLBuilder, String, …)` (two exact
+                    // `String` args, +200) over the generic
+                    // `MutableMap.set(K, V)` (generic args, +10), even though
+                    // a `CaseInsensitiveMap` is a `MutableMap`, not a
+                    // `URLBuilder` — and dispatching it dropped the entry
+                    // (every URL query param). Scaling the receiver score past
+                    // the summed argument scores keeps most-specific-receiver
+                    // resolution while leaving arguments as the tie-break
+                    // between candidates whose receivers score equally. Unlike
+                    // dropping a receiver-incompatible candidate, this never
+                    // over-excludes a pack class whose supertype closure is
+                    // incomplete — such a candidate simply scores like any
+                    // other unmatched receiver.
+                    let mut score = recv_score.saturating_mul(1000);
                     for (i, a) in args.iter().enumerate() {
                         if let Some(p) = f.params.get(i + 1) {
                             score += self.overload_score_arg(&p.ty, a).unwrap_or(-1);
