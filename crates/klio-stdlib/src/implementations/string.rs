@@ -598,7 +598,48 @@ pub(crate) fn string_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
             .ok_or_else(|| RuntimeError::Arity("indexOf requires an argument".into()))?,
         "indexOf",
     )?;
-    Ok(Value::new_int(byte_to_char_index(s, s.find(&needle))))
+    // Kotlin: `indexOf(char/string, startIndex = 0, ignoreCase = false)`.
+    // The start index is in UTF-16 code units (Kotlin's `Char` unit), matching
+    // `byte_to_char_index`. Search the substring from there so a call like
+    // `urlString.indexOf('/', protocol.name.length + 3)` skips the leading
+    // `scheme://` rather than re-matching the authority's first slash.
+    let start_u16 = ctx
+        .args
+        .get(2)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0) as usize;
+    let ignore_case = matches!(ctx.args.get(3), Some(Value::Bool(true)));
+    let start_byte = utf16_index_to_byte(s, start_u16);
+    if start_byte > s.len() {
+        return Ok(Value::new_int(-1));
+    }
+    let hay = &s[start_byte..];
+    let found = if ignore_case {
+        hay.to_lowercase().find(&needle.to_lowercase())
+    } else {
+        hay.find(needle.as_str())
+    };
+    Ok(Value::new_int(
+        byte_to_char_index(s, found.map(|off| start_byte + off)),
+    ))
+}
+
+/// Byte offset in a UTF-8 string of the char boundary at or after the given
+/// UTF-16 code-unit index — the inverse of `byte_to_char_index`'s unit, used
+/// to honour Kotlin string `startIndex` arguments.
+pub(crate) fn utf16_index_to_byte(s: &str, target: usize) -> usize {
+    if target == 0 {
+        return 0;
+    }
+    let mut u16 = 0usize;
+    for (b, ch) in s.char_indices() {
+        if u16 >= target {
+            return b;
+        }
+        u16 += ch.len_utf16();
+    }
+    s.len()
 }
 
 pub(crate) fn string_last_index_of(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
