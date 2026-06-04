@@ -167,18 +167,43 @@ impl VmHost<'_> {
             // (`block.invoke(receiver, p)` / `block(receiver, p)` for a
             // `R.(P) -> T`): the lambda's value params are `[p]`, so being
             // called with exactly one *extra* leading arg means arg0 is the
-            // extension receiver. Route through `call_value_with_this` so the
-            // receiver is bound as `this` (and pushed for member-extension /
-            // bare-member resolution), matching the member-style
-            // `receiver.block(p)` path. Valid Kotlin never calls a
-            // non-receiver lambda with surplus args, so the `+1` arity is an
-            // unambiguous signal. (Vararg targets, which legitimately take
-            // surplus args, are excluded.)
+            // extension receiver. Bind it into the closure's `this` capture
+            // and re-run on this same (main-evaluator) path — which snapshots
+            // frames so a suspension inside the body (`delay`) parks
+            // correctly, unlike the intrinsic-host invoke. The body resolves
+            // its receiver through the `this` capture slot
+            // (`func.capture_order`), so overriding the closure value's
+            // captures (not the side-table `info.captures`, which this path
+            // ignores) is what reaches the evaluator. Valid Kotlin never
+            // over-supplies a non-receiver lambda, so the `+1` arity is
+            // unambiguous; vararg targets (legitimately variadic) are
+            // excluded; and a `this` capture must exist (a genuine receiver
+            // lambda) so a 2-param lambda invoked with 3 args isn't misread.
             let last_vararg = func.params.last().is_some_and(|p| p.is_vararg);
-            if !last_vararg && !args.is_empty() && args.len() == info.n_params + 1 {
-                let receiver = args[0].clone();
+            let this_cap_idx = info.capture_names.iter().position(|n| n == "this");
+            if !last_vararg
+                && args.len() == info.n_params + 1
+                && let Some(this_idx) = this_cap_idx
+            {
+                let mut new_caps: Vec<klio_runtime::Value> = (**captures).clone();
+                if this_idx >= new_caps.len() {
+                    new_caps.resize(this_idx + 1, klio_runtime::Value::Null);
+                }
+                new_caps[this_idx] = args[0].clone();
+                let bound = klio_runtime::Value::IrClosure {
+                    id: *id,
+                    captures: Arc::new(new_caps),
+                };
                 let rest: Vec<klio_runtime::Value> = args[1..].to_vec();
-                return self.call_value_with_this(callee, &receiver, &rest, &[]);
+                let pushed = matches!(args[0], klio_runtime::Value::Instance(_));
+                if pushed {
+                    self.push_access_enclosing(&args[0].clone());
+                }
+                let r = self.call_value(&bound, &rest);
+                if pushed {
+                    self.pop_access_enclosing();
+                }
+                return r;
             }
             // Fill missing positional args from the target's
             // registered default-arg thunks (an implicit-`it` lambda
