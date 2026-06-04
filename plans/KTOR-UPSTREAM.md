@@ -312,17 +312,25 @@ upstream and delete the request-member shims.
      `decodeImpl` uses `ByteArray.decodeToString()`, already an intrinsic.)
    - **ktor-io `io.ktor.utils.io.core` Buffer/Source layer.** Codecs' own
      `Source.forEach` calls `source.takeWhile { chunk -> while (chunk.canRead())
-     block(chunk.readByte()) }`. `takeWhile`/`canRead` are *consumable upstream*
-     — they live in ktor-io `common/src/io/ktor/utils/io/core/{ByteReadPacket,Buffer}.kt`
-     (not kotlinx.io). `Source.takeWhile(block: (kotlinx.io.Buffer) -> Boolean)`
-     walks the underlying **kotlinx.io Buffer segments via `segment.length`**,
-     which klio's kotlinx.io Buffer doesn't expose (`Vm::get_field \`length\`
-     on \`<instance>\``; `Buffer.write`/`readByte`/`exhausted` *do* work). So this
-     needs consuming the ktor-io core compat layer **and** the kotlinx.io Buffer
-     segment surface — a distinct subsystem from the charset actual.
+     block(chunk.readByte()) }`. These are *consumable upstream*:
+     `Buffer.kt` is trivial (`typealias Buffer = kotlinx.io.Buffer`;
+     `fun Buffer.canRead() = !exhausted()`), and `Source.takeWhile` lives in
+     `ByteReadPacket.kt` (`while (!exhausted() && block(buffer)) {}`). The
+     underlying kotlinx.io `Buffer` already works in klio
+     (`write`/`readByte`/`exhausted`/`size`/`buffer` all verified — the earlier
+     "`get_field length`" was the *stdlib* `Iterable.takeWhile` mis-resolving
+     because ktor-io wasn't loaded, **not** a kotlinx.io segment bug).
+     `ByteReadPacket.kt` does pull `io.ktor.utils.io.pool.ObjectPool` (one
+     `Sink(pool)` overload), so consuming it brings the small ktor-io pool too.
+   - **charset `Encoding.kt`** is the `expect abstract class Charset/CharsetEncoder/
+     CharsetDecoder` + `expect fun encodeImpl/encodeToByteArray` surface; either
+     consume it and supply klio actuals, or keep klio's concrete
+     `io.ktor.utils.io.charsets` package and add `newEncoder()` + `encode(...) ->
+     kotlinx.io.Buffer` to it.
    `Url.kt` is additionally `@Serializable` (imports `kotlinx.serialization.*`).
-   So the gate is three components: the `CharsetEncoder.encode` actual, the
-   ktor-io core Buffer/Source layer, and the kotlinx.io Buffer-segment surface.
+   So the gate is: consume ktor-io core (`Buffer`+`ByteReadPacket`+`pool`) +
+   provide `CharsetEncoder.encode` (UTF-8/Latin-1 → kotlinx.io Buffer) + consume
+   `Codecs`/`URLParser`/`URLBuilder`; `Url` then needs serialization support.
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.
