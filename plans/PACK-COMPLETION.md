@@ -47,6 +47,34 @@ instance's `toString()`, kotlinx.datetime `LocalDate` arithmetic
 navigators), and **named + defaulted constructor arguments** for primary
 *and* secondary constructors (was: named/omitted params left Null).
 
+**Ahead-of-time gap diagnostic.** `klio check --unimplemented <prog>` now
+statically reports every reachable `expect` declaration (program + packs +
+embedded stdlib) that has no `actual` body and no host intrinsic — the
+silent-`Unit` failure mode. It matches against the real binding key set and
+excludes interpreter-builtin members, so the report is genuine gaps; it
+exits non-zero when any exist. Driving its worklist took the stdlib surface
+from 103 → ~21 reported gaps, all root-caused + parity-checked: Array
+`elementAt`/`plus`/`plusElement`/`orEmpty`/`contentHashCode`/`contentDeep*`
+(+ `+` operator routing on arrays); hyperbolic math + `Float.pow` +
+`Double` `nextUp`/`nextDown`/`nextTowards`/`ulp`/`withSign` (+ `as_double`
+now accepts every numeric); `String` `toShort`/`toByte`/`toFloat(OrNull)` +
+case/`capitalize` forms; `Char.compareTo` (**was an infinite loop** — any
+sort by a Char key hung), `Char.isISOControl`/case forms; `MutableList`
+`sortWith`/`fill`; `StringBuilder` `set`/`setRange`/`appendRange`/
+`insertRange`; `CharSequence`/`String` `contentEquals`/`elementAt`; reified
+`enumValues<T>()`/`enumValueOf<T>()`; `readln`/`readlnOrNull`. Also two
+interp root-causes the check surfaced earlier: a companion that extends its
+enclosing class no longer infinite-loops on a bare top-level call, and a
+nested lambda now inherits the enclosing receiver-lambda's `this`. Remaining
+reported gaps are non-functional or hard: internal stdlib plumbing
+(`collectionToArray`/`nativeIndexOf`/`checkRadix`/… — shadowed by intrinsics,
+never reached), `Char.category`/`isDefined`/`isTitleCase` (need Unicode
+category tables), `Throwable.printStackTrace`/`stackTraceToString` (klio has
+no real stack frames), `String.CASE_INSENSITIVE_ORDER` (needs a
+lowercasing-selector comparator value), and a few tool false-positives
+(`concatToString`/`repeat`/`MatchGroupCollection.get` work via differently-
+keyed intrinsics).
+
 Resolution/dispatch fixes since: **B7 atomicfu arrays** — dropped the
 unused `kotlin.concurrent.atomics` array `expect`s so they stop
 ambiguating `kotlinx.atomicfu.AtomicIntArray` / `atomicArrayOfNulls`;
