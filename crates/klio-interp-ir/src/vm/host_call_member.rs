@@ -2909,12 +2909,15 @@ impl VmHost<'_> {
             }
         }
         // A bare `name(args)` inside a class lowers to `this.name(args)`.
-        // If the receiver has no such *method* but a top-level function
-        // `name` exists — e.g. a companion `val allStatusCodes` property
-        // beside the top-level `fun allStatusCodes()` — Kotlin resolves
-        // the call to the function: a non-invokable property can't
-        // satisfy a call. Fall back to the global function here.
+        // When the receiver has a *property* `name` (no method of that
+        // name resolved above) beside a top-level `fun name()` — e.g. the
+        // `HttpStatusCode` companion's `val allStatusCodes` next to the
+        // top-level `fun allStatusCodes()` — Kotlin resolves the call to
+        // the function: a non-invokable property can't satisfy a call.
+        // Gated on the receiver actually having that property so an
+        // unrelated method-not-found never misroutes to a global.
         if let klio_runtime::Value::Instance(_) = receiver
+            && self.host_has_member(receiver, name)
             && let Some(g) = self.lookup_global(name)
             && matches!(
                 g,
