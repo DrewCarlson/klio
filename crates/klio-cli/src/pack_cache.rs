@@ -461,12 +461,13 @@ fn package_of_source(bytes: &[u8]) -> Option<String> {
     None
 }
 
-/// Does a user import prefix-match a (possibly gated) package?
+/// Does a user import specifically *target* a (possibly gated) package —
+/// i.e. it is that package (`import pkg.*`) or a member of it
+/// (`import pkg.Symbol`)? A parent star-import (`import a.b.*` against a
+/// gated `a.b.c`) does NOT target it, so it must not trigger a feature
+/// hint for every gated sub-package.
 fn import_matches_package(import: &str, pkg: &str) -> bool {
-    !pkg.is_empty()
-        && (import == pkg
-            || import.starts_with(&format!("{pkg}."))
-            || pkg.starts_with(&format!("{import}.")))
+    !pkg.is_empty() && (import == pkg || import.starts_with(&format!("{pkg}.")))
 }
 
 /// Walk the local pack cache, parse each pack's AST bundle, and
