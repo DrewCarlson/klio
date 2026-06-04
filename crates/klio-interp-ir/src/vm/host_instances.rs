@@ -975,6 +975,12 @@ impl VmHost<'_> {
             if parent_def.as_ref().is_none_or(|d| d.is_interface) {
                 break;
             }
+            // Pack the delegation args for the parent's `vararg` primary
+            // param (`class Sub : Base("a")` → `Base`'s `vararg xs` receives
+            // `["a"]`, not the bare element) so the parent body's `*xs`
+            // spread / vararg reads work.
+            let parent_args =
+                crate::pack_primary_ctor_varargs(&self.module, &parent_name, parent_args);
             chain.push((parent_name.clone(), parent_args.clone()));
             cur_class = parent_name;
             cur_args = parent_args;
