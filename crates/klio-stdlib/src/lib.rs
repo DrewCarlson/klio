@@ -82,6 +82,17 @@ pub const IMPLICIT_ALIASES: &[(&str, &str)] = &[
     ("emptyList", "kotlin.collections.emptyList"),
     ("emptyMap", "kotlin.collections.emptyMap"),
     ("emptySet", "kotlin.collections.emptySet"),
+    // The inline builder factories. A bare reference must resolve to the
+    // host intrinsic actual rather than to a same-named Kotlin-source
+    // overload — in a pack consumer the stdlib's two overloads
+    // (`buildString(block)` / `buildString(capacity, block)`) are only
+    // visible as forward stubs at lower time, so an arity-aware bind is
+    // unavailable and the bare-name path would otherwise pick the wrong
+    // overload's body and invoke the capacity argument.
+    ("buildList", "kotlin.collections.buildList"),
+    ("buildSet", "kotlin.collections.buildSet"),
+    ("buildMap", "kotlin.collections.buildMap"),
+    ("buildString", "kotlin.text.buildString"),
     ("listOf", "kotlin.collections.listOf"),
     ("mapOf", "kotlin.collections.mapOf"),
     ("mutableListOf", "kotlin.collections.mutableListOf"),

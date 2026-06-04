@@ -245,6 +245,21 @@ pub(crate) fn string_builder_insert_range(ctx: &mut CallCtx) -> Result<Value, Ru
 }
 
 pub(crate) fn string_builder_append(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    // `append(value: CharSequence?/CharArray, startIndex: Int, endIndex: Int)`
+    // is the subrange overload — it appends `value[startIndex, endIndex)`, not
+    // the three arguments separately. Detect it (a CharSequence/CharArray
+    // value followed by two Ints) and route to the range append; everything
+    // else is the single-value `append`.
+    if ctx.args.len() == 4
+        && matches!(
+            ctx.args.get(1),
+            Some(Value::String(_) | Value::StringBuilder(_) | Value::Array { .. })
+        )
+        && ctx.args.get(2).and_then(Value::as_i64).is_some()
+        && ctx.args.get(3).and_then(Value::as_i64).is_some()
+    {
+        return string_builder_append_range(ctx);
+    }
     let sb = sb_arg(ctx.args, "StringBuilder.append")?;
     {
         let mut buf = sb.borrow_mut();

@@ -86,10 +86,18 @@ pub(crate) fn builders_build_map(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 }
 
 pub(crate) fn builders_build_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    if ctx.args.len() != 1 {
-        return Err(RuntimeError::Arity("buildString expects (block)".into()));
-    }
-    let block = ctx.args[0].clone();
+    // `buildString(builderAction)` or `buildString(capacity,
+    // builderAction)`. The capacity is only a sizing hint here, so the
+    // builder lambda is always the last argument.
+    let block = match ctx.args.len() {
+        1 => ctx.args[0].clone(),
+        2 => ctx.args[1].clone(),
+        _ => {
+            return Err(RuntimeError::Arity(
+                "buildString expects (block) or (capacity, block)".into(),
+            ));
+        }
+    };
     let sb = Value::StringBuilder(ObjRef::new(String::new()));
     {
         let CallCtx { out, host, .. } = ctx;

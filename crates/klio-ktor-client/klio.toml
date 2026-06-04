@@ -21,6 +21,13 @@ auto_bindings = true
 root = "upstream/ktor-io/common/src"
 include = ["io/ktor/utils/io/Annotations.kt"]
 
+# Upstream `io.ktor.util` string helpers (escapeHTML / quote /
+# toLowerCasePreservingASCIIRules / caseInsensitive …) — self-contained,
+# foundational for the http header/value parsing layer. Ungated (core).
+[[source]]
+root = "upstream/ktor-utils/common/src"
+include = ["io/ktor/util/Text.kt"]
+
 [[source]]
 root = "upstream/ktor-http/common/src"
 include = [
