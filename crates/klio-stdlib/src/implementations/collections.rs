@@ -3329,6 +3329,58 @@ fn index_oob(msg: String) -> RuntimeError {
     ))
 }
 
+/// `Array<T>.contentEquals(other)` and the primitive-array variants.
+/// Upstream declares these `infix` extensions on a nullable receiver with
+/// no klio body; without an actual every `a.contentEquals(b)` no-ops to
+/// `Unit`. Two arrays are content-equal when they have the same length and
+/// each element pair is `==` (klio structural equality), with two nulls
+/// equal and a null vs non-null unequal.
+pub(crate) fn array_content_equals(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("contentEquals requires a receiver".into()))?;
+    let other = ctx
+        .args
+        .get(1)
+        .ok_or_else(|| RuntimeError::Arity("contentEquals expects (other)".into()))?;
+    if matches!(recv, Value::Null) || matches!(other, Value::Null) {
+        return Ok(Value::Bool(
+            matches!(recv, Value::Null) && matches!(other, Value::Null),
+        ));
+    }
+    let a = iterable_items(recv, "contentEquals")?;
+    let b = iterable_items(other, "contentEquals")?;
+    if a.len() != b.len() {
+        return Ok(Value::Bool(false));
+    }
+    let eq = a
+        .iter()
+        .zip(b.iter())
+        .all(|(x, y)| Value::structural_eq_boxed(x, y));
+    Ok(Value::Bool(eq))
+}
+
+/// `Array<T>.contentToString()` / primitive variants: `[a, b, c]`, or the
+/// literal `null` for a null receiver. Mirrors the element rendering of
+/// `toString` (the `Value` Display).
+pub(crate) fn array_content_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("contentToString requires a receiver".into()))?;
+    if matches!(recv, Value::Null) {
+        return Ok(Value::String(std::sync::Arc::new("null".to_string())));
+    }
+    let items = iterable_items(recv, "contentToString")?;
+    let body = items
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Value::String(std::sync::Arc::new(format!("[{body}]"))))
+}
+
 /// `Array<T>.copyInto(destination, destinationOffset = 0, startIndex = 0,
 /// endIndex = size): destination` and the primitive-array variants.
 /// Copies `this[startIndex, endIndex)` into `destination` starting at

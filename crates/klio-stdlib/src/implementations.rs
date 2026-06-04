@@ -551,6 +551,35 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.ULongArray.fill", array_fill),
     ("kotlin.UShortArray.fill", array_fill),
     ("kotlin.UByteArray.fill", array_fill),
+    // Structural content equality / rendering. Also unimplemented
+    // `expect`/`infix` extensions; without these `a.contentEquals(b)` and
+    // `a.contentToString()` no-op to `Unit`.
+    ("kotlin.Array.contentEquals", array_content_equals),
+    ("kotlin.IntArray.contentEquals", array_content_equals),
+    ("kotlin.LongArray.contentEquals", array_content_equals),
+    ("kotlin.DoubleArray.contentEquals", array_content_equals),
+    ("kotlin.FloatArray.contentEquals", array_content_equals),
+    ("kotlin.ShortArray.contentEquals", array_content_equals),
+    ("kotlin.ByteArray.contentEquals", array_content_equals),
+    ("kotlin.CharArray.contentEquals", array_content_equals),
+    ("kotlin.BooleanArray.contentEquals", array_content_equals),
+    ("kotlin.UIntArray.contentEquals", array_content_equals),
+    ("kotlin.ULongArray.contentEquals", array_content_equals),
+    ("kotlin.UShortArray.contentEquals", array_content_equals),
+    ("kotlin.UByteArray.contentEquals", array_content_equals),
+    ("kotlin.Array.contentToString", array_content_to_string),
+    ("kotlin.IntArray.contentToString", array_content_to_string),
+    ("kotlin.LongArray.contentToString", array_content_to_string),
+    ("kotlin.DoubleArray.contentToString", array_content_to_string),
+    ("kotlin.FloatArray.contentToString", array_content_to_string),
+    ("kotlin.ShortArray.contentToString", array_content_to_string),
+    ("kotlin.ByteArray.contentToString", array_content_to_string),
+    ("kotlin.CharArray.contentToString", array_content_to_string),
+    ("kotlin.BooleanArray.contentToString", array_content_to_string),
+    ("kotlin.UIntArray.contentToString", array_content_to_string),
+    ("kotlin.ULongArray.contentToString", array_content_to_string),
+    ("kotlin.UShortArray.contentToString", array_content_to_string),
+    ("kotlin.UByteArray.contentToString", array_content_to_string),
     // In-place natural-order sort (no-arg and (fromIndex, toIndex)).
     // Also an unimplemented `expect`; without it `sort()` no-ops and
     // `sortedArray`/`sortDescending`, which delegate to it, are wrong.
