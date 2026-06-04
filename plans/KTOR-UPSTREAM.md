@@ -52,9 +52,38 @@ Dependency order: **ktor-io → ktor-utils → ktor-http → {client-core, serve
 Features stay one-per-Gradle-module (`client`, `server`, `client-serialization`,
 `server-serialization`, …), so consumers opt in exactly as today.
 
+## Progress
+
+Real upstream now runs in klio (validated as multi-file programs): `HttpStatusCode`
+(incl. `fromValue`), `HttpMethod`, and `ContentType` (incl. `parse`, `match`,
+`withCharset`) — consumed verbatim from `ktor-http/common/src`, with a small
+klioMain `Charset` actual (the genuinely low-level piece).
+
+General interpreter fixes landed along the way (each helps all programs):
+- bare call resolves to a top-level `fun` over a same-named property
+  (`HttpStatusCode.allStatusCodes`);
+- `String.equals` returns `Bool`, incl. the `ignoreCase` form, named or positional;
+- `key in map` over a user `Map` type routes to `containsKey`.
+
+## Open blockers (next, in order)
+
+1. **Map key equality must honor the key's `equals`/`hashCode`.** klio compares
+   Map keys structurally (by fields/identity), but Kotlin uses the key's
+   `equals`/`hashCode`. ktor's `Headers`/`Parameters` store entries in a
+   `CaseInsensitiveMap` keyed by `CaseInsensitiveString` (custom case-folding
+   `equals`), so lookups currently miss. This is a core Map-semantics change
+   (get/containsKey/put/remove invoking the key's `equals` for instance keys) and
+   gates the ktor-http header/URL surface.
+2. **ktor-http remainder** — `Headers`/`Parameters`/`Url`/`URLBuilder`/codecs,
+   once (1) lands.
+3. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
+   + `createPlugin`/`EventDefinition`), the spine of both cores.
+4. **Cores on upstream**, engine staying klio-side.
+
 ## Status
 
-Foundation + Layer-0 groundwork started. Layers 0–1 are mechanical once the
-actuals exist; Layer 2 (Pipeline runtime) is the gating interpreter work for the
-full client/server. The shim remains in place until each layer's upstream
-replacement is validated, so functionality does not regress mid-migration.
+The protocol foundation is consuming real upstream and the general fixes it needs
+are landing. The remaining path is a deliberate multi-step program: the Map
+key-equality change, then the ktor-http remainder, then the Pipeline runtime for
+the cores. The shim stays in place so client/server keep working until each
+layer's upstream replacement is validated.
