@@ -3498,6 +3498,97 @@ pub(crate) fn array_content_hash_code(ctx: &mut CallCtx) -> Result<Value, Runtim
     Ok(Value::Int(result))
 }
 
+/// `Array<T>?.orEmpty()` — the receiver if non-null, else an empty array.
+pub(crate) fn array_or_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    match ctx.args.first() {
+        Some(v @ Value::Array { .. }) => Ok(v.clone()),
+        _ => Ok(Value::Array {
+            items: ObjRef::new(Vec::new()),
+            prim: None,
+        }),
+    }
+}
+
+/// Render a value for `contentDeepToString`, recursing into nested arrays.
+fn deep_to_string(v: &Value) -> String {
+    match v {
+        Value::Array { items, .. } => {
+            let body = items
+                .borrow()
+                .iter()
+                .map(deep_to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{body}]")
+        }
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// `Array<T>.contentDeepToString()` — like `contentToString` but recursing
+/// into nested arrays.
+pub(crate) fn array_content_deep_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("contentDeepToString requires a receiver".into()))?;
+    if matches!(recv, Value::Null) {
+        return Ok(Value::String(Arc::new("null".to_string())));
+    }
+    Ok(Value::String(Arc::new(deep_to_string(recv))))
+}
+
+/// Deep equality for `contentDeepEquals`: nested arrays compare by content
+/// recursively, other elements by structural `==`.
+fn deep_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Array { items: ia, .. }, Value::Array { items: ib, .. }) => {
+            let ia = ia.borrow();
+            let ib = ib.borrow();
+            ia.len() == ib.len() && ia.iter().zip(ib.iter()).all(|(x, y)| deep_eq(x, y))
+        }
+        _ => Value::structural_eq_boxed(a, b),
+    }
+}
+
+pub(crate) fn array_content_deep_equals(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("contentDeepEquals requires a receiver".into()))?;
+    let other = ctx
+        .args
+        .get(1)
+        .ok_or_else(|| RuntimeError::Arity("contentDeepEquals expects (other)".into()))?;
+    Ok(Value::Bool(deep_eq(recv, other)))
+}
+
+/// Deep element hash for `contentDeepHashCode`.
+fn deep_hash_element(v: &Value) -> i32 {
+    match v {
+        Value::Array { items, .. } => {
+            let mut result: i32 = 1;
+            for e in items.borrow().iter() {
+                result = result.wrapping_mul(31).wrapping_add(deep_hash_element(e));
+            }
+            result
+        }
+        other => kotlin_value_hash(other),
+    }
+}
+
+pub(crate) fn array_content_deep_hash_code(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("contentDeepHashCode requires a receiver".into()))?;
+    if matches!(recv, Value::Null) {
+        return Ok(Value::Int(0));
+    }
+    Ok(Value::Int(deep_hash_element(recv)))
+}
+
 /// The primitive-array kind of an array receiver (so a result array keeps
 /// the same element-type tag), or `None` for a boxed `Array<T>`.
 fn array_prim_of(v: &Value) -> Option<klio_runtime::PrimitiveArrayKind> {
