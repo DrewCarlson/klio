@@ -462,9 +462,24 @@ upstream and delete the request-member shims.
    body-prop shape, named-arg construction, `internal constructor` primary. The
    bug is in how the consumed parser drives klio's string intrinsics
    (`findScheme` / `count` / `indexOfColonInHostPort` / `indexOfAny` /
-   `indexOfFirst`/`indexOfLast`) — next step is to consume just those parser
-   helpers and unit-test each against `"http://localhost:80"` to find which
-   returns the wrong index so `port` never gets assigned.
+   `indexOfFirst`/`indexOfLast`).
+   **One found + fixed (landed):** `indexOfAny("@/\\?#".toCharArray(), …)` threw
+   `get_field length on Char` because `String.toCharArray()` returned a
+   `List<Char>` instead of a `CharArray`, so overload resolution bound
+   `indexOfAny(strings: Collection<String>, …)` (which read `.length` on each
+   `Char`). Fixed: `toCharArray` returns a `Value::Array { prim: Char }` (commit
+   `stdlib: String.toCharArray returns a CharArray`); a standalone replica of
+   the parser's host/port extraction now resolves `host`/`port` correctly.
+   **Still failing:** the *real* consumed `URLBuilder("http://localhost:80")
+   .build()` still yields `port == Null` (init-block require fails at load),
+   even though the standalone replica works. So a *second* parser bug remains —
+   the private `count` / `findScheme` and the `indexOfColonInHostPort` extension
+   share names with stdlib functions (`CharSequence.count`, etc.), so inside
+   `takeFromUnsafe` a bare `count(s, i, j, '/')` / `findScheme(...)` call may bind
+   the wrong same-named overload and `fillHost` is reached with wrong indices (or
+   not reached). Next: instrument `takeFromUnsafe`'s `slashCount` / `fillHost`
+   call in situ (the companion-init load path) to see which private helper
+   mis-resolves.
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.
