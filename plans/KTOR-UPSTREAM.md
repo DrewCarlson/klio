@@ -319,6 +319,16 @@ upstream and delete the request-member shims.
   read falls through to the global where the call binds the function and applies
   the real arguments. Covered by `corpus/toplevel_fn_in_receiver_lambda.kt`
   (kotlinc byte-parity).
+- **Default argument that reads the extension receiver.** A default arg like
+  `fun String.f(end: Int = length)` (`length` = `this.length`) lost `this` when
+  the default thunk ran via the named-argument fill path — the thunk binds
+  `this` as a leading param, but the bare `length` lowered to
+  `LoadFromThisOrGlobal` (whose capture slot is empty in a thunk) and escaped to
+  an unresolved global. The Path lowering now reads `this.length` whenever
+  `this` is genuinely bound (`b.resolve("this")` is `Some`) even in a param
+  thunk; a non-extension thunk never binds `this`, so it keeps the global probe.
+  ktor's `String.decodeURLQueryComponent(end: Int = length, …)` needs this.
+  Covered by `corpus/default_arg_reads_receiver.kt` (kotlinc byte-parity).
 - **Bare extension call binds the receiver-matching overload.** A bare call
   to a same-named extension inside an extension body now binds the overload
   whose `this`-param type matches the enclosing receiver — `takeWhile` inside
@@ -387,34 +397,16 @@ upstream and delete the request-member shims.
 
 ## Open blockers (next, in order)
 
-1. **ktor-http remainder — `Url` / `URLBuilder` / `Codecs`.** `URLBuilder`
-   hard-depends on `Codecs` (`encodeURLParameter`/`encodeURLQueryComponent`/…),
-   so `Codecs.kt` is the gate. Prerequisites are **now landed** (see above):
-   the charset `newEncoder()`/`encode()` actual + the ktor-io core
-   (`Buffer.canRead`, `Source.takeWhile`) are consumed and verified working via
-   explicit calls (`encode(s).takeWhile { … canRead … readByte }` drains
-   correctly), and `Range + Range` (`URL_ALPHABET`) is fixed.
-   The `buildString { coll.forEach { append } }` shape now works (the
-   top-level-fn-in-receiver-lambda fix above; `decodeURLPart` works too).
-   **Two blockers remain for `Codecs.kt` itself:**
-   - **`Source.forEach` block invocation (still empty).** The `takeWhile`
-     resolution is now fixed (bare-ext receiver-match, landed above) — inside
-     `fun Source.forEach`, the bare `takeWhile { … }` binds the pack's
-     `Source.takeWhile`. But the encode functions still yield an empty string
-     in pack form: `Source.forEach`'s `takeWhile { buffer -> while
-     (buffer.canRead()) block(buffer.readByte()); true }` does not run
-     `block` (the `encodeURLParameter` `forEach` lambda), so nothing is
-     appended. Next: trace whether `Source.takeWhile`'s `while (!exhausted()
-     && block(buffer))` reads `this.buffer` correctly and invokes the
-     forwarded `block` param in pack-lowered form (an explicit
-     `content.takeWhile { … }` from non-pack code drains correctly, so the gap
-     is again pack-lowered nested invocation, narrowed from the whole
-     `forEach`).
-   - **`length` default-arg.** `decodeURLQueryComponent(start = 0, end =
-     length, …)` — the default `end = length` (i.e. `this.length` on the String
-     receiver) resolves to an `unresolved global length` for a defaulted arg.
-   Once both resolve, `Codecs.kt` consumes cleanly; then `URLParser`/
-   `URLBuilder`, and `Url` (which is `@Serializable`, needs serialization).
+1. **ktor-http remainder — `Url` / `URLBuilder`.** `Codecs.kt` is **consumed**
+   (encode + decode): `encodeURLParameter`/`encodeURLQueryComponent`/
+   `encodeURLPath` and `decodeURLPart`/`decodeURLQueryComponent` all run through
+   the real pack (verified in `tests/ktor_http_value_types.rs`), backed by the
+   charset `newEncoder()`/`encode()` actual + consumed ktor-io core
+   (`Buffer.canRead`, `Source.takeWhile`) + five general interpreter fixes
+   (`Range + Range`, top-level-fn-in-receiver-lambda, bare-ext receiver-match,
+   `this@fn` in a nested receiver lambda, default-arg reads receiver). Next:
+   consume `URLParser.kt` / `URLBuilder.kt` (they import `Codecs`), then `Url`
+   (which is `@Serializable`, needs serialization support).
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.

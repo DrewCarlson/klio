@@ -795,9 +795,16 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     };
                     return lower_expr(b, &qualified);
                 }
-                if !b.is_param_thunk()
-                    && let Some(this_reg) = b.resolve("this")
-                {
+                // A genuinely-bound `this` (`b.resolve("this")` is `Some`)
+                // means a real receiver is in scope — a method/extension body
+                // OR an *extension* default-arg thunk, whose receiver is bound
+                // as a leading `this` param (`fun String.f(end: Int = length)`
+                // → the `end` thunk binds `this`). Such a thunk must read
+                // `this.length`, not `LoadFromThisOrGlobal` (whose capture
+                // slot is empty in a thunk, so `this` would be lost and
+                // `length` escape to an unresolved global). A *non*-extension
+                // thunk never binds `this`, so it keeps the global probe.
+                if let Some(this_reg) = b.resolve("this") {
                     // A bare name that resolves to a known top-level
                     // function is a value-position function reference,
                     // not an implicit `this.<name>` field read. Skip

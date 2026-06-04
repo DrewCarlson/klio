@@ -60,6 +60,7 @@ include = [
     "io/ktor/http/Ranges.kt",
     "io/ktor/http/ContentRange.kt",
     "io/ktor/http/RangesSpecifier.kt",
+    "io/ktor/http/Codecs.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)

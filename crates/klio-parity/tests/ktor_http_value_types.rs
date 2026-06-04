@@ -92,6 +92,14 @@ fun main() {
 
     val parts = parseHeaderValue("a/b; q=0.8; level=1, c/d")
     println("${parts.size}|${parts[0].value}|${parts[0].params.size}")
+
+    println(" a b/c?".encodeURLParameter())
+    println("a b".encodeURLParameter(spaceToPlus = true))
+    println("hello world".encodeURLQueryComponent())
+    println("/path/with space".encodeURLPath())
+    println("%2Fp%20q".decodeURLPart())
+    println("a+b%20c".decodeURLQueryComponent(plusIsSpace = true))
+    println("caf%C3%A9".decodeURLPart())
 }
 "#;
 
@@ -107,7 +115,14 @@ fun main() {
          attachment; filename=\"a b.txt\"\n\
          text/plain|UTF-8\n\
          application/json; q=0.5\n\
-         2|a/b|2\n",
+         2|a/b|2\n\
+         %20a%20b%2Fc%3F\n\
+         a+b\n\
+         hello%20world\n\
+         /path/with%20space\n\
+         /p q\n\
+         a b c\n\
+         café\n",
         "ktor header value-type output drifted"
     );
 }
