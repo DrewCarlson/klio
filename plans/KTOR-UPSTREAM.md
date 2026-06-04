@@ -108,6 +108,44 @@ More fixes landed: anonymous-object property initializers over captures are
 now evaluated (`val inner = src.iterator()`), so `DelegatingMutableSet`'s
 anonymous iterator constructs; and `entries`/`size` over the wrapper work.
 
+## Pipeline runtime (phase 2) — recon + progress
+
+The big remaining lift: consume the real upstream `io.ktor.util.pipeline.*`
+(`Pipeline`/`PipelineContext`/`SuspendFunctionGun` + `PipelinePhase`/
+`PhaseContent`, ~1050 lines) so client/server cores run on upstream and the
+request-member shims delete. `SuspendFunctionGun` is the coroutine state
+machine; it drives the low-level **manual-continuation** API directly:
+`suspendCoroutineUninterceptedOrReturn`, `Continuation.intercepted()`,
+storing a `Continuation` and resuming it by hand (`resumeRootWith`/
+`addContinuation`), `startCoroutineUninterceptedOrReturn`, plus a
+`pipelineStartCoroutineUninterceptedOrReturn` `expect` needing a klio actual.
+
+**Landed:** the first hard prerequisite — an object expression created
+inside an inline function (the `kotlin.coroutines.Continuation(ctx) { … }`
+factory) whose members reference the captured crossinline parameter of the
+*same name* (`override fun resumeWith(r) = resumeWith(r)`) now binds the
+captured param instead of self-recursing into the member (was an infinite
+loop). Fixed at lowering for both bare calls and reads of an anon-object
+capture name.
+
+**Next blockers (in order):**
+1. **Anon-object getter capture** — `override val context get() = context`
+   still returns null: an anon object's property getter is lowered lazily,
+   outside the `set_lower_anon_captures` window, so the captured `context`
+   isn't reached and `intercepted()` then casts a null context (→ "cast to
+   Map"). Lower anon getters eagerly with the capture set (like the
+   methods), or run them with the captures layered.
+2. **Low-level manual-continuation primitives** — `startCoroutine` /
+   `Continuation(ctx){}` resume / `suspendCoroutineUninterceptedOrReturn`
+   with a hand-stored-and-resumed continuation must work for the
+   `SuspendFunctionGun` loop. klio's coroutine engine is built for the
+   high-level cooperative scheduler (`runBlocking`/`launch`/`delay`); the
+   manual-continuation API is the gap.
+3. **`io.ktor.util` deps** (`Attributes`, `KtorDsl`, `StackWalkingFailed`)
+   and `kotlinx.atomicfu` references inside the pipeline files.
+4. Then wire `pipelineStartCoroutineUninterceptedOrReturn`'s actual and
+   switch the cores onto upstream, deleting the request-member shims.
+
 ## Open blockers (next, in order)
 
 1. **Receiver-lambda *property* invoked extension-style.**
