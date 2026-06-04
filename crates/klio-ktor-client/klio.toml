@@ -37,6 +37,17 @@ include = [
     "io/ktor/util/DelegatingMutableSet.kt",
     "io/ktor/util/CaseInsensitiveMap.kt",
     "io/ktor/util/StringValues.kt",
+    "io/ktor/util/reflect/Type.kt",
+    "io/ktor/util/Attributes.kt",
+]
+
+# Platform `actual`s for the ktor-util reflect `expect`s (`Type`,
+# `KType.platformType`, `Any.instanceOf`). The posix variant is pure common
+# Kotlin (typealias to `KType`, `KClass.isInstance`).
+[[source]]
+root = "upstream/ktor-utils/posix/src"
+include = [
+    "io/ktor/util/reflect/TypeInfoNative.kt",
 ]
 
 [[source]]

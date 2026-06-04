@@ -189,3 +189,45 @@ fun main() {
         "ktor URL parsing output drifted"
     );
 }
+
+#[test]
+fn ktor_attributes_from_upstream() {
+    install_ktor_pack();
+
+    // `Attributes` / `AttributeKey` consumed from upstream `Attributes.kt`
+    // (+ `reflect/Type.kt` and the posix reflect actual); klio supplies the
+    // platform `Attributes(concurrent)` factory. Exercises put/get/contains,
+    // the `[]` set operator, `computeIfAbsent`, and remove across two keys of
+    // different value types (regression for the erased `as T` cast).
+    let src = r#"
+import io.ktor.util.*
+
+fun main() {
+    val a = Attributes()
+    val name = AttributeKey<String>("name")
+    val count = AttributeKey<Int>("count")
+    a.put(name, "ktor")
+    a[count] = 7
+    println("${a[name]}|${a[count]}|${name in a}|${a.allKeys.size}")
+    println(a.computeIfAbsent(count) { 99 })
+    println(a.computeIfAbsent(AttributeKey<String>("lang")) { "kotlin" })
+    a.remove(name)
+    println("${name in a}|${a.getOrNull(name)}")
+}
+"#;
+
+    let dir = std::env::temp_dir().join("klio_ktor_attributes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.kt");
+    std::fs::write(&file, src).unwrap();
+
+    let got = run(&file);
+    assert_eq!(
+        got,
+        "ktor|7|true|2\n\
+         7\n\
+         kotlin\n\
+         false|null\n",
+        "ktor Attributes output drifted"
+    );
+}
