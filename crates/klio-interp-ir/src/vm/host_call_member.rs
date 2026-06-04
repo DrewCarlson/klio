@@ -134,6 +134,57 @@ impl VmHost<'_> {
         }
     }
 
+    /// Find a function-typed property named `name` reachable from the
+    /// enclosing-`this` chain or any of those instances' `outer` links.
+    /// Backs the "extension-function-typed member invoked with an explicit
+    /// receiver" form (`x.block()` where `block: R.() -> T` is a property of
+    /// the lexically enclosing instance) — including from inside a nested
+    /// anonymous object whose `outer` holds the property (ktor's
+    /// `DelegatingMutableSet` iterator calling the outer's `convertTo`).
+    pub(crate) fn enclosing_callable_property(
+        &self,
+        name: &str,
+    ) -> Option<klio_runtime::Value> {
+        let is_callable = |v: &klio_runtime::Value| {
+            matches!(
+                v,
+                klio_runtime::Value::Lambda { .. }
+                    | klio_runtime::Value::IrClosure { .. }
+                    | klio_runtime::Value::Function { .. }
+                    | klio_runtime::Value::BoundMethod { .. }
+            )
+        };
+        let mut work: Vec<klio_runtime::Value> = self.enclosing_this_chain();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut i = 0;
+        while i < work.len() {
+            let v = work[i].clone();
+            i += 1;
+            let klio_runtime::Value::Instance(inst) = &v else {
+                continue;
+            };
+            let (found, outer) = {
+                let b = inst.borrow();
+                if !seen.insert(b.identity) {
+                    continue;
+                }
+                let found = b
+                    .fields
+                    .iter()
+                    .find(|(n, fv)| n == name && is_callable(fv))
+                    .map(|(_, fv)| fv.clone());
+                (found, b.outer.clone())
+            };
+            if found.is_some() {
+                return found;
+            }
+            if let Some(o) = outer {
+                work.push(o);
+            }
+        }
+        None
+    }
+
     pub(crate) fn call_member(
         &mut self,
         receiver: &klio_runtime::Value,
@@ -2639,7 +2690,22 @@ impl VmHost<'_> {
                     "Vm::call_member `{name}` (member-only probe)"
                 )));
             }
-            if let Some((fid, _func)) = chosen {
+            // A receiver-incompatible *member* extension must not shadow a
+            // function-typed property of the enclosing instance invoked
+            // extension-style. ktor's `DelegatingMutableSet` declares both a
+            // lambda property `convertTo: From.() -> To` and a member
+            // extension `Collection<From>.convertTo()`; `element.convertTo()`
+            // (a single `From`) must invoke the lambda property, not the
+            // collection member extension (which would recurse / mis-bind).
+            // Only defers when no candidate's declared receiver accepts the
+            // actual receiver AND such a property is in scope, so a genuine
+            // member-extension call (receiver compatible) is unaffected.
+            let defer_to_property = !any_compat
+                && chosen.as_ref().is_some_and(|(fid, _)| {
+                    self.module.registry.member_ext_owner_class.contains_key(fid)
+                })
+                && self.enclosing_callable_property(name).is_some();
+            if let Some((fid, _func)) = chosen.filter(|_| !defer_to_property) {
                 // Runaway-recursion guard, scoped to the top-level
                 // extension dispatch only. Re-entering this block for
                 // the same (name, receiver-instance) is legitimate at
@@ -2881,21 +2947,7 @@ impl VmHost<'_> {
         // where `block: suspend FlowCollector<T>.() -> Unit` is a
         // field of the enclosing `SafeFlow`.) Invoke the callable
         // with the receiver as its extension-receiver argument.
-        if let Some(klio_runtime::Value::Instance(encl)) = self.enclosing_this() {
-            let cand = encl
-                .borrow()
-                .fields
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| v.clone());
-            if let Some(v) = cand
-                && matches!(
-                    v,
-                    klio_runtime::Value::Lambda { .. }
-                        | klio_runtime::Value::IrClosure { .. }
-                        | klio_runtime::Value::Function { .. }
-                        | klio_runtime::Value::BoundMethod { .. }
-                )
+        if let Some(v) = self.enclosing_callable_property(name) {
             {
                 // Bind the explicit receiver as the callable's
                 // implicit `this` so the body's bare member calls
