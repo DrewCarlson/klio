@@ -248,6 +248,25 @@ impl VmHost<'_> {
                 class_def = d;
             }
         }
+        // Same collision artifact for an interface: a ctor target whose simple
+        // name also names an interface (a nested `Map.Entry` / `MutableEntry`
+        // synthesised from a type position vs a user `class Entry` implementing
+        // it) may resolve to the interface when it was registered last.
+        // Redirect to the concrete same-name sibling so `Entry(...)` constructs
+        // the class. A genuine interface with no concrete sibling (`List`,
+        // `MutableList`) is left alone for the factory handling below.
+        if class_def.is_interface {
+            let want = ir_class.name.clone();
+            let concrete = {
+                let g = self.classes.borrow();
+                g.values()
+                    .find(|d| d.name == want && !d.is_abstract && !d.is_interface)
+                    .cloned()
+            };
+            if let Some(d) = concrete {
+                class_def = d;
+            }
+        }
         if class_def.is_abstract {
             return Err(klio_ir::eval::EvalError::Throw(
                 klio_runtime::Value::Exception {

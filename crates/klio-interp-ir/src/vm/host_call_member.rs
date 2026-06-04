@@ -185,6 +185,51 @@ impl VmHost<'_> {
         None
     }
 
+    /// Does the receiver's *actual* runtime type satisfy `ty_name`? Unlike
+    /// `receiver_compatible_with_param` (which accepts any `Instance`
+    /// wholesale), this walks an instance's class + supertype chain for the
+    /// type's simple name, so a `CaseInsensitiveString` is not treated as a
+    /// `Collection`. `Any`/`Unit`, function types, and bare type-parameter
+    /// names (`T`, `From`) accept anything.
+    pub(crate) fn receiver_implements_type(
+        &self,
+        receiver: &klio_runtime::Value,
+        ty_name: &str,
+    ) -> bool {
+        let pn = ty_name.rsplit('.').next().unwrap_or(ty_name);
+        let pn = pn.trim_end_matches('?');
+        if matches!(pn, "Any" | "Unit")
+            || pn.starts_with("Function")
+            || (!pn.is_empty()
+                && pn.len() <= 2
+                && pn.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
+        {
+            return true;
+        }
+        match receiver {
+            klio_runtime::Value::Instance(inst) => {
+                let mut queue = vec![inst.borrow().class.name.clone()];
+                let mut seen: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                while let Some(c) = queue.pop() {
+                    if !seen.insert(c.clone()) {
+                        continue;
+                    }
+                    if c.rsplit('.').next().unwrap_or(&c) == pn {
+                        return true;
+                    }
+                    if let Some(d) = self.classes.borrow().get(&c).cloned() {
+                        for s in &d.supertype_names {
+                            queue.push(s.clone());
+                        }
+                    }
+                }
+                false
+            }
+            other => other.is_runtime_type(pn),
+        }
+    }
+
     pub(crate) fn call_member(
         &mut self,
         receiver: &klio_runtime::Value,
@@ -2700,11 +2745,12 @@ impl VmHost<'_> {
             // Only defers when no candidate's declared receiver accepts the
             // actual receiver AND such a property is in scope, so a genuine
             // member-extension call (receiver compatible) is unaffected.
-            let defer_to_property = !any_compat
-                && chosen.as_ref().is_some_and(|(fid, _)| {
-                    self.module.registry.member_ext_owner_class.contains_key(fid)
-                })
-                && self.enclosing_callable_property(name).is_some();
+            let defer_to_property = chosen.as_ref().is_some_and(|(fid, f)| {
+                self.module.registry.member_ext_owner_class.contains_key(fid)
+                    && f.params
+                        .first()
+                        .is_some_and(|p| !self.receiver_implements_type(receiver, &p.ty.name))
+            }) && self.enclosing_callable_property(name).is_some();
             if let Some((fid, _func)) = chosen.filter(|_| !defer_to_property) {
                 // Runaway-recursion guard, scoped to the top-level
                 // extension dispatch only. Re-entering this block for
