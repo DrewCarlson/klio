@@ -44,6 +44,8 @@ include = [
     "io/ktor/http/HttpHeaderValueParser.kt",
     "io/ktor/http/HeaderValueWithParameters.kt",
     "io/ktor/http/ContentTypes.kt",
+    "io/ktor/http/Headers.kt",
+    "io/ktor/http/Parameters.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
