@@ -528,6 +528,34 @@ pub(crate) fn string_equals(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Bool(eq))
 }
 
+/// `CharSequence.contentEquals(other: CharSequence?, ignoreCase = false)` —
+/// true when the two character sequences are equal (optionally case-folded).
+/// A null `other` is unequal. A bodyless `expect` otherwise.
+pub(crate) fn char_sequence_content_equals(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("contentEquals requires a receiver".into()))?;
+    let cs_to_string = |v: &Value| -> Result<String, RuntimeError> {
+        match v {
+            Value::StringBuilder(sb) => Ok(sb.borrow().clone()),
+            other => arg_as_string(other, "contentEquals"),
+        }
+    };
+    let a = cs_to_string(recv)?;
+    let other = match ctx.args.get(1) {
+        Some(Value::Null) | None => return Ok(Value::Bool(false)),
+        Some(v) => cs_to_string(v)?,
+    };
+    let ignore_case = matches!(ctx.args.get(2), Some(Value::Bool(true)));
+    let eq = if ignore_case {
+        a.to_lowercase() == other.to_lowercase()
+    } else {
+        a == other
+    };
+    Ok(Value::Bool(eq))
+}
+
 pub(crate) fn string_contains(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let s = recv_string(ctx.args, "String.contains")?;
     let needle = arg_as_string(
