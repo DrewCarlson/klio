@@ -334,30 +334,84 @@ impl VmHost<'_> {
             let anon_cap_set: std::collections::HashSet<String> =
                 captured_names.iter().cloned().collect();
             klio_ir::lower::set_lower_anon_captures(Some(anon_cap_set));
+            // Property inits that aren't a literal or a bare captured name
+            // are lowered as zero-arg thunks (a synthetic method body) and
+            // run after the instance exists, so e.g.
+            // `object : Iterator { val it = src.iterator() … }` evaluates
+            // the call with the captures (and `this`) in scope instead of
+            // falling back to Null.
+            let mut complex_prop_inits: Vec<(String, Arc<klio_ir::Module>, klio_ir::FuncId)> =
+                Vec::new();
             for m in members {
-                if let klio_ast::Decl::Function(f) = m {
-                    if f.body.is_none() {
-                        continue;
+                match m {
+                    klio_ast::Decl::Function(f) => {
+                        if f.body.is_none() {
+                            continue;
+                        }
+                        let mut sub_module = klio_ir::Module::default();
+                        let func = klio_ir::lower::lower_method(
+                            &mut sub_module,
+                            f,
+                            &synth_class_name,
+                            &own_members,
+                        );
+                        let fid = func.id;
+                        let module_rc = Arc::new(sub_module);
+                        let entry = (module_rc, fid, capture_pairs.clone());
+                        let mut tbl = self.anon_methods.borrow_mut();
+                        tbl.insert(
+                            (
+                                synth_class_name.clone(),
+                                format!("{}#{}", f.name.name, f.params.len()),
+                            ),
+                            entry.clone(),
+                        );
+                        tbl.insert((synth_class_name.clone(), f.name.name.clone()), entry);
                     }
-                    let mut sub_module = klio_ir::Module::default();
-                    let func = klio_ir::lower::lower_method(
-                        &mut sub_module,
-                        f,
-                        &synth_class_name,
-                        &own_members,
-                    );
-                    let fid = func.id;
-                    let module_rc = Arc::new(sub_module);
-                    let entry = (module_rc, fid, capture_pairs.clone());
-                    let mut tbl = self.anon_methods.borrow_mut();
-                    tbl.insert(
-                        (
-                            synth_class_name.clone(),
-                            format!("{}#{}", f.name.name, f.params.len()),
-                        ),
-                        entry.clone(),
-                    );
-                    tbl.insert((synth_class_name.clone(), f.name.name.clone()), entry);
+                    klio_ast::Decl::Property(p) => {
+                        let Some(init) = &p.init else { continue };
+                        let is_bare_path = matches!(
+                            init,
+                            klio_ast::Expr::Path { segments, .. } if segments.len() == 1
+                        );
+                        if simple_literal(init).is_some() || is_bare_path {
+                            continue;
+                        }
+                        let thunk = klio_ast::Function {
+                            name: klio_ast::Ident {
+                                name: format!("$init${}", p.name.name),
+                                span: p.name.span,
+                            },
+                            receiver_type: None,
+                            type_params: Vec::new(),
+                            where_bounds: Vec::new(),
+                            params: Vec::new(),
+                            return_type: None,
+                            body: Some(klio_ast::FunctionBody::Expr(init.clone())),
+                            is_open: false,
+                            is_override: false,
+                            is_abstract: false,
+                            is_operator: false,
+                            is_inline: false,
+                            is_infix: false,
+                            is_tailrec: false,
+                            is_suspend: false,
+                            is_expect: false,
+                            is_actual: false,
+                            visibility: klio_ast::Visibility::Public,
+                            annotations: Vec::new(),
+                            span: p.name.span,
+                        };
+                        let mut sub_module = klio_ir::Module::default();
+                        let func = klio_ir::lower::lower_method(
+                            &mut sub_module,
+                            &thunk,
+                            &synth_class_name,
+                            &own_members,
+                        );
+                        complex_prop_inits.push((p.name.name.clone(), Arc::new(sub_module), func.id));
+                    }
+                    _ => {}
                 }
             }
             klio_ir::lower::set_lower_anon_captures(None);
@@ -610,6 +664,48 @@ impl VmHost<'_> {
                         inst.borrow_mut().define(&p.name, v);
                     }
                 }
+            }
+            // Run the anon object's own complex property inits (the
+            // thunks lowered above) now that the instance + inherited
+            // fields exist, with the captured names and `this` in scope —
+            // mirroring the anon-method capture binding.
+            for (prop_name, module_rc, fid) in &complex_prop_inits {
+                let Some(func) = module_rc.funcs.get(fid.0 as usize).cloned() else {
+                    continue;
+                };
+                let prev = self.globals.clone();
+                if !capture_pairs.is_empty() {
+                    let scoped =
+                        klio_runtime::ObjRef::new(klio_runtime::Env::with_parent(prev.clone()));
+                    for (n, v) in &capture_pairs {
+                        scoped.borrow_mut().define(n.clone(), v.clone());
+                    }
+                    self.globals = scoped;
+                }
+                let cap_vec: Vec<klio_runtime::Value> = func
+                    .capture_order
+                    .iter()
+                    .map(|n| {
+                        if n == "this" {
+                            inst_value.clone()
+                        } else {
+                            capture_pairs
+                                .iter()
+                                .find(|(cn, _)| cn == n)
+                                .map_or(klio_runtime::Value::Null, |(_, v)| v.clone())
+                        }
+                    })
+                    .collect();
+                let res = klio_ir::eval::eval_with_captures(
+                    module_rc,
+                    &func,
+                    vec![inst_value.clone()],
+                    cap_vec,
+                    self,
+                );
+                self.globals = prev;
+                let v = res?;
+                inst.borrow_mut().define(prop_name, v);
             }
             return Ok(inst_value);
         }

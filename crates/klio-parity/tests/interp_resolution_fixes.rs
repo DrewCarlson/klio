@@ -169,3 +169,29 @@ fun main() {
 "#;
     assert_klio("map_hofs_on_user_map_via_entries", src, "6\ntrue\n6\n");
 }
+
+// An anonymous object's property initialized from a non-trivial
+// expression over a captured value (`val inner = src.iterator()`) is
+// evaluated, not left null — ktor's DelegatingMutableSet iterator does
+// exactly this.
+#[test]
+fn anon_object_property_init_over_capture() {
+    let src = r#"
+interface MyIter { fun hasNext(): Boolean; fun next(): Int }
+class Wrap(val src: List<Int>) {
+    fun iter(): MyIter = object : MyIter {
+        val inner = src.iterator()
+        override fun hasNext(): Boolean = inner.hasNext()
+        override fun next(): Int = inner.next()
+    }
+}
+fun main() {
+    val w = Wrap(listOf(1, 2, 3))
+    val it = w.iter()
+    var sum = 0
+    while (it.hasNext()) sum += it.next()
+    println(sum)
+}
+"#;
+    assert_klio("anon_object_property_init_over_capture", src, "6\n");
+}
