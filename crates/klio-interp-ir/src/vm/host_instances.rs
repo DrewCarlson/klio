@@ -970,6 +970,14 @@ impl VmHost<'_> {
                 }
                 break;
             }
+            // A class is never its own superclass. A qualified nested
+            // supertype (`Outer.Inner`) collapses to its last segment, so a
+            // top-level class sharing that simple name (`class Inner :
+            // Outer.Inner()`) resolves its own name as the parent here —
+            // stop rather than chain into self forever.
+            if parent_name == cur_class {
+                break;
+            }
             // Resolve to a non-interface parent for ctor chaining.
             let parent_def = self.classes.borrow().get(&parent_name).cloned();
             if parent_def.as_ref().is_none_or(|d| d.is_interface) {

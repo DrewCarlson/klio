@@ -1703,6 +1703,15 @@ fn build_module_with_overrides(
     for def in classes.values() {
         for sup_name in &def.supertype_names {
             if let Some(sup_def) = class_table_snapshot.get(sup_name) {
+                // A class is never its own supertype. A qualified nested
+                // supertype (`Outer.Inner`) collapses to its last segment in
+                // `supertype_names`, so a top-level class sharing that simple
+                // name (`class Inner : Outer.Inner()`) resolves its own name
+                // here — linking it as parent forms a self-cycle that every
+                // unguarded parent-chain walk loops on.
+                if Arc::ptr_eq(def, sup_def) {
+                    continue;
+                }
                 if sup_def.is_interface {
                     def.interfaces.borrow_mut().push(Arc::clone(sup_def));
                 } else if def.parent.borrow().is_none() {

@@ -612,37 +612,40 @@ representation both cores use. A probe consuming `OutgoingContent` +
   without a custom getter), reading its field instead. `TextContent` now
   reports its real content type. Covered by
   `ctor_param_overrides_base_getter.kt` (kotlinc byte-parity).
-- **Blocker — a top-level class extending a nested class of the same simple
-  name hangs at load.** `class ByteArrayContent : OutgoingContent.ByteArrayContent()`
-  loops during class registration (before `main` runs). Root cause: the parser
-  collapses a qualified type path to its last segment (`parse_simple_type` in
-  `parse/types.rs`), so the top-level `ByteArrayContent`'s supertype
-  `OutgoingContent.ByteArrayContent` is recorded as the bare name
-  `ByteArrayContent` — aliasing the same-named top-level class. A self-parent
-  guard in `build.rs` parent-linking does *not* stop the hang, so the loop is
-  elsewhere in registration (nested-class lifting / sealed-subtype collection)
-  and the precise site is still to be pinned. The real fix is to resolve a
-  qualified nested supertype (`Outer.Name`) to the mangled nested class
-  (`Outer$Name`) rather than the simple-name-colliding top-level one.
-  `TextContent` (distinctly named) is unaffected. This gates `ByteArrayContent`,
-  so the content layer is not yet wired into the pack; resolving the
-  qualified-supertype collision is the next step before the body layer consumes.
+- **Landed — a top-level class extending a nested class of the same simple
+  name no longer hangs.** `class ByteArrayContent : OutgoingContent.ByteArrayContent()`
+  looped during construction. Root cause: the parser collapses a qualified type
+  path to its last segment (`parse_simple_type` in `parse/types.rs`), so the
+  top-level `ByteArrayContent`'s supertype `OutgoingContent.ByteArrayContent` is
+  recorded as the bare name `ByteArrayContent`, resolving to the same-named
+  top-level class — itself. Two unguarded parent-chain walks then looped on the
+  self-cycle: the ctor-arg chain in `new_instance` and the primitive-zero
+  seeding walk over the `parent` field. Fixed by guarding both — `build.rs`
+  parent-linking skips a self `Arc::ptr_eq` link, and the `new_instance` chain
+  stops when the resolved parent equals the current class. Construction now
+  terminates and the subclass's own members work. Covered by
+  `self_named_nested_supertype.kt` (kotlinc byte-parity).
+- **Remaining blocker — class-table key collision drops the concrete class's
+  fields.** The nested abstract `OutgoingContent.ByteArrayContent` is lifted to
+  top level under its *bare* name (`build/lift.rs` — unlike nested objects,
+  which mangle to `Outer$Name` on collision), colliding with the concrete
+  top-level `ByteArrayContent`. When the nested one wins the simple-name key,
+  the concrete's primary-param fields are never stored, so `b.contentLength`'s
+  `bytes.size` read fails. The fix is to mangle a nested class to `Outer$Name`
+  when its bare name collides with a top-level type and resolve qualified
+  supertype references accordingly. `TextContent` (distinctly named) consumes
+  cleanly today. This gates `ByteArrayContent`, so the content layer is not yet
+  wired into the pack.
 
 ## Status
 
 The protocol foundation, the full URL layer, `Attributes`, and the **Pipeline
-runtime** are consuming real upstream and executing. The body content layer is
-probed (`TextContent` works after the override fix; `ByteArrayContent` is
-blocked on the self-name-collision hang). Next: fix that hang to consume the
-content layer, then the `io.ktor.utils.io` channel streaming subsystem, then
-switch the client/server **cores** onto upstream `Pipeline`/`PipelineContext` —
-removing the simplified `Application` / `ApplicationCall` / `HttpClient` shim
-redeclarations. The shim stays in place so client/server keep working until
-each layer's upstream replacement is validated.
-
-The protocol foundation, the full URL layer, `Attributes`, and the **Pipeline
-runtime** are consuming real upstream and executing. Next: switch the
-client/server **cores** onto upstream `Pipeline`/`PipelineContext`, which
-removes the simplified `Application` / `ApplicationCall` / `HttpClient` shim
-redeclarations. The shim stays in place so client/server keep working until
-each layer's upstream replacement is validated.
+runtime** consume real upstream and execute. The body content layer is probed:
+`TextContent` consumes cleanly (after the override + name-collision-hang fixes),
+`ByteArrayContent` is blocked on the nested-class-name table collision. Next:
+resolve that collision to consume the content layer, then the
+`io.ktor.utils.io` channel streaming subsystem, then switch the client/server
+**cores** onto upstream `Pipeline`/`PipelineContext` — removing the simplified
+`Application` / `ApplicationCall` / `HttpClient` shim redeclarations. The shim
+stays in place so client/server keep working until each layer's upstream
+replacement is validated.
