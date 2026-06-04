@@ -14,9 +14,19 @@ auto_bindings = true
 # Real upstream ktor-http value types consumed verbatim from the
 # submodule (the start of the upstream-consumption migration; see
 # plans/KTOR-UPSTREAM.md). These are ungated (core), always available.
+# Real upstream `io.ktor.utils.io` annotations (`InternalAPI`, `KtorDsl`,
+# `ExperimentalKtorApi`, …) consumed verbatim — pure declarations the rest
+# of ktor's commonMain imports. Ungated (core).
+[[source]]
+root = "upstream/ktor-io/common/src"
+include = ["io/ktor/utils/io/Annotations.kt"]
+
 [[source]]
 root = "upstream/ktor-http/common/src"
-include = ["io/ktor/http/HttpStatusCode.kt"]
+include = [
+    "io/ktor/http/HttpStatusCode.kt",
+    "io/ktor/http/HttpMethod.kt",
+]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
 # native engine helpers.
