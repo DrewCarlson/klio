@@ -151,15 +151,32 @@ a synchronous interceptor chain end to end (`A got start` → `B got start-A` �
 headers, content negotiation; I/O suspension lives at the leaves, not in
 `proceed`).
 
-**Remaining — async interceptor suspension.** When an interceptor suspends at
-a *real* point mid-`proceed` (e.g. `delay`), `startCoroutineUninterceptedOrReturn`
-doesn't hand `loop` a `COROUTINE_SUSPENDED` it can act on, so the suspended
-interceptor isn't resumed and the pipeline proceeds with a stale subject. This
-needs the undispatched-start semantics below plus the interceptor running under
-the caller's coroutine context (not `EmptyCoroutineContext`, so `delay` parks
-on the active dispatcher).
+**Landed — receiver-lambda value-style invocation.** `block(receiver, p)` /
+`block.invoke(receiver, p)` for a `R.(P) -> T` now binds the receiver (was
+unbound; only `receiver.block(p)` worked). This is the `DebugPipelineContext`
+interceptor-invocation shape (`executeInterceptor.invoke(this, subject)`), so
+that context — a plain suspend loop, no manual continuation array — also runs
+the synchronous chain. Either context (`SuspendFunctionGun` via the field-
+incdec fix, or `DebugPipelineContext` via `DISABLE_SFG=true`) executes the
+synchronous pipeline.
 
-**Undispatched-start semantics.** Root cause:
+**Remaining — async interceptor suspension (one precise blocker).** When an
+interceptor suspends at a real point mid-`proceed` (`delay`), the suspension
+crosses the intrinsic-host boundary: `invoke_callable` (and
+`invoke_callable_with_this`, the path `call_value_with_this` uses) maps
+`EvalError::Suspended(state)` through its `other =>` arm to
+`RuntimeError::Type("coroutine suspended …")` — a fatal error — because the
+`IntrinsicHost` trait's `RuntimeError::Suspend(i64)` can't carry the captured
+`SuspendState` frames. So a suspending callback invoked via the intrinsic-host
+path can't park. The fix: invoke the (receiver-bound) interceptor through the
+main `eval_with_captures` path, which propagates `EvalError::Suspended` with
+frames natively (it already drives `runBlocking`/`launch`); i.e. give
+`call_value_with_this` a frame-preserving path that sets up the receiver
+(this-capture + receiver-label, as `invoke_callable_with_this` does) but runs
+on the main evaluator instead of the intrinsic host. Then `DISABLE_SFG=true` +
+the `io.ktor.util` deps let the cores consume upstream.
+
+**Undispatched-start semantics (alternative, if keeping `SuspendFunctionGun`).** Root cause:
 `SuspendFunctionGun.loop` calls `startCoroutineUninterceptedOrReturn(...)` and
 expects the JVM contract — run the interceptor *up to its first suspension*
 and **return `COROUTINE_SUSPENDED` as a value** (the parked continuation
