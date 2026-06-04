@@ -1910,6 +1910,30 @@ fn build_module_with_overrides(
                 if let Decl::Function(f) = m {
                     own_members.insert(f.name.name.clone());
                 }
+                // A bare reference to a companion member in a secondary ctor's
+                // delegation args / body resolves to the companion (no `this`
+                // exists yet) — e.g. `constructor(p) : this(p, SharedList)`.
+                if let Decl::Class(inner) = m
+                    && inner.is_companion
+                {
+                    own_members.insert(inner.name.name.clone());
+                    for cm in &inner.members {
+                        match cm {
+                            Decl::Function(f) => {
+                                own_members.insert(f.name.name.clone());
+                            }
+                            Decl::Property(p) => {
+                                own_members.insert(p.name.name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    for p in &inner.primary_params {
+                        if p.property.is_some() {
+                            own_members.insert(p.name.name.clone());
+                        }
+                    }
+                }
             }
             let mut entries: Vec<SecondaryCtorEntry> = Vec::new();
             for (sc_idx, sc) in c.secondary_ctors.iter().enumerate() {
@@ -1926,11 +1950,15 @@ fn build_module_with_overrides(
                 };
                 let mut arg_fids: Vec<klio_ir::FuncId> = Vec::with_capacity(delegation_args.len());
                 for (arg_idx, e) in delegation_args.iter().enumerate() {
-                    let fid = klio_ir::lower::lower_expr_as_param_thunk(
+                    // Scoped so a bare own/companion member in the delegation
+                    // arg (`: this(p, SharedList)`) resolves against the class.
+                    let fid = klio_ir::lower::lower_expr_as_param_thunk_scoped(
                         &mut module,
                         &param_refs,
                         e,
                         &format!("__sec_ctor_{}_{sc_idx}_arg{arg_idx}", c.name.name),
+                        Some(c.name.name.as_str()),
+                        Some(&own_members),
                     );
                     arg_fids.push(fid);
                 }
@@ -1940,11 +1968,13 @@ fn build_module_with_overrides(
                     .enumerate()
                     .map(|(p_idx, p)| {
                         p.default.as_ref().map(|e| {
-                            klio_ir::lower::lower_expr_as_param_thunk(
+                            klio_ir::lower::lower_expr_as_param_thunk_scoped(
                                 &mut module,
                                 &param_refs,
                                 e,
                                 &format!("__sec_ctor_{}_{sc_idx}_def{p_idx}", c.name.name),
+                                Some(c.name.name.as_str()),
+                                Some(&own_members),
                             )
                         })
                     })
