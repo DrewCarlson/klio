@@ -39,15 +39,14 @@ fn install_ktor_pack() {
             bin.exists(),
             "target/release/klio missing — run `cargo build -p klio-cli --release` first"
         );
-        // The ktor pack's `Url` is `@Serializable` and ships the
-        // `UrlSerializer` object (`descriptor = PrimitiveSerialDescriptor(…,
-        // PrimitiveKind.STRING)`), which klio initializes eagerly at pack
-        // load — so the serialization stack (and its `kotlinx.io` /
-        // `atomicfu` deps) must be installed first. Then the ktor pack.
+        // ktor-http's real runtime deps: `Codecs` URL encoding drains a
+        // `kotlinx.io` `Buffer` (which needs `atomicfu`). `Url` is
+        // `@Serializable`, but its `UrlSerializer` object initializes lazily
+        // (on first serialization), so a plain parse/encode program does not
+        // need the serialization stack.
         for crate_dir in [
             "klio-kotlinx-atomicfu",
             "klio-kotlinx-io",
-            "klio-kotlinx-serialization",
             "klio-ktor-client",
         ] {
             let dir = ws_root().join("crates").join(crate_dir);
