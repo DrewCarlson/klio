@@ -1637,6 +1637,23 @@ impl VmHost<'_> {
             (klio_runtime::Value::MapEntry { value, .. }, "component2" | "value") => {
                 return Ok((**value).clone());
             }
+            // A user class implementing `Map.Entry` / `MutableMap.MutableEntry`
+            // (ktor's `CaseInsensitiveMap.Entry`) destructures via
+            // `component1()` / `component2()`, which read its `key` / `value`
+            // properties — without this the `Map.Entry.componentN` stdlib
+            // extension is reached and casts the instance to a native map.
+            (klio_runtime::Value::Instance(_), "component1")
+                if self.receiver_implements_type(receiver, "Entry")
+                    || self.receiver_implements_type(receiver, "MutableEntry") =>
+            {
+                return self.get_field(receiver, "key");
+            }
+            (klio_runtime::Value::Instance(_), "component2")
+                if self.receiver_implements_type(receiver, "Entry")
+                    || self.receiver_implements_type(receiver, "MutableEntry") =>
+            {
+                return self.get_field(receiver, "value");
+            }
             // `MutableMap.MutableEntry.setValue(v)` writes through to the
             // backing map (when this entry came from a live `entries` view)
             // and returns the previous value.
