@@ -324,6 +324,53 @@ impl VmHost<'_> {
         arg_names: &[Option<String>],
         type_args: &[String],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Reified enum reflection: `enumValues<T>()` / `enumValueOf<T>(name)`
+        // are bodyless `expect`s. Resolve the reified type argument to its
+        // enum class and synthesise the result from the class's entries,
+        // mirroring `EnumClass.values()` / `valueOf(name)`.
+        if let Some(f) = module.funcs.get(func.0 as usize)
+            && f.fqn.starts_with("kotlin")
+            && matches!(f.name.as_str(), "enumValues" | "enumValueOf")
+            && let Some(tn) = type_args.first().filter(|s| !s.is_empty())
+        {
+            let from_classes = self
+                .classes
+                .borrow()
+                .get(tn)
+                .cloned()
+                .map(klio_runtime::Value::Class);
+            let cls = from_classes.or_else(|| self.lookup_global(tn));
+            if let Some(klio_runtime::Value::Class(cls)) = cls
+                && cls.is_enum
+            {
+                if f.name == "enumValues" {
+                    let items: Vec<klio_runtime::Value> =
+                        cls.enum_entries.borrow().iter().map(|(_, v)| v.clone()).collect();
+                    return Ok(klio_runtime::Value::List {
+                        items: klio_runtime::ObjRef::new(items),
+                        mutable: false,
+                        enum_class: Some(Arc::new(cls.name.clone())),
+                        backing: None,
+                    });
+                }
+                // enumValueOf<T>(name)
+                if let Some(klio_runtime::Value::String(s)) = args.first() {
+                    if let Some((_, v)) = cls
+                        .enum_entries
+                        .borrow()
+                        .iter()
+                        .find(|(n, _)| n == s.as_str())
+                    {
+                        return Ok(v.clone());
+                    }
+                    return Err(klio_ir::eval::EvalError::Throw(klio_runtime::Value::Exception {
+                        fqn: Arc::new("kotlin.IllegalArgumentException".to_string()),
+                        message: Some(Arc::new(format!("No enum constant {}.{s}", cls.fqn))),
+                        cause: None,
+                    }));
+                }
+            }
+        }
         // Overload resolution: when the target function shares its
         // name with siblings, the IR call site bakes in the first
         // FuncId at lower time — pick the best match here using the
