@@ -614,16 +614,19 @@ representation both cores use. A probe consuming `OutgoingContent` +
   `ctor_param_overrides_base_getter.kt` (kotlinc byte-parity).
 - **Blocker — a top-level class extending a nested class of the same simple
   name hangs at load.** `class ByteArrayContent : OutgoingContent.ByteArrayContent()`
-  loops during class registration (before `main` runs). Root cause: a class's
-  `supertype_names` keeps only the supertype's simple name (`build.rs`), so the
-  top-level `ByteArrayContent`'s supertype `OutgoingContent.ByteArrayContent`
-  resolves by simple name to the same-named top-level class — itself — making it
-  its own parent. The parent link must resolve a qualified nested supertype
-  (`Outer.Name`) to the mangled nested class (`Outer$Name`), not the
-  simple-name-colliding top-level one. `TextContent` (distinctly named) is
-  unaffected. This gates `ByteArrayContent`, so the content layer is not yet
-  wired into the pack; fixing the qualified-supertype resolution is the next
-  step before the body layer consumes.
+  loops during class registration (before `main` runs). Root cause: the parser
+  collapses a qualified type path to its last segment (`parse_simple_type` in
+  `parse/types.rs`), so the top-level `ByteArrayContent`'s supertype
+  `OutgoingContent.ByteArrayContent` is recorded as the bare name
+  `ByteArrayContent` — aliasing the same-named top-level class. A self-parent
+  guard in `build.rs` parent-linking does *not* stop the hang, so the loop is
+  elsewhere in registration (nested-class lifting / sealed-subtype collection)
+  and the precise site is still to be pinned. The real fix is to resolve a
+  qualified nested supertype (`Outer.Name`) to the mangled nested class
+  (`Outer$Name`) rather than the simple-name-colliding top-level one.
+  `TextContent` (distinctly named) is unaffected. This gates `ByteArrayContent`,
+  so the content layer is not yet wired into the pack; resolving the
+  qualified-supertype collision is the next step before the body layer consumes.
 
 ## Status
 
