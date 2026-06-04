@@ -2751,7 +2751,28 @@ impl VmHost<'_> {
                         .first()
                         .is_some_and(|p| !self.receiver_implements_type(receiver, &p.ty.name))
             }) && self.enclosing_callable_property(name).is_some();
-            if let Some((fid, _func)) = chosen.filter(|_| !defer_to_property) {
+            // A bare-package stdlib collection/sequence extension chosen for a
+            // user collection is the platform `expect` (e.g.
+            // `kotlin.collections.toTypedArray`), which klio compiles to a
+            // no-op stub returning `Unit` — its real actual is the
+            // type-prefixed intrinsic (`kotlin.collections.Iterable.<name>`).
+            // When the receiver is iterable and such an intrinsic exists, defer
+            // to the Iterable fallback below, which drains the receiver into a
+            // native list and dispatches the intrinsic.
+            let defer_to_iterable = matches!(receiver, klio_runtime::Value::Instance(_))
+                && chosen.as_ref().is_some_and(|(_, f)| {
+                    f.fqn == format!("kotlin.collections.{name}")
+                        || f.fqn == format!("kotlin.sequences.{name}")
+                })
+                && self.host_has_member(receiver, "iterator")
+                && (self
+                    .lookup_intrinsic(&format!("kotlin.collections.Iterable.{name}"))
+                    .is_some()
+                    || self
+                        .lookup_intrinsic(&format!("kotlin.collections.List.{name}"))
+                        .is_some());
+            if let Some((fid, _func)) = chosen.filter(|_| !defer_to_property && !defer_to_iterable)
+            {
                 // Runaway-recursion guard, scoped to the top-level
                 // extension dispatch only. Re-entering this block for
                 // the same (name, receiver-instance) is legitimate at

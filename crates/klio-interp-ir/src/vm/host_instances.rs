@@ -748,7 +748,21 @@ impl VmHost<'_> {
         // Apply primary-param properties from each level bottom-up
         // so child overrides win on collision.
         for (cls_name, cls_args) in chain.iter().rev() {
-            let cls_def = self.classes.borrow().get(cls_name).cloned();
+            // The class table is keyed by simple name, so a synthesised
+            // interface (`Map.Entry`) can shadow a concrete same-name class
+            // (`class Entry`) — the re-lookup would then return the interface
+            // (no primary params) and the instance's fields stay empty. The
+            // constructor was already redirected to the concrete `class_def`;
+            // reuse it for the leaf instead of the shadowing table entry.
+            let cls_def = self
+                .classes
+                .borrow()
+                .get(cls_name)
+                .cloned()
+                .filter(|d| !d.is_interface);
+            let cls_def = cls_def.or_else(|| {
+                (*cls_name == class_def.name).then(|| Arc::clone(&class_def))
+            });
             if let Some(cls_def) = cls_def {
                 for (param, value) in cls_def.primary_params.iter().zip(cls_args.iter()) {
                     if param.property.is_some() {
