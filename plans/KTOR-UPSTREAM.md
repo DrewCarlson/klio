@@ -450,6 +450,21 @@ upstream and delete the request-member shims.
    generic pattern fix. Then `Url` / `URLBuilder` / `URLParser` consume
    (serialization not required; `origin`, `DEFAULT_PORT`-as-bare-ref, eager
    const init, and primary-ctor const defaults are all handled).
+   **Further narrowing (latest):** making `origin`'s actual return an
+   *explicit-port* URL (`"http://localhost:80"`) **also fails** the same way —
+   so it is NOT port-less handling, the const default, or `toInt` (verified:
+   `"x".toInt()` correctly throws `NumberFormatException`, not `Null`; `toIntOrNull`
+   returns null). `URLBuilder("http://localhost:80").build()` still yields
+   `port == Null`, so the parser (`takeFromUnsafe` → `fillHost`'s `port =
+   substring.toInt()` / `else DEFAULT_PORT`) is not setting `port` for *any* URL.
+   Ruled out: port-less handling, const-default, `toInt`-returns-null, circular
+   `originUrl` read (no `get_field specifiedPort/host`), same-named param+property
+   body-prop shape, named-arg construction, `internal constructor` primary. The
+   bug is in how the consumed parser drives klio's string intrinsics
+   (`findScheme` / `count` / `indexOfColonInHostPort` / `indexOfAny` /
+   `indexOfFirst`/`indexOfLast`) — next step is to consume just those parser
+   helpers and unit-test each against `"http://localhost:80"` to find which
+   returns the wrong index so `port` never gets assigned.
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.
