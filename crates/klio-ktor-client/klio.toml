@@ -26,7 +26,13 @@ include = ["io/ktor/utils/io/Annotations.kt"]
 # foundational for the http header/value parsing layer. Ungated (core).
 [[source]]
 root = "upstream/ktor-utils/common/src"
-include = ["io/ktor/util/Text.kt"]
+include = [
+    "io/ktor/util/Text.kt",
+    "io/ktor/util/Collections.kt",
+    "io/ktor/util/DelegatingMutableSet.kt",
+    "io/ktor/util/CaseInsensitiveMap.kt",
+    "io/ktor/util/StringValues.kt",
+]
 
 [[source]]
 root = "upstream/ktor-http/common/src"
@@ -35,6 +41,9 @@ include = [
     "io/ktor/http/HttpMethod.kt",
     "io/ktor/http/HttpProtocolVersion.kt",
     "io/ktor/http/HttpHeaders.kt",
+    "io/ktor/http/HttpHeaderValueParser.kt",
+    "io/ktor/http/HeaderValueWithParameters.kt",
+    "io/ktor/http/ContentTypes.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)

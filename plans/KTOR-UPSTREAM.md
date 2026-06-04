@@ -229,40 +229,34 @@ upstream and delete the request-member shims.
   `Value::Range` cannot represent (`HeaderValue.quality`'s `it in 0.0..1.0`).
   `Float` comparisons widen to `Double` (lossless) since only `Float`
   *arithmetic* had explicit arms.
-- **Consumed verbatim:** `io.ktor.util.Text.kt`. The util collection layer
+- **Nested object/class name collision with a top-level type (the load-order
+  bug).** A nested `object Foo` was lifted to top level under its *bare* name,
+  overwriting a same-named true top-level class in the global table (last writer
+  wins → source-load-order-dependent). This is why consuming `ContentTypes.kt`
+  (nested `object Application`) broke the server's `Application.routing`
+  extension: whichever of `ContentType.Application` / the server `class
+  Application` lowered last owned the bare name. Fix: `build/lift.rs` mangles a
+  nested object whose bare name collides with a true top-level type to
+  `Outer$Name` (mirroring the existing `private`-object case) and records the
+  outer-body alias; `get_field` on a class receiver resolves `Outer$Name` for a
+  qualified `Outer.Name` read; and `lower_receiver` skips the class-name
+  shortcut when the enclosing class aliases the name (so a bare `Foo` inside
+  `Outer` reaches `Outer$Foo`, not the top-level class). Matches kotlinc:
+  top-level keeps the bare name, nested resolves through its qualifier. Covered
+  by `corpus/nested_name_collision.kt`.
+- **Consumed verbatim:** `io.ktor.util.Text.kt`, the util collection layer
   (`Collections.kt` + a klio `unmodifiable` actual, `DelegatingMutableSet.kt`,
-  `CaseInsensitiveMap.kt`, `StringValues.kt`) and the http header/content-type
+  `CaseInsensitiveMap.kt`, `StringValues.kt`), and the http header/content-type
   layer (`HttpHeaderValueParser.kt`, `HeaderValueWithParameters.kt`,
-  `ContentTypes.kt`) load and the full `ContentType` API runs (parse /
-  withParameter / match / charset / parseHeaderValue), but consuming them is
-  blocked on (1) and (2) below — held back from `klio.toml` until fixed.
+  `ContentTypes.kt`). The hand-written `shim/.../ContentType.kt` is deleted; the
+  full upstream `ContentType` API runs (parse / withParameter / match / charset
+  / parseHeaderValue) and the client+server smokes pass. `Charset`/`Charsets`
+  (the `io.ktor.utils.io.charsets` surface `ContentTypes.kt` needs) is a klio
+  actual; byte-level encode/decode is added when the body layer is consumed.
 
 ## Open blockers (next, in order)
 
-1. **Pack source *load order* is resolution-significant — consuming
-   `ContentTypes.kt` from the upstream root breaks the server program's
-   `routing` ("unresolved global `routing`").** Root cause is now pinned and it
-   is **not content and not a name collision** — it is load order. The pack
-   builder (`collect_pack_sources` in `klio-cli/src/pack_build.rs`) sets each
-   source's `rel_path` to its path relative to the *library dir* (root prefix
-   included) and then `files.sort_by(rel_path)`. So the same `ContentTypes.kt`
-   gets a different sort key depending on its `[[source]]` root: from
-   `upstream/ktor-http/common/src` its `rel_path` sorts *among* the other http
-   files (alphabetically `ContentTypes` precedes `HttpHeaders`/`HttpMethod`/…),
-   whereas from a `scratch/` dir its `rel_path` sorts *last*. Empirically,
-   byte-identical content: **upstream root → `routing` unresolved; `scratch/`
-   root → everything passes (full `ContentType` API + the `ktor_server_smoke`
-   test).** `ContentType` itself resolves correctly in *both* orders (parse /
-   match / charset all work); only the **server feature's `routing` extension**
-   resolution is order-sensitive. So a core source registered "early" perturbs a
-   later feature's extension resolution. The fix is to make pack consumer
-   resolution order-independent — register every source's type/extension
-   *headers* across all sources (and features) before resolving bodies /
-   extension-receiver bindings — rather than depending on `rel_path` sort order.
-   (Do **not** fix by shipping a `scratch/` copy of `ContentTypes.kt`: that is a
-   maintained duplicate, the opposite of upstream consumption.) Gates
-   `ContentTypes.kt` and replacing the divergent `shim/.../ContentType.kt`.
-2. **Receiver-lambda *property* invoked extension-style.**
+1. **Receiver-lambda *property* invoked extension-style.**
    `DelegatingMutableSet.next()` does `delegateIterator.next().convertTo()`,
    where `convertTo: From.() -> To` is the wrapper's lambda property invoked
    with the entry as receiver. Iterating a `CaseInsensitiveMap`/`StringValues`
@@ -272,12 +266,13 @@ upstream and delete the request-member shims.
    (the lambda is the *enclosing* instance's property, reached via the anon
    object's outer `this`; resolve at lowering or with the current method's
    `this` in scope, not via a blanket global-lambda lookup). Gates iterating
-   the wrapper views.
-3. **ktor-http remainder** — `Headers`/`Parameters`/`Url`/`URLBuilder`/codecs,
-   once (1)+(2) land.
-4. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
+   the wrapper views (and thus the `Headers`/`Parameters` layer that builds on
+   `StringValues`).
+2. **ktor-http remainder** — `Headers`/`Parameters`/`Url`/`URLBuilder`/codecs,
+   once (1) lands.
+3. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
-5. **Cores on upstream**, engine staying klio-side.
+4. **Cores on upstream**, engine staying klio-side.
 
 ## Status
 
