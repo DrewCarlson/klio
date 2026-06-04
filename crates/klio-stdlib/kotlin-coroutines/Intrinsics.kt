@@ -79,6 +79,27 @@ public fun <R, T> (suspend R.() -> T).startCoroutineUninterceptedOrReturn(
     return startBlock(completion) { block(receiver) }
 }
 
+// Receiver lambda with one value parameter — the shape of a ktor
+// `PipelineInterceptor` (`suspend PipelineContext<…>.(TSubject) -> Unit`).
+// `pipelineStartCoroutineUninterceptedOrReturn`'s actual routes here.
+public fun <R, P, T> (suspend R.(P) -> T).startCoroutineUninterceptedOrReturn(
+    receiver: R,
+    param: P,
+    completion: Continuation<T>
+): Any? {
+    val block = this
+    return startBlock(completion) { receiver.block(param) }
+}
+
+public fun <R, P, T> (suspend R.(P) -> T).createCoroutineUnintercepted(
+    receiver: R,
+    param: P,
+    completion: Continuation<T>
+): Continuation<Unit> {
+    val block = this
+    return KlioStartContinuation(completion) { receiver.block(param) }
+}
+
 internal fun <T> startBlock(completion: Continuation<T>, body: () -> T): Any? {
     // `startCoroutineUninterceptedOrReturn` semantics: run the
     // coroutine in the current activation and return its result
