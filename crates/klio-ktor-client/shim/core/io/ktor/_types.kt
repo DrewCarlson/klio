@@ -15,5 +15,7 @@ class HttpMethod(val value: String) {
         val Patch: HttpMethod = HttpMethod("PATCH")
         val Head: HttpMethod = HttpMethod("HEAD")
         val Options: HttpMethod = HttpMethod("OPTIONS")
+        val Connect: HttpMethod = HttpMethod("CONNECT")
+        val Trace: HttpMethod = HttpMethod("TRACE")
     }
 }
