@@ -52,6 +52,38 @@ impl VmHost<'_> {
         clippy::cast_possible_wrap,
         clippy::match_same_arms
     )]
+    /// `map.containsKey(needle)` honoring a key instance's custom
+    /// `equals` (Kotlin Map lookup uses the key's `equals`, e.g. ktor's
+    /// case-folding `CaseInsensitiveString`). Builtin keys take the fast
+    /// structural path; an instance search key invokes `equals` (keys
+    /// snapshotted so the call can't conflict with the entries borrow).
+    pub(crate) fn map_contains_key_eq(
+        &mut self,
+        entries: &klio_runtime::ObjRef<Vec<(klio_runtime::Value, klio_runtime::Value)>>,
+        needle: &klio_runtime::Value,
+    ) -> Result<bool, klio_ir::eval::EvalError> {
+        if !matches!(needle, klio_runtime::Value::Instance(_)) {
+            return Ok(entries
+                .borrow()
+                .iter()
+                .any(|(k, _)| klio_runtime::Value::structural_eq_boxed(k, needle)));
+        }
+        let keys: Vec<klio_runtime::Value> =
+            entries.borrow().iter().map(|(k, _)| k.clone()).collect();
+        for k in &keys {
+            match self.call_member(k, "equals", std::slice::from_ref(needle)) {
+                Ok(klio_runtime::Value::Bool(true)) => return Ok(true),
+                Ok(klio_runtime::Value::Bool(false)) => {}
+                _ => {
+                    if klio_runtime::Value::structural_eq_boxed(k, needle) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn call_member(
         &mut self,
         receiver: &klio_runtime::Value,
@@ -1210,12 +1242,11 @@ impl VmHost<'_> {
         if let klio_runtime::Value::Map { entries, .. } = receiver {
             match (name, args.len()) {
                 ("contains" | "containsKey", 1) => {
-                    let needle = &args[0];
-                    let has = entries
-                        .borrow()
-                        .iter()
-                        .any(|(k, _)| klio_runtime::Value::structural_eq_boxed(k, needle));
-                    return Ok(klio_runtime::Value::Bool(has));
+                    let needle = args[0].clone();
+                    let entries = entries.clone();
+                    return Ok(klio_runtime::Value::Bool(
+                        self.map_contains_key_eq(&entries, &needle)?,
+                    ));
                 }
                 ("containsValue", 1) => {
                     let needle = &args[0];

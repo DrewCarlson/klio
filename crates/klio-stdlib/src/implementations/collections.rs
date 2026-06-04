@@ -3947,26 +3947,23 @@ pub(crate) fn coll_map_is_not_empty(ctx: &mut CallCtx) -> Result<Value, RuntimeE
 }
 pub(crate) fn coll_map_get(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "Map.get")?;
-    let Some(key) = ctx.args.get(1) else {
-        return Err(RuntimeError::Arity("get requires a key".into()));
-    };
-    Ok(entries
-        .borrow()
-        .iter()
-        .find(|(k, _)| Value::structural_eq_boxed(k, key))
-        .map_or(Value::Null, |(_, v)| v.clone()))
+    let key = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("get requires a key".into()))?;
+    Ok(map_key_index(ctx, &entries, &key)
+        .and_then(|i| entries.borrow().get(i).map(|(_, v)| v.clone()))
+        .unwrap_or(Value::Null))
 }
 pub(crate) fn coll_map_contains_key(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "Map.containsKey")?;
-    let Some(key) = ctx.args.get(1) else {
-        return Err(RuntimeError::Arity("containsKey requires a key".into()));
-    };
-    Ok(Value::Bool(
-        entries
-            .borrow()
-            .iter()
-            .any(|(k, _)| Value::structural_eq_boxed(k, key)),
-    ))
+    let key = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("containsKey requires a key".into()))?;
+    Ok(Value::Bool(map_key_index(ctx, &entries, &key).is_some()))
 }
 pub(crate) fn coll_map_contains_value(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "Map.containsValue")?;
@@ -4034,35 +4031,34 @@ pub(crate) fn coll_map_to_string(ctx: &mut CallCtx) -> Result<Value, RuntimeErro
 }
 pub(crate) fn coll_mut_map_put(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "MutableMap.put")?;
-    let Some(key) = ctx.args.get(1) else {
-        return Err(RuntimeError::Arity("put requires a key".into()));
-    };
-    let Some(value) = ctx.args.get(2) else {
-        return Err(RuntimeError::Arity("put requires a value".into()));
-    };
-    let mut borrow = entries.borrow_mut();
-    if let Some(slot) = borrow
-        .iter_mut()
-        .find(|(k, _)| Value::structural_eq_boxed(k, key))
-    {
-        let prev = std::mem::replace(&mut slot.1, value.clone());
+    let key = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("put requires a key".into()))?;
+    let value = ctx
+        .args
+        .get(2)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("put requires a value".into()))?;
+    if let Some(i) = map_key_index(ctx, &entries, &key) {
+        let mut borrow = entries.borrow_mut();
+        let prev = std::mem::replace(&mut borrow[i].1, value);
         Ok(prev)
     } else {
-        borrow.push((key.clone(), value.clone()));
+        entries.borrow_mut().push((key, value));
         Ok(Value::Null)
     }
 }
 pub(crate) fn coll_mut_map_remove(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let entries = recv_map_entries(ctx.args, "MutableMap.remove")?;
-    let Some(key) = ctx.args.get(1) else {
-        return Err(RuntimeError::Arity("remove requires a key".into()));
-    };
-    let mut borrow = entries.borrow_mut();
-    if let Some(pos) = borrow
-        .iter()
-        .position(|(k, _)| Value::structural_eq_boxed(k, key))
-    {
-        let (_, v) = borrow.remove(pos);
+    let key = ctx
+        .args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| RuntimeError::Arity("remove requires a key".into()))?;
+    if let Some(pos) = map_key_index(ctx, &entries, &key) {
+        let (_, v) = entries.borrow_mut().remove(pos);
         Ok(v)
     } else {
         Ok(Value::Null)
@@ -4094,6 +4090,40 @@ pub(crate) fn map_find(entries: &ObjRef<Vec<(Value, Value)>>, key: &Value) -> Op
         .iter()
         .find(|(k, _)| Value::structural_eq_boxed(k, key))
         .map(|(_, v)| v.clone())
+}
+
+/// Index of `key` in a map's entries, honoring a key instance's custom
+/// `equals` — Kotlin Map lookup uses the key's `equals`, not structural
+/// identity (e.g. ktor's case-folding `CaseInsensitiveString` keys).
+/// Primitive/builtin search keys take the fast structural path; only a
+/// class-instance key invokes `equals` through the host. The keys are
+/// snapshotted first so invoking `equals` can't conflict with the
+/// `entries` borrow.
+pub(crate) fn map_key_index(
+    ctx: &mut CallCtx,
+    entries: &ObjRef<Vec<(Value, Value)>>,
+    key: &Value,
+) -> Option<usize> {
+    if !matches!(key, Value::Instance(_)) {
+        return entries
+            .borrow()
+            .iter()
+            .position(|(k, _)| Value::structural_eq_boxed(k, key));
+    }
+    let keys: Vec<Value> = entries.borrow().iter().map(|(k, _)| k.clone()).collect();
+    let CallCtx { out, host, .. } = ctx;
+    for (i, k) in keys.iter().enumerate() {
+        match host.invoke_method(k, "equals", std::slice::from_ref(key), *out) {
+            Some(Ok(Value::Bool(true))) => return Some(i),
+            Some(Ok(Value::Bool(false))) => {}
+            _ => {
+                if Value::structural_eq_boxed(k, key) {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
 }
 
 pub(crate) fn map_set(entries: &ObjRef<Vec<(Value, Value)>>, key: Value, value: Value) {

@@ -110,3 +110,33 @@ fun main() {
         "true\nfalse\n",
     );
 }
+
+// Map lookup honors a key's custom `equals`/`hashCode`, not structural
+// identity — get / containsKey / put (update) / remove all match by the
+// key's `equals` (ktor's `CaseInsensitiveString` header keys need this).
+#[test]
+fn map_uses_key_equals_not_structural_identity() {
+    let src = r#"
+class CIString(val s: String) {
+    override fun equals(other: Any?): Boolean = other is CIString && other.s.equals(s, ignoreCase = true)
+    override fun hashCode(): Int = s.lowercase().hashCode()
+    override fun toString(): String = s
+}
+fun main() {
+    val m = mutableMapOf<CIString, Int>()
+    m[CIString("Content-Type")] = 1
+    println(m.containsKey(CIString("content-type")))
+    println(m[CIString("CONTENT-TYPE")])
+    m[CIString("content-type")] = 2
+    println(m.size)
+    println(m[CIString("Content-Type")])
+    println(m.remove(CIString("CONTENT-TYPE")))
+    println(m.size)
+}
+"#;
+    assert_klio(
+        "map_uses_key_equals_not_structural_identity",
+        src,
+        "true\n1\n1\n2\n2\n0\n",
+    );
+}
