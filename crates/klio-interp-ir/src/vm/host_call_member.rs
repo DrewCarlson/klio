@@ -1194,6 +1194,18 @@ impl VmHost<'_> {
             };
             return Ok(klio_runtime::Value::Bool(inside));
         }
+        // `key in map` on a *user* Map implementation (e.g. ktor's
+        // CaseInsensitiveMap): Kotlin resolves it through the stdlib
+        // `operator fun Map.contains(key) = containsKey(key)`. Route a
+        // `contains(k)` with no own `contains` method to `containsKey`.
+        if name == "contains"
+            && args.len() == 1
+            && matches!(receiver, klio_runtime::Value::Instance(_))
+            && self.host_has_member(receiver, "containsKey")
+            && !self.host_has_member(receiver, "contains")
+        {
+            return self.call_member(receiver, "containsKey", args);
+        }
         // `m.contains(key)` / `m.containsKey(key)` / `m.containsValue(v)` for Map.
         if let klio_runtime::Value::Map { entries, .. } = receiver {
             match (name, args.len()) {

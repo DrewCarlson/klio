@@ -633,3 +633,37 @@ fun main() {
         "true\nfalse\ntrue\nfalse\ntrue\n",
     );
 }
+
+// `key in map` on a user class implementing Map resolves through the
+// stdlib `operator fun Map.contains(key) = containsKey(key)` — it must
+// dispatch the override, not return a non-bool (ktor's StringValues
+// builders do `name in values` over a custom map).
+#[test]
+fn in_operator_on_user_map_uses_contains_key() {
+    let src = r#"
+class FlagMap : MutableMap<String, Int> {
+    override fun containsKey(key: String): Boolean = key.startsWith("known")
+    override val size: Int get() = 0
+    override val keys: MutableSet<String> get() = mutableSetOf()
+    override val values: MutableCollection<Int> get() = mutableListOf()
+    override val entries: MutableSet<MutableMap.MutableEntry<String, Int>> get() = mutableSetOf()
+    override fun isEmpty(): Boolean = true
+    override fun containsValue(value: Int): Boolean = false
+    override fun get(key: String): Int? = null
+    override fun put(key: String, value: Int): Int? = null
+    override fun remove(key: String): Int? = null
+    override fun putAll(from: Map<out String, Int>) {}
+    override fun clear() {}
+}
+fun main() {
+    val m = FlagMap()
+    println("known-x" in m)
+    println("other" in m)
+}
+"#;
+    assert_klio(
+        "in_operator_on_user_map_uses_contains_key",
+        src,
+        "true\nfalse\n",
+    );
+}
