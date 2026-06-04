@@ -1025,10 +1025,16 @@ impl VmHost<'_> {
             // is what broke `this@thenBy.compare` inside the stdlib
             // `Comparator<T>.thenBy { … }` SAM, where the enclosing
             // stack held an unrelated instance from the sort driver.
-            let receiver_is_bound_instance = !matches!(
-                receiver,
-                klio_runtime::Value::Null | klio_runtime::Value::Unit
-            );
+            // Only a real user `Instance` standing in `this` is the labeled
+            // extension's own receiver (bound by an inline splice — the
+            // `this@thenBy.compare` case). A builtin lambda receiver
+            // (a `StringBuilder` from `buildString { … }`, etc.) is NOT the
+            // labeled fn's receiver — `this@probe` inside `fun String.probe()
+            // = buildString { … this@probe … }` must reach the enclosing
+            // String, not the StringBuilder — so defer to the enclosing
+            // receiver in that case.
+            let receiver_is_bound_instance =
+                matches!(receiver, klio_runtime::Value::Instance(_));
             if !receiver_is_bound_instance && let Some(encl) = enclosing {
                 let same = match (&encl, receiver) {
                     (klio_runtime::Value::Instance(a), klio_runtime::Value::Instance(b)) => {
