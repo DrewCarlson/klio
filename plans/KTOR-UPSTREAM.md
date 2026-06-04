@@ -319,6 +319,17 @@ upstream and delete the request-member shims.
   read falls through to the global where the call binds the function and applies
   the real arguments. Covered by `corpus/toplevel_fn_in_receiver_lambda.kt`
   (kotlinc byte-parity).
+- **Bare extension call binds the receiver-matching overload.** A bare call
+  to a same-named extension inside an extension body now binds the overload
+  whose `this`-param type matches the enclosing receiver — `takeWhile` inside
+  `fun Source.forEach` binds `Source.takeWhile`, not the arity-equal stdlib
+  `CharSequence.takeWhile`. The `FuncBuilder` carries the enclosing extension's
+  declared receiver type (`recv_ty`, set from `Function.receiver_type`); the
+  forward-reference stub now seeds the real receiver type on its implicit
+  `this` param (was a `kotlin.Unit` placeholder) so the candidate's receiver
+  type is stable even before its body lowers; and bare-call resolution prefers
+  a candidate matching `recv_ty` when the arity-only pick doesn't. Covered by
+  `corpus/bare_ext_call_receiver_match.kt` (kotlinc byte-parity).
 - **Charset encoder actual + ktor-io core consumed.** The klio
   `io.ktor.utils.io.charsets` actual gained `Charset.newEncoder()` /
   `CharsetEncoder.encode(input, from, to)` (returns a kotlinx.io `Buffer` of
@@ -386,28 +397,19 @@ upstream and delete the request-member shims.
    The `buildString { coll.forEach { append } }` shape now works (the
    top-level-fn-in-receiver-lambda fix above; `decodeURLPart` works too).
    **Two blockers remain for `Codecs.kt` itself:**
-   - **`Source.forEach` / `takeWhile` resolution (bare-ext receiver-type
-     awareness).** The encode functions (`encodeURLParameter`, …) iterate
-     `content.forEach { … }` where `content` is the charset-encoder `Buffer`
-     and `forEach` is Codecs' private `Source.forEach`, which calls
-     `takeWhile { buf -> while (buf.canRead()) block(buf.readByte()) }`.
-     Consumed as a pack, the encode result is empty: the bare `takeWhile`
-     inside `Source.forEach` binds a stdlib `CharSequence/Iterable.takeWhile`
-     (the bare-call resolver picks an extension overload by *arity only*),
-     rather than the pack's receiver-matching `Source.takeWhile`, so the block
-     never runs. An *explicit* `content.takeWhile { … }` dispatches correctly
-     (runtime member dispatch picks by receiver type — verified). Fix needs the
-     bare-call resolver to prefer the extension overload whose receiver type
-     matches the enclosing `this`. **Blocked on:** the enclosing extension
-     receiver type is not available at lower time — `owner_class` is `None` for
-     a top-level `fun Source.forEach` (only set for class methods). A naive
-     "defer to runtime member dispatch when ≥2 candidate receiver types match
-     the arity" rule is **too broad** — it breaks legitimate consumed-stdlib
-     bare-ext calls like `mapTo` inside `fun Iterable<T>.map` (whose static
-     bind to the matching-receiver `Iterable.mapTo` is correct, and which
-     `call_member` cannot re-resolve at runtime). So the proper fix is to
-     thread the enclosing extension-receiver type into the `FuncBuilder` and
-     prefer the candidate whose `this`-param type matches it.
+   - **`Source.forEach` block invocation (still empty).** The `takeWhile`
+     resolution is now fixed (bare-ext receiver-match, landed above) — inside
+     `fun Source.forEach`, the bare `takeWhile { … }` binds the pack's
+     `Source.takeWhile`. But the encode functions still yield an empty string
+     in pack form: `Source.forEach`'s `takeWhile { buffer -> while
+     (buffer.canRead()) block(buffer.readByte()); true }` does not run
+     `block` (the `encodeURLParameter` `forEach` lambda), so nothing is
+     appended. Next: trace whether `Source.takeWhile`'s `while (!exhausted()
+     && block(buffer))` reads `this.buffer` correctly and invokes the
+     forwarded `block` param in pack-lowered form (an explicit
+     `content.takeWhile { … }` from non-pack code drains correctly, so the gap
+     is again pack-lowered nested invocation, narrowed from the whole
+     `forEach`).
    - **`length` default-arg.** `decodeURLQueryComponent(start = 0, end =
      length, …)` — the default `end = length` (i.e. `this.length` on the String
      receiver) resolves to an `unresolved global length` for a defaulted arg.

@@ -2342,6 +2342,38 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             }
                         })
                 };
+                // Prefer the same-name extension overload whose receiver type
+                // matches the enclosing extension's declared receiver. Inside
+                // `fun Source.forEach`, a bare `takeWhile { … }` must bind
+                // `Source.takeWhile`, not the arity-equal stdlib
+                // `CharSequence.takeWhile` the resolver picked above. Only
+                // re-targets among bodied arity-matching extension candidates,
+                // and only when the current pick does *not* already match the
+                // enclosing receiver — so a correct same-receiver pick (e.g.
+                // `Iterable.mapTo` inside `fun Iterable<T>.map`) is untouched.
+                let recv_ty_owned = b.recv_ty().map(str::to_string);
+                let bare_func_id = match (bare_func_id, recv_ty_owned) {
+                    (Some(chosen), Some(recv)) => {
+                        let matches_recv = |fid: &FuncId| {
+                            b.module.funcs.get(fid.0 as usize).is_some_and(|f| {
+                                !f.blocks.is_empty()
+                                    && f.params.first().is_some_and(|p| {
+                                        p.name == "this" && p.ty.name == recv
+                                    })
+                            })
+                        };
+                        if matches_recv(&chosen) {
+                            Some(chosen)
+                        } else {
+                            cands
+                                .iter()
+                                .copied()
+                                .find(|fid| arity_match(fid) && matches_recv(fid))
+                                .or(Some(chosen))
+                        }
+                    }
+                    (other, _) => other,
+                };
                 if let Some(func_id) = bare_func_id.filter(|_| !shadowed_by_class) {
                     // Extension fn called by its bare name from inside
                     // a receiver-typed scope: prepend the active

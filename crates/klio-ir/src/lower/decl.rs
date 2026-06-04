@@ -686,6 +686,11 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
     if let Some(owner) = owner_class {
         let () = b.set_owner_class(owner.to_string());
     }
+    // Record the enclosing extension's declared receiver type so a bare
+    // call to a same-named extension inside the body resolves to the
+    // overload whose receiver type matches (e.g. `Source.takeWhile` over
+    // `CharSequence.takeWhile` inside `fun Source.forEach`).
+    b.set_recv_ty(f.receiver_type.as_ref().map(|r| r.name.name.clone()));
     if let Some(set) = own_members {
         let () = b.set_own_members(set.clone());
     }

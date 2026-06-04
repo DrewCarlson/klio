@@ -1102,12 +1102,21 @@ fn build_module_with_overrides(
             // Forward-reference stub. Seed an implicit `this` first
             // param for an extension function so a call lowered
             // before the real body (which prepends the receiver) can
-            // still detect `needs_this`. The real definition replaces
-            // this slot when its body is lowered.
-            let stub_params: Vec<klio_ir::Param> = if f.receiver_type.is_some() {
+            // still detect `needs_this`. The `this` param carries the
+            // declared receiver type so bare-call resolution can prefer
+            // a same-named extension overload whose receiver matches the
+            // enclosing receiver even while this sibling is still a stub
+            // (`Source.takeWhile` over `CharSequence.takeWhile` inside
+            // `fun Source.forEach`). The real definition replaces this
+            // slot when its body is lowered.
+            let stub_params: Vec<klio_ir::Param> = if let Some(rt) = &f.receiver_type {
                 vec![klio_ir::Param {
                     name: "this".to_string(),
-                    ty: klio_ir::TypeRef::unit(),
+                    ty: klio_ir::TypeRef {
+                        name: rt.name.name.clone(),
+                        nullable: rt.nullable,
+                        args: Vec::new(),
+                    },
                     default: None,
                     is_property: false,
                     is_vararg: false,

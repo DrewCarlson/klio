@@ -74,6 +74,13 @@ pub struct FuncBuilder<'a> {
     /// the owning class. Used by `super.method()` lowering to
     /// emit `Inst::CallSuper` with the right starting class.
     owner_class: Option<String>,
+    /// Declared receiver-type name of the enclosing *extension* function
+    /// (`fun Source.forEach(...)` → `Some("Source")`). Lets bare-call
+    /// resolution prefer a same-named extension overload whose `this`-param
+    /// type matches the enclosing receiver (`Source.takeWhile` over stdlib
+    /// `CharSequence.takeWhile` inside `Source.forEach`) instead of an
+    /// arity-only pick. `None` for plain functions and class methods.
+    recv_ty: Option<String>,
     /// Names declared on the owning class (methods, body
     /// properties, primary-ctor properties). Used by method-
     /// body lowering to know whether an unqualified `foo(...)`
@@ -212,6 +219,7 @@ impl<'a> FuncBuilder<'a> {
             boxed_vars: std::collections::HashSet::new(),
             any_typed_locals: std::collections::HashSet::new(),
             owner_class: None,
+            recv_ty: None,
             own_members: std::collections::HashSet::new(),
             private_method_fids: std::collections::HashMap::new(),
             tailrec_self: None,
@@ -510,6 +518,13 @@ impl<'a> FuncBuilder<'a> {
     #[must_use]
     pub fn owner_class(&self) -> Option<&str> {
         self.owner_class.as_deref()
+    }
+    pub fn set_recv_ty(&mut self, name: Option<String>) {
+        self.recv_ty = name;
+    }
+    #[must_use]
+    pub fn recv_ty(&self) -> Option<&str> {
+        self.recv_ty.as_deref()
     }
     pub fn set_own_members(&mut self, set: std::collections::HashSet<String>) {
         self.own_members = set;
