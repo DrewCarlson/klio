@@ -26,6 +26,8 @@ root = "upstream/ktor-http/common/src"
 include = [
     "io/ktor/http/HttpStatusCode.kt",
     "io/ktor/http/HttpMethod.kt",
+    "io/ktor/http/HttpProtocolVersion.kt",
+    "io/ktor/http/HttpHeaders.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
