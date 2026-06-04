@@ -625,9 +625,20 @@ impl VmHost<'_> {
         let mut throwable_cause: Option<klio_runtime::Value> = None;
         {
             let cur_def = self.classes.borrow().get(&cur_class).cloned();
-            let parent_name = cur_def
-                .as_ref()
-                .and_then(|d| d.supertype_names.first().cloned());
+            // First non-interface supertype (the class parent) — see the
+            // chain-walk note below; an interface listed first is not the
+            // throwable ancestor whose `super(...)` carries message/cause.
+            let parent_name = cur_def.as_ref().and_then(|d| {
+                d.supertype_names
+                    .iter()
+                    .find(|n| {
+                        self.classes
+                            .borrow()
+                            .get(n.as_str())
+                            .is_none_or(|sd| !sd.is_interface)
+                    })
+                    .cloned()
+            });
             if let Some(pname) = parent_name {
                 let is_throwable_name = matches!(
                     pname.as_str(),
@@ -675,9 +686,23 @@ impl VmHost<'_> {
         }
         while let Some(thunks) = self.prog.parent_ctor_args.get(&cur_class).cloned() {
             let cur_def = self.classes.borrow().get(&cur_class).cloned();
-            let parent_name = cur_def
-                .as_ref()
-                .and_then(|d| d.supertype_names.first().cloned());
+            // The superclass for ctor chaining is the first *non-interface*
+            // supertype — a class may list interfaces before its superclass
+            // (`HeadersImpl : Headers, StringValuesImpl(...)`), and the
+            // `super(...)` args belong to that superclass, not the interface.
+            // A supertype with no registered ClassDef (a builtin like
+            // `Throwable`) is treated as the class parent.
+            let parent_name = cur_def.as_ref().and_then(|d| {
+                d.supertype_names
+                    .iter()
+                    .find(|n| {
+                        self.classes
+                            .borrow()
+                            .get(n.as_str())
+                            .is_none_or(|sd| !sd.is_interface)
+                    })
+                    .cloned()
+            });
             let Some(parent_name) = parent_name else {
                 break;
             };
