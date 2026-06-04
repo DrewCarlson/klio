@@ -1,6 +1,6 @@
 use crate::{
-    Arc, ClosureInfo, MEMBER_ONLY_PROBE, VmHost, in_top_level_init, with_inner_outer_hint,
-    with_outer_this,
+    Arc, ClosureInfo, MEMBER_ONLY_PROBE, VmHost, in_top_level_init, with_ctor_guard,
+    with_inner_outer_hint, with_outer_this,
 };
 
 impl VmHost<'_> {
@@ -131,6 +131,29 @@ impl VmHost<'_> {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn lookup_global(&mut self, name: &str) -> Option<klio_runtime::Value> {
         let cached = self.globals.borrow().lookup(name);
+        // On-demand init of a deferred `object`: its eager startup init threw
+        // (a missing dependency it is never expected to need unless used —
+        // e.g. ktor's `UrlSerializer`), so it was skipped. Initialize it now,
+        // on first access, matching Kotlin's lazy `object` initialization. A
+        // genuine init error surfaces here rather than aborting program load.
+        if cached.is_none()
+            && self.prog.object_names.contains(name)
+            && let Some(class_id) = self.module.class_id(name)
+            && !with_ctor_guard(|g| g.borrow().iter().any(|n| n == name))
+        {
+            if let Ok(inst @ klio_runtime::Value::Instance(_)) =
+                <Self as klio_ir::eval::Host>::new_instance(self, class_id, &[])
+            {
+                if let klio_runtime::Value::Instance(i) = &inst
+                    && let Some((outer_name, _)) = name.split_once("$Companion$")
+                    && let Some(outer_def) = self.classes.borrow().get(outer_name).cloned()
+                {
+                    i.borrow_mut().outer = Some(klio_runtime::Value::Class(outer_def));
+                }
+                self.globals.borrow_mut().define(name, inst.clone());
+                return Some(inst);
+            }
+        }
         // Forward reference to a top-level property whose own
         // initializer has not run yet (it is declared after the
         // initializer currently executing). The slot is still its

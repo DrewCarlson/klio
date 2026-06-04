@@ -41,6 +41,7 @@ impl Vm {
                 extension_prop_setters: std::collections::HashMap::new(),
                 secondary_ctors: std::collections::HashMap::new(),
                 primary_ctor_default_thunks: std::collections::HashMap::new(),
+                object_names: std::collections::HashSet::new(),
                 class_delegates: std::collections::HashMap::new(),
                 func_defaults: std::collections::HashMap::new(),
                 installed_bindings: Arc::new(klio_stdlib::HostBindings::new()),
@@ -88,6 +89,7 @@ impl Vm {
             extension_prop_setters: built.extension_prop_setters,
             secondary_ctors: built.secondary_ctors,
             primary_ctor_default_thunks: built.primary_ctor_default_thunks,
+            object_names: built.object_names.iter().cloned().collect(),
             class_delegates: built.class_delegates,
             func_defaults: built.func_defaults,
             installed_bindings: Arc::new(klio_stdlib::HostBindings::new()),
@@ -280,8 +282,19 @@ impl Vm {
             };
             let inst = {
                 let mut host = self.make_host(out);
-                <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[])
-                    .map_err(VmError::from)?
+                match <VmHost as klio_ir::eval::Host>::new_instance(&mut host, class_id, &[]) {
+                    Ok(v) => v,
+                    // Defer an object whose eager initializer throws — it is
+                    // initialized on first access in `lookup_global` instead
+                    // (Kotlin initializes an `object` lazily on first
+                    // access). An object never accessed thus never forces its
+                    // dependencies (ktor's `@Serializable` `Url` ships the
+                    // `UrlSerializer` object whose descriptor needs the
+                    // serialization stack; a plain `Url(...)` program never
+                    // touches it). A genuine init error in an object that is
+                    // used still surfaces — at its first access.
+                    Err(_) => continue,
+                }
             };
             if let klio_runtime::Value::Instance(i) = &inst
                 && let Some((outer_name, _)) = obj_name.split_once("$Companion$")

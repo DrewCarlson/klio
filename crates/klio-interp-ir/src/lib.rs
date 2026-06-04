@@ -71,6 +71,15 @@ pub struct ProgramImage {
     secondary_ctors: std::collections::HashMap<String, Vec<build::SecondaryCtorEntry>>,
     primary_ctor_default_thunks:
         std::collections::HashMap<String, Vec<Option<klio_ir::FuncId>>>,
+    /// Names of every top-level `object` / synthesised companion. The
+    /// startup pass initializes these eagerly, but defers any whose
+    /// initializer throws (e.g. ktor's `UrlSerializer` object, whose
+    /// `PrimitiveSerialDescriptor(...)` needs the serialization stack a
+    /// plain `Url` program never installs). `lookup_global` then
+    /// initializes a deferred object on first access — matching Kotlin's
+    /// lazy `object` initialization, so an unused object never forces its
+    /// dependencies.
+    object_names: std::collections::HashSet<String>,
     class_delegates: std::collections::HashMap<String, Vec<(String, klio_ir::FuncId)>>,
     func_defaults: std::collections::HashMap<klio_ir::FuncId, Vec<Option<klio_ir::FuncId>>>,
     installed_bindings: Arc<klio_stdlib::HostBindings>,
