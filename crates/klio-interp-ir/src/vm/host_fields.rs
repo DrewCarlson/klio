@@ -402,6 +402,27 @@ impl VmHost<'_> {
                     None
                 })
                 .or_else(|| {
+                    // A `Type.Companion` extension property
+                    // (`val URLBuilder.Companion.origin`) collapses at parse
+                    // time to the *class* receiver, so it registers under the
+                    // outer class name (`URLBuilder`). The runtime receiver is
+                    // the companion instance, whose class name is
+                    // `URLBuilder$Companion$…`; key the lookup by the outer
+                    // class so a bare `origin` inside the companion (and a
+                    // qualified `URLBuilder.Companion.origin`) resolves.
+                    if let klio_runtime::Value::Instance(i) = receiver {
+                        let cls = i.borrow().class.name.clone();
+                        if let Some((outer, _)) = cls.split_once("$Companion") {
+                            return self
+                                .prog
+                                .extension_props
+                                .get(&(outer.to_string(), name.to_string()))
+                                .copied();
+                        }
+                    }
+                    None
+                })
+                .or_else(|| {
                     self.prog
                         .extension_props
                         .get(&("Any".to_string(), name.to_string()))
