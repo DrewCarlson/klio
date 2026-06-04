@@ -817,6 +817,17 @@ impl VmHost<'_> {
         // `Container.Nested(args)` or `Sealed.Variant(args)` — look
         // up the named class in the module table and construct. Prefer
         // the receiver's OWN nested member (resolved by qualified FQN)
+        // `KClass.isInstance(value)` reflection: does the value belong to
+        // the class this `KClass` reflects? Uses the runtime subtype walk
+        // (`is_runtime_type` honours an instance's supertype closure and the
+        // builtin type lattice). ktor's `Any.instanceOf(type)` actual is
+        // `type.isInstance(this)`.
+        if let klio_runtime::Value::Class(cls) = receiver
+            && name == "isInstance"
+            && args.len() == 1
+        {
+            return Ok(klio_runtime::Value::Bool(args[0].is_runtime_type(&cls.name)));
+        }
         // over a same-simple-name global: a user `sealed class S { data
         // class Error(...) }` declares `S.Error`, which must not
         // resolve to the builtin `kotlin.Error` that shares the simple
