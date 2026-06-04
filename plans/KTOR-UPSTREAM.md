@@ -291,15 +291,29 @@ upstream and delete the request-member shims.
   `CaseInsensitiveMap.kt`, `StringValues.kt`), and the http layer
   (`HttpStatusCode`/`HttpMethod`/`HttpProtocolVersion`/`HttpHeaders`,
   `HttpHeaderValueParser`, `HeaderValueWithParameters`, `ContentTypes`,
-  **`Headers`, `Parameters`**). The hand-written `shim/.../ContentType.kt` is
-  deleted. The upstream `ContentType` API (parse / withParameter / match /
-  charset / parseHeaderValue) and the full `Headers`/`Parameters` API
-  (case-insensitive get / getAll / names / forEach / `headers { }` /
-  `ParametersBuilder`) run; client+server smokes pass. `Charset`/`Charsets` is a
-  klio actual (name + forName); byte-level encode/decode is added with the body
-  layer.
+  **`Headers`, `Parameters`**, plus the header helpers **`CacheControl`,
+  `ContentTypeMatcher`, `HttpMessage`, `LinkHeader`, `RequestConnectionPoint`,
+  `Ranges` (`RangeUnits`/`ContentRange`), `ContentRange` (the
+  `contentRangeHeaderValue` fn), `RangesSpecifier`**). The hand-written
+  `shim/.../ContentType.kt` is deleted. The upstream `ContentType` API (parse /
+  withParameter / match / charset / parseHeaderValue), the full
+  `Headers`/`Parameters` API, and the header helpers run; client+server smokes
+  pass. `Charset`/`Charsets` is a klio actual (name + forName); byte-level
+  encode/decode is added with the body layer.
 
 ## Open blockers (next, in order)
+
+0. **`ContentDisposition.parse` infinite-recurses** (so `ContentDisposition.kt`
+   is held back). Its companion is `fun parse(value: String): ContentDisposition
+   = parse(value) { v, p -> ContentDisposition(v, p) }` — the trailing-lambda
+   2-arg call should bind the inherited `HeaderValueWithParameters.Companion.parse(value,
+   init)`, but klio binds the same-companion 1-arg `parse(value)` and recurses.
+   `ContentType.parse` (block body, same superclass companion) resolves
+   correctly, so it is a subtle companion-overload-resolution difference
+   (expression body and/or the leading `if (value.isBlank()) return Any` guard).
+   A minimal local repro of both block- and expression-body forms recurses, so
+   the local repro does not yet capture ContentType's working path — needs
+   isolation against the consumed `HeaderValueWithParameters` companion.
 
 1. **ktor-http remainder — `Url` / `URLBuilder` / `Codecs`.** `URLBuilder`
    hard-depends on `Codecs` (`encodeURLParameter`/`encodeURLQueryComponent`/…), so
