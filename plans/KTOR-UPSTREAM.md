@@ -300,6 +300,23 @@ upstream and delete the request-member shims.
   gate keeps a single-lambda HOF (`map { }`, `let { }`) — where the member
   legitimately takes the lambda — on the normal member path. Covered by
   `corpus/inline_fn_member_shadow_trailing_lambda.kt`.
+- **`Range + Range` / `Range + element` concatenate via `Iterable.plus`.** A
+  range is an `Iterable`, so `('a'..'z') + ('A'..'Z')` is the stdlib `plus`
+  (a `List`), not numeric `+`; klio threw `BinOp::Add on Range`. The collection
+  `plus`/`minus` dispatch now includes `Value::Range`, and `iterable_items`
+  (the drain helper) + `coll_list_plus`/`coll_list_minus` expand a `Range`/
+  `Sequence`/`Array` argument. `Codecs.URL_ALPHABET` (`('a'..'z') + ('A'..'Z')
+  + ('0'..'9')`) needs this. Covered by `corpus/range_plus_concat.kt`
+  (kotlinc byte-parity).
+- **Charset encoder actual + ktor-io core consumed.** The klio
+  `io.ktor.utils.io.charsets` actual gained `Charset.newEncoder()` /
+  `CharsetEncoder.encode(input, from, to)` (returns a kotlinx.io `Buffer` of
+  the UTF-8 / ISO-8859-1 bytes) + `newDecoder()` / `CharsetDecoder.decode`,
+  matching upstream `CharsetEncoder.encode`. Upstream `io.ktor.utils.io.core`
+  `Buffer.kt` (`canRead`) + `ByteReadPacket.kt` (`Source.takeWhile`/`remaining`
+  /…) + `Deprecation.kt` are consumed verbatim. Verified: an explicit
+  `Charsets.UTF_8.newEncoder().encode(s).takeWhile { … canRead … readByte }`
+  drains the encoded bytes correctly.
 - **Receiver-lambda bare read resolves an enclosing property over a same-name
   top-level function.** `HeaderValueWithParameters.toString()`'s
   `StringBuilder(size).apply { … parameters.lastIndex … }` reads the enclosing
@@ -349,41 +366,26 @@ upstream and delete the request-member shims.
 ## Open blockers (next, in order)
 
 1. **ktor-http remainder — `Url` / `URLBuilder` / `Codecs`.** `URLBuilder`
-   hard-depends on `Codecs` (`encodeURLParameter`/`encodeURLQueryComponent`/…), so
-   `Codecs.kt` is the gate. Its percent-encoding needs exactly two things (both
-   now scoped precisely from the source):
-   - **`CharsetEncoder.encode(...)`** — `charset.newEncoder().encode(s)` /
-     `encode(s, from, to)` returning a kotlinx.io `Source` of the bytes. The klio
-     `Charset` actual must gain `newEncoder()` + `encode` (UTF-8 / ISO-8859-1),
-     building a kotlinx.io `Buffer`. (Decode needs **no** `CharsetDecoder` —
-     `decodeImpl` uses `ByteArray.decodeToString()`, already an intrinsic.)
-   - **ktor-io `io.ktor.utils.io.core` Buffer/Source layer.** Codecs' own
-     `Source.forEach` calls `source.takeWhile { chunk -> while (chunk.canRead())
-     block(chunk.readByte()) }`. These are *consumable upstream*:
-     `Buffer.kt` is trivial (`typealias Buffer = kotlinx.io.Buffer`;
-     `fun Buffer.canRead() = !exhausted()`), and `Source.takeWhile` lives in
-     `ByteReadPacket.kt` (`while (!exhausted() && block(buffer)) {}`). The
-     underlying kotlinx.io `Buffer` already works in klio
-     (`write`/`readByte`/`exhausted`/`size`/`buffer` all verified — the earlier
-     "`get_field length`" was the *stdlib* `Iterable.takeWhile` mis-resolving
-     because ktor-io wasn't loaded, **not** a kotlinx.io segment bug).
-     `ByteReadPacket.kt` pulls `io.ktor.utils.io.pool.ObjectPool` (one
-     `Sink(pool)` overload), and that pool (`Pool.kt`) imports
-     `kotlinx.atomicfu.*` and declares `expect abstract class DefaultPool` — so
-     consuming the core for `takeWhile` drags in the atomicfu dep + a
-     `DefaultPool` actual. (Codecs uses only `takeWhile`/`canRead`/`readByte`, so
-     an alternative is a tiny klio actual for `Source.takeWhile` + `Buffer.canRead`
-     — but that's a redeclaration; prefer consuming `Buffer.kt`+`ByteReadPacket.kt`
-     + the small pool.)
-   - **charset `Encoding.kt`** is the `expect abstract class Charset/CharsetEncoder/
-     CharsetDecoder` + `expect fun encodeImpl/encodeToByteArray` surface; either
-     consume it and supply klio actuals, or keep klio's concrete
-     `io.ktor.utils.io.charsets` package and add `newEncoder()` + `encode(...) ->
-     kotlinx.io.Buffer` to it.
-   `Url.kt` is additionally `@Serializable` (imports `kotlinx.serialization.*`).
-   So the gate is: consume ktor-io core (`Buffer`+`ByteReadPacket`+`pool`) +
-   provide `CharsetEncoder.encode` (UTF-8/Latin-1 → kotlinx.io Buffer) + consume
-   `Codecs`/`URLParser`/`URLBuilder`; `Url` then needs serialization support.
+   hard-depends on `Codecs` (`encodeURLParameter`/`encodeURLQueryComponent`/…),
+   so `Codecs.kt` is the gate. Prerequisites are **now landed** (see above):
+   the charset `newEncoder()`/`encode()` actual + the ktor-io core
+   (`Buffer.canRead`, `Source.takeWhile`) are consumed and verified working via
+   explicit calls (`encode(s).takeWhile { … canRead … readByte }` drains
+   correctly), and `Range + Range` (`URL_ALPHABET`) is fixed.
+   **Remaining blocker for `Codecs.kt` itself:** its encode functions are
+   `buildString { content.forEach { append(…) } }` (e.g.
+   `encodeURLParameter`), where `content.forEach` is Codecs' own private
+   `Source.forEach` (wrapping `takeWhile`). Consumed *as a pack*, the nested
+   `forEach`-lambda's `append` does not reach the enclosing `buildString`
+   StringBuilder — the call yields an empty string. The exact same source
+   structure works in a non-pack program (and the pack's `escapeHTML`, which
+   uses a `for` loop instead of a `forEach` lambda, works), so the bug is
+   nested-receiver-lambda (`buildString { it.forEach { append } }`) member
+   resolution **specific to pack-lowered functions**. `decodeURLPart` /
+   `decodeURLQueryComponent` (no `buildString { forEach }`) already work through
+   the consumed `Codecs.kt`. Once the pack nested-lambda `append` resolves,
+   `Codecs.kt` consumes cleanly; then `URLParser`/`URLBuilder`, and `Url`
+   (which is `@Serializable`, needs serialization support).
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.

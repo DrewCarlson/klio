@@ -21,6 +21,14 @@ pub(crate) fn iterable_items(v: &Value, what: &str) -> Result<Vec<Value>, Runtim
                 backing: None,
             })
             .collect()),
+        Value::Range { .. } => {
+            let (start, end, step, kind) = super::ranges::as_range_view(v).ok_or_else(|| {
+                RuntimeError::Type(format!("{what} requires an iterable receiver"))
+            })?;
+            Ok(range_iter_int(start, end, step)
+                .map(|n| super::ranges::range_endpoint(kind, n))
+                .collect())
+        }
         _ => Err(RuntimeError::Type(format!(
             "{what} requires an iterable receiver"
         ))),
@@ -2895,6 +2903,9 @@ pub(crate) fn coll_list_plus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     };
     match arg {
         Value::List { items, .. } | Value::Set { items, .. } => out.extend(items.borrow().clone()),
+        Value::Range { .. } | Value::Sequence(_) | Value::Array { .. } => {
+            out.extend(iterable_items(arg, "plus")?);
+        }
         single => out.push(single.clone()),
     }
     Ok(make_list(out, false))
@@ -2907,6 +2918,9 @@ pub(crate) fn coll_list_minus(ctx: &mut CallCtx) -> Result<Value, RuntimeError> 
     };
     let removals: Vec<Value> = match arg {
         Value::List { items, .. } | Value::Set { items, .. } => items.borrow().clone(),
+        Value::Range { .. } | Value::Sequence(_) | Value::Array { .. } => {
+            iterable_items(arg, "minus")?
+        }
         single => vec![single.clone()],
     };
     let mut out: Vec<Value> = Vec::new();

@@ -915,7 +915,11 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<
             if matches!(*op, BinOp::Add | BinOp::Sub)
                 && matches!(
                     l,
-                    Value::Map { .. } | Value::List { .. } | Value::Set { .. } | Value::Sequence(_)
+                    Value::Map { .. }
+                        | Value::List { .. }
+                        | Value::Set { .. }
+                        | Value::Sequence(_)
+                        | Value::Range { .. }
                 )
             {
                 let method = if matches!(*op, BinOp::Add) {

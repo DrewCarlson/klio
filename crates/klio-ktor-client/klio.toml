@@ -19,7 +19,12 @@ auto_bindings = true
 # of ktor's commonMain imports. Ungated (core).
 [[source]]
 root = "upstream/ktor-io/common/src"
-include = ["io/ktor/utils/io/Annotations.kt"]
+include = [
+    "io/ktor/utils/io/Annotations.kt",
+    "io/ktor/utils/io/Deprecation.kt",
+    "io/ktor/utils/io/core/Buffer.kt",
+    "io/ktor/utils/io/core/ByteReadPacket.kt",
+]
 
 # Upstream `io.ktor.util` string helpers (escapeHTML / quote /
 # toLowerCasePreservingASCIIRules / caseInsensitive …) — self-contained,
