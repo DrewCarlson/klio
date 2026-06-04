@@ -13,3 +13,6 @@
 [submodule "third-party/kotlinx/kotlinx-serialization"]
 	path = crates/klio-kotlinx-serialization/upstream
 	url = https://github.com/Kotlin/kotlinx.serialization
+[submodule "crates/klio-ktor-client/upstream"]
+	path = crates/klio-ktor-client/upstream
+	url = https://github.com/ktorio/ktor.git
