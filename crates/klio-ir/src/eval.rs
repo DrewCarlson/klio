@@ -1753,6 +1753,25 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<
             let v = frame.read(*src);
             if host.instance_of(&v, ty) {
                 frame.write(*dst, v);
+            } else if frame
+                .module
+                .registry
+                .func_type_params
+                .get(&frame.func.id)
+                .is_some_and(|tps| tps.iter().any(|t| t == &ty.name))
+                || is_erased_type_param_name(&ty.name)
+            {
+                // `x as T` (or `as? T`) where `T` is an erased type parameter
+                // is an unchecked cast — the JVM erases the type argument and
+                // emits no `checkcast`, so the value passes through. Checking
+                // it via `instance_of` is both wrong (the param is erased) and
+                // unstable: a reified-`T` binding from an unrelated call
+                // (`AttributeKey<Int>("x")`) can leak into the global scope and
+                // make the param name resolve to a stale concrete type. The
+                // declared-type-param table covers top-level functions; the
+                // single/double-uppercase name shape covers methods (whose
+                // type params are not recorded there).
+                frame.write(*dst, v);
             } else if *safe {
                 frame.write(*dst, Value::Null);
             } else {
@@ -2177,6 +2196,15 @@ fn value_to_i64(v: &Value) -> Option<i64> {
 /// Operator-name a `BinOp` dispatches through when one operand is a
 /// user class. Returns `None` for ops that have no operator-method
 /// counterpart (e.g. boolean short-circuits).
+/// Heuristic for an erased generic type-parameter name (`T`, `R`, `E`, `K`,
+/// `V`, `TT`, …): a one- or two-character all-uppercase identifier. Used to
+/// treat `x as T` as an unchecked cast for a function/method type parameter
+/// whose declared-type-param table entry is unavailable (methods).
+fn is_erased_type_param_name(name: &str) -> bool {
+    let n = name.trim_end_matches('?');
+    !n.is_empty() && n.len() <= 2 && n.chars().all(|c| c.is_ascii_uppercase())
+}
+
 fn operator_method(op: BinOp) -> Option<&'static str> {
     Some(match op {
         BinOp::Add => "plus",
