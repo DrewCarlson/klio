@@ -404,9 +404,20 @@ upstream and delete the request-member shims.
    charset `newEncoder()`/`encode()` actual + consumed ktor-io core
    (`Buffer.canRead`, `Source.takeWhile`) + five general interpreter fixes
    (`Range + Range`, top-level-fn-in-receiver-lambda, bare-ext receiver-match,
-   `this@fn` in a nested receiver lambda, default-arg reads receiver). Next:
-   consume `URLParser.kt` / `URLBuilder.kt` (they import `Codecs`), then `Url`
-   (which is `@Serializable`, needs serialization support).
+   `this@fn` in a nested receiver lambda, default-arg reads receiver).
+   **Probe finding:** adding `Url.kt`/`URLProtocol.kt`/`URLBuilder.kt`/
+   `URLParser.kt` to the pack builds and loads — `Url`'s
+   `@Serializable(with = UrlSerializer::class)` annotation does **not** block
+   consumption (it's tolerated; serialization infra is not needed just to
+   construct/use `Url`). The actual blocker is `expect val
+   URLBuilder.Companion.origin: String` (used by `private val originUrl =
+   Url(origin)` in the companion): a klio `actual val
+   URLBuilder.Companion.origin get() = "http://localhost"` is not picked up —
+   the bare `origin` inside the companion initializer mis-resolves to
+   `get_field(companion, "origin")` (a missing field) rather than the
+   extension-property getter. Next: resolve a bare reference to an extension
+   *property* on the enclosing companion to its getter (the `extension_props`
+   path doesn't fire for the companion receiver here); then `Url` consumes.
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.
