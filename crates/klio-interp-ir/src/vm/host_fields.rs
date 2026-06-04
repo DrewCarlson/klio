@@ -280,6 +280,20 @@ impl VmHost<'_> {
                     }
                 }
             }
+            // A nested object whose bare name collided with a top-level
+            // type was lifted as `Outer$Name` (see `build/lift.rs`) so the
+            // real top-level type keeps the bare name. Resolve the mangled
+            // singleton (then class) for a qualified `Outer.Name` access
+            // before the bare-name lookups below.
+            let mangled = format!("{}${name}", cls.name);
+            if let Some(v) = self.globals.borrow().lookup(&mangled)
+                && matches!(v, klio_runtime::Value::Instance(_))
+            {
+                return Ok(v);
+            }
+            if let Some(def) = self.classes.borrow().get(&mangled).cloned() {
+                return Ok(klio_runtime::Value::Class(def));
+            }
             // Nested singleton object: `Outer.Monotonic` /
             // `Sealed.Subclass` is a synthesised object singleton
             // published as a global. Its instance must win over the

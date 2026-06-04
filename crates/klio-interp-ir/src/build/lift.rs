@@ -189,22 +189,28 @@ pub(crate) fn lift_class_recursive(
         String,
         std::collections::HashMap<String, String>,
     >,
+    top_level_type_names: &std::collections::HashSet<String>,
 ) {
     for m in &c.members {
         if let Decl::Object(co) = m {
             // Nested `object Foo { … }` inside a class. Lift as
-            // a standalone singleton class. When the source marked
-            // it `private`, rename the lifted class to `Outer$Foo`
-            // so a same-named user top-level declaration can
-            // coexist; record an alias so the outer's method
-            // bodies still resolve bare `Foo`.
+            // a standalone singleton class. Rename the lifted class to
+            // `Outer$Foo` when the source marked it `private` OR when its
+            // bare name collides with a true top-level type — otherwise the
+            // bare lift would overwrite that top-level class in the global
+            // table (last writer wins, source-order-dependent). The alias
+            // keeps the outer's own bodies resolving bare `Foo`; `get_field`
+            // on a class receiver resolves the mangled name for external
+            // `Outer.Foo` access.
             let is_private = matches!(co.visibility, klio_ast::Visibility::Private);
-            let (lifted_name, alias_simple) = if is_private {
+            let collides = top_level_type_names.contains(&co.name.name);
+            let (lifted_name, alias_simple) = if is_private || collides {
                 let renamed = format!("{}${}", c.name.name, co.name.name);
                 (renamed, Some(co.name.name.clone()))
             } else {
                 (co.name.name.clone(), None)
             };
+            let is_private = is_private || collides;
             object_names.push(lifted_name.clone());
             enclosing_class.insert(lifted_name.clone(), c.name.name.clone());
             let mut extras: std::collections::HashSet<String> = collect_enclosing_member_names(c);
@@ -279,6 +285,7 @@ pub(crate) fn lift_class_recursive(
                     nested_outer_members,
                     enclosing_class,
                     nested_object_aliases,
+                    top_level_type_names,
                 );
                 out_decls.push(Decl::Class(renamed));
                 companion_singletons.insert(c.name.name.clone(), comp_name);
@@ -315,6 +322,7 @@ pub(crate) fn lift_class_recursive(
                     nested_outer_members,
                     enclosing_class,
                     nested_object_aliases,
+                    top_level_type_names,
                 );
                 out_decls.push(Decl::Class(nested.clone()));
             }

@@ -25,7 +25,27 @@ pub fn lower_receiver(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
         && segments.len() == 1
     {
         let n = &segments[0].name;
-        if b.resolve(n).is_none() && !b.knows_outer(n) && b.module.class_id(n).is_some() {
+        // Skip the class-name shortcut when the enclosing class aliases this
+        // name to a (mangled) nested object: a bare `Inner` inside `Outer`
+        // must reach `Outer$Inner` even though a same-named top-level class
+        // owns the bare `class_id`. Falling through to `lower_expr` applies
+        // the alias rewrite in the `Expr::Path` arm.
+        let aliased = b
+            .owner_class()
+            .map(str::to_string)
+            .and_then(|owner| {
+                b.module
+                    .registry
+                    .nested_object_aliases
+                    .get(&owner)
+                    .map(|m| m.contains_key(n))
+            })
+            .unwrap_or(false);
+        if !aliased
+            && b.resolve(n).is_none()
+            && !b.knows_outer(n)
+            && b.module.class_id(n).is_some()
+        {
             let dst = b.alloc_reg();
             let nm = b.module.intern_const(Const::String(n.clone()));
             b.push(Inst::LoadGlobal { dst, name: nm });

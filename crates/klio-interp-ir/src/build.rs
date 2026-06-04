@@ -513,6 +513,23 @@ fn build_module_with_overrides(
     // all class names are known: (referencing-class-simple-name,
     // object-simple-name, mangled-name).
     let mut pending_object_aliases: Vec<(String, String, String)> = Vec::new();
+    // Simple names declared as a true *top-level* class/object anywhere in
+    // the (merged) module. A nested `object` lifted to top level under its
+    // bare name would overwrite a same-named top-level class in the global
+    // table (last writer wins, so the outcome depends on source load order).
+    // `lift_class_recursive` mangles a nested object whose name is in this
+    // set to `Outer$Name` instead, leaving the bare name to the real
+    // top-level type; `get_field` on a class receiver resolves the mangled
+    // form for qualified `Outer.Name` access.
+    let top_level_type_names: std::collections::HashSet<String> = file
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Class(c) => Some(c.name.name.clone()),
+            Decl::Object(o) => Some(o.name.name.clone()),
+            _ => None,
+        })
+        .collect();
     let mut all_decls: Vec<Decl> = Vec::with_capacity(file.decls.len());
     for d in &file.decls {
         match d {
@@ -571,6 +588,7 @@ fn build_module_with_overrides(
                     &mut nested_outer_members,
                     &mut enclosing_class,
                     &mut nested_object_aliases,
+                    &top_level_type_names,
                 );
                 all_decls.push(d.clone());
             }
