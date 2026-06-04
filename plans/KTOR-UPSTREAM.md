@@ -595,7 +595,43 @@ interpreter/stdlib bugs, each with a kotlinc-parity corpus test:
   addTo` calls `destination.ensureCapacity(…)` when `destination is ArrayList`.
   Added both as no-op capacity hints (`arraylist_ensure_capacity.kt`).
 
+## Body content layer — probed; one fix landed, one blocker
+
+The `io.ktor.http.content` `OutgoingContent` hierarchy is the body
+representation both cores use. A probe consuming `OutgoingContent` +
+`TextContent` + `ByteArrayContent` (with the `io.ktor.utils.io`
+`ByteReadChannel`/`ByteWriteChannel` interfaces — the streaming `ByteChannel`
++ operations layer is a separate, larger lift) found:
+
+- **Landed — a ctor-param `override val` over a base `open val … get()` reads
+  the override's field, not the inherited getter.** `get_field`'s getter walk
+  picked the first getter up the supertype chain, so `TextContent`'s
+  `override val contentType: ContentType` (a ctor-param property) read
+  `OutgoingContent`'s `contentType get() = null`. The walk now stops at the
+  most-derived class that stores the property (a ctor-param or body property
+  without a custom getter), reading its field instead. `TextContent` now
+  reports its real content type. Covered by
+  `ctor_param_overrides_base_getter.kt` (kotlinc byte-parity).
+- **Blocker — a concrete class whose simple name equals its nested abstract
+  supertype's hangs.** `class ByteArrayContent : OutgoingContent.ByteArrayContent()`
+  (the concrete content type shares the name of the sealed nested variant it
+  extends) loops on construction/field access — the self-name collision
+  resolves the supertype back to the concrete class. `TextContent` (a
+  distinctly-named subclass) is unaffected. This nested/self-name resolution
+  bug gates `ByteArrayContent`, so the content layer is not yet wired into the
+  pack; fixing it is the next step before the body layer consumes.
+
 ## Status
+
+The protocol foundation, the full URL layer, `Attributes`, and the **Pipeline
+runtime** are consuming real upstream and executing. The body content layer is
+probed (`TextContent` works after the override fix; `ByteArrayContent` is
+blocked on the self-name-collision hang). Next: fix that hang to consume the
+content layer, then the `io.ktor.utils.io` channel streaming subsystem, then
+switch the client/server **cores** onto upstream `Pipeline`/`PipelineContext` —
+removing the simplified `Application` / `ApplicationCall` / `HttpClient` shim
+redeclarations. The shim stays in place so client/server keep working until
+each layer's upstream replacement is validated.
 
 The protocol foundation, the full URL layer, `Attributes`, and the **Pipeline
 runtime** are consuming real upstream and executing. Next: switch the

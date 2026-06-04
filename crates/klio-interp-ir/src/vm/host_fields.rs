@@ -689,6 +689,18 @@ impl VmHost<'_> {
             // instance (`DatePeriod`), so the
             // `(declaring-class, prop)` key is an ancestor's.
             let recv_fqn = inst.borrow().class.fqn.clone();
+            // The most-derived declaration of a property wins: a class
+            // that stores `name` as a (ctor-param or body) property
+            // *without* a custom getter overrides a base `open val … get()`,
+            // so its backing field is read rather than the inherited getter.
+            let declares_stored = |cdef: &klio_runtime::ClassDef| -> bool {
+                cdef.primary_params
+                    .iter()
+                    .any(|p| p.name == name && p.property.is_some())
+                    || cdef.body_properties.iter().any(|p| {
+                        p.name == name && p.getter.is_none() && p.delegate.is_none()
+                    })
+            };
             let getter_fid = {
                 let mut found: Option<klio_ir::FuncId> = None;
                 // Resolve the receiver's own class by its
@@ -700,46 +712,56 @@ impl VmHost<'_> {
                 // field) rather than borrowing a same-simple-name
                 // sibling's. Supertype levels keep the simple-name
                 // walk (their names are recorded simple).
+                let own_class = inst.borrow().class.clone();
                 let own_is_qualified = recv_fqn != class_name;
-                if own_is_qualified {
-                    found = self
-                        .prog
-                        .instance_prop_getters
-                        .get(&(recv_fqn.clone(), name.to_string()))
-                        .copied();
-                }
-                if found.is_none() {
-                    let mut cur = if own_is_qualified {
-                        // Skip the colliding own-class simple-name
-                        // probe and continue from this instance's
-                        // supertypes — `self.classes` is simple-name
-                        // keyed, so looking the own class up there
-                        // could return a same-name sibling from
-                        // another package and walk its hierarchy.
-                        inst.borrow().class.supertype_names.first().cloned()
-                    } else {
-                        Some(class_name.clone())
-                    };
-                    let mut seen: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                    while let Some(cn) = cur.take() {
-                        if !seen.insert(cn.clone()) {
-                            break;
-                        }
-                        if let Some(fid) = self
+                if declares_stored(&own_class) {
+                    // Own class stores the property — skip the getter
+                    // walk entirely so the inherited getter never shadows
+                    // the overriding field.
+                } else {
+                    if own_is_qualified {
+                        found = self
                             .prog
                             .instance_prop_getters
-                            .get(&(cn.clone(), name.to_string()))
-                            .copied()
-                        {
-                            found = Some(fid);
-                            break;
+                            .get(&(recv_fqn.clone(), name.to_string()))
+                            .copied();
+                    }
+                    if found.is_none() {
+                        let mut cur = if own_is_qualified {
+                            // Skip the colliding own-class simple-name
+                            // probe and continue from this instance's
+                            // supertypes — `self.classes` is simple-name
+                            // keyed, so looking the own class up there
+                            // could return a same-name sibling from
+                            // another package and walk its hierarchy.
+                            inst.borrow().class.supertype_names.first().cloned()
+                        } else {
+                            Some(class_name.clone())
+                        };
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        while let Some(cn) = cur.take() {
+                            if !seen.insert(cn.clone()) {
+                                break;
+                            }
+                            let cdef = self.classes.borrow().get(&cn).cloned();
+                            // A class in the chain that stores `name`
+                            // overrides any higher base getter — stop and
+                            // read its field.
+                            if cdef.as_ref().is_some_and(|d| declares_stored(d)) {
+                                break;
+                            }
+                            if let Some(fid) = self
+                                .prog
+                                .instance_prop_getters
+                                .get(&(cn.clone(), name.to_string()))
+                                .copied()
+                            {
+                                found = Some(fid);
+                                break;
+                            }
+                            cur = cdef.and_then(|d| d.supertype_names.first().cloned());
                         }
-                        cur = self
-                            .classes
-                            .borrow()
-                            .get(&cn)
-                            .and_then(|d| d.supertype_names.first().cloned());
                     }
                 }
                 found
