@@ -14,6 +14,35 @@ packs already work.
 - Runtime fix: a bare call `name()` whose own member is a same-named *property*
   now resolves to a top-level `fun name()` — real upstream `HttpStatusCode` runs.
 
+### General interpreter / stdlib fixes landed (unblock broader consumption)
+
+Surfaced while making `kotlin.io.encoding.Base64` (a precondition for ktor
+`basicAuth` and the codecs) run end to end. Each is a root-cause fix with a
+regression test:
+
+- **Companion that extends its enclosing class** (`class C { companion object
+  Default : C() }`, exactly `Base64`'s shape) no longer infinite-loops on a bare
+  top-level call inside a member: the companion-fallback supertype walk skipped
+  forwarding to a singleton whose identity *is* the receiver.
+- **Nested lambda inherits the enclosing receiver-lambda's `this`.** A lambda
+  inside `apply`/`with`/`buildString` (or an extension-receiver lambda) that
+  referenced `this` collapsed it to `Unit`; `resolve_capture` now forwards the
+  receiver through the enclosing builder's capture slot. Fixes the idiomatic
+  `IntArray(n).apply { src.forEachIndexed { i, s -> this[i] = s } }` (Base64's
+  decode-table build).
+- **Bodyless `expect` overloads are no longer selected.** `minOf`/`maxOf`'s
+  primitive overloads are `expect inline` with no klio actual (the real impl is
+  a host intrinsic); overload resolution in member/lambda context picked the
+  empty expect. `overload_score` now declines bodyless candidates and
+  `call_named_overload` defers to the intrinsic.
+- **stdlib actuals:** `Base64` platform helpers; `Array.contentEquals` /
+  `contentToString` (were no-op `Unit`).
+
+### ktor-client request members (shim, real shipping path)
+
+`put`/`delete`/`patch`/`head`/`options` (+ `*With` builder DSL), `parameter`,
+`bearerAuth`, `basicAuth` (now that Base64 works), and `HttpMethod.Connect/Trace`.
+
 ## Module map (measured against klio)
 
 | module | parse-clean | expects (need actuals) | key runtime blockers |
