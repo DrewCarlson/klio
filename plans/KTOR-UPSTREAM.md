@@ -484,10 +484,53 @@ upstream and delete the request-member shims.
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.
 
+## URL layer consumed — query params the last gap
+
+The full URL stack now loads and parses from real upstream: `Query.kt`,
+`UrlDecodedParametersBuilder.kt`, `URLUtils.kt`, `URLProtocol.kt`,
+`URLBuilder.kt`, `URLParser.kt`, `Url.kt`, plus the posix `origin` actual
+(`URLBuilderPosix.kt`). `Url("http://localhost:8080/path?q=1")` resolves
+`protocol`, `host`, `port`, `encodedPath`, and `fragment` correctly. Getting
+there landed a stack of general interpreter/stdlib fixes, each with a
+kotlinc-parity corpus test:
+
+- non-literal primary-ctor defaults (`Parameters.Empty`) evaluated via lowered
+  thunks (`ctor_default_object_ref.kt`);
+- a same-named class/factory call resolved by arity + argument type, so
+  `URLBuilder()` builds the all-default class while `URLBuilder("…")` /
+  `Url("…")` reach the String factory (`factory_fn_over_constructor.kt`);
+- on-demand companion init when a sibling's eager initializer calls it
+  (`URLBuilder.Companion`'s `originUrl = Url(origin)` reaching
+  `URLProtocol.createOrDefault`) (`companion_init_order.kt`);
+- constructing a same-named factory when asked to instantiate an interface
+  (`ParametersBuilder()` → `ParametersBuilderImpl`);
+- `String.indexOf(_, startIndex)` honouring its start index (`index_of_start.kt`);
+- a vararg function no longer matched by exact arg count, so `mutableListOf("x")`
+  reaches the intrinsic instead of binding the unpacked vararg body
+  (`vararg_single_arg.kt`).
+
+**Remaining gap — query parameters.** `parseQueryString` populates a
+`ParametersBuilder`, whose backing `StringValuesBuilderImpl.values` is a
+`CaseInsensitiveMap` (pack-consumed `class CaseInsensitiveMap<V> :
+MutableMap<String, V>`). `map.put(k, v)` on it works, but `map[k] = v` /
+`map.set(k, v)` does not store: a user-program `MutableMap` of the identical
+shape dispatches `set` through the `MutableMap.set` operator extension to its
+`put` and works, but the pack-consumed `CaseInsensitiveMap` instead routes `set`
+into the read-only Map fallback (materialise entries → builtin `Value::Map` →
+`dispatch_intrinsic`), which mutates a snapshot and leaves the instance
+unchanged — so every query param is dropped and `encodedQuery` is empty. The fix
+is in `set`/operator dispatch for a pack-consumed class implementing
+`MutableMap`: its generic `MutableMap` supertype isn't matched by the
+operator-extension receiver test, so the call falls through to the materialising
+fallback (which must never run a *mutating* op). A program-defined class with
+the same shape resolves correctly, so it is specific to how a pack class's
+generic supertype is recorded/matched.
+
 ## Status
 
-The protocol foundation is consuming real upstream and the general fixes it needs
-are landing. The remaining path is a deliberate multi-step program: the Map
-key-equality change, then the ktor-http remainder, then the Pipeline runtime for
+The protocol foundation is consuming real upstream and the general fixes are
+landing. URL value types now parse from upstream end-to-end except query params.
+Remaining program, in order: the `CaseInsensitiveMap.set` / pack-class
+`MutableMap` operator dispatch (for query params), then the Pipeline runtime for
 the cores. The shim stays in place so client/server keep working until each
 layer's upstream replacement is validated.

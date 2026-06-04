@@ -61,6 +61,21 @@ include = [
     "io/ktor/http/ContentRange.kt",
     "io/ktor/http/RangesSpecifier.kt",
     "io/ktor/http/Codecs.kt",
+    "io/ktor/http/Query.kt",
+    "io/ktor/http/UrlDecodedParametersBuilder.kt",
+    "io/ktor/http/URLUtils.kt",
+    "io/ktor/http/URLProtocol.kt",
+    "io/ktor/http/URLBuilder.kt",
+    "io/ktor/http/URLParser.kt",
+    "io/ktor/http/Url.kt",
+]
+
+# Platform `actual`s for the ktor-http `expect`s. The posix variant is pure
+# common Kotlin (no JVM/JS imports): `URLBuilder.Companion.origin`.
+[[source]]
+root = "upstream/ktor-http/posix/src"
+include = [
+    "io/ktor/http/URLBuilderPosix.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
