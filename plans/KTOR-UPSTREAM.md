@@ -244,6 +244,17 @@ upstream and delete the request-member shims.
   `Outer` reaches `Outer$Foo`, not the top-level class). Matches kotlinc:
   top-level keeps the bare name, nested resolves through its qualifier. Covered
   by `corpus/nested_name_collision.kt`.
+- **Function-typed property invoked extension-style.** `x.convertTo()` where
+  `convertTo: From.() -> To` is a property of the enclosing instance now invokes
+  the lambda even when a same-named member extension on a different receiver
+  type (`Collection<From>.convertTo()`) also exists — `call_member` had deferred
+  to the receiver-incompatible member extension. When no extension candidate's
+  declared receiver accepts the actual receiver and a function-typed property of
+  that name is reachable (walking the enclosing-`this` chain *and* each
+  instance's `outer` links, so it resolves from inside a nested anon object),
+  defer to the property. This is `DelegatingMutableSet.next()`'s
+  `delegateIterator.next().convertTo()`; it previously hung. Covered by
+  `corpus/receiver_lambda_property.kt`.
 - **Consumed verbatim:** `io.ktor.util.Text.kt`, the util collection layer
   (`Collections.kt` + a klio `unmodifiable` actual, `DelegatingMutableSet.kt`,
   `CaseInsensitiveMap.kt`, `StringValues.kt`), and the http header/content-type
@@ -256,18 +267,25 @@ upstream and delete the request-member shims.
 
 ## Open blockers (next, in order)
 
-1. **Receiver-lambda *property* invoked extension-style.**
-   `DelegatingMutableSet.next()` does `delegateIterator.next().convertTo()`,
-   where `convertTo: From.() -> To` is the wrapper's lambda property invoked
-   with the entry as receiver. Iterating a `CaseInsensitiveMap`/`StringValues`
-   view (`entries`/`keys`/`values`) hangs. A broad `call_member` fallback for
-   this misrouted coroutine method calls to same-named captured lambdas (broke
-   mm9/mm10 conformance) and was reverted — it needs a precise resolution
-   (the lambda is the *enclosing* instance's property, reached via the anon
-   object's outer `this`; resolve at lowering or with the current method's
-   `this` in scope, not via a blanket global-lambda lookup). Gates iterating
-   the wrapper views (and thus the `Headers`/`Parameters` layer that builds on
-   `StringValues`).
+1. **Stdlib collection operators on a *user-defined* collection.** Iterating a
+   `CaseInsensitiveMap` / `StringValues` view (`keys`/`entries`/`values`, all
+   `DelegatingMutableSet`) through stdlib operators fails: the per-receiver-type
+   intrinsics `kotlin.collections.{Set,List,Collection,Iterable}.{sorted,
+   toTypedArray,toList,toMutableList,toSet,map,…}` are reached on a user
+   `Value::Instance` (via the supertype probe in `call_member`) but assume a
+   native `Value::List`/`Set` and fail (`cast to Array failed`, or
+   `ArrayList(coll)` rejecting a user collection). Two sub-cases seen:
+   `keys.sorted()` → `toTypedArray()` cast; `entries` builds `Entry(...)`
+   (CaseInsensitiveMap's private class implementing `MutableMap.MutableEntry`).
+   Fix: materialize a user-`Instance` receiver into a native collection by
+   driving its `iterator()`/`hasNext()`/`next()` protocol (via
+   `IntrinsicHost::invoke_method`; a shared `materialise_iterable` helper) —
+   but only for **read** ops (`sorted`/`toList`/`map`/`toTypedArray`/…); mutators
+   (`add`/`remove`/`clear`) must keep operating on the user collection, so this
+   is a curated per-operation change, not a blanket receiver rewrite. The
+   `convertTo` receiver-lambda-property resolution that previously *hung* this
+   path is now fixed (see Landed). Gates iterating the views, and thus the
+   `Headers`/`Parameters` layer built on `StringValues`.
 2. **ktor-http remainder** — `Headers`/`Parameters`/`Url`/`URLBuilder`/codecs,
    once (1) lands.
 3. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
