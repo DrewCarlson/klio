@@ -56,6 +56,12 @@ enum Cmd {
         /// Enable a pack feature (cargo style), `<pack>/<feature>`. Repeatable.
         #[arg(long = "feature", value_name = "PACK/FEATURE")]
         features: Vec<String>,
+        /// Instead of type-checking, report every reachable `expect`
+        /// declaration (stdlib + packs included) that has no `actual`
+        /// body and no host intrinsic — calls to which silently return
+        /// `Unit` at runtime.
+        #[arg(long = "unimplemented")]
+        unimplemented: bool,
     },
     /// Start an interactive REPL.
     Repl,
@@ -239,7 +245,15 @@ fn main_inner() -> ExitCode {
             files,
             format,
             features,
-        } => run_check(&files, format, &parse_requested_features(&features)),
+            unimplemented,
+        } => {
+            let requested = parse_requested_features(&features);
+            if unimplemented {
+                unimplemented::run_check_unimplemented(&files, &requested)
+            } else {
+                run_check(&files, format, &requested)
+            }
+        }
         Cmd::Repl => run_repl(),
         Cmd::Pack { cmd } => run_pack(cmd),
     }
@@ -267,6 +281,7 @@ fn parse_requested_features(specs: &[String]) -> pack_cache::RequestedFeatures {
 mod commands;
 mod pack_build;
 mod pack_cache;
+mod unimplemented;
 
 #[cfg(test)]
 mod source_selection_tests {
