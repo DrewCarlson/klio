@@ -191,6 +191,20 @@ pub(crate) fn char_is_lowercase(ctx: &mut CallCtx) -> Result<Value, RuntimeError
     let s = char_unit_to_scalar(recv_char(ctx.args, "Char.isLowerCase")?);
     Ok(Value::Bool(s.is_some_and(kt_is_lower_case)))
 }
+/// `Char.compareTo(other)` — the only primitive `compareTo` with no klio
+/// intrinsic; without it the call fell through to a fallback that
+/// re-dispatched `compareTo` forever (so `compareBy { it.first() }` hung).
+/// Returns the sign of the UTF-16 code-unit ordering (-1 / 0 / 1), matching
+/// kotlinc and the other primitive `compareTo` intrinsics.
+pub(crate) fn char_compare_to(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let a = recv_char(ctx.args, "Char.compareTo")?;
+    let Some(Value::Char(b)) = ctx.args.get(1) else {
+        return Err(RuntimeError::Type("Char.compareTo requires a Char".into()));
+    };
+    let b = *b;
+    Ok(Value::Int(if a < b { -1 } else { i32::from(a > b) }))
+}
+
 /// `Char.isISOControl()` — a C0 (`0x00..=0x1F`) or C1 (`0x7F..=0x9F`)
 /// control code unit. A bodyless `expect` otherwise.
 pub(crate) fn char_is_iso_control(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {

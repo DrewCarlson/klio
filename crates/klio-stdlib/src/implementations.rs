@@ -196,6 +196,7 @@ const TABLE: &[(&str, StdlibFn)] = &[
     ("kotlin.Char.uppercase", char_uppercase),
     // Deprecated case forms (return Char / String, locale-independent) and
     // ISO-control predicate — bodyless expects otherwise.
+    ("kotlin.Char.compareTo", char_compare_to),
     ("kotlin.Char.toUpperCase", char_uppercase_char),
     ("kotlin.Char.toLowerCase", char_lowercase_char),
     ("kotlin.Char.toTitleCase", char_titlecase_char),
