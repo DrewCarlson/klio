@@ -93,6 +93,42 @@ fn run(file: &Path) -> String {
 }
 
 #[test]
+fn ktor_channel_read_from_upstream() {
+    install_ktor_pack();
+
+    // The `io.ktor.utils.io` channel read path consumed from upstream: the
+    // fully-buffered `SourceByteReadChannel` plus the
+    // `ByteReadChannel(bytes/text)` factories and `readRemaining()` /
+    // `readByteArray()` — the shape a response body is drained with. (The
+    // async `ByteChannel` write side, which needs coroutine-suspension
+    // fidelity, is a later lift.)
+    let src = r#"
+import io.ktor.utils.io.*
+import kotlinx.coroutines.*
+
+fun main() = runBlocking {
+    val text = String(ByteReadChannel("hello world").readRemaining().readByteArray())
+    println(text)
+    val nums = ByteReadChannel(byteArrayOf(1, 2, 3, 4, 5)).readRemaining().readByteArray()
+    println("${nums.size}|${nums.joinToString(",")}")
+}
+"#;
+
+    let dir = std::env::temp_dir().join("klio_ktor_channel_read");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.kt");
+    std::fs::write(&file, src).unwrap();
+
+    let got = run(&file);
+    assert_eq!(
+        got,
+        "hello world\n\
+         5|1,2,3,4,5\n",
+        "ktor channel read output drifted"
+    );
+}
+
+#[test]
 fn ktor_content_types_from_upstream() {
     install_ktor_pack();
 

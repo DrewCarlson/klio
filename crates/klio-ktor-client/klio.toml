@@ -24,11 +24,22 @@ include = [
     "io/ktor/utils/io/Deprecation.kt",
     "io/ktor/utils/io/core/Buffer.kt",
     "io/ktor/utils/io/core/ByteReadPacket.kt",
-    # Channel interface types the `OutgoingContent` body layer references in
-    # its signatures (the streaming `ByteChannel` + operations layer is a
-    # later lift; the interfaces alone suffice for the content types).
+    "io/ktor/utils/io/core/BytePacketBuilder.kt",
+    "io/ktor/utils/io/core/Builder.kt",
+    # Channel interface types (referenced by the `OutgoingContent` body layer)
+    # and the read side of the channel layer: the fully-buffered, non-suspending
+    # `SourceByteReadChannel`, the `ByteReadChannel(bytes/text/source)`
+    # factories, and the read operations (`readRemaining`/`readByteArray`/…) —
+    # the shape a response body is drained with. The async `ByteChannel` write
+    # side (which needs coroutine-suspension fidelity) is a later lift; its
+    # references in the read operations sit in unused function bodies.
     "io/ktor/utils/io/ByteReadChannel.kt",
     "io/ktor/utils/io/ByteWriteChannel.kt",
+    "io/ktor/utils/io/Exceptions.kt",
+    "io/ktor/utils/io/CloseToken.kt",
+    "io/ktor/utils/io/SourceByteReadChannel.kt",
+    "io/ktor/utils/io/ByteChannelCtor.kt",
+    "io/ktor/utils/io/ByteReadChannelOperations.kt",
 ]
 
 # Upstream `io.ktor.util` string helpers (escapeHTML / quote /

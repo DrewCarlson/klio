@@ -645,17 +645,18 @@ interpreter fixes got there, each with a kotlinc-parity corpus test:
   `is`-checks resolve, and the hierarchy is correct. Covered by
   `self_named_nested_supertype.kt`.
 
-## Channel streaming subsystem — read side in progress
+## Channel streaming subsystem — read side consumed
 
-A probe consuming the concrete `ByteChannel` + its read/write operations (the
-streaming layer behind the `ByteReadChannel`/`ByteWriteChannel` interfaces)
-established what is needed and surfaced the gating issue:
+The **read side** of the `io.ktor.utils.io` channel layer is consumed from
+upstream and wired into the pack: the fully-buffered, non-suspending
+`SourceByteReadChannel`, the `ByteReadChannel(bytes/text/source)` factories, and
+the read operations (`readRemaining`/`readByteArray`/…) — the shape a response
+body is drained with. Verified by `ktor_channel_read_from_upstream`
+(`ByteReadChannel("hello world").readRemaining().readByteArray()` round-trips
+to the original text/bytes). The async `ByteChannel` *write* side is deferred
+(see below). Getting here surfaced and fixed three general interpreter bugs,
+each with a kotlinc-parity corpus test:
 
-- klio actuals for the `io.ktor.utils.io.locks` expects (`SynchronizedObject` /
-  `ReentrantLock` / `synchronized` / `withLock` — single-threaded no-ops that
-  still run their block) and `DEVELOPMENT_MODE = false` let the channel files
-  load cleanly. The `BytePacketBuilder` / `buildPacket` core helpers
-  (`Sink`/`Buffer` typealiases) are needed too.
 - **Landed — a member function's function-reference default parameter (`::fn`)
   now calls the referenced function.** A method's default-arg thunk is lowered
   before top-level functions are registered, so `::fn` records a `PropertyRef`
@@ -664,13 +665,6 @@ established what is needed and surfaced the gating issue:
   `f.invoke(x)` likewise). `call_value` / `call_member` now call the referenced
   top-level function when a `PropertyRef` names one. Covered by
   `method_fn_ref_default_param.kt` (kotlinc byte-parity).
-- **The async `ByteChannel` (write side) blocks on coroutine suspension** —
-  a write→`flushAndClose`→`readRemaining` round trip reads a
-  `kotlinx.coroutines.internal.Symbol` from `_closedCause` because
-  `awaitContent()` suspends through `suspendCancellableCoroutine` + the `Slot`
-  state machine, which klio's cooperative driver mishandles. So the write side
-  is deferred; the **read side** (`SourceByteReadChannel` — a fully-buffered,
-  non-suspending channel) is the shape a response body uses and avoids this.
 - **Landed — named-argument overload resolution prefers the type-fitting
   candidate.** A named-arg call (`buffer.write(byteArray, startIndex = …,
   endIndex = …)`) mis-resolved to a same-named extension whose first parameter
@@ -680,22 +674,31 @@ established what is needed and surfaced the gating issue:
   candidate whose positional argument definitely can't bind a concrete
   parameter and declines (so the receiver's own member wins) for named calls.
   Covered by `named_arg_member_over_extension.kt` (kotlinc byte-parity).
-- **Read-path probe — next gap.** Consuming the read side
-  (`SourceByteReadChannel` + the `ByteReadChannel(bytes/text/source)` factories
-  + `readRemaining`) now loads and resolves the channel construction, but
-  `readRemaining().readByteArray()` hits a `getBackingArrayReference` gap in
-  klio's kotlinx-io (`Buffer`/`ByteString` byte extraction). The channel files
-  remain unwired pending that kotlinx-io fix.
+- **Landed — an interface-factory call resolves the overload by argument
+  type.** `ByteReadChannel(byteArray)` (an interface with several same-named
+  factory functions) reached the wrong factory: the diversion picked the first
+  whose arity matched, and the `ByteReadChannel(ByteArray, offset, length)`
+  factory's trailing defaulted params made its declared arity exceed the
+  supplied count, so a same-name single-parameter overload (`(Source)` /
+  `(String)`) won and bound the `ByteArray` to the wrong parameter. The
+  diversion now scores arity-applicable factories by argument type. Covered by
+  `interface_factory_overload_by_argtype.kt` (kotlinc byte-parity).
+- **Deferred — the async `ByteChannel` *write* side** blocks on coroutine
+  suspension: a write→`flushAndClose`→`readRemaining` round trip reads a
+  `kotlinx.coroutines.internal.Symbol` from `_closedCause` because
+  `awaitContent()` suspends through `suspendCancellableCoroutine` + the `Slot`
+  state machine, which klio's cooperative driver mishandles. The read side
+  (above) avoids this; the write side needs coroutine-suspension fidelity and
+  its locks/`DEVELOPMENT_MODE` actuals.
 
 ## Status
 
 The protocol foundation, the full URL layer, `Attributes`, the **Pipeline
-runtime**, and the **body content layer** consume real upstream and execute.
-Next: finish the channel **read side** (close the `getBackingArrayReference`
-kotlinx-io gap so `ByteReadChannel(bytes).readRemaining().readByteArray()`
-works — the response-body shape), then switch the client/server **cores** onto
-upstream `Pipeline`/`PipelineContext` — removing the simplified `Application` /
-`ApplicationCall` / `HttpClient` shim redeclarations. The async `ByteChannel`
-write side remains gated on coroutine-suspension fidelity. The shim stays in
-place so client/server keep working until each layer's upstream replacement is
-validated.
+runtime**, the **body content layer**, and the **channel read side** consume
+real upstream and execute. Next: switch the client/server **cores** onto
+upstream `Pipeline`/`PipelineContext` (the response body now has a real
+`ByteReadChannel`; klio supplies the engine `actual` over `__kktor_request`) —
+removing the simplified `Application` / `ApplicationCall` / `HttpClient` shim
+redeclarations. The async `ByteChannel` write side remains gated on
+coroutine-suspension fidelity. The shim stays in place so client/server keep
+working until each layer's upstream replacement is validated.

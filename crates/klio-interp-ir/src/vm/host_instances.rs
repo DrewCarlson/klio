@@ -365,31 +365,61 @@ impl VmHost<'_> {
             {
                 let module = Arc::clone(&self.module);
                 let provided = args.len();
-                let factory = module
-                    .funcs_by_simple_name(&class_def.name)
-                    .iter()
-                    .filter_map(|fid| module.funcs.get(fid.0 as usize).map(|f| (*fid, f)))
-                    .find(|(fid, f)| {
-                        if f.blocks.is_empty()
-                            || f.params.first().is_some_and(|p| p.name == "this")
-                        {
-                            return false;
-                        }
-                        if f.params.last().is_some_and(|p| p.is_vararg) {
-                            return true;
-                        }
-                        // Exact arity, or omitted trailing params all default.
-                        provided <= f.params.len()
+                // Among same-named factory overloads that are arity-applicable
+                // (with default padding), pick the one whose parameter types
+                // best fit the supplied args — so `ByteReadChannel(byteArray)`
+                // reaches the `ByteReadChannel(ByteArray, …)` factory rather
+                // than a same-name `(String)` / `(Source)` overload that also
+                // accepts one argument.
+                let mut best: Option<(klio_ir::FuncId, i64)> = None;
+                for fid in module.funcs_by_simple_name(&class_def.name) {
+                    let Some(f) = module.funcs.get(fid.0 as usize) else {
+                        continue;
+                    };
+                    if f.blocks.is_empty() || f.params.first().is_some_and(|p| p.name == "this") {
+                        continue;
+                    }
+                    let vararg = f.params.last().is_some_and(|p| p.is_vararg);
+                    let arity_ok = vararg
+                        || (provided <= f.params.len()
                             && (provided..f.params.len()).all(|idx| {
                                 self.prog
                                     .func_defaults
                                     .get(fid)
                                     .and_then(|slots| slots.get(idx).copied().flatten())
                                     .is_some()
-                            })
-                    })
-                    .map(|(fid, _)| fid);
-                if let Some(fid) = factory {
+                            }));
+                    if !arity_ok {
+                        continue;
+                    }
+                    let mut score: i64 = 0;
+                    let mut viable = true;
+                    for (i, a) in args.iter().enumerate() {
+                        if let Some(p) = f.params.get(i) {
+                            match self.overload_score_arg(&p.ty, a) {
+                                Some(s) => score += i64::from(s),
+                                None => {
+                                    let pn = p.ty.name.as_str();
+                                    let generic = p.ty.nullable
+                                        || matches!(pn, "Any" | "Unit")
+                                        || pn.starts_with("Function")
+                                        || (pn.len() <= 2
+                                            && pn.chars().all(|c| c.is_ascii_uppercase()));
+                                    if generic {
+                                        score -= 2;
+                                    } else {
+                                        viable = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if viable && best.as_ref().is_none_or(|(_, s)| score > *s) {
+                        best = Some((*fid, score));
+                    }
+                }
+                if let Some((fid, _)) = best {
                     return self.call_func(&module, fid, args.to_vec());
                 }
             }
