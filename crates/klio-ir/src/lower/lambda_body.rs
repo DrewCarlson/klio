@@ -7,6 +7,22 @@ pub(super) fn resolve_capture(b: &mut FuncBuilder<'_>, name: &str) -> Reg {
     if let Some(r) = b.resolve(name) {
         return r;
     }
+    // A lambda body's implicit `this` (the receiver of an `apply` /
+    // `with` / extension-receiver lambda) is bound at invoke time
+    // through the closure's capture slot rather than a scope binding
+    // or an `outer_names` entry — so `knows_outer("this")` is false
+    // even though `this` is reachable. The `Expr::This` lowering uses
+    // the same `is_lambda_body()` signal. Mirror it here so a *nested*
+    // lambda can capture the enclosing receiver: forward `this`
+    // through this builder's own capture slot rather than collapsing
+    // it to `Unit`.
+    if name == "this" && b.is_lambda_body() {
+        let idx = b.record_capture("this");
+        let dst = b.alloc_reg();
+        b.push(Inst::LoadCapture { dst, idx });
+        b.bind("this".to_string(), dst);
+        return dst;
+    }
     if b.knows_outer(name) {
         let idx = b.record_capture(name);
         let dst = b.alloc_reg();

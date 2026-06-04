@@ -225,3 +225,38 @@ fun main() {
         "7\n",
     );
 }
+
+// A nested lambda must inherit the enclosing *receiver* lambda's `this`
+// (the receiver of `apply` / `with` / `buildString`), not collapse it to
+// `Unit`. `IntArray(n).apply { src.forEachIndexed { i, s -> this[s] = i } }`
+// is exactly how `kotlin.io.encoding.Base64` builds its decode table; the
+// inner `this` is the array being configured by `apply`.
+#[test]
+fn nested_lambda_inherits_receiver_lambda_this() {
+    let src = r#"
+class Acc(var total: Int)
+fun main() {
+    val src = intArrayOf(10, 20, 30)
+    val m = IntArray(4).apply {
+        this.fill(-1)
+        src.forEachIndexed { index, value -> this[index] = value }
+    }
+    println(m.joinToString(","))            // 10,20,30,-1
+
+    val a = Acc(0).apply {
+        listOf(1, 2, 3).forEach { x -> total = total + x }
+    }
+    println(a.total)                        // 6
+
+    val picked = Acc(0).apply {
+        intArrayOf(4, 5, 6).forEach { v -> total = maxOf(total, v) }
+    }
+    println(picked.total)                   // 6
+}
+"#;
+    assert_klio(
+        "nested_lambda_inherits_receiver_lambda_this",
+        src,
+        "10,20,30,-1\n6\n6\n",
+    );
+}
