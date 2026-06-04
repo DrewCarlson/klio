@@ -3030,18 +3030,6 @@ impl VmHost<'_> {
         {
             return self.call_value(&g, args);
         }
-        // `recv.name(args)` where `name` is not a member of `recv` but a
-        // captured/in-scope *lambda* — a receiver-lambda property closed
-        // over by an anon object, e.g. ktor's `DelegatingMutableSet`
-        // `convertTo: From.() -> To` invoked as `entry.convertTo()`.
-        // Invoke the lambda with `recv` bound as its receiver. Restricted
-        // to lambda values so a same-named top-level `fun` (handled above
-        // for the property case) is never misrouted here.
-        if let Some(g) = self.lookup_global(name)
-            && matches!(g, klio_runtime::Value::Lambda { .. } | klio_runtime::Value::IrClosure { .. })
-        {
-            return self.call_value_with_this(&g, receiver, args, &[]);
-        }
         Err(klio_ir::eval::EvalError::Unimplemented(format!(
             "Vm::call_member `{name}` on `{}`",
             receiver.type_fqn()

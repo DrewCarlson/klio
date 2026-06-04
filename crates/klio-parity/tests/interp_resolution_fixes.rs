@@ -195,23 +195,3 @@ fun main() {
 "#;
     assert_klio("anon_object_property_init_over_capture", src, "6\n");
 }
-
-// A captured receiver-lambda invoked extension-style (`x.t()` where `t:
-// Int.() -> String` is closed over by an anon object) binds `x` as the
-// lambda's receiver — ktor's DelegatingMutableSet does this with its
-// `convertTo` transform.
-#[test]
-fn captured_receiver_lambda_invoked_extension_style() {
-    let src = r#"
-fun run(items: List<Int>, t: Int.() -> String) {
-    val it = object : Iterator<String> {
-        val inner = items.iterator()
-        override fun hasNext(): Boolean = inner.hasNext()
-        override fun next(): String = inner.next().t()
-    }
-    while (it.hasNext()) println(it.next())
-}
-fun main() { run(listOf(1, 2)) { "v$this" } }
-"#;
-    assert_klio("captured_receiver_lambda_invoked_extension_style", src, "v1\nv2\n");
-}

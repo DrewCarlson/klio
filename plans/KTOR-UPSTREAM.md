@@ -79,20 +79,18 @@ More fixes landed: anonymous-object property initializers over captures are
 now evaluated (`val inner = src.iterator()`), so `DelegatingMutableSet`'s
 anonymous iterator constructs; and `entries`/`size` over the wrapper work.
 
-Also landed: a captured receiver-lambda invoked extension-style
-(`x.t()` where `t: Int.() -> String` is closed over by an anon object) now
-binds `x` as the lambda's receiver.
-
 ## Open blockers (next, in order)
 
-1. **Enclosing-instance receiver-lambda *property* invoked extension-style.**
+1. **Receiver-lambda *property* invoked extension-style.**
    `DelegatingMutableSet.next()` does `delegateIterator.next().convertTo()`,
-   where `convertTo: From.() -> To` is the enclosing wrapper instance's
-   *property* (reached via the anon object's outer `this`), invoked with the
-   entry as receiver. The captured-local case is fixed; this needs the current
-   method's `this`/outer chain reachable from `call_member`'s fallback (or a
-   lowering-time rewrite). Gates iterating the wrapper views (keys/entries/
-   values all use the same shape).
+   where `convertTo: From.() -> To` is the wrapper's lambda property invoked
+   with the entry as receiver. A broad `call_member` fallback for this
+   misrouted coroutine method calls to same-named captured lambdas (broke
+   mm9/mm10 conformance) and was reverted — it needs a precise resolution
+   (the lambda is the *enclosing* instance's property, reached via the anon
+   object's outer `this`; resolve at lowering or with the current method's
+   `this` in scope, not via a blanket global-lambda lookup). Gates iterating
+   the wrapper views (keys/entries/values all use the same shape).
 2. **ktor-http remainder** — `Headers`/`Parameters`/`Url`/`URLBuilder`/codecs,
    once (1) lands.
 3. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
