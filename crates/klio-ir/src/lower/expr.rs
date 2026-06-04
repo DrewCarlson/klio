@@ -503,6 +503,26 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                     return r;
                 }
+                // A bare read of a name the enclosing anon object closes
+                // over reads that captured value — even when the object
+                // also declares a same-named member (the `Continuation(ctx)
+                // { override val context get() = context }` factory). The
+                // captured outer is in lexical scope and shadows the
+                // member's getter for an unqualified read, so resolve via
+                // `LoadCapture` rather than a `this.<name>` field probe
+                // that would miss the getter-only property. No-op outside
+                // anon-method lowering.
+                if is_lower_anon_capture(&segments[0].name) {
+                    let idx = b.record_capture(&segments[0].name);
+                    let cell = b.alloc_reg();
+                    b.push(Inst::LoadCapture { dst: cell, idx });
+                    if b.is_boxed(&segments[0].name) {
+                        let dst = b.alloc_reg();
+                        b.push(Inst::CellGet { dst, cell });
+                        return dst;
+                    }
+                    return cell;
+                }
                 // Lambda-body capture: name lives in an enclosing
                 // frame but not as a top-level global.
                 if b.knows_outer(&segments[0].name) {
@@ -1531,6 +1551,40 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         return r;
                     }
                 }
+            }
+            // A bare call to a name the enclosing anon object closes
+            // over invokes that captured value — even when the name also
+            // names a member of the object. This is the
+            // `Continuation(ctx) { override fun resumeWith(r) =
+            // resumeWith(r) }` factory: Kotlin's inline expansion binds
+            // the crossinline parameter, not the member, so a member
+            // dispatch here would self-recurse. The captured name is
+            // genuinely in lexical scope (a closed-over outer
+            // param/local), so it shadows the same-named member for an
+            // unqualified call. Resolve via `LoadCapture` + `CallValue`.
+            // Skipped when a real local of that name shadows it, and
+            // (since `is_lower_anon_capture` is only set while lowering an
+            // anon object's own method bodies) a no-op everywhere else.
+            if !*is_infix
+                && let Expr::Path { segments, .. } = callee.as_ref()
+                && segments.len() == 1
+                && b.resolve(&segments[0].name).is_none()
+                && is_lower_anon_capture(&segments[0].name)
+            {
+                let idx = b.record_capture(&segments[0].name);
+                let callee_r = b.alloc_reg();
+                b.push(Inst::LoadCapture { dst: callee_r, idx });
+                let (args_start, count) = lower_arg_run(b, args);
+                let arg_names = intern_arg_names(b.module, ast_arg_names);
+                let dst = b.alloc_reg();
+                b.push(Inst::CallValue {
+                    dst,
+                    callee: callee_r,
+                    args: args_start,
+                    n_args: count,
+                    arg_names,
+                });
+                return dst;
             }
             // Infix call `a fn b` lowers as `a.fn(b)` — the
             // dispatch site is a member call on the receiver

@@ -284,3 +284,38 @@ fun main() {
 "#;
     assert_klio("min_max_of_resolve_in_member_context", src, "20\n24\n6\n");
 }
+
+// An object expression member whose body makes a bare call to a captured
+// outer parameter of the *same name* must invoke the capture, not re-enter
+// the member (which self-recurses forever). This is the shape of the
+// `kotlin.coroutines.Continuation(ctx) { … }` factory: `override fun
+// resumeWith(r) = resumeWith(r)` binds the crossinline parameter. A normal
+// anon-object call to a real sibling member must still dispatch to the
+// member.
+#[test]
+fn anon_object_member_calls_captured_same_named_param() {
+    let src = r#"
+interface Sink { fun push(x: Int) }
+fun mk(push: (Int) -> Unit): Sink = object : Sink {
+    override fun push(x: Int) = push(x)
+}
+interface Calc { fun run(): Int }
+fun calc(): Calc = object : Calc {
+    fun helper(n: Int): Int = n * 2
+    override fun run(): Int = helper(21)
+}
+fun main() {
+    var sum = 0
+    val s = mk { v -> sum += v }
+    s.push(10)
+    s.push(5)
+    println(sum)
+    println(calc().run())
+}
+"#;
+    assert_klio(
+        "anon_object_member_calls_captured_same_named_param",
+        src,
+        "15\n42\n",
+    );
+}
