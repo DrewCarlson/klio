@@ -422,14 +422,25 @@ upstream and delete the request-member shims.
    runs at load before the top-level `const val DEFAULT_PORT` global is set —
    **also fixed (landed):** a primary-ctor default that is a bare top-level
    `const val` is resolved from the const registry at construction time.
-   **Current blocker:** pack load still throws `BinOp::LessEq on Int(0) and
-   Null` from `URLBuilder.Companion`'s `val originUrl = Url(origin)` — i.e.
-   constructing `Url("http://localhost")` (the `Url(String)` factory →
-   `URLBuilder(urlString).build()` → parser) yields a `Null` port/specifiedPort
-   for a port-less URL, so `require(specifiedPort in 0..65535)` fails. Next:
-   trace the `Url(String)` / `URLBuilder(String)` parse path and ensure a
-   port-less URL's `specifiedPort` defaults to `DEFAULT_PORT` (0), not `Null`.
-   Then `Url` / `URLBuilder` / `URLParser` consume (serialization not required).
+   **Current blocker (narrowed):** pack load throws `BinOp::LessEq on Int(0)
+   and Null` from `__init_block_Url_0` — `Url`'s `require(specifiedPort in
+   0..65535)` with `specifiedPort == Null`. The chain is `URLBuilder.Companion`'s
+   eager `val originUrl = Url(origin)` → `URLBuilder("http://localhost").build()`
+   → `Url(specifiedPort = port)`, where the `URLBuilder`'s `port` is `Null`.
+   Instrumentation showed: `get_field` is **never** called for `DEFAULT_PORT`
+   (so it's not the parser's `port = DEFAULT_PORT` bare-ref path — the eager
+   const-init covers that), and **neither** `new_instance` (the trailing-default
+   pass) **nor** `new_instance_named` (the named-reorder const-resolution)
+   probe fires for the `port` param — so `URLBuilder()`'s `port` ctor default
+   (`= DEFAULT_PORT`) is filled by a *third* construction path. `URLBuilder`
+   declares `port` as a `var port: Int = port` body property with a custom
+   `set(value) { require(value in 0..65535); field = value }` setter plus
+   `applyOrigin()` in `build()`. Next: locate where `URLBuilder()`'s primary-ctor
+   param default is applied during body-property / setter construction (it
+   bypasses both `new_instance*` default-fill probes) and resolve the
+   `DEFAULT_PORT` default there. Then `Url` / `URLBuilder` / `URLParser` consume
+   (serialization not required; `origin`, `DEFAULT_PORT`-as-bare-ref, and
+   primary-ctor const defaults are already handled).
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.
