@@ -93,6 +93,51 @@ fn run(file: &Path) -> String {
 }
 
 #[test]
+fn ktor_date_and_empty_content_from_upstream() {
+    install_ktor_pack();
+
+    // Cores stage-1 foundation: `io.ktor.util.date.GMTDate` (request/response
+    // timestamps) with klio's UTC calendar-math actuals, and the request-body
+    // default `io.ktor.client.utils.EmptyContent` (an `OutgoingContent`).
+    let src = r#"
+import io.ktor.util.date.*
+import io.ktor.client.utils.*
+import io.ktor.http.content.*
+
+fun show(d: GMTDate) {
+    println("${d.year}-${d.month}-${d.dayOfMonth}|${d.hours}:${d.minutes}:${d.seconds}|${d.dayOfWeek}|${d.dayOfYear}")
+}
+
+fun main() {
+    show(GMTDate(0L))
+    show(GMTDate(1609459200000L))
+    val d = GMTDate(30, 15, 12, 25, Month.DECEMBER, 2020)
+    show(d)
+    println(GMTDate(d.timestamp).timestamp == d.timestamp)
+
+    val e: OutgoingContent = EmptyContent
+    println("${e.contentLength}|${e.isEmpty()}|${e is OutgoingContent.NoContent}")
+}
+"#;
+
+    let dir = std::env::temp_dir().join("klio_ktor_date_content");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.kt");
+    std::fs::write(&file, src).unwrap();
+
+    let got = run(&file);
+    assert_eq!(
+        got,
+        "1970-JANUARY-1|0:0:0|THURSDAY|0\n\
+         2021-JANUARY-1|0:0:0|FRIDAY|0\n\
+         2020-DECEMBER-25|12:15:30|FRIDAY|359\n\
+         true\n\
+         0|true|true\n",
+        "ktor date / EmptyContent output drifted"
+    );
+}
+
+#[test]
 fn ktor_channel_read_from_upstream() {
     install_ktor_pack();
 

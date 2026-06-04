@@ -718,6 +718,12 @@ validated, then the corresponding shim file is deleted):
    `HttpClientEngineConfig` / `HttpRequestData` / `HttpResponseData` +
    `EmptyContent`; write the klio engine `actual` (build an `HttpResponseData`
    from `__kktor_request`'s bytes via a read-side `ByteReadChannel`).
+   *In progress:* `EmptyContent` (the request-body default) and
+   `io.ktor.util.date.GMTDate` (response timestamps) are consumed — klio
+   supplies the UTC calendar-math `GMTDate` actuals + a `getTimeMillis` clock
+   intrinsic (verified by `ktor_date_and_empty_content_from_upstream`). Next in
+   this stage: `HttpRequestData`/`HttpResponseData` + the engine interfaces +
+   the klio engine `actual`.
 2. **Call + statement** — `HttpClientCall`, `HttpRequest`/`HttpResponse`,
    `DefaultHttpRequest`/`DefaultHttpResponse`, `HttpStatement`.
 3. **Pipelines + `HttpClient`** — `HttpRequestPipeline`/`HttpSendPipeline`/

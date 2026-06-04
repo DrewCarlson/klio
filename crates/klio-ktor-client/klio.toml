@@ -55,6 +55,9 @@ include = [
     "io/ktor/util/StringValues.kt",
     "io/ktor/util/reflect/Type.kt",
     "io/ktor/util/Attributes.kt",
+    # GMTDate (request/response timestamps in the cores). klio supplies the
+    # UTC calendar-math actuals + the `getTimeMillis` clock intrinsic.
+    "io/ktor/util/date/Date.kt",
     # Pipeline runtime (spine of both cores). Engine = DebugPipelineContext
     # (klio `DISABLE_SFG = true`); SuspendFunctionGun consumed but unused.
     "io/ktor/util/debug/plugins/PluginName.kt",
@@ -127,6 +130,14 @@ include = [
 root = "upstream/ktor-http/posix/src"
 include = [
     "io/ktor/http/URLBuilderPosix.kt",
+]
+
+# Client-core foundation (cores stage 1 — engine boundary). `EmptyContent` is
+# the request-body default; the rest of the client core builds on it.
+[[source]]
+root = "upstream/ktor-client/ktor-client-core/common/src"
+include = [
+    "io/ktor/client/utils/Content.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)

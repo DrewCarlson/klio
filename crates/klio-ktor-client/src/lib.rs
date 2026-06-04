@@ -25,7 +25,19 @@ klio_stdlib::host_bindings! {
         // Server engine: bind a socket and dispatch each request back
         // into the interpreter's routing lambda.
         "io.ktor.server.engine.__kktor_serve"     => serve,
+        // Platform clock for `io.ktor.util.date` (the posix actual reads it
+        // via cinterop; klio supplies the wall-clock epoch millis).
+        "io.ktor.util.date.getTimeMillis"         => get_time_millis,
     }
+}
+
+fn get_time_millis(_ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    #[allow(clippy::cast_possible_wrap)]
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(Value::Long(millis))
 }
 
 fn arg_string(ctx: &CallCtx, idx: usize) -> Result<String, RuntimeError> {
