@@ -140,3 +140,32 @@ fun main() {
         "true\n1\n1\n2\n2\n0\n",
     );
 }
+
+// Stdlib Map extensions (forEach / any / map) work on a *user* class
+// implementing Map by materializing its `entries` — ktor's StringValues
+// iterates a custom map with `values.forEach { … }`.
+#[test]
+fn map_hofs_on_user_map_via_entries() {
+    let src = r#"
+class SimpleMap : Map<String, Int> {
+    private val d = mapOf("a" to 1, "b" to 2, "c" to 3)
+    override val entries get() = d.entries
+    override val keys get() = d.keys
+    override val values get() = d.values
+    override val size get() = d.size
+    override fun isEmpty() = d.isEmpty()
+    override fun containsKey(key: String) = d.containsKey(key)
+    override fun containsValue(value: Int) = d.containsValue(value)
+    override fun get(key: String) = d[key]
+}
+fun main() {
+    val m = SimpleMap()
+    var sum = 0
+    m.forEach { (_, v) -> sum += v }
+    println(sum)
+    println(m.any { it.value > 2 })
+    println(m.map { it.value }.sum())
+}
+"#;
+    assert_klio("map_hofs_on_user_map_via_entries", src, "6\ntrue\n6\n");
+}

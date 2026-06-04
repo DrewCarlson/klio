@@ -1,5 +1,6 @@
 use crate::{
-    Arc, ITERABLE_FALLBACK_ACTIVE, MEMBER_ONLY_PROBE, VmHost, VmIntrinsicHost, kotlin_hash_code,
+    Arc, ITERABLE_FALLBACK_ACTIVE, MAP_FALLBACK_ACTIVE, MEMBER_ONLY_PROBE, VmHost, VmIntrinsicHost,
+    kotlin_hash_code,
     materialise_range_items, member_is_property, pack_vararg_args, pad_args_with_defaults,
     receiver_compatible_with_param, value_structural_hash, with_call_outer_guard,
 };
@@ -82,6 +83,55 @@ impl VmHost<'_> {
             }
         }
         Ok(false)
+    }
+
+    /// Build a builtin `Value::Map` from a user `Map` implementation by
+    /// reading its `entries` (draining a user entry-set if needed) and
+    /// extracting each entry's key/value. Used by the Map fallback so
+    /// stdlib `Map.<name>` extensions work over user Map types.
+    fn materialize_user_map(
+        &mut self,
+        recv: &klio_runtime::Value,
+    ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        let entries_val = self.call_member(recv, "entries", &[])?;
+        let entry_items: Vec<klio_runtime::Value> = match &entries_val {
+            klio_runtime::Value::Set { items, .. } | klio_runtime::Value::List { items, .. } => {
+                items.borrow().clone()
+            }
+            klio_runtime::Value::Instance(_) => match self.drain_iterable_to_list(&entries_val)? {
+                klio_runtime::Value::List { items, .. } => items.borrow().clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        let mut pairs: Vec<(klio_runtime::Value, klio_runtime::Value)> =
+            Vec::with_capacity(entry_items.len());
+        for e in entry_items {
+            pairs.push(self.map_entry_kv(&e)?);
+        }
+        Ok(klio_runtime::Value::Map {
+            entries: klio_runtime::ObjRef::new(pairs),
+            mutable: false,
+        })
+    }
+
+    /// Extract `(key, value)` from a map entry value — a builtin
+    /// `MapEntry`/`Pair`, or a user `Map.Entry` with `key`/`value`.
+    fn map_entry_kv(
+        &mut self,
+        e: &klio_runtime::Value,
+    ) -> Result<(klio_runtime::Value, klio_runtime::Value), klio_ir::eval::EvalError> {
+        match e {
+            klio_runtime::Value::MapEntry { key, value, .. } => {
+                Ok(((**key).clone(), (**value).clone()))
+            }
+            klio_runtime::Value::Pair(a, b) => Ok(((**a).clone(), (**b).clone())),
+            _ => {
+                let k = self.call_member(e, "key", &[])?;
+                let v = self.call_member(e, "value", &[])?;
+                Ok((k, v))
+            }
+        }
     }
 
     pub(crate) fn call_member(
@@ -2911,6 +2961,29 @@ impl VmHost<'_> {
             None
         }) {
             return hit;
+        }
+        // Map fallback: a user class implementing Map (exposes
+        // `entries`, not a plain `iterator()`) resolves a stdlib
+        // `Map.<name>` extension (`forEach`, `mapValues`, `filterKeys`,
+        // `any`, …) by materialising its entries into a builtin Map and
+        // re-dispatching there. ktor's `CaseInsensitiveMap` relies on
+        // this for `values.forEach { … }` in StringValues.
+        if let klio_runtime::Value::Instance(_) = receiver {
+            let already = MAP_FALLBACK_ACTIVE.with(std::cell::Cell::get);
+            if !already
+                && self.host_has_member(receiver, "entries")
+                && !self.host_has_member(receiver, "iterator")
+                && let Some(f) = self.lookup_intrinsic(&format!("kotlin.collections.Map.{name}"))
+            {
+                MAP_FALLBACK_ACTIVE.with(|c| c.set(true));
+                let built = self.materialize_user_map(receiver);
+                MAP_FALLBACK_ACTIVE.with(|c| c.set(false));
+                let map_val = built?;
+                let mut new_args: Vec<klio_runtime::Value> = Vec::with_capacity(args.len() + 1);
+                new_args.push(map_val);
+                new_args.extend(args.iter().cloned());
+                return self.dispatch_intrinsic(f, &new_args);
+            }
         }
         // Iterable fallback: a user class that exposes an
         // `iterator()` method is iterable; an unbound member call

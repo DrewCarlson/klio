@@ -1019,6 +1019,12 @@ thread_local! {
     static ITERABLE_FALLBACK_ACTIVE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 
+    /// Guards the user-Map fallback (materialize a user `Map` impl via
+    /// its `entries` and re-dispatch a stdlib `Map.<name>` extension),
+    /// so materializing `entries` can't loop back through the fallback.
+    static MAP_FALLBACK_ACTIVE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+
     static COROUTINE_TIME_MODE: std::cell::Cell<TimeMode> =
         const { std::cell::Cell::new(TimeMode::Wall) };
 
