@@ -2186,7 +2186,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         // Skip it so the binding falls through
                         // to the implicit-alias / global
                         // path that resolves the actual.
-                        !f.blocks.is_empty() && user_params(f) == want
+                        //
+                        // A vararg function accepts a variable argument
+                        // count, so an exact `user_params == want` match is
+                        // only coincidental (it fires when `want` equals the
+                        // declared param count). Binding it via a plain
+                        // `Call` here would feed the unpacked args to a body
+                        // expecting a packed vararg array — e.g.
+                        // `mutableListOf("x")` matching the consumed
+                        // `mutableListOf(vararg elements)` (one declared
+                        // param) and yielding `Unit`. Exclude varargs so
+                        // every vararg call routes through the
+                        // intrinsic / legacy path that packs them (the same
+                        // path a non-coincidental arg count already takes).
+                        !f.blocks.is_empty()
+                            && f.params.last().is_none_or(|p| !p.is_vararg)
+                            && user_params(f) == want
                     })
                 };
                 let non_ext = |fid: &FuncId| {
