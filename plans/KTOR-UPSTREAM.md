@@ -435,12 +435,21 @@ upstream and delete the request-member shims.
    (`= DEFAULT_PORT`) is filled by a *third* construction path. `URLBuilder`
    declares `port` as a `var port: Int = port` body property with a custom
    `set(value) { require(value in 0..65535); field = value }` setter plus
-   `applyOrigin()` in `build()`. Next: locate where `URLBuilder()`'s primary-ctor
-   param default is applied during body-property / setter construction (it
-   bypasses both `new_instance*` default-fill probes) and resolve the
-   `DEFAULT_PORT` default there. Then `Url` / `URLBuilder` / `URLParser` consume
-   (serialization not required; `origin`, `DEFAULT_PORT`-as-bare-ref, and
-   primary-ctor const defaults are already handled).
+   `applyOrigin()` in `build()`. **Minimal repros do NOT reproduce:** a class
+   `B(port: Int = DEFAULT_PORT) { var port: Int = port; set(v){require(v in
+   0..65535);field=v} }` with `companion { val sample = B() }`, and even the
+   full chain `fun B.fill() { port = DEFAULT_PORT }; fun makeB(s) = B().fill();
+   companion { val sample = makeB("x") }`, both run clean (port `0`). And
+   `get_field` is never called for `specifiedPort`/`host` during the failure
+   (the `Null` `specifiedPort` is a ctor *param* read in `Url`'s init block, not
+   a circular `originUrl` read). So the bug is specific to `URLBuilder`'s actual
+   internals — its 10-param primary ctor, the `protocol` getter /
+   `protocolOrNull`, `applyOrigin`, or a URL-parser intrinsic (`findScheme` /
+   `count` / `indexOfAny`) mis-parsing `"http://localhost"` so `port` is never
+   set. Needs in-situ tracing of the consumed `URLBuilder`/`URLParser`, not a
+   generic pattern fix. Then `Url` / `URLBuilder` / `URLParser` consume
+   (serialization not required; `origin`, `DEFAULT_PORT`-as-bare-ref, eager
+   const init, and primary-ctor const defaults are all handled).
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.
