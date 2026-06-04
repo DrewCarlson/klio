@@ -308,6 +308,17 @@ upstream and delete the request-member shims.
   `Sequence`/`Array` argument. `Codecs.URL_ALPHABET` (`('a'..'z') + ('A'..'Z')
   + ('0'..'9')`) needs this. Covered by `corpus/range_plus_concat.kt`
   (kotlinc byte-parity).
+- **Top-level stdlib function call inside a receiver lambda.** A bare
+  `listOf(...)` / `setOf(...)` / `mapOf(...)` inside `with(r) { … }` /
+  `buildString { … }` lowers its callee to `LoadFromThisOrGlobal`, which probes
+  `get_field(receiver, "listOf")` first. `get_field`'s stdlib-property probe
+  matched `kotlin.collections.listOf` (a *function*) and auto-invoked it as a
+  one-arg property getter (`listOf(receiver)`), yielding a collection the call
+  site then tried to invoke (`call_value on List`). `get_field` now skips the
+  property probe when the name is a `klio_stdlib::is_toplevel_function`, so the
+  read falls through to the global where the call binds the function and applies
+  the real arguments. Covered by `corpus/toplevel_fn_in_receiver_lambda.kt`
+  (kotlinc byte-parity).
 - **Charset encoder actual + ktor-io core consumed.** The klio
   `io.ktor.utils.io.charsets` actual gained `Charset.newEncoder()` /
   `CharsetEncoder.encode(input, from, to)` (returns a kotlinx.io `Buffer` of
@@ -372,20 +383,25 @@ upstream and delete the request-member shims.
    (`Buffer.canRead`, `Source.takeWhile`) are consumed and verified working via
    explicit calls (`encode(s).takeWhile { … canRead … readByte }` drains
    correctly), and `Range + Range` (`URL_ALPHABET`) is fixed.
-   **Remaining blocker for `Codecs.kt` itself:** its encode functions are
-   `buildString { content.forEach { append(…) } }` (e.g.
-   `encodeURLParameter`), where `content.forEach` is Codecs' own private
-   `Source.forEach` (wrapping `takeWhile`). Consumed *as a pack*, the nested
-   `forEach`-lambda's `append` does not reach the enclosing `buildString`
-   StringBuilder — the call yields an empty string. The exact same source
-   structure works in a non-pack program (and the pack's `escapeHTML`, which
-   uses a `for` loop instead of a `forEach` lambda, works), so the bug is
-   nested-receiver-lambda (`buildString { it.forEach { append } }`) member
-   resolution **specific to pack-lowered functions**. `decodeURLPart` /
-   `decodeURLQueryComponent` (no `buildString { forEach }`) already work through
-   the consumed `Codecs.kt`. Once the pack nested-lambda `append` resolves,
-   `Codecs.kt` consumes cleanly; then `URLParser`/`URLBuilder`, and `Url`
-   (which is `@Serializable`, needs serialization support).
+   The `buildString { coll.forEach { append } }` shape now works (the
+   top-level-fn-in-receiver-lambda fix above; `decodeURLPart` works too).
+   **Two blockers remain for `Codecs.kt` itself:**
+   - **`Source.forEach` / `takeWhile` resolution.** The encode functions
+     (`encodeURLParameter`, …) iterate `content.forEach { … }` where `content`
+     is the charset-encoder `Buffer` and `forEach` is Codecs' private
+     `Source.forEach`, which calls `takeWhile { buf -> while (buf.canRead())
+     block(buf.readByte()) }`. Consumed as a pack, the encode result is empty:
+     the bare `takeWhile` inside `Source.forEach` binds a stdlib
+     `CharSequence/Iterable.takeWhile` (arity-only `call_named_overload`) rather
+     than the pack's receiver-matching `Source.takeWhile`, so the block never
+     runs. An *explicit* `content.takeWhile { … }` dispatches correctly (by
+     receiver type), so the gap is bare-extension-call receiver-type awareness
+     in `CallMemberOrGlobal`.
+   - **`length` default-arg.** `decodeURLQueryComponent(start = 0, end =
+     length, …)` — the default `end = length` (i.e. `this.length` on the String
+     receiver) resolves to an `unresolved global length` for a defaulted arg.
+   Once both resolve, `Codecs.kt` consumes cleanly; then `URLParser`/
+   `URLBuilder`, and `Url` (which is `@Serializable`, needs serialization).
 2. **Layer 2 — Pipeline runtime** (`Pipeline`/`PipelineContext`/`SuspendFunctionGun`
    + `createPlugin`/`EventDefinition`), the spine of both cores.
 3. **Cores on upstream**, engine staying klio-side.

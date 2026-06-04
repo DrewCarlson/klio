@@ -934,6 +934,17 @@ impl VmHost<'_> {
         // `arr.size`, etc. The stdlib registers these as 1-arg
         // intrinsics that take the receiver as their sole arg.
         let type_fqn = receiver.type_fqn();
+        // A bare `name(...)` inside a receiver lambda lowers its callee to
+        // `LoadFromThisOrGlobal`, which probes `get_field(receiver, name)`
+        // first. A top-level stdlib *function* (`listOf`, `setOf`,
+        // `mapOf`, …) is not a property of any receiver, but its FQN
+        // (`kotlin.collections.listOf`) matches a probe below; auto-invoking
+        // it as a 1-arg property getter (`listOf(receiver)`) yields a
+        // collection that the call site then tries to invoke
+        // (`call_value on List`). Skip the property probe for these so the
+        // read falls through to the global, where the call binds the
+        // function and applies the real arguments.
+        let probe_is_toplevel_fn = klio_stdlib::is_toplevel_function(name);
         let probes = [
             format!("{type_fqn}.{name}"),
             format!("kotlin.collections.{name}"),
@@ -941,10 +952,12 @@ impl VmHost<'_> {
             format!("kotlin.math.{name}"),
             format!("kotlin.{name}"),
         ];
-        for probe in &probes {
-            if let Some(func) = self.lookup_intrinsic(probe) {
-                let args = [receiver.clone()];
-                return self.dispatch_intrinsic(func, &args);
+        if !probe_is_toplevel_fn {
+            for probe in &probes {
+                if let Some(func) = self.lookup_intrinsic(probe) {
+                    let args = [receiver.clone()];
+                    return self.dispatch_intrinsic(func, &args);
+                }
             }
         }
         // Class-delegation forwarding for property reads: a
