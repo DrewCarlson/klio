@@ -142,9 +142,24 @@ capture name.
   shape. A faithful `SuspendFunctionGun` port now threads the subject through
   the interceptor chain correctly (`A got start` / `B got start-A` / …).
 
-**The core remaining blocker — undispatched-start semantics.** A faithful
-`SuspendFunctionGun` port runs the interceptors and threads the subject, but
-its continuation bookkeeping (`lastSuspensionIndex`) underflows. Root cause:
+**Landed — synchronous `SuspendFunctionGun` works.** The `lastSuspensionIndex`
+underflow was a general interp bug: prefix `++field` / `--field` on a bare
+instance field never wrote back (it rebound a local; only postfix had the
+SetField-on-this branch). Fixed. A faithful `SuspendFunctionGun` port now runs
+a synchronous interceptor chain end to end (`A got start` → `B got start-A` →
+`C got start-A-B`, `final=start-A-B-C`) — the common pipeline path (routing,
+headers, content negotiation; I/O suspension lives at the leaves, not in
+`proceed`).
+
+**Remaining — async interceptor suspension.** When an interceptor suspends at
+a *real* point mid-`proceed` (e.g. `delay`), `startCoroutineUninterceptedOrReturn`
+doesn't hand `loop` a `COROUTINE_SUSPENDED` it can act on, so the suspended
+interceptor isn't resumed and the pipeline proceeds with a stale subject. This
+needs the undispatched-start semantics below plus the interceptor running under
+the caller's coroutine context (not `EmptyCoroutineContext`, so `delay` parks
+on the active dispatcher).
+
+**Undispatched-start semantics.** Root cause:
 `SuspendFunctionGun.loop` calls `startCoroutineUninterceptedOrReturn(...)` and
 expects the JVM contract — run the interceptor *up to its first suspension*
 and **return `COROUTINE_SUSPENDED` as a value** (the parked continuation
