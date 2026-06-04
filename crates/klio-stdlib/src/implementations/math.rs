@@ -174,6 +174,85 @@ pub(crate) fn float_pow(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Float(base.powf(exp)))
 }
 
+/// `Math.nextUp` — the adjacent f64 toward +∞.
+fn f64_next_up(x: f64) -> f64 {
+    if x.is_nan() || x == f64::INFINITY {
+        return x;
+    }
+    if x == 0.0 {
+        return f64::from_bits(1); // smallest positive subnormal
+    }
+    let bits = x.to_bits();
+    f64::from_bits(if x > 0.0 { bits + 1 } else { bits - 1 })
+}
+
+/// `Math.nextDown` — the adjacent f64 toward -∞.
+fn f64_next_down(x: f64) -> f64 {
+    -f64_next_up(-x)
+}
+
+pub(crate) fn double_next_up(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(f64_next_up(recv_double(ctx.args, "Double.nextUp")?)))
+}
+pub(crate) fn double_next_down(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    Ok(Value::Double(f64_next_down(recv_double(
+        ctx.args,
+        "Double.nextDown",
+    )?)))
+}
+pub(crate) fn double_next_towards(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let x = recv_double(ctx.args, "Double.nextTowards")?;
+    let to = as_double(
+        ctx.args
+            .get(1)
+            .ok_or_else(|| RuntimeError::Arity("nextTowards expects (to)".into()))?,
+        "Double.nextTowards",
+    )?;
+    let r = if x.is_nan() || to.is_nan() {
+        f64::NAN
+    } else if x == to {
+        to
+    } else if x < to {
+        f64_next_up(x)
+    } else {
+        f64_next_down(x)
+    };
+    Ok(Value::Double(r))
+}
+pub(crate) fn double_ulp(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let x = recv_double(ctx.args, "Double.ulp")?;
+    let r = if x.is_nan() {
+        f64::NAN
+    } else if x.is_infinite() {
+        f64::INFINITY
+    } else {
+        let a = x.abs();
+        f64_next_up(a) - a
+    };
+    Ok(Value::Double(r))
+}
+pub(crate) fn double_with_sign(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let x = recv_double(ctx.args, "Double.withSign")?;
+    let sign = as_double(
+        ctx.args
+            .get(1)
+            .ok_or_else(|| RuntimeError::Arity("withSign expects (sign)".into()))?,
+        "Double.withSign",
+    )?;
+    Ok(Value::Double(x.copysign(sign)))
+}
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn float_with_sign(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let x = recv_double(ctx.args, "Float.withSign")? as f32;
+    let sign = as_double(
+        ctx.args
+            .get(1)
+            .ok_or_else(|| RuntimeError::Arity("withSign expects (sign)".into()))?,
+        "Float.withSign",
+    )? as f32;
+    Ok(Value::Float(x.copysign(sign)))
+}
+
 pub(crate) fn math_sinh(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Double(as_double(arg1(ctx, "sinh")?, "sinh")?.sinh()))
 }

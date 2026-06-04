@@ -3429,6 +3429,75 @@ pub(crate) fn array_content_to_string(ctx: &mut CallCtx) -> Result<Value, Runtim
     Ok(Value::String(std::sync::Arc::new(format!("[{body}]"))))
 }
 
+/// Kotlin `hashCode()` for the element types that appear in arrays, so
+/// `contentHashCode` matches the JVM bit-for-bit. Object elements other
+/// than `String` fall back to 0 (klio has no stable object hashCode), so
+/// `Array<T>.contentHashCode` is only exact for null / primitive / String
+/// / String-like contents.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn kotlin_value_hash(v: &Value) -> i32 {
+    fn long_hash(bits: i64) -> i32 {
+        (bits ^ (((bits as u64) >> 32) as i64)) as i32
+    }
+    match v {
+        Value::Null | Value::Unit => 0,
+        Value::Int(x) => *x,
+        Value::Short(x) => i32::from(*x),
+        Value::Byte(x) => i32::from(*x),
+        Value::Char(x) => i32::from(*x),
+        Value::Bool(b) => {
+            if *b {
+                1231
+            } else {
+                1237
+            }
+        }
+        Value::Long(x) => long_hash(*x),
+        Value::UInt(x) => *x as i32,
+        Value::UShort(x) => i32::from(*x),
+        Value::UByte(x) => i32::from(*x),
+        Value::ULong(x) => long_hash(*x as i64),
+        Value::Float(f) => {
+            if f.is_nan() {
+                0x7fc0_0000_u32 as i32
+            } else {
+                f.to_bits() as i32
+            }
+        }
+        Value::Double(d) => {
+            let bits = if d.is_nan() {
+                0x7ff8_0000_0000_0000_u64 as i64
+            } else {
+                d.to_bits() as i64
+            };
+            long_hash(bits)
+        }
+        Value::String(s) => s
+            .encode_utf16()
+            .fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(i32::from(c))),
+        _ => 0,
+    }
+}
+
+/// `Array<T>.contentHashCode()` / primitive-array variants: the JVM
+/// `Arrays.hashCode` fold — `result = 31 * result + element.hashCode()`
+/// seeded at 1 (null receiver hashes 0).
+pub(crate) fn array_content_hash_code(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
+    let recv = ctx
+        .args
+        .first()
+        .ok_or_else(|| RuntimeError::Type("contentHashCode requires a receiver".into()))?;
+    if matches!(recv, Value::Null) {
+        return Ok(Value::Int(0));
+    }
+    let items = iterable_items(recv, "contentHashCode")?;
+    let mut result: i32 = 1;
+    for e in &items {
+        result = result.wrapping_mul(31).wrapping_add(kotlin_value_hash(e));
+    }
+    Ok(Value::Int(result))
+}
+
 /// The primitive-array kind of an array receiver (so a result array keeps
 /// the same element-type tag), or `None` for a boxed `Array<T>`.
 fn array_prim_of(v: &Value) -> Option<klio_runtime::PrimitiveArrayKind> {
