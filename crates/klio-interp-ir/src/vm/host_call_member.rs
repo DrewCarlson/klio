@@ -2793,6 +2793,14 @@ impl VmHost<'_> {
         // `this.of(...)`; the instance has no such member, so route
         // to the class's companion singleton before failing.
         if let klio_runtime::Value::Instance(inst) = receiver {
+            // Identity of the receiver: a companion that extends its own
+            // enclosing class (`class Box { companion object Default :
+            // Box() }`) has the receiver itself as the companion
+            // singleton of a supertype on the walk. Forwarding back to it
+            // would re-enter this block with a fresh `seen` set and
+            // recurse forever, so skip any singleton that *is* the
+            // receiver.
+            let recv_id = inst.borrow().identity;
             let mut cur = Some(inst.borrow().class.name.clone());
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             while let Some(cname) = cur.take() {
@@ -2807,9 +2815,9 @@ impl VmHost<'_> {
                     .cloned();
                 if let Some(comp_name) = comp_name {
                     let singleton = self.globals.borrow().lookup(&comp_name);
-                    if let Some(singleton) = singleton
-                        && matches!(singleton, klio_runtime::Value::Instance(_))
-                        && let Ok(v) = self.call_member(&singleton, name, args)
+                    if let Some(singleton @ klio_runtime::Value::Instance(s)) = &singleton
+                        && s.borrow().identity != recv_id
+                        && let Ok(v) = self.call_member(singleton, name, args)
                     {
                         return Ok(v);
                     }

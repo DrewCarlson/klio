@@ -195,3 +195,33 @@ fun main() {
 "#;
     assert_klio("anon_object_property_init_over_capture", src, "6\n");
 }
+
+// A class whose companion object *extends the enclosing class*
+// (`class Box { companion object Default : Box() }`) — exactly the
+// shape of `kotlin.io.encoding.Base64` — must not loop when a member
+// body makes a bare call to a top-level function. The companion is
+// reached as `this` for `Box.member()`, and the companion-fallback
+// supertype walk would otherwise forward the bare call back to the
+// same companion singleton forever.
+#[test]
+fn companion_extends_enclosing_class_bare_top_level_call() {
+    let src = r#"
+fun guard(b: Boolean) { if (!b) throw IllegalStateException("no") }
+open class Box private constructor(val flag: Boolean) {
+    fun pick(): Int {
+        guard(!flag)
+        check(flag == false)
+        return 7
+    }
+    companion object Default : Box(false)
+}
+fun main() {
+    println(Box.pick())
+}
+"#;
+    assert_klio(
+        "companion_extends_enclosing_class_bare_top_level_call",
+        src,
+        "7\n",
+    );
+}
