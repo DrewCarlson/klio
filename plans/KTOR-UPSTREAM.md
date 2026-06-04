@@ -286,6 +286,33 @@ upstream and delete the request-member shims.
   primary-param fields stayed unset (a later init reading such a field saw the
   wrong value — `non-bool in branch`). Select the first non-interface supertype.
   Covered by `corpus/interface_then_superclass.kt`.
+- **Trailing-lambda call binding the arity-matching inline fn, not a
+  lower-arity same-name member.** `ContentDisposition.Companion.parse(value) =
+  parse(value) { v, p -> ContentDisposition(v, p) }` must bind the inherited
+  2-arg inline `HeaderValueWithParameters.parse(value, init)`, but
+  `prefer_member`/`CallMember` bound the same-companion 1-arg `parse(value)`,
+  **dropping the trailing lambda** and recursing. The 2-arg `parse` is
+  inline-only (absent from `funcs_by_simple_name` — `cands=[]`), so it is only
+  reachable by inlining. The inline-fn arm (`lower/expr.rs`) now also inlines
+  when a same-name own member shadows the inline fn *and* the call carries a
+  trailing lambda the member can't receive (`want >= 2`, function-typed final
+  inline param, no bodied same-name overload of matching arity). The `want >= 2`
+  gate keeps a single-lambda HOF (`map { }`, `let { }`) — where the member
+  legitimately takes the lambda — on the normal member path. Covered by
+  `corpus/inline_fn_member_shadow_trailing_lambda.kt`.
+- **Receiver-lambda bare read resolves an enclosing property over a same-name
+  top-level function.** `HeaderValueWithParameters.toString()`'s
+  `StringBuilder(size).apply { … parameters.lastIndex … }` reads the enclosing
+  `this.parameters` (a `List`), but `Parameters.kt` also declares a top-level
+  `fun parameters(builder)`; inside the `apply` receiver lambda `this` is the
+  StringBuilder, so `get_field` on it fell through to the global function (a
+  `Function` value → `get_field lastIndex on Function`). `get_field` now probes
+  the enclosing implicit receiver (`this@Outer`) for a real (non-callable)
+  property *before* the top-level lookup when that global is callable — Kotlin's
+  rule that an implicit-receiver member outranks a top-level function. The
+  legitimate `const`/top-level path is untouched (only adopted when the
+  enclosing yields a non-callable). Covered by
+  `corpus/receiver_lambda_property_vs_global_fn.kt`.
 - **Consumed verbatim:** `io.ktor.util.Text.kt`, the util collection layer
   (`Collections.kt` + a klio `unmodifiable` actual, `DelegatingMutableSet.kt`,
   `CaseInsensitiveMap.kt`, `StringValues.kt`), and the http layer
@@ -297,33 +324,29 @@ upstream and delete the request-member shims.
   `contentRangeHeaderValue` fn), `RangesSpecifier`**). The hand-written
   `shim/.../ContentType.kt` is deleted. The upstream `ContentType` API (parse /
   withParameter / match / charset / parseHeaderValue), the full
-  `Headers`/`Parameters` API, and the header helpers run; client+server smokes
-  pass. `Charset`/`Charsets` is a klio actual (name + forName); byte-level
-  encode/decode is added with the body layer.
+  `Headers`/`Parameters` API, the header helpers, and **`ContentDisposition`**
+  (parse / withParameter / `Parameters`) run; client+server smokes pass.
+  `Charset`/`Charsets` is a klio actual (name + forName); byte-level
+  encode/decode is added with the body layer. Covered end-to-end by
+  `tests/ktor_http_value_types.rs`.
+
+## Discovered latent bugs (pre-existing, not blocking ktor-http)
+
+- **Companion-method codegen mis-lowers some `List` extension calls.** A plain
+  companion-object method calling certain stdlib list extensions on a local
+  (`segs.drop(1)` / `segs.take(1)` where `segs = value.split(...)`) lowers to a
+  `CallValue` on the list (`call_value on kotlin.collections.List`). Shape- and
+  expression-dependent; reproduces with **no** inline/`expect` involved.
+  ktor-http's consumed code does not hit it (`HeaderValueWithParameters.parse`
+  passes a `List` *property* through `init`, which works).
+- **Typeck rejects named/reordered constructor args.** `corpus_typechecks_clean`
+  is red on clean `main`: `Cfg(size = 5)` / `Cfg(on = true, name = "y")`
+  (`corpus/ctor_named_default.kt`) report spurious `T0001` mismatches — the
+  checker validates named args positionally without honouring the name→param
+  reorder. Interpreter runs the program correctly (parity-green); only the
+  type-check phase errs.
 
 ## Open blockers (next, in order)
-
-0. **`ContentDisposition.parse` infinite-recurses** (so `ContentDisposition.kt`
-   is held back) — **root cause now pinned via lowering instrumentation.** Its
-   companion `fun parse(value) = parse(value) { v, p -> ContentDisposition(v, p) }`
-   should bind the inherited `HeaderValueWithParameters.Companion.parse(value,
-   init)` (2-arg) but binds the same-companion 1-arg `parse(value)` and recurses.
-   The divergence from the working `ContentType.parse` is **the trailing
-   lambda's complexity**, not block-vs-expr: in the bare-call lowering
-   (`lower/expr.rs`), the inner `parse(value){…}` of `ContentDisposition` (a
-   *simple* lambda → `lambda_writes_outer_var == false`) falls to the
-   `prefer_member` branch (`owner=ContentDisposition$Companion$Companion`,
-   `want=2`, `cands=[]`, `prefer_member=true`) → lowered as `this.parse(value,
-   lambda)` (CallMember); at runtime that binds the companion's own 1-arg
-   `parse`, **dropping the trailing lambda** (the same trailing-lambda/arity
-   mis-bind class as the `buildString` fix). `ContentType.parse`'s lambda
-   mutates/captures (`lambda_writes_outer_var == true`), so it takes the
-   writeback `CallMember` arm instead, which resolves the inherited 2-arg parse.
-   The 2-arg parse is **not** in `funcs_by_simple_name("parse")` (`cands=[]`) —
-   it's an inherited companion member. Fix: the `prefer_member`/`CallMember` path
-   must not bind a lower-arity member to a call that carries extra positional
-   args (incl. a trailing lambda); it should resolve the arity-matching inherited
-   companion `parse` (or fall through rather than recurse).
 
 1. **ktor-http remainder — `Url` / `URLBuilder` / `Codecs`.** `URLBuilder`
    hard-depends on `Codecs` (`encodeURLParameter`/`encodeURLQueryComponent`/…), so

@@ -1026,6 +1026,60 @@ impl VmHost<'_> {
                 cur = next;
             }
         }
+        // A top-level *function* must not outrank a property of an
+        // enclosing implicit receiver. Inside a receiver lambda
+        // (`StringBuilder(…).apply { … parameters.lastIndex … }`)
+        // written in a member of a class that declares a `parameters`
+        // property, the bare read resolves to `this@Outer.parameters`,
+        // not a same-named top-level `fun parameters(...)`. The
+        // receiver here is the lambda's receiver (the StringBuilder),
+        // which has no such field, so without this probe the global
+        // function below wins and a later `.lastIndex` reads a
+        // `Function`. Try the enclosing receiver first when the global
+        // is callable, and only adopt a non-callable result (a real
+        // property) so the legitimate top-level `const`/`fun` path is
+        // untouched when no enclosing property exists.
+        let global_is_callable = self.module.func_id(name).is_some()
+            || matches!(
+                self.globals.borrow().lookup(name),
+                Some(
+                    klio_runtime::Value::Function { .. }
+                        | klio_runtime::Value::Lambda { .. }
+                        | klio_runtime::Value::IrClosure { .. }
+                        | klio_runtime::Value::Intrinsic { .. }
+                        | klio_runtime::Value::BoundMethod { .. }
+                        | klio_runtime::Value::BoundUserMethod { .. }
+                )
+            );
+        if global_is_callable
+            && let Some(outer) = with_outer_this(|s| s.borrow().last().cloned())
+            && !matches!(&outer, klio_runtime::Value::Null | klio_runtime::Value::Unit)
+            && !matches!(
+                (&outer, receiver),
+                (klio_runtime::Value::Instance(a), klio_runtime::Value::Instance(b))
+                    if klio_runtime::ObjRef::ptr_eq(a, b)
+            )
+        {
+            let oid = match &outer {
+                klio_runtime::Value::Instance(i) => klio_runtime::ObjRef::as_ptr(i) as usize,
+                _ => 0,
+            };
+            if let Some(Ok(v)) =
+                with_field_resolve_pair(oid, name, || self.get_field(&outer, name))
+                && !matches!(
+                    v,
+                    klio_runtime::Value::Unit
+                        | klio_runtime::Value::Function { .. }
+                        | klio_runtime::Value::Lambda { .. }
+                        | klio_runtime::Value::IrClosure { .. }
+                        | klio_runtime::Value::Intrinsic { .. }
+                        | klio_runtime::Value::BoundMethod { .. }
+                        | klio_runtime::Value::BoundUserMethod { .. }
+                )
+            {
+                return Ok(v);
+            }
+        }
         // Bare top-level `const val` / `val` referenced inside an
         // extension-fn body lowers as `this.<name>` (the receiver is
         // a bound param). When the receiver has no such field the

@@ -1621,8 +1621,62 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // combinatorially through Flow / Channel
                     // operator chains.
                     let has_reified = f.type_params.iter().any(|tp| tp.is_reified);
-                    let needs_inline =
-                        f.is_suspend || arg_lambda_has_nonlocal_return(args) || has_reified;
+                    // Inline when a same-name member of the enclosing receiver
+                    // would otherwise shadow this inline fn AND no bodied
+                    // same-name function can actually accept this call: a
+                    // companion's 1-arg `parse(value)` beside the inherited
+                    // 2-arg inline `parse(value, init)` captures the call via
+                    // `prefer_member`/`CallMember`, drops the trailing lambda,
+                    // and recurses (`ContentDisposition.parse`). Inlining binds
+                    // the real inline fn instead. The gates keep the normal
+                    // path when a member legitimately handles the call: a
+                    // function-typed final param the lambda fills (`Box.map(f)`
+                    // — a bodied `map` of matching arity exists, so it is not
+                    // shadowed away) or a member matching the call shape
+                    // (`String.get(i)` shadowing the InlineOnly `Map.get`).
+                    let want = args.len();
+                    let trailing_lambda = args
+                        .last()
+                        .is_some_and(|a| matches!(a, Expr::Lambda { .. } | Expr::AnonFun { .. }));
+                    let inline_takes_fn =
+                        f.params.last().is_some_and(|p| p.ty.function.is_some());
+                    // `want >= 2` confines this to a call with positional
+                    // arg(s) *plus* a trailing lambda — the shape a
+                    // lower-arity member silently truncates (`parse(value)
+                    // { … }` → the 1-arg `parse(value)` drops the lambda).
+                    // A single-lambda HOF call (`map { … }`, `let { … }`)
+                    // has `want == 1` and stays on the member path, where
+                    // the member legitimately receives the lambda.
+                    let drops_trailing_lambda = trailing_lambda && want >= 2;
+                    // Don't inline when a bodied same-name function can
+                    // already accept this call's arity (a top-level overload
+                    // of matching shape resolves on the normal path).
+                    let a_func_fits = b.module.funcs_by_simple_name(nm).iter().any(|fid| {
+                        let Some(mf) = b.module.funcs.get(fid.0 as usize) else {
+                            return false;
+                        };
+                        if mf.blocks.is_empty() {
+                            return false;
+                        }
+                        let has_this = mf.params.first().is_some_and(|p| p.name == "this");
+                        let base = usize::from(has_this);
+                        let user = mf.params.len() - base;
+                        user == want
+                            || (want < user
+                                && mf.params[(base + want)..]
+                                    .iter()
+                                    .all(|p| p.default.is_some() || p.is_vararg))
+                            || (want > user && mf.params.last().is_some_and(|p| p.is_vararg))
+                    });
+                    let shadowed_by_member = drops_trailing_lambda
+                        && inline_takes_fn
+                        && !a_func_fits
+                        && b.resolve(nm).is_none()
+                        && b.has_own_member(nm);
+                    let needs_inline = f.is_suspend
+                        || arg_lambda_has_nonlocal_return(args)
+                        || has_reified
+                        || shadowed_by_member;
                     let expected = b.peek_expected().cloned();
                     if needs_inline
                         && let Some(r) = try_inline_call_with_type_args(

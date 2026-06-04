@@ -47,6 +47,7 @@ include = [
     "io/ktor/http/Headers.kt",
     "io/ktor/http/Parameters.kt",
     "io/ktor/http/CacheControl.kt",
+    "io/ktor/http/ContentDisposition.kt",
     "io/ktor/http/ContentTypeMatcher.kt",
     "io/ktor/http/HttpMessage.kt",
     "io/ktor/http/LinkHeader.kt",
