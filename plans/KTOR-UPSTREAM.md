@@ -748,11 +748,18 @@ validated, then the corresponding shim file is deleted):
 2. **Call + statement** — `HttpClientCall`, `HttpRequest`/`HttpResponse`,
    `DefaultHttpRequest`/`DefaultHttpResponse`, `HttpStatement`.
 3. **Pipelines + `HttpClient` (the swap)** — build the upstream client files
-   into the `client` *feature* (replacing `shim/client` rather than core):
-   `HttpRequest.kt` (builder + data types), `HttpRequestPipeline`/
-   `HttpSendPipeline`/`HttpReceivePipeline`/`HttpResponsePipeline`, then
-   `HttpClient` with a minimal default-plugin set; point the `client` feature
-   at the upstream files and delete `shim/client/*` in the same step.
+   into the `client-upstream` *feature* (a parallel staging feature that won't
+   collide with the live shim `client` feature), then once `HttpClient` works
+   there, point `client` at it and delete `shim/client/*` in one step.
+   *In progress:* `HttpRequest.kt` (the real `HttpRequestBuilder` —
+   url: URLBuilder, headers: HeadersBuilder, body: OutgoingContent — plus the
+   immutable `HttpRequestData`/`HttpResponseData`) and `RequestBody.kt` are
+   consumed into `client-upstream` and build a request end to end (verified by
+   `ktor_request_builder_from_upstream`). This needed a general parser fix:
+   annotations on property accessors (`@InternalAPI set(value)`,
+   `@Marker public set`) — `property_accessor_annotation.kt`. Next: the
+   request/response pipelines and `HttpClient` (+ engine `actual`), then the
+   feature swap.
 4. **Server core** — `Application`/`ApplicationCall`/`ApplicationCallPipeline`,
    routing, `respondText`; klio engine `actual` over `__kktor_serve`; delete
    `shim/server/*`.

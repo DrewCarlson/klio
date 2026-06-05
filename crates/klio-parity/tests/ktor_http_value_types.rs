@@ -92,6 +92,58 @@ fn run(file: &Path) -> String {
     String::from_utf8(o.stdout).expect("utf8 stdout")
 }
 
+fn run_feature(file: &Path, feature: &str) -> String {
+    let o = Command::new(klio_bin())
+        .arg("run")
+        .arg("--feature")
+        .arg(feature)
+        .arg(file)
+        .output()
+        .expect("spawn klio run");
+    assert!(
+        o.status.success(),
+        "klio run failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    String::from_utf8(o.stdout).expect("utf8 stdout")
+}
+
+#[test]
+fn ktor_request_builder_from_upstream() {
+    install_ktor_pack();
+
+    // Cores stage-3 (the swap), under the `client-upstream` feature: the real
+    // upstream `HttpRequestBuilder` (url: URLBuilder, headers: HeadersBuilder,
+    // body: OutgoingContent) and its immutable `HttpRequestData` — replacing
+    // the simplified `shim/client` `HttpRequestBuilder` (url: String). Required
+    // a parser fix for annotations on property accessors (`@InternalAPI set`).
+    let src = r#"
+import io.ktor.client.request.*
+import io.ktor.http.*
+
+fun main() {
+    val b = HttpRequestBuilder()
+    b.method = HttpMethod.Post
+    b.url.takeFrom("http://localhost:8080/api?x=1")
+    b.headers.append("Accept", "application/json")
+    val data = b.build()
+    println("${data.method.value}|${data.url}|${data.headers["Accept"]}")
+}
+"#;
+
+    let dir = std::env::temp_dir().join("klio_ktor_request_builder");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.kt");
+    std::fs::write(&file, src).unwrap();
+
+    let got = run_feature(&file, "io.ktor/client-upstream");
+    assert_eq!(
+        got,
+        "POST|http://localhost:8080/api?x=1|application/json\n",
+        "ktor upstream HttpRequestBuilder output drifted"
+    );
+}
+
 #[test]
 fn ktor_date_and_empty_content_from_upstream() {
     install_ktor_pack();

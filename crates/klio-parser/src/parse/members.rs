@@ -619,6 +619,45 @@ impl Parser<'_, '_> {
         // ahead of the `get` / `set` keyword. Kotlin allows `inline get()`
         // and `private inline set(v)`; both combinations parse here.
         while let Some(tok) = self.tokens.get(i) {
+            // Skip an annotation on the accessor (`@InternalAPI set(value)`,
+            // `@Suppress("X") get()`); klio ignores accessor annotations.
+            if tok.kind.is_at() {
+                i += 1; // `@`
+                // Optional use-site target `@set:Foo` / `@get:Foo`.
+                if self.tokens.get(i).is_some_and(|t| matches!(t.kind, TokenKind::Ident))
+                    && self.tokens.get(i + 1).is_some_and(|t| matches!(t.kind, TokenKind::Colon))
+                {
+                    i += 2;
+                }
+                // Qualified annotation name: `Ident ('.' Ident)*`.
+                while self.tokens.get(i).is_some_and(|t| matches!(t.kind, TokenKind::Ident)) {
+                    i += 1;
+                    if self.tokens.get(i).is_some_and(|t| matches!(t.kind, TokenKind::Dot)) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                // Optional `(args)` — skip the balanced parens.
+                if self.tokens.get(i).is_some_and(|t| matches!(t.kind, TokenKind::LParen)) {
+                    let mut depth = 0i32;
+                    while let Some(t) = self.tokens.get(i) {
+                        match t.kind {
+                            TokenKind::LParen => depth += 1,
+                            TokenKind::RParen => depth -= 1,
+                            _ => {}
+                        }
+                        i += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+                    i += 1;
+                }
+                continue;
+            }
             if !matches!(tok.kind, TokenKind::Ident) {
                 break;
             }

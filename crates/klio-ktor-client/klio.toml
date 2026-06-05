@@ -146,6 +146,13 @@ include = [
     "io/ktor/client/utils/Content.kt",
     "io/ktor/client/engine/HttpClientEngineConfig.kt",
     "io/ktor/client/engine/HttpClientEngineCapability.kt",
+    # Upstream client request layer (builder + immutable data types). These
+    # shadow `shim/client` declarations, so they are gated under the
+    # `client-upstream` feature (the stage-3 swap that replaces `shim/client`)
+    # rather than core — otherwise they collide with the shim under
+    # `--feature client`.
+    "io/ktor/client/request/RequestBody.kt",
+    "io/ktor/client/request/HttpRequest.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
@@ -176,6 +183,11 @@ id = "kotlinx.io"
 default = []
 # ktor-client-core: HttpClient + request/response builder DSL.
 client = { sources = ["shim/client"] }
+# Staged upstream client-core consumption (stage 3 — see plans/KTOR-UPSTREAM).
+# Gates the real upstream client files that shadow `shim/client`; building up
+# here in parallel keeps the shim `client` feature working until the swap is
+# complete (then `client` points here and `shim/client` is deleted).
+client-upstream = { sources = ["upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/request/"] }
 # ktor-server-core: embeddedServer + routing + respondText.
 server = { sources = ["shim/server"] }
 # ktor-client-content-negotiation + ktor-serialization-kotlinx-json:
