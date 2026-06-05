@@ -173,6 +173,12 @@ fn request(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     let url = arg_string(ctx, 1)?;
     let body = arg_string(ctx, 2)?;
     let headers = arg_string_array(ctx, 3)?;
+    // Permanent, env-gated HTTP trace (`KLIO_TRACE_HTTP=1`): logs each
+    // outbound request to stderr. Useful for confirming whether a client
+    // call actually reached the engine's transport layer.
+    if std::env::var("KLIO_TRACE_HTTP").is_ok() {
+        eprintln!("[HTTP] {method} {url}");
+    }
     Ok(make_string_array(perform(&method, &url, &body, &headers)))
 }
 

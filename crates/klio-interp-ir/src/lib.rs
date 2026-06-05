@@ -47,6 +47,7 @@ mod vm {
     pub(crate) mod host_instances;
     pub(crate) mod intrinsic_host;
     pub(crate) mod run;
+    pub(crate) mod trace;
     pub(crate) mod vmhost;
 }
 

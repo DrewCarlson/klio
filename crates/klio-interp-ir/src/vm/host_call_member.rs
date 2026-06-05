@@ -236,6 +236,13 @@ impl VmHost<'_> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        crate::vm::trace::trace_resolve!(
+            name,
+            "call_member recv={} name={} argc={}",
+            crate::vm::trace::recv_label(receiver),
+            name,
+            args.len()
+        );
         // Member-only probe applies to *this* resolution only — once a
         // member is found and its body runs, nested calls resolve
         // normally. Capture and clear the flag here so it never leaks
@@ -3352,6 +3359,13 @@ impl VmHost<'_> {
         args: &[klio_runtime::Value],
         arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        crate::vm::trace::trace_resolve!(
+            name,
+            "call_member_named recv={} name={} argc={}",
+            crate::vm::trace::recv_label(receiver),
+            name,
+            args.len()
+        );
         // data-class `copy(name = …, age = …)` — reorder named args
         // into the primary-ctor param positions, defaulting missing
         // slots to the receiver's current field values.

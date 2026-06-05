@@ -16,6 +16,14 @@ impl VmHost<'_> {
             module.funcs.get(func.0 as usize).cloned().ok_or_else(|| {
                 klio_ir::eval::EvalError::Type(format!("unknown FuncId {}", func.0))
             })?;
+        crate::vm::trace::trace_resolve!(
+            &f.name,
+            "call_func {} fid={} fqn={} argc={}",
+            f.name,
+            func.0,
+            f.fqn,
+            args.len()
+        );
         // Pack-installed binding fast path: a top-level function whose
         // package-qualified FQN matches a registered binding shadows
         // the shim body shipped in source.
@@ -481,6 +489,13 @@ impl VmHost<'_> {
         let Some((func, _)) = best else {
             return Ok(None);
         };
+        crate::vm::trace::trace_resolve!(
+            name,
+            "global-overload {} -> fid={} (of {} candidates)",
+            name,
+            func.0,
+            candidates.len()
+        );
         let result = self.call_func_typed(module, func, args.to_vec(), arg_names, &[], false)?;
         Ok(Some(result))
     }
