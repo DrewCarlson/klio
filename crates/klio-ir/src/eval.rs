@@ -1760,6 +1760,7 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<
                 .get(&frame.func.id)
                 .is_some_and(|tps| tps.iter().any(|t| t == &ty.name))
                 || is_erased_type_param_name(&ty.name)
+                || !host.is_concrete_cast_target(&ty.name)
             {
                 // `x as T` (or `as? T`) where `T` is an erased type parameter
                 // is an unchecked cast — the JVM erases the type argument and
@@ -1770,7 +1771,10 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<
                 // make the param name resolve to a stale concrete type. The
                 // declared-type-param table covers top-level functions; the
                 // single/double-uppercase name shape covers methods (whose
-                // type params are not recorded there).
+                // type params are not recorded there); the host
+                // concrete-target probe covers multi-letter type params
+                // (`TBuilder`) referenced from a nested lambda whose own func
+                // id carries none of the enclosing method's type params.
                 frame.write(*dst, v);
             } else if *safe {
                 frame.write(*dst, Value::Null);
@@ -1955,15 +1959,25 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<
                 resolved = Some(v);
             }
             // Enclosing-receiver fallback: a bare property read inside
-            // a receiver lambda may name a member of the lexically
-            // enclosing `this@Outer`.
-            if resolved.is_none()
-                && let Some(outer) = host.enclosing_this()
-                && !matches!(outer, Value::Null | Value::Unit)
-                && let Ok(v) = host.get_field(&outer, &name_str)
-                && !matches!(v, Value::Unit)
-            {
-                resolved = Some(v);
+            // a receiver lambda may name a member of a lexically
+            // enclosing `this@Outer`. Walk the whole enclosing chain —
+            // a receiver scope function (`with(x) { outerMember }`)
+            // rebinds the lambda's `this` capture to its own receiver
+            // `x`, pushing `x` ahead of the real `this@Outer` on the
+            // chain, so the member lives further out than the nearest
+            // receiver.
+            if resolved.is_none() {
+                for outer in host.enclosing_this_chain() {
+                    if matches!(outer, Value::Null | Value::Unit) {
+                        continue;
+                    }
+                    if let Ok(v) = host.get_field(&outer, &name_str)
+                        && !matches!(v, Value::Unit)
+                    {
+                        resolved = Some(v);
+                        break;
+                    }
+                }
             }
             let v = match resolved {
                 Some(v) => v,

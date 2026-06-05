@@ -856,25 +856,24 @@ impl klio_runtime::IntrinsicHost for VmIntrinsicHost<'_> {
                         cap[idx] = this.clone();
                     }
                 }
-                // The receiver reaches a receiver lambda one of two
-                // ways. If the body captured `this` (it uses bare
-                // members / `this`), the override above already
-                // delivered the receiver through that capture slot —
-                // the declared params are the *value* params, so pass
-                // only `args` (a `Sink.(Int) -> Unit` written
-                // `{ v -> … }` has one param `v`, not the receiver).
-                // Without a `this` capture the receiver is the lambda's
-                // sole positional (`{ it.foo() }`-style), so prepend it.
-                let has_this_capture = info.capture_names.iter().any(|n| n == "this");
+                // The receiver always reaches the body through the `this`
+                // capture slot (overridden above) for bare-member
+                // resolution. Independently, it fills the leading
+                // declared positional whenever the caller left one
+                // unfilled (`args.len() < n_params`): an
+                // `(T) -> Unit` / `T.() -> Unit` lambda written
+                // `{ scope -> … }` and invoked receiver-only (`x.apply(it)`,
+                // `with(x, it)`) binds `scope` to the receiver. These two
+                // deliveries are not mutually exclusive — a `this` capture
+                // (which a body picks up merely by referencing a bare
+                // top-level symbol) must not suppress the positional
+                // binding, or the named receiver param is left null. When
+                // the caller already supplies a value for every declared
+                // parameter the lambda is an ordinary value function
+                // (`{ it * 10 }`, `Sink.(Int) -> Unit` `{ v -> … }`) and
+                // the receiver must not displace its parameter.
                 let mut all: Vec<klio_runtime::Value> = Vec::with_capacity(info.n_params);
-                // Deliver the receiver as the leading positional only
-                // when there is an unfilled leading slot for it
-                // (`{ it.foo() }`-style receiver lambda invoked with
-                // fewer args than params). When the caller already
-                // supplies a value for every declared parameter, the
-                // lambda is an ordinary value function (`{ it * 10 }`)
-                // and the receiver must not displace its parameter.
-                if info.n_params >= 1 && !has_this_capture && args.len() < info.n_params {
+                if info.n_params >= 1 && args.len() < info.n_params {
                     all.push(this.clone());
                     for a in args {
                         all.push(a.clone());

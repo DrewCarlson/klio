@@ -195,6 +195,53 @@ fun main() = runBlocking {{
     );
 }
 
+/// Construct the upstream `HttpClient` end to end: `HttpClient(KlioClient)`
+/// drives the full init — the default plugin installs through
+/// `HttpClientConfig` + the `createClientPlugin` API + the klio engine
+/// actual. Exercises (through real ktor code) the construction fixes:
+/// enclosing-`this` chain resolution in `with(userConfig){…}`, reified
+/// type-arg inference in plugin `key` initializers, the unchecked
+/// `as TBuilder` cast, receiver→named-param binding when `config.install`
+/// closures carry a spurious `this` capture, and invoking the
+/// `createConfiguration` constructor-reference property.
+#[test]
+fn ktor_upstream_httpclient_constructs() {
+    install_packs();
+    let dir = std::env::temp_dir().join("klio_ktor_upstream_construct");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("construct.kt");
+    std::fs::write(
+        &file,
+        r#"
+import io.ktor.client.*
+import io.ktor.client.engine.klio.*
+
+fun main() {
+    val client = HttpClient(KlioClient)
+    println("constructed")
+    client.close()
+}
+"#,
+    )
+    .unwrap();
+    let o = Command::new(klio_bin())
+        .arg("run")
+        .arg(&file)
+        .args(["--feature", "io.ktor/client-upstream"])
+        .output()
+        .expect("spawn klio run");
+    assert!(
+        o.status.success(),
+        "klio run failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(o.stdout).expect("utf8 stdout"),
+        "constructed\n",
+        "upstream HttpClient construction output drifted"
+    );
+}
+
 #[test]
 fn ktor_client_typed_bodies() {
     install_packs();

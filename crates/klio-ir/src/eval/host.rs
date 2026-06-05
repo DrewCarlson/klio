@@ -106,6 +106,18 @@ pub trait Host {
         let nominal = value.type_fqn();
         nominal == ty.name || nominal.ends_with(&format!(".{}", ty.name))
     }
+
+    /// True when `name` denotes a concrete type a checked cast can test
+    /// against — a user class, a builtin, or a reified type-param bound
+    /// to a concrete class at the call site. A name that resolves to no
+    /// concrete type is an *erased* type parameter (`TBuilder`,
+    /// `TConfig`, …): `x as <that>` is an unchecked cast that never
+    /// throws on the JVM. The default conservatively reports every name
+    /// as concrete (preserving the throwing behaviour); the interpreter
+    /// host overrides this with the real class/global/builtin tables.
+    fn is_concrete_cast_target(&mut self, _name: &str) -> bool {
+        true
+    }
     /// Resolve a bare global identifier (top-level fn, intrinsic,
     /// imported symbol). Default returns Unit which surfaces as a
     /// runtime "value not callable" error if the caller tries to

@@ -3230,6 +3230,32 @@ impl VmHost<'_> {
                 }
             }
         }
+        // `name(args)` where `name` is a *function-typed property* of the
+        // receiver (`private val createConfiguration: () -> T` invoked as
+        // `createConfiguration()`): no method `name` resolved above, so
+        // read the field and, when it holds a callable, invoke it. Kotlin
+        // treats a function-typed member called with parentheses as an
+        // invoke of the stored function. Reaches here when the bare call
+        // was lowered as a member call (e.g. from inside an inlined
+        // `apply { … }` body, where the owner-member context that would
+        // otherwise lower it as a property-read-then-invoke is absent).
+        if let klio_runtime::Value::Instance(inst) = receiver {
+            let field = inst.borrow().get(name);
+            if let Some(f) = field
+                && matches!(
+                    f,
+                    klio_runtime::Value::Function { .. }
+                        | klio_runtime::Value::IrClosure { .. }
+                        | klio_runtime::Value::Lambda { .. }
+                        // A constructor reference (`::Config`) stored in the
+                        // field is a `Value::Class`; `call_value` invokes it
+                        // as a constructor.
+                        | klio_runtime::Value::Class(_)
+                )
+            {
+                return self.call_value(&f, args);
+            }
+        }
         // A bare `name(args)` inside a class lowers to `this.name(args)`.
         // When the receiver has a *property* `name` (no method of that
         // name resolved above) beside a top-level `fun name()` — e.g. the

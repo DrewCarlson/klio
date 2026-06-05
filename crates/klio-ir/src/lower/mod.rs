@@ -38,10 +38,10 @@ use lambda_body::{
 pub use literals::widen_numeric_literal;
 use literals::{is_package_head, is_pkg_root};
 pub use thunks::{
-    lower_accessor_block, lower_accessor_expr, lower_binary_expr_as_thunk, lower_block_as_thunk,
-    lower_block_as_unary_thunk, lower_empty_thunk, lower_expr_as_param_thunk,
-    lower_expr_as_param_thunk_scoped, lower_expr_as_thunk, lower_init_block,
-    lower_init_block_with_params, lower_unary_expr_as_thunk,
+    lower_accessor_block, lower_accessor_expr, lower_accessor_expr_with_expected,
+    lower_binary_expr_as_thunk, lower_block_as_thunk, lower_block_as_unary_thunk, lower_empty_thunk,
+    lower_expr_as_param_thunk, lower_expr_as_param_thunk_scoped, lower_expr_as_thunk,
+    lower_init_block, lower_init_block_with_params, lower_unary_expr_as_thunk,
 };
 use when_expr::lower_when;
 

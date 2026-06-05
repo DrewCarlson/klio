@@ -1402,13 +1402,14 @@ fn build_module_with_overrides(
             for m in &c.members {
                 if let Decl::Property(p) = m {
                     if let Some(init) = &p.init {
-                        let fid = klio_ir::lower::lower_accessor_expr(
+                        let fid = klio_ir::lower::lower_accessor_expr_with_expected(
                             &mut module,
                             &c.name.name,
                             &own_members,
                             &prop_init_params,
                             init,
                             &format!("__init_prop_{}_{}", c.name.name, p.name.name),
+                            p.ty.clone(),
                         );
                         body_prop_inits.insert((c.name.name.clone(), p.name.name.clone()), fid);
                     } else if let Some(delegate) = &p.delegate {

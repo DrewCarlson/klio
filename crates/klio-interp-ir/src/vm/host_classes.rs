@@ -1055,6 +1055,30 @@ impl VmHost<'_> {
 
     // Single type-check dispatch over runtime value shapes.
     #[allow(clippy::too_many_lines)]
+    /// Whether `name` denotes a concrete type a checked cast can test
+    /// against (user/pack class, a reified type-param bound to a class,
+    /// or a builtin). Anything else is an erased type parameter, for
+    /// which `x as <that>` is an unchecked, non-throwing cast.
+    pub(crate) fn is_concrete_cast_target(&mut self, name: &str) -> bool {
+        let n = name.trim_end_matches('?');
+        if n.is_empty() {
+            return false;
+        }
+        // A user / pack class declaration.
+        if self.module.class_id(n).is_some() || self.classes.borrow().contains_key(n) {
+            return true;
+        }
+        // A reified type parameter bound to a concrete class value at
+        // the call site (`Value::Class` whose name differs from the
+        // bare param name) — the cast can be checked against it.
+        if let Some(klio_runtime::Value::Class(c)) = self.globals.borrow().lookup(n) {
+            if c.name != n {
+                return true;
+            }
+        }
+        is_builtin_type_name(n)
+    }
+
     pub(crate) fn instance_of(
         &mut self,
         value: &klio_runtime::Value,
@@ -1425,4 +1449,44 @@ impl VmHost<'_> {
         // Builtin runtime types satisfy their nominal supertypes.
         value.is_runtime_type(&ty.name)
     }
+}
+
+/// Recognise the builtin / stdlib type names that are not registered as
+/// user classes but are still concrete cast targets (so `x as String`
+/// against a non-String still throws). Used to distinguish a real
+/// checked cast from an erased type-parameter cast (`x as TBuilder`).
+fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        // Primitives + their boxed/number forms.
+        "Int" | "Long" | "Short" | "Byte" | "Double" | "Float" | "Char" | "Boolean"
+            | "UInt" | "ULong" | "UShort" | "UByte" | "Number" | "Unit" | "Nothing" | "Any"
+            // Strings / char sequences.
+            | "String" | "CharSequence" | "StringBuilder"
+            // Comparison / common interfaces.
+            | "Comparable" | "Comparator" | "Pair" | "Triple"
+            // Collections + arrays (read-only and mutable).
+            | "Array" | "IntArray" | "LongArray" | "ShortArray" | "ByteArray" | "DoubleArray"
+            | "FloatArray" | "CharArray" | "BooleanArray" | "UIntArray" | "ULongArray"
+            | "UShortArray" | "UByteArray"
+            | "List" | "MutableList" | "ArrayList" | "AbstractList" | "AbstractMutableList"
+            | "Collection" | "MutableCollection" | "AbstractCollection"
+            | "Iterable" | "MutableIterable" | "Iterator" | "MutableIterator" | "ListIterator"
+            | "Set" | "MutableSet" | "HashSet" | "LinkedHashSet" | "AbstractSet"
+            | "Map" | "MutableMap" | "HashMap" | "LinkedHashMap" | "AbstractMap"
+            | "Sequence" | "EnumEntries"
+            // Ranges / progressions.
+            | "IntRange" | "LongRange" | "CharRange" | "IntProgression" | "LongProgression"
+            | "CharProgression" | "ClosedRange" | "OpenEndRange"
+            // Reflection.
+            | "KClass" | "KProperty" | "KCallable" | "KFunction" | "KMutableProperty"
+            // Throwable hierarchy.
+            | "Throwable" | "Exception" | "RuntimeException" | "Error"
+            | "IllegalArgumentException" | "IllegalStateException" | "IndexOutOfBoundsException"
+            | "ArrayIndexOutOfBoundsException" | "StringIndexOutOfBoundsException"
+            | "NullPointerException" | "ArithmeticException" | "ClassCastException"
+            | "NoSuchElementException" | "NumberFormatException" | "UnsupportedOperationException"
+            | "UninitializedPropertyAccessException" | "ConcurrentModificationException"
+            | "NoWhenBranchMatchedException" | "AssertionError"
+    ) || name.starts_with("Function")
 }

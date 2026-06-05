@@ -181,6 +181,10 @@ impl klio_ir::eval::Host for VmHost<'_> {
         Self::instance_of(self, value, ty)
     }
 
+    fn is_concrete_cast_target(&mut self, name: &str) -> bool {
+        Self::is_concrete_cast_target(self, name)
+    }
+
     fn call_func(
         &mut self,
         module: &klio_ir::Module,

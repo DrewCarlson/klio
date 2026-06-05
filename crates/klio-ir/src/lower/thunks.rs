@@ -172,11 +172,30 @@ pub fn lower_accessor_expr<S: BuildHasher>(
     expr: &Expr,
     name: &str,
 ) -> crate::FuncId {
+    lower_accessor_expr_with_expected(module, owner_class, own_members, params, expr, name, None)
+}
+
+/// Like [`lower_accessor_expr`] but seeds the tail-position expected
+/// type so a reified inline call in the body (a member property
+/// initializer `val key: AttributeKey<T> = AttributeKey(name)`) infers
+/// its type argument from the property's declared type — the same hint
+/// a local `val x: T = …` already supplies.
+pub fn lower_accessor_expr_with_expected<S: BuildHasher>(
+    module: &mut crate::Module,
+    owner_class: &str,
+    own_members: &std::collections::HashSet<String, S>,
+    params: &[&str],
+    expr: &Expr,
+    name: &str,
+    expected: Option<klio_ast::TypeRef>,
+) -> crate::FuncId {
     let mut b = FuncBuilder::new(module);
     let () = b.set_owner_class(owner_class.to_string());
     let () = b.set_own_members(own_members.iter().cloned().collect());
     bind_params(&mut b, params);
+    let prev = b.push_expected(expected);
     let v = lower_expr(&mut b, expr);
+    b.restore_expected(prev);
     b.terminate(Terminator::Return(Some(v)));
     let mut func = b.finish(name, name, crate::TypeRef::unit());
     func.params = accessor_params(params);
