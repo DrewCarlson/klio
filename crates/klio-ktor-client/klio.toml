@@ -146,13 +146,18 @@ include = [
     "io/ktor/client/utils/Content.kt",
     "io/ktor/client/engine/HttpClientEngineConfig.kt",
     "io/ktor/client/engine/HttpClientEngineCapability.kt",
-    # Upstream client request layer (builder + immutable data types). These
-    # shadow `shim/client` declarations, so they are gated under the
-    # `client-upstream` feature (the stage-3 swap that replaces `shim/client`)
-    # rather than core — otherwise they collide with the shim under
-    # `--feature client`.
+    # Upstream client core (request/statement/call layers). These shadow
+    # `shim/client` declarations, so they are gated under the `client-upstream`
+    # feature (the stage-3 swap that replaces `shim/client`) rather than core —
+    # otherwise they collide with the shim under `--feature client`.
     "io/ktor/client/request/RequestBody.kt",
     "io/ktor/client/request/HttpRequest.kt",
+    "io/ktor/client/request/DefaultHttpRequest.kt",
+    "io/ktor/client/request/HttpRequestPipeline.kt",
+    "io/ktor/client/statement/HttpResponse.kt",
+    "io/ktor/client/statement/DefaultHttpResponse.kt",
+    "io/ktor/client/statement/HttpResponsePipeline.kt",
+    "io/ktor/client/call/HttpClientCall.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
@@ -187,7 +192,11 @@ client = { sources = ["shim/client"] }
 # Gates the real upstream client files that shadow `shim/client`; building up
 # here in parallel keeps the shim `client` feature working until the swap is
 # complete (then `client` points here and `shim/client` is deleted).
-client-upstream = { sources = ["upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/request/"] }
+client-upstream = { sources = [
+    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/request/",
+    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/statement/",
+    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/call/",
+] }
 # ktor-server-core: embeddedServer + routing + respondText.
 server = { sources = ["shim/server"] }
 # ktor-client-content-negotiation + ktor-serialization-kotlinx-json:

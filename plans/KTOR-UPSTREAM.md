@@ -751,15 +751,24 @@ validated, then the corresponding shim file is deleted):
    into the `client-upstream` *feature* (a parallel staging feature that won't
    collide with the live shim `client` feature), then once `HttpClient` works
    there, point `client` at it and delete `shim/client/*` in one step.
-   *In progress:* `HttpRequest.kt` (the real `HttpRequestBuilder` —
-   url: URLBuilder, headers: HeadersBuilder, body: OutgoingContent — plus the
-   immutable `HttpRequestData`/`HttpResponseData`) and `RequestBody.kt` are
-   consumed into `client-upstream` and build a request end to end (verified by
-   `ktor_request_builder_from_upstream`). This needed a general parser fix:
-   annotations on property accessors (`@InternalAPI set(value)`,
-   `@Marker public set`) — `property_accessor_annotation.kt`. Next: the
-   request/response pipelines and `HttpClient` (+ engine `actual`), then the
-   feature swap.
+   *In progress, consumed into `client-upstream`:*
+   - `HttpRequest.kt` (the real `HttpRequestBuilder` — url: URLBuilder,
+     headers: HeadersBuilder, body: OutgoingContent — plus the immutable
+     `HttpRequestData`/`HttpResponseData`) + `RequestBody.kt` — builds a
+     request end to end (`ktor_request_builder_from_upstream`). Needed a
+     general parser fix: annotations on property accessors
+     (`@InternalAPI set(value)`, `@Marker public set`) —
+     `property_accessor_annotation.kt`.
+   - `HttpRequestPipeline`/`HttpSendPipeline`/`HttpResponsePipeline`/
+     `HttpReceivePipeline` (the `HttpClient.execute` spine, `Pipeline`
+     subclasses over the real builder) + `DefaultHttpRequest` + `HttpResponse`/
+     `DefaultHttpResponse` + `HttpClientCall` — the pipelines construct and
+     *execute* through `DebugPipelineContext`
+     (`ktor_request_pipeline_from_upstream`).
+
+   Next: the klio `HttpClientEngine` `actual` (over `__kktor_request`) +
+   `HttpClient` itself with a minimal default-plugin set, then point `client`
+   at `client-upstream` and delete `shim/client/*`.
 4. **Server core** — `Application`/`ApplicationCall`/`ApplicationCallPipeline`,
    routing, `respondText`; klio engine `actual` over `__kktor_serve`; delete
    `shim/server/*`.

@@ -145,6 +145,45 @@ fun main() {
 }
 
 #[test]
+fn ktor_request_pipeline_from_upstream() {
+    install_ktor_pack();
+
+    // The upstream client request/response pipelines (the `HttpClient.execute`
+    // spine) consumed into `client-upstream`: `HttpRequestPipeline` /
+    // `HttpResponsePipeline` (Pipeline subclasses over the real
+    // `HttpRequestBuilder`), executing through `DebugPipelineContext`.
+    let src = r#"
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
+import io.ktor.util.pipeline.*
+import kotlinx.coroutines.*
+
+fun main() = runBlocking {
+    val rq = HttpRequestPipeline()
+    val rp = HttpResponsePipeline()
+    println("${HttpRequestPipeline.Before.name}|${HttpRequestPipeline.Send.name}|${HttpResponsePipeline.Parse.name}")
+
+    val builder = HttpRequestBuilder()
+    rq.intercept(HttpRequestPipeline.Render) { proceedWith(subject.toString() + "!") }
+    println(rq.execute(builder, "payload"))
+}
+"#;
+
+    let dir = std::env::temp_dir().join("klio_ktor_request_pipeline");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("prog.kt");
+    std::fs::write(&file, src).unwrap();
+
+    let got = run_feature(&file, "io.ktor/client-upstream");
+    assert_eq!(
+        got,
+        "Before|Send|Parse\n\
+         payload!\n",
+        "ktor upstream request pipeline output drifted"
+    );
+}
+
+#[test]
 fn ktor_date_and_empty_content_from_upstream() {
     install_ktor_pack();
 
