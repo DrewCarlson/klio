@@ -201,3 +201,38 @@ fun main() = runBlocking { println(Impl().run1()) }
 "#;
     assert_klio("user_prop_not_shadowed", src, "closed=false\n");
 }
+
+// A bare `coroutineContext` inside a member/extension of a
+// `CoroutineScope` is that receiver's own property — a member of the
+// implicit receiver shadows the top-level suspend `coroutineContext`
+// intrinsic. ktor's `HttpClientEngine.closed` reads
+// `coroutineContext[Job]?.isActive` on the engine's own supervisor; if
+// it instead saw the ambient runBlocking context the engine would look
+// permanently closed. A bare intrinsic in a plain suspend fn (no such
+// receiver, e.g. `yield()`) still resolves to the running context.
+#[test]
+fn bare_coroutine_context_in_scope_member_is_own_property() {
+    let src = r#"
+import kotlinx.coroutines.*
+import kotlin.coroutines.*
+abstract class EngBase(name: String) : CoroutineScope {
+    override val coroutineContext: CoroutineContext by lazy {
+        SupervisorJob() + Dispatchers.Unconfined + CoroutineName(name)
+    }
+    private val closed: Boolean get() = !(coroutineContext[Job]?.isActive ?: false)
+    abstract suspend fun execute(data: String): String
+    suspend fun within(data: String): String {
+        val ctx = coroutineContext + Job(coroutineContext[Job])
+        return async(ctx) {
+            if (closed) throw IllegalStateException("CLOSED")
+            execute(data)
+        }.await()
+    }
+}
+class Eng : EngBase("eng") {
+    override suspend fun execute(data: String): String = "EXEC($data)"
+}
+fun main() = runBlocking { println(Eng().within("req")) }
+"#;
+    assert_klio("bare_cc_scope_member", src, "EXEC(req)\n");
+}

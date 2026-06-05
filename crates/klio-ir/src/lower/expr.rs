@@ -693,6 +693,33 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                     return cell;
                 }
+                // A bare `coroutineContext` inside a member/extension of
+                // a `CoroutineScope` is the receiver's own property
+                // (Kotlin: a member of the implicit receiver shadows the
+                // top-level suspend `coroutineContext` intrinsic). Lower
+                // it to the explicit-property read so the runtime reads
+                // the receiver's stored context (ktor's
+                // `HttpClientEngine.closed` /
+                // `createCallContext` build on the engine's own
+                // supervisor) instead of redirecting to the ambient
+                // running coroutine. The bare intrinsic — a suspend fn
+                // with no `CoroutineScope` receiver, e.g. `yield()` —
+                // owns no such member and keeps the redirect.
+                if segments[0].name == "coroutineContext"
+                    && b.has_own_member("coroutineContext")
+                    && let Some(this_reg) = b.resolve("this")
+                {
+                    let dst = b.alloc_reg();
+                    let field = b
+                        .module
+                        .intern_const(Const::String("$coroutineContext$explicit".to_string()));
+                    b.push(Inst::GetField {
+                        dst,
+                        receiver: this_reg,
+                        field,
+                    });
+                    return dst;
+                }
                 // Inside a method / extension fn body `this` is
                 // bound as the implicit first param. An unqualified
                 // identifier that didn't resolve as a local /
