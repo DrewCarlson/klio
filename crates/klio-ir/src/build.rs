@@ -814,6 +814,7 @@ impl<'a> FuncBuilder<'a> {
             is_inline: self.is_inline,
             capture_order: self.capture_order.clone(),
             implicit_label: None,
+            low_priority: false,
         }
     }
 }

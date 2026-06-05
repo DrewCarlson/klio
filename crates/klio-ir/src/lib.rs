@@ -621,6 +621,14 @@ pub struct Func {
     /// functions and for lambdas not in argument position.
     #[serde(default)]
     pub implicit_label: Option<String>,
+    /// Marked `@kotlin.internal.LowPriorityInOverloadResolution` or
+    /// `@Deprecated(level = DeprecationLevel.ERROR)`. Such a function is
+    /// only a valid overload-resolution target when no ordinary candidate
+    /// applies (Kotlin uses this for guard stubs like the receiver-less
+    /// `async`/`launch` that merely throw). Overload selection skips it
+    /// while any normal sibling fits.
+    #[serde(default)]
+    pub low_priority: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

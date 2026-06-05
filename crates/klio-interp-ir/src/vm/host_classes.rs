@@ -331,8 +331,26 @@ impl VmHost<'_> {
             // inline fn's crossinline param) dispatches as
             // CallMemberOrValue instead of mis-SAM-dispatching the
             // receiver's abstract method.
-            let anon_cap_set: std::collections::HashSet<String> =
-                captured_names.iter().cloned().collect();
+            // A captured name that names a top-level *extension* function
+            // (`fun R.f(...)`, param0 == "this") must NOT be value-captured:
+            // value-capture binds a single global value with no receiver, so
+            // `async { … }` closed over by a suspend-lambda anon-object would
+            // bind the receiver-less deprecated `async` guard (which throws)
+            // instead of `CoroutineScope.async` dispatched on the captured
+            // enclosing `this`. Drop such names so the body resolves them
+            // through the global/member path (with overload + receiver).
+            let anon_cap_set: std::collections::HashSet<String> = captured_names
+                .iter()
+                .filter(|n| {
+                    !self.module.funcs_by_simple_name(n).iter().any(|fid| {
+                        self.module
+                            .funcs
+                            .get(fid.0 as usize)
+                            .is_some_and(|f| f.params.first().is_some_and(|p| p.name == "this"))
+                    })
+                })
+                .cloned()
+                .collect();
             klio_ir::lower::set_lower_anon_captures(Some(anon_cap_set));
             // Property inits that aren't a literal or a bare captured name
             // are lowered as zero-arg thunks (a synthetic method body) and

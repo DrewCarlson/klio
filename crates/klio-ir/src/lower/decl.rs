@@ -774,5 +774,29 @@ pub(crate) fn lower_function_body_with_implicit_owner_priv(
         };
     }
     func.is_suspend = f.is_suspend;
+    func.low_priority = is_low_priority_overload(f);
     func
+}
+
+/// A function is excluded from overload resolution while any ordinary
+/// candidate applies when it carries `@LowPriorityInOverloadResolution`
+/// (kotlin-internal) or `@Deprecated(level = DeprecationLevel.ERROR)`.
+/// kotlinx.coroutines uses these on the receiver-less `async`/`launch`
+/// guard stubs that exist only to produce a compile error and otherwise
+/// just `throw`; klio must never bind one over a real overload.
+fn is_low_priority_overload(f: &klio_ast::Function) -> bool {
+    f.annotations.iter().any(|a| {
+        let leaf = a.path.last().map(|i| i.name.as_str()).unwrap_or_default();
+        if leaf == "LowPriorityInOverloadResolution" {
+            return true;
+        }
+        if leaf == "Deprecated" {
+            // `@Deprecated(..., level = DeprecationLevel.ERROR)`.
+            return a.args.iter().any(|e| {
+                let s = format!("{e:?}");
+                s.contains("ERROR")
+            });
+        }
+        false
+    })
 }

@@ -2379,6 +2379,31 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         .get(fid.0 as usize)
                         .is_some_and(|f| f.params.first().is_none_or(|p| p.name != "this"))
                 };
+                // `@LowPriorityInOverloadResolution` / `@Deprecated(ERROR)`
+                // guard stubs are valid targets only when nothing else fits.
+                let not_low = |fid: &FuncId| {
+                    b.module
+                        .funcs
+                        .get(fid.0 as usize)
+                        .is_some_and(|f| !f.low_priority)
+                };
+                // Trailing-lambda arity match: `f(a, …) { lambda }` binds the
+                // lambda to the LAST (function-typed) param, with the
+                // intermediate params defaulted — so `engine.async(ctx) { … }`
+                // matches `CoroutineScope.async(context, start, block)`
+                // (`want` = 2, three user params) and prepends `this`, rather
+                // than falling through to the receiver-less guard.
+                let last_arg_lambda = matches!(args.last(), Some(Expr::Lambda { .. }));
+                let arity_match_tl = |fid: &FuncId| -> bool {
+                    last_arg_lambda
+                        && b.module.funcs.get(fid.0 as usize).is_some_and(|f| {
+                            let up = user_params(f);
+                            !f.blocks.is_empty()
+                                && f.params.last().is_some_and(|p| p.ty.name.starts_with("Function"))
+                                && up >= want
+                                && want >= 1
+                        })
+                };
                 // Names known to be backed by an intrinsic /
                 // implicit-alias (kotlin.* top-level). When no
                 // arity-matching IR func exists for these, decline
@@ -2492,13 +2517,30 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         .or_else(|| {
                             cands
                                 .iter()
-                                .find(|fid| non_ext(fid) && arity_match(fid))
+                                .find(|fid| non_ext(fid) && arity_match(fid) && not_low(fid))
                                 .copied()
                         })
                         .or_else(|| {
                             cands
                                 .iter()
-                                .find(|fid| !non_ext(fid) && arity_match(fid))
+                                .find(|fid| !non_ext(fid) && arity_match(fid) && not_low(fid))
+                                .copied()
+                        })
+                        // Trailing-lambda matches: the lambda binds the last
+                        // function-typed param with intermediate params
+                        // defaulted. Prefer a receiver-form (ext) overload so
+                        // the active `this` is prepended, over a receiver-less
+                        // guard stub — both before the legacy fallback.
+                        .or_else(|| {
+                            cands
+                                .iter()
+                                .find(|fid| !non_ext(fid) && arity_match_tl(fid) && not_low(fid))
+                                .copied()
+                        })
+                        .or_else(|| {
+                            cands
+                                .iter()
+                                .find(|fid| non_ext(fid) && arity_match_tl(fid) && not_low(fid))
                                 .copied()
                         })
                         .or_else(|| {

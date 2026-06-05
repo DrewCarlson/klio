@@ -408,6 +408,50 @@ impl VmHost<'_> {
             // skip it when scoring against the caller's args.
             let params_skip = usize::from(f.params.first().is_some_and(|p| p.name == "this"));
             let effective: &[klio_ir::Param] = &f.params[params_skip..];
+            // Trailing-lambda rule (mirrors `call_func` / `overload_score`):
+            // a `recv.f(a, …) { lambda }` call binds the trailing lambda to
+            // the LAST function-typed param, with intermediate params
+            // defaulted. Without it `engine.async(ctx) { … }` rejects
+            // `CoroutineScope.async` (the `{ }` mis-aligned onto the `start`
+            // param) and a no-receiver low-priority sibling (the deprecated
+            // `async` error stub) wins and throws.
+            if args.len() < effective.len()
+                && !args.is_empty()
+                && effective.last().is_some_and(|p| crate::is_function_type(&p.ty))
+                && args.last().is_some_and(crate::value_is_callable)
+            {
+                let lead = args.len() - 1;
+                let last_param = effective.len() - 1;
+                let defaults = self.prog.func_defaults.get(&f.id);
+                let gap_defaulted = (lead..last_param).all(|k| {
+                    defaults
+                        .and_then(|d| d.get(params_skip + k))
+                        .is_some_and(std::option::Option::is_some)
+                });
+                if gap_defaulted {
+                    let mut total: i32 = 0;
+                    let mut ok = true;
+                    for k in 0..lead {
+                        match self.overload_score_arg(&effective[k].ty, &args[k]) {
+                            Some(s) => total += s,
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        match self.overload_score_arg(&effective[last_param].ty, &args[lead]) {
+                            Some(s) => total += s,
+                            None => ok = false,
+                        }
+                    }
+                    if ok && best.is_none_or(|(_, s)| total > s) {
+                        best = Some((i, total));
+                    }
+                    continue;
+                }
+            }
             // Accept an exact-arity match, or a call that supplies
             // fewer args when every unsupplied trailing parameter has
             // a default (`fun make(s, adj: Long = 0)` called as
@@ -501,6 +545,46 @@ impl VmHost<'_> {
         let last_vararg = f.params.last().is_some_and(|p| p.is_vararg);
         if f.params.len() < args.len() && !last_vararg {
             return None;
+        }
+        // Trailing-lambda rule (mirrors `call_func`): a `f(a, …) { lambda }`
+        // call supplies fewer positional args than params; the trailing
+        // lambda binds the LAST (function-typed) param and the intermediate
+        // params fall back to defaults. Score the leading args against the
+        // leading params and the lambda against the last param. Without
+        // this the lambda mis-aligns to an earlier param slot and a
+        // receiver-form overload is wrongly rejected — e.g.
+        // `CoroutineScope.async(ctx) { … }` (the `{ }` falling onto the
+        // `start` param) is dropped, leaving the no-receiver deprecated
+        // `async` error stub to win and throw at runtime.
+        if f.params.len() > args.len()
+            && !args.is_empty()
+            && f.params.last().is_some_and(|p| crate::is_function_type(&p.ty))
+            && args.last().is_some_and(crate::value_is_callable)
+        {
+            let lead = args.len() - 1;
+            let last_param = f.params.len() - 1;
+            if lead <= last_param {
+                let defaults = self.prog.func_defaults.get(&cand);
+                let gap_defaulted = (lead..last_param).all(|i| {
+                    defaults
+                        .and_then(|d| d.get(i))
+                        .is_some_and(std::option::Option::is_some)
+                });
+                if gap_defaulted {
+                    let mut total: i32 = -1;
+                    for i in 0..lead {
+                        match self.overload_score_arg(&f.params[i].ty, &args[i]) {
+                            Some(s) => total += s,
+                            None => return None,
+                        }
+                    }
+                    match self.overload_score_arg(&f.params[last_param].ty, &args[lead]) {
+                        Some(s) => total += s,
+                        None => return None,
+                    }
+                    return Some(total);
+                }
+            }
         }
         if f.params.len() > args.len() {
             let defaults = self.prog.func_defaults.get(&cand);
