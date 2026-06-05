@@ -872,9 +872,23 @@ validated, then the corresponding shim file is deleted):
      function in the chain (e.g. `Send.Sender.proceed`'s expression body vs a
      block body, or adding a `println`) flips the symptom between the hang and
      a fast `cast to HttpClientCall` — i.e. the suspend state-machine lowering
-     is structure-sensitive here. Next step is Rust-level instrumentation of
-     the coroutine/suspend dispatch (Kotlin-level prints perturb the lowering),
-     focused on the nested-pipeline `do-while` `proceedLoop` resume.
+     is structure-sensitive here. A Rust-level instruction sampler (a
+     temporary counter in `exec_inst`, since Kotlin prints perturb the
+     lowering) localized the spin to a `proceed ↔ execute` cycle that repeats
+     until `DefaultSender` hits `maxSendCount` (20) and constructs a
+     `SendCountExceedException`. Crucially the **engine never issues an HTTP
+     request (the local server is never hit) even though `DefaultSender`
+     reaches the send-count limit** — so the send loop is `proceed → … →
+     DefaultSender.execute → client.sendPipeline.execute` returning a call (or
+     re-entering) that a `Send`-phase handler (`HttpRedirect`/`HttpRequestRetry`
+     re-send, or a response whose status reads as a redirect) keeps
+     re-`proceed`ing, without the `sendPipeline` reaching the klio engine's
+     `HttpSendPipeline.Engine` interceptor / `__kktor_request`. Two sub-leads:
+     (a) why the `sendPipeline` doesn't reach the engine in the composed path
+     when `engine.execute` works directly, and (b) the response status the
+     re-send handler reads. (A user exception subclassing a builtin throwable
+     — `class E(msg) : IllegalStateException(msg)` — constructs and throws
+     fine in isolation, so `SendCountExceedException` itself is not the root.)
      Then point `client` at `client-upstream` and delete `shim/client/*`.
      (Parallel gap, not yet fixed: the *typechecker* rejects the valid-Kotlin
      receiver-lambda-explicit-arg shape with `UNRESOLVED_REFERENCE` even though
