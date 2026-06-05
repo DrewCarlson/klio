@@ -204,6 +204,19 @@ impl VmHost<'_> {
                 && args.len() == info.n_params + 1
                 && let Some(this_idx) = this_cap_idx
             {
+                // The closure's captured `this` (before the explicit
+                // receiver overrides it) is the lexically-enclosing
+                // receiver the body closed over — e.g. ktor's engine
+                // interceptor lambda closes over `this@install` (the
+                // `HttpClientEngine`) yet is invoked by the pipeline as
+                // `interceptor.invoke(pipelineContext, subject)`. Push it
+                // as an enclosing receiver so the body can still resolve
+                // the engine's members (`checkExtensions`,
+                // `executeWithinCallContext`), mirroring
+                // `invoke_callable_with_this`. Without it those bare
+                // member calls escape to the global scope and the request
+                // never reaches the engine's `execute`.
+                let prior_this = captures.get(this_idx).cloned();
                 let mut new_caps: Vec<klio_runtime::Value> = (**captures).clone();
                 if this_idx >= new_caps.len() {
                     new_caps.resize(this_idx + 1, klio_runtime::Value::Null);
@@ -214,12 +227,31 @@ impl VmHost<'_> {
                     captures: Arc::new(new_caps),
                 };
                 let rest: Vec<klio_runtime::Value> = args[1..].to_vec();
-                let pushed = matches!(args[0], klio_runtime::Value::Instance(_));
-                if pushed {
+                // Push the prior captured `this` as the enclosing
+                // receiver, unless it is null/unit or the same instance
+                // as the new receiver (no shadowing to undo).
+                let pushed_outer = match (&prior_this, &args[0]) {
+                    (None | Some(klio_runtime::Value::Null | klio_runtime::Value::Unit), _) => {
+                        false
+                    }
+                    (
+                        Some(klio_runtime::Value::Instance(a)),
+                        klio_runtime::Value::Instance(b),
+                    ) => !klio_runtime::ObjRef::ptr_eq(a, b),
+                    (Some(_), _) => true,
+                };
+                if pushed_outer && let Some(p) = &prior_this {
+                    self.push_access_enclosing(p);
+                }
+                let pushed_receiver = matches!(args[0], klio_runtime::Value::Instance(_));
+                if pushed_receiver {
                     self.push_access_enclosing(&args[0].clone());
                 }
                 let r = self.call_value(&bound, &rest);
-                if pushed {
+                if pushed_receiver {
+                    self.pop_access_enclosing();
+                }
+                if pushed_outer {
                     self.pop_access_enclosing();
                 }
                 return r;

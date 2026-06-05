@@ -261,3 +261,38 @@ fun main() {
         "105\n206\nr=105\ngot(105)\n",
     );
 }
+
+// A receiver lambda created inside a method closes over the enclosing
+// `this`, is stored, and is later invoked via the `Function` interface
+// (`block.invoke(receiver, arg)`) with a *different* receiver — exactly
+// how ktor's pipeline runs an engine interceptor:
+// `interceptor.invoke(pipelineContext, subject)`. The body's bare call
+// to an enclosing-class member (`secret()`, like the engine's private
+// `checkExtensions` / `executeWithinCallContext`) must still resolve
+// against the closed-over enclosing receiver — the explicit-receiver
+// invoke path must push it as an enclosing receiver, not only the new
+// receiver.
+#[test]
+fn invoke_with_receiver_keeps_enclosing_capture() {
+    assert_klio(
+        "invoke_keeps_enclosing",
+        r#"
+class Ctx
+class Registry {
+    val blocks = mutableListOf<Ctx.(String) -> String>()
+    fun intercept(b: Ctx.(String) -> String) { blocks.add(b) }
+    fun run(arg: String): String = blocks[0].invoke(Ctx(), arg)
+}
+class Engine {
+    private fun secret(): String = "ENG"
+    fun install(r: Registry) { r.intercept { arg -> secret() + ":" + arg } }
+}
+fun main() {
+    val r = Registry()
+    Engine().install(r)
+    println(r.run("X"))
+}
+"#,
+        "ENG:X\n",
+    );
+}
