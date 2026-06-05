@@ -324,6 +324,7 @@ pub trait Host {
         args: Vec<Value>,
         arg_names: &[Option<String>],
         _type_args: &[String],
+        _exact: bool,
     ) -> Result<Value, EvalError> {
         self.call_func_named(module, func, args, arg_names)
     }

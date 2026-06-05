@@ -138,6 +138,17 @@ pub enum Inst {
         /// dispatch when the callee is an `inline fun <reified T>`.
         #[serde(default)]
         type_args: Vec<ConstId>,
+        /// The overload was resolved statically at lower time using an
+        /// explicit argument cast (`f(x as T)`). Runtime overload
+        /// re-resolution (`pick_overload`) must NOT override it by the
+        /// argument's runtime value type — the cast is the source's
+        /// deliberate selection (Kotlin resolves by the static type).
+        /// Without this a delegation like ktor's deprecated
+        /// `async(context: Job) = async(context as CoroutineContext, …)`
+        /// re-selects the `Job` overload (the value is still a `Job`)
+        /// and recurses forever.
+        #[serde(default)]
+        exact: bool,
     },
     /// `receiver.lambda(args)` — invoke a callable with a
     /// receiver bound as `this` inside the body. Used for

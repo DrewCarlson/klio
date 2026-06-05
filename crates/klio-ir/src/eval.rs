@@ -1111,6 +1111,7 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<
             n_args,
             arg_names,
             type_args,
+            exact,
         } => {
             let arg_values = read_arg_run(frame, *args, *n_args);
             let names = resolve_arg_names(frame.module, arg_names);
@@ -1160,7 +1161,8 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<
             } else {
                 false
             };
-            let res = host.call_func_typed(frame.module, *func, arg_values, &names, &ta);
+            let res =
+                host.call_func_typed(frame.module, *func, arg_values, &names, &ta, *exact);
             if pushed_enclosing {
                 host.pop_access_enclosing();
             }

@@ -142,3 +142,34 @@ fun main() = runBlocking { println("result=" + runWith(21)) }
 "#;
     assert_klio("local_class_suspend_resume", src, "result=got=42\n");
 }
+
+// A deprecated overload that delegates to the general one via an
+// explicit cast — kotlinx.coroutines' `async(context: Job, …) =
+// async(context as CoroutineContext, …)` — must reach the general
+// `async(CoroutineContext)` overload, not re-select the `Job` overload
+// (the runtime value is still a `Job`) and recurse forever. Here the
+// receiver-lambda `ic.invoke(next, r)` calls a suspend method whose body
+// is `async(coroutineContext + Job()) { … }.await()`, exercising the
+// delegation through the real coroutines library.
+#[test]
+fn async_job_overload_delegates_without_recursing() {
+    let src = r#"
+import kotlinx.coroutines.*
+import kotlin.coroutines.*
+interface Snd { suspend fun execute(r: String): String }
+class Base : Snd {
+    override suspend fun execute(r: String): String {
+        val ctx = coroutineContext + Job()
+        return async(ctx) { "E($r)" }.await()
+    }
+}
+class Inter(val ic: suspend Snd.(String) -> String, val next: Snd) : Snd {
+    override suspend fun execute(r: String): String = ic.invoke(next, r)
+}
+fun main() = runBlocking {
+    val s: Snd = Inter({ r -> "R1[" + execute(r) + "]" }, Base())
+    println(s.execute("x"))
+}
+"#;
+    assert_klio("async_job_overload_delegates", src, "R1[E(x)]\n");
+}

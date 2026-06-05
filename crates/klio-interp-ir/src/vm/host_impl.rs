@@ -211,8 +211,9 @@ impl klio_ir::eval::Host for VmHost<'_> {
         args: Vec<klio_runtime::Value>,
         arg_names: &[Option<String>],
         type_args: &[String],
+        exact: bool,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        Self::call_func_typed(self, module, func, args, arg_names, type_args)
+        Self::call_func_typed(self, module, func, args, arg_names, type_args, exact)
     }
 
     fn call_named_overload(

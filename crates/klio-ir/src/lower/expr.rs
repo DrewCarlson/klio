@@ -75,6 +75,68 @@ pub fn lower_receiver(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
 // implement Kotlin's defined conversions (UInt/ULong/Int/Float literal
 // lowering) and the usize->u8/u32 casts pack argument counts and
 // register indices into the IR's fixed-width slots.
+/// Among same-name overload candidates, prefer the one whose parameter
+/// type at an explicitly-cast argument position (`x as T`) matches the
+/// cast target `T`. Kotlin's overload resolution honours such a cast;
+/// klio otherwise picks by arity alone (ignoring arg types), so e.g.
+/// the deprecated `async(context: Job, …)` overload's delegation
+/// `async(context as CoroutineContext, …)` re-selects the `Job` overload
+/// (the runtime value is still a `Job`) and recurses forever. Returns
+/// `None` when no cast argument disambiguates an arity-matching
+/// candidate, so the caller falls back to its arity-first pick.
+fn overload_pick_by_cast(
+    b: &FuncBuilder<'_>,
+    cands: &[FuncId],
+    args: &[Expr],
+    want: usize,
+) -> Option<FuncId> {
+    let casts: Vec<(usize, String)> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| match a {
+            Expr::As { ty, .. } => Some((
+                i,
+                ty.name
+                    .name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&ty.name.name)
+                    .to_string(),
+            )),
+            _ => None,
+        })
+        .collect();
+    if casts.is_empty() {
+        return None;
+    }
+    let mut best: Option<(FuncId, i32)> = None;
+    for fid in cands {
+        let Some(f) = b.module.funcs.get(fid.0 as usize) else {
+            continue;
+        };
+        if f.blocks.is_empty() || f.params.last().is_some_and(|p| p.is_vararg) {
+            continue;
+        }
+        let base = usize::from(f.params.first().is_some_and(|p| p.name == "this"));
+        if f.params.len().saturating_sub(base) != want {
+            continue;
+        }
+        let mut score = 0i32;
+        for (i, cast_ty) in &casts {
+            if let Some(p) = f.params.get(base + i) {
+                let pn = p.ty.name.rsplit('.').next().unwrap_or(&p.ty.name);
+                if pn == cast_ty {
+                    score += 2;
+                }
+            }
+        }
+        if score > 0 && best.is_none_or(|(_, s)| score > s) {
+            best = Some((*fid, score));
+        }
+    }
+    best.map(|(f, _)| f)
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
@@ -1513,6 +1575,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         n_args,
                         arg_names,
                         type_args,
+                        exact: false,
                     });
                 } else {
                     // Not a user module fn. A bound local of this
@@ -2240,6 +2303,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             n_args: count,
                             arg_names,
                             type_args,
+                            exact: false,
                         });
                         return dst;
                     }
@@ -2385,13 +2449,29 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     && !b.is_local_fn(&segments[0].name)
                     && !b.is_local_ext_fn(&segments[0].name)
                     && !contract_with_msg;
-                let bare_func_id: Option<FuncId> = if intrinsic_owns_all || prefer_member {
+                // An explicit argument cast (`f(x as T)`) is a strong,
+                // deliberate overload signal — try it even when the name
+                // would otherwise prefer an enclosing-member dispatch, so
+                // a delegation like `async(context as CoroutineContext, …)`
+                // (where `async` is an extension treated as a member of the
+                // receiver scope) reaches the cast-matched overload instead
+                // of re-selecting the deprecated `async(Job)` member form.
+                let cast_pick = if intrinsic_owns_all {
                     None
                 } else {
-                    cands
-                        .iter()
-                        .find(|fid| non_ext(fid) && arity_match(fid))
-                        .copied()
+                    overload_pick_by_cast(b, &cands, args, want)
+                };
+                let bare_func_id: Option<FuncId> =
+                    if intrinsic_owns_all || (prefer_member && cast_pick.is_none()) {
+                        None
+                    } else {
+                        cast_pick
+                        .or_else(|| {
+                            cands
+                                .iter()
+                                .find(|fid| non_ext(fid) && arity_match(fid))
+                                .copied()
+                        })
                         .or_else(|| {
                             cands
                                 .iter()
@@ -2475,6 +2555,11 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     }
                     (other, _) => other,
                 };
+                // The overload was selected from an explicit argument cast
+                // (`f(x as T)`) and survived refinement — emit it as an
+                // `exact` Call so runtime overload re-resolution does not
+                // override the cast by the argument's runtime value type.
+                let was_cast = cast_pick.is_some() && bare_func_id == cast_pick;
                 if let Some(func_id) = bare_func_id.filter(|_| !shadowed_by_class) {
                     // Extension fn called by its bare name from inside
                     // a receiver-typed scope: prepend the active
@@ -2594,7 +2679,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                 && (1 + user_arg_count) < target_params.len()
                                 && ast_arg_names.iter().all(std::option::Option::is_none)
                                 && trailing_lambda_call;
-                            if !synth_names_needed {
+                            if !synth_names_needed && !was_cast {
                                 // Kotlin: a member of the
                                 // (smart-cast) implicit receiver
                                 // outranks a same-named top-level
@@ -2610,6 +2695,15 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                 // (recursed for
                                 // `resumeCancellableWith`,
                                 // mis-bound on `Result`).
+                                // An explicit argument cast
+                                // (`async(context as CoroutineContext,
+                                // …)`) is excepted: the cast already
+                                // selected the overload, and re-routing
+                                // through `call_member` would re-resolve
+                                // by the *erased* runtime value type
+                                // (here a `Job`), re-selecting the
+                                // deprecated `async(Job)` form and
+                                // recursing. Emit the direct exact Call.
                                 let (uargs_start, ucount) = lower_arg_run(b, args);
                                 let uarg_names = intern_arg_names(b.module, ast_arg_names);
                                 let nmc = b
@@ -2662,6 +2756,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                                 n_args: count,
                                 arg_names,
                                 type_args,
+                                exact: was_cast,
                             });
                             return dst;
                         }
@@ -2703,6 +2798,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         n_args: count,
                         arg_names,
                         type_args,
+                        exact: was_cast,
                     });
                     return dst;
                 }
@@ -2815,6 +2911,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             n_args: args.len() as u8 + 1,
                             arg_names,
                             type_args: Vec::new(),
+                            exact: false,
                         });
                         return dst;
                     }
@@ -3049,6 +3146,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             n_args,
                             arg_names,
                             type_args,
+                            exact: false,
                         });
                         return dst;
                     }
@@ -3298,6 +3396,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                             n_args: n,
                             arg_names,
                             type_args,
+                            exact: false,
                         });
                         return dst;
                     }

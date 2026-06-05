@@ -323,6 +323,7 @@ impl VmHost<'_> {
         args: Vec<klio_runtime::Value>,
         arg_names: &[Option<String>],
         type_args: &[String],
+        exact: bool,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         // Reified enum reflection: `enumValues<T>()` / `enumValueOf<T>(name)`
         // are bodyless `expect`s. Resolve the reified type argument to its
@@ -374,8 +375,17 @@ impl VmHost<'_> {
         // Overload resolution: when the target function shares its
         // name with siblings, the IR call site bakes in the first
         // FuncId at lower time — pick the best match here using the
-        // runtime arg types.
-        let func = self.pick_overload(module, func, &args).unwrap_or(func);
+        // runtime arg types. Skipped for an `exact` call: the lowering
+        // already resolved the overload from an explicit argument cast
+        // (`f(x as T)`), and re-picking by the runtime value type would
+        // override the cast (the value's most-derived type), e.g.
+        // re-selecting the deprecated `async(Job)` overload for an
+        // `async(ctx as CoroutineContext)` delegation and recursing.
+        let func = if exact {
+            func
+        } else {
+            self.pick_overload(module, func, &args).unwrap_or(func)
+        };
         // Incompatible-receiver guard (sound, narrow): a bare call
         // baked to a top-level extension (`fun R.f`, param0
         // == "this") whose declared receiver `R` is a *user / pack
@@ -471,7 +481,7 @@ impl VmHost<'_> {
         let Some((func, _)) = best else {
             return Ok(None);
         };
-        let result = self.call_func_typed(module, func, args.to_vec(), arg_names, &[])?;
+        let result = self.call_func_typed(module, func, args.to_vec(), arg_names, &[], false)?;
         Ok(Some(result))
     }
 
