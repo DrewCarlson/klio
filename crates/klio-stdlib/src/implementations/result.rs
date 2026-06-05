@@ -288,10 +288,13 @@ pub(crate) fn coro_resume(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
     Ok(Value::Unit)
 }
 
-/// `__klio_co_runRoot(block)` — drive `block` as a cooperative
-/// coroutine root to quiescence, returning its terminal value.
+/// `__klio_co_runRoot(scope, block)` — drive `block` as a cooperative
+/// coroutine root to quiescence, returning its terminal value. The block
+/// is always the trailing arg; an optional leading arg is the coroutine
+/// the block belongs to, made the active scope while it runs (so a
+/// suspend-implicit `coroutineContext` read inside resolves to its `Job`).
 pub(crate) fn coro_run_root(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
-    let block = match ctx.args.first() {
+    let block = match ctx.args.last() {
         Some(v) => v.clone(),
         None => {
             return Err(RuntimeError::Type(
@@ -299,7 +302,12 @@ pub(crate) fn coro_run_root(ctx: &mut CallCtx) -> Result<Value, RuntimeError> {
             ));
         }
     };
-    ctx.host.coroutine_run_root(&block, ctx.out)
+    let scope = if ctx.args.len() >= 2 {
+        ctx.args.first().cloned()
+    } else {
+        None
+    };
+    ctx.host.coroutine_run_root(scope.as_ref(), &block, ctx.out)
 }
 
 /// `Result.getOrThrow()` — the success value, or rethrow the

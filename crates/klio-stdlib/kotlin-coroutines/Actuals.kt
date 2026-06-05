@@ -52,8 +52,15 @@ internal fun __klio_co_resume(slot: Long, ok: Boolean, value: Any?) {
 // to the completion continuation, so this returns nothing — a
 // suspension inside `block` parks the whole activation, including
 // the pending completion delivery.
+//
+// `scope` is the coroutine the block belongs to (the completion, which
+// for `async`/`launch` is the `AbstractCoroutine` itself). The driver
+// makes it the active `CoroutineScope` while the block runs so a
+// suspend-implicit `coroutineContext` read inside resolves to the
+// coroutine's own context — including its `Job` — instead of the
+// inherited root scope.
 @PublishedApi
-internal fun __klio_co_runRoot(block: () -> Unit): Unit = block()
+internal fun __klio_co_runRoot(scope: Any?, block: () -> Unit): Unit = block()
 
 // --- the continuation klio hands to a suspendCoroutine block -------
 

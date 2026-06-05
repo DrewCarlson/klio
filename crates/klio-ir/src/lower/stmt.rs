@@ -174,6 +174,9 @@ fn lower_local_fn_decl(b: &mut FuncBuilder<'_>, f: &klio_ast::Function) -> Optio
         } else {
             None
         };
+        let enclosing_owner = b
+            .owner_class()
+            .map(|o| (o.to_string(), b.enclosing_members_for_child()));
         let (body_func, captured_names) = lower_lambda_body_capturing_kind_with(
             b.module,
             &param_idents,
@@ -184,6 +187,7 @@ fn lower_local_fn_decl(b: &mut FuncBuilder<'_>, f: &klio_ast::Function) -> Optio
             tailrec_self,
             true,
             inherited_rlp,
+            enclosing_owner,
         );
         let captures: Vec<Reg> = captured_names
             .iter()

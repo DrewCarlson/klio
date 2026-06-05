@@ -388,6 +388,7 @@ impl klio_runtime::IntrinsicHost for VmIntrinsicHost<'_> {
 
     fn coroutine_run_root(
         &mut self,
+        scope: Option<&klio_runtime::Value>,
         block: &klio_runtime::Value,
         out: &mut dyn Output,
     ) -> Result<klio_runtime::Value, klio_runtime::RuntimeError> {
@@ -401,7 +402,14 @@ impl klio_runtime::IntrinsicHost for VmIntrinsicHost<'_> {
         // children interleave by deadline instead of launch order.
         let nested = with_coro(|s| !s.borrow().is_empty());
         if nested {
-            return match self.eval_closure_raw(block, &[], None, out) {
+            // Make the coroutine's own scope (the completion — for
+            // `async`/`launch` the `AbstractCoroutine` itself) active while
+            // the block runs, so a suspend-implicit `coroutineContext` read
+            // inside resolves to it (and thus to its active `Job`) rather
+            // than the inherited root scope.
+            let _scope_guard = scope.map(ActiveScopeGuard::enter);
+            let r = self.eval_closure_raw(block, &[], None, out);
+            return match r {
                 Ok(v) => Ok(v),
                 Err(klio_ir::eval::EvalError::Suspended(st)) => {
                     Self::park(*st);
@@ -416,7 +424,12 @@ impl klio_runtime::IntrinsicHost for VmIntrinsicHost<'_> {
                 Err(e) => Err(klio_runtime::RuntimeError::Type(format!("{e}"))),
             };
         }
-        self.drive_root(block, &klio_runtime::Value::Unit, out, true)
+        self.drive_root(
+            block,
+            scope.unwrap_or(&klio_runtime::Value::Unit),
+            out,
+            true,
+        )
     }
 
     fn coroutine_resume_external(

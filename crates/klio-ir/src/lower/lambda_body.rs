@@ -48,6 +48,7 @@ pub(super) fn lower_lambda_body_capturing(
     outer: std::collections::HashSet<String>,
     outer_boxed: &std::collections::HashSet<String>,
     inherited_rlp: std::collections::HashSet<String>,
+    enclosing_owner: Option<(String, std::collections::HashSet<String>)>,
 ) -> (crate::FuncId, Vec<String>) {
     lower_lambda_body_capturing_kind(
         module,
@@ -58,6 +59,7 @@ pub(super) fn lower_lambda_body_capturing(
         outer_boxed,
         None,
         inherited_rlp,
+        enclosing_owner,
     )
 }
 
@@ -71,6 +73,7 @@ pub(super) fn lower_lambda_body_capturing_kind(
     outer_boxed: &std::collections::HashSet<String>,
     tailrec_self: Option<&str>,
     inherited_rlp: std::collections::HashSet<String>,
+    enclosing_owner: Option<(String, std::collections::HashSet<String>)>,
 ) -> (crate::FuncId, Vec<String>) {
     lower_lambda_body_capturing_kind_with(
         module,
@@ -82,12 +85,12 @@ pub(super) fn lower_lambda_body_capturing_kind(
         tailrec_self,
         false,
         inherited_rlp,
+        enclosing_owner,
     )
 }
 
 // Innermost rung of the lambda-body lowering wrapper chain; each flag/ref
 // is threaded straight from the AST and bundling them would only obscure it.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_lambda_body_capturing_kind_with(
     module: &mut crate::Module,
@@ -99,8 +102,18 @@ pub(super) fn lower_lambda_body_capturing_kind_with(
     tailrec_self: Option<&str>,
     is_named_local_fn: bool,
     inherited_rlp: std::collections::HashSet<String>,
+    enclosing_owner: Option<(String, std::collections::HashSet<String>)>,
 ) -> (crate::FuncId, Vec<String>) {
     let mut b = FuncBuilder::new(module);
+    // Carry the lexically enclosing class (and its member-name set) so a
+    // member reference inside the lambda resolves against the class that
+    // declares it: a private getter (`closed`) reads the right field, and
+    // a bare member call (`execute`) binds the enclosing member ahead of a
+    // same-named imported extension.
+    if let Some((owner, members)) = enclosing_owner {
+        b.set_owner_class(owner);
+        b.set_enclosing_members(members);
+    }
     if is_named_local_fn {
         b.set_outer_names_named_local_fn(outer);
     } else if is_lambda {

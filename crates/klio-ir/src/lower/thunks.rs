@@ -191,6 +191,13 @@ pub fn lower_accessor_expr_with_expected<S: BuildHasher>(
 ) -> crate::FuncId {
     let mut b = FuncBuilder::new(module);
     let () = b.set_owner_class(owner_class.to_string());
+    // The accessor body runs with `this` of type `owner_class`, so a bare
+    // call inside resolves against that receiver — record it so the
+    // overload/inline resolver prefers a member of the receiver over a
+    // same-named imported extension with a different receiver type (e.g.
+    // `get(Job)` inside `CoroutineContext.job` binds the context's `get`
+    // operator, not ktor's inline `HttpClient.get`).
+    let () = b.set_recv_ty(Some(owner_class.to_string()));
     let () = b.set_own_members(own_members.iter().cloned().collect());
     bind_params(&mut b, params);
     let prev = b.push_expected(expected);
@@ -229,6 +236,7 @@ pub fn lower_accessor_block<S: BuildHasher>(
 ) -> crate::FuncId {
     let mut b = FuncBuilder::new(module);
     let () = b.set_owner_class(owner_class.to_string());
+    let () = b.set_recv_ty(Some(owner_class.to_string()));
     let () = b.set_own_members(own_members.iter().cloned().collect());
     bind_params(&mut b, params);
     let v = lower_block(&mut b, block);

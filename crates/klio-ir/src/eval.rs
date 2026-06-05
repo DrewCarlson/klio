@@ -2021,11 +2021,18 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<
                     }
                 }
             }
+            // The scope-qualified form (`$sgetter$<owner>\u{1f}<name>`)
+            // carries the lexical owner only for the `this`/enclosing
+            // getter reads above; the global fallback uses the bare name.
+            let bare_name: &str = name_str
+                .strip_prefix("$sgetter$")
+                .and_then(|r| r.split_once('\u{1f}'))
+                .map_or(name_str.as_str(), |(_, n)| n);
             let v = match resolved {
                 Some(v) => v,
                 None => host
-                    .lookup_global_throwing(&name_str)?
-                    .ok_or_else(|| EvalError::Unbound(format!("unresolved global `{name_str}`")))?,
+                    .lookup_global_throwing(bare_name)?
+                    .ok_or_else(|| EvalError::Unbound(format!("unresolved global `{bare_name}`")))?,
             };
             frame.write(*dst, v);
         }

@@ -730,9 +730,20 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 if b.has_own_member(&segments[0].name) {
                     if let Some(this_reg) = b.resolve("this") {
                         let dst = b.alloc_reg();
-                        let nm = b
-                            .module
-                            .intern_const(Const::String(segments[0].name.clone()));
+                        // Scope-qualify the read with the lexically enclosing
+                        // class so a custom getter on *that* class is reached
+                        // even when a derived class stores a same-named field
+                        // (Kotlin's two private `closed`: a `HttpClientEngine`
+                        // getter vs a `HttpClientEngineBase` atomic field).
+                        let nm = if let Some(owner) = b.owner_class() {
+                            b.module.intern_const(Const::String(format!(
+                                "$sgetter${owner}\u{1f}{}",
+                                segments[0].name
+                            )))
+                        } else {
+                            b.module
+                                .intern_const(Const::String(segments[0].name.clone()))
+                        };
                         b.push(Inst::GetField {
                             dst,
                             receiver: this_reg,
@@ -917,9 +928,23 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 }
                 let this_idx = b.record_capture("this");
                 let dst = b.alloc_reg();
-                let name = b
-                    .module
-                    .intern_const(Const::String(segments[0].name.clone()));
+                // Scope-qualify the read with the lexically enclosing class
+                // so that, when the name resolves to a member, it binds that
+                // class's own custom getter rather than an inherited/derived
+                // same-named field (Kotlin's two private `closed`: a
+                // `HttpClientEngine` getter vs a `HttpClientEngineBase`
+                // atomic field). The runtime `get_field` handler invokes the
+                // owner's getter when one exists and otherwise reads the plain
+                // field; the global fallback strips the sentinel.
+                let name = if let Some(owner) = b.owner_class() {
+                    b.module.intern_const(Const::String(format!(
+                        "$sgetter${owner}\u{1f}{}",
+                        segments[0].name
+                    )))
+                } else {
+                    b.module
+                        .intern_const(Const::String(segments[0].name.clone()))
+                };
                 b.push(Inst::LoadFromThisOrGlobal {
                     dst,
                     this_idx,
@@ -1812,8 +1837,22 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                     // keeps the existing behavior.
                     let recv_mismatch = f.receiver_type.as_ref().is_some_and(|rt| {
                         let rn = rt.name.name.as_str();
-                        b.recv_ty()
-                            .is_some_and(|cur| cur != rn && b.owner_class() != Some(rn))
+                        // Positive receiver mismatch: the current receiver
+                        // type is known and is neither the extension's
+                        // receiver nor the enclosing class.
+                        let positive = b
+                            .recv_ty()
+                            .is_some_and(|cur| cur != rn && b.owner_class() != Some(rn));
+                        // Enclosing-member precedence: the lexically enclosing
+                        // class declares its own `nm`, so that member wins
+                        // over a same-named imported extension (Kotlin scopes
+                        // members ahead of non-local extensions). Without this
+                        // a bare `get(Job)` inside `CoroutineContext.job`
+                        // splices the unrelated `HttpClient.get` extension
+                        // instead of the context's `get` operator.
+                        let member_wins = b.has_enclosing_member(nm)
+                            && b.owner_class().is_some_and(|oc| oc != rn);
+                        positive || member_wins
                     });
                     let needs_inline = !recv_mismatch
                         && (f.is_suspend
@@ -3763,6 +3802,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let outer_names: std::collections::HashSet<String> = b.visible_names();
             let inherited_rlp = b.receiver_lambda_param_names();
             let outer_boxed = b.boxed_vars_snapshot();
+            let enclosing_owner = b
+                .owner_class()
+                .map(|o| (o.to_string(), b.enclosing_members_for_child()));
             let (body_func, captured_names) = lower_lambda_body_capturing(
                 b.module,
                 params,
@@ -3770,6 +3812,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 outer_names,
                 &outer_boxed,
                 inherited_rlp,
+                enclosing_owner,
             );
             // Record the implicit label (the enclosing call's simple name,
             // re-armed by `lower_arg_run`) so `this@<label>` inside the
@@ -4189,6 +4232,9 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let outer_names: std::collections::HashSet<String> = b.visible_names();
             let inherited_rlp = b.receiver_lambda_param_names();
             let outer_boxed = b.boxed_vars_snapshot();
+            let enclosing_owner = b
+                .owner_class()
+                .map(|o| (o.to_string(), b.enclosing_members_for_child()));
             let (body_func, captured_names) = lower_lambda_body_capturing_kind(
                 b.module,
                 &param_idents,
@@ -4198,6 +4244,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 &outer_boxed,
                 None,
                 inherited_rlp,
+                enclosing_owner,
             );
             let captures: Vec<Reg> = captured_names
                 .iter()

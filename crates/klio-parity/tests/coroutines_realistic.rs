@@ -51,6 +51,23 @@ fun main() = runBlocking {
 }
 
 #[test]
+fn async_coroutine_carries_active_job_in_context() {
+    // A coroutine started by `async` carries its own `Job` in the running
+    // `coroutineContext`, and that job is active while the body runs.
+    let src = r#"
+import kotlinx.coroutines.*
+fun main() = runBlocking {
+    val d = async {
+        val job = coroutineContext[Job]
+        "present=${job != null} active=${job?.isActive}"
+    }
+    println(d.await())
+}
+"#;
+    assert_klio("async_job_in_context", src, "present=true active=true\n");
+}
+
+#[test]
 fn cancellation_propagates_to_children() {
     let src = r#"
 import kotlinx.coroutines.*

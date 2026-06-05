@@ -86,6 +86,13 @@ pub struct FuncBuilder<'a> {
     /// body lowering to know whether an unqualified `foo(...)`
     /// is `this.foo(...)` (a class member) or a global lookup.
     own_members: std::collections::HashSet<String>,
+    /// Member names of the lexically enclosing class, carried into a
+    /// lambda body. Unlike `own_members` this never reroutes a bare
+    /// reference through `this.<member>` (a lambda's own `this` is not
+    /// the enclosing receiver); it only lets an enclosing member
+    /// out-prioritise a same-named imported extension when deciding
+    /// whether to splice an inline extension fn.
+    enclosing_members: std::collections::HashSet<String>,
     /// Private methods of `owner_class` that have already been
     /// lowered (so their `FuncIds` are known). A bare call in this
     /// builder's body resolving to a name in this map binds
@@ -221,6 +228,7 @@ impl<'a> FuncBuilder<'a> {
             owner_class: None,
             recv_ty: None,
             own_members: std::collections::HashSet::new(),
+            enclosing_members: std::collections::HashSet::new(),
             private_method_fids: std::collections::HashMap::new(),
             tailrec_self: None,
             param_names: std::collections::HashSet::new(),
@@ -528,6 +536,31 @@ impl<'a> FuncBuilder<'a> {
     }
     pub fn set_own_members(&mut self, set: std::collections::HashSet<String>) {
         self.own_members = set;
+    }
+    #[must_use]
+    pub fn own_members(&self) -> &std::collections::HashSet<String> {
+        &self.own_members
+    }
+    pub fn set_enclosing_members(&mut self, set: std::collections::HashSet<String>) {
+        self.enclosing_members = set;
+    }
+    /// The lexically enclosing class declares a member named `name` —
+    /// either this builder *is* a class-member body (`own_members`) or a
+    /// lambda that inherited its enclosing class's member set.
+    #[must_use]
+    pub fn has_enclosing_member(&self, name: &str) -> bool {
+        self.own_members.contains(name) || self.enclosing_members.contains(name)
+    }
+    /// The enclosing-class member set to hand a lambda lowered inside this
+    /// builder: a class-member body contributes its `own_members`; a lambda
+    /// forwards the set it already inherited.
+    #[must_use]
+    pub fn enclosing_members_for_child(&self) -> std::collections::HashSet<String> {
+        if self.own_members.is_empty() {
+            self.enclosing_members.clone()
+        } else {
+            self.own_members.clone()
+        }
     }
     pub fn set_private_method_fids(
         &mut self,

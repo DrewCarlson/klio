@@ -53,6 +53,31 @@ impl VmHost<'_> {
             CC_EXPLICIT_READ.with(|c| c.set(false));
             return r;
         }
+        // Scope-qualified property read (`$sgetter$<owner>\u{1f}<name>`):
+        // a bare member-property read inside a method/lambda binds the
+        // *lexically enclosing* class's own custom getter, not an
+        // inherited/derived same-named member. Kotlin's two private
+        // `closed` — `HttpClientEngine.closed` (a Boolean getter) and
+        // `HttpClientEngineBase.closed` (an AtomicBoolean field) — don't
+        // override each other; code in `HttpClientEngine` must reach its
+        // own getter, while `HttpClientEngineBase.close()` reaches its
+        // field. Invoke the owner's custom getter when one is declared;
+        // otherwise fall back to the ordinary field/getter walk.
+        if let Some(rest) = name.strip_prefix("$sgetter$")
+            && let Some((owner, prop)) = rest.split_once('\u{1f}')
+        {
+            if let Some(fid) = self
+                .prog
+                .instance_prop_getters
+                .get(&(owner.to_string(), prop.to_string()))
+                .copied()
+                && let Some(func) = self.module.funcs.get(fid.0 as usize).cloned()
+            {
+                let module = Arc::clone(&self.module);
+                return klio_ir::eval::eval_with(&module, &func, vec![receiver.clone()], self);
+            }
+            return self.get_field(receiver, prop);
+        }
         // Suspend-implicit `kotlin.coroutines.coroutineContext`
         // intrinsic: it is the *running* coroutine's context, not a
         // member of whatever `this` a suspend member carries. klio

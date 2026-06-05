@@ -123,9 +123,11 @@ pub trait IntrinsicHost {
     /// (no scheduling).
     fn coroutine_run_root(
         &mut self,
+        scope: Option<&Value>,
         block: &Value,
         out: &mut dyn Output,
     ) -> Result<Value, RuntimeError> {
+        let _ = scope;
         self.invoke_callable(block, &[], out)
     }
 

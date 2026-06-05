@@ -128,7 +128,7 @@ internal class KlioStartContinuation<T>(
         // and the later resume drives it to the real result.
         val comp = completion
         val b = body
-        __klio_co_runRoot {
+        __klio_co_runRoot(comp) {
             val r: Result<T> = try {
                 Result.success(b())
             } catch (e: Throwable) {
