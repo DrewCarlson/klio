@@ -805,37 +805,35 @@ validated, then the corresponding shim file is deleted):
           reference) — capture and positional delivery are independent;
        5. a function-typed / constructor-reference property (`createConfiguration`)
           invoked by bare name reads the field and invokes the stored callable.
-     `HttpClient(KlioClient)` constructs in a plain `fun main`. Two
-     lowering-level blockers remain before the request DSL works end to end
-     (both diagnosed; a runtime-only fix for each regresses the coroutine
-     suite, so they need a lowering signal, not a runtime heuristic):
-       - **runBlocking construction.** `HttpClient(engineFactory)` ends with
-         `client.coroutineContext[Job]!!`. Inside `runBlocking` an active
-         coroutine scope is set, and klio's get_field redirects *any*
-         `x.coroutineContext` read to that ambient scope (so the explicit read
-         on the `CoroutineScope` `HttpClient`, which owns
-         `engine.coroutineContext + clientJob`, returns the wrong context and
-         the `!!` NPEs). The redirect exists for the bare-implicit suspend
-         `kotlin.coroutines.coroutineContext` intrinsic; gating it on
-         "receiver has no own `coroutineContext` member" fixes the client read
-         but breaks `yield` (whose internal bare read has a member-bearing
-         receiver yet wants the running context). Fix: lower the *implicit*
-         bare `coroutineContext` to a distinct form so only it redirects;
-         an explicit `recv.coroutineContext` is a plain field read.
-       - **request DSL (`client.get(url)` etc.).** A bare `block()` where
-         `block: T.() -> R` is a param must run against the *call-site*
-         enclosing receiver (the builder), not `block`'s creation-scope `this`.
-         It works in a plain `fun main` (the param's `this`-capture is empty,
-         so the runtime override fires) but fails inside `runBlocking` (the
-         capture is pre-populated with the coroutine scope's `this`).
-         Unconditionally rebinding at the `CallValue` site regresses coroutine
-         `launch`/`async` block dispatch (the runtime can't tell a receiver
-         lambda from a `this`-capturing closure). Fix: lower `block()` for a
-         receiver-function-typed param to a receiver call that forwards the
-         current receiver. Files staged for this (`request/builders.kt`,
-         `request/buildersWithUrl.kt`, `request/utils.kt`,
-         `statement/HttpStatement.kt`, `statement/Readers.kt`) are NOT yet in
-         the include list — add them with the lowering fix.
+     **`HttpClient(KlioClient)` constructs, including inside `runBlocking`.**
+     Two general interpreter fixes landed for it (both kotlinc-parity tested):
+       - **Explicit `recv.coroutineContext`** is lowered to a sentinel field so
+         get_field reads the receiver's own context instead of redirecting to
+         the ambient running context. The redirect exists only for the
+         suspend-implicit bare `coroutineContext` intrinsic; an explicit read on
+         a `CoroutineScope` (ktor's `HttpClient`, owning
+         `engine.coroutineContext + clientJob`) must read that field, so
+         `client.coroutineContext[Job]!!` no longer NPEs under `runBlocking`.
+       - **Bare `block()` of a receiver-lambda param** (`block: T.() -> R`)
+         dispatches against the call-site enclosing receiver — threaded through
+         capture boundaries and inline splices (the prior commit) so composing
+         receiver-lambda builders work.
+     One blocker remains before the request DSL (`client.get(url)`) runs end to
+     end: **overloaded `inline fun` resolution.** `get`/`request` ship multiple
+     `inline` overloads (`get(builder: HttpRequestBuilder)` vs
+     `get(block: HttpRequestBuilder.() -> Unit)`); klio's inline-fn table is
+     keyed by simple name and keeps one overload per name, so `get { … }` binds
+     the value-param form and a lambda lands where a builder is expected
+     (`builder.method = …` on a `Function`). A shape-only picker (arity +
+     trailing-lambda) fixes the bare `get`/`request` case but mis-resolves
+     *member* inline calls of the same name on different receivers
+     (`url.takeFrom`, `headers.append`) — it needs receiver-type awareness the
+     untyped lowering doesn't have. Fix: make the inline-overload table
+     multi-valued and resolve by arity + trailing-lambda + receiver type (the
+     last from the call's receiver expression / `recv_ty`). The DSL files
+     (`request/builders.kt`, `request/buildersWithUrl.kt`, `request/utils.kt`,
+     `statement/HttpStatement.kt`, `statement/Readers.kt`) are staged but NOT
+     in the include list — add them with that fix.
      Then validate `HttpClient.execute` end to end, point `client` at
      `client-upstream`, and delete `shim/client/*`.
 4. **Server core** — `Application`/`ApplicationCall`/`ApplicationCallPipeline`,

@@ -198,7 +198,11 @@ fun main() = runBlocking {{
 /// Construct the upstream `HttpClient` end to end: `HttpClient(KlioClient)`
 /// drives the full init — the default plugin installs through
 /// `HttpClientConfig` + the `createClientPlugin` API + the klio engine
-/// actual. Exercises (through real ktor code) the construction fixes:
+/// actual. Runs inside `runBlocking` so the factory's
+/// `client.coroutineContext[Job]!!` reads the client's own context
+/// (`engine.coroutineContext + clientJob`), not the ambient running
+/// context — guarding the explicit-`coroutineContext` resolution fix.
+/// Exercises (through real ktor code) the construction fixes:
 /// enclosing-`this` chain resolution in `with(userConfig){…}`, reified
 /// type-arg inference in plugin `key` initializers, the unchecked
 /// `as TBuilder` cast, receiver→named-param binding when `config.install`
@@ -215,8 +219,9 @@ fn ktor_upstream_httpclient_constructs() {
         r#"
 import io.ktor.client.*
 import io.ktor.client.engine.klio.*
+import kotlinx.coroutines.runBlocking
 
-fun main() {
+fun main() = runBlocking {
     val client = HttpClient(KlioClient)
     println("constructed")
     client.close()

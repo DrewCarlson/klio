@@ -1106,6 +1106,28 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 b.push(Inst::LoadGlobal { dst, name: n });
                 return dst;
             }
+            // An explicit `recv.coroutineContext` is a literal field read —
+            // never the suspend-implicit running-context intrinsic — so it
+            // must not be redirected to the active coroutine scope. A
+            // `CoroutineScope` such as ktor's `HttpClient` owns its own
+            // `coroutineContext` (`engine.coroutineContext + clientJob`), and
+            // `client.coroutineContext[Job]` must read *that*. The sentinel
+            // field name signals get_field to skip the bare-`coroutineContext`
+            // redirect (which still applies to the implicit single-segment
+            // form lowered elsewhere).
+            if name.name == "coroutineContext" {
+                let recv = lower_receiver(b, receiver);
+                let dst = b.alloc_reg();
+                let field = b
+                    .module
+                    .intern_const(Const::String("$coroutineContext$explicit".to_string()));
+                b.push(Inst::GetField {
+                    dst,
+                    receiver: recv,
+                    field,
+                });
+                return dst;
+            }
             let recv = lower_receiver(b, receiver);
             let dst = b.alloc_reg();
             let field = b.module.intern_const(Const::String(name.name.clone()));

@@ -3,6 +3,14 @@ use crate::{
     with_field_resolve_pair, with_outer_this,
 };
 
+thread_local! {
+    /// Set while reading the real `coroutineContext` field for an
+    /// explicit `recv.coroutineContext` (the `$coroutineContext$explicit`
+    /// sentinel), so the suspend-implicit redirect is skipped for that
+    /// one read.
+    static CC_EXPLICIT_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl VmHost<'_> {
     // One long field-resolution dispatch chain; splitting it would fragment
     // the ordered fallthrough. Casts reinterpret a thread id (i64 as u64),
@@ -34,6 +42,17 @@ impl VmHost<'_> {
             };
             return Ok(klio_runtime::Value::String(Arc::new(v)));
         }
+        // Explicit `recv.coroutineContext` (lowered to this sentinel):
+        // a literal field read that bypasses the bare-`coroutineContext`
+        // redirect below, so a `CoroutineScope` reads its own stored
+        // context (`HttpClient`'s `engine.coroutineContext + clientJob`)
+        // rather than the ambient running context.
+        if name == "$coroutineContext$explicit" {
+            CC_EXPLICIT_READ.with(|c| c.set(true));
+            let r = self.get_field(receiver, "coroutineContext");
+            CC_EXPLICIT_READ.with(|c| c.set(false));
+            return r;
+        }
         // Suspend-implicit `kotlin.coroutines.coroutineContext`
         // intrinsic: it is the *running* coroutine's context, not a
         // member of whatever `this` a suspend member carries. klio
@@ -42,6 +61,7 @@ impl VmHost<'_> {
         // `coroutineContext` getter (receiver == the active scope)
         // resolves normally — no redirect, no recursion.
         if name == "coroutineContext"
+            && !CC_EXPLICIT_READ.with(std::cell::Cell::get)
             && let Some(scope) = active_coro_scope()
         {
             let same = matches!(
