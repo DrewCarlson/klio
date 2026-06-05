@@ -1,4 +1,4 @@
-use super::inline_state::{inline_expand_enter, inline_expand_leave, inline_fn_ast};
+use super::inline_state::{inline_expand_enter, inline_expand_leave, inline_fn_ast_for};
 use super::{lower_block, lower_expr};
 use crate::build::FuncBuilder;
 use crate::{Const, Inst, Reg, Terminator};
@@ -219,7 +219,15 @@ pub(super) fn try_inline_call_with_type_args(
     type_args: &[klio_ast::TypeRef],
     expected: Option<&klio_ast::TypeRef>,
 ) -> Option<Reg> {
-    let f = inline_fn_ast(fname)?;
+    // Resolve the inline overload matching this call's shape (so an
+    // overloaded inline fn binds the function-param form for a trailing
+    // lambda); conservative — falls back to the first overload otherwise.
+    let call_shape = (
+        args.len(),
+        args.last()
+            .is_some_and(|a| matches!(a, Expr::Lambda { .. } | Expr::AnonFun { .. })),
+    );
+    let f = inline_fn_ast_for(fname, Some(call_shape))?;
     if b.inline_in_progress(fname) {
         return None;
     }

@@ -157,6 +157,29 @@ fun main() { println(makeGetUrl("u").method) }
     );
 }
 
+// An overloaded `suspend inline fun` (a value-param form and a
+// function-param form, like ktor's `get(builder)` / `get(block)`) binds a
+// trailing-lambda call to the function-param overload. klio's inline-fn
+// table is keyed by simple name, so without shape-aware overload selection
+// the lambda would land on the value-param form. (kotlinc parity is
+// skipped — a standalone coroutine program needs the kotlinx-coroutines
+// classpath the parity oracle lacks; the klio assertion is the guard.)
+#[test]
+fn overloaded_suspend_inline_picks_function_param_for_lambda() {
+    assert_klio(
+        "overloaded_suspend_inline_picks_function_param_for_lambda",
+        r#"
+import kotlinx.coroutines.runBlocking
+class B { var m = "" }
+suspend inline fun pick(b: B): B { b.m = "V"; return b }
+suspend inline fun pick(block: B.() -> Unit): B = pick(B().apply(block))
+suspend fun run2(): String = pick { m = "L" }.m
+fun main() { runBlocking { println(run2()) } }
+"#,
+        "V\n",
+    );
+}
+
 // A function-typed property — including a constructor reference
 // `::Config` — invoked by bare name inside a method (here reached via an
 // inlined `apply { }` body, where the member-call lowering loses the

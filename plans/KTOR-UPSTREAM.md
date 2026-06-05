@@ -818,24 +818,31 @@ validated, then the corresponding shim file is deleted):
          dispatches against the call-site enclosing receiver — threaded through
          capture boundaries and inline splices (the prior commit) so composing
          receiver-lambda builders work.
+     **Overloaded `inline fun` resolution landed.** `get`/`request` ship
+     multiple `inline` overloads (`get(builder: HttpRequestBuilder)` vs
+     `get(block: HttpRequestBuilder.() -> Unit)`); the inline-fn table is now
+     multi-valued and a trailing-lambda call binds the function-param overload
+     (the lambda fills the last param; leading params covered by the remaining
+     positional args). Conservative — it only re-picks for a trailing-lambda
+     call with a unique fitting function-param overload, so member inline calls
+     of a shared name (`url.takeFrom`) are untouched. Verified: the request
+     builder + a suspend-inline overload repro pass.
      One blocker remains before the request DSL (`client.get(url)`) runs end to
-     end: **overloaded `inline fun` resolution.** `get`/`request` ship multiple
-     `inline` overloads (`get(builder: HttpRequestBuilder)` vs
-     `get(block: HttpRequestBuilder.() -> Unit)`); klio's inline-fn table is
-     keyed by simple name and keeps one overload per name, so `get { … }` binds
-     the value-param form and a lambda lands where a builder is expected
-     (`builder.method = …` on a `Function`). A shape-only picker (arity +
-     trailing-lambda) fixes the bare `get`/`request` case but mis-resolves
-     *member* inline calls of the same name on different receivers
-     (`url.takeFrom`, `headers.append`) — it needs receiver-type awareness the
-     untyped lowering doesn't have. Fix: make the inline-overload table
-     multi-valued and resolve by arity + trailing-lambda + receiver type (the
-     last from the call's receiver expression / `recv_ty`). The DSL files
-     (`request/builders.kt`, `request/buildersWithUrl.kt`, `request/utils.kt`,
-     `statement/HttpStatement.kt`, `statement/Readers.kt`) are staged but NOT
-     in the include list — add them with that fix.
-     Then validate `HttpClient.execute` end to end, point `client` at
-     `client-upstream`, and delete `shim/client/*`.
+     end: **consuming `request/builders.kt` regresses the request builder.**
+     With `builders.kt` in the include list, an unrelated program doing
+     `b.url.takeFrom(s)` / `b.build()` fails (`set method on Int` /
+     `get_field originUrl`). Confirmed independent of the overload picker (it
+     reproduces with the picker reverted), so it is a load-time collision /
+     resolution shift from the `request`/`get`/… overloads `builders.kt` adds —
+     not yet diagnosed. The DSL files (`request/builders.kt`,
+     `request/buildersWithUrl.kt`, `request/utils.kt`,
+     `statement/HttpStatement.kt`, `statement/Readers.kt`, plus
+     `plugins/HttpTimeout.kt` and `utils/ClientEvents.kt` for
+     `unwrapRequestTimeoutException` / `HttpRequestCreated`) are staged but NOT
+     in the include list — add them once that collision is fixed.
+     Then validate `HttpClient.execute` end to end (its request pipeline must
+     yield an `HttpClientCall` — the next layer after the builder), point
+     `client` at `client-upstream`, and delete `shim/client/*`.
 4. **Server core** — `Application`/`ApplicationCall`/`ApplicationCallPipeline`,
    routing, `respondText`; klio engine `actual` over `__kktor_serve`; delete
    `shim/server/*`.

@@ -2,7 +2,8 @@ use super::{
     AstBinOp, AstBlock, AstUnOp, BinOp, BlockId, Const, Expr, Func, FuncBuilder, FuncId, Inst, Reg,
     Stmt, Terminator, UnOp, arg_lambda_has_nonlocal_return, ast_binop, boxed_cell_reg,
     callee_label, collect_dotted_fqn, collect_path_idents, collect_path_idents_stmt, expr_span,
-    inline_fn_ast, intern_arg_names, intern_type_args, is_any_typed_path, is_boxed_to_any_form,
+    inline_fn_ast, inline_fn_ast_for, intern_arg_names, intern_type_args, is_any_typed_path,
+    is_boxed_to_any_form,
     is_lower_anon_capture, is_package_head, is_pkg_root, lambda_mutated_outer_vars,
     lambda_writes_outer_var, lower_arg_run, lower_for, lower_for_labeled,
     lower_lambda_body_capturing, lower_lambda_body_capturing_kind, lower_stmt, lower_when,
@@ -1635,7 +1636,15 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 if let Some(lam) = b.inline_lambda_for(nm) {
                     return splice_inline_lambda(b, &lam, args);
                 }
-                if let Some(f) = inline_fn_ast(nm) {
+                // Pick the inline overload by call shape so an overloaded
+                // `inline fun get(builder)` / `get(block)` binds a trailing
+                // lambda to the function-param form.
+                let inline_call_shape = (
+                    args.len(),
+                    args.last()
+                        .is_some_and(|a| matches!(a, Expr::Lambda { .. } | Expr::AnonFun { .. })),
+                );
+                if let Some(f) = inline_fn_ast_for(nm, Some(inline_call_shape)) {
                     // Inline a suspending builder (continuation
                     // capture), an inline fn whose lambda arg
                     // does a non-local `return` (must target

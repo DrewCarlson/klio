@@ -1040,12 +1040,15 @@ fn build_module_with_overrides(
     {
         fn collect_inline(
             d: &Decl,
-            out: &mut std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>>,
+            out: &mut std::collections::HashMap<String, Vec<std::rc::Rc<klio_ast::Function>>>,
         ) {
             match d {
                 Decl::Function(f) if f.is_inline && f.body.is_some() => {
+                    // Keep every overload (declaration order) so a call site
+                    // can pick the function-param form for a trailing lambda.
                     out.entry(f.name.name.clone())
-                        .or_insert_with(|| std::rc::Rc::new(f.clone()));
+                        .or_default()
+                        .push(std::rc::Rc::new(f.clone()));
                 }
                 Decl::Class(c) => {
                     for m in &c.members {
@@ -1060,8 +1063,10 @@ fn build_module_with_overrides(
                 _ => {}
             }
         }
-        let mut inline_fns: std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>> =
-            std::collections::HashMap::new();
+        let mut inline_fns: std::collections::HashMap<
+            String,
+            Vec<std::rc::Rc<klio_ast::Function>>,
+        > = std::collections::HashMap::new();
         for d in &all_decls {
             collect_inline(d, &mut inline_fns);
         }

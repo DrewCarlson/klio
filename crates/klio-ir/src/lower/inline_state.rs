@@ -12,7 +12,7 @@ thread_local! {
     /// klio's frame-kind non-local-return mechanism, so the inline
     /// blast radius stays minimal.
     static INLINE_FN_ASTS: std::cell::RefCell<
-        std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>>,
+        std::collections::HashMap<String, Vec<std::rc::Rc<klio_ast::Function>>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 
     /// Simple names that a default-imported host binding owns (e.g.
@@ -36,9 +36,12 @@ thread_local! {
     };
 }
 
-/// Install the suspend-inline-fn AST table for the current build.
+/// Install the suspend-inline-fn AST table for the current build. Each
+/// simple name maps to all its inline overloads (declaration order) so a
+/// call site can disambiguate a function-param overload from a value-param
+/// one by the trailing-arg shape.
 pub fn set_inline_fn_asts<S: ::std::hash::BuildHasher>(
-    m: std::collections::HashMap<String, std::rc::Rc<klio_ast::Function>, S>,
+    m: std::collections::HashMap<String, Vec<std::rc::Rc<klio_ast::Function>>, S>,
 ) {
     INLINE_FN_ASTS.with(|c| *c.borrow_mut() = m.into_iter().collect());
 }
@@ -55,11 +58,68 @@ pub fn set_shadowed_inline_names<S: ::std::hash::BuildHasher>(
 }
 
 pub(super) fn inline_fn_ast(name: &str) -> Option<std::rc::Rc<klio_ast::Function>> {
+    inline_fn_ast_for(name, None)
+}
+
+/// Resolve the inline overload of `name` for a call whose shape is
+/// `call = (positional_arg_count, last_arg_is_lambda)`.
+///
+/// Deliberately conservative: returns the first-declared overload (the
+/// historical single-table behavior) in every case *except* a
+/// trailing-lambda call for which exactly one arity-fitting overload has a
+/// function-typed last parameter — then that overload wins. This is the
+/// minimal change that lets `get { … }` bind `get(block: …() -> Unit)`
+/// rather than the first-declared `get(builder)` value form, without
+/// re-resolving any non-lambda or single-overload call (so member inline
+/// calls of a shared name on different receivers are untouched).
+pub(super) fn inline_fn_ast_for(
+    name: &str,
+    call: Option<(usize, bool)>,
+) -> Option<std::rc::Rc<klio_ast::Function>> {
     let shadowed = SHADOWED_INLINE_NAMES.with(|c| c.borrow().contains(name));
     if shadowed {
         return None;
     }
-    INLINE_FN_ASTS.with(|c| c.borrow().get(name).cloned())
+    INLINE_FN_ASTS.with(|c| {
+        let map = c.borrow();
+        let cands = map.get(name)?;
+        let first = cands.first().cloned();
+        let Some((want, true)) = call else {
+            return first;
+        };
+        if cands.len() < 2 {
+            return first;
+        }
+        // A trailing-lambda call `f(a, …) { lambda }` binds the lambda to
+        // the overload's *last* parameter (which must be function-typed),
+        // and the `want - 1` leading positional args must satisfy the
+        // remaining leading parameters (with defaults/varargs filling the
+        // rest). `get { }` (want = 1) thus fits `get(block)` but not
+        // `get(urlString, block)` — the lambda can't supply `urlString`.
+        let lead = want.saturating_sub(1);
+        let fits_trailing_lambda = |f: &klio_ast::Function| {
+            let n = f.params.len();
+            if n == 0 {
+                return false;
+            }
+            if f.params[n - 1].ty.function.is_none() {
+                return false;
+            }
+            let leading = &f.params[..n - 1];
+            let required = leading
+                .iter()
+                .filter(|p| p.default.is_none() && !p.is_vararg)
+                .count();
+            let last_lead_vararg = leading.last().is_some_and(|p| p.is_vararg);
+            lead >= required && (lead <= leading.len() || last_lead_vararg)
+        };
+        let mut matches: Vec<&std::rc::Rc<klio_ast::Function>> =
+            cands.iter().filter(|f| fits_trailing_lambda(f)).collect();
+        if matches.len() == 1 {
+            return matches.pop().cloned();
+        }
+        first
+    })
 }
 
 const INLINE_EXPAND_MAX: u32 = 8;
