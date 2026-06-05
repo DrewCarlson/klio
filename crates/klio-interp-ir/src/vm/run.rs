@@ -313,44 +313,63 @@ impl Vm {
                 .get(fid.0 as usize)
                 .cloned()
                 .ok_or(VmError::InvalidMain)?;
-            let v = {
+            let v_opt = {
                 let _tl = TlInitGuard::enter();
                 let mut host = self.make_host(out);
-                let mut v = klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host)
-                    .map_err(VmError::from)?;
-                if module.registry.top_level_delegated_props.contains(name)
-                    && let klio_runtime::Value::Instance(ref inst) = v
-                {
-                    let dcls_name = inst.borrow().class.name.clone();
-                    let has_provide = module
-                        .classes
-                        .iter()
-                        .find(|c| c.name == dcls_name)
-                        .is_some_and(|c| {
-                            c.methods.iter().any(|fid| {
-                                module
-                                    .funcs
-                                    .get(fid.0 as usize)
-                                    .is_some_and(|f| f.name == "provideDelegate")
-                            })
-                        });
-                    if has_provide {
-                        let prop_ref = klio_runtime::Value::PropertyRef {
-                            name: Arc::new(name.clone()),
-                        };
-                        if let Ok(replacement) = <VmHost as klio_ir::eval::Host>::call_member(
-                            &mut host,
-                            &v,
-                            "provideDelegate",
-                            &[klio_runtime::Value::Null, prop_ref],
-                        ) {
-                            v = replacement;
+                match klio_ir::eval::eval_with(&module, &init_func, Vec::new(), &mut host) {
+                    Ok(mut v) => {
+                        if module.registry.top_level_delegated_props.contains(name)
+                            && let klio_runtime::Value::Instance(ref inst) = v
+                        {
+                            let dcls_name = inst.borrow().class.name.clone();
+                            let has_provide = module
+                                .classes
+                                .iter()
+                                .find(|c| c.name == dcls_name)
+                                .is_some_and(|c| {
+                                    c.methods.iter().any(|fid| {
+                                        module
+                                            .funcs
+                                            .get(fid.0 as usize)
+                                            .is_some_and(|f| f.name == "provideDelegate")
+                                    })
+                                });
+                            if has_provide {
+                                let prop_ref = klio_runtime::Value::PropertyRef {
+                                    name: Arc::new(name.clone()),
+                                };
+                                if let Ok(replacement) =
+                                    <VmHost as klio_ir::eval::Host>::call_member(
+                                        &mut host,
+                                        &v,
+                                        "provideDelegate",
+                                        &[klio_runtime::Value::Null, prop_ref],
+                                    )
+                                {
+                                    v = replacement;
+                                }
+                            }
                         }
+                        Some(v)
                     }
+                    // A top-level `val` whose initializer references a symbol
+                    // not yet consumed (staged pack consumption — e.g. ktor's
+                    // `DEFAULT_CAPABILITIES = setOf(HttpTimeoutCapability)`
+                    // before the timeout plugin is consumed) is deferred to
+                    // on-access (`lookup_global` re-runs it via
+                    // `top_level_prop_inits`), rather than aborting the whole
+                    // load. Only a missing-symbol failure defers; a genuine
+                    // initializer error still propagates.
+                    Err(
+                        klio_ir::eval::EvalError::Unbound(_)
+                        | klio_ir::eval::EvalError::Unimplemented(_),
+                    ) => None,
+                    Err(e) => return Err(VmError::from(e)),
                 }
-                v
             };
-            self.globals.borrow_mut().define(name, v);
+            if let Some(v) = v_opt {
+                self.globals.borrow_mut().define(name, v);
+            }
         }
         // Patch enum-entry instance fields with evaluated ctor args.
         let enum_inits: Vec<(String, String, Vec<klio_ir::FuncId>)> =

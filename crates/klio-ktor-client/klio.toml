@@ -132,16 +132,20 @@ include = [
     "io/ktor/http/URLBuilderPosix.kt",
 ]
 
-# Client-core foundation (cores stage 1 — engine boundary). `EmptyContent` is
-# the request-body default; `HttpClientEngineConfig` is the engine config base.
-# (`HttpClientEngineCapability` is deferred: its eager `DEFAULT_CAPABILITIES`
-# references the timeout plugin's `HttpTimeoutCapability`, pulling the plugin
-# layer.)
+# Client-core foundation (cores stage 1 — engine boundary). These are the
+# client-core types with no `shim/client` equivalent, so they sit in core
+# without colliding: `EmptyContent` (request-body default), the engine config
+# base, and the engine-capability interface (`HttpClientEngineCapability`'s
+# eager `DEFAULT_CAPABILITIES` references the not-yet-consumed timeout plugin;
+# klio defers a missing-symbol top-level-val init to on-access). Client types
+# that DO shadow the shim (`HttpRequestBuilder`/`HttpResponse`/`HttpClient`)
+# wait for the stage-3 feature swap.
 [[source]]
 root = "upstream/ktor-client/ktor-client-core/common/src"
 include = [
     "io/ktor/client/utils/Content.kt",
     "io/ktor/client/engine/HttpClientEngineConfig.kt",
+    "io/ktor/client/engine/HttpClientEngineCapability.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)

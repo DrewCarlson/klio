@@ -714,30 +714,45 @@ body is a buffered read-side `ByteReadChannel`). Plugins are the main unknown:
 Stages (each ends green with the shim still present until its replacement is
 validated, then the corresponding shim file is deleted):
 
-1. **Engine boundary** — consume `HttpClientEngine` / `HttpClientEngineBase` /
-   `HttpClientEngineConfig` / `HttpRequestData` / `HttpResponseData` +
-   `EmptyContent`; write the klio engine `actual` (build an `HttpResponseData`
-   from `__kktor_request`'s bytes via a read-side `ByteReadChannel`).
-   *In progress:* `EmptyContent`, `io.ktor.util.date.GMTDate` (klio UTC
-   calendar-math actuals + `getTimeMillis` intrinsic), and
-   `HttpClientEngineConfig` are consumed (verified by
-   `ktor_date_and_empty_content_from_upstream`). **Loading finding:** klio
-   tolerates an *unresolved type reference* in a consumed file (a field/param
-   annotation or unused method body — e.g. `HttpClientEngineConfig.proxy:
-   ProxyConfig?` with `ProxyConfig` not yet consumed), but an *eager top-level
-   `val`* that references an unconsumed symbol breaks the whole pack load
-   (`HttpClientEngineCapability`'s `DEFAULT_CAPABILITIES = setOf(
-   HttpTimeoutCapability)` → must consume/stub the timeout plugin first). So
-   the consumption order is: pull each file, then satisfy only its
-   *eager-init* references (types-in-signatures resolve lazily). Next:
-   `HttpRequestData`/`HttpResponseData` + `HttpClientEngine`/`Base` + the klio
-   engine `actual`, satisfying the eager-init refs (`ENGINE_CAPABILITIES_KEY`,
-   `DEFAULT_CAPABILITIES`) as they surface.
+0. **Non-colliding foundation (in core).** Client-core types with no
+   `shim/client` equivalent sit in core safely. Consumed: `EmptyContent`,
+   `io.ktor.util.date.GMTDate` (klio UTC calendar-math actuals +
+   `getTimeMillis` intrinsic), `HttpClientEngineConfig`,
+   `HttpClientEngineCapability` (verified by
+   `ktor_date_and_empty_content_from_upstream`).
+
+   Two loading findings shape the rest:
+   - klio tolerates an *unresolved type reference* in a consumed file
+     (field/param annotation or unused method body — e.g.
+     `HttpClientEngineConfig.proxy: ProxyConfig?`), but an *eager top-level
+     `val`* referencing an unconsumed symbol used to abort the whole load.
+     **Fixed:** a missing-symbol (`Unbound`/`Unimplemented`) top-level-val
+     init now defers to on-access (like a lazy object) instead of aborting, so
+     `HttpClientEngineCapability`'s `DEFAULT_CAPABILITIES = setOf(
+     HttpTimeoutCapability)` no longer blocks while the timeout plugin is
+     unconsumed.
+   - **Collision constraint:** an upstream client type that shadows a
+     `shim/client` declaration (`HttpRequestBuilder`/`HttpResponse`/`HttpClient`
+     — and their file-mates, e.g. `HttpRequestData`/`HttpResponseData` live in
+     `HttpRequest.kt` *with* `HttpRequestBuilder`) cannot sit in core: under
+     `--feature client` both the shim and the upstream copy load and collide
+     (shim `url: String` vs upstream `url: URLBuilder`). So all shim-shadowing
+     client files — and the data types entangled with them — move to the
+     stage-3 swap.
+
+1. **Engine boundary (remaining).** `HttpClientEngine` / `HttpClientEngineBase`
+   + the klio engine `actual` (build an `HttpResponseData` from
+   `__kktor_request`'s bytes via a read-side `ByteReadChannel`). The data types
+   `HttpRequestData`/`HttpResponseData` are entangled with `HttpRequestBuilder`
+   in `HttpRequest.kt`, so they land with the stage-3 swap, not in core.
 2. **Call + statement** — `HttpClientCall`, `HttpRequest`/`HttpResponse`,
    `DefaultHttpRequest`/`DefaultHttpResponse`, `HttpStatement`.
-3. **Pipelines + `HttpClient`** — `HttpRequestPipeline`/`HttpSendPipeline`/
-   `HttpReceivePipeline`/`HttpResponsePipeline`, then `HttpClient` with a
-   minimal default-plugin set; delete `shim/client/*`.
+3. **Pipelines + `HttpClient` (the swap)** — build the upstream client files
+   into the `client` *feature* (replacing `shim/client` rather than core):
+   `HttpRequest.kt` (builder + data types), `HttpRequestPipeline`/
+   `HttpSendPipeline`/`HttpReceivePipeline`/`HttpResponsePipeline`, then
+   `HttpClient` with a minimal default-plugin set; point the `client` feature
+   at the upstream files and delete `shim/client/*` in the same step.
 4. **Server core** — `Application`/`ApplicationCall`/`ApplicationCallPipeline`,
    routing, `respondText`; klio engine `actual` over `__kktor_serve`; delete
    `shim/server/*`.
