@@ -287,6 +287,41 @@ impl VmHost<'_> {
         _arg_names: &[Option<String>],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
         use klio_runtime::IntrinsicHost as _;
+        // Explicit-receiver receiver-lambda call (`block(receiver, p)` for a
+        // `R.(P) -> T`, exactly one extra leading arg): bind `this_value`
+        // into the `this` capture as a fallback and dispatch on the MAIN
+        // evaluator path (`call_value`). That path applies the receiver-split
+        // — arg0 is the explicit receiver and overrides `this` — and snapshots
+        // frames so a suspension inside a `suspend` body parks correctly. The
+        // intrinsic-host invoke below does neither, which strands a captured
+        // receiver-lambda call such as ktor's on(Send) handler
+        // `handler(Sender(this, …), request)` (the body's bare `proceed`
+        // resolves against the receiver only when it reaches the body as the
+        // closure's `this`).
+        if let klio_runtime::Value::IrClosure { id, captures } = callee {
+            #[allow(clippy::cast_possible_truncation)]
+            if let Some(info) = self.closures.get(*id as usize)
+                && info.n_params >= 1
+                && args.len() == info.n_params + 1
+                && info.capture_names.iter().any(|n| n == "this")
+            {
+                let idx = info
+                    .capture_names
+                    .iter()
+                    .position(|n| n == "this")
+                    .expect("this capture present");
+                let mut new_caps: Vec<klio_runtime::Value> = (**captures).clone();
+                if idx >= new_caps.len() {
+                    new_caps.resize(idx + 1, klio_runtime::Value::Null);
+                }
+                new_caps[idx] = this_value.clone();
+                let bound = klio_runtime::Value::IrClosure {
+                    id: *id,
+                    captures: Arc::new(new_caps),
+                };
+                return self.call_value(&bound, args);
+            }
+        }
         let mut sink = self.out_sink.clone();
         let r = {
             let mut intrinsic = VmIntrinsicHost {

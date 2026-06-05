@@ -227,3 +227,37 @@ fun main() { val c = Impl(::Config).build { v = 9 }; println(c.v) }
         "9\n",
     );
 }
+
+// A receiver lambda `R.(P) -> R2` invoked with the receiver supplied as an
+// explicit *leading argument* (`handler(receiver, p)`, not `receiver.handler(p)`)
+// binds arg0 as the receiver, so the body reaches the receiver's members by
+// bare name — both when the bare member call is the whole body and when it is
+// nested in a sub-expression. This is exactly ktor's send pipeline shape: an
+// `on(Send)` handler is invoked as `handler(Sender(this, …), request)` and its
+// body calls the receiver's `proceed` by bare name (often as an assignment RHS
+// `val origin = proceed(request)`). Without the explicit-receiver dispatch the
+// bare `proceed` falls through to a global lookup and fails.
+#[test]
+fn receiver_lambda_invoked_with_explicit_receiver_arg() {
+    assert_klio(
+        "receiver_lambda_invoked_with_explicit_receiver_arg",
+        r#"
+class Sender(val tag: Int) { fun proceed(x: Int): Int = tag + x }
+fun drive(handler: Sender.(Int) -> Int): Int {
+    val invoke: (Int) -> Int = { v -> handler(Sender(100), v) }
+    return invoke(5)
+}
+fun driveStr(handler: Sender.(Int) -> String): String {
+    val invoke: (Int) -> String = { v -> handler(Sender(100), v) }
+    return invoke(5)
+}
+fun main() {
+    println(drive { v -> proceed(v) })
+    println(drive { v -> proceed(v) + proceed(1) })
+    println(driveStr { v -> "r=" + proceed(v) })
+    println(driveStr { v -> val r = proceed(v); "got($r)" })
+}
+"#,
+        "105\n206\nr=105\ngot(105)\n",
+    );
+}
