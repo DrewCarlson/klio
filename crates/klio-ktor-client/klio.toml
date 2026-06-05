@@ -197,6 +197,13 @@ include = [
     "io/ktor/client/plugins/HttpRedirect.kt",
     "io/ktor/client/plugins/HttpPlainText.kt",
     "io/ktor/client/plugins/DefaultResponseValidation.kt",
+    "io/ktor/client/plugins/HttpTimeout.kt",
+    "io/ktor/client/utils/ClientEvents.kt",
+    "io/ktor/client/request/builders.kt",
+    "io/ktor/client/request/buildersWithUrl.kt",
+    "io/ktor/client/request/utils.kt",
+    "io/ktor/client/statement/HttpStatement.kt",
+    "io/ktor/client/statement/Readers.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
@@ -232,6 +239,7 @@ client = { sources = ["shim/client"] }
 # here in parallel keeps the shim `client` feature working until the swap is
 # complete (then `client` points here and `shim/client` is deleted).
 client-upstream = { sources = [
+    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/utils/ClientEvents.kt",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/request/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/statement/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/call/",

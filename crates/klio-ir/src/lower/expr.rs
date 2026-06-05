@@ -1711,10 +1711,27 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                         && !a_func_fits
                         && b.resolve(nm).is_none()
                         && b.has_own_member(nm);
-                    let needs_inline = f.is_suspend
-                        || arg_lambda_has_nonlocal_return(args)
-                        || has_reified
-                        || shadowed_by_member;
+                    // An inline *extension* fn (`HttpClient.get`) is only
+                    // applicable to a bare call when the enclosing implicit
+                    // receiver is that type. A bare `get(index)` inside
+                    // `CharSequence.indexOfAny` (`this.get(index)`) must not
+                    // splice the ktor `HttpClient.get` body — its `get` simple
+                    // name collides with the stdlib indexing `get`. Skip the
+                    // inline on a *positive* receiver mismatch (the enclosing
+                    // receiver type is known and differs), so the call falls
+                    // through to normal resolution which binds the real member.
+                    // A None enclosing receiver (lambda capture, top level)
+                    // keeps the existing behavior.
+                    let recv_mismatch = f.receiver_type.as_ref().is_some_and(|rt| {
+                        let rn = rt.name.name.as_str();
+                        b.recv_ty()
+                            .is_some_and(|cur| cur != rn && b.owner_class() != Some(rn))
+                    });
+                    let needs_inline = !recv_mismatch
+                        && (f.is_suspend
+                            || arg_lambda_has_nonlocal_return(args)
+                            || has_reified
+                            || shadowed_by_member);
                     let expected = b.peek_expected().cloned();
                     if needs_inline
                         && let Some(r) = try_inline_call_with_type_args(

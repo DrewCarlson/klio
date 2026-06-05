@@ -180,6 +180,35 @@ fun main() { runBlocking { println(run2()) } }
     );
 }
 
+// A `suspend inline` *extension* fn must not be inline-spliced for a bare
+// call whose enclosing receiver is a different type. Here `Cfg.get` (which
+// sets `tag`) shares the simple name `get` with the stdlib `CharSequence.get`
+// indexing; a bare `get(0)` inside `CharSequence.firstTwo` must dispatch the
+// real `CharSequence.get` (returning a Char), not splice `Cfg.get`'s body
+// (`tag = …`) onto the Int index. This is the exact shape that made loading
+// ktor's `inline fun HttpClient.get(builder)` corrupt stdlib `indexOfAny`.
+// (kotlinc parity is skipped — a standalone coroutine program lacks the
+// kotlinx-coroutines classpath in the parity oracle; the klio assertion is
+// the guard: a regression throws "set_field tag on kotlin.Int".)
+#[test]
+fn inline_extension_does_not_shadow_stdlib_bare_call() {
+    assert_klio(
+        "inline_extension_does_not_shadow_stdlib_bare_call",
+        r#"
+import kotlinx.coroutines.runBlocking
+class Cfg { var tag = "" }
+suspend inline fun Cfg.get(n: Int): Cfg { tag = "cfg"; return this }
+suspend fun CharSequence.firstTwo(): String {
+    val a = get(0)
+    val b = get(1)
+    return "" + a + b
+}
+fun main() { runBlocking { println("hello".firstTwo()) } }
+"#,
+        "he\n",
+    );
+}
+
 // A function-typed property — including a constructor reference
 // `::Config` — invoked by bare name inside a method (here reached via an
 // inlined `apply { }` body, where the member-call lowering loses the

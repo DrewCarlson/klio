@@ -827,28 +827,31 @@ validated, then the corresponding shim file is deleted):
      call with a unique fitting function-param overload, so member inline calls
      of a shared name (`url.takeFrom`) are untouched. Verified: the request
      builder + a suspend-inline overload repro pass.
-     One blocker remains before the request DSL (`client.get(url)`) runs end to
-     end: **consuming `request/builders.kt` regresses the request builder.**
-     With `builders.kt` in the include list, an unrelated program doing
-     `b.url.takeFrom(s)` / `b.build()` fails (`set method on Int` /
-     `get_field originUrl`). Confirmed independent of the overload picker (it
-     reproduces with the picker reverted), so it is a load-time collision /
-     resolution shift from the `request`/`get`/… overloads `builders.kt` adds.
-     Traced: `b.url.takeFrom(s)` ends in `set method on Int` inside the stdlib
-     `indexOfAny` frame — i.e. loading `builders.kt` corrupts resolution of a
-     call reached transitively from URL parsing (`indexOfAny`), surfacing as a
-     `method` field-set on an `Int`. Likely a same-simple-name collision between
-     a `builders.kt` declaration and a stdlib/url symbol shifting overload or
-     inline resolution; next step is to bisect which `builders.kt` declaration
-     introduces it (and whether gating/renaming the consumed surface avoids it). The DSL files (`request/builders.kt`,
-     `request/buildersWithUrl.kt`, `request/utils.kt`,
-     `statement/HttpStatement.kt`, `statement/Readers.kt`, plus
-     `plugins/HttpTimeout.kt` and `utils/ClientEvents.kt` for
-     `unwrapRequestTimeoutException` / `HttpRequestCreated`) are staged but NOT
-     in the include list — add them once that collision is fixed.
-     Then validate `HttpClient.execute` end to end (its request pipeline must
-     yield an `HttpClientCall` — the next layer after the builder), point
-     `client` at `client-upstream`, and delete `shim/client/*`.
+     **The request DSL is consumed and the request builder works.** The
+     `builders.kt`-load collision is root-caused and fixed (confirmed by an
+     independent multi-agent analysis): a bare `get(index)` inside stdlib
+     `CharSequence.indexOfAny` was inline-spliced as ktor's `suspend inline fun
+     HttpClient.get(builder)` (selected by simple name only), running
+     `builder.method = HttpMethod.Get` with the Int index → `set method on Int`.
+     The bare-call inline expansion now skips an inline *extension* fn on a
+     positive receiver-type mismatch (enclosing `recv_ty` differs from the fn's
+     receiver type), so `get(index)` falls through to the real `CharSequence.get`
+     (kotlinc-parity tested; `request/builders.kt` + `buildersWithUrl.kt` +
+     `utils.kt` + `statement/HttpStatement.kt` + `Readers.kt` +
+     `plugins/HttpTimeout.kt` + `utils/ClientEvents.kt` are now in the include
+     list).
+     Remaining before `client.get(url)` returns a response: **the request
+     pipeline must yield an `HttpClientCall`.** Currently `requestPipeline.execute`
+     returns the unchanged `EmptyContent` subject — the `HttpSend` `Send`-phase
+     interceptor runs `interceptedSender.execute(context)` but the sender chain
+     (`InterceptedSender.execute` → the `Send` hook lambda →
+     `handler(Send.Sender(this,…), request)` → `Send.Sender.proceed(request)` →
+     `httpSendSender.execute` → `sendPipeline` → engine) never reaches
+     `proceed`, so no call is produced and `proceedWith(call)` is skipped. This
+     is a receiver-lambda dispatch layer in the Send-hook chain to debug next
+     (the engine-direct path + the request builder + the request/response
+     pipelines all work in isolation; this is their composition).
+     Then point `client` at `client-upstream` and delete `shim/client/*`.
 4. **Server core** — `Application`/`ApplicationCall`/`ApplicationCallPipeline`,
    routing, `respondText`; klio engine `actual` over `__kktor_serve`; delete
    `shim/server/*`.
