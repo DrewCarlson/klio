@@ -591,7 +591,28 @@ fn build_module_with_overrides(
                     continue;
                 }
                 object_names.push(o.name.name.clone());
-                all_decls.push(Decl::Class(synthesize_class_from_object(o)));
+                // Lift the object's nested classes/objects to top level
+                // exactly as a class's are — otherwise a nested type such
+                // as `Send.Sender` (a class inside an `object Send`) is
+                // never registered and `Send.Sender(…)` / a bare `Sender(…)`
+                // inside the object's methods mis-dispatches as a member
+                // call on the singleton instead of constructing the nested
+                // class.
+                let synth = synthesize_class_from_object(o);
+                lift_class_recursive(
+                    &synth,
+                    &[],
+                    &mut all_decls,
+                    &mut object_names,
+                    &mut companion_singletons,
+                    &mut nested_outer_members,
+                    &mut enclosing_class,
+                    &mut nested_object_aliases,
+                    &top_level_type_names,
+                    &mut mangled_nested,
+                    &used_qualified_supertypes,
+                );
+                all_decls.push(Decl::Class(synth));
             }
             Decl::Class(c) => {
                 if c.is_expect && actual_class_names.contains(&c.name.name) {
