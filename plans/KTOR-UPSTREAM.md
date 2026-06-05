@@ -840,18 +840,45 @@ validated, then the corresponding shim file is deleted):
      `utils.kt` + `statement/HttpStatement.kt` + `Readers.kt` +
      `plugins/HttpTimeout.kt` + `utils/ClientEvents.kt` are now in the include
      list).
-     Remaining before `client.get(url)` returns a response: **the request
-     pipeline must yield an `HttpClientCall`.** Currently `requestPipeline.execute`
-     returns the unchanged `EmptyContent` subject — the `HttpSend` `Send`-phase
-     interceptor runs `interceptedSender.execute(context)` but the sender chain
-     (`InterceptedSender.execute` → the `Send` hook lambda →
-     `handler(Send.Sender(this,…), request)` → `Send.Sender.proceed(request)` →
-     `httpSendSender.execute` → `sendPipeline` → engine) never reaches
-     `proceed`, so no call is produced and `proceedWith(call)` is skipped. This
-     is a receiver-lambda dispatch layer in the Send-hook chain to debug next
-     (the engine-direct path + the request builder + the request/response
-     pipelines all work in isolation; this is their composition).
+     **The Send-hook chain composition is fixed across three interpreter
+     bugs (each committed with tests):**
+       1. *Direct vararg constructor calls* now pack their trailing args into
+          the `vararg` array (and an empty array for a zero-arg call), in both
+          the interpreter (`new_instance`) and the typechecker (the ctor
+          signature's `is_vararg` flags). Previously only super-constructor
+          delegation packed, so `Pipeline(vararg phases)`-style direct calls
+          mis-counted arity.
+       2. *Classes nested in a top-level `object`* are now lifted/registered
+          like classes nested in a regular class. `Send.Sender` (a class
+          inside `object Send`) was never registered, so `Sender(this, …)` /
+          `Send.Sender(…)` inside the object's methods mis-dispatched as a
+          member call on the singleton.
+       3. *Receiver-lambda value calls with an explicit leading receiver*
+          (`handler(Send.Sender(this,…), request)`) now bind arg0 as the
+          receiver via the main `call_value` path (receiver-split +
+          suspension-safe), so the handler body's bare `proceed` resolves
+          against the `Send.Sender` receiver instead of falling through to a
+          global lookup.
+     Remaining: **`client.get(url)` reaches the Send chain but the full
+     request hangs in a CPU-bound loop (no engine HTTP issued).** The
+     engine-direct path, the request builder, the raw `Pipeline`
+     (super-delegation subclass + `intercept`/`execute`), the suspend
+     interceptor + `proceedWith` reentrancy, and the 2-level
+     `InterceptedSender → handler → proceed` chain all pass in isolation; the
+     loop appears only in the real composition (nested `DebugPipelineContext`
+     executions: the `requestPipeline` Send interceptor drives
+     `DefaultSender.execute` → `client.sendPipeline.execute` → engine, all
+     `suspend`). Diagnostic signal: editing the *body form* of a `suspend`
+     function in the chain (e.g. `Send.Sender.proceed`'s expression body vs a
+     block body, or adding a `println`) flips the symptom between the hang and
+     a fast `cast to HttpClientCall` — i.e. the suspend state-machine lowering
+     is structure-sensitive here. Next step is Rust-level instrumentation of
+     the coroutine/suspend dispatch (Kotlin-level prints perturb the lowering),
+     focused on the nested-pipeline `do-while` `proceedLoop` resume.
      Then point `client` at `client-upstream` and delete `shim/client/*`.
+     (Parallel gap, not yet fixed: the *typechecker* rejects the valid-Kotlin
+     receiver-lambda-explicit-arg shape with `UNRESOLVED_REFERENCE` even though
+     the interpreter now runs it; see fix #3.)
 4. **Server core** — `Application`/`ApplicationCall`/`ApplicationCallPipeline`,
    routing, `respondText`; klio engine `actual` over `__kktor_serve`; delete
    `shim/server/*`.
