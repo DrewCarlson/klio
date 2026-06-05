@@ -765,10 +765,20 @@ validated, then the corresponding shim file is deleted):
      `DefaultHttpResponse` + `HttpClientCall` — the pipelines construct and
      *execute* through `DebugPipelineContext`
      (`ktor_request_pipeline_from_upstream`).
+   - **Engine boundary done.** The engine layer (`HttpClientEngine` /
+     `HttpClientEngineBase` / `HttpClientEngineConfig` / `HttpClientEngineCapability`
+     / `Utils` + `CoroutinesUtils`) consumes in core; klio supplies the
+     `ioDispatcher` actual (`Dispatchers.Unconfined`). The **klio
+     `HttpClientEngine` actual** (`KlioClientEngine`, in `shim/client-upstream`)
+     drives a request through the `__kktor_request` host binding and wraps the
+     response bytes in a read-side `ByteReadChannel` — executes a real request
+     against a local server end to end (`ktor_upstream_engine_execute`:
+     `200|{…}`).
 
-   Next: the klio `HttpClientEngine` `actual` (over `__kktor_request`) +
-   `HttpClient` itself with a minimal default-plugin set, then point `client`
-   at `client-upstream` and delete `shim/client/*`.
+   Next: `HttpClient` itself + its default plugins (HttpRequestLifecycle,
+   BodyProgress, SaveBody, DefaultTransformers, HttpSend, HttpCallValidator) +
+   the plugin API, then point `client` at `client-upstream` and delete
+   `shim/client/*`.
 4. **Server core** — `Application`/`ApplicationCall`/`ApplicationCallPipeline`,
    routing, `respondText`; klio engine `actual` over `__kktor_serve`; delete
    `shim/server/*`.

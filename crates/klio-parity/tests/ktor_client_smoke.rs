@@ -33,6 +33,7 @@ fn install_packs() {
     for pack in [
         "klio-kotlinx-atomicfu",
         "klio-kotlinx-coroutines",
+        "klio-kotlinx-io",
         "klio-kotlinx-serialization",
         "klio-ktor-client",
     ] {
@@ -135,6 +136,63 @@ fn run_via_binary(file: &Path) -> String {
         String::from_utf8_lossy(&o.stderr)
     );
     String::from_utf8(o.stdout).expect("utf8 stdout")
+}
+
+#[test]
+fn ktor_upstream_engine_execute() {
+    install_packs();
+    let (port, handle) = serve(1);
+
+    // The klio `HttpClientEngine` actual (the custom engine over the
+    // `__kktor_request` host binding) consumed for the upstream client core
+    // (stage 3): build an `HttpRequestData` with the upstream
+    // `HttpRequestBuilder`, drive it through `engine.execute`, and drain the
+    // response body off the read-side `ByteReadChannel`.
+    let src = format!(
+        r#"
+import io.ktor.client.engine.*
+import io.ktor.client.engine.klio.*
+import io.ktor.client.request.*
+import io.ktor.http.*
+import io.ktor.utils.io.*
+import kotlinx.coroutines.runBlocking
+
+fun main() = runBlocking {{
+    val engine = KlioClientEngine(KlioClientEngineConfig())
+    val b = HttpRequestBuilder()
+    b.method = HttpMethod.Get
+    b.url.takeFrom("http://127.0.0.1:{port}/user")
+    val resp = engine.execute(b.build())
+    val channel = resp.body as ByteReadChannel
+    val body = String(channel.readRemaining().readByteArray())
+    println("${{resp.statusCode.value}}|$body")
+    engine.close()
+}}
+"#
+    );
+
+    let dir = std::env::temp_dir().join("klio_ktor_upstream_engine");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("eng.kt");
+    std::fs::write(&file, src).unwrap();
+    let o = Command::new(klio_bin())
+        .arg("run")
+        .arg(&file)
+        .args(["--feature", "io.ktor/client-upstream"])
+        .output()
+        .expect("spawn klio run");
+    handle.join().ok();
+    assert!(
+        o.status.success(),
+        "klio run failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let got = String::from_utf8(o.stdout).expect("utf8 stdout");
+    assert_eq!(
+        got,
+        "200|{\"name\":\"Ada\",\"age\":36,\"roles\":[\"ADMIN\",\"USER\"]}\n",
+        "ktor upstream engine execute output drifted"
+    );
 }
 
 #[test]

@@ -55,6 +55,8 @@ include = [
     "io/ktor/util/StringValues.kt",
     "io/ktor/util/reflect/Type.kt",
     "io/ktor/util/Attributes.kt",
+    # `SilentSupervisor` etc. — the engine base's coroutine context builder.
+    "io/ktor/util/CoroutinesUtils.kt",
     # GMTDate (request/response timestamps in the cores). klio supplies the
     # UTC calendar-math actuals + the `getTimeMillis` clock intrinsic.
     "io/ktor/util/date/Date.kt",
@@ -146,6 +148,10 @@ include = [
     "io/ktor/client/utils/Content.kt",
     "io/ktor/client/engine/HttpClientEngineConfig.kt",
     "io/ktor/client/engine/HttpClientEngineCapability.kt",
+    "io/ktor/client/engine/HttpClientEngine.kt",
+    "io/ktor/client/engine/HttpClientEngineBase.kt",
+    "io/ktor/client/engine/HttpClientEngineFactory.kt",
+    "io/ktor/client/engine/Utils.kt",
     # Upstream client core (request/statement/call layers). These shadow
     # `shim/client` declarations, so they are gated under the `client-upstream`
     # feature (the stage-3 swap that replaces `shim/client`) rather than core —
@@ -196,6 +202,7 @@ client-upstream = { sources = [
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/request/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/statement/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/call/",
+    "shim/client-upstream",
 ] }
 # ktor-server-core: embeddedServer + routing + respondText.
 server = { sources = ["shim/server"] }
