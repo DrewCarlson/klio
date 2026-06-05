@@ -113,6 +113,11 @@ pub struct TryFrame {
 #[derive(Debug, Clone)]
 pub struct FrameSnapshot {
     pub func: FuncId,
+    /// The sub-module this frame's `func` was lowered into, when it is a
+    /// per-method sub-module (anonymous object / local / nested class).
+    /// `None` for the main module. On resume the `FuncId` is resolved
+    /// against this module so the right function body re-enters.
+    pub module: Option<std::sync::Arc<Module>>,
     pub block: BlockId,
     /// Index of the *next* instruction to run within `block.insts`.
     pub inst_idx: usize,
@@ -155,6 +160,14 @@ struct Frame<'a> {
     regs: Vec<Value>,
     params: Vec<Value>,
     captures: Vec<Value>,
+    /// The owning module handle when this frame runs in a per-method
+    /// *sub-module* (anonymous object / local class / nested
+    /// `private`/member class — each lowered into its own `Module`).
+    /// `None` for a frame in the main module. Captured into the frame's
+    /// `FrameSnapshot` so a suspended sub-module method resumes by
+    /// resolving its `FuncId` against the correct module rather than the
+    /// main one (which would index a different, wrong function).
+    module_arc: Option<std::sync::Arc<Module>>,
 }
 
 /// Normalize an `Int` value occupying a non-nullable `Long` slot to a
@@ -200,6 +213,7 @@ impl<'a> Frame<'a> {
             regs: vec![Value::Unit; func.n_locals as usize],
             params,
             captures,
+            module_arc: None,
         }
     }
 
@@ -250,6 +264,22 @@ pub fn eval_with_captures(
     captures: Vec<Value>,
     host: &mut dyn Host,
 ) -> Result<Value, EvalError> {
+    eval_with_captures_in(module, None, func, args, captures, host)
+}
+
+/// Run a method/closure that was lowered into a per-method *sub-module*
+/// (anonymous object / local class / nested class). `owning` is the
+/// `Arc` to that sub-module; the frame records it so a suspension inside
+/// the body resumes by resolving its `FuncId` against this module, not
+/// the main one. `module` must be `&*owning` when `owning` is `Some`.
+pub fn eval_with_captures_in(
+    module: &Module,
+    owning: Option<std::sync::Arc<Module>>,
+    func: &Func,
+    args: Vec<Value>,
+    captures: Vec<Value>,
+    host: &mut dyn Host,
+) -> Result<Value, EvalError> {
     // Each interpreted Kotlin call chains into another Rust stack
     // frame here, so deep Kotlin recursion (typical in
     // kotlinx-coroutines internals — BufferedChannel's segment walks,
@@ -264,6 +294,7 @@ pub fn eval_with_captures(
         let mut try_stack: Vec<TryFrame> = Vec::new();
         let func_name = func.name.clone();
         let mut frame = Frame::new_with_captures(module, func, args, captures);
+        frame.module_arc = owning;
         let cur = func.entry;
         let result = match run_frame(module, &mut frame, &mut try_stack, cur, 0, host) {
             // A labeled return whose target is this function exits it as
@@ -301,9 +332,17 @@ pub fn resume_continuation(
     let mut first = true;
     let mut pending_throw_from_inner: Option<Value> = None;
     while let Some(snap) = frames.pop_front() {
-        let func = &module.funcs[snap.func.0 as usize];
+        // Resolve the frame's `FuncId` against the module it was lowered
+        // into — a per-method sub-module for an anon-object / local /
+        // nested class, the passed-in (main) module otherwise. Resolving a
+        // sub-module FuncId against the main module would re-enter a
+        // different, wrong function (the bug behind the ktor send-loop).
+        let snap_module = snap.module.clone();
+        let m: &Module = snap_module.as_deref().unwrap_or(module);
+        let func = &m.funcs[snap.func.0 as usize];
         let mut frame =
-            Frame::new_with_captures(module, func, snap.params.clone(), snap.captures.clone());
+            Frame::new_with_captures(m, func, snap.params.clone(), snap.captures.clone());
+        frame.module_arc = snap_module.clone();
         frame.regs.clone_from(&snap.regs);
         // Kotlin `Continuation.resumeWith(Result.failure(e))` means
         // "resume by throwing `e` at the suspension point". Only the
@@ -332,7 +371,7 @@ pub fn resume_continuation(
         }
         let mut try_stack = snap.try_stack.clone();
         match run_frame_inner(
-            module,
+            m,
             &mut frame,
             &mut try_stack,
             snap.block,
@@ -459,6 +498,7 @@ fn run_frame_inner<'a>(
                     let resume_reg = state.pending_resume_reg.take().or_else(|| inst_dst(inst));
                     state.frames.push(FrameSnapshot {
                         func: frame.func.id,
+                        module: frame.module_arc.clone(),
                         block: cur,
                         inst_idx: idx + 1,
                         regs: frame.regs.clone(),

@@ -1995,7 +1995,14 @@ impl VmHost<'_> {
                     all.push(receiver.clone());
                     all.extend_from_slice(args);
                     let all = pack_vararg_args(&func, all);
-                    return klio_ir::eval::eval_with(&module_rc, &func, all, self);
+                    return klio_ir::eval::eval_with_captures_in(
+                        &module_rc,
+                        Some(Arc::clone(&module_rc)),
+                        &func,
+                        all,
+                        Vec::new(),
+                        self,
+                    );
                 }
             }
             let entry = {
@@ -2073,8 +2080,14 @@ impl VmHost<'_> {
                             .map_or(klio_runtime::Value::Null, |(_, v)| v.clone())
                     })
                     .collect();
-                let result =
-                    klio_ir::eval::eval_with_captures(&module_rc, &func, all, cap_vec, self);
+                let result = klio_ir::eval::eval_with_captures_in(
+                    &module_rc,
+                    Some(Arc::clone(&module_rc)),
+                    &func,
+                    all,
+                    cap_vec,
+                    self,
+                );
                 self.globals = prev;
                 return result;
             }

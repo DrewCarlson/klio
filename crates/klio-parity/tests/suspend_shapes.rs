@@ -117,3 +117,28 @@ fun main() { println(compute()) }
 ";
     assert_klio("rb_returns", src, "300\n");
 }
+
+// A `suspend` method of a *local class* (lowered into its own per-method
+// sub-module) parks at a `delay` and resumes correctly. The frame
+// snapshot records which module the method was lowered into, so resume
+// resolves its `FuncId` against that sub-module rather than the main
+// module (where the same index is a different function — which fed the
+// resumed value back garbage). Nested-`private`-class methods (ktor's
+// `HttpSend.DefaultSender`) take the same per-method sub-module path.
+#[test]
+fn local_class_suspend_method_resumes_in_its_module() {
+    let src = r#"
+import kotlinx.coroutines.*
+suspend fun runWith(x: Int): String {
+    class Worker {
+        suspend fun work(n: Int): Int {
+            delay(1)
+            return n * 2
+        }
+    }
+    return "got=" + Worker().work(x)
+}
+fun main() = runBlocking { println("result=" + runWith(21)) }
+"#;
+    assert_klio("local_class_suspend_resume", src, "result=got=42\n");
+}
