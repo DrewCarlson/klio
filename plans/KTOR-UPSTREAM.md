@@ -775,10 +775,22 @@ validated, then the corresponding shim file is deleted):
      against a local server end to end (`ktor_upstream_engine_execute`:
      `200|{…}`).
 
-   Next: `HttpClient` itself + its default plugins (HttpRequestLifecycle,
-   BodyProgress, SaveBody, DefaultTransformers, HttpSend, HttpCallValidator) +
-   the plugin API, then point `client` at `client-upstream` and delete
-   `shim/client/*`.
+   - **`HttpClient` + plugins consumed (construction WIP).** The plugin API
+     (`plugins/api/*`), the legacy `HttpClientPlugin`, the default plugins
+     (`HttpRequestLifecycle`/`BodyProgress`/`SaveBody`/`DefaultTransform`/
+     `HttpSend`/`HttpCallValidator`/`HttpRedirect`/`HttpPlainText`/
+     `DefaultResponseValidation`), and `HttpClient`/`HttpClientConfig` are
+     consumed into `client-upstream`; the supporting util layer
+     (`io.ktor.events.Events`, `util.PlatformUtils` + klio `platform`/
+     `isDevelopmentMode` actuals, `util.collections.*` + a klio `ConcurrentMap`
+     actual) is in core. The pack builds and loads; **`HttpClient(KlioClient)`
+     does not yet construct** — blocked on a bare `config` reference resolving
+     as an unresolved global during the construction/plugin-install path (the
+     bare member/abstract-property isn't routed through the receiver there;
+     in-isolation lazy/abstract member resolution works, so it's specific to
+     this construction shape). Next: pin and fix that `config` resolution,
+     then validate `HttpClient.execute` end to end, point `client` at
+     `client-upstream`, and delete `shim/client/*`.
 4. **Server core** — `Application`/`ApplicationCall`/`ApplicationCallPipeline`,
    routing, `respondText`; klio engine `actual` over `__kktor_serve`; delete
    `shim/server/*`.

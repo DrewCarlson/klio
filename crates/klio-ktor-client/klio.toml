@@ -57,6 +57,14 @@ include = [
     "io/ktor/util/Attributes.kt",
     # `SilentSupervisor` etc. — the engine base's coroutine context builder.
     "io/ktor/util/CoroutinesUtils.kt",
+    # PlatformUtils (platform detection / development-mode flag the client
+    # core reads). klio supplies the `platform` / `isDevelopmentMode` actuals.
+    "io/ktor/util/PlatformUtils.kt",
+    "io/ktor/util/collections/CollectionUtils.kt",
+    "io/ktor/util/collections/ConcurrentMap.kt",
+    "io/ktor/util/collections/ConcurrentSet.kt",
+    "io/ktor/util/collections/CopyOnWriteHashMap.kt",
+    "io/ktor/util/collections/MapDelegates.kt",
     # GMTDate (request/response timestamps in the cores). klio supplies the
     # UTC calendar-math actuals + the `getTimeMillis` clock intrinsic.
     "io/ktor/util/date/Date.kt",
@@ -126,6 +134,13 @@ include = [
     "io/ktor/http/content/ByteArrayContent.kt",
 ]
 
+# Event bus (`io.ktor.events.Events`) — `HttpClient.monitor`. Ungated (core).
+[[source]]
+root = "upstream/ktor-shared/ktor-events/common/src"
+include = [
+    "io/ktor/events/Events.kt",
+]
+
 # Platform `actual`s for the ktor-http `expect`s. The posix variant is pure
 # common Kotlin (no JVM/JS imports): `URLBuilder.Companion.origin`.
 [[source]]
@@ -164,6 +179,24 @@ include = [
     "io/ktor/client/statement/DefaultHttpResponse.kt",
     "io/ktor/client/statement/HttpResponsePipeline.kt",
     "io/ktor/client/call/HttpClientCall.kt",
+    "io/ktor/client/HttpClientConfig.kt",
+    "io/ktor/client/HttpClient.kt",
+    "io/ktor/client/plugins/HttpClientPlugin.kt",
+    "io/ktor/client/plugins/api/ClientHook.kt",
+    "io/ktor/client/plugins/api/ClientPluginBuilder.kt",
+    "io/ktor/client/plugins/api/ClientPluginInstance.kt",
+    "io/ktor/client/plugins/api/CommonHooks.kt",
+    "io/ktor/client/plugins/api/CreatePluginUtils.kt",
+    "io/ktor/client/plugins/api/KtorCallContexts.kt",
+    "io/ktor/client/plugins/HttpRequestLifecycle.kt",
+    "io/ktor/client/plugins/BodyProgress.kt",
+    "io/ktor/client/plugins/SaveBody.kt",
+    "io/ktor/client/plugins/DefaultTransform.kt",
+    "io/ktor/client/plugins/HttpSend.kt",
+    "io/ktor/client/plugins/HttpCallValidator.kt",
+    "io/ktor/client/plugins/HttpRedirect.kt",
+    "io/ktor/client/plugins/HttpPlainText.kt",
+    "io/ktor/client/plugins/DefaultResponseValidation.kt",
 ]
 # Default auto-binding prefix is `io.ktor.`, covering both the client
 # (`io.ktor.client.engine.*`) and server (`io.ktor.server.engine.*`)
@@ -202,6 +235,9 @@ client-upstream = { sources = [
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/request/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/statement/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/call/",
+    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/plugins/",
+    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/HttpClient.kt",
+    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/HttpClientConfig.kt",
     "shim/client-upstream",
 ] }
 # ktor-server-core: embeddedServer + routing + respondText.
