@@ -660,6 +660,18 @@ impl VmHost<'_> {
         }
         let n_primary = class_def.primary_params.len();
         let mut effective_args: Vec<klio_runtime::Value> = args.to_vec();
+        // Pack trailing positional args into the primary ctor's `vararg`
+        // slot (an empty array when none are supplied). The runtime
+        // `ClassParamDef` drops the vararg flag, so packing reads it off
+        // the IR class — same path as super-ctor delegation, but for a
+        // direct `Klass(a, b, c)` / zero-arg `Klass()` call. Without this
+        // a vararg ctor mis-counts arity (`Klass() expects 1 args, got 3`)
+        // and a zero-arg call default-fills the vararg slot with `Null`.
+        {
+            let module = Arc::clone(&self.module);
+            effective_args =
+                crate::pack_primary_ctor_varargs(&module, &class_def.name, effective_args);
+        }
         // A same-named top-level factory function wins over the class
         // constructor when the primary ctor *definitely cannot* take the
         // supplied args. Kotlin lets a factory sit beside a class:

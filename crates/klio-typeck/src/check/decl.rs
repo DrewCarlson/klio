@@ -278,7 +278,7 @@ impl Checker<'_> {
                 .iter()
                 .map(|p| p.name.name.clone())
                 .collect(),
-            is_vararg: c.primary_params.iter().map(|_| false).collect(),
+            is_vararg: c.primary_params.iter().map(|p| p.is_vararg).collect(),
             return_ty: Type::Unresolved,
             is_infix: false,
             type_param_count: c.type_params.len(),
