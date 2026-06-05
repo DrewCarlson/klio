@@ -1122,19 +1122,17 @@ fn build_module_with_overrides(
         }
         klio_ir::lower::set_shadowed_inline_names(shadowed);
     }
-    // Non-wildcard imports, keyed by the name they bind (alias or
-    // last segment), so the lowerer can rewrite a bare reference to
-    // an imported (possibly named-) companion member into the
-    // qualified `Class.…` access it can lower. Set here, before the
-    // body passes, since the registry is otherwise only finalised at
-    // the end of this function.
+    // Non-wildcard imports, keyed first by the declaring file then by
+    // the name they bind (alias or last segment), so the lowerer can
+    // rewrite a bare reference to an imported (possibly named-)
+    // companion member into the qualified `Class.…` access it can
+    // lower. Set here, before the body passes, since the registry is
+    // otherwise only finalised at the end of this function.
     //
-    // `combined.imports` lists pack-file imports first and the user
-    // file's imports last (see `build_module_files`). Insert with
-    // last-writer-wins so a user `import a.b.Foo` overrides a
-    // pack's internal `import x.y.Foo` for the same leaf — the
-    // pack's import was an implementation detail of that pack's
-    // body lowering, never a resolution the user opted into.
+    // `combined.imports` merges every source file's imports (each
+    // retaining its original `FileId`); keying by file keeps a Kotlin
+    // named import file-local, so a pack file's `import …Foo` neither
+    // shadows nor is shadowed by another file's bare `Foo`.
     for imp in &file.imports {
         if imp.wildcard || imp.path.is_empty() {
             continue;
@@ -1144,7 +1142,15 @@ fn build_module_with_overrides(
             .alias
             .as_ref()
             .map_or_else(|| segs.last().unwrap().clone(), |a| a.name.clone());
-        module.registry.import_aliases.insert(leaf, segs);
+        // File-scoped: each merged source file keeps its own import set
+        // (keyed by the import declaration's `FileId`) so one file's
+        // named import never shadows a bare reference in another.
+        module
+            .registry
+            .import_aliases
+            .entry(imp.span.file)
+            .or_default()
+            .insert(leaf, segs);
     }
     // Pre-register every class name so `class_id` resolves
     // regardless of declaration order: a method body may reference

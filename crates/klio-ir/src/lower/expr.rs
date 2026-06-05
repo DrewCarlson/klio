@@ -832,9 +832,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 if b.resolve(&segments[0].name).is_none()
                     && let Some(rewrite) = b
                         .module
-                        .registry
-                        .import_aliases
-                        .get(&segments[0].name)
+                        .import_alias_in(segments[0].span.file, &segments[0].name)
                         .and_then(|segs| {
                             let cls_idx =
                                 segs.iter().rposition(|s| b.module.class_id(s).is_some())?;
@@ -2272,9 +2270,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 let collision = b.module.funcs_by_simple_name(&segments[0].name).len() > 1;
                 let imported_func_id = if collision {
                     b.module
-                        .registry
-                        .import_aliases
-                        .get(&segments[0].name)
+                        .import_alias_in(segments[0].span.file, &segments[0].name)
                         .filter(|segs| segs.len() >= 2)
                         .and_then(|segs| b.module.func_id_by_fqn(&segs.join(".")))
                 } else {

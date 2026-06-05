@@ -798,14 +798,20 @@ pub struct ModuleRegistry {
     /// checker already unfolds aliases in type position).
     #[serde(default)]
     pub type_aliases: std::collections::HashMap<String, String>,
-    /// Non-wildcard import leaf → the import's full segment path.
-    /// Lets the lowerer resolve a bare reference to an imported
-    /// member of a (possibly named) companion object — e.g. `import
-    /// a.b.C.Factory.RENDEZVOUS` then bare `RENDEZVOUS` — by
+    /// Per-file (`FileId`) non-wildcard import leaf → the import's full
+    /// segment path. Lets the lowerer resolve a bare reference to an
+    /// imported member of a (possibly named) companion object — e.g.
+    /// `import a.b.C.Factory.RENDEZVOUS` then bare `RENDEZVOUS` — by
     /// rewriting it to the qualified `C.…` access the IR can lower,
     /// since the lowering pass otherwise carries no import context.
+    /// Keyed by file because a Kotlin named import is file-scoped: a
+    /// pack file's `import …ChannelResult.Companion.closed` must not
+    /// shadow a bare `closed` in another file (an interpreter-merged
+    /// module holds every file's decls, so a global map leaked one
+    /// file's imports into all the others).
     #[serde(default)]
-    pub import_aliases: std::collections::HashMap<String, Vec<String>>,
+    pub import_aliases:
+        std::collections::HashMap<klio_span::FileId, std::collections::HashMap<String, Vec<String>>>,
     /// Nested-object simple-name aliases, keyed by enclosing class
     /// name. Populated when a `private object Inner { … }` inside an
     /// outer class is lifted to a top-level synth class with the
@@ -956,6 +962,16 @@ impl Module {
     #[must_use]
     pub fn func_id_by_fqn(&self, fqn: &str) -> Option<FuncId> {
         self.funcs.iter().find(|f| f.fqn == fqn).map(|f| f.id)
+    }
+
+    /// The full segment path of a non-wildcard import whose leaf is
+    /// `name`, as seen from source file `file`. A named import is
+    /// file-scoped, so only imports declared in `file` are consulted.
+    pub fn import_alias_in(&self, file: klio_span::FileId, name: &str) -> Option<&Vec<String>> {
+        self.registry
+            .import_aliases
+            .get(&file)
+            .and_then(|m| m.get(name))
     }
 
     /// Register a class declaration and return its id. If the name

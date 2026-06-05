@@ -173,3 +173,31 @@ fun main() = runBlocking {
 "#;
     assert_klio("async_job_overload_delegates", src, "R1[E(x)]\n");
 }
+
+// A bare name inside a `CoroutineScope`-receiver block must resolve to
+// the enclosing class's own property, not to a same-named member that a
+// *different* library file imported. kotlinx.coroutines' BufferedChannel
+// does `import …ChannelResult.Companion.closed`; a global import table
+// leaked that `closed` into every file, so a user `val closed` read in
+// an `async { … }` block was rewritten to the `ChannelResult` companion
+// access and mis-dispatched. Named imports are file-scoped.
+#[test]
+fn user_property_not_shadowed_by_other_files_named_import() {
+    let src = r#"
+import kotlinx.coroutines.*
+import kotlin.coroutines.*
+abstract class Base(name: String) : CoroutineScope {
+    override val coroutineContext: CoroutineContext by lazy {
+        SupervisorJob() + Dispatchers.Unconfined + CoroutineName(name)
+    }
+    val closed: Boolean get() = false
+    suspend fun run1(): String {
+        val cc = coroutineContext + Job(coroutineContext[Job])
+        return async(cc) { "closed=" + closed }.await()
+    }
+}
+class Impl : Base("impl")
+fun main() = runBlocking { println(Impl().run1()) }
+"#;
+    assert_klio("user_prop_not_shadowed", src, "closed=false\n");
+}
