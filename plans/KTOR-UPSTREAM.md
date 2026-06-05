@@ -833,8 +833,14 @@ validated, then the corresponding shim file is deleted):
      `b.url.takeFrom(s)` / `b.build()` fails (`set method on Int` /
      `get_field originUrl`). Confirmed independent of the overload picker (it
      reproduces with the picker reverted), so it is a load-time collision /
-     resolution shift from the `request`/`get`/… overloads `builders.kt` adds —
-     not yet diagnosed. The DSL files (`request/builders.kt`,
+     resolution shift from the `request`/`get`/… overloads `builders.kt` adds.
+     Traced: `b.url.takeFrom(s)` ends in `set method on Int` inside the stdlib
+     `indexOfAny` frame — i.e. loading `builders.kt` corrupts resolution of a
+     call reached transitively from URL parsing (`indexOfAny`), surfacing as a
+     `method` field-set on an `Int`. Likely a same-simple-name collision between
+     a `builders.kt` declaration and a stdlib/url symbol shifting overload or
+     inline resolution; next step is to bisect which `builders.kt` declaration
+     introduces it (and whether gating/renaming the consumed surface avoids it). The DSL files (`request/builders.kt`,
      `request/buildersWithUrl.kt`, `request/utils.kt`,
      `statement/HttpStatement.kt`, `statement/Readers.kt`, plus
      `plugins/HttpTimeout.kt` and `utils/ClientEvents.kt` for
