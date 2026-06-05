@@ -307,6 +307,23 @@ pub(super) fn try_inline_call_with_type_args(
             }
         }
     }
+    // Mark params whose declared type is a receiver-typed function
+    // (`block: T.() -> R`) so a bare `block(...)` in the spliced body
+    // dispatches `this.block()`. Same record-and-remove discipline as
+    // the generic marks above.
+    let mut marked_rlp: Vec<String> = Vec::new();
+    for p in &f.params {
+        if p.ty
+            .function
+            .as_ref()
+            .and_then(|ft| ft.receiver.as_ref())
+            .is_some()
+            && !b.is_receiver_lambda_param(&p.name.name)
+        {
+            b.mark_receiver_lambda_param(&p.name.name);
+            marked_rlp.push(p.name.name.clone());
+        }
+    }
     b.push_inline_lambda_frame(lambda_map);
     if f.receiver_type.is_some()
         && let Some(recv) = this_arg
@@ -373,6 +390,9 @@ pub(super) fn try_inline_call_with_type_args(
     });
     b.terminate(Terminator::Goto(join));
     b.switch_to(join);
+    for n in &marked_rlp {
+        b.unmark_receiver_lambda_param(n);
+    }
     b.pop_inline_return();
     b.pop_inline_lambda_frame();
     b.pop_scope();

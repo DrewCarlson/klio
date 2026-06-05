@@ -1810,6 +1810,40 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             if let Expr::Path { segments, .. } = callee.as_ref()
                 && segments.len() == 1
             {
+                // A bare call to a receiver-lambda param (`block: T.() -> R`)
+                // dispatches with the enclosing `this` as receiver —
+                // kotlinc rewrites `block()` to `this.block()`. This covers
+                // the param reached as a *capture* from a nested lambda
+                // (the resolved-own-param case is handled further below in
+                // the `b.resolve(...)` block). Without it a captured
+                // `block()` whose receiver lives only in the enclosing-this
+                // chain runs against the wrong receiver (its creation-scope
+                // `this`, e.g. a surrounding `runBlocking` scope).
+                if b.is_receiver_lambda_param(&segments[0].name)
+                    && b.resolve(&segments[0].name).is_none()
+                    && b.knows_outer(&segments[0].name)
+                {
+                    let this_reg = if b.knows_outer("this") || b.is_lambda_body() {
+                        Some(resolve_capture(b, "this"))
+                    } else {
+                        b.resolve("this")
+                    };
+                    if let Some(this_reg) = this_reg {
+                        let callee_r = resolve_capture(b, &segments[0].name);
+                        let (args_start, count) = lower_arg_run(b, args);
+                        let arg_names = intern_arg_names(b.module, ast_arg_names);
+                        let dst = b.alloc_reg();
+                        b.push(Inst::CallValueWithThis {
+                            dst,
+                            callee: callee_r,
+                            receiver: this_reg,
+                            args: args_start,
+                            n_args: count,
+                            arg_names,
+                        });
+                        return dst;
+                    }
+                }
                 // Kotlin keeps the function and property namespaces
                 // separate: in call position `name(args)` resolves
                 // to a member function of the enclosing class (own
@@ -3515,9 +3549,16 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // stdlib intrinsics) fall through to the tree walker's
             // global lookup at call time.
             let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let inherited_rlp = b.receiver_lambda_param_names();
             let outer_boxed = b.boxed_vars_snapshot();
-            let (body_func, captured_names) =
-                lower_lambda_body_capturing(b.module, params, body, outer_names, &outer_boxed);
+            let (body_func, captured_names) = lower_lambda_body_capturing(
+                b.module,
+                params,
+                body,
+                outer_names,
+                &outer_boxed,
+                inherited_rlp,
+            );
             // Record the implicit label (the enclosing call's simple name,
             // re-armed by `lower_arg_run`) so `this@<label>` inside the
             // lambda resolves to the receiver it is invoked with.
@@ -3934,6 +3975,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             let param_idents: Vec<klio_ast::Ident> =
                 params.iter().map(|p| p.name.clone()).collect();
             let outer_names: std::collections::HashSet<String> = b.visible_names();
+            let inherited_rlp = b.receiver_lambda_param_names();
             let outer_boxed = b.boxed_vars_snapshot();
             let (body_func, captured_names) = lower_lambda_body_capturing_kind(
                 b.module,
@@ -3943,6 +3985,7 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 false,
                 &outer_boxed,
                 None,
+                inherited_rlp,
             );
             let captures: Vec<Reg> = captured_names
                 .iter()

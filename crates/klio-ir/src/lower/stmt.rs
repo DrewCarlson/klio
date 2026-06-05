@@ -151,6 +151,7 @@ fn lower_local_fn_decl(b: &mut FuncBuilder<'_>, f: &klio_ast::Function) -> Optio
     if let Some(body) = body_block {
         let self_cell = local_fn_self_cell(b, f, &body);
         let outer_names: std::collections::HashSet<String> = b.visible_names();
+        let inherited_rlp = b.receiver_lambda_param_names();
         let outer_boxed = b.boxed_vars_snapshot();
         // A local *extension* function (`fun List<T>.mid() =
         // …`) binds its receiver as the implicit first `this`
@@ -182,6 +183,7 @@ fn lower_local_fn_decl(b: &mut FuncBuilder<'_>, f: &klio_ast::Function) -> Optio
             &outer_boxed,
             tailrec_self,
             true,
+            inherited_rlp,
         );
         let captures: Vec<Reg> = captured_names
             .iter()

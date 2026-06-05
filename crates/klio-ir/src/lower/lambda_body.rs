@@ -47,10 +47,21 @@ pub(super) fn lower_lambda_body_capturing(
     body: &klio_ast::Block,
     outer: std::collections::HashSet<String>,
     outer_boxed: &std::collections::HashSet<String>,
+    inherited_rlp: std::collections::HashSet<String>,
 ) -> (crate::FuncId, Vec<String>) {
-    lower_lambda_body_capturing_kind(module, params, body, outer, true, outer_boxed, None)
+    lower_lambda_body_capturing_kind(
+        module,
+        params,
+        body,
+        outer,
+        true,
+        outer_boxed,
+        None,
+        inherited_rlp,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_lambda_body_capturing_kind(
     module: &mut crate::Module,
     params: &[klio_ast::Ident],
@@ -59,6 +70,7 @@ pub(super) fn lower_lambda_body_capturing_kind(
     is_lambda: bool,
     outer_boxed: &std::collections::HashSet<String>,
     tailrec_self: Option<&str>,
+    inherited_rlp: std::collections::HashSet<String>,
 ) -> (crate::FuncId, Vec<String>) {
     lower_lambda_body_capturing_kind_with(
         module,
@@ -69,11 +81,13 @@ pub(super) fn lower_lambda_body_capturing_kind(
         outer_boxed,
         tailrec_self,
         false,
+        inherited_rlp,
     )
 }
 
 // Innermost rung of the lambda-body lowering wrapper chain; each flag/ref
 // is threaded straight from the AST and bundling them would only obscure it.
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_lambda_body_capturing_kind_with(
     module: &mut crate::Module,
@@ -84,6 +98,7 @@ pub(super) fn lower_lambda_body_capturing_kind_with(
     outer_boxed: &std::collections::HashSet<String>,
     tailrec_self: Option<&str>,
     is_named_local_fn: bool,
+    inherited_rlp: std::collections::HashSet<String>,
 ) -> (crate::FuncId, Vec<String>) {
     let mut b = FuncBuilder::new(module);
     if is_named_local_fn {
@@ -93,6 +108,11 @@ pub(super) fn lower_lambda_body_capturing_kind_with(
     } else {
         b.set_outer_names_without_lambda(outer);
     }
+    // A captured `block: T.() -> R` from an enclosing scope must still
+    // dispatch a bare `block()` here as `this.block()` — carry the
+    // enclosing receiver-lambda-param names so `is_receiver_lambda_param`
+    // sees them across the capture boundary.
+    b.inherit_receiver_lambda_params(inherited_rlp);
     if let Some(name) = tailrec_self {
         let () = b.set_tailrec_self(name.to_string());
     }

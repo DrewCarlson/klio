@@ -118,6 +118,45 @@ fun main() { val r = Reg(); r.add(); r.applyAll(Client()) }
     );
 }
 
+// A bare `block()` where `block: T.() -> R` is a *captured* param (one
+// composing-builder calling through to another) must run against the
+// active enclosing receiver, threaded through every nesting level.
+#[test]
+fn nested_receiver_lambda_block_composition() {
+    assert_klio(
+        "nested_receiver_lambda_block_composition",
+        r#"
+class Builder { var method = "" }
+fun make(block: Builder.() -> Unit): Builder = Builder().apply(block)
+fun makeGet(block: Builder.() -> Unit): Builder = make { method = "GET"; block() }
+fun makeGetUrl(url: String, block: Builder.() -> Unit = {}): Builder =
+    makeGet { method = method + ":$url"; block() }
+fun main() { println(makeGetUrl("u").method) }
+"#,
+        "GET:u\n",
+    );
+}
+
+// Same composition through `inline fun` builders — the inline splice
+// must also carry the receiver-lambda-param mark so a spliced bare
+// `block()` dispatches against the current receiver (the shape ktor's
+// `client.get(url)` → `request { … }` DSL relies on).
+#[test]
+fn nested_receiver_lambda_block_composition_inline() {
+    assert_klio(
+        "nested_receiver_lambda_block_composition_inline",
+        r#"
+class Builder { var method = "" }
+inline fun make(block: Builder.() -> Unit): Builder = Builder().apply(block)
+inline fun makeGet(block: Builder.() -> Unit): Builder = make { method = "GET"; block() }
+inline fun makeGetUrl(url: String, block: Builder.() -> Unit = {}): Builder =
+    makeGet { method = method + ":$url"; block() }
+fun main() { println(makeGetUrl("u").method) }
+"#,
+        "GET:u\n",
+    );
+}
+
 // A function-typed property — including a constructor reference
 // `::Config` — invoked by bare name inside a method (here reached via an
 // inlined `apply { }` body, where the member-call lowering loses the

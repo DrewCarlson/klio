@@ -599,6 +599,26 @@ impl<'a> FuncBuilder<'a> {
     pub fn is_receiver_lambda_param(&self, name: &str) -> bool {
         self.receiver_lambda_params.contains(name)
     }
+    /// The receiver-lambda-param names this builder knows — its own plus
+    /// any inherited from enclosing scopes. Passed down when a nested
+    /// lambda/local-fn body is lowered so a captured `block: T.() -> R`
+    /// invoked bare there still dispatches `this.block()`.
+    #[must_use]
+    pub fn receiver_lambda_param_names(&self) -> std::collections::HashSet<String> {
+        self.receiver_lambda_params.clone()
+    }
+    /// Seed this builder's receiver-lambda-param set from an enclosing
+    /// scope's (used for a nested lambda/local-fn body, where such a
+    /// param is reached as a capture rather than an own param).
+    pub fn inherit_receiver_lambda_params(&mut self, names: std::collections::HashSet<String>) {
+        self.receiver_lambda_params.extend(names);
+    }
+    /// Drop a receiver-lambda-param mark added for the duration of an
+    /// inline-fn body splice, so it doesn't leak onto a same-named
+    /// caller local after the body is lowered.
+    pub fn unmark_receiver_lambda_param(&mut self, name: &str) {
+        self.receiver_lambda_params.remove(name);
+    }
     pub fn mark_generic_typed_param(&mut self, name: &str) {
         self.generic_typed_params.insert(name.to_string());
     }
