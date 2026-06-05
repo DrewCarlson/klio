@@ -236,13 +236,15 @@ impl VmHost<'_> {
         name: &str,
         args: &[klio_runtime::Value],
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
-        crate::vm::trace::trace_resolve!(
-            name,
-            "call_member recv={} name={} argc={}",
-            crate::vm::trace::recv_label(receiver),
-            name,
-            args.len()
-        );
+        if crate::vm::trace::enabled(name) {
+            crate::vm::trace::emit(format_args!(
+                "call_member recv={} name={} argc={}",
+                crate::vm::trace::recv_label(receiver),
+                name,
+                args.len()
+            ));
+            crate::vm::trace::maybe_dump_chain(&self.enclosing_this_chain());
+        }
         // Member-only probe applies to *this* resolution only — once a
         // member is found and its body runs, nested calls resolve
         // normally. Capture and clear the flag here so it never leaks

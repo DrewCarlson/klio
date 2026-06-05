@@ -49,6 +49,18 @@ pub(crate) fn emit(args: std::fmt::Arguments<'_>) {
     eprintln!("[RESOLVE] {args}");
 }
 
+/// When `KLIO_TRACE_CHAIN=1`, print the current enclosing-`this` chain
+/// (closest receiver first) after a traced member dispatch — the set a
+/// bare member call resolves against. Reveals when a lexically-intended
+/// enclosing receiver is missing or shadowed by a dynamically-nested one.
+pub(crate) fn maybe_dump_chain(chain: &[klio_runtime::Value]) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("KLIO_TRACE_CHAIN").is_ok()) {
+        let labels: Vec<String> = chain.iter().map(recv_label).collect();
+        eprintln!("[RESOLVE]   chain=[{}]", labels.join(", "));
+    }
+}
+
 /// A short receiver-kind label for a dispatch trace (the runtime value's
 /// class name for an instance, or a coarse variant tag otherwise).
 pub(crate) fn recv_label(v: &klio_runtime::Value) -> String {
