@@ -1104,8 +1104,25 @@ impl VmHost<'_> {
                     // Bound property reference invoked with no args.
                     return self.get_field(&rc, &n);
                 } else {
-                    // Bound method reference: forward the call.
-                    return self.call_member(&rc, &n, args);
+                    // Bound method reference: forward the call. A bare
+                    // `::name` the lowerer bound to `this` may instead target
+                    // a *top-level function* (the binding predates the
+                    // function's registration, e.g. a default-arg `::wrap`
+                    // invoked via `f.invoke(…)`); fall back to the global
+                    // callable only when member dispatch finds no such member,
+                    // so a genuine bound member ref keeps dispatching.
+                    let r = self.call_member(&rc, &n, args);
+                    if matches!(name, "invoke" | "call")
+                        && matches!(&r, Err(klio_ir::eval::EvalError::Unimplemented(_)))
+                        && let Some(
+                            callable @ (klio_runtime::Value::Function { .. }
+                            | klio_runtime::Value::IrClosure { .. }
+                            | klio_runtime::Value::Lambda { .. }),
+                        ) = self.lookup_global(&n)
+                    {
+                        return self.call_value(&callable, args);
+                    }
+                    return r;
                 }
             }
         }

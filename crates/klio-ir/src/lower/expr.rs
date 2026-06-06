@@ -4,7 +4,7 @@ use super::{
     callee_label, collect_dotted_fqn, collect_path_idents, collect_path_idents_stmt, expr_span,
     inline_fn_ast, inline_fn_ast_for, intern_arg_names, intern_type_args, is_any_typed_path,
     is_boxed_to_any_form,
-    is_lower_anon_capture, is_package_head, is_pkg_root, lambda_mutated_outer_vars,
+    is_lower_anon_capture, is_package_head, is_pkg_root, is_top_level_prop, lambda_mutated_outer_vars,
     lambda_writes_outer_var, lower_arg_run, lower_for, lower_for_labeled,
     lower_lambda_body_capturing, lower_lambda_body_capturing_kind, lower_stmt, lower_when,
     resolve_capture, splice_inline_lambda, try_inline_call_with_type_args,
@@ -21,6 +21,24 @@ use super::{
 /// nested-class (`Outer.Inner`) and companion-member forwarding work
 /// — unlike the same Path in value position, which resolves to the
 /// companion object. Everything else defers to `lower_expr`.
+/// The register holding the current implicit receiver (`this`), if one
+/// is in scope: either bound directly (a method / extension / receiver
+/// lambda body) or reachable as an outer capture. Returns `None` at top
+/// level / in a non-receiver context. Used to bind a bare `::name`
+/// member reference to its receiver at creation time.
+fn resolve_this_reg(b: &mut FuncBuilder<'_>) -> Option<Reg> {
+    if let Some(r) = b.resolve("this") {
+        return Some(r);
+    }
+    if b.knows_outer("this") {
+        let idx = b.record_capture("this");
+        let dst = b.alloc_reg();
+        b.push(Inst::LoadCapture { dst, idx });
+        return Some(dst);
+    }
+    None
+}
+
 pub fn lower_receiver(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
     if let Expr::Path { segments, .. } = expr
         && segments.len() == 1
@@ -903,6 +921,29 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
                 // slot is empty in a thunk, so `this` would be lost and
                 // `length` escape to an unresolved global). A *non*-extension
                 // thunk never binds `this`, so it keeps the global probe.
+                // A bare reference to a known top-level (file-scope)
+                // property is a global read, not an implicit
+                // `this.<name>` member access. Emit the global load
+                // directly so it never probes an unrelated enclosing
+                // receiver: a `private val LOGGER` read from inside an
+                // interceptor lambda whose `this` is the pipeline
+                // context must reach the file-scope global, not
+                // `get_field` on the lambda's receiver (which, for a
+                // builtin instance, can synthesise a misleading value).
+                // A same-named member of the enclosing class shadows the
+                // global, so this only fires when no member matches —
+                // every member path above has already returned.
+                if is_top_level_prop(&segments[0].name)
+                    && !b.has_own_member(&segments[0].name)
+                    && !b.has_enclosing_member(&segments[0].name)
+                {
+                    let dst = b.alloc_reg();
+                    let nm = b
+                        .module
+                        .intern_const(Const::String(segments[0].name.clone()));
+                    b.push(Inst::LoadGlobal { dst, name: nm });
+                    return dst;
+                }
                 if let Some(this_reg) = b.resolve("this") {
                     // A bare name that resolves to a known top-level
                     // function is a value-position function reference,
@@ -4155,8 +4196,28 @@ pub fn lower_expr(b: &mut FuncBuilder<'_>, expr: &Expr) -> Reg {
             // PropertyRef metadata value.
             let dst = b.alloc_reg();
             let nm = b.module.intern_const(Const::String(name.name.clone()));
+            // A bare `::name` that resolves to a member of the implicit
+            // receiver that the lowerer does NOT track statically is a *bound*
+            // member reference (Kotlin's `this::name`): bind the receiver now
+            // and emit a `MemberRef` so the reference works when invoked later
+            // from another frame (`handler(context, ::proceed)`) and so an
+            // `::x.isInitialized` lateinit probe reads the right instance. The
+            // bound ref dispatches the member on invocation, falls back to a
+            // same-named top-level function when no member exists (a default-arg
+            // `::fn` lowered before `fn` is registered), and answers
+            // `isInitialized` against the captured receiver. A *local* (`name`
+            // in scope as a value) or a *top-level property* keeps the unbound
+            // `PropertyRef`/global form; a top-level function/class loads its
+            // value directly.
+            let is_tracked = b.resolve(&name.name).is_some() || is_top_level_prop(&name.name);
             if b.module.func_id(&name.name).is_some() || b.module.class_id(&name.name).is_some() {
                 b.push(Inst::LoadGlobal { dst, name: nm });
+            } else if !is_tracked && let Some(this_reg) = resolve_this_reg(b) {
+                b.push(Inst::MemberRef {
+                    dst,
+                    receiver: this_reg,
+                    name: nm,
+                });
             } else {
                 b.push(Inst::PropertyRef { dst, name: nm });
             }

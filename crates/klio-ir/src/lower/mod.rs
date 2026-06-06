@@ -29,8 +29,8 @@ use for_loop::{lower_for, lower_for_labeled};
 use inline_call::{
     arg_lambda_has_nonlocal_return, splice_inline_lambda, try_inline_call_with_type_args,
 };
-use inline_state::{inline_fn_ast, inline_fn_ast_for};
-pub use inline_state::{set_inline_fn_asts, set_shadowed_inline_names};
+use inline_state::{inline_fn_ast, inline_fn_ast_for, is_top_level_prop};
+pub use inline_state::{set_inline_fn_asts, set_shadowed_inline_names, set_top_level_prop_names};
 use lambda_body::{
     lower_lambda_body_capturing, lower_lambda_body_capturing_kind,
     lower_lambda_body_capturing_kind_with, resolve_capture,

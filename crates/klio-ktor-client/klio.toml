@@ -84,6 +84,10 @@ include = [
     "io/ktor/util/pipeline/DebugPipelineContext.kt",
     "io/ktor/util/pipeline/SuspendFunctionGun.kt",
     "io/ktor/util/pipeline/Pipeline.kt",
+    # Logging (LOGGER in HttpRedirect/HttpSend etc.). `Logger` is an expect
+    # interface; klio supplies the `KtorSimpleLogger` actual (posix uses cinterop).
+    "io/ktor/util/logging/Logger.kt",
+    "io/ktor/util/logging/KtorSimpleLogger.kt",
 ]
 
 # Platform `actual`s for the ktor-util reflect + pipeline `expect`s. The posix
@@ -95,6 +99,10 @@ include = [
     "io/ktor/util/debug/IntellijIdeaDebugDetectorNative.kt",
     "io/ktor/util/pipeline/PipelineNative.kt",
     "io/ktor/util/pipeline/StackTraceRecoverNative.kt",
+    # `Logger` actual interface + `LogLevel` enum (pure Kotlin; the cinterop-using
+    # `KtorSimpleLoggerNative` is replaced by `shim/core/.../KtorSimpleLoggerKlio`).
+    "io/ktor/util/logging/LoggerNative.kt",
+    "io/ktor/util/logging/LogLevelNative.kt",
 ]
 
 [[source]]
@@ -113,6 +121,7 @@ include = [
     "io/ktor/http/ContentDisposition.kt",
     "io/ktor/http/ContentTypeMatcher.kt",
     "io/ktor/http/HttpMessage.kt",
+    "io/ktor/http/HttpMessageProperties.kt",
     "io/ktor/http/LinkHeader.kt",
     "io/ktor/http/RequestConnectionPoint.kt",
     "io/ktor/http/Ranges.kt",
@@ -171,6 +180,7 @@ include = [
     # `shim/client` declarations, so they are gated under the `client-upstream`
     # feature (the stage-3 swap that replaces `shim/client`) rather than core —
     # otherwise they collide with the shim under `--feature client`.
+    "io/ktor/client/content/ObservableContent.kt",
     "io/ktor/client/request/RequestBody.kt",
     "io/ktor/client/request/HttpRequest.kt",
     "io/ktor/client/request/DefaultHttpRequest.kt",
@@ -179,6 +189,9 @@ include = [
     "io/ktor/client/statement/DefaultHttpResponse.kt",
     "io/ktor/client/statement/HttpResponsePipeline.kt",
     "io/ktor/client/call/HttpClientCall.kt",
+    "io/ktor/client/call/SavedCall.kt",
+    "io/ktor/client/call/DelegatedCall.kt",
+    "io/ktor/client/call/utils.kt",
     "io/ktor/client/HttpClientConfig.kt",
     "io/ktor/client/HttpClient.kt",
     "io/ktor/client/plugins/HttpClientPlugin.kt",
@@ -240,6 +253,7 @@ client = { sources = ["shim/client"] }
 # complete (then `client` points here and `shim/client` is deleted).
 client-upstream = { sources = [
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/utils/ClientEvents.kt",
+    "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/content/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/request/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/statement/",
     "upstream/ktor-client/ktor-client-core/common/src/io/ktor/client/call/",

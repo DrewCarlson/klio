@@ -243,3 +243,31 @@ fun main() = runBlocking {
 "#;
     assert_klio("channel_buffered", src, "abc\n");
 }
+
+// A bare `coroutineContext` inside an extension of a `CoroutineScope` reads the
+// receiver's own stored context (the member shadows the ambient intrinsic), not
+// the running coroutine's context.
+#[test]
+fn coroutine_scope_extension_reads_receiver_context() {
+    let src = r#"
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.runBlocking
+import kotlin.coroutines.CoroutineContext
+
+class Holder(override val coroutineContext: CoroutineContext) : CoroutineScope
+
+fun Holder.tagName(): String = coroutineContext[CoroutineName]?.name ?: "none"
+
+fun main() = runBlocking {
+    val h = Holder(CoroutineName("held"))
+    println(h.tagName())
+    println(coroutineContext[CoroutineName]?.name ?: "ambient-none")
+}
+"#;
+    assert_klio(
+        "scope_extension_context",
+        src,
+        "held\nambient-none\n",
+    );
+}

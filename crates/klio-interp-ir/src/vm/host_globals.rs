@@ -154,15 +154,22 @@ impl VmHost<'_> {
                 return Some(inst);
             }
         }
-        // Forward reference to a top-level property whose own
-        // initializer has not run yet (it is declared after the
-        // initializer currently executing). The slot is still its
-        // pre-init `Null` placeholder; drive the initializer on demand
-        // so the real value — not `Null` — is observed (a cycle
-        // degrades to the placeholder via the re-entrancy guard).
-        if in_top_level_init()
-            && matches!(&cached, None | Some(klio_runtime::Value::Null))
-            && self.prog.top_level_prop_inits.contains_key(name)
+        // Top-level property whose own initializer has not produced its
+        // value yet. Two cases drive an on-demand init:
+        //  * A *deferred* prop (`cached.is_none()`): its startup init threw
+        //    a missing-symbol error (staged pack consumption — e.g. ktor's
+        //    `AttributeKey<ProgressListener>(…)` in BodyProgress, deferred
+        //    when the symbol wasn't consumed yet) so it was skipped. It can
+        //    be re-driven on first access from *anywhere*, including a
+        //    runtime lambda — matching Kotlin's lazy top-level init.
+        //  * A forward reference during startup (`Null` placeholder, still
+        //    inside top-level init): the prop is declared after the
+        //    initializer currently running; drive it so the real value, not
+        //    the placeholder, is observed.
+        // A cycle degrades to the placeholder via the re-entrancy guard.
+        if self.prog.top_level_prop_inits.contains_key(name)
+            && (cached.is_none()
+                || (in_top_level_init() && matches!(&cached, Some(klio_runtime::Value::Null))))
             && let Ok(Some(v)) = self.ensure_top_level_inited(name)
             && !matches!(v, klio_runtime::Value::Null)
         {

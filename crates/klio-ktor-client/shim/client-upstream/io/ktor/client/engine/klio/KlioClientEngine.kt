@@ -13,7 +13,8 @@ import io.ktor.http.*
 import io.ktor.http.content.*
 import io.ktor.util.date.GMTDate
 import io.ktor.utils.io.*
-import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 
 public class KlioClientEngineConfig : HttpClientEngineConfig()
 
@@ -62,7 +63,12 @@ public class KlioClientEngine(
             headers = respHeaders.build(),
             version = HttpProtocolVersion.HTTP_1_1,
             body = ByteReadChannel(parts[1].encodeToByteArray()),
-            callContext = coroutineContext,
+            // The call context carries a fresh completable `Job` for the
+            // response lifecycle. The host request is synchronous (the whole
+            // body is already in `parts`), so the job has no children and the
+            // statement layer's `cleanup()` (`coroutineContext[Job]!!.complete()
+            // .join()`) settles immediately.
+            callContext = currentCoroutineContext() + Job(),
         )
     }
 }

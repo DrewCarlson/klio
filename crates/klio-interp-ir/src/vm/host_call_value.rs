@@ -36,7 +36,23 @@ impl VmHost<'_> {
                 if args.is_empty() && member_is_property(&self.classes, &recv, &name) {
                     return self.get_field(&recv, &name);
                 }
-                return self.call_member(&recv, &name, args);
+                let r = self.call_member(&recv, &name, args);
+                // Fallback: a bare `::name` the lowerer bound to the enclosing
+                // `this` may actually target a *top-level function* — the
+                // binding is lowered before the function is registered (e.g. a
+                // method default-arg thunk's `::shout`), so it can't be
+                // distinguished at lower time. Only when member dispatch finds
+                // no such member do we retry the global callable, so a genuine
+                // bound member ref (`obj::method`, even one whose name matches
+                // a top-level fn) keeps dispatching the member.
+                if matches!(&r, Err(klio_ir::eval::EvalError::Unimplemented(_)))
+                    && let Some(callable @ (klio_runtime::Value::Function { .. }
+                        | klio_runtime::Value::IrClosure { .. }
+                        | klio_runtime::Value::Lambda { .. })) = self.lookup_global(&name)
+                {
+                    return self.call_value(&callable, args);
+                }
+                return r;
             }
             return self.call_member(callee, "invoke", args);
         }
@@ -211,25 +227,20 @@ impl VmHost<'_> {
                 // `HttpClientEngine`) yet is invoked by the pipeline as
                 // `interceptor.invoke(pipelineContext, subject)`. Push it
                 // as an enclosing receiver so the body can still resolve
-                // the engine's members (`checkExtensions`,
-                // `executeWithinCallContext`), mirroring
-                // `invoke_callable_with_this`. Without it those bare
-                // member calls escape to the global scope and the request
-                // never reaches the engine's `execute`.
+                // the engine's members, mirroring `invoke_callable_with_this`.
                 let prior_this = captures.get(this_idx).cloned();
-                let mut new_caps: Vec<klio_runtime::Value> = (**captures).clone();
-                if this_idx >= new_caps.len() {
-                    new_caps.resize(this_idx + 1, klio_runtime::Value::Null);
-                }
-                new_caps[this_idx] = args[0].clone();
-                let bound = klio_runtime::Value::IrClosure {
-                    id: *id,
-                    captures: Arc::new(new_caps),
+                let bound = {
+                    let mut new_caps: Vec<klio_runtime::Value> = (**captures).clone();
+                    if this_idx >= new_caps.len() {
+                        new_caps.resize(this_idx + 1, klio_runtime::Value::Null);
+                    }
+                    new_caps[this_idx] = args[0].clone();
+                    klio_runtime::Value::IrClosure {
+                        id: *id,
+                        captures: Arc::new(new_caps),
+                    }
                 };
                 let rest: Vec<klio_runtime::Value> = args[1..].to_vec();
-                // Push the prior captured `this` as the enclosing
-                // receiver, unless it is null/unit or the same instance
-                // as the new receiver (no shadowing to undo).
                 let pushed_outer = match (&prior_this, &args[0]) {
                     (None | Some(klio_runtime::Value::Null | klio_runtime::Value::Unit), _) => {
                         false

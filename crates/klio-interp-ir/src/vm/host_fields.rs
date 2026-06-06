@@ -27,6 +27,44 @@ impl VmHost<'_> {
         receiver: &klio_runtime::Value,
         name: &str,
     ) -> Result<klio_runtime::Value, klio_ir::eval::EvalError> {
+        // Reflective reads on a *bound* member reference (`this::name`, lowered
+        // to a `$bound_ref$` synth carrying `__bound_receiver__` /
+        // `__bound_name__`): `.name` / `.simpleName` yield the referenced
+        // member's name, and `.isInitialized` answers the lateinit probe
+        // against the captured receiver (`::field.isInitialized` inside a
+        // class). Mirrors the unbound `PropertyRef` handling further down.
+        if matches!(name, "isInitialized" | "name" | "simpleName")
+            && let klio_runtime::Value::Instance(inst) = receiver
+        {
+            let bound = {
+                let b = inst.borrow();
+                match (b.get("__bound_receiver__"), b.get("__bound_name__")) {
+                    (Some(r), Some(klio_runtime::Value::String(n))) => Some((r, n)),
+                    _ => None,
+                }
+            };
+            if let Some((bound_recv, bound_name)) = bound {
+                if matches!(name, "name" | "simpleName") {
+                    return Ok(klio_runtime::Value::String(Arc::clone(&bound_name)));
+                }
+                // isInitialized: true iff the captured receiver declares
+                // `bound_name` as a lateinit property whose slot is non-Null.
+                if let klio_runtime::Value::Instance(ri) = &bound_recv {
+                    let b = ri.borrow();
+                    let is_lateinit = b
+                        .class
+                        .body_properties
+                        .iter()
+                        .any(|p| p.name == *bound_name && p.is_lateinit);
+                    let initialised = is_lateinit
+                        && b.fields.iter().any(|(n, v)| {
+                            n == &*bound_name && !matches!(v, klio_runtime::Value::Null)
+                        });
+                    return Ok(klio_runtime::Value::Bool(initialised));
+                }
+                return Ok(klio_runtime::Value::Bool(false));
+            }
+        }
         // `e::class.simpleName` / `.qualifiedName` for a builtin exception:
         // `e::class` returns the Exception value itself (klio has no ClassDef
         // for the builtin Throwable hierarchy), so resolve the reflective name
@@ -96,7 +134,26 @@ impl VmHost<'_> {
                     klio_runtime::Value::Instance(b)
                 ) if klio_runtime::ObjRef::ptr_eq(a, b)
             );
-            if !same {
+            // A receiver that is itself a `CoroutineScope` owns the
+            // context the Kotlin member read targets (`this.coroutineContext`
+            // shadows the ambient intrinsic). This applies to a bare read
+            // inside an *extension* of such a type too — e.g.
+            // `HttpResponse.cleanup()` reads the response's stored
+            // `coroutineContext` (its call job), not the ambient one.
+            //
+            // The check is deliberately limited to a *stored field*: a data
+            // object like `DefaultHttpResponse` keeps its context in an
+            // `override val coroutineContext = …` slot, whereas a live
+            // coroutine scope (`DeferredCoroutine`, `StandaloneCoroutine`)
+            // computes it through a getter and IS the running coroutine, so
+            // its bare `coroutineContext` must still redirect to the active
+            // scope (carrying the running Job). Probing getters here would
+            // wrongly suppress that redirect.
+            let recv_owns_context = matches!(
+                receiver,
+                klio_runtime::Value::Instance(i) if i.borrow().get("coroutineContext").is_some()
+            );
+            if !same && !recv_owns_context {
                 return self.get_field(&scope, "coroutineContext");
             }
         }

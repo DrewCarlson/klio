@@ -34,6 +34,32 @@ thread_local! {
     static INLINE_EXPAND_DEPTH: std::cell::Cell<u32> = const {
         std::cell::Cell::new(0)
     };
+
+    /// Simple names of *top-level* (file-scope) properties — `val`/`var`
+    /// declared outside any class. Set by the build driver before body
+    /// lowering. A bare reference to such a name inside a method/lambda
+    /// body must resolve as a global property read, not an implicit
+    /// `this.<name>` field access: a top-level `private val LOGGER` read
+    /// from inside an interceptor lambda (whose `this` is the pipeline
+    /// context, with no `LOGGER` member) would otherwise `get_field` on
+    /// the wrong receiver. Lowering consults this set to skip the
+    /// `this.<name>` shortcut for known globals.
+    static TOP_LEVEL_PROP_NAMES: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Install the set of top-level property simple names for the current
+/// build, so bare-name lowering routes them to a global read instead of
+/// an implicit `this.<name>` field access.
+pub fn set_top_level_prop_names<S: ::std::hash::BuildHasher>(
+    names: std::collections::HashSet<String, S>,
+) {
+    TOP_LEVEL_PROP_NAMES.with(|c| *c.borrow_mut() = names.into_iter().collect());
+}
+
+/// True when `name` is a known top-level (file-scope) property.
+pub(super) fn is_top_level_prop(name: &str) -> bool {
+    TOP_LEVEL_PROP_NAMES.with(|c| c.borrow().contains(name))
 }
 
 /// Install the suspend-inline-fn AST table for the current build. Each

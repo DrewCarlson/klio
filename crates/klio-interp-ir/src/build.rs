@@ -1122,6 +1122,21 @@ fn build_module_with_overrides(
         }
         klio_ir::lower::set_shadowed_inline_names(shadowed);
     }
+    // Top-level (file-scope) property names — `val`/`var` outside any
+    // class, excluding extension properties (which carry a receiver and
+    // dispatch by type). A bare reference to one inside a method/lambda
+    // body lowers as a global read rather than an implicit `this.<name>`
+    // field access (see the bare-name shortcut in `lower::expr`).
+    {
+        let top_props: std::collections::HashSet<String> = all_decls
+            .iter()
+            .filter_map(|d| match d {
+                Decl::Property(p) if p.receiver_type.is_none() => Some(p.name.name.clone()),
+                _ => None,
+            })
+            .collect();
+        klio_ir::lower::set_top_level_prop_names(top_props);
+    }
     // Non-wildcard imports, keyed first by the declaring file then by
     // the name they bind (alias or last segment), so the lowerer can
     // rewrite a bare reference to an imported (possibly named-)
