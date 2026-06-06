@@ -1186,12 +1186,27 @@ fn exec_inst(frame: &mut Frame<'_>, inst: &Inst, host: &mut dyn Host) -> Result<
             // calling frame's `this` so the body sees its expected
             // receiver. Without this the body's bare references to
             // T's members fall through to globals.
+            //
+            // The calling frame's receiver is normally a `this`-named
+            // param, but a *receiver lambda* (`T.() -> R`) carries its
+            // receiver as a `this`-named *capture* instead. Consult both
+            // so a member-extension invoked through a value (`this::m`
+            // captured and called via `CallValue`) from inside a receiver
+            // lambda still gets the receiver bound as its leading `this`.
             let caller_this: Option<Value> = frame
                 .func
                 .params
                 .iter()
                 .position(|p| p.name == "this")
                 .and_then(|i| frame.params.get(i).cloned())
+                .or_else(|| {
+                    frame
+                        .func
+                        .capture_order
+                        .iter()
+                        .position(|n| n == "this")
+                        .and_then(|i| frame.captures.get(i).cloned())
+                })
                 .filter(|v| matches!(v, Value::Instance(_)));
             if let Some((n_params, first_is_this)) = host.callable_receiver_shape(&callee_v)
                 && first_is_this
