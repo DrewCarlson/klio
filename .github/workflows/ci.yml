@@ -7,23 +7,24 @@ on:
     branches: [main]
 
 jobs:
-  check:
-    name: fmt + clippy + test
+  build-and-test:
+    name: zig build + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          components: rustfmt, clippy
+      - name: install zig 0.16.0
+        run: |
+          set -euo pipefail
+          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: zig version
+        run: zig version
 
-      # klio-stdlib-pack's build script embeds curated upstream sources read
-      # from a local JetBrains/kotlin checkout under kotlin/. A sparse,
-      # blobless clone of libraries/stdlib at the target tag is enough.
+      # The interpreter reads upstream Kotlin stdlib sources from kotlin/ at
+      # runtime (the stdlib pack is built from them). A sparse, blobless clone
+      # of libraries/stdlib at the target tag is enough.
       - name: cache kotlin stdlib sources (kotlin/)
         id: kotlin-src-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -40,41 +41,8 @@ jobs:
           git -C kotlin sparse-checkout set libraries/stdlib
           git -C kotlin checkout v2.3.21
 
-      - name: cache kotlin-native (~/.konan)
-        id: konan-cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.konan
-          key: konan-${{ runner.os }}-${{ runner.arch }}-2.3.21
-          restore-keys: |
-            konan-${{ runner.os }}-${{ runner.arch }}-
+      - name: zig build
+        run: zig build
 
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: install kotlin-native (if not cached)
-        if: steps.konan-cache.outputs.cache-hit != 'true'
-        run: cargo run -q -p klio-parity --bin klio-parity -- --install
-
-      - name: cargo test
-        run: cargo test --workspace
-
-      - name: stdlib coverage non-regression gate
-        run: |
-          set -euo pipefail
-          output=$(cargo run -q -p klio-stdlib-gen -- coverage)
-          echo "$output"
-          current=$(printf '%s\n' "$output" | grep -oE 'implemented [0-9]+' | awk '{print $2}')
-          if [ -z "${current:-}" ]; then
-            echo "failed to parse implemented count from coverage output" >&2
-            exit 1
-          fi
-          baseline=$(tr -d '[:space:]' < coverage-baseline.txt)
-          echo "current=$current baseline=$baseline"
-          if [ "$current" -lt "$baseline" ]; then
-            echo "stdlib coverage regressed: $current < $baseline (see coverage-baseline.txt)" >&2
-            exit 1
-          fi
+      - name: zig build test
+        run: zig build test --summary all
