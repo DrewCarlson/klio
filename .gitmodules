@@ -7,3 +7,12 @@
 [submodule "kotlin-klio/klio-kotlinx-coroutines/upstream"]
 	path = kotlin-klio/klio-kotlinx-coroutines/upstream
 	url = https://github.com/Kotlin/kotlinx.coroutines
+[submodule "kotlin-klio/klio-kotlinx-datetime/upstream"]
+	path = kotlin-klio/klio-kotlinx-datetime/upstream
+	url = https://github.com/Kotlin/kotlinx-datetime
+[submodule "kotlin-klio/klio-kotlinx-serialization/upstream"]
+	path = kotlin-klio/klio-kotlinx-serialization/upstream
+	url = https://github.com/Kotlin/kotlinx.serialization
+[submodule "kotlin-klio/klio-ktor-client/upstream"]
+	path = kotlin-klio/klio-ktor-client/upstream
+	url = https://github.com/ktorio/ktor
