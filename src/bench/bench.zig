@@ -82,11 +82,11 @@ const CaptureOutput = struct {
     }
 };
 
-/// Locate the `corpus/` directory of the bench crate. The bench corpus
-/// physically lives under `crates/klio-bench/corpus`; the path is resolved
-/// relative to the process working directory. Caller owns the result.
+/// Locate the bench corpus directory. The bench corpus physically lives under
+/// `tests/fixtures/bench_corpus`; the path is resolved relative to the process
+/// working directory. Caller owns the result.
 pub fn corpusRoot(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
-    return allocator.dupe(u8, "crates/klio-bench/corpus");
+    return allocator.dupe(u8, "tests/fixtures/bench_corpus");
 }
 
 /// Walk a corpus directory and return every `.kt` file, sorted. Caller

@@ -1,6 +1,6 @@
 //! Extension function resolution: top-level vs member, generic
 //! extension, extension on nullable, extension dispatched on
-//! interface. Ported from crates/klio-parity/tests/extension_resolution.rs.
+//! interface. Ported from the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

@@ -1,7 +1,7 @@
 //! Advanced generic scenarios: covariant/contravariant variance,
 //! star-projection, reified inline functions, bounds projection,
 //! generic function reified-class lookup. Ported from
-//! crates/klio-parity/tests/generics_advanced.rs.
+//! the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

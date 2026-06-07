@@ -1,5 +1,5 @@
 //! Operator edge cases and conversions.
-//! Port of crates/klio-parity/tests/operator_edge_cases.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

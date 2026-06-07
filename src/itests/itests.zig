@@ -1,4 +1,4 @@
-//! Integration test suite: ported from crates/*/tests. Each file runs through
+//! Integration test suite. Each file runs through
 //! the real pipeline and asserts behavior/diagnostics.
 test {
     _ = @import("parity_advanced_idioms.zig");

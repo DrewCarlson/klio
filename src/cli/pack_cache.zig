@@ -1,6 +1,6 @@
 //! Pack cache + installed-pack loading.
 //!
-//! Mirrors `crates/klio-cli/src/pack_cache.rs`. Walks the local pack
+//! Walks the local pack
 //! cache, parses each pack the user imports so resolution + type
 //! inference see its real signatures, consumes the embedded stdlib's
 //! curated sources, and merges every pack's host bindings into a single

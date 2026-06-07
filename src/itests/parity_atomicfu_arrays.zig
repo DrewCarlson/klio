@@ -4,7 +4,7 @@
 //! so a user import failed at runtime; the stdlib pack no longer bundles
 //! those array `expect`s.
 //!
-//! Port of crates/klio-parity/tests/atomicfu_arrays.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

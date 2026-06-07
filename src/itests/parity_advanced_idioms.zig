@@ -2,7 +2,7 @@
 //! sequence laziness, reified generics, lateinit, contracts,
 //! reflection lite, scoping edges.
 //!
-//! Port of crates/klio-parity/tests/advanced_idioms.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

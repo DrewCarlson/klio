@@ -1,7 +1,7 @@
 //! Realistic coroutine shapes drawn from kotlinx-coroutines patterns:
 //! cancellation race, supervisorScope, async with explicit start, channels,
 //! flow collection, parallel decomposition. Port of
-//! crates/klio-parity/tests/coroutines_realistic.rs.
+//! the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

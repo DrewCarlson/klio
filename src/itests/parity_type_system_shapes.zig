@@ -3,7 +3,7 @@
 //! with inherited fields, `KClass` equality, type parameter T.foo
 //! resolution.
 //!
-//! Port of crates/klio-parity/tests/type_system_shapes.rs.
+//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

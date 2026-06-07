@@ -1,4 +1,4 @@
-//! Port of crates/klio-cfa/tests/smartcast.rs.
+//! Port of the Rust suite.
 //!
 //! Each test parses a small Kotlin function, lowers it, runs the
 //! smart-cast pass, and asserts on the per-place fact at a chosen

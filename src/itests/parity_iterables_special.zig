@@ -2,7 +2,7 @@
 //! zipWithNext, scan, runningFold, take/drop, takeLast/dropLast,
 //! single/firstOrNull, indexOfFirst.
 //!
-//! Ported from crates/klio-parity/tests/iterables_special.rs.
+//! Ported from the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

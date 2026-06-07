@@ -1,10 +1,9 @@
 //! Pack subcommand: build a `.klio-pack` artifact, migrate one, and talk
 //! to a local-filesystem registry.
 //!
-//! Mirrors `crates/klio-cli/src/pack_build.rs`. The `run_pack` dispatch
-//! over every `PackCmd` subcommand wires one command apiece; the cache
-//! helpers it dispatches to (`inspect_pack`, `install_pack_into_cache`,
-//! …) live in `pack_cache.zig`, mirroring the Rust crate split.
+//! The `run_pack` dispatch over every `PackCmd` subcommand wires one
+//! command apiece; the cache helpers it dispatches to (`inspect_pack`,
+//! `install_pack_into_cache`, …) live in `pack_cache.zig`.
 //!
 //! This build has no zstd codec, so every section that the Rust builder
 //! stored as `Compression.Zstd` is stored uncompressed here (same caveat

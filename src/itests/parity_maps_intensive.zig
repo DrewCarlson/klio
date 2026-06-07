@@ -1,7 +1,7 @@
 //! Map manipulation: iteration, mutation, key/value views, mapValues,
 //! filterKeys/filterValues, getOrPut, entries destructuring.
 //!
-//! Port of crates/klio-parity/tests/maps_intensive.rs.
+//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

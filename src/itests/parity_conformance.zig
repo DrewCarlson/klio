@@ -1,12 +1,12 @@
 //! Memory-model conformance suite. Each litmus program in
-//! `crates/klio-parity/tests/conformance/` is the executable form of one rule
+//! `tests/fixtures/conformance/` is the executable form of one rule
 //! in the memory model. Expected stdout is encoded as leading `//> ` comment
-//! lines. Port of crates/klio-parity/tests/conformance.rs.
+//! lines.
 
 const std = @import("std");
 const parity = @import("parity");
 
-const CONFORMANCE_DIR = "crates/klio-parity/tests/conformance";
+const CONFORMANCE_DIR = "tests/fixtures/conformance";
 
 // One arena shared by every pipeline run in this file. The pipeline installs
 // process-global tables (inline-fn ASTs, the enclosing-`this` stack, ...)

@@ -217,7 +217,7 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
 };
 
 /// klio-authored platform `actual` source files shipped in the same `SOURCES`
-/// section, paths relative to the `crates/klio-stdlib` directory.
+/// section, paths relative to the `kotlin-klio` directory.
 pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-time/Actuals.kt",
     "kotlin-coroutines/Actuals.kt",
@@ -233,8 +233,8 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
 /// The local upstream Kotlin checkout's `libraries/stdlib` directory, relative
 /// to the workspace root (the process cwd when the pack is built).
 const UPSTREAM_STDLIB_ROOT = "kotlin/libraries/stdlib";
-/// The `crates/klio-stdlib` directory holding the klio-authored actuals.
-const KLIO_STDLIB_DIR = "crates/klio-stdlib";
+/// The `kotlin-klio` directory holding the klio-authored actuals.
+const KLIO_STDLIB_DIR = "kotlin-klio";
 
 /// Build a deterministic pack for the in-process Kotlin standard library.
 ///
@@ -340,7 +340,7 @@ fn buildCuratedSources(a: std.mem.Allocator, result: *PackError) std.mem.Allocat
     }
 
     var klio_dir = cwd.openDir(io, KLIO_STDLIB_DIR, .{}) catch {
-        result.* = .{ .Io = "klio-stdlib directory missing: expected actuals at crates/klio-stdlib" };
+        result.* = .{ .Io = "klio-stdlib directory missing: expected actuals at kotlin-klio" };
         return null;
     };
     defer klio_dir.close(io);

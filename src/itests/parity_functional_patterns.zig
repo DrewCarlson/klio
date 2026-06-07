@@ -1,6 +1,6 @@
 //! Functional-style patterns: pipelines, immutable builders, Option-
 //! like Result handling, recursive structures. Ported from
-//! crates/klio-parity/tests/functional_patterns.rs.
+//! the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

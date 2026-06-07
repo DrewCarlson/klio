@@ -1,7 +1,7 @@
 //! Exception handling, finally semantics, multi-catch, rethrow,
 //! try-as-expression, and exception inside lambda capture.
 //!
-//! Port of crates/klio-parity/tests/exceptions_and_flow.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

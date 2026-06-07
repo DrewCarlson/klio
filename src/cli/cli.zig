@@ -1,9 +1,8 @@
 //! `klio` command-line entry point: argument parsing + subcommand
 //! dispatch.
 //!
-//! Mirrors `crates/klio-cli/src/main.rs`. The Rust binary used `clap`
-//! for declarative parsing; here the parsing is hand-rolled to stay
-//! dependency-free, but the surface (subcommands, flags, usage) matches.
+//! The parsing is hand-rolled to stay dependency-free; the surface
+//! (subcommands, flags, usage) is fixed.
 //!
 //! The exe root (`src/main.zig`) owns `pub fn main` and calls
 //! `cli.run(gpa)`, which returns the process exit code.

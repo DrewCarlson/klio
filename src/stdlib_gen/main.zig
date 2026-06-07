@@ -32,7 +32,7 @@ pub const Cmd = union(enum) {
         /// (`<repo>/kotlin/libraries/stdlib`).
         stdlib: ?[]const u8 = null,
         /// Output directory for generated data
-        /// (`<repo>/crates/klio-stdlib/src/generated`).
+        /// (`<repo>/src/stdlib/generated`).
         out: ?[]const u8 = null,
     };
 };
@@ -72,7 +72,7 @@ fn build(allocator: Allocator, io: Io, args: Cmd.Build, err_writer: *std.Io.Writ
     const out_dir = if (args.out) |o|
         try allocator.dupe(u8, o)
     else
-        try std.fs.path.join(allocator, &.{ root, "crates/klio-stdlib/src/generated" });
+        try std.fs.path.join(allocator, &.{ root, "src/stdlib/generated" });
     defer allocator.free(out_dir);
 
     if (!isDir(io, stdlib_path)) {

@@ -2,7 +2,7 @@
 //! by field, toString format, destructuring via componentN, copy with
 //! all defaults.
 //!
-//! Port of crates/klio-parity/tests/data_class_features.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

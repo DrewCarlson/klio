@@ -1,6 +1,6 @@
 //! Declaration-checking phase. Free functions over `*Checker`.
 //!
-//! Mirrors `crates/klio-typeck/src/check/decl.rs`: top-level declaration
+//! Top-level declaration
 //! intake, class-info collection, and the per-declaration body / shape
 //! checks (override rules, data/enum/value class shapes, supertype
 //! validity, lateinit, operator signatures, circular bounds, diamond

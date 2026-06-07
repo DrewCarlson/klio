@@ -1,12 +1,12 @@
 //! Regression net for the currently-working coroutine subset. Locks down
 //! behavior across the layer-split and coroutine stages: a pure refactor must
 //! not change any of these outputs. Expected stdout is encoded as leading
-//! `//> ` comment lines. Port of crates/klio-parity/tests/coroutine_smoke.rs.
+//! `//> ` comment lines.
 
 const std = @import("std");
 const parity = @import("parity");
 
-const SMOKE_DIR = "crates/klio-parity/tests/coroutine_smoke";
+const SMOKE_DIR = "tests/fixtures/coroutine_smoke";
 
 // The klio pipeline installs process-global lowering/VM state (inline-fn
 // tables, the enclosing-`this` stack) backed by the run's allocator. A

@@ -1,6 +1,6 @@
 //! String manipulation, number parsing, regex, char operations.
 //!
-//! Port of crates/klio-parity/tests/strings_numbers.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

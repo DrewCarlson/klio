@@ -1,5 +1,5 @@
 //! Real-OS-thread stress + ordering tests for `ObjRef`'s publish protocol
-//! (port of crates/klio-runtime/tests/objref_threads.rs). Exercises the
+//! (port of the Rust suite). Exercises the
 //! actual `std`-backed adaptive cell across genuine threads through the
 //! public `runtime` module API.
 //!

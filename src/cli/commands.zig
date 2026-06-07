@@ -1,6 +1,6 @@
 //! Subcommand definitions for the `klio` CLI: lex, parse, run, check, repl.
 //!
-//! Mirrors `crates/klio-cli/src/commands.rs`. Each `run*` returns a
+//! Each `run*` returns a
 //! process exit code; diagnostics are rendered through the
 //! `diagnostics.render` family. The full pipeline is
 //! read .kt -> lexer -> parser -> resolver -> typeck -> ir lower ->

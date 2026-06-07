@@ -1,6 +1,6 @@
 //! Named arguments, default values, varargs, mixed forms.
 //!
-//! Port of crates/klio-parity/tests/named_args_defaults.rs.
+//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

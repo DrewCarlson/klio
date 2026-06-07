@@ -1,4 +1,4 @@
-//! Port of crates/klio-cfa/tests/builder.rs.
+//! Port of the Rust suite.
 //!
 //! Exercises the IR + builder by constructing canonical CFG shapes by
 //! hand and asserting their printed form. The Rust tests use

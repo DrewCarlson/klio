@@ -5,7 +5,7 @@
 //! (`byteArrayOf`) and calls `min(limit, …)`. Bare `min(a, b)` here is
 //! `kotlin.math.min`. These tests pin the fixed behavior.
 //!
-//! Ported from crates/klio-parity/tests/kotlinx_io_read.rs.
+//! Ported from the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

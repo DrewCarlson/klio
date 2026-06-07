@@ -8,13 +8,11 @@
 //! exact stdout today (`RUNNABLE`). Programs that genuinely need OS-thread
 //! spawning to be meaningful are listed in `PENDING`, keyed by the blocker,
 //! and run by an ignored test until real thread spawn lands.
-//!
-//! Port of crates/klio-parity/tests/threaded_litmus.rs.
 const std = @import("std");
 const parity = @import("parity");
 
 /// The litmus corpus directory, relative to the workspace root (cwd).
-const LITMUS_DIR = "crates/klio-parity/tests/threaded_litmus";
+const LITMUS_DIR = "tests/fixtures/threaded_litmus";
 
 // The klio pipeline installs process-global lowering/VM state (inline-fn
 // tables, the enclosing-`this` stack) backed by the run's allocator. A

@@ -2,7 +2,7 @@
 //! generic dispatch, suspended lambda captures, member-ref to
 //! generic methods, scope function chaining with explicit this@.
 //!
-//! Ported from crates/klio-parity/tests/lambdas_and_dispatch.rs.
+//! Ported from the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

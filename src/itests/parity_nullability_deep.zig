@@ -1,7 +1,7 @@
 //! Null safety, smart casts after null checks, type-erased nullable
 //! receivers, elvis returns, !! assertion.
 //!
-//! Port of crates/klio-parity/tests/nullability_deep.rs.
+//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

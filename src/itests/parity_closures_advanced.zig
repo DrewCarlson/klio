@@ -2,7 +2,7 @@
 //! with `this` reassignment, lambdas stored and invoked later,
 //! enclosed-by-loop iteration variables.
 //!
-//! Port of crates/klio-parity/tests/closures_advanced.rs.
+//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

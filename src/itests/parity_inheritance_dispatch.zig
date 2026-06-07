@@ -1,6 +1,6 @@
 //! Inheritance + dispatch parity: super calls, diamond, generic
 //! inheritance, abstract/final/open interplay, companion through subclass.
-//! Ported from crates/klio-parity/tests/inheritance_dispatch.rs.
+//! Ported from the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

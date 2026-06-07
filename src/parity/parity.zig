@@ -650,9 +650,9 @@ pub fn defaultJobs(allocator: Allocator) usize {
     return std.math.clamp(cores, 1, 6);
 }
 
-/// The workspace corpus directory (`crates/klio-parity/tests/corpus`).
+/// The workspace corpus directory (`tests/fixtures/parity_corpus`).
 pub fn corpusDir(allocator: Allocator) Allocator.Error![]u8 {
-    return std.fs.path.join(allocator, &.{ "crates", "klio-parity", "tests", "corpus" });
+    return std.fs.path.join(allocator, &.{ "tests", "fixtures", "parity_corpus" });
 }
 
 /// The workspace `examples/` directory.
@@ -1515,9 +1515,9 @@ fn runWithPacksInner(allocator: Allocator, io: Io, file: []const u8) Allocator.E
 
     const ws = try workspaceRoot(arena);
     const pack_dirs = [_][]const u8{
-        try std.fs.path.join(arena, &.{ ws, "crates", "klio-kotlinx-coroutines" }),
-        try std.fs.path.join(arena, &.{ ws, "crates", "klio-kotlinx-atomicfu" }),
-        try std.fs.path.join(arena, &.{ ws, "crates", "klio-kotlinx-io" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-coroutines" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-atomicfu" }),
+        try std.fs.path.join(arena, &.{ ws, "kotlin-klio", "klio-kotlinx-io" }),
     };
 
     var map = SourceMap.init(arena);

@@ -1,0 +1,38 @@
+public class kotlinx/atomicfu/plugin/gradle/AtomicFUGradlePlugin : org/gradle/api/Plugin {
+	public fun <init> ()V
+	public synthetic fun apply (Ljava/lang/Object;)V
+	public fun apply (Lorg/gradle/api/Project;)V
+}
+
+public final class kotlinx/atomicfu/plugin/gradle/AtomicFUPluginExtension {
+	public fun <init> (Ljava/lang/String;)V
+	public final fun getDependenciesVersion ()Ljava/lang/String;
+	public final fun getJvmVariant ()Ljava/lang/String;
+	public final fun getTransformJs ()Z
+	public final fun getTransformJvm ()Z
+	public final fun getVerbose ()Z
+	public final fun setDependenciesVersion (Ljava/lang/String;)V
+	public final fun setJvmVariant (Ljava/lang/String;)V
+	public final fun setTransformJs (Z)V
+	public final fun setTransformJvm (Z)V
+	public final fun setVerbose (Z)V
+}
+
+public abstract class kotlinx/atomicfu/plugin/gradle/AtomicFUTransformTask : org/gradle/api/DefaultTask {
+	public field classPath Lorg/gradle/api/file/FileCollection;
+	public field inputFiles Lorg/gradle/api/file/FileCollection;
+	public fun <init> ()V
+	public final fun getClassPath ()Lorg/gradle/api/file/FileCollection;
+	public abstract fun getDestinationDirectory ()Lorg/gradle/api/file/DirectoryProperty;
+	public final fun getInputFiles ()Lorg/gradle/api/file/FileCollection;
+	public final fun getJvmVariant ()Ljava/lang/String;
+	public final fun getOutputDir ()Ljava/io/File;
+	public final fun getVerbose ()Z
+	public final fun setClassPath (Lorg/gradle/api/file/FileCollection;)V
+	public final fun setInputFiles (Lorg/gradle/api/file/FileCollection;)V
+	public final fun setJvmVariant (Ljava/lang/String;)V
+	public final fun setOutputDir (Ljava/io/File;)V
+	public final fun setVerbose (Z)V
+	public final fun transform ()V
+}
+

@@ -5,7 +5,7 @@
 //! without a klio-runnable body; before the host actuals landed every
 //! one silently no-opped (a `ByteArray` copy left the destination zeroed).
 //!
-//! Port of crates/klio-parity/tests/array_bulk_ops.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

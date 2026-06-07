@@ -1,7 +1,7 @@
 //! Visibility modifiers parity: private/internal/protected access
 //! constraints, file-private top-level, package-private (internal).
 //!
-//! Port of crates/klio-parity/tests/visibility_modifiers.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

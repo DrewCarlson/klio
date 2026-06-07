@@ -2,7 +2,7 @@
 //! exhaustive when over object subtypes, pattern matching on data
 //! classes, multi-branch arms with destructured bindings.
 //!
-//! Port of crates/klio-parity/tests/sealed_when_patterns.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

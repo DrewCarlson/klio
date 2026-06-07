@@ -1,7 +1,7 @@
 //! Collections-intensive parity: chain operations, fold variants,
 //! windowed iteration, partitioning, sortedBy variants.
 //!
-//! Port of crates/klio-parity/tests/collections_intensive.rs.
+//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

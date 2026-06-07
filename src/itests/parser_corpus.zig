@@ -1,4 +1,4 @@
-//! Parser corpus tests (port of crates/klio-parser/tests/corpus.rs). Each `.kt`
+//! Parser corpus tests (port of the Rust suite). Each `.kt`
 //! snippet is parsed end-to-end and the pretty-printed AST + any diagnostics are
 //! compared against the checked-in expected rendering. The Rust original used
 //! `insta` snapshots; here the embedded source string and its expected output

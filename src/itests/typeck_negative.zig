@@ -1,9 +1,8 @@
-//! Negative-case corpus (port of crates/klio-typeck/tests/negative.rs).
+//! Negative-case corpus.
 //!
-//! Each `.kt` fixture under crates/klio-typeck/tests/negative/ MUST produce
+//! Each `.kt` fixture under tests/fixtures/typeck_negative/ MUST produce
 //! at least one type-checker diagnostic carrying the expected legacy code.
-//! The fixtures are read from disk (same files the Rust suite reads from
-//! CARGO_MANIFEST_DIR/tests/negative), run through the real pipeline
+//! The fixtures are read from disk, run through the real pipeline
 //! lexer -> parser -> resolver -> typeck, and the emitted legacy codes are
 //! asserted against the expected ones — faithful to the Rust assertions.
 //!
@@ -24,7 +23,7 @@ const Lexer = lexer.Lexer;
 const Parser = parser.Parser;
 const FileId = span.FileId;
 
-const NEG_DIR = "crates/klio-typeck/tests/negative";
+const NEG_DIR = "tests/fixtures/typeck_negative";
 
 /// Run lexer -> parser -> resolver -> typeck over `src` (a single file with
 /// `file_id`) and return the list of legacy diagnostic codes the type checker

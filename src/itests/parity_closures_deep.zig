@@ -1,6 +1,6 @@
 //! Advanced closure / capture / dispatch scenarios.
 //!
-//! Port of crates/klio-parity/tests/closures_deep.rs.
+//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

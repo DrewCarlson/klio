@@ -1,6 +1,6 @@
 //! Suspend function shapes that drive realistic coroutine code.
 //!
-//! Port of crates/klio-parity/tests/suspend_shapes.rs.
+//! Port of the Rust suite.
 const std = @import("std");
 const parity = @import("parity");
 

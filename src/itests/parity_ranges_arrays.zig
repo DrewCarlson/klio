@@ -1,5 +1,5 @@
 //! Ranges, arrays, progressions, and primitive array specializations.
-//! Port of crates/klio-parity/tests/ranges_arrays.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

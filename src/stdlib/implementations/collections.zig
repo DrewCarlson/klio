@@ -1,11 +1,9 @@
 //! Collection stdlib intrinsics (List / Set / Map / Iterable / Array /
-//! Pair / Triple / Sequence). Faithful port of
-//! `crates/klio-stdlib/src/implementations/collections.rs`.
+//! Pair / Triple / Sequence).
 //!
 //! Each intrinsic is a `fn(*CallCtx) std.mem.Allocator.Error!EvalResult`.
-//! The Rust functions returned `Result<Value, RuntimeError>`; here `Ok(v)`
-//! becomes `EvalResult{ .ok = v }` and `Err(e)` becomes `EvalResult{ .err
-//! = e }`. OOM is the only Zig `error`.
+//! `Ok(v)` becomes `EvalResult{ .ok = v }` and `Err(e)` becomes
+//! `EvalResult{ .err = e }`. OOM is the only Zig `error`.
 //!
 //! Memory model: heap-owning containers (`StringRef`, `ValueList`,
 //! `MapEntries`) are created via `ctx.allocator` and never freed

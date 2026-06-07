@@ -1,6 +1,6 @@
 //! Interface contracts, default methods, fun interfaces, and access through
 //! upcast/downcast.
-//! Ported from crates/klio-parity/tests/interfaces_visibility.rs.
+//! Ported from the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");

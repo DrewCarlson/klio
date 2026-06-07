@@ -1,7 +1,7 @@
 //! String processing parity: regex, padStart/padEnd, lines, take/drop,
 //! Char conversions, String<->Bytes, format integers.
 //!
-//! Port of crates/klio-parity/tests/string_processing.rs.
+//! Port of the Rust suite.
 
 const std = @import("std");
 const parity = @import("parity");
