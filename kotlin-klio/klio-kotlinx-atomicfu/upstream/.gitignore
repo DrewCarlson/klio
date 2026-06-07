@@ -1,6 +1,0 @@
-.idea
-*.iml
-*/target/*
-build
-.gradle
-.kotlin
