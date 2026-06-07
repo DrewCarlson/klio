@@ -6,3 +6,4 @@ kotlin-language-spec
 kotlin
 .ideazig-out/
 .zig-cache/
+zig-pkg/
