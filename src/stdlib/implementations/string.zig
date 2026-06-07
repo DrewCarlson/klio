@@ -8,6 +8,7 @@
 const std = @import("std");
 const runtime = @import("runtime");
 const text = @import("../text.zig");
+const regexp = @import("regexp.zig");
 
 const Value = runtime.Value;
 const RuntimeError = runtime.RuntimeError;
@@ -804,7 +805,7 @@ pub fn string_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     if (ctx.args.len > 1 and ctx.args[1] == .Regex) {
         const repl: ?Value = if (ctx.args.len > 2) ctx.args[2] else null;
-        return performRegexReplace(ctx, s, repl, false, "replace");
+        return regexp.stringRegexReplace(ctx, ctx.args[0].String, ctx.args[1].Regex, repl, false, "replace");
     }
     if (ctx.args.len < 2) return errArity("replace requires old");
     const olr = try argAsString(ctx.allocator, ctx.args[1], "replace");
@@ -1092,9 +1093,20 @@ fn stringSplitItems(ctx: *CallCtx, who: []const u8) Allocator.Error!union(enum) 
         .err => |e| return .{ .err = e },
     };
     if (ctx.args.len > 1 and ctx.args[1] == .Regex) {
-        // Regex split needs the host engine, which klio does not yet
-        // provide; the upstream path is unreachable without it.
-        return .{ .err = .{ .Unimplemented = "String.split(Regex) requires the regex engine" } };
+        var limit: i64 = 0;
+        if (ctx.args.len > 2) {
+            const v = ctx.args[2];
+            if (v.isIntegral()) {
+                limit = v.asI64().?;
+            } else {
+                return .{ .err = .{ .Type = "split limit must be Int" } };
+            }
+        }
+        const res = try regexp.stringRegexSplitItems(ctx, ctx.args[0].String, ctx.args[1].Regex, limit);
+        return switch (res) {
+            .ok => |items| .{ .ok = items },
+            .err => |e| .{ .err = e },
+        };
     }
     // `split(vararg delimiters: String/Char, ignoreCase = false, limit = 0)`.
     var delims: std.ArrayList([]const u8) = .empty;
@@ -1514,7 +1526,7 @@ pub fn string_replace_first(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     if (ctx.args.len > 1 and ctx.args[1] == .Regex) {
         const repl: ?Value = if (ctx.args.len > 2) ctx.args[2] else null;
-        return performRegexReplace(ctx, s, repl, true, "replaceFirst");
+        return regexp.stringRegexReplace(ctx, ctx.args[0].String, ctx.args[1].Regex, repl, true, "replaceFirst");
     }
     if (ctx.args.len < 2) return errArity("replaceFirst requires old");
     const olr = try argAsString(ctx.allocator, ctx.args[1], "replaceFirst");
@@ -2116,20 +2128,6 @@ fn normalizeScientific(allocator: Allocator, s: []const u8, upper: bool) Allocat
     const exp_mag: u32 = @intCast(if (exp_n < 0) -exp_n else exp_n);
     const e_letter: u8 = if (upper) 'E' else 'e';
     return std.fmt.allocPrint(allocator, "{s}{c}{c}{d:0>2}", .{ mantissa, e_letter, exp_sign, exp_mag });
-}
-
-// ============================================================
-// Regex replace (host engine required; not yet wired in klio).
-// ============================================================
-
-fn performRegexReplace(ctx: *CallCtx, s: []const u8, repl: ?Value, first_only: bool, who: []const u8) Allocator.Error!EvalResult {
-    _ = s;
-    _ = first_only;
-    if (repl == null) {
-        const msg = try std.fmt.allocPrint(ctx.allocator, "{s} requires a replacement", .{who});
-        return errArity(msg);
-    }
-    return .{ .err = .{ .Unimplemented = "String.replace(Regex) requires the regex engine" } };
 }
 
 // ============================================================

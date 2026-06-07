@@ -1298,7 +1298,7 @@ fn performRegexReplace(
     const allocator = ctx.allocator;
 
     if (repl == null) {
-        return arityErr("Regex.replace requires a replacement");
+        return arityErr(try std.fmt.allocPrint(allocator, "{s} requires a replacement", .{cfg.who}));
     }
 
     if (repl.? == .String) {
@@ -1370,7 +1370,7 @@ fn performRegexReplace(
                     defer allocator.free(cs);
                     try out.appendSlice(allocator, cs);
                 },
-                else => return typeErr("Regex.replace transform must return a CharSequence"),
+                else => return typeErr(try std.fmt.allocPrint(allocator, "{s} transform must return a CharSequence", .{cfg.who})),
             },
         }
     }
@@ -1424,10 +1424,16 @@ pub fn regex_split(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     const prog = progFromRegex(r) orelse return typeErr("Regex.split requires a Regex receiver");
-    const allocator = ctx.allocator;
+    const parts = try splitItems(ctx.allocator, prog, s, limit);
+    return ok(try makeList(ctx.allocator, parts, false));
+}
 
+/// Split `s` on every match of `prog`, mirroring the `regex` crate's
+/// `split` / `splitn`. `limit <= 0` is unbounded; `limit > 0` caps the
+/// result at `limit` parts. Caller owns the returned slice.
+fn splitItems(allocator: std.mem.Allocator, prog: *const Program, s: []const u8, limit: i64) ![]Value {
     var items: std.ArrayList(Value) = .empty;
-    defer items.deinit(allocator);
+    errdefer items.deinit(allocator);
     var last: usize = 0;
     var pos: usize = 0;
     while (true) {
@@ -1454,7 +1460,39 @@ pub fn regex_split(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     try items.append(allocator, try makeString(allocator, s[last..]));
-    return ok(try makeList(allocator, items.items, false));
+    return items.toOwnedSlice(allocator);
+}
+
+// ============================================================
+// Entry points for `String.split/replace/replaceFirst(Regex, …)`
+// ============================================================
+
+/// `String.split(Regex)` / `splitToSequence(Regex)`: the receiver string
+/// `sr` split on `r`, honoring the optional `limit`. Returns the part
+/// values so the caller can wrap them as a List or Sequence.
+pub fn stringRegexSplitItems(
+    ctx: *CallCtx,
+    sr: StringRef,
+    r: ObjRef(RegexData),
+    limit: i64,
+) std.mem.Allocator.Error!union(enum) { ok: []Value, err: RuntimeError } {
+    const prog = progFromRegex(r) orelse return .{ .err = .{ .Type = "split requires a Regex" } };
+    const parts = try splitItems(ctx.allocator, prog, sr.asPtr().*, limit);
+    return .{ .ok = parts };
+}
+
+/// `String.replace(Regex, …)` / `String.replaceFirst(Regex, …)`: the
+/// receiver string `sr` with matches of `r` rewritten by `repl` (a Kotlin
+/// `$group` template, or a `(MatchResult) -> CharSequence` callable).
+pub fn stringRegexReplace(
+    ctx: *CallCtx,
+    sr: StringRef,
+    r: ObjRef(RegexData),
+    repl: ?Value,
+    first_only: bool,
+    comptime who: []const u8,
+) std.mem.Allocator.Error!EvalResult {
+    return performRegexReplace(ctx, r, sr, repl, .{ .first_only = first_only, .who = who });
 }
 
 pub fn regex_static_escape(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {

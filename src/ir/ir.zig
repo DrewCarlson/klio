@@ -728,6 +728,9 @@ pub const Module = struct {
     pub fn deinit(self: *Module, allocator: Allocator) void {
         self.funcs.deinit(allocator);
         self.classes.deinit(allocator);
+        for (self.consts.items) |c| {
+            if (c == .String) allocator.free(c.String);
+        }
         self.consts.deinit(allocator);
         self.top_level.deinit(allocator);
         self.class_index.deinit(allocator);
@@ -909,12 +912,23 @@ pub const Module = struct {
     /// Append a constant to the pool, returning its id. Today's pool
     /// is unsorted-and-unique by structural equality; lowering passes
     /// can deduplicate when they care.
+    ///
+    /// String consts are *owned* by the pool: the byte slice is duped
+    /// into `allocator` (the module's long-lived allocator) so callers
+    /// may free their temporary name/text buffer after interning.
+    /// `Module.deinit` frees these copies, matching how Rust's
+    /// `Const::String(String)` owns and drops its data.
     pub fn internConst(self: *Module, allocator: Allocator, c: Const) Allocator.Error!ConstId {
         for (self.consts.items, 0..) |k, i| {
             if (Const.eql(k, c)) return ConstId.from(@intCast(i));
         }
         const id = ConstId.from(@intCast(self.consts.items.len));
-        try self.consts.append(allocator, c);
+        try self.consts.ensureUnusedCapacity(allocator, 1);
+        const owned: Const = switch (c) {
+            .String => |s| .{ .String = try allocator.dupe(u8, s) },
+            else => c,
+        };
+        self.consts.appendAssumeCapacity(owned);
         return id;
     }
 };
@@ -1154,4 +1168,29 @@ test "float nan does not collapse" {
     // entry. This guards that interning is total — it never traps on
     // NaN.
     try testing.expect(m.consts.items[0] == .Double);
+}
+
+test "string consts are owned by the pool" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+
+    // A caller-owned temporary that is freed right after interning. The
+    // pool must keep its own copy, so the stored slice cannot alias the
+    // freed buffer.
+    const tmp = try testing.allocator.dupe(u8, "kotlin.math.abs");
+    const id = try m.internConst(testing.allocator, .{ .String = tmp });
+    testing.allocator.free(tmp);
+
+    try testing.expect(m.consts.items[id.int()] == .String);
+    try testing.expectEqualStrings("kotlin.math.abs", m.consts.items[id.int()].String);
+    // The stored copy is distinct memory from the freed temporary.
+    try testing.expect(m.consts.items[id.int()].String.ptr != tmp.ptr);
+
+    // Interning an equal string dedups to the same id without leaking a
+    // second copy.
+    const tmp2 = try testing.allocator.dupe(u8, "kotlin.math.abs");
+    const id2 = try m.internConst(testing.allocator, .{ .String = tmp2 });
+    testing.allocator.free(tmp2);
+    try testing.expectEqual(id, id2);
+    try testing.expectEqual(@as(usize, 1), m.consts.items.len);
 }

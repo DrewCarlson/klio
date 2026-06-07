@@ -300,7 +300,11 @@ pub fn parseStringTemplate(p: *Parser) ?Expr {
             },
             .StringText => |s| {
                 _ = support.bump(p);
-                parts.append(p.allocator, StringPart{ .Text = s }) catch @panic("OOM in primary");
+                // Own the text in the AST allocator: the lexer's StringText is an
+                // owned token buffer that callers free after parsing, so borrowing
+                // it would dangle once tokens are released (before lowering).
+                const owned = p.allocator.dupe(u8, s) catch @panic("OOM in primary");
+                parts.append(p.allocator, StringPart{ .Text = owned }) catch @panic("OOM in primary");
             },
             .ShortInterp => |name| {
                 const tok = support.bump(p);
