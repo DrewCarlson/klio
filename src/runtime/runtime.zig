@@ -1,1 +1,397 @@
-//runtime module — port in progress
+//! Shared runtime types for the interpreter and the stdlib.
+//!
+//! `Value`, `RuntimeError`, the `Output` sink, and `Env` live here so that
+//! the stdlib can express Rust-native intrinsics in terms of the same
+//! types the interpreter evaluates against, without either depending on
+//! the other. Mirrors the Rust crate's `lib.rs` `pub use ...::*`.
+
+const std = @import("std");
+
+const objcell = @import("objcell.zig");
+const value_mod = @import("value.zig");
+const class_mod = @import("class.zig");
+const host_mod = @import("host.zig");
+const output_mod = @import("output.zig");
+const env_mod = @import("env.zig");
+const float_fmt_mod = @import("float_fmt.zig");
+const gc_traverse_mod = @import("gc_traverse.zig");
+
+// objcell
+pub const ObjRef = objcell.ObjRef;
+pub const ObjGuard = objcell.ObjGuard;
+pub const ObjGuardMut = objcell.ObjGuardMut;
+pub const ControlBlock = objcell.ControlBlock;
+pub const BorrowMutError = objcell.BorrowMutError;
+pub const fenceAndPublish = objcell.fenceAndPublish;
+
+// value
+pub const Value = value_mod.Value;
+pub const RuntimeError = value_mod.RuntimeError;
+pub const EvalResult = value_mod.EvalResult;
+pub const MapViewKind = value_mod.MapViewKind;
+pub const MapBacking = value_mod.MapBacking;
+pub const MapPair = value_mod.MapPair;
+pub const MapEntries = value_mod.MapEntries;
+pub const RangeKind = value_mod.RangeKind;
+pub const NumericRank = value_mod.NumericRank;
+pub const PrimitiveArrayKind = value_mod.PrimitiveArrayKind;
+pub const DelegateKind = value_mod.DelegateKind;
+pub const SuspendBody = value_mod.SuspendBody;
+pub const SuspendState = value_mod.SuspendState;
+pub const SuspendTransition = value_mod.SuspendTransition;
+pub const SuspendFrame = value_mod.SuspendFrame;
+pub const PausedResume = value_mod.PausedResume;
+pub const SuspendCallerCont = value_mod.SuspendCallerCont;
+pub const HostSlotResult = value_mod.HostSlotResult;
+pub const SequenceData = value_mod.SequenceData;
+pub const SequenceSource = value_mod.SequenceSource;
+pub const SeqOp = value_mod.SeqOp;
+pub const RegexData = value_mod.RegexData;
+pub const MatchData = value_mod.MatchData;
+pub const MatchGroupData = value_mod.MatchGroupData;
+pub const ComparatorStep = value_mod.ComparatorStep;
+pub const StringRef = value_mod.StringRef;
+pub const ValueList = value_mod.ValueList;
+pub const ValueSlice = value_mod.ValueSlice;
+
+// class
+pub const ClassDef = class_mod.ClassDef;
+pub const SupertypeDelegate = class_mod.SupertypeDelegate;
+pub const ClassParamDef = class_mod.ClassParamDef;
+pub const TypeShape = class_mod.TypeShape;
+pub const MethodDef = class_mod.MethodDef;
+pub const PropertyDef = class_mod.PropertyDef;
+pub const InstanceData = class_mod.InstanceData;
+pub const NativeState = class_mod.NativeState;
+pub const NativeBox = class_mod.NativeBox;
+pub const MethodHit = class_mod.MethodHit;
+pub const PropertyHit = class_mod.PropertyHit;
+
+// host
+pub const StdlibFn = host_mod.StdlibFn;
+pub const CallCtx = host_mod.CallCtx;
+pub const IntrinsicHost = host_mod.IntrinsicHost;
+pub const Scheduler = host_mod.Scheduler;
+pub const InProcessScheduler = host_mod.InProcessScheduler;
+pub const NoopHost = host_mod.NoopHost;
+pub const HostResultU64 = host_mod.HostResultU64;
+
+// output
+pub const Output = output_mod.Output;
+pub const OutOp = output_mod.OutOp;
+pub const RecordingSink = output_mod.RecordingSink;
+pub const StdoutOutput = output_mod.StdoutOutput;
+pub const CaptureOutput = output_mod.CaptureOutput;
+pub const kotlinFloatToString = output_mod.kotlinFloatToString;
+pub const kotlinDoubleToString = output_mod.kotlinDoubleToString;
+pub const charUnitToString = output_mod.charUnitToString;
+pub const pushCharUnit = output_mod.pushCharUnit;
+pub const charUnitsToString = output_mod.charUnitsToString;
+
+// env
+pub const Env = env_mod.Env;
+pub const publishEnvDeep = env_mod.publishEnvDeep;
+
+// gc_traverse
+pub const publishEnv = gc_traverse_mod.publishEnv;
+pub const publishValue = gc_traverse_mod.publishValue;
+
+// float_fmt
+pub const floatToString = float_fmt_mod.floatToString;
+pub const doubleToString = float_fmt_mod.doubleToString;
+
+test {
+    std.testing.refAllDecls(@This());
+    _ = objcell;
+    _ = value_mod;
+    _ = class_mod;
+    _ = host_mod;
+    _ = output_mod;
+    _ = env_mod;
+    _ = float_fmt_mod;
+    _ = gc_traverse_mod;
+}
+
+// -------------------------------------------------------------------------
+// Tests (mirrors the Rust crate's `lib.rs` `mod tests`)
+// -------------------------------------------------------------------------
+
+const ast = @import("ast");
+const span = @import("span");
+const testing = std.testing;
+
+const InstanceField = class_mod.InstanceData.Field;
+
+fn makeClass(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    is_data: bool,
+    is_object: bool,
+    is_enum: bool,
+) !ObjRef(ClassDef) {
+    const cd: ClassDef = .{
+        .name = name,
+        .fqn = name,
+        .annotation_names = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .body_properties = &.{},
+        .init_blocks = &.{},
+        .init_block_property_positions = &.{},
+        .is_data = is_data,
+        .is_value = false,
+        .is_object = is_object,
+        .is_enum = is_enum,
+        .is_sealed = false,
+        .supertype_names = &.{},
+        .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+        .is_interface = false,
+        .is_fun_interface = false,
+        .parent_ctor_args = &.{},
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .is_anonymous = false,
+        .secondary_ctors = &.{},
+        .enum_entries = try ObjRef(std.ArrayList(class_mod.ClassDef.EnumEntry)).init(allocator, .empty),
+        .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .nested_classes = try ObjRef(std.ArrayList(class_mod.ClassDef.NestedClass)).init(allocator, .empty),
+        .captured_env = try ObjRef(Env).init(allocator, Env.init(allocator)),
+        .supertype_delegates = try ObjRef(std.ArrayList(class_mod.SupertypeDelegate)).init(allocator, .empty),
+        .delegate_forwarders = try ObjRef(std.ArrayList(class_mod.MethodDef)).init(allocator, .empty),
+        .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+    };
+    return ObjRef(ClassDef).init(allocator, cd);
+}
+
+test "plain instance display uses class at hex" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cls = try makeClass(a, "Foo", false, false, false);
+    const inst = try ObjRef(InstanceData).init(a, .{
+        .class = cls,
+        .fields = .empty,
+        .outer = null,
+        .identity = 0x2a,
+        .native_state = null,
+    });
+
+    const s = try (Value{ .Instance = inst }).display(a);
+    try testing.expectEqualStrings("Foo@2a", s);
+}
+
+test "data instance display unchanged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cls = try makeClass(a, "D", true, false, false);
+    const inst = try ObjRef(InstanceData).init(a, .{
+        .class = cls,
+        .fields = .empty,
+        .outer = null,
+        .identity = 99,
+        .native_state = null,
+    });
+
+    const s = try (Value{ .Instance = inst }).display(a);
+    try testing.expectEqualStrings("D()", s);
+}
+
+test "enum entries is_runtime_type matches both" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var entry_items = try ValueList.init(a, .empty);
+    {
+        const g = entry_items.borrowMut();
+        defer g.deinit();
+        try g.get().append(a, .{ .Int = 1 });
+    }
+    const entries = Value{ .List = .{
+        .items = entry_items,
+        .mutable = false,
+        .enum_class = try StringRef.init(a, "Color"),
+        .backing = null,
+    } };
+    try testing.expect(entries.isRuntimeType("List"));
+    try testing.expect(entries.isRuntimeType("EnumEntries"));
+    try testing.expect(entries.isRuntimeType("Collection"));
+
+    var plain_items = try ValueList.init(a, .empty);
+    {
+        const g = plain_items.borrowMut();
+        defer g.deinit();
+        try g.get().append(a, .{ .Int = 1 });
+    }
+    const plain = Value{ .List = .{
+        .items = plain_items,
+        .mutable = false,
+        .enum_class = null,
+        .backing = null,
+    } };
+    try testing.expect(plain.isRuntimeType("List"));
+    try testing.expect(!plain.isRuntimeType("EnumEntries"));
+}
+
+test "enum entries keeps list type fqn for dispatch" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var items = try ValueList.init(a, .empty);
+    {
+        const g = items.borrowMut();
+        defer g.deinit();
+        try g.get().append(a, .{ .Int = 1 });
+    }
+    const entries = Value{ .List = .{
+        .items = items,
+        .mutable = false,
+        .enum_class = try StringRef.init(a, "Color"),
+        .backing = null,
+    } };
+    try testing.expectEqualStrings("kotlin.collections.List", entries.typeFqn());
+}
+
+test "publish deep nested graph publishes every cell" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // List -> Instance -> field Map -> Cell
+    const cell = try ObjRef(Value).init(a, .{ .Int = 7 });
+    var map_entries = try MapEntries.init(a, .empty);
+    {
+        const g = map_entries.borrowMut();
+        defer g.deinit();
+        try g.get().append(a, .{ .key = .{ .String = try StringRef.init(a, "k") }, .value = .{ .Cell = cell } });
+    }
+    const map = Value{ .Map = .{ .entries = map_entries, .mutable = true } };
+    const cls = try makeClass(a, "Holder", false, false, false);
+    var fields: std.ArrayList(InstanceField) = .empty;
+    try fields.append(a, .{ .name = "m", .value = map });
+    const inst = try ObjRef(InstanceData).init(a, .{
+        .class = cls,
+        .fields = fields,
+        .outer = null,
+        .identity = 1,
+        .native_state = null,
+    });
+    var items = try ValueList.init(a, .empty);
+    {
+        const g = items.borrowMut();
+        defer g.deinit();
+        try g.get().append(a, .{ .Instance = inst });
+    }
+    const root = Value{ .List = .{ .items = items, .mutable = false, .enum_class = null, .backing = null } };
+
+    try testing.expect(!items.isShared());
+    try testing.expect(!inst.isShared());
+    try testing.expect(!map_entries.isShared());
+    try testing.expect(!cell.isShared());
+
+    root.publishDeep(a);
+
+    try testing.expect(items.isShared());
+    try testing.expect(inst.isShared());
+    try testing.expect(map_entries.isShared());
+    try testing.expect(cell.isShared());
+    // The captured_env of the embedded ClassDef is reached too.
+    {
+        const ig = inst.borrow();
+        defer ig.deinit();
+        try testing.expect(ig.get().class.asPtr().captured_env.isShared());
+    }
+}
+
+test "publish deep cyclic graph terminates" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Instance whose field is a Cell pointing back to the instance.
+    const cls = try makeClass(a, "Node", false, false, false);
+    const inst = try ObjRef(InstanceData).init(a, .{
+        .class = cls,
+        .fields = .empty,
+        .outer = null,
+        .identity = 1,
+        .native_state = null,
+    });
+    const cell = try ObjRef(Value).init(a, .{ .Instance = inst });
+    {
+        const g = inst.borrowMut();
+        defer g.deinit();
+        try g.get().fields.append(a, .{ .name = "self", .value = .{ .Cell = cell } });
+    }
+
+    // Env whose parent chain loops back on itself.
+    const env_cell = try ObjRef(Env).init(a, Env.init(a));
+    {
+        const g = env_cell.borrowMut();
+        defer g.deinit();
+        g.get().parent = env_cell;
+        try g.get().define("here", .{ .Instance = inst });
+    }
+    const empty_block = try a.create(ast.Block);
+    empty_block.* = .{ .stmts = &.{}, .span = span.Span.init(span.FileId.from(0), 0, 0) };
+    const lam = Value{ .Lambda = .{
+        .params = try ObjRef([]const []const u8).init(a, &.{}),
+        .body = empty_block,
+        .env = env_cell,
+        .absorb_return = false,
+    } };
+
+    (Value{ .Instance = inst }).publishDeep(a);
+    lam.publishDeep(a);
+
+    try testing.expect(inst.isShared());
+    try testing.expect(cell.isShared());
+    try testing.expect(env_cell.isShared());
+}
+
+test "publish deep is idempotent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cell = try ObjRef(Value).init(a, .{ .Int = 1 });
+    var items = try ValueList.init(a, .empty);
+    {
+        const g = items.borrowMut();
+        defer g.deinit();
+        try g.get().append(a, .{ .Cell = cell });
+    }
+    const root = Value{ .List = .{ .items = items, .mutable = true, .enum_class = null, .backing = null } };
+
+    root.publishDeep(a);
+    root.publishDeep(a);
+
+    try testing.expect(items.isShared());
+    try testing.expect(cell.isShared());
+}
+
+test "publish deep scalars are noops" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    (Value{ .Int = 42 }).publishDeep(a);
+    {
+        const s = try StringRef.init(a, "hi");
+        (Value{ .String = s }).publishDeep(a);
+    }
+    (Value{ .Null = {} }).publishDeep(a);
+    (Value{ .Unit = {} }).publishDeep(a);
+    {
+        var caps = try ValueSlice.init(a, try a.dupe(Value, &.{ .{ .Int = 1 }, .{ .Bool = true } }));
+        defer caps.deinit();
+        (Value{ .IrClosure = .{ .id = 0, .captures = caps } }).publishDeep(a);
+    }
+}
