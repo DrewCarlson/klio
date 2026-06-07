@@ -89,18 +89,29 @@ pub fn io_read_line(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(ctx.allocator);
 
-    var byte: [1]u8 = undefined;
+    var threaded: std.Io.Threaded = .init(ctx.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A single-byte buffer keeps the reader from consuming past the newline,
+    // so a later `readLine()` call still sees the rest of the input.
+    var read_buf: [1]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().readerStreaming(io, &read_buf);
+    const r = &stdin_reader.interface;
+
     var saw_any = false;
     while (true) {
-        const n = std.posix.read(std.posix.STDIN_FILENO, &byte) catch |e| {
-            buf.deinit(ctx.allocator);
-            const msg = try std.fmt.allocPrint(ctx.allocator, "readLine failed: {s}", .{@errorName(e)});
-            return .{ .err = .{ .Type = msg } };
+        const byte = r.takeByte() catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => {
+                buf.deinit(ctx.allocator);
+                const msg = try std.fmt.allocPrint(ctx.allocator, "readLine failed: {s}", .{@errorName(e)});
+                return .{ .err = .{ .Type = msg } };
+            },
         };
-        if (n == 0) break;
         saw_any = true;
-        if (byte[0] == '\n') break;
-        try buf.append(ctx.allocator, byte[0]);
+        if (byte == '\n') break;
+        try buf.append(ctx.allocator, byte);
     }
 
     if (!saw_any and buf.items.len == 0) {

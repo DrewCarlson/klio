@@ -52,13 +52,7 @@ pub fn hostBindings(allocator: Allocator) Allocator.Error!HostBindings {
 
 fn get_time_millis(ctx: *CallCtx) Allocator.Error!EvalResult {
     _ = ctx;
-    var ts: linux.timespec = undefined;
-    const rc = linux.clock_gettime(.REALTIME, &ts);
-    const millis: i64 = if (linux.errno(rc) == .SUCCESS)
-        @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms)
-    else
-        0;
-    return .{ .ok = .{ .Long = millis } };
+    return .{ .ok = .{ .Long = runtime.clockWallMillis() } };
 }
 
 /// `Result<T, RuntimeError>` returned by the argument decoders. OOM stays
@@ -847,30 +841,9 @@ fn stderrPrint(s: []const u8) void {
 }
 
 /// `std::env::var(name).is_ok()` — true when the env var is present.
-/// Zig 0.16 has no global env accessor, so the process environment is read
-/// from `/proc/self/environ` (the kernel's NUL-delimited `KEY=VALUE` view).
+/// Reads the process environment portably (see `runtime.procEnvIsSet`).
 fn envIsSet(allocator: Allocator, name: []const u8) bool {
-    const fd_raw = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(fd_raw) != .SUCCESS) return false;
-    const fd: i32 = @intCast(fd_raw);
-    defer _ = linux.close(fd);
-
-    var contents: std.ArrayList(u8) = .empty;
-    defer contents.deinit(allocator);
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = linux.read(fd, &buf, buf.len);
-        if (linux.errno(n) != .SUCCESS) return false;
-        if (n == 0) break;
-        contents.appendSlice(allocator, buf[0..n]) catch return false;
-    }
-
-    var it = std.mem.splitScalar(u8, contents.items, 0);
-    while (it.next()) |entry| {
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        if (std.mem.eql(u8, entry[0..eq], name)) return true;
-    }
-    return false;
+    return runtime.procEnvIsSet(allocator, name);
 }
 
 // -------------------------------------------------------------------------

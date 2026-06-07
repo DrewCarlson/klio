@@ -48,40 +48,15 @@ fn ensureFilter() void {
 }
 
 /// Read environment variable `name` into `buf`, returning the value
-/// slice (a subslice of `buf`) or `null` when unset. Reads
-/// `/proc/self/environ`; a value longer than `buf` is truncated.
+/// slice (a subslice of `buf`) or `null` when unset. Reads the process
+/// environment portably; a value longer than `buf` is truncated.
 fn readEnv(name: []const u8, buf: []u8) ?[]const u8 {
-    const linux = std.os.linux;
-    const fd_raw = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(fd_raw) != .SUCCESS) return null;
-    const fd: i32 = @intCast(fd_raw);
-    defer _ = linux.close(fd);
-
-    var scratch: [4096]u8 = undefined;
-    // Read the whole environ into a fixed working area; environ blocks
-    // are small. We scan it once to avoid heap use.
-    var acc: [16384]u8 = undefined;
-    var acc_len: usize = 0;
-    while (true) {
-        const n = linux.read(fd, &scratch, scratch.len);
-        if (linux.errno(n) != .SUCCESS) return null;
-        if (n == 0) break;
-        const take = @min(n, acc.len - acc_len);
-        @memcpy(acc[acc_len .. acc_len + take], scratch[0..take]);
-        acc_len += take;
-        if (acc_len == acc.len) break;
-    }
-    var it = std.mem.splitScalar(u8, acc[0..acc_len], 0);
-    while (it.next()) |entry| {
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        if (std.mem.eql(u8, entry[0..eq], name)) {
-            const val = entry[eq + 1 ..];
-            const len = @min(val.len, buf.len);
-            @memcpy(buf[0..len], val[0..len]);
-            return buf[0..len];
-        }
-    }
-    return null;
+    const a = std.heap.page_allocator;
+    const val = (runtime.procEnvGetVar(a, name) catch null) orelse return null;
+    defer a.free(val);
+    const len = @min(val.len, buf.len);
+    @memcpy(buf[0..len], val[0..len]);
+    return buf[0..len];
 }
 
 /// True when dispatch decisions for `name` should be logged.

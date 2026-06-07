@@ -53,9 +53,9 @@ const USAGE =
 
 /// Public entry point. Parses process args, dispatches to the matching
 /// subcommand, and returns the process exit code. The exe's `main`
-/// calls this.
-pub fn run(gpa: std.mem.Allocator) !u8 {
-    const argv = try io.processArgs(gpa);
+/// calls this, passing the entry-point command-line arguments.
+pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
+    const argv = try io.processArgs(gpa, args_in);
     defer io.freeArgs(gpa, argv);
 
     // argv[0] is the program name.

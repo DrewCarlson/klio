@@ -212,22 +212,7 @@ pub fn concurrent_thread_sleep(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult
 
 /// Block the calling thread for `millis` milliseconds.
 fn sleepMillis(millis: u64) void {
-    const total_ns = millis *% std.time.ns_per_ms;
-    var req: std.os.linux.timespec = .{
-        .sec = @intCast(total_ns / std.time.ns_per_s),
-        .nsec = @intCast(total_ns % std.time.ns_per_s),
-    };
-    // Restart on interruption (EINTR) so the full duration elapses.
-    while (true) {
-        var rem: std.os.linux.timespec = undefined;
-        const rc = std.os.linux.nanosleep(&req, &rem);
-        const err = std.os.linux.errno(rc);
-        if (err == .INTR) {
-            req = rem;
-            continue;
-        }
-        return;
-    }
+    runtime.clockSleepMillis(@intCast(@min(millis, @as(u64, std.math.maxInt(i64)))));
 }
 
 /// `Thread.currentThread()` — a `Thread` sentinel for the calling OS

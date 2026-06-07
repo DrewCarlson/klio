@@ -773,20 +773,10 @@ fn runFrameInner(
 }
 
 /// Whether the named environment variable is present. Used only by the
-/// optional throw-trace diagnostic. Reads the C `environ` block when
-/// libc is linked; otherwise reports unset.
+/// optional throw-trace diagnostic. Reads the process environment portably
+/// (see `runtime.procEnvIsSet`).
 fn envVarSet(name: []const u8) bool {
-    if (!@import("builtin").link_libc) return false;
-    var i: usize = 0;
-    while (std.c.environ[i]) |entry| : (i += 1) {
-        const e = std.mem.span(entry);
-        if (std.mem.indexOfScalar(u8, e, '=')) |eq| {
-            if (std.mem.eql(u8, e[0..eq], name)) return true;
-        } else if (std.mem.eql(u8, e, name)) {
-            return true;
-        }
-    }
-    return false;
+    return runtime.procEnvIsSet(std.heap.page_allocator, name);
 }
 
 fn isReturnLike(term: Terminator) bool {

@@ -566,13 +566,7 @@ fn delayMillis(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// Wall-clock time in milliseconds since the Unix epoch.
 fn currentTimeMillis(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     _ = ctx;
-    var ts: std.os.linux.timespec = undefined;
-    const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
-    const t: i64 = if (std.os.linux.errno(rc) == .SUCCESS)
-        @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms)
-    else
-        0;
-    return .{ .ok = .{ .Long = t } };
+    return .{ .ok = .{ .Long = runtime.clockWallMillis() } };
 }
 
 fn tokenCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -648,35 +642,10 @@ fn kxcoSystemProp(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 /// Read an environment variable into freshly allocated bytes, or null
 /// when unset. The returned slice (when non-null) is owned by `allocator`.
-/// Zig 0.16 has no global env accessor (the environment is handed to
-/// `main` rather than stored in a static), so the process environment is
-/// read from `/proc/self/environ`, the kernel's NUL-delimited
-/// `KEY=VALUE` view. Any read failure is treated as "unset" (null).
+/// Reads the process environment portably (see `runtime.procEnvGetVar`).
+/// Any read failure is treated as "unset" (null).
 fn lookupEnv(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
-    const linux = std.os.linux;
-    const fd_raw = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(fd_raw) != .SUCCESS) return null;
-    const fd: i32 = @intCast(fd_raw);
-    defer _ = linux.close(fd);
-
-    var contents: std.ArrayList(u8) = .empty;
-    defer contents.deinit(allocator);
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = linux.read(fd, &buf, buf.len);
-        if (linux.errno(n) != .SUCCESS) return null;
-        if (n == 0) break;
-        contents.appendSlice(allocator, buf[0..n]) catch return null;
-    }
-
-    var it = std.mem.splitScalar(u8, contents.items, 0);
-    while (it.next()) |entry| {
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        if (std.mem.eql(u8, entry[0..eq], name)) {
-            return allocator.dupe(u8, entry[eq + 1 ..]) catch return null;
-        }
-    }
-    return null;
+    return runtime.procEnvGetVar(allocator, name) catch null;
 }
 
 /// `kotlinx.coroutines.internal.synchronizedImpl(lock, block)` — klio's
