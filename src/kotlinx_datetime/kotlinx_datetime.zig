@@ -64,10 +64,8 @@ const Now = struct {
 };
 
 fn utcNow() Now {
-    var ts: std.os.linux.timespec = undefined;
-    const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
-    if (std.os.linux.errno(rc) != .SUCCESS) return .{ .secs = 0, .nanos = 0 };
-    return .{ .secs = @intCast(ts.sec), .nanos = @intCast(ts.nsec) };
+    const w = runtime.clockWallTime();
+    return .{ .secs = w.secs, .nanos = w.nanos };
 }
 
 fn currentTimeMillis(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -110,34 +108,10 @@ fn systemTimeZoneId(allocator: std.mem.Allocator) std.mem.Allocator.Error![]cons
     return try allocator.dupe(u8, "UTC");
 }
 
-/// Read an environment variable's value. Zig 0.16 has no global env accessor,
-/// so the process environment is read from `/proc/self/environ` (the kernel's
-/// NUL-delimited `KEY=VALUE` view). Returns an `allocator`-owned copy or null.
+/// Read an environment variable's value. Returns an `allocator`-owned copy or
+/// null. Reads the process environment portably (see `runtime.procEnvGetVar`).
 fn getEnvVar(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error!?[]u8 {
-    const linux = std.os.linux;
-    const fd_raw = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(fd_raw) != .SUCCESS) return null;
-    const fd: i32 = @intCast(fd_raw);
-    defer _ = linux.close(fd);
-
-    var contents: std.ArrayList(u8) = .empty;
-    defer contents.deinit(allocator);
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = linux.read(fd, &buf, buf.len);
-        if (linux.errno(n) != .SUCCESS) return null;
-        if (n == 0) break;
-        try contents.appendSlice(allocator, buf[0..n]);
-    }
-
-    var it = std.mem.splitScalar(u8, contents.items, 0);
-    while (it.next()) |entry| {
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        if (std.mem.eql(u8, entry[0..eq], name)) {
-            return try allocator.dupe(u8, entry[eq + 1 ..]);
-        }
-    }
-    return null;
+    return runtime.procEnvGetVar(allocator, name);
 }
 
 // -------------------------------------------------------------------------

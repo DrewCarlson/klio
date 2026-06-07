@@ -24,6 +24,8 @@ const section_names = pack.section_names;
 const PackReader = pack.PackReader;
 const PackError = pack.PackError;
 
+const runtime = @import("runtime");
+
 const stdlib = @import("stdlib");
 const HostBindings = stdlib.HostBindings;
 
@@ -77,26 +79,11 @@ pub const ManifestResult = union(enum) {
 // environment access
 // ---------------------------------------------------------------------
 
-/// Read one environment variable from the parent process via
-/// `/proc/self/environ`. Returns an owned copy of the value or `null`.
-/// Mirrors Rust's `std::env::var_os` for the few variables this module
-/// consults (`HOME`, `KLIO_PACK_DIAG`).
+/// Read one environment variable from the parent process. Returns an
+/// owned copy of the value or `null`. Mirrors Rust's `std::env::var_os`
+/// for the few variables this module consults (`HOME`, `KLIO_PACK_DIAG`).
 fn getEnvVar(allocator: Allocator, name: []const u8) ?[]u8 {
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const eio = threaded.io();
-    const data = std.Io.Dir.cwd().readFileAlloc(eio, "/proc/self/environ", allocator, .unlimited) catch
-        return null;
-    defer allocator.free(data);
-    var it = std.mem.splitScalar(u8, data, 0);
-    while (it.next()) |entry| {
-        if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        if (std.mem.eql(u8, entry[0..eq], name)) {
-            return allocator.dupe(u8, entry[eq + 1 ..]) catch null;
-        }
-    }
-    return null;
+    return runtime.procEnvGetVar(allocator, name) catch null;
 }
 
 /// True when `name` is present in the environment (any value), mirroring
@@ -113,18 +100,7 @@ fn envVarPresent(allocator: Allocator, name: []const u8) bool {
 /// stdlib-pack loader can consult `KLIO_STDLIB_PACK`. Caller deinits.
 fn procEnvMap(allocator: Allocator) std.process.Environ.Map {
     var map = std.process.Environ.Map.init(allocator);
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const eio = threaded.io();
-    const data = std.Io.Dir.cwd().readFileAlloc(eio, "/proc/self/environ", allocator, .unlimited) catch
-        return map;
-    defer allocator.free(data);
-    var it = std.mem.splitScalar(u8, data, 0);
-    while (it.next()) |entry| {
-        if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        map.put(entry[0..eq], entry[eq + 1 ..]) catch {};
-    }
+    runtime.procEnvPutAllInto(allocator, &map);
     return map;
 }
 

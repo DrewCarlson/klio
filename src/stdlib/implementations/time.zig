@@ -13,13 +13,7 @@ const Value = runtime.Value;
 /// upstream `kotlin.time` commonMain `Clock.System` / `Instant`.
 pub fn time_system_millis(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     _ = ctx;
-    var ts: std.os.linux.timespec = undefined;
-    const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
-    const millis: i64 = if (std.os.linux.errno(rc) == .SUCCESS)
-        @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms)
-    else
-        0;
-    return .{ .ok = .{ .Long = millis } };
+    return .{ .ok = .{ .Long = runtime.clockWallMillis() } };
 }
 
 /// Process-global monotonic origin in nanoseconds, fixed on first read.
@@ -32,10 +26,7 @@ const MonotonicOrigin = struct {
 
     /// Read the raw monotonic clock in nanoseconds.
     fn readNanos() u64 {
-        var ts: std.os.linux.timespec = undefined;
-        const rc = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-        if (std.os.linux.errno(rc) != .SUCCESS) return 0;
-        return @as(u64, @intCast(ts.sec)) *% std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        return runtime.clockMonotonicNanos();
     }
 
     /// Nanoseconds elapsed since the origin, fixing the origin on first call.

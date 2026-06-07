@@ -1,0 +1,62 @@
+//! Portable clock and sleep helpers.
+//!
+//! Zig 0.16 routes wall-clock, monotonic time, and sleeping through the
+//! `Io` interface rather than direct syscalls, which keeps these portable
+//! across Linux, macOS, and Windows. Each helper spins up a short-lived
+//! `std.Io.Threaded` instance; the cost is negligible next to the work
+//! these intrinsics back.
+
+const std = @import("std");
+
+/// Wall-clock time in milliseconds since the Unix epoch.
+pub fn wallMillis() i64 {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    return std.Io.Clock.real.now(io).toMilliseconds();
+}
+
+/// Wall-clock seconds and the nanosecond remainder since the Unix epoch.
+pub const WallTime = struct { secs: i64, nanos: u32 };
+
+pub fn wallTime() WallTime {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ns: i128 = @intCast(std.Io.Clock.real.now(io).nanoseconds);
+    const secs = @divFloor(ns, std.time.ns_per_s);
+    const nanos: u32 = @intCast(@mod(ns, std.time.ns_per_s));
+    return .{ .secs = @intCast(secs), .nanos = nanos };
+}
+
+/// Monotonic clock reading in nanoseconds (since some unspecified epoch).
+/// Only differences between readings are meaningful. Returns 0 on failure.
+pub fn monotonicNanos() u64 {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const ns: i128 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    if (ns <= 0) return 0;
+    return @intCast(@min(ns, @as(i128, std.math.maxInt(u64))));
+}
+
+/// Sleep for `ms` milliseconds. A non-positive value returns immediately.
+pub fn sleepMillis(ms: i64) void {
+    if (ms <= 0) return;
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(ms), .awake) catch {};
+}
+
+const testing = std.testing;
+
+test "wallMillis is positive" {
+    try testing.expect(wallMillis() > 0);
+}
+
+test "monotonicNanos is non-decreasing" {
+    const a = monotonicNanos();
+    const b = monotonicNanos();
+    try testing.expect(b >= a);
+}

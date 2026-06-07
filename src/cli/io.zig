@@ -7,51 +7,38 @@
 //! `runtime.Output` sink that writes program output to stdout.
 
 const std = @import("std");
-const linux = std.os.linux;
 
 const runtime = @import("runtime");
 const Output = runtime.Output;
 
-const STDIN: i32 = 0;
-const STDOUT: i32 = 1;
-const STDERR: i32 = 2;
-
-fn writeFd(fd: i32, data: []const u8) void {
-    var off: usize = 0;
-    while (off < data.len) {
-        const rc = linux.write(fd, data.ptr + off, data.len - off);
-        const e = linux.errno(rc);
-        if (e == .INTR) continue;
-        if (e != .SUCCESS) return;
-        if (rc == 0) return;
-        off += rc;
-    }
+fn writeFile(file: std.Io.File, data: []const u8) void {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const tio = threaded.io();
+    file.writeStreamingAll(tio, data) catch {};
 }
 
 pub fn writeStdout(s: []const u8) void {
-    writeFd(STDOUT, s);
+    writeFile(std.Io.File.stdout(), s);
 }
 
 pub fn writeStderr(s: []const u8) void {
-    writeFd(STDERR, s);
+    writeFile(std.Io.File.stderr(), s);
 }
 
-/// Read the full process command line (argv) into an owned slice of
-/// owned strings. Zig 0.16's `std.process.Args` is only constructible
-/// from the entry-point vector, so for a `run(gpa)` entry the argv is
-/// recovered from `/proc/self/cmdline` (NUL-separated). The caller owns
-/// the returned slice and each element.
-pub fn processArgs(gpa: std.mem.Allocator) ![]const []const u8 {
-    const raw = readWholeFd("/proc/self/cmdline", gpa) catch return &.{};
-    defer gpa.free(raw);
+/// Copy the process command line (argv) into an owned slice of owned
+/// strings, walking the entry-point arguments via the portable
+/// `std.process.Args` iterator. The caller owns the returned slice and
+/// each element.
+pub fn processArgs(gpa: std.mem.Allocator, args: std.process.Args) ![]const []const u8 {
+    var it = try args.iterateAllocator(gpa);
+    defer it.deinit();
     var out: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (out.items) |a| gpa.free(a);
         out.deinit(gpa);
     }
-    var it = std.mem.splitScalar(u8, raw, 0);
     while (it.next()) |arg| {
-        if (arg.len == 0) continue;
         try out.append(gpa, try gpa.dupe(u8, arg));
     }
     return out.toOwnedSlice(gpa);
@@ -66,46 +53,29 @@ pub fn freeArgs(gpa: std.mem.Allocator, args: []const []const u8) void {
 /// Read a whole file at `path` (opened relative to cwd) into an owned
 /// buffer. Returns an error on open/read failure.
 pub fn readFile(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    return readWholeFd(path, gpa);
-}
-
-fn readWholeFd(path: []const u8, gpa: std.mem.Allocator) ![]u8 {
-    var path_buf: [4096]u8 = undefined;
-    if (path.len >= path_buf.len) return error.NameTooLong;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
-    const rc = linux.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
-    const fd: i32 = @intCast(rc);
-    defer _ = linux.close(fd);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var chunk: [8192]u8 = undefined;
-    while (true) {
-        const n = linux.read(fd, &chunk, chunk.len);
-        const e = linux.errno(n);
-        if (e == .INTR) continue;
-        if (e != .SUCCESS) return error.ReadFailed;
-        if (n == 0) break;
-        try out.appendSlice(gpa, chunk[0..n]);
-    }
-    return out.toOwnedSlice(gpa);
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const tio = threaded.io();
+    return std.Io.Dir.cwd().readFileAlloc(tio, path, gpa, .unlimited) catch
+        return error.ReadFailed;
 }
 
 /// Read a line from stdin into `buf` (without the trailing newline).
 /// Returns the slice read, or `null` on EOF.
 pub fn readLine(buf: []u8) ?[]const u8 {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const tio = threaded.io();
+    // A single-byte buffer keeps the reader from consuming past the newline,
+    // so a REPL's next prompt still sees the user's type-ahead.
+    var read_buf: [1]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().readerStreaming(tio, &read_buf);
+    const r = &stdin_reader.interface;
     var len: usize = 0;
     while (len < buf.len) {
-        var ch: [1]u8 = undefined;
-        const rc = linux.read(STDIN, &ch, 1);
-        const e = linux.errno(rc);
-        if (e == .INTR) continue;
-        if (e != .SUCCESS) return if (len == 0) null else buf[0..len];
-        if (rc == 0) return if (len == 0) null else buf[0..len];
-        if (ch[0] == '\n') return buf[0..len];
-        buf[len] = ch[0];
+        const ch = r.takeByte() catch return if (len == 0) null else buf[0..len];
+        if (ch == '\n') return buf[0..len];
+        buf[len] = ch;
         len += 1;
     }
     return buf[0..len];

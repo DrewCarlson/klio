@@ -32,29 +32,12 @@ const INDEFINITE: i64 = std.math.maxInt(i64);
 /// origin and elapsed-since-origin reading (the Rust
 /// `std::time::Instant`).
 fn monotonicNanos() i128 {
-    var ts: std.os.linux.timespec = undefined;
-    const rc = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    if (std.os.linux.errno(rc) != .SUCCESS) return 0;
-    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+    return runtime.clockMonotonicNanos();
 }
 
-/// Block the calling thread for `millis` milliseconds, restarting on
-/// signal interruption so the full duration elapses.
+/// Block the calling thread for `millis` milliseconds.
 fn sleepMillis(millis: u64) void {
-    const total_ns = millis *% std.time.ns_per_ms;
-    var req: std.os.linux.timespec = .{
-        .sec = @intCast(total_ns / std.time.ns_per_s),
-        .nsec = @intCast(total_ns % std.time.ns_per_s),
-    };
-    while (true) {
-        var rem: std.os.linux.timespec = undefined;
-        const rc = std.os.linux.nanosleep(&req, &rem);
-        if (std.os.linux.errno(rc) == .INTR) {
-            req = rem;
-            continue;
-        }
-        return;
-    }
+    runtime.clockSleepMillis(@intCast(@min(millis, @as(u64, std.math.maxInt(i64)))));
 }
 
 /// Cross-thread wakeup primitive shared between a `runBlocking` driver

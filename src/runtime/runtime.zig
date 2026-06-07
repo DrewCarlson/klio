@@ -13,6 +13,8 @@ const class_mod = @import("class.zig");
 const host_mod = @import("host.zig");
 const output_mod = @import("output.zig");
 const env_mod = @import("env.zig");
+const proc_env_mod = @import("proc_env.zig");
+const clock_mod = @import("clock.zig");
 const float_fmt_mod = @import("float_fmt.zig");
 const gc_traverse_mod = @import("gc_traverse.zig");
 
@@ -92,6 +94,18 @@ pub const charUnitsToString = output_mod.charUnitsToString;
 pub const Env = env_mod.Env;
 pub const publishEnvDeep = env_mod.publishEnvDeep;
 
+// proc_env (portable process-environment access)
+pub const procEnvGetVar = proc_env_mod.getVar;
+pub const procEnvIsSet = proc_env_mod.isSet;
+pub const procEnvPutAllInto = proc_env_mod.putAllInto;
+
+// clock (portable wall-clock / monotonic time / sleep)
+pub const clockWallMillis = clock_mod.wallMillis;
+pub const clockWallTime = clock_mod.wallTime;
+pub const ClockWallTime = clock_mod.WallTime;
+pub const clockMonotonicNanos = clock_mod.monotonicNanos;
+pub const clockSleepMillis = clock_mod.sleepMillis;
+
 // gc_traverse
 pub const publishEnv = gc_traverse_mod.publishEnv;
 pub const publishValue = gc_traverse_mod.publishValue;
@@ -108,6 +122,8 @@ test {
     _ = host_mod;
     _ = output_mod;
     _ = env_mod;
+    _ = proc_env_mod;
+    _ = clock_mod;
     _ = float_fmt_mod;
     _ = gc_traverse_mod;
 }

@@ -32,6 +32,8 @@ const Parser = parser.Parser;
 const resolver = @import("resolver");
 const typeck = @import("typeck");
 
+const runtime = @import("runtime");
+
 const stdlib = @import("stdlib");
 const HostBindings = stdlib.HostBindings;
 
@@ -328,20 +330,7 @@ fn pathExists(gpa: std.mem.Allocator, path: []const u8) bool {
 }
 
 fn getEnv(gpa: std.mem.Allocator, name: []const u8) ?[]u8 {
-    var threaded = threadedIo(gpa);
-    defer threaded.deinit();
-    const tio = threaded.io();
-    const data = std.Io.Dir.cwd().readFileAlloc(tio, "/proc/self/environ", gpa, .unlimited) catch return null;
-    defer gpa.free(data);
-    var it = std.mem.splitScalar(u8, data, 0);
-    while (it.next()) |entry| {
-        if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        if (std.mem.eql(u8, entry[0..eq], name)) {
-            return gpa.dupe(u8, entry[eq + 1 ..]) catch null;
-        }
-    }
-    return null;
+    return runtime.procEnvGetVar(gpa, name) catch null;
 }
 
 fn packErrText(gpa: std.mem.Allocator, err: PackError) Failure {

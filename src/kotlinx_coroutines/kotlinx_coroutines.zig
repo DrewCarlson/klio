@@ -292,7 +292,7 @@ fn channelReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
     switch (outcome) {
         .Got => |g| {
-            if (g.resumed) |slot| ctx.host.coroutineResumeSlot(slot);
+            if (g.resumed) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
             return .{ .ok = g.value };
         },
         .ParkOnSlot => |slot| {
@@ -320,7 +320,7 @@ fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
         // else: closed or empty — value stays null.
     }
-    if (resumed_slot) |slot| ctx.host.coroutineResumeSlot(slot);
+    if (resumed_slot) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
     return .{ .ok = value orelse .Null };
 }
 
@@ -340,8 +340,7 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
         const exc = try closedReceiveExc(ctx.allocator);
         for (recvs) |slot| {
-            const payload = try ctx.allocator.create(Value);
-            payload.* = exc;
+            const payload = try Value.box(ctx.allocator, exc);
             const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
             ctx.host.coroutineResumeSlotValue(slot, failure);
         }
@@ -352,8 +351,7 @@ fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
         const send_exc = try closedSendExc(ctx.allocator);
         for (sends) |sw| {
-            const payload = try ctx.allocator.create(Value);
-            payload.* = send_exc;
+            const payload = try Value.box(ctx.allocator, send_exc);
             const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
             ctx.host.coroutineResumeSlotValue(sw.slot, failure);
         }
@@ -432,7 +430,7 @@ fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     if (had_state) {
-        if (resumed_slot) |slot| ctx.host.coroutineResumeSlot(slot);
+        if (resumed_slot) |slot| ctx.host.coroutineResumeSlotValue(slot, .Unit);
         if (maybe_v) |v| {
             try iter_inst.asPtr().define(regAllocator(), "__pending__", v);
             return .{ .ok = .{ .Bool = true } };
@@ -566,13 +564,7 @@ fn delayMillis(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 /// Wall-clock time in milliseconds since the Unix epoch.
 fn currentTimeMillis(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     _ = ctx;
-    var ts: std.os.linux.timespec = undefined;
-    const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
-    const t: i64 = if (std.os.linux.errno(rc) == .SUCCESS)
-        @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms)
-    else
-        0;
-    return .{ .ok = .{ .Long = t } };
+    return .{ .ok = .{ .Long = runtime.clockWallMillis() } };
 }
 
 fn tokenCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -648,35 +640,10 @@ fn kxcoSystemProp(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
 /// Read an environment variable into freshly allocated bytes, or null
 /// when unset. The returned slice (when non-null) is owned by `allocator`.
-/// Zig 0.16 has no global env accessor (the environment is handed to
-/// `main` rather than stored in a static), so the process environment is
-/// read from `/proc/self/environ`, the kernel's NUL-delimited
-/// `KEY=VALUE` view. Any read failure is treated as "unset" (null).
+/// Reads the process environment portably (see `runtime.procEnvGetVar`).
+/// Any read failure is treated as "unset" (null).
 fn lookupEnv(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
-    const linux = std.os.linux;
-    const fd_raw = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(fd_raw) != .SUCCESS) return null;
-    const fd: i32 = @intCast(fd_raw);
-    defer _ = linux.close(fd);
-
-    var contents: std.ArrayList(u8) = .empty;
-    defer contents.deinit(allocator);
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = linux.read(fd, &buf, buf.len);
-        if (linux.errno(n) != .SUCCESS) return null;
-        if (n == 0) break;
-        contents.appendSlice(allocator, buf[0..n]) catch return null;
-    }
-
-    var it = std.mem.splitScalar(u8, contents.items, 0);
-    while (it.next()) |entry| {
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-        if (std.mem.eql(u8, entry[0..eq], name)) {
-            return allocator.dupe(u8, entry[eq + 1 ..]) catch return null;
-        }
-    }
-    return null;
+    return runtime.procEnvGetVar(allocator, name) catch null;
 }
 
 /// `kotlinx.coroutines.internal.synchronizedImpl(lock, block)` — klio's
@@ -701,31 +668,31 @@ fn spawnLaunchBlock(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .Unit };
 }
 
-/// `__kxco_dispatch { … }` — dispatch a coroutine body onto the real
-/// parallel worker pool (`Dispatchers.Default`). Returns an opaque job
-/// id the caller joins with `__kxco_joinDispatched`. The body, its
-/// captures, and any value it returns cross threads; the host
-/// `publish_deep`'s the escaping graph before the worker starts and again
-/// on completion (mirrors the spawned-thread boundary).
+/// `__kxco_dispatch { … }` — dispatch a coroutine body onto a real OS
+/// thread (`Dispatchers.Default`). Returns an opaque job id the caller
+/// joins with `__kxco_joinDispatched`. The body, its captures, and any
+/// value it returns cross threads; the host `publish_deep`'s the escaping
+/// graph before the worker starts and again on completion (mirrors the
+/// spawned-thread boundary).
 fn dispatchCoroutine(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Type = "__kxco_dispatch: expected the coroutine block as the first arg" } };
     }
     const block = ctx.args[0];
-    return switch (try ctx.host.dispatchCoroutine(&block, false, ctx.out)) {
+    return switch (try ctx.host.spawnOsThread(&block, ctx.out)) {
         .ok => |id| .{ .ok = .{ .Long = @bitCast(id) } },
         .err => |e| .{ .err = e },
     };
 }
 
-/// `__kxco_dispatchIo { … }` — same as `__kxco_dispatch` but routes to
-/// the elastic (`Dispatchers.IO`) pool for blocking offload.
+/// `__kxco_dispatchIo { … }` — `Dispatchers.IO`. One OS thread per call,
+/// same as `__kxco_dispatch`.
 fn dispatchCoroutineIo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Type = "__kxco_dispatchIo: expected the coroutine block as the first arg" } };
     }
     const block = ctx.args[0];
-    return switch (try ctx.host.dispatchCoroutine(&block, true, ctx.out)) {
+    return switch (try ctx.host.spawnOsThread(&block, ctx.out)) {
         .ok => |id| .{ .ok = .{ .Long = @bitCast(id) } },
         .err => |e| .{ .err = e },
     };
@@ -742,21 +709,20 @@ fn joinDispatched(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     // The job id was stored bit-for-bit; recover the opaque u64.
     const job: u64 = @bitCast(id);
-    if (try ctx.host.joinDispatched(job)) |e| {
+    if (try ctx.host.joinOsThread(job)) |e| {
         return .{ .err = e };
     }
     return .{ .ok = .Unit };
 }
 
-/// Park the active `suspendCoroutine` continuation on the scheduler's
-/// resume queue. The interpreter fires `cont.resume(Unit)` on each parked
-/// continuation between rounds, advancing the corresponding paused frame.
+/// `__kxco_scheduleResume(cont)` — historically queued a continuation for
+/// the interpreter to fire between rounds. The cooperative driver resumes
+/// parked activations directly through the slot mailbox, so no resume
+/// queue is drained and this is a no-op kept for binding stability.
 fn scheduleResume(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Type = "__kxco_scheduleResume: expected the continuation arg" } };
     }
-    const cont = ctx.args[0];
-    try ctx.host.scheduler().scheduleResume(cont);
     return .{ .ok = .Unit };
 }
 
@@ -789,7 +755,7 @@ fn parkSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .Int => |i| @as(i64, i),
         else => return .{ .err = .{ .Type = "__kxco_parkSlot: argument must be Long" } },
     };
-    ctx.host.coroutineParkSlot(slot);
+    ctx.host.coroutineArmSlot(slot);
     return .{ .err = .{ .Suspend = -1 } };
 }
 
@@ -802,7 +768,7 @@ fn resumeSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .Int => |i| @as(i64, i),
         else => return .{ .err = .{ .Type = "__kxco_resumeSlot: argument must be Long" } },
     };
-    ctx.host.coroutineResumeSlot(slot);
+    ctx.host.coroutineResumeSlotValue(slot, .Unit);
     return .{ .ok = .Unit };
 }
 
