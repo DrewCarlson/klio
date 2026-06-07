@@ -1,0 +1,228 @@
+//! Lambda-body lowering: a lambda literal's body is lowered into a
+//! standalone `Func` that closes over the enclosing scope's registers.
+//! Free functions over the shared `FuncBuilder`; filled in alongside the
+//! expression dispatch.
+
+const std = @import("std");
+const ast = @import("ast");
+const ir = @import("../ir.zig");
+const build = @import("../build.zig");
+
+const ast_scan = @import("ast_scan.zig");
+const decl = @import("decl.zig");
+const expr = @import("expr.zig");
+
+const Allocator = std.mem.Allocator;
+const FuncBuilder = build.FuncBuilder;
+const Module = ir.Module;
+const FuncId = ir.FuncId;
+const Reg = ir.Reg;
+const Inst = ir.Inst;
+const Const = ir.Const;
+const Param = ir.Param;
+const Terminator = ir.Terminator;
+const TypeRef = ir.TypeRef;
+const StringSet = std.StringHashMap(void);
+
+/// The lexically enclosing class context handed to a lambda body so an
+/// enclosing-class member out-prioritises a same-named imported
+/// extension. Mirrors Rust's `Option<(String, HashSet<String>)>`.
+pub const EnclosingOwner = struct {
+    class: []const u8,
+    members: StringSet,
+};
+
+/// The allocator backing a `Module`'s growable tables. The module's
+/// containers are unmanaged, so recover the allocator from a managed
+/// member (`func_name_index`) it was initialised with.
+fn moduleAllocator(module: *Module) Allocator {
+    return module.func_name_index.allocator;
+}
+
+/// The product of lowering a lambda body: the body `Func`'s id plus the
+/// capture-name list (in `LoadCapture` index order) the construction site
+/// must snapshot. Mirrors Rust's `(FuncId, Vec<String>)`.
+pub const LoweredLambda = struct {
+    func: FuncId,
+    captures: [][]const u8,
+};
+
+/// Resolve a name to a register inside a lambda body, recording a capture
+/// (and emitting `LoadCapture`) when the name lives in the enclosing
+/// frame rather than locally.
+pub fn resolveCapture(b: *FuncBuilder, name: []const u8) Allocator.Error!Reg {
+    if (b.resolve(name)) |r| {
+        return r;
+    }
+    // A lambda body's implicit `this` (the receiver of an `apply` /
+    // `with` / extension-receiver lambda) is bound at invoke time
+    // through the closure's capture slot rather than a scope binding
+    // or an `outer_names` entry — so `knowsOuter("this")` is false
+    // even though `this` is reachable. The `Expr.This` lowering uses
+    // the same `isLambdaBody()` signal. Mirror it here so a *nested*
+    // lambda can capture the enclosing receiver: forward `this`
+    // through this builder's own capture slot rather than collapsing
+    // it to `Unit`.
+    if (std.mem.eql(u8, name, "this") and b.isLambdaBody()) {
+        const idx = try b.recordCapture("this");
+        const dst = b.allocReg();
+        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+        try b.bind("this", dst);
+        return dst;
+    }
+    if (b.knowsOuter(name)) {
+        const idx = try b.recordCapture(name);
+        const dst = b.allocReg();
+        try b.push(.{ .LoadCapture = .{ .dst = dst, .idx = idx } });
+        try b.bind(name, dst);
+        return dst;
+    }
+    const dst = b.allocReg();
+    const unit = try b.module.internConst(b.allocator, .Unit);
+    try b.push(.{ .Const = .{ .dst = dst, .value = unit } });
+    return dst;
+}
+
+/// Lower a lambda body, threading the enclosing builder's
+/// visible-name set so Path references that hit it lower to
+/// `LoadCapture`. Returns the body's `FuncId` plus the ordered
+/// list of captured names — the caller resolves each to an outer
+/// reg and ships it through `Inst.Lambda::captures`.
+pub fn lowerLambdaBodyCapturing(
+    module: *Module,
+    params: []const ast.Ident,
+    body: *const ast.Block,
+    outer: StringSet,
+    outer_boxed: *const StringSet,
+    inherited_rlp: StringSet,
+    enclosing_owner: ?EnclosingOwner,
+) Allocator.Error!LoweredLambda {
+    return lowerLambdaBodyCapturingKind(
+        module,
+        params,
+        body,
+        outer,
+        true,
+        outer_boxed,
+        null,
+        inherited_rlp,
+        enclosing_owner,
+    );
+}
+
+pub fn lowerLambdaBodyCapturingKind(
+    module: *Module,
+    params: []const ast.Ident,
+    body: *const ast.Block,
+    outer: StringSet,
+    is_lambda: bool,
+    outer_boxed: *const StringSet,
+    tailrec_self: ?[]const u8,
+    inherited_rlp: StringSet,
+    enclosing_owner: ?EnclosingOwner,
+) Allocator.Error!LoweredLambda {
+    return lowerLambdaBodyCapturingKindWith(
+        module,
+        params,
+        body,
+        outer,
+        is_lambda,
+        outer_boxed,
+        tailrec_self,
+        false,
+        inherited_rlp,
+        enclosing_owner,
+    );
+}
+
+// Innermost rung of the lambda-body lowering wrapper chain; each flag/ref
+// is threaded straight from the AST and bundling them would only obscure it.
+pub fn lowerLambdaBodyCapturingKindWith(
+    module: *Module,
+    params: []const ast.Ident,
+    body: *const ast.Block,
+    outer: StringSet,
+    is_lambda: bool,
+    outer_boxed: *const StringSet,
+    tailrec_self: ?[]const u8,
+    is_named_local_fn: bool,
+    inherited_rlp: StringSet,
+    enclosing_owner: ?EnclosingOwner,
+) Allocator.Error!LoweredLambda {
+    var b = try FuncBuilder.init(moduleAllocator(module), module);
+    defer b.deinit();
+    // Carry the lexically enclosing class (and its member-name set) so a
+    // member reference inside the lambda resolves against the class that
+    // declares it: a private getter (`closed`) reads the right field, and
+    // a bare member call (`execute`) binds the enclosing member ahead of a
+    // same-named imported extension.
+    if (enclosing_owner) |eo| {
+        b.setOwnerClass(eo.class);
+        b.setEnclosingMembers(eo.members);
+    }
+    if (is_named_local_fn) {
+        b.setOuterNamesNamedLocalFn(outer);
+    } else if (is_lambda) {
+        b.setOuterNames(outer);
+    } else {
+        b.setOuterNamesWithoutLambda(outer);
+    }
+    // A captured `block: T.() -> R` from an enclosing scope must still
+    // dispatch a bare `block()` here as `this.block()` — carry the
+    // enclosing receiver-lambda-param names so `isReceiverLambdaParam`
+    // sees them across the capture boundary.
+    var inherited = inherited_rlp;
+    defer inherited.deinit();
+    try b.inheritReceiverLambdaParams(&inherited);
+    if (tailrec_self) |name| {
+        b.setTailrecSelf(name);
+    }
+    var boxed = try ast_scan.computeBoxedVars(b.allocator, body.stmts);
+    if (outer_boxed.count() != 0) {
+        var refs = StringSet.init(b.allocator);
+        defer refs.deinit();
+        for (body.stmts) |*s| {
+            try ast_scan.collectPathIdentsStmt(s, &refs);
+        }
+        var it = outer_boxed.keyIterator();
+        while (it.next()) |n| {
+            if (refs.contains(n.*)) {
+                try boxed.put(n.*, {});
+            }
+        }
+    }
+    b.setBoxedVars(boxed);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(b.allocator);
+    for (params) |p| try names.append(b.allocator, p.name);
+    if (params.len == 0) {
+        try names.append(b.allocator, "it");
+    }
+    try decl.bindParams(&b, names.items);
+    const result = try expr.lowerBlock(&b, body);
+    b.terminate(.{ .Return = result });
+    const captured = try b.allocator.dupe([]const u8, b.capturesTaken());
+    var func = try b.finish("<lambda>", "<lambda>", build.typeUnit());
+    // Function count is bounded well below u32::MAX; the index is the new FuncId.
+    const id = FuncId.from(@intCast(module.funcs.items.len));
+    func.id = id;
+    func.is_lambda = is_lambda;
+    const placed_params = try b.allocator.alloc(Param, names.items.len);
+    for (names.items, placed_params) |n, *dst| {
+        dst.* = .{
+            .name = n,
+            .ty = build.typeUnit(),
+            .default = null,
+            .is_property = false,
+            .is_vararg = false,
+            .has_default = false,
+        };
+    }
+    func.params = placed_params;
+    try module.funcs.append(b.allocator, func);
+    return .{ .func = id, .captures = captured };
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}
