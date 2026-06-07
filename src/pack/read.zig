@@ -2,16 +2,18 @@
 //! section directory eagerly; section payloads are decoded on demand.
 //!
 //! The byte-level deserializer mirrors `write.zig`'s postcard encoder.
-//! The zstd-backed decompression paths and the mmap-backed constructor
-//! are reserved for a later stage; this file carries the uncompressed
-//! core and the owned-bytes constructor.
+//! Sections marked `Zstd`/`ZstdDict` are decompressed through the system
+//! zstd library; the mmap-backed constructor for large packs is reserved
+//! for a later stage.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const format = @import("format.zig");
 const errors = @import("errors.zig");
+const zstd = @import("zstd.zig");
 const PackError = errors.PackError;
+const section_names = format.section_names;
 const Compression = format.Compression;
 const SectionDirectory = format.SectionDirectory;
 const SectionEntry = format.SectionEntry;
@@ -188,12 +190,41 @@ pub const PackReader = struct {
         const stored = self.bytes[start..end];
         switch (entry.compression) {
             .None => return SectionBytes{ .borrowed = stored },
-            .Zstd, .ZstdDict => {
-                // The zstd codec is reserved for a later stage; the entry
-                // point and directory layout are in place so a
-                // decompressor drops in without a format change.
-                result.* = .{ .Compression = "zstd decompression not available in this build" };
-                return null;
+            .Zstd => {
+                const out = zstd.decompress(self.allocator, stored, @intCast(entry.uncompressed_len)) catch |e| {
+                    switch (e) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.ZstdFailed => {
+                            result.* = .{ .Compression = zstd.last_error };
+                            return null;
+                        },
+                    }
+                };
+                return SectionBytes{ .owned = out };
+            },
+            .ZstdDict => {
+                const dict_entry = self.findEntry(section_names.ZSTD_DICT) orelse {
+                    result.* = .{ .Compression = "section is zstd_dict compressed but the pack has no zstd_dict section" };
+                    return null;
+                };
+                const dict_start = self.payload_start + @as(usize, @intCast(dict_entry.offset));
+                const dict_end = dict_start + @as(usize, @intCast(dict_entry.stored_len));
+                const dict = self.bytes[dict_start..dict_end];
+                const out = zstd.decompressDict(
+                    self.allocator,
+                    stored,
+                    dict,
+                    @intCast(entry.uncompressed_len),
+                ) catch |e| {
+                    switch (e) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.ZstdFailed => {
+                            result.* = .{ .Compression = zstd.last_error };
+                            return null;
+                        },
+                    }
+                };
+                return SectionBytes{ .owned = out };
             },
         }
     }
@@ -388,7 +419,6 @@ test "varint decode round-trips LEB128" {
 test "fromPath loads and validates a written pack" {
     const a = std.testing.allocator;
     const write = @import("write.zig");
-    const section_names = format.section_names;
     const io = std.testing.io;
 
     var err: PackError = undefined;

@@ -3,15 +3,17 @@
 //! The byte-level (de)serializer here is the postcard wire format: little
 //! varints for multi-byte integers, length-prefixed sequences and byte
 //! strings, single-byte bool / `Option` tags, and in-order struct fields.
-//! The zstd-backed compression paths are reserved for a later stage; this
-//! file carries the uncompressed core so the format and schema types
-//! round-trip end to end.
+//! Sections marked `Zstd`/`ZstdDict` are compressed through the system
+//! zstd library; `ZstdDict` sections compress against the pack's
+//! dictionary, which is emitted as a `zstd_dict` section so readers can
+//! decode without out-of-band state.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const format = @import("format.zig");
 const errors = @import("errors.zig");
+const zstd = @import("zstd.zig");
 const PackError = errors.PackError;
 const Compression = format.Compression;
 const SectionDirectory = format.SectionDirectory;
@@ -143,14 +145,39 @@ pub const PackWriter = struct {
 
         for (self.sections.items) |s| {
             const uncompressed_len: u64 = s.payload.len;
+            var owned_stored: ?[]u8 = null;
+            defer if (owned_stored) |o| a.free(o);
             const stored: []const u8 = switch (s.compression) {
                 .None => s.payload,
-                .Zstd, .ZstdDict => {
-                    // The zstd codec is reserved for a later stage; the
-                    // entry point and directory layout are in place so a
-                    // compressor drops in without a format change.
-                    result.* = .{ .Compression = "zstd compression not available in this build" };
-                    return null;
+                .Zstd => blk: {
+                    const buf = zstd.compress(a, s.payload, DEFAULT_ZSTD_LEVEL) catch |e| {
+                        switch (e) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            error.ZstdFailed => {
+                                result.* = .{ .Compression = zstd.last_error };
+                                return null;
+                            },
+                        }
+                    };
+                    owned_stored = buf;
+                    break :blk buf;
+                },
+                .ZstdDict => blk: {
+                    const dict = self.zstd_dict orelse {
+                        result.* = .{ .Compression = "section requests zstd_dict compression but the pack has no dictionary" };
+                        return null;
+                    };
+                    const buf = zstd.compressDict(a, s.payload, dict, DEFAULT_ZSTD_LEVEL) catch |e| {
+                        switch (e) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            error.ZstdFailed => {
+                                result.* = .{ .Compression = zstd.last_error };
+                                return null;
+                            },
+                        }
+                    };
+                    owned_stored = buf;
+                    break :blk buf;
                 },
             };
             const offset: u64 = payloads.items.len;

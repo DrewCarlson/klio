@@ -166,13 +166,87 @@ test "duplicate section is rejected" {
 }
 
 test "zstd section round trip" {
-    // The zstd codec is reserved for a later stage; the directory layout
-    // and entry points are in place. Restore this once the compressor
-    // lands.
-    return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var err: PackError = undefined;
+
+    // Repetitive payload so compression actually shrinks the bytes.
+    const payload = "klio pack zstd compressed section payload " ** 32;
+
+    var w = PackWriter.init(a);
+    defer w.deinit();
+    _ = try w.addZstd(section_names.SYMBOLS, payload);
+    _ = try w.addRaw(section_names.MANIFEST, "manifest-bytes");
+    var bytes = (try w.finish(&err)).?;
+    defer bytes.deinit(a);
+
+    const owned = try a.dupe(u8, bytes.items);
+    var reader = (try PackReader.fromBytes(a, owned, &err)).?;
+    defer reader.deinit();
+
+    // The stored section is smaller than the original payload.
+    const entry = blk: {
+        for (reader.sections()) |e| {
+            if (std.mem.eql(u8, e.name, section_names.SYMBOLS)) break :blk e;
+        }
+        return error.MissingSection;
+    };
+    try std.testing.expectEqual(Compression.Zstd, entry.compression);
+    try std.testing.expectEqual(@as(u64, payload.len), entry.uncompressed_len);
+    try std.testing.expect(entry.stored_len < payload.len);
+
+    // The compressed section decodes back to the original bytes.
+    const got = (try reader.readSection(section_names.SYMBOLS, &err)).?;
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(u8, payload, got.slice());
+
+    // The uncompressed neighbour still reads back fine.
+    const got_manifest = (try reader.readSection(section_names.MANIFEST, &err)).?;
+    defer got_manifest.deinit(a);
+    try std.testing.expectEqualSlices(u8, "manifest-bytes", got_manifest.slice());
 }
 
 test "zstd dict round trip" {
-    // The zstd codec is reserved for a later stage; see above.
-    return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var err: PackError = undefined;
+
+    const dict = "the quick brown fox jumps over the lazy dog " ** 8;
+    const payload = "the quick brown fox is fast and the lazy dog is slow " ** 8;
+
+    var w = PackWriter.init(a);
+    defer w.deinit();
+    _ = w.setZstdDict(dict);
+    _ = try w.addZstdDict(section_names.SYMBOLS, payload);
+    var bytes = (try w.finish(&err)).?;
+    defer bytes.deinit(a);
+
+    const owned = try a.dupe(u8, bytes.items);
+    var reader = (try PackReader.fromBytes(a, owned, &err)).?;
+    defer reader.deinit();
+
+    // The dictionary was emitted as its own section so the reader is
+    // self-contained.
+    var saw_dict = false;
+    var saw_symbols = false;
+    for (reader.sections()) |e| {
+        if (std.mem.eql(u8, e.name, section_names.ZSTD_DICT)) {
+            saw_dict = true;
+            try std.testing.expectEqual(Compression.None, e.compression);
+        }
+        if (std.mem.eql(u8, e.name, section_names.SYMBOLS)) {
+            saw_symbols = true;
+            try std.testing.expectEqual(Compression.ZstdDict, e.compression);
+        }
+    }
+    try std.testing.expect(saw_dict);
+    try std.testing.expect(saw_symbols);
+
+    // The dict-compressed section decodes back to the original bytes.
+    const got = (try reader.readSection(section_names.SYMBOLS, &err)).?;
+    defer got.deinit(a);
+    try std.testing.expectEqualSlices(u8, payload, got.slice());
+
+    // The dictionary section itself reads back as the raw dict bytes.
+    const got_dict = (try reader.readSection(section_names.ZSTD_DICT, &err)).?;
+    defer got_dict.deinit(a);
+    try std.testing.expectEqualSlices(u8, dict, got_dict.slice());
 }

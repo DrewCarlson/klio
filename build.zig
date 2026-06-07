@@ -81,6 +81,23 @@ pub fn build(b: *std.Build) void {
         for (m.deps) |d| mod.addImport(d, mods.get(d).?);
     }
 
+    // The pack format compresses sections with the system zstd library.
+    // Zig std ships only a zstd decoder, so the encoder is linked from
+    // libzstd directly (no dev header needed — the symbols are declared
+    // extern in src/pack/zstd.zig). The library is linked as an object
+    // file because distros ship the versioned `libzstd.so.1` without a
+    // `-dev` `libzstd.so` symlink; `-Dzstd-lib=` overrides the path. Link
+    // inputs attached to the pack module flow into every artifact that
+    // imports it.
+    const zstd_lib = b.option(
+        []const u8,
+        "zstd-lib",
+        "Path to the shared zstd library to link (default: /usr/lib/x86_64-linux-gnu/libzstd.so.1)",
+    ) orelse "/usr/lib/x86_64-linux-gnu/libzstd.so.1";
+    const pack_mod = mods.get("pack").?;
+    pack_mod.link_libc = true;
+    pack_mod.addObjectFile(.{ .cwd_relative = zstd_lib });
+
     const exe = b.addExecutable(.{
         .name = "klio",
         .root_module = b.createModule(.{
