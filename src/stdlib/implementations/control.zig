@@ -1,0 +1,485 @@
+//! Control-flow / builder / contract stdlib intrinsics.
+//!
+//! Each intrinsic is a `fn(*CallCtx) !EvalResult`. For member access the
+//! receiver is `args[0]`, with any further user arguments following.
+
+const std = @import("std");
+const runtime = @import("runtime");
+
+const Value = runtime.Value;
+const RuntimeError = runtime.RuntimeError;
+const EvalResult = runtime.EvalResult;
+const CallCtx = runtime.CallCtx;
+const StringRef = runtime.StringRef;
+const ValueList = runtime.ValueList;
+const MapEntries = runtime.MapEntries;
+const ObjRef = runtime.ObjRef;
+
+fn ok(v: Value) EvalResult {
+    return .{ .ok = v };
+}
+
+fn arityErr(msg: []const u8) EvalResult {
+    return .{ .err = .{ .Arity = msg } };
+}
+
+pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args.len > 2) {
+        return arityErr("buildList expects (block) or (capacity, block)");
+    }
+    const block = ctx.args[ctx.args.len - 1];
+    const buildable = Value{ .List = .{
+        .items = try ValueList.init(ctx.allocator, .empty),
+        .mutable = true,
+        .enum_class = null,
+        .backing = null,
+    } };
+    {
+        const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
+        if (r == .err) {
+            buildable.List.items.deinit();
+            return r;
+        }
+    }
+    return ok(.{ .List = .{
+        .items = buildable.List.items,
+        .mutable = false,
+        .enum_class = null,
+        .backing = null,
+    } });
+}
+
+pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args.len > 2) {
+        return arityErr("buildSet expects (block) or (capacity, block)");
+    }
+    const block = ctx.args[ctx.args.len - 1];
+    const buildable = Value{ .List = .{
+        .items = try ValueList.init(ctx.allocator, .empty),
+        .mutable = true,
+        .enum_class = null,
+        .backing = null,
+    } };
+    {
+        const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
+        if (r == .err) {
+            buildable.List.items.deinit();
+            return r;
+        }
+    }
+    var deduped = try ValueList.init(ctx.allocator, .empty);
+    {
+        const src = buildable.List.items.borrow();
+        defer src.deinit();
+        const dst = deduped.borrowMut();
+        defer dst.deinit();
+        for (src.get().items) |*v| {
+            var seen = false;
+            for (dst.get().items) |*x| {
+                if (Value.structuralEqBoxed(x, v)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try dst.get().append(ctx.allocator, v.*);
+        }
+    }
+    buildable.List.items.deinit();
+    return ok(.{ .Set = .{
+        .items = deduped,
+        .mutable = false,
+        .backing = null,
+    } });
+}
+
+pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0 or ctx.args.len > 2) {
+        return arityErr("buildMap expects (block) or (capacity, block)");
+    }
+    const block = ctx.args[ctx.args.len - 1];
+    const buildable = Value{ .Map = .{
+        .entries = try MapEntries.init(ctx.allocator, .empty),
+        .mutable = true,
+    } };
+    {
+        const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
+        if (r == .err) {
+            buildable.Map.entries.deinit();
+            return r;
+        }
+    }
+    return ok(.{ .Map = .{
+        .entries = buildable.Map.entries,
+        .mutable = false,
+    } });
+}
+
+pub fn builders_build_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    // `buildString(builderAction)` or `buildString(capacity,
+    // builderAction)`. The capacity is only a sizing hint here, so the
+    // builder lambda is always the last argument.
+    const block = switch (ctx.args.len) {
+        1 => ctx.args[0],
+        2 => ctx.args[1],
+        else => return arityErr("buildString expects (block) or (capacity, block)"),
+    };
+    const sb = Value{ .StringBuilder = try ObjRef(std.ArrayList(u8)).init(ctx.allocator, .empty) };
+    {
+        const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &sb, ctx.out);
+        if (r == .err) {
+            sb.StringBuilder.deinit();
+            return r;
+        }
+    }
+    const owned = blk: {
+        const g = sb.StringBuilder.borrow();
+        defer g.deinit();
+        break :blk try ctx.allocator.dupe(u8, g.get().items);
+    };
+    sb.StringBuilder.deinit();
+    return ok(.{ .String = try StringRef.init(ctx.allocator, owned) });
+}
+
+pub fn contract_error(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const v = if (ctx.args.len > 0) ctx.args[0] else Value.Null;
+    const msg = switch (v) {
+        .String => |s| blk: {
+            const g = s.borrow();
+            defer g.deinit();
+            break :blk try ctx.allocator.dupe(u8, g.get().*);
+        },
+        else => try v.display(ctx.allocator),
+    };
+    return .{ .err = .{ .Thrown = .{ .Exception = .{
+        .fqn = try StringRef.init(ctx.allocator, "kotlin.IllegalStateException"),
+        .message = try StringRef.init(ctx.allocator, msg),
+        .cause = null,
+    } } } };
+}
+
+pub fn contract_todo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const msg = if (ctx.args.len > 0) switch (ctx.args[0]) {
+        .String => |s| blk: {
+            const g = s.borrow();
+            defer g.deinit();
+            break :blk try std.fmt.allocPrint(ctx.allocator, "An operation is not implemented: {s}", .{g.get().*});
+        },
+        else => blk: {
+            const rendered = try ctx.args[0].display(ctx.allocator);
+            defer ctx.allocator.free(rendered);
+            break :blk try std.fmt.allocPrint(ctx.allocator, "An operation is not implemented: {s}", .{rendered});
+        },
+    } else try ctx.allocator.dupe(u8, "An operation is not implemented.");
+    return .{ .err = .{ .Thrown = .{ .Exception = .{
+        .fqn = try StringRef.init(ctx.allocator, "kotlin.NotImplementedError"),
+        .message = try StringRef.init(ctx.allocator, msg),
+        .cause = null,
+    } } } };
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+const testing = std.testing;
+
+/// Host that records `invoke_callable_with_this` calls and, when armed,
+/// mutates the supplied `this` buildable so the builder intrinsics have an
+/// effect to observe. The default scheduler is the in-process one.
+const RecordingHost = struct {
+    scheduler_impl: runtime.InProcessScheduler,
+    /// Values appended to a `List`/`Set` buildable on invocation.
+    append_values: []const Value = &.{},
+    /// Bytes appended to a `StringBuilder` buildable on invocation.
+    append_bytes: []const u8 = "",
+    /// Entries inserted into a `Map` buildable on invocation.
+    append_entries: []const runtime.MapPair = &.{},
+    /// When set, the invocation reports this error instead of running.
+    fail_with: ?RuntimeError = null,
+    allocator: std.mem.Allocator,
+    invoked: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) RecordingHost {
+        return .{ .scheduler_impl = runtime.InProcessScheduler.init(allocator), .allocator = allocator };
+    }
+    fn deinit(self: *RecordingHost) void {
+        self.scheduler_impl.deinit();
+    }
+
+    fn vtScheduler(ctx: *anyopaque) runtime.Scheduler {
+        const self: *RecordingHost = @ptrCast(@alignCast(ctx));
+        return self.scheduler_impl.scheduler();
+    }
+    fn vtInvokeCallable(ctx: *anyopaque, callable: *const Value, args: []const Value, out: runtime.Output) std.mem.Allocator.Error!EvalResult {
+        _ = ctx;
+        _ = callable;
+        _ = args;
+        _ = out;
+        return .{ .ok = .Unit };
+    }
+    fn vtInvokeCallableWithThis(ctx: *anyopaque, callable: *const Value, args: []const Value, this_value: *const Value, out: runtime.Output) std.mem.Allocator.Error!EvalResult {
+        _ = callable;
+        _ = args;
+        _ = out;
+        const self: *RecordingHost = @ptrCast(@alignCast(ctx));
+        self.invoked += 1;
+        if (self.fail_with) |e| return .{ .err = e };
+        switch (this_value.*) {
+            .List => |l| {
+                const g = l.items.borrowMut();
+                defer g.deinit();
+                for (self.append_values) |v| try g.get().append(self.allocator, v);
+            },
+            .Map => |m| {
+                const g = m.entries.borrowMut();
+                defer g.deinit();
+                for (self.append_entries) |e| try g.get().append(self.allocator, e);
+            },
+            .StringBuilder => |sb| {
+                const g = sb.borrowMut();
+                defer g.deinit();
+                try g.get().appendSlice(self.allocator, self.append_bytes);
+            },
+            else => {},
+        }
+        return .{ .ok = .Unit };
+    }
+
+    const vtable: runtime.IntrinsicHost.VTable = .{
+        .scheduler = vtScheduler,
+        .invoke_callable = vtInvokeCallable,
+        .invoke_callable_with_this = vtInvokeCallableWithThis,
+    };
+
+    fn host(self: *RecordingHost) runtime.IntrinsicHost {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
+
+fn freeListResult(v: Value) void {
+    // The element/entry storage is an `ObjRef` over an `ArrayList`; releasing
+    // the final handle runs the list's own `deinit`, so no manual clear here.
+    switch (v) {
+        .List => |l| l.items.deinit(),
+        .Set => |s| s.items.deinit(),
+        .Map => |m| m.entries.deinit(),
+        else => {},
+    }
+}
+
+fn freeException(e: anytype) void {
+    e.fqn.deinit();
+    if (e.message) |m| {
+        const g = m.borrow();
+        testing.allocator.free(g.get().*);
+        g.deinit();
+        m.deinit();
+    }
+}
+
+test "buildList freezes a populated list" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    const appended = [_]Value{ .{ .Int = 1 }, .{ .Int = 2 } };
+    rec.append_values = &appended;
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const block: Value = .Unit;
+    const args = [_]Value{block};
+    var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try builders_build_list(&ctx);
+    try testing.expect(r == .ok);
+    defer freeListResult(r.ok);
+    try testing.expect(!r.ok.List.mutable);
+    const g = r.ok.List.items.borrow();
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 2), g.get().items.len);
+    try testing.expectEqual(@as(i32, 1), g.get().items[0].Int);
+    try testing.expectEqual(@as(i32, 2), g.get().items[1].Int);
+}
+
+test "buildList accepts a capacity hint argument" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const args = [_]Value{ .{ .Int = 8 }, .Unit };
+    var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try builders_build_list(&ctx);
+    try testing.expect(r == .ok);
+    defer freeListResult(r.ok);
+    try testing.expectEqual(@as(usize, 1), rec.invoked);
+}
+
+test "buildList rejects bad arity" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    var ctx = CallCtx{ .args = &.{}, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try builders_build_list(&ctx);
+    try testing.expect(r == .err);
+    try testing.expect(r.err == .Arity);
+}
+
+test "buildSet dedups structurally equal elements" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    const appended = [_]Value{ .{ .Int = 1 }, .{ .Int = 1 }, .{ .Int = 2 } };
+    rec.append_values = &appended;
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const args = [_]Value{.Unit};
+    var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try builders_build_set(&ctx);
+    try testing.expect(r == .ok);
+    defer freeListResult(r.ok);
+    try testing.expect(r.ok == .Set);
+    try testing.expect(!r.ok.Set.mutable);
+    const g = r.ok.Set.items.borrow();
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 2), g.get().items.len);
+    try testing.expectEqual(@as(i32, 1), g.get().items[0].Int);
+    try testing.expectEqual(@as(i32, 2), g.get().items[1].Int);
+}
+
+test "buildMap freezes the produced entries" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    const entries = [_]runtime.MapPair{
+        .{ .key = .{ .Int = 1 }, .value = .{ .Int = 10 } },
+    };
+    rec.append_entries = &entries;
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const args = [_]Value{.Unit};
+    var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try builders_build_map(&ctx);
+    try testing.expect(r == .ok);
+    defer freeListResult(r.ok);
+    try testing.expect(r.ok == .Map);
+    try testing.expect(!r.ok.Map.mutable);
+    const g = r.ok.Map.entries.borrow();
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 1), g.get().items.len);
+    try testing.expectEqual(@as(i32, 1), g.get().items[0].key.Int);
+    try testing.expectEqual(@as(i32, 10), g.get().items[0].value.Int);
+}
+
+test "buildString returns the accumulated buffer" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    rec.append_bytes = "hello";
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const args = [_]Value{.Unit};
+    var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try builders_build_string(&ctx);
+    try testing.expect(r == .ok);
+    const g = r.ok.String.borrow();
+    defer {
+        testing.allocator.free(g.get().*);
+        g.deinit();
+        r.ok.String.deinit();
+    }
+    try testing.expectEqualStrings("hello", g.get().*);
+}
+
+test "buildString rejects bad arity" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const args = [_]Value{ .Unit, .Unit, .Unit };
+    var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try builders_build_string(&ctx);
+    try testing.expect(r == .err);
+    try testing.expect(r.err == .Arity);
+}
+
+test "buildList propagates a builder error" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    rec.fail_with = .Break;
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const args = [_]Value{.Unit};
+    var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try builders_build_list(&ctx);
+    try testing.expect(r == .err);
+    try testing.expect(r.err == .Break);
+}
+
+test "error throws IllegalStateException with the message string" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const sref = try StringRef.init(testing.allocator, "boom");
+    defer sref.deinit();
+    const args = [_]Value{.{ .String = sref }};
+    var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try contract_error(&ctx);
+    try testing.expect(r == .err);
+    try testing.expect(r.err == .Thrown);
+    const exc = r.err.Thrown.Exception;
+    defer freeException(exc);
+    const fg = exc.fqn.borrow();
+    defer fg.deinit();
+    try testing.expectEqualStrings("kotlin.IllegalStateException", fg.get().*);
+    const mg = exc.message.?.borrow();
+    defer mg.deinit();
+    try testing.expectEqualStrings("boom", mg.get().*);
+}
+
+test "error renders a non-string argument via display" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const args = [_]Value{.{ .Int = 42 }};
+    var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try contract_error(&ctx);
+    try testing.expect(r == .err);
+    const exc = r.err.Thrown.Exception;
+    defer freeException(exc);
+    const mg = exc.message.?.borrow();
+    defer mg.deinit();
+    try testing.expectEqualStrings("42", mg.get().*);
+}
+
+test "TODO throws NotImplementedError with a message" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const sref = try StringRef.init(testing.allocator, "later");
+    defer sref.deinit();
+    const args = [_]Value{.{ .String = sref }};
+    var ctx = CallCtx{ .args = &args, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try contract_todo(&ctx);
+    try testing.expect(r == .err);
+    const exc = r.err.Thrown.Exception;
+    defer freeException(exc);
+    const fg = exc.fqn.borrow();
+    defer fg.deinit();
+    try testing.expectEqualStrings("kotlin.NotImplementedError", fg.get().*);
+    const mg = exc.message.?.borrow();
+    defer mg.deinit();
+    try testing.expectEqualStrings("An operation is not implemented: later", mg.get().*);
+}
+
+test "TODO without an argument uses the default message" {
+    var rec = RecordingHost.init(testing.allocator);
+    defer rec.deinit();
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    var ctx = CallCtx{ .args = &.{}, .out = cap.output(), .host = rec.host(), .allocator = testing.allocator };
+    const r = try contract_todo(&ctx);
+    try testing.expect(r == .err);
+    const exc = r.err.Thrown.Exception;
+    defer freeException(exc);
+    const mg = exc.message.?.borrow();
+    defer mg.deinit();
+    try testing.expectEqualStrings("An operation is not implemented.", mg.get().*);
+}

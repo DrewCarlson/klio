@@ -1,0 +1,5194 @@
+//! Collection stdlib intrinsics (List / Set / Map / Iterable / Array /
+//! Pair / Triple / Sequence). Faithful port of
+//! `crates/klio-stdlib/src/implementations/collections.rs`.
+//!
+//! Each intrinsic is a `fn(*CallCtx) std.mem.Allocator.Error!EvalResult`.
+//! The Rust functions returned `Result<Value, RuntimeError>`; here `Ok(v)`
+//! becomes `EvalResult{ .ok = v }` and `Err(e)` becomes `EvalResult{ .err
+//! = e }`. OOM is the only Zig `error`.
+//!
+//! Memory model: heap-owning containers (`StringRef`, `ValueList`,
+//! `MapEntries`) are created via `ctx.allocator` and never freed
+//! individually — the interpreter drives an arena per eval phase, matching
+//! where the Rust `Arc`/`ObjRef` data dropped at scope exit. A plain
+//! `Value` copy shares the same backing handle, mirroring `Arc::clone`.
+
+const std = @import("std");
+const runtime = @import("runtime");
+const text = @import("../text.zig");
+
+const CallCtx = runtime.CallCtx;
+const EvalResult = runtime.EvalResult;
+const RuntimeError = runtime.RuntimeError;
+const Value = runtime.Value;
+const StringRef = runtime.StringRef;
+const ValueList = runtime.ValueList;
+const MapEntries = runtime.MapEntries;
+const MapPair = runtime.MapPair;
+const MapBacking = runtime.MapBacking;
+const MapViewKind = runtime.MapViewKind;
+const PrimitiveArrayKind = runtime.PrimitiveArrayKind;
+const RangeKind = runtime.RangeKind;
+const ObjRef = runtime.ObjRef;
+const InstanceData = runtime.InstanceData;
+const IntrinsicHost = runtime.IntrinsicHost;
+const Output = runtime.Output;
+const SeqOp = runtime.SeqOp;
+
+const Allocator = std.mem.Allocator;
+const Error = std.mem.Allocator.Error;
+const Order = std.math.Order;
+
+// =====================================================================
+// Result/error helpers
+// =====================================================================
+
+fn ok(v: Value) EvalResult {
+    return .{ .ok = v };
+}
+
+fn typeErr(msg: []const u8) EvalResult {
+    return .{ .err = .{ .Type = msg } };
+}
+
+fn arityErr(msg: []const u8) EvalResult {
+    return .{ .err = .{ .Arity = msg } };
+}
+
+/// Build an owned, formatted message slice from the ctx allocator.
+fn fmt(a: Allocator, comptime spec: []const u8, args: anytype) Error![]u8 {
+    return std.fmt.allocPrint(a, spec, args);
+}
+
+/// Render a value the way Kotlin `toString` does, owned by `a`.
+fn display(a: Allocator, v: Value) Error![]u8 {
+    return v.display(a);
+}
+
+// =====================================================================
+// Value construction helpers (Arc / ObjRef equivalents)
+// =====================================================================
+
+/// `Arc::new(string)` — wrap an already-owned slice in a `StringRef`.
+fn makeStringOwned(a: Allocator, s: []const u8) Error!Value {
+    return .{ .String = try StringRef.init(a, s) };
+}
+
+/// Heap-box a `Value` (`Box::new(v)` -> `*Value`).
+fn box(a: Allocator, v: Value) Error!*Value {
+    const p = try a.create(Value);
+    p.* = v;
+    return p;
+}
+
+/// `make_list(items, mutable)` — wrap a slice of values into a `List`.
+fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
+    var list: std.ArrayList(Value) = .empty;
+    try list.appendSlice(a, items);
+    return .{ .List = .{
+        .items = try ValueList.init(a, list),
+        .mutable = mutable,
+        .enum_class = null,
+        .backing = null,
+    } };
+}
+
+/// `make_list` consuming an already-built ArrayList (no copy).
+fn makeListFromArrayList(a: Allocator, list: std.ArrayList(Value), mutable: bool) Error!Value {
+    return .{ .List = .{
+        .items = try ValueList.init(a, list),
+        .mutable = mutable,
+        .enum_class = null,
+        .backing = null,
+    } };
+}
+
+/// `make_set(items, mutable)` — dedupe by boxed structural equality.
+fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
+    var deduped: std.ArrayList(Value) = .empty;
+    for (items) |v| {
+        if (!containsBoxed(deduped.items, &v)) {
+            try deduped.append(a, v);
+        }
+    }
+    return .{ .Set = .{
+        .items = try ValueList.init(a, deduped),
+        .mutable = mutable,
+        .backing = null,
+    } };
+}
+
+fn makeArray(a: Allocator, items: []const Value, prim: ?PrimitiveArrayKind) Error!Value {
+    var list: std.ArrayList(Value) = .empty;
+    try list.appendSlice(a, items);
+    return .{ .Array = .{ .items = try ValueList.init(a, list), .prim = prim } };
+}
+
+fn makeArrayFromArrayList(a: Allocator, list: std.ArrayList(Value), prim: ?PrimitiveArrayKind) Error!Value {
+    return .{ .Array = .{ .items = try ValueList.init(a, list), .prim = prim } };
+}
+
+/// `make_map(entries, mutable)` — dedupe keys, last write wins.
+fn makeMap(a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
+    var out: std.ArrayList(MapPair) = .empty;
+    for (entries) |kv| {
+        if (findKeyIndexBoxed(out.items, &kv.key)) |i| {
+            out.items[i].value = kv.value;
+        } else {
+            try out.append(a, kv);
+        }
+    }
+    return .{ .Map = .{ .entries = try MapEntries.init(a, out), .mutable = mutable } };
+}
+
+fn makeMapFromArrayList(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool) Error!Value {
+    return .{ .Map = .{ .entries = try MapEntries.init(a, entries), .mutable = mutable } };
+}
+
+fn makePair(a: Allocator, first: Value, second: Value) Error!Value {
+    return .{ .Pair = .{ .first = try box(a, first), .second = try box(a, second) } };
+}
+
+fn makeTriple(a: Allocator, first: Value, second: Value, third: Value) Error!Value {
+    return .{ .Triple = .{
+        .first = try box(a, first),
+        .second = try box(a, second),
+        .third = try box(a, third),
+    } };
+}
+
+/// `make_exception(fqn, message)` -> a thrown-ready `Value::Exception`.
+fn makeException(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!Value {
+    const fqn_ref = try StringRef.init(a, fqn);
+    const msg_ref: ?StringRef = if (message) |m| try StringRef.init(a, m) else null;
+    return .{ .Exception = .{ .fqn = fqn_ref, .message = msg_ref, .cause = null } };
+}
+
+/// `Err(RuntimeError::Thrown(make_exception(...)))` as an EvalResult.
+fn thrown(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!EvalResult {
+    return .{ .err = .{ .Thrown = try makeException(a, fqn, message) } };
+}
+
+// =====================================================================
+// Borrow helpers over ObjRef containers
+// =====================================================================
+
+/// Snapshot the items of a `ValueList` into a freshly allocated slice.
+fn snapshotItems(a: Allocator, items: ValueList) Error![]Value {
+    const g = items.borrow();
+    defer g.deinit();
+    return a.dupe(Value, g.get().items);
+}
+
+fn listLen(items: ValueList) usize {
+    const g = items.borrow();
+    defer g.deinit();
+    return g.get().items.len;
+}
+
+fn mapLen(entries: MapEntries) usize {
+    const g = entries.borrow();
+    defer g.deinit();
+    return g.get().items.len;
+}
+
+/// Snapshot a `MapEntries` into a freshly allocated slice of pairs.
+fn snapshotEntries(a: Allocator, entries: MapEntries) Error![]MapPair {
+    const g = entries.borrow();
+    defer g.deinit();
+    return a.dupe(MapPair, g.get().items);
+}
+
+// =====================================================================
+// Equality / search helpers
+// =====================================================================
+
+fn eqBoxed(x: *const Value, y: *const Value) bool {
+    return Value.structuralEqBoxed(x, y);
+}
+
+fn containsBoxed(items: []const Value, needle: *const Value) bool {
+    for (items) |*v| {
+        if (eqBoxed(v, needle)) return true;
+    }
+    return false;
+}
+
+fn indexOfBoxed(items: []const Value, needle: *const Value) ?usize {
+    for (items, 0..) |*v, i| {
+        if (eqBoxed(v, needle)) return i;
+    }
+    return null;
+}
+
+fn findKeyIndexBoxed(entries: []const MapPair, key: *const Value) ?usize {
+    for (entries, 0..) |*kv, i| {
+        if (eqBoxed(&kv.key, key)) return i;
+    }
+    return null;
+}
+
+fn isCallable(v: Value) bool {
+    return switch (v) {
+        .Lambda, .IrClosure, .Function, .Intrinsic, .Instance => true,
+        else => false,
+    };
+}
+
+/// Match the trailing-lambda detection the join/zip ops use.
+fn isTransformCallable(v: Value) bool {
+    return switch (v) {
+        .IrClosure, .Lambda, .BoundMethod => true,
+        .Instance => |inst| blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk std.mem.startsWith(u8, cg.get().name, "$bound_ref$");
+        },
+        else => false,
+    };
+}
+
+// =====================================================================
+// Host call helper: thread a RuntimeError through as data
+// =====================================================================
+
+/// Invoke a callable; on a `RuntimeError` short-circuit by returning the
+/// `EvalResult.err` to the caller. On success returns the produced Value.
+const CallOutcome = union(enum) { value: Value, err: EvalResult };
+
+fn invoke(ctx: *CallCtx, callable: *const Value, args: []const Value) Error!CallOutcome {
+    const r = try ctx.host.invokeCallable(callable, args, ctx.out);
+    return switch (r) {
+        .ok => |v| .{ .value = v },
+        .err => |e| .{ .err = .{ .err = e } },
+    };
+}
+
+// =====================================================================
+// Natural-order comparison
+// =====================================================================
+
+/// Either an ordering or a short-circuit error EvalResult.
+const CompareOutcome = union(enum) { order: Order, err: EvalResult };
+
+/// Kotlin's `Double`/`Float` total order (`java.lang.Double.compare`):
+/// every `NaN` is greater than all other values, all `NaN`s equal, and
+/// `-0.0 < 0.0`.
+fn kotlinFloatTotalCmp(x: f64, y: f64) Order {
+    if (x < y) return .lt;
+    if (x > y) return .gt;
+    const bits = struct {
+        fn f(v: f64) i64 {
+            if (std.math.isNan(v)) return @bitCast(@as(u64, 0x7ff8_0000_0000_0000));
+            return @bitCast(v);
+        }
+    }.f;
+    return std.math.order(bits(x), bits(y));
+}
+
+/// Compare two values by Kotlin's natural ordering.
+fn compareValues(a: Allocator, x: Value, y: Value) Error!CompareOutcome {
+    if (x.isNumeric() and y.isNumeric()) {
+        if (x.isIntegral() and y.isIntegral()) {
+            return .{ .order = std.math.order(x.asI64().?, y.asI64().?) };
+        }
+        return .{ .order = kotlinFloatTotalCmp(x.asF64().?, y.asF64().?) };
+    }
+    switch (x) {
+        .String => |sx| if (y == .String) {
+            const gx = sx.borrow();
+            defer gx.deinit();
+            const gy = y.String.borrow();
+            defer gy.deinit();
+            return .{ .order = text.compareUtf16(gx.get().*, gy.get().*) };
+        },
+        .Char => |cx| if (y == .Char) return .{ .order = std.math.order(cx, y.Char) },
+        .Bool => |bx| if (y == .Bool) return .{ .order = std.math.order(@intFromBool(bx), @intFromBool(y.Bool)) },
+        else => {},
+    }
+    const xd = try display(a, x);
+    const yd = try display(a, y);
+    return .{ .err = typeErr(try fmt(a, "values are not comparable: {s}, {s}", .{ xd, yd })) };
+}
+
+fn reverseOrder(o: Order) Order {
+    return switch (o) {
+        .lt => .gt,
+        .eq => .eq,
+        .gt => .lt,
+    };
+}
+
+fn i32ToOrdering(n: i32) Order {
+    return std.math.order(n, 0);
+}
+
+/// Stable natural-order sort over a slice. Returns a short-circuit
+/// EvalResult when two elements are incomparable.
+fn sortValuesNatural(a: Allocator, items: []Value) Error!?EvalResult {
+    return sortValuesNaturalDesc(a, items, false);
+}
+
+fn sortValuesNaturalDesc(a: Allocator, items: []Value, descending: bool) Error!?EvalResult {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        var j = i;
+        while (j > 0) {
+            const o = switch (try compareValues(a, items[j - 1], items[j])) {
+                .order => |o| o,
+                .err => |e| return e,
+            };
+            const flipped = if (descending) reverseOrder(o) else o;
+            if (flipped == .gt) {
+                std.mem.swap(Value, &items[j - 1], &items[j]);
+                j -= 1;
+            } else break;
+        }
+    }
+    return null;
+}
+
+/// Replace a `ValueList`'s backing storage with a fresh slice's contents.
+fn writeBackItems(items: ValueList, a: Allocator, src: []const Value) Error!void {
+    const g = items.borrowMut();
+    defer g.deinit();
+    g.get().clearRetainingCapacity();
+    try g.get().appendSlice(a, src);
+}
+
+// =====================================================================
+// Receiver accessors
+// =====================================================================
+
+const ListItemsOutcome = union(enum) { items: ValueList, err: EvalResult };
+
+fn recvListItems(a: Allocator, args: []const Value, what: []const u8) Error!ListItemsOutcome {
+    if (args.len > 0 and args[0] == .List) return .{ .items = args[0].List.items };
+    return .{ .err = typeErr(try fmt(a, "{s} requires a List receiver", .{what})) };
+}
+
+fn recvSetItems(a: Allocator, args: []const Value, what: []const u8) Error!ListItemsOutcome {
+    if (args.len > 0 and args[0] == .Set) return .{ .items = args[0].Set.items };
+    return .{ .err = typeErr(try fmt(a, "{s} requires a Set receiver", .{what})) };
+}
+
+const MapEntriesOutcome = union(enum) { entries: MapEntries, err: EvalResult };
+
+fn recvMapEntries(a: Allocator, args: []const Value, what: []const u8) Error!MapEntriesOutcome {
+    if (args.len > 0 and args[0] == .Map) return .{ .entries = args[0].Map.entries };
+    return .{ .err = typeErr(try fmt(a, "{s} requires a Map receiver", .{what})) };
+}
+
+// =====================================================================
+// Range iteration (local copy of ranges helpers; ranges.zig not ported)
+// =====================================================================
+
+/// Inclusive integer progression iterator state.
+const RangeIter = struct {
+    cur: i64,
+    end: i64,
+    step: i64,
+    done: bool,
+
+    fn init(start: i64, end: i64, step: i64) RangeIter {
+        const empty = step == 0 or (step > 0 and start > end) or (step < 0 and start < end);
+        return .{ .cur = start, .end = end, .step = step, .done = empty };
+    }
+
+    fn next(self: *RangeIter) ?i64 {
+        if (self.done) return null;
+        const v = self.cur;
+        if (self.step > 0) {
+            if (self.cur > self.end) {
+                self.done = true;
+                return null;
+            }
+            self.cur +|= self.step;
+        } else {
+            if (self.cur < self.end) {
+                self.done = true;
+                return null;
+            }
+            self.cur +|= self.step;
+        }
+        return v;
+    }
+};
+
+/// `range_endpoint(kind, v)` — narrow/reinterpret an i64 endpoint.
+fn rangeEndpoint(kind: RangeKind, v: i64) Value {
+    return switch (kind) {
+        .Long => .{ .Long = v },
+        .Int => .{ .Int = @truncate(v) },
+        .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
+    };
+}
+
+/// `as_range_view(v)` — view a Range value or a `kotlin.ranges.*` Instance.
+const RangeView = struct { start: i64, end: i64, step: i64, kind: RangeKind };
+
+fn asRangeView(v: Value) ?RangeView {
+    switch (v) {
+        .Range => |r| return .{ .start = r.start, .end = r.end, .step = r.step, .kind = r.kind },
+        .Instance => |inst| {
+            const g = inst.borrow();
+            defer g.deinit();
+            const b = g.get();
+            const cg = b.class.borrow();
+            defer cg.deinit();
+            const fqn = cg.get().fqn;
+            if (!std.mem.startsWith(u8, fqn, "kotlin.ranges.")) return null;
+            const kind: RangeKind = if (std.mem.indexOf(u8, fqn, "Long") != null)
+                .Long
+            else if (std.mem.indexOf(u8, fqn, "Char") != null)
+                .Char
+            else if (std.mem.indexOf(u8, fqn, "Int") != null)
+                .Int
+            else
+                return null;
+            const start = instNum(b, &.{ "first", "start" }) orelse return null;
+            const end = instNum(b, &.{ "last", "endInclusive" }) orelse return null;
+            const step = instNum(b, &.{"step"}) orelse 1;
+            return .{ .start = start, .end = end, .step = step, .kind = kind };
+        },
+        else => return null,
+    }
+}
+
+fn instNum(inst: *const InstanceData, names: []const []const u8) ?i64 {
+    for (names) |n| {
+        if (inst.get(n)) |val| {
+            if (val.asI64()) |i| return i;
+            if (val == .Char) return @as(i64, val.Char);
+        }
+    }
+    return null;
+}
+
+// =====================================================================
+// iterable_items: collect an iterable receiver into a fresh []Value
+// =====================================================================
+
+/// Either a collected slice of items or a short-circuit error EvalResult.
+const ItemsOutcome = union(enum) { items: []Value, err: EvalResult };
+
+/// Collect a List/Set/Array/Map/Range receiver into a freshly allocated
+/// slice. Map yields `MapEntry` values. Returns an error EvalResult when
+/// the receiver is not iterable.
+fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcome {
+    switch (v) {
+        .List, .Set, .Array => {
+            const items = switch (v) {
+                .List => |l| l.items,
+                .Set => |s| s.items,
+                .Array => |arr| arr.items,
+                else => unreachable,
+            };
+            return .{ .items = try snapshotItems(a, items) };
+        },
+        .Map => |m| {
+            const g = m.entries.borrow();
+            defer g.deinit();
+            const src = g.get().items;
+            var out = try a.alloc(Value, src.len);
+            for (src, 0..) |kv, i| {
+                out[i] = .{ .MapEntry = .{
+                    .key = try box(a, kv.key),
+                    .value = try box(a, kv.value),
+                    .backing = null,
+                } };
+            }
+            return .{ .items = out };
+        },
+        .Range => {
+            const view = asRangeView(v) orelse {
+                return .{ .err = typeErr(try fmt(a, "{s} requires an iterable receiver", .{what})) };
+            };
+            var list: std.ArrayList(Value) = .empty;
+            var it = RangeIter.init(view.start, view.end, view.step);
+            while (it.next()) |n| try list.append(a, rangeEndpoint(view.kind, n));
+            return .{ .items = try list.toOwnedSlice(a) };
+        },
+        else => return .{ .err = typeErr(try fmt(a, "{s} requires an iterable receiver", .{what})) },
+    }
+}
+
+// =====================================================================
+// Iterable transforms (filterNotNull, sumOf, max/min of, distinctBy,
+// groupBy, groupingBy + terminals, associate*, sorted*, onEach, mapNotNull)
+// =====================================================================
+
+pub fn coll_iter_filter_not_null(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const items = switch (try iterableItems(a, ctx.args[0], "filterNotNull")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    var result: std.ArrayList(Value) = .empty;
+    for (items) |v| {
+        if (v != .Null) try result.append(a, v);
+    }
+    return ok(try makeListFromArrayList(a, result, false));
+}
+
+pub fn coll_iter_sum_of(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr("sumOf expects (receiver, block)");
+    const items = switch (try iterableItems(a, ctx.args[0], "sumOf")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    var acc_int: ?i64 = 0;
+    var acc_dbl: ?f64 = null;
+    for (items) |v| {
+        const r = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+        if (r.isIntegral()) {
+            const n = r.asI64().?;
+            if (acc_int) |*aa| {
+                aa.* +%= n;
+            } else if (acc_dbl) |*aa| {
+                aa.* += @as(f64, @floatFromInt(n));
+            }
+        } else if (r.isFloating()) {
+            const d = r.asF64().?;
+            if (acc_int) |aa| {
+                acc_dbl = @as(f64, @floatFromInt(aa)) + d;
+                acc_int = null;
+            } else if (acc_dbl) |*aa| {
+                aa.* += d;
+            }
+        } else {
+            const rd = try display(a, r);
+            return typeErr(try fmt(a, "sumOf selector must return Int or Double, got {s}", .{rd}));
+        }
+    }
+    if (acc_dbl) |d| return ok(.{ .Double = d });
+    return ok(Value.newInt(acc_int orelse 0));
+}
+
+fn iterMaxMinOfOrNull(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr(try fmt(a, "{s} expects (receiver, block)", .{what}));
+    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    var best: ?Value = null;
+    for (items) |v| {
+        const r = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+        if (best) |b| {
+            const o = switch (try compareValues(a, r, b)) {
+                .order => |o| o,
+                .err => |e| return e,
+            };
+            const take = if (want_max) o == .gt else o == .lt;
+            if (take) best = r;
+        } else {
+            best = r;
+        }
+    }
+    return ok(best orelse Value.Null);
+}
+
+pub fn coll_iter_max_of_or_null(ctx: *CallCtx) Error!EvalResult {
+    return iterMaxMinOfOrNull(ctx, true, "maxOfOrNull");
+}
+
+pub fn coll_iter_min_of_or_null(ctx: *CallCtx) Error!EvalResult {
+    return iterMaxMinOfOrNull(ctx, false, "minOfOrNull");
+}
+
+pub fn coll_iter_distinct_by(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr("distinctBy expects (receiver, block)");
+    const items = switch (try iterableItems(a, ctx.args[0], "distinctBy")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    var keys: std.ArrayList(Value) = .empty;
+    var result: std.ArrayList(Value) = .empty;
+    for (items) |v| {
+        const key = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+        if (!containsBoxed(keys.items, &key)) {
+            try keys.append(a, key);
+            try result.append(a, v);
+        }
+    }
+    return ok(try makeListFromArrayList(a, result, false));
+}
+
+pub fn coll_iter_group_by(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr("groupBy expects (receiver, block)");
+    const items = switch (try iterableItems(a, ctx.args[0], "groupBy")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    const Group = struct { key: Value, vs: std.ArrayList(Value) };
+    var groups: std.ArrayList(Group) = .empty;
+    for (items) |v| {
+        const key = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+        var found = false;
+        for (groups.items) |*g| {
+            if (eqBoxed(&g.key, &key)) {
+                try g.vs.append(a, v);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            var vs: std.ArrayList(Value) = .empty;
+            try vs.append(a, v);
+            try groups.append(a, .{ .key = key, .vs = vs });
+        }
+    }
+    var entries: std.ArrayList(MapPair) = .empty;
+    for (groups.items) |g| {
+        try entries.append(a, .{ .key = g.key, .value = try makeListFromArrayList(a, g.vs, false) });
+    }
+    return ok(try makeMapFromArrayList(a, entries, false));
+}
+
+pub fn coll_iter_grouping_by(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr("groupingBy expects (receiver, keySelector)");
+    const items = switch (try iterableItems(a, ctx.args[0], "groupingBy")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    const id = ctx.host.allocInstanceId();
+    const src = try makeList(a, items, false);
+    const fields = [_]InstanceData.Field{
+        .{ .name = "__grouping_src", .value = src },
+        .{ .name = "__grouping_key", .value = block },
+    };
+    return ok(try ctx.host.newSynthInstance("kotlin.collections.Grouping", id, &fields));
+}
+
+const GroupingParts = union(enum) { parts: struct { items: []Value, key: Value }, err: EvalResult };
+
+fn groupingParts(a: Allocator, v: Value) Error!GroupingParts {
+    if (v == .Instance) {
+        const g = v.Instance.borrow();
+        defer g.deinit();
+        const inst = g.get();
+        if (inst.get("__grouping_src")) |src| {
+            if (src == .List) {
+                if (inst.get("__grouping_key")) |key| {
+                    const items = try snapshotItems(a, src.List.items);
+                    return .{ .parts = .{ .items = items, .key = key } };
+                }
+            }
+        }
+    }
+    return .{ .err = typeErr("expected a Grouping receiver") };
+}
+
+pub fn coll_grouping_each_count(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const gp = switch (try groupingParts(a, ctx.args[0])) {
+        .parts => |p| p,
+        .err => |e| return e,
+    };
+    const Count = struct { key: Value, n: i64 };
+    var counts: std.ArrayList(Count) = .empty;
+    for (gp.items) |v| {
+        const k = switch (try invoke(ctx, &gp.key, &.{v})) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+        var found = false;
+        for (counts.items) |*c| {
+            if (eqBoxed(&c.key, &k)) {
+                c.n += 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) try counts.append(a, .{ .key = k, .n = 1 });
+    }
+    var entries: std.ArrayList(MapPair) = .empty;
+    for (counts.items) |c| {
+        try entries.append(a, .{ .key = c.key, .value = Value.newInt(c.n) });
+    }
+    return ok(try makeMapFromArrayList(a, entries, false));
+}
+
+pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const gp = switch (try groupingParts(a, ctx.args[0])) {
+        .parts => |p| p,
+        .err => |e| return e,
+    };
+    const initial = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
+    if (ctx.args.len <= 2) return arityErr("fold expects (initial, operation)");
+    const op = ctx.args[2];
+    var acc: std.ArrayList(MapPair) = .empty;
+    for (gp.items) |v| {
+        const k = switch (try invoke(ctx, &gp.key, &.{v})) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+        const pos = findKeyIndexBoxed(acc.items, &k);
+        const cur = if (pos) |p| acc.items[p].value else blk: {
+            if (isCallable(initial)) {
+                break :blk switch (try invoke(ctx, &initial, &.{ k, v })) {
+                    .value => |val| val,
+                    .err => |e| return e,
+                };
+            } else break :blk initial;
+        };
+        const next = switch (try invoke(ctx, &op, &.{ cur, v })) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+        if (pos) |p| {
+            acc.items[p].value = next;
+        } else {
+            try acc.append(a, .{ .key = k, .value = next });
+        }
+    }
+    return ok(try makeMapFromArrayList(a, acc, false));
+}
+
+pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const gp = switch (try groupingParts(a, ctx.args[0])) {
+        .parts => |p| p,
+        .err => |e| return e,
+    };
+    if (ctx.args.len <= 1) return arityErr("reduce expects (operation)");
+    const op = ctx.args[1];
+    var acc: std.ArrayList(MapPair) = .empty;
+    for (gp.items) |v| {
+        const k = switch (try invoke(ctx, &gp.key, &.{v})) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+        if (findKeyIndexBoxed(acc.items, &k)) |p| {
+            const cur = acc.items[p].value;
+            acc.items[p].value = switch (try invoke(ctx, &op, &.{ k, cur, v })) {
+                .value => |val| val,
+                .err => |e| return e,
+            };
+        } else {
+            try acc.append(a, .{ .key = k, .value = v });
+        }
+    }
+    return ok(try makeMapFromArrayList(a, acc, false));
+}
+
+pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr("associate expects (receiver, block)");
+    const items = switch (try iterableItems(a, ctx.args[0], "associate")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    var entries: std.ArrayList(MapPair) = .empty;
+    for (items) |v| {
+        const r = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+        if (r != .Pair) return typeErr("associate selector must return Pair");
+        const key = r.Pair.first.*;
+        const val = r.Pair.second.*;
+        if (findKeyIndexBoxed(entries.items, &key)) |i| {
+            entries.items[i].value = val;
+        } else {
+            try entries.append(a, .{ .key = key, .value = val });
+        }
+    }
+    return ok(try makeMapFromArrayList(a, entries, false));
+}
+
+pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr("associateBy expects (receiver, block)");
+    const items = switch (try iterableItems(a, ctx.args[0], "associateBy")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    var entries: std.ArrayList(MapPair) = .empty;
+    for (items) |v| {
+        const key = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+        if (findKeyIndexBoxed(entries.items, &key)) |i| {
+            entries.items[i].value = v;
+        } else {
+            try entries.append(a, .{ .key = key, .value = v });
+        }
+    }
+    return ok(try makeMapFromArrayList(a, entries, false));
+}
+
+pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr("associateWith expects (receiver, block)");
+    const items = switch (try iterableItems(a, ctx.args[0], "associateWith")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    var entries: std.ArrayList(MapPair) = .empty;
+    for (items) |v| {
+        const val = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+        if (findKeyIndexBoxed(entries.items, &v)) |i| {
+            entries.items[i].value = val;
+        } else {
+            try entries.append(a, .{ .key = v, .value = val });
+        }
+    }
+    return ok(try makeMapFromArrayList(a, entries, false));
+}
+
+/// Insertion sort over a slice using a host-driven key comparison. The
+/// callback maps each element to a key, then keys compare by natural
+/// order (optionally reversed). On error short-circuits with the
+/// EvalResult.
+fn sortByKeyInsertion(ctx: *CallCtx, items: []Value, block: Value, descending: bool) Error!?EvalResult {
+    const a = ctx.allocator;
+    // Precompute keys.
+    const keys = try a.alloc(Value, items.len);
+    for (items, 0..) |v, i| {
+        keys[i] = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |val| val,
+            .err => |e| return e,
+        };
+    }
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        var j = i;
+        while (j > 0) {
+            const o = switch (try compareValues(a, keys[j - 1], keys[j])) {
+                .order => |o| o,
+                .err => |e| return e,
+            };
+            const flipped = if (descending) reverseOrder(o) else o;
+            if (flipped == .gt) {
+                std.mem.swap(Value, &items[j - 1], &items[j]);
+                std.mem.swap(Value, &keys[j - 1], &keys[j]);
+                j -= 1;
+            } else break;
+        }
+    }
+    return null;
+}
+
+fn iterSortedByImpl(ctx: *CallCtx, descending: bool, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr(try fmt(a, "{s} expects (receiver, block)", .{what}));
+    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    if (try sortByKeyInsertion(ctx, items, block, descending)) |e| return e;
+    return ok(try makeList(a, items, false));
+}
+
+pub fn coll_iter_sorted_by(ctx: *CallCtx) Error!EvalResult {
+    return iterSortedByImpl(ctx, false, "sortedBy");
+}
+
+pub fn coll_iter_sorted_by_desc(ctx: *CallCtx) Error!EvalResult {
+    return iterSortedByImpl(ctx, true, "sortedByDescending");
+}
+
+fn iterMaxMinByImpl(ctx: *CallCtx, descending: bool, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr(try fmt(a, "{s} expects (receiver, block)", .{what}));
+    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    if (items.len == 0) return ok(Value.Null);
+    const block = ctx.args[1];
+    var best_key = switch (try invoke(ctx, &block, &.{items[0]})) {
+        .value => |v| v,
+        .err => |e| return e,
+    };
+    var best = items[0];
+    for (items[1..]) |v| {
+        const key = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+        const o = switch (try compareValues(a, key, best_key)) {
+            .order => |o| o,
+            .err => |e| return e,
+        };
+        const take = if (descending) o == .lt else o == .gt;
+        if (take) {
+            best_key = key;
+            best = v;
+        }
+    }
+    return ok(best);
+}
+
+pub fn coll_iter_max_by_or_null(ctx: *CallCtx) Error!EvalResult {
+    return iterMaxMinByImpl(ctx, false, "maxByOrNull");
+}
+
+pub fn coll_iter_min_by_or_null(ctx: *CallCtx) Error!EvalResult {
+    return iterMaxMinByImpl(ctx, true, "minByOrNull");
+}
+
+/// Dispatch `comparator.compare(a, b)` for a non-intrinsic Comparator
+/// value (interpreted object / SAM / bare callable). Returns the i64
+/// result or a short-circuit EvalResult.
+const CmpResult = union(enum) { n: i64, err: EvalResult };
+
+fn invokeComparatorCompare(ctx: *CallCtx, comparator: Value, x: Value, y: Value) Error!CmpResult {
+    const args = [_]Value{ x, y };
+    const r = if (try ctx.host.invokeMethod(&comparator, "compare", &args, ctx.out)) |m|
+        m
+    else
+        try ctx.host.invokeCallable(&comparator, &args, ctx.out);
+    return switch (r) {
+        .ok => |v| if (v.asI64()) |n| .{ .n = n } else .{ .err = typeErr("Comparator.compare must return Int") },
+        .err => |e| .{ .err = .{ .err = e } },
+    };
+}
+
+pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.sort")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const copy = try snapshotItems(a, it);
+    if (try sortValuesNatural(a, copy)) |e| return e;
+    writeBackItems(it, a, copy) catch return error.OutOfMemory;
+    return ok(Value.Unit);
+}
+
+pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.sortWith")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len <= 1) return arityErr("sortWith expects (comparator)");
+    const cmp = ctx.args[1];
+    const copy = try snapshotItems(a, it);
+    // Insertion sort so the comparator callback can dispatch through host.
+    var i: usize = 1;
+    while (i < copy.len) : (i += 1) {
+        var j = i;
+        while (j > 0) {
+            const n = switch (try invokeComparatorCompare(ctx, cmp, copy[j - 1], copy[j])) {
+                .n => |v| v,
+                .err => |e| return e,
+            };
+            if (n > 0) {
+                std.mem.swap(Value, &copy[j - 1], &copy[j]);
+                j -= 1;
+            } else break;
+        }
+    }
+    writeBackItems(it, a, copy) catch return error.OutOfMemory;
+    return ok(Value.Unit);
+}
+
+pub fn coll_mut_list_fill(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.fill")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len <= 1) return arityErr("fill expects (value)");
+    const value = ctx.args[1];
+    const g = it.borrowMut();
+    defer g.deinit();
+    for (g.get().items) |*slot| slot.* = value;
+    return ok(Value.Unit);
+}
+
+pub fn coll_mut_list_reverse(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.reverse")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const g = it.borrowMut();
+    defer g.deinit();
+    std.mem.reverse(Value, g.get().items);
+    return ok(Value.Unit);
+}
+
+pub fn coll_iter_sorted_with(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr("sortedWith expects (receiver, comparator)");
+    var items = switch (try iterableItems(a, ctx.args[0], "sortedWith")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const comparator = ctx.args[1];
+    if (comparator != .Comparator) {
+        // Treat as any object with `compare(a, b): Int`.
+        var i: usize = 1;
+        while (i < items.len) : (i += 1) {
+            var j = i;
+            while (j > 0) {
+                const o = switch (try invokeComparatorCompare(ctx, comparator, items[j - 1], items[j])) {
+                    .n => |v| v,
+                    .err => |e| return e,
+                };
+                if (o > 0) {
+                    std.mem.swap(Value, &items[j - 1], &items[j]);
+                    j -= 1;
+                } else break;
+            }
+        }
+        return ok(try makeList(a, items, false));
+    }
+    const descending = comparator.Comparator.descending;
+    const steps_g = comparator.Comparator.steps.borrow();
+    defer steps_g.deinit();
+    const steps = steps_g.get().*;
+    if (steps.len == 0) {
+        if (try sortValuesNaturalDesc(a, items, descending)) |e| return e;
+    } else {
+        var i: usize = 1;
+        while (i < items.len) : (i += 1) {
+            var j = i;
+            while (j > 0) {
+                var ord: Order = .eq;
+                for (steps) |step| {
+                    const ka = switch (try invoke(ctx, &step.selector, &.{items[j - 1]})) {
+                        .value => |v| v,
+                        .err => |e| return e,
+                    };
+                    const kb = switch (try invoke(ctx, &step.selector, &.{items[j]})) {
+                        .value => |v| v,
+                        .err => |e| return e,
+                    };
+                    const o = switch (try compareValues(a, ka, kb)) {
+                        .order => |o| o,
+                        .err => |e| return e,
+                    };
+                    const flipped = if (step.descending) reverseOrder(o) else o;
+                    if (flipped != .eq) {
+                        ord = flipped;
+                        break;
+                    }
+                }
+                if (descending) ord = reverseOrder(ord);
+                if (ord == .gt) {
+                    std.mem.swap(Value, &items[j - 1], &items[j]);
+                    j -= 1;
+                } else break;
+            }
+        }
+    }
+    return ok(try makeList(a, items, false));
+}
+
+fn iterExtreme(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr(try fmt(a, "{s} expects (receiver, block)", .{what}));
+    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    var best: ?Value = null;
+    for (items) |v| {
+        const r = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+        if (best) |b| {
+            const o = switch (try compareValues(a, b, r)) {
+                .order => |o| o,
+                .err => |e| return e,
+            };
+            const replace = (want_max and o == .lt) or (!want_max and o == .gt);
+            best = if (replace) r else b;
+        } else best = r;
+    }
+    if (best) |b| return ok(b);
+    return try thrown(a, "kotlin.NoSuchElementException", "Collection is empty.");
+}
+
+pub fn coll_iter_max_of(ctx: *CallCtx) Error!EvalResult {
+    return iterExtreme(ctx, true, "maxOf");
+}
+
+pub fn coll_iter_min_of(ctx: *CallCtx) Error!EvalResult {
+    return iterExtreme(ctx, false, "minOf");
+}
+
+pub fn coll_iter_on_each(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr("onEach expects (receiver, block)");
+    const recv = ctx.args[0];
+    const items = switch (try iterableItems(a, recv, "onEach")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    for (items) |v| {
+        switch (try invoke(ctx, &block, &.{v})) {
+            .value => {},
+            .err => |e| return e,
+        }
+    }
+    return ok(recv);
+}
+
+pub fn coll_iter_map_not_null(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 2) return arityErr("mapNotNull expects (receiver, block)");
+    const items = switch (try iterableItems(a, ctx.args[0], "mapNotNull")) {
+        .items => |xs| xs,
+        .err => |e| return e,
+    };
+    const block = ctx.args[1];
+    var result: std.ArrayList(Value) = .empty;
+    for (items) |v| {
+        const r = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+        if (r != .Null) try result.append(a, r);
+    }
+    return ok(try makeListFromArrayList(a, result, false));
+}
+
+// =====================================================================
+// Map scope helpers
+// =====================================================================
+
+pub fn map_get_or_else(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 3) return arityErr("getOrElse expects (receiver, key, block)");
+    if (ctx.args[0] != .Map) return typeErr("getOrElse requires a Map receiver");
+    const entries = try snapshotEntries(a, ctx.args[0].Map.entries);
+    const key = ctx.args[1];
+    if (findKeyIndexBoxed(entries, &key)) |i| return ok(entries[i].value);
+    const block = ctx.args[2];
+    return try ctx.host.invokeCallable(&block, &.{}, ctx.out);
+}
+
+pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len != 3) return arityErr("getOrPut expects (receiver, key, block)");
+    if (ctx.args[0] != .Map) return typeErr("getOrPut requires a MutableMap receiver");
+    const entries_rc = ctx.args[0].Map.entries;
+    const key = ctx.args[1];
+    {
+        const g = entries_rc.borrow();
+        defer g.deinit();
+        if (findKeyIndexBoxed(g.get().items, &key)) |i| return ok(g.get().items[i].value);
+    }
+    const block = ctx.args[2];
+    const new_v = switch (try invoke(ctx, &block, &.{})) {
+        .value => |v| v,
+        .err => |e| return e,
+    };
+    {
+        const g = entries_rc.borrowMut();
+        defer g.deinit();
+        try g.get().append(a, .{ .key = key, .value = new_v });
+    }
+    return ok(new_v);
+}
+
+// =====================================================================
+// Array constructors / isEmpty
+// =====================================================================
+
+fn arrayLen(recv: Value) ?usize {
+    return switch (recv) {
+        .Array => |arr| listLen(arr.items),
+        .List => |l| listLen(l.items),
+        else => null,
+    };
+}
+
+pub fn array_is_empty(ctx: *CallCtx) Error!EvalResult {
+    const r = if (ctx.args.len > 0) arrayLen(ctx.args[0]) else null;
+    if (r) |n| return ok(.{ .Bool = n == 0 });
+    return typeErr("isEmpty requires an array");
+}
+
+pub fn array_is_not_empty(ctx: *CallCtx) Error!EvalResult {
+    const r = if (ctx.args.len > 0) arrayLen(ctx.args[0]) else null;
+    if (r) |n| return ok(.{ .Bool = n != 0 });
+    return typeErr("isNotEmpty requires an array");
+}
+
+const SizeOutcome = union(enum) { n: i64, err: EvalResult };
+
+fn arraySizeArg(a: Allocator, v: Value, what: []const u8) Error!SizeOutcome {
+    const n = v.asI64() orelse return .{ .err = typeErr(try fmt(a, "{s} expects an Int size", .{what})) };
+    if (n < 0) return .{ .err = typeErr(try fmt(a, "{s}: negative array size {d}", .{ what, n })) };
+    return .{ .n = n };
+}
+
+fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, default: Value) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args.len > 2) {
+        return arityErr(try fmt(a, "{s} expects (size) or (size, init)", .{name}));
+    }
+    const n = switch (try arraySizeArg(a, ctx.args[0], name)) {
+        .n => |v| v,
+        .err => |e| return e,
+    };
+    if (ctx.args.len == 1) {
+        var list: std.ArrayList(Value) = .empty;
+        var i: i64 = 0;
+        while (i < n) : (i += 1) try list.append(a, default);
+        return ok(try makeArrayFromArrayList(a, list, prim));
+    }
+    const block = ctx.args[1];
+    var list: std.ArrayList(Value) = .empty;
+    var i: i64 = 0;
+    while (i < n) : (i += 1) {
+        const v = switch (try invoke(ctx, &block, &.{Value.newInt(i)})) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+        try list.append(a, v);
+    }
+    return ok(try makeArrayFromArrayList(a, list, prim));
+}
+
+pub fn array_ctor_generic(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "Array", null, Value.Null);
+}
+pub fn array_ctor_int(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "IntArray", .Int, .{ .Int = 0 });
+}
+pub fn array_ctor_long(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "LongArray", .Long, .{ .Long = 0 });
+}
+pub fn array_ctor_double(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "DoubleArray", .Double, .{ .Double = 0.0 });
+}
+pub fn array_ctor_float(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "FloatArray", .Float, .{ .Float = 0.0 });
+}
+pub fn array_ctor_short(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "ShortArray", .Short, .{ .Short = 0 });
+}
+pub fn array_ctor_byte(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "ByteArray", .Byte, .{ .Byte = 0 });
+}
+pub fn array_ctor_boolean(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "BooleanArray", .Boolean, .{ .Bool = false });
+}
+pub fn array_ctor_char(ctx: *CallCtx) Error!EvalResult {
+    return arrayCtorImpl(ctx, "CharArray", .Char, .{ .Char = 0 });
+}
+
+// =====================================================================
+// Collection builders
+// =====================================================================
+
+fn pairArgs(ctx: *CallCtx) union(enum) { pair: struct { a: Value, b: Value }, err: EvalResult } {
+    if (ctx.args.len == 2) return .{ .pair = .{ .a = ctx.args[0], .b = ctx.args[1] } };
+    return .{ .err = arityErr("Pair expects 2 arguments") };
+}
+
+pub fn coll_pair_ctor(ctx: *CallCtx) Error!EvalResult {
+    const p = switch (pairArgs(ctx)) {
+        .pair => |p| p,
+        .err => |e| return e,
+    };
+    return ok(try makePair(ctx.allocator, p.a, p.b));
+}
+
+pub fn coll_to_infix(ctx: *CallCtx) Error!EvalResult {
+    return coll_pair_ctor(ctx);
+}
+
+pub fn coll_list_of(ctx: *CallCtx) Error!EvalResult {
+    return ok(try makeList(ctx.allocator, ctx.args, false));
+}
+
+pub fn coll_list_of_not_null(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (ctx.args) |v| {
+        if (v != .Null) try items.append(a, v);
+    }
+    return ok(try makeListFromArrayList(a, items, false));
+}
+
+pub fn coll_array_of(ctx: *CallCtx) Error!EvalResult {
+    return ok(try makeArray(ctx.allocator, ctx.args, null));
+}
+
+pub fn coll_array_of_nulls(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 2 and ctx.args[0] == .Array) {
+        const n = switch (try arraySizeArg(a, ctx.args[1], "arrayOfNulls")) {
+            .n => |v| v,
+            .err => |e| return e,
+        };
+        var list: std.ArrayList(Value) = .empty;
+        var i: i64 = 0;
+        while (i < n) : (i += 1) try list.append(a, Value.Null);
+        return ok(try makeArrayFromArrayList(a, list, null));
+    }
+    return arrayCtorImpl(ctx, "arrayOfNulls", null, Value.Null);
+}
+
+pub fn coll_empty_array(ctx: *CallCtx) Error!EvalResult {
+    return ok(try makeArray(ctx.allocator, &.{}, null));
+}
+
+fn primArrayOf(ctx: *CallCtx, prim: PrimitiveArrayKind) Error!EvalResult {
+    return ok(try makeArray(ctx.allocator, ctx.args, prim));
+}
+pub fn coll_int_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .Int);
+}
+pub fn coll_long_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .Long);
+}
+pub fn coll_short_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .Short);
+}
+pub fn coll_byte_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .Byte);
+}
+pub fn coll_double_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .Double);
+}
+pub fn coll_float_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .Float);
+}
+pub fn coll_bool_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .Boolean);
+}
+pub fn coll_char_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .Char);
+}
+pub fn coll_uint_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .UInt);
+}
+pub fn coll_ulong_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .ULong);
+}
+pub fn coll_ushort_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .UShort);
+}
+pub fn coll_ubyte_array_of(ctx: *CallCtx) Error!EvalResult {
+    return primArrayOf(ctx, .UByte);
+}
+
+pub fn coll_mutable_list_of(ctx: *CallCtx) Error!EvalResult {
+    return ok(try makeList(ctx.allocator, ctx.args, true));
+}
+
+fn arrayRecvItems(a: Allocator, ctx: *CallCtx, who: []const u8) Error!ItemsOutcome {
+    if (ctx.args.len > 0) {
+        switch (ctx.args[0]) {
+            .Array => |arr| return .{ .items = try snapshotItems(a, arr.items) },
+            .List => |l| return .{ .items = try snapshotItems(a, l.items) },
+            .Set => |s| return .{ .items = try snapshotItems(a, s.items) },
+            else => {},
+        }
+    }
+    return .{ .err = typeErr(try fmt(a, "{s} requires an array receiver", .{who})) };
+}
+
+pub fn coll_array_as_array_list(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const items = switch (try arrayRecvItems(a, ctx, "asArrayList")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeList(a, items, true));
+}
+
+pub fn coll_array_as_list(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const items = switch (try arrayRecvItems(a, ctx, "asList")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeList(a, items, false));
+}
+
+pub fn coll_empty_list(ctx: *CallCtx) Error!EvalResult {
+    return ok(try makeList(ctx.allocator, &.{}, false));
+}
+
+pub fn coll_set_of(ctx: *CallCtx) Error!EvalResult {
+    return ok(try makeSet(ctx.allocator, ctx.args, false));
+}
+pub fn coll_mutable_set_of(ctx: *CallCtx) Error!EvalResult {
+    return ok(try makeSet(ctx.allocator, ctx.args, true));
+}
+pub fn coll_empty_set(ctx: *CallCtx) Error!EvalResult {
+    return ok(try makeSet(ctx.allocator, &.{}, false));
+}
+
+fn mapOfImpl(ctx: *CallCtx, mutable: bool, who: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    var entries: std.ArrayList(MapPair) = .empty;
+    for (ctx.args) |v| {
+        if (v != .Pair) return typeErr(try fmt(a, "{s} expects Pair arguments (use `key to value` or `Pair(k, v)`)", .{who}));
+        try entries.append(a, .{ .key = v.Pair.first.*, .value = v.Pair.second.* });
+    }
+    return ok(try makeMapFromArrayList(a, try dedupeMapInPlace(a, entries), mutable));
+}
+
+/// Apply make_map dedupe semantics to an already-collected entry list.
+fn dedupeMapInPlace(a: Allocator, entries: std.ArrayList(MapPair)) Error!std.ArrayList(MapPair) {
+    var out: std.ArrayList(MapPair) = .empty;
+    for (entries.items) |kv| {
+        if (findKeyIndexBoxed(out.items, &kv.key)) |i| {
+            out.items[i].value = kv.value;
+        } else {
+            try out.append(a, kv);
+        }
+    }
+    return out;
+}
+
+pub fn coll_map_of(ctx: *CallCtx) Error!EvalResult {
+    return mapOfImpl(ctx, false, "mapOf");
+}
+pub fn coll_mutable_map_of(ctx: *CallCtx) Error!EvalResult {
+    return mapOfImpl(ctx, true, "mutableMapOf");
+}
+pub fn coll_empty_map(ctx: *CallCtx) Error!EvalResult {
+    return ok(try makeMap(ctx.allocator, &.{}, false));
+}
+
+/// Drain any iterable `value` into a fresh slice. Native List/Set copy
+/// directly; a user class is driven through iterator()/hasNext()/next().
+fn materialiseIterableInstance(ctx: *CallCtx, value: Value) Error!ItemsOutcome {
+    const a = ctx.allocator;
+    switch (value) {
+        .List => |l| return .{ .items = try snapshotItems(a, l.items) },
+        .Set => |s| return .{ .items = try snapshotItems(a, s.items) },
+        else => {},
+    }
+    const iter = (try ctx.host.invokeMethod(&value, "iterator", &.{}, ctx.out)) orelse
+        return .{ .err = typeErr("value is not iterable") };
+    const iter_v = switch (iter) {
+        .ok => |v| v,
+        .err => |e| return .{ .err = .{ .err = e } },
+    };
+    var items: std.ArrayList(Value) = .empty;
+    while (true) {
+        const has_r = (try ctx.host.invokeMethod(&iter_v, "hasNext", &.{}, ctx.out)) orelse
+            return .{ .err = typeErr("iterator is missing hasNext()") };
+        const has = switch (has_r) {
+            .ok => |v| v,
+            .err => |e| return .{ .err = .{ .err = e } },
+        };
+        if (!(has == .Bool and has.Bool)) break;
+        const item_r = (try ctx.host.invokeMethod(&iter_v, "next", &.{}, ctx.out)) orelse
+            return .{ .err = typeErr("iterator is missing next()") };
+        const item = switch (item_r) {
+            .ok => |v| v,
+            .err => |e| return .{ .err = .{ .err = e } },
+        };
+        try items.append(a, item);
+        if (items.items.len > 1_000_000) {
+            return .{ .err = typeErr("iterator produced over 1,000,000 items") };
+        }
+    }
+    return .{ .items = try items.toOwnedSlice(a) };
+}
+
+pub fn coll_to_typed_array(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("toTypedArray requires a receiver");
+    const recv = ctx.args[0];
+    const items = if (recv == .Instance)
+        switch (try materialiseIterableInstance(ctx, recv)) {
+            .items => |x| x,
+            .err => |e| return e,
+        }
+    else switch (try iterableItems(a, recv, "toTypedArray")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeArray(a, items, null));
+}
+
+pub fn coll_set_of_not_null(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    var items: std.ArrayList(Value) = .empty;
+    for (ctx.args) |v| {
+        if (v != .Null) try items.append(a, v);
+    }
+    return ok(try makeSet(a, items.items, false));
+}
+
+pub fn coll_sorted_set_of(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const items = try a.dupe(Value, ctx.args);
+    if (try sortValuesNatural(a, items)) |e| return e;
+    return ok(try makeSet(a, items, true));
+}
+
+pub fn coll_sorted_map_of(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    var entries: std.ArrayList(MapPair) = .empty;
+    for (ctx.args) |v| {
+        if (v != .Pair) return typeErr("sortedMapOf expects Pair arguments");
+        try entries.append(a, .{ .key = v.Pair.first.*, .value = v.Pair.second.* });
+    }
+    if (try sortMapByKey(a, entries.items, false)) |e| return e;
+    return ok(try makeMap(a, entries.items, true));
+}
+
+/// Insertion sort a map's entries by key (natural order, optional reverse).
+fn sortMapByKey(a: Allocator, entries: []MapPair, descending: bool) Error!?EvalResult {
+    var i: usize = 1;
+    while (i < entries.len) : (i += 1) {
+        var j = i;
+        while (j > 0) {
+            const o = switch (try compareValues(a, entries[j - 1].key, entries[j].key)) {
+                .order => |o| o,
+                .err => |e| return e,
+            };
+            const flipped = if (descending) reverseOrder(o) else o;
+            if (flipped == .gt) {
+                std.mem.swap(MapPair, &entries[j - 1], &entries[j]);
+                j -= 1;
+            } else break;
+        }
+    }
+    return null;
+}
+
+pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    switch (ctx.args.len) {
+        0 => return ok(try makeList(a, &.{}, true)),
+        1 => {
+            const arg = ctx.args[0];
+            switch (arg) {
+                .Int => return ok(try makeList(a, &.{}, true)),
+                .List => |l| return ok(try makeList(a, try snapshotItems(a, l.items), true)),
+                .Set => |s| return ok(try makeList(a, try snapshotItems(a, s.items), true)),
+                .Instance => {
+                    const items = switch (try materialiseIterableInstance(ctx, arg)) {
+                        .items => |x| x,
+                        .err => |e| return e,
+                    };
+                    return ok(try makeList(a, items, true));
+                },
+                else => return typeErr("ArrayList expects no args, an Int capacity, or a Collection"),
+            }
+        },
+        else => return arityErr("ArrayList expects 0 or 1 args"),
+    }
+}
+
+pub fn coll_hash_map_ctor(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or (ctx.args.len == 1 and ctx.args[0] == .Int)) {
+        return ok(try makeMap(a, &.{}, true));
+    }
+    if (ctx.args.len == 1 and ctx.args[0] == .Map) {
+        return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), true));
+    }
+    return typeErr("HashMap expects no args, an Int capacity, or a Map");
+}
+
+pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    switch (ctx.args.len) {
+        0 => return ok(try makeSet(a, &.{}, true)),
+        1 => {
+            const arg = ctx.args[0];
+            switch (arg) {
+                .Int => return ok(try makeSet(a, &.{}, true)),
+                .List => |l| return ok(try makeSet(a, try snapshotItems(a, l.items), true)),
+                .Set => |s| return ok(try makeSet(a, try snapshotItems(a, s.items), true)),
+                .Instance => {
+                    const items = switch (try materialiseIterableInstance(ctx, arg)) {
+                        .items => |x| x,
+                        .err => |e| return e,
+                    };
+                    return ok(try makeSet(a, items, true));
+                },
+                else => return typeErr("HashSet expects no args, an Int capacity, or a Collection"),
+            }
+        },
+        else => return arityErr("HashSet expects 0 or 1 args"),
+    }
+}
+
+// =====================================================================
+// List / MutableList
+// =====================================================================
+
+pub fn coll_list_size(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.size")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(Value.newInt(@intCast(listLen(it))));
+}
+pub fn coll_list_is_empty(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.isEmpty")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(.{ .Bool = listLen(it) == 0 });
+}
+pub fn coll_list_is_not_empty(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.isNotEmpty")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(.{ .Bool = listLen(it) != 0 });
+}
+pub fn coll_list_get(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.get")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2 or ctx.args[1] != .Int) return typeErr("List.get requires an Int index");
+    const i = ctx.args[1].Int;
+    const g = it.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    if (i < 0 or @as(usize, @intCast(i)) >= items.len) {
+        return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, items.len }));
+    }
+    return ok(items[@intCast(i)]);
+}
+pub fn coll_list_contains(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.contains")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("contains requires an argument");
+    const needle = ctx.args[1];
+    const g = it.borrow();
+    defer g.deinit();
+    return ok(.{ .Bool = containsBoxed(g.get().items, &needle) });
+}
+pub fn coll_list_index_of(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.indexOf")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("indexOf requires an argument");
+    const needle = ctx.args[1];
+    const g = it.borrow();
+    defer g.deinit();
+    const pos = indexOfBoxed(g.get().items, &needle);
+    return ok(Value.newInt(if (pos) |p| @intCast(p) else -1));
+}
+pub fn coll_iter_index_of_first(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const items = switch (try iterableItems(a, ctx.args[0], "indexOfFirst")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("indexOfFirst requires a block");
+    const block = ctx.args[1];
+    for (items, 0..) |v, i| {
+        const r = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+        if (r == .Bool and r.Bool) return ok(Value.newInt(@intCast(i)));
+    }
+    return ok(Value.newInt(-1));
+}
+pub fn coll_iter_index_of_last(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const items = switch (try iterableItems(a, ctx.args[0], "indexOfLast")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("indexOfLast requires a block");
+    const block = ctx.args[1];
+    var found: i64 = -1;
+    for (items, 0..) |v, i| {
+        const r = switch (try invoke(ctx, &block, &.{v})) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+        if (r == .Bool and r.Bool) found = @intCast(i);
+    }
+    return ok(Value.newInt(found));
+}
+pub fn coll_list_fold_right(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const items = switch (try iterableItems(a, ctx.args[0], "foldRight")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("foldRight requires an initial value");
+    var acc = ctx.args[1];
+    if (ctx.args.len < 3) return arityErr("foldRight requires a block");
+    const block = ctx.args[2];
+    var i = items.len;
+    while (i > 0) {
+        i -= 1;
+        acc = switch (try invoke(ctx, &block, &.{ items[i], acc })) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+    }
+    return ok(acc);
+}
+fn reduceRightImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
+    const a = ctx.allocator;
+    const items = switch (try iterableItems(a, ctx.args[0], "reduceRight")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("reduceRight requires a block");
+    const block = ctx.args[1];
+    if (items.len == 0) {
+        if (or_null) return ok(Value.Null);
+        return try thrown(a, "kotlin.UnsupportedOperationException", "Empty collection can't be reduced.");
+    }
+    var acc = items[items.len - 1];
+    var i = items.len - 1;
+    while (i > 0) {
+        i -= 1;
+        acc = switch (try invoke(ctx, &block, &.{ items[i], acc })) {
+            .value => |x| x,
+            .err => |e| return e,
+        };
+    }
+    return ok(acc);
+}
+pub fn coll_list_reduce_right(ctx: *CallCtx) Error!EvalResult {
+    return reduceRightImpl(ctx, false);
+}
+pub fn coll_list_reduce_right_or_null(ctx: *CallCtx) Error!EvalResult {
+    return reduceRightImpl(ctx, true);
+}
+fn listLastImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
+    const a = ctx.allocator;
+    const items = switch (try iterableItems(a, ctx.args[0], "last")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len >= 2) {
+        const block = ctx.args[1];
+        var i = items.len;
+        while (i > 0) {
+            i -= 1;
+            const r = switch (try invoke(ctx, &block, &.{items[i]})) {
+                .value => |x| x,
+                .err => |e| return e,
+            };
+            if (r == .Bool and r.Bool) return ok(items[i]);
+        }
+        if (or_null) return ok(Value.Null);
+        return try thrown(a, "kotlin.NoSuchElementException", "Collection contains no element matching the predicate.");
+    }
+    if (items.len > 0) return ok(items[items.len - 1]);
+    if (or_null) return ok(Value.Null);
+    return try thrown(a, "kotlin.NoSuchElementException", "Collection is empty.");
+}
+pub fn coll_list_last(ctx: *CallCtx) Error!EvalResult {
+    return listLastImpl(ctx, false);
+}
+pub fn coll_list_last_or_null(ctx: *CallCtx) Error!EvalResult {
+    return listLastImpl(ctx, true);
+}
+pub fn coll_list_last_index_of(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.lastIndexOf")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("lastIndexOf requires an argument");
+    const needle = ctx.args[1];
+    const g = it.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    var i = items.len;
+    while (i > 0) {
+        i -= 1;
+        if (eqBoxed(&items[i], &needle)) return ok(Value.newInt(@intCast(i)));
+    }
+    return ok(Value.newInt(-1));
+}
+
+fn joinOptStr(a: Allocator, args: []const Value, idx: usize, default: []const u8) Error![]const u8 {
+    if (idx >= args.len) return default;
+    return switch (args[idx]) {
+        .Null => default,
+        .String => |s| blk: {
+            const g = s.borrow();
+            defer g.deinit();
+            break :blk g.get().*;
+        },
+        else => |other| try display(a, other),
+    };
+}
+
+fn joinToStringImpl(ctx: *CallCtx, items: []const Value, allow_instance_to_string: bool) Error!EvalResult {
+    const a = ctx.allocator;
+    var effective = ctx.args[1..];
+    var transform_slot: ?Value = null;
+    if (effective.len > 0) {
+        const last = effective[effective.len - 1];
+        if (isTransformCallable(last)) {
+            transform_slot = last;
+            effective = effective[0 .. effective.len - 1];
+        }
+    }
+    const sep = try joinOptStr(a, effective, 0, ", ");
+    const prefix = try joinOptStr(a, effective, 1, "");
+    const postfix = try joinOptStr(a, effective, 2, "");
+    const limit: i64 = if (effective.len <= 3 or effective[3] == .Null)
+        -1
+    else
+        (effective[3].asI64() orelse -1);
+    const truncated = try joinOptStr(a, effective, 4, "...");
+    const n = items.len;
+    const take: usize = if (limit < 0) n else @min(@as(usize, @intCast(limit)), n);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, prefix);
+    var i: usize = 0;
+    while (i < take) : (i += 1) {
+        const v = items[i];
+        if (i > 0) try out.appendSlice(a, sep);
+        const piece: []const u8 = if (transform_slot) |t| blk: {
+            const r = switch (try invoke(ctx, &t, &.{v})) {
+                .value => |x| x,
+                .err => |e| return e,
+            };
+            break :blk switch (r) {
+                .String => |s| sblk: {
+                    const g = s.borrow();
+                    defer g.deinit();
+                    break :sblk try a.dupe(u8, g.get().*);
+                },
+                else => try display(a, r),
+            };
+        } else if (allow_instance_to_string and v == .Instance) blk: {
+            const m = try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out);
+            if (m) |mr| {
+                if (mr == .ok and mr.ok == .String) {
+                    const g = mr.ok.String.borrow();
+                    defer g.deinit();
+                    break :blk try a.dupe(u8, g.get().*);
+                }
+            }
+            break :blk try display(a, v);
+        } else try display(a, v);
+        try out.appendSlice(a, piece);
+    }
+    if (limit >= 0 and n > take) {
+        if (take > 0) try out.appendSlice(a, sep);
+        try out.appendSlice(a, truncated);
+    }
+    try out.appendSlice(a, postfix);
+    return ok(try makeStringOwned(a, try out.toOwnedSlice(a)));
+}
+
+pub fn coll_list_join_to_string(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return arityErr("joinToString expects an iterable receiver");
+    const items = switch (try iterableItems(a, ctx.args[0], "joinToString")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return joinToStringImpl(ctx, items, true);
+}
+
+pub fn coll_array_join_to_string(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("Array.joinToString requires a receiver");
+    const items = switch (try iterableItems(a, ctx.args[0], "Array.joinToString")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return joinToStringImpl(ctx, items, false);
+}
+
+fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
+    return ok(try makeStringOwned(a, try display(a, ctx.args[0])));
+}
+pub fn coll_list_to_string(ctx: *CallCtx) Error!EvalResult {
+    return collToString(ctx, "List.toString");
+}
+
+pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.add")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const user = ctx.args.len - 1;
+    if (user == 1) {
+        const g = it.borrowMut();
+        defer g.deinit();
+        try g.get().append(a, ctx.args[1]);
+        return ok(.{ .Bool = true });
+    }
+    if (user >= 2) {
+        if (ctx.args[1] != .Int) return typeErr("add(index, item) requires an Int index");
+        const i = ctx.args[1].Int;
+        const item = ctx.args[2];
+        const g = it.borrowMut();
+        defer g.deinit();
+        const len = g.get().items.len;
+        if (i < 0 or @as(usize, @intCast(i)) > len) {
+            return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len }));
+        }
+        try g.get().insert(a, @intCast(i), item);
+        return ok(Value.Unit);
+    }
+    return arityErr("add requires an argument");
+}
+pub fn coll_mut_list_add_first(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.addFirst")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("addFirst requires an argument");
+    const g = it.borrowMut();
+    defer g.deinit();
+    try g.get().insert(a, 0, ctx.args[1]);
+    return ok(Value.Unit);
+}
+pub fn coll_mut_list_remove_first(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.removeFirst")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const g = it.borrowMut();
+    defer g.deinit();
+    if (g.get().items.len == 0) {
+        return try thrown(a, "kotlin.NoSuchElementException", "ArrayDeque is empty.");
+    }
+    return ok(g.get().orderedRemove(0));
+}
+pub fn coll_mut_list_remove_last(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.removeLast")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const g = it.borrowMut();
+    defer g.deinit();
+    if (g.get().pop()) |v| return ok(v);
+    return try thrown(a, "kotlin.NoSuchElementException", "ArrayDeque is empty.");
+}
+pub fn coll_mut_list_remove_at(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.removeAt")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2 or ctx.args[1] != .Int) return typeErr("removeAt requires an Int index");
+    const i = ctx.args[1].Int;
+    const g = it.borrowMut();
+    defer g.deinit();
+    const len = g.get().items.len;
+    if (i < 0 or @as(usize, @intCast(i)) >= len) {
+        return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len }));
+    }
+    return ok(g.get().orderedRemove(@intCast(i)));
+}
+pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.clear")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    {
+        const g = it.borrowMut();
+        defer g.deinit();
+        g.get().clearRetainingCapacity();
+    }
+    syncMapView(a, ctx.args[0]);
+    return ok(Value.Unit);
+}
+pub fn coll_array_list_capacity_noop(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    return ok(Value.Unit);
+}
+
+// =====================================================================
+// Map-view sync (keys/values/entries live views)
+// =====================================================================
+
+const MapViewRef = struct { items: ValueList, backing: *MapBacking };
+
+/// After a live `MutableMap.keys`/`.values`/`.entries` view mutated its
+/// `items`, rebuild the backing map's entries to mirror the survivors.
+/// Order-preserving subsequence match.
+fn syncMapView(a: Allocator, receiver: Value) void {
+    _ = a;
+    const view: MapViewRef = switch (receiver) {
+        .Set => |s| if (s.backing) |b| .{ .items = s.items, .backing = b } else return,
+        .List => |l| if (l.backing) |b| .{ .items = l.items, .backing = b } else return,
+        else => return,
+    };
+    const items_g = view.items.borrow();
+    defer items_g.deinit();
+    const items = items_g.get().items;
+    const kind = view.backing.kind;
+    const entries_g = view.backing.entries.borrowMut();
+    defer entries_g.deinit();
+    const entries = entries_g.get();
+    var j: usize = 0;
+    var w: usize = 0;
+    var r: usize = 0;
+    while (r < entries.items.len) : (r += 1) {
+        const kv = entries.items[r];
+        const proj = switch (kind) {
+            .Values => kv.value,
+            else => kv.key,
+        };
+        var matched = false;
+        if (j < items.len) {
+            const it = items[j];
+            const target = switch (kind) {
+                .Entries => if (it == .MapEntry) it.MapEntry.key.* else it,
+                else => it,
+            };
+            matched = eqBoxed(&proj, &target);
+        }
+        if (matched) {
+            entries.items[w] = kv;
+            w += 1;
+            j += 1;
+        }
+    }
+    entries.shrinkRetainingCapacity(w);
+}
+
+// =====================================================================
+// Companion constants & public comparison/sequence helpers
+// =====================================================================
+
+/// Result of the public natural-order comparison: an ordering or a
+/// `RuntimeError` (as data).
+pub const OrderResult = union(enum) { order: Order, err: RuntimeError };
+
+/// Natural-order comparison exposed to the interpreter's higher-order
+/// ops. Returns an ordering or a `RuntimeError` as data.
+pub fn compareValuesPublic(a: Allocator, x: Value, y: Value) Error!OrderResult {
+    return switch (try compareValues(a, x, y)) {
+        .order => |o| .{ .order = o },
+        .err => |e| .{ .err = e.err },
+    };
+}
+
+/// `primitive_companion_const(ty, name)` — companion constants for the
+/// built-in numeric/char primitive types.
+pub fn primitive_companion_const(ty: []const u8, name: []const u8) ?Value {
+    const T = struct {
+        fn eq(x: []const u8, y: []const u8) bool {
+            return std.mem.eql(u8, x, y);
+        }
+    };
+    if (T.eq(ty, "Int")) {
+        if (T.eq(name, "MAX_VALUE")) return Value.newInt(@as(i64, std.math.maxInt(i32)));
+        if (T.eq(name, "MIN_VALUE")) return Value.newInt(@as(i64, std.math.minInt(i32)));
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(32);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(4);
+    } else if (T.eq(ty, "Long")) {
+        if (T.eq(name, "MAX_VALUE")) return .{ .Long = std.math.maxInt(i64) };
+        if (T.eq(name, "MIN_VALUE")) return .{ .Long = std.math.minInt(i64) };
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(64);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(8);
+    } else if (T.eq(ty, "Short")) {
+        if (T.eq(name, "MAX_VALUE")) return .{ .Short = std.math.maxInt(i16) };
+        if (T.eq(name, "MIN_VALUE")) return .{ .Short = std.math.minInt(i16) };
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(16);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(2);
+    } else if (T.eq(ty, "Byte")) {
+        if (T.eq(name, "MAX_VALUE")) return .{ .Byte = std.math.maxInt(i8) };
+        if (T.eq(name, "MIN_VALUE")) return .{ .Byte = std.math.minInt(i8) };
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(8);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(1);
+    } else if (T.eq(ty, "Double")) {
+        if (T.eq(name, "MAX_VALUE")) return .{ .Double = std.math.floatMax(f64) };
+        if (T.eq(name, "MIN_VALUE")) return .{ .Double = std.math.floatMin(f64) };
+        if (T.eq(name, "POSITIVE_INFINITY")) return .{ .Double = std.math.inf(f64) };
+        if (T.eq(name, "NEGATIVE_INFINITY")) return .{ .Double = -std.math.inf(f64) };
+        if (T.eq(name, "NaN")) return .{ .Double = std.math.nan(f64) };
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(64);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(8);
+    } else if (T.eq(ty, "Float")) {
+        if (T.eq(name, "MAX_VALUE")) return .{ .Float = std.math.floatMax(f32) };
+        if (T.eq(name, "MIN_VALUE")) return .{ .Float = std.math.floatMin(f32) };
+        if (T.eq(name, "POSITIVE_INFINITY")) return .{ .Float = std.math.inf(f32) };
+        if (T.eq(name, "NEGATIVE_INFINITY")) return .{ .Float = -std.math.inf(f32) };
+        if (T.eq(name, "NaN")) return .{ .Float = std.math.nan(f32) };
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(32);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(4);
+    } else if (T.eq(ty, "Char")) {
+        if (T.eq(name, "MAX_VALUE")) return .{ .Char = 0xFFFF };
+        if (T.eq(name, "MIN_VALUE")) return .{ .Char = 0 };
+        if (T.eq(name, "SIZE_BITS")) return Value.newInt(16);
+        if (T.eq(name, "SIZE_BYTES")) return Value.newInt(2);
+    }
+    return null;
+}
+
+// =====================================================================
+// Sequence materialisation
+// =====================================================================
+
+const SeqOutcome = union(enum) { items: []Value, err: RuntimeError };
+
+fn seqCall(host: IntrinsicHost, f: *const Value, args: []const Value, out: Output) Error!union(enum) { value: Value, err: RuntimeError } {
+    const r = try host.invokeCallable(f, args, out);
+    return switch (r) {
+        .ok => |v| .{ .value = v },
+        .err => |e| .{ .err = e },
+    };
+}
+
+pub fn materialiseSequence(a: Allocator, host: IntrinsicHost, out: Output, seq_val: Value) Error!SeqOutcome {
+    return materialiseSequenceBounded(a, host, out, seq_val, null);
+}
+
+pub fn materialiseSequenceBounded(a: Allocator, host: IntrinsicHost, out: Output, seq_val: Value, max: ?usize) Error!SeqOutcome {
+    if (seq_val != .Sequence) {
+        return .{ .err = .{ .Type = "materialise_sequence: not a Sequence" } };
+    }
+    const seq_g = seq_val.Sequence.borrow();
+    defer seq_g.deinit();
+    const seq = seq_g.get().*;
+
+    var all_streaming = true;
+    for (seq.ops) |op| {
+        switch (op) {
+            .Map, .Filter, .FilterNot, .Take, .Drop, .TakeWhile, .DropWhile, .OnEach, .MapIndexed, .FilterIndexed => {},
+            else => {
+                all_streaming = false;
+                break;
+            },
+        }
+    }
+
+    if (all_streaming) {
+        return streamSequence(a, host, out, seq, max);
+    }
+    return bufferSequence(a, host, out, seq);
+}
+
+const PumpState = struct {
+    taken: []usize,
+    dropped: []usize,
+    take_while_live: []bool,
+    drop_while_live: []bool,
+    indices: []usize,
+};
+
+/// Returns true to keep pulling source items, false when a Take cap was
+/// reached (pipeline exhausted). On a callback error returns the error.
+fn pumpItem(
+    a: Allocator,
+    host: IntrinsicHost,
+    out: Output,
+    start_value: Value,
+    ops: []const SeqOp,
+    st: *PumpState,
+    output: *std.ArrayList(Value),
+) Error!union(enum) { cont: bool, err: RuntimeError } {
+    var current = start_value;
+    for (ops, 0..) |op, idx| {
+        switch (op) {
+            .Map => |f| {
+                current = switch (try seqCall(host, &f, &.{current}, out)) {
+                    .value => |v| v,
+                    .err => |e| return .{ .err = e },
+                };
+            },
+            .OnEach => |f| {
+                switch (try seqCall(host, &f, &.{current}, out)) {
+                    .value => {},
+                    .err => |e| return .{ .err = e },
+                }
+            },
+            .MapIndexed => |f| {
+                const i = st.indices[idx];
+                st.indices[idx] += 1;
+                current = switch (try seqCall(host, &f, &.{ Value.newInt(@intCast(i)), current }, out)) {
+                    .value => |v| v,
+                    .err => |e| return .{ .err = e },
+                };
+            },
+            .FilterIndexed => |f| {
+                const i = st.indices[idx];
+                st.indices[idx] += 1;
+                const r = switch (try seqCall(host, &f, &.{ Value.newInt(@intCast(i)), current }, out)) {
+                    .value => |v| v,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!(r == .Bool and r.Bool)) return .{ .cont = true };
+            },
+            .Filter => |f| {
+                const r = switch (try seqCall(host, &f, &.{current}, out)) {
+                    .value => |v| v,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!(r == .Bool and r.Bool)) return .{ .cont = true };
+            },
+            .FilterNot => |f| {
+                const r = switch (try seqCall(host, &f, &.{current}, out)) {
+                    .value => |v| v,
+                    .err => |e| return .{ .err = e },
+                };
+                if (r == .Bool and r.Bool) return .{ .cont = true };
+            },
+            .Take => |n| {
+                if (st.taken[idx] >= @as(usize, @intCast(n))) return .{ .cont = false };
+                st.taken[idx] += 1;
+            },
+            .Drop => |n| {
+                if (st.dropped[idx] < @as(usize, @intCast(n))) {
+                    st.dropped[idx] += 1;
+                    return .{ .cont = true };
+                }
+            },
+            .TakeWhile => |f| {
+                if (!st.take_while_live[idx]) return .{ .cont = false };
+                const r = switch (try seqCall(host, &f, &.{current}, out)) {
+                    .value => |v| v,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!(r == .Bool and r.Bool)) {
+                    st.take_while_live[idx] = false;
+                    return .{ .cont = false };
+                }
+            },
+            .DropWhile => |f| {
+                if (st.drop_while_live[idx]) {
+                    const r = switch (try seqCall(host, &f, &.{current}, out)) {
+                        .value => |v| v,
+                        .err => |e| return .{ .err = e },
+                    };
+                    if (r == .Bool and r.Bool) return .{ .cont = true };
+                    st.drop_while_live[idx] = false;
+                }
+            },
+            else => unreachable,
+        }
+    }
+    try output.append(a, current);
+    return .{ .cont = true };
+}
+
+fn takeCapReached(ops: []const SeqOp, taken: []const usize) bool {
+    for (ops, 0..) |op, i| {
+        if (op == .Take and taken[i] >= @as(usize, @intCast(op.Take))) return true;
+    }
+    return false;
+}
+
+fn streamSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.SequenceData, max: ?usize) Error!SeqOutcome {
+    const n_ops = seq.ops.len;
+    var st = PumpState{
+        .taken = try a.alloc(usize, n_ops),
+        .dropped = try a.alloc(usize, n_ops),
+        .take_while_live = try a.alloc(bool, n_ops),
+        .drop_while_live = try a.alloc(bool, n_ops),
+        .indices = try a.alloc(usize, n_ops),
+    };
+    @memset(st.taken, 0);
+    @memset(st.dropped, 0);
+    @memset(st.take_while_live, true);
+    @memset(st.drop_while_live, true);
+    @memset(st.indices, 0);
+    var output: std.ArrayList(Value) = .empty;
+
+    switch (seq.source) {
+        .Items => |v| {
+            const g = v.borrow();
+            defer g.deinit();
+            for (g.get().*) |item| {
+                if (takeCapReached(seq.ops, st.taken)) break;
+                const res = try pumpItem(a, host, out, item, seq.ops, &st, &output);
+                switch (res) {
+                    .cont => |c| if (!c) break,
+                    .err => |e| return .{ .err = e },
+                }
+                if (max) |m| {
+                    if (output.items.len >= m) break;
+                }
+            }
+        },
+        .Generate => |gen| {
+            var cur: ?Value = if (gen.seed) |s| s.* else null;
+            const limit: usize = 1_000_000;
+            var produced: usize = 0;
+            while (true) {
+                if (takeCapReached(seq.ops, st.taken)) break;
+                const candidate = if (cur) |v| v else blk: {
+                    const r = switch (try seqCall(host, gen.next, &.{}, out)) {
+                        .value => |v| v,
+                        .err => |e| return .{ .err = e },
+                    };
+                    if (r == .Null) break;
+                    break :blk r;
+                };
+                produced += 1;
+                if (produced > limit) {
+                    return .{ .err = .{ .Type = "Sequence: generator exceeded 1,000,000 items" } };
+                }
+                const res = try pumpItem(a, host, out, candidate, seq.ops, &st, &output);
+                switch (res) {
+                    .cont => |c| if (!c) break,
+                    .err => |e| return .{ .err = e },
+                }
+                if (max) |m| {
+                    if (output.items.len >= m) break;
+                }
+                const nxt = switch (try seqCall(host, gen.next, &.{candidate}, out)) {
+                    .value => |v| v,
+                    .err => |e| return .{ .err = e },
+                };
+                if (nxt == .Null) break;
+                cur = nxt;
+            }
+        },
+    }
+    return .{ .items = try output.toOwnedSlice(a) };
+}
+
+fn bufferSequence(a: Allocator, host: IntrinsicHost, out: Output, seq: runtime.SequenceData) Error!SeqOutcome {
+    var items: std.ArrayList(Value) = .empty;
+    switch (seq.source) {
+        .Items => |v| {
+            const g = v.borrow();
+            defer g.deinit();
+            try items.appendSlice(a, g.get().*);
+        },
+        .Generate => |gen| {
+            const limit: usize = 1024;
+            var cur: ?Value = if (gen.seed) |s| s.* else null;
+            while (items.items.len < limit) {
+                const candidate = if (cur) |v| v else blk: {
+                    const r = switch (try seqCall(host, gen.next, &.{}, out)) {
+                        .value => |v| v,
+                        .err => |e| return .{ .err = e },
+                    };
+                    if (r == .Null) break;
+                    break :blk r;
+                };
+                try items.append(a, candidate);
+                const nxt = switch (try seqCall(host, gen.next, &.{candidate}, out)) {
+                    .value => |v| v,
+                    .err => |e| return .{ .err = e },
+                };
+                if (nxt == .Null) break;
+                cur = nxt;
+            }
+        },
+    }
+    var cur_items = try items.toOwnedSlice(a);
+    for (seq.ops) |op| {
+        cur_items = switch (try applySeqOp(a, host, out, op, cur_items)) {
+            .items => |xs| xs,
+            .err => |e| return .{ .err = e },
+        };
+    }
+    return .{ .items = cur_items };
+}
+
+fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: []Value) Error!SeqOutcome {
+    switch (op) {
+        .Map => |f| {
+            var nx = try a.alloc(Value, items.len);
+            for (items, 0..) |v, i| {
+                nx[i] = switch (try seqCall(host, &f, &.{v}, out)) {
+                    .value => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+            }
+            return .{ .items = nx };
+        },
+        .OnEach => |f| {
+            for (items) |v| {
+                switch (try seqCall(host, &f, &.{v}, out)) {
+                    .value => {},
+                    .err => |e| return .{ .err = e },
+                }
+            }
+            return .{ .items = items };
+        },
+        .MapIndexed => |f| {
+            var nx = try a.alloc(Value, items.len);
+            for (items, 0..) |v, i| {
+                nx[i] = switch (try seqCall(host, &f, &.{ Value.newInt(@intCast(i)), v }, out)) {
+                    .value => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+            }
+            return .{ .items = nx };
+        },
+        .FilterIndexed => |f| {
+            var nx: std.ArrayList(Value) = .empty;
+            for (items, 0..) |v, i| {
+                const r = switch (try seqCall(host, &f, &.{ Value.newInt(@intCast(i)), v }, out)) {
+                    .value => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+                if (r == .Bool and r.Bool) try nx.append(a, v);
+            }
+            return .{ .items = try nx.toOwnedSlice(a) };
+        },
+        .Filter => |f| {
+            var nx: std.ArrayList(Value) = .empty;
+            for (items) |v| {
+                const r = switch (try seqCall(host, &f, &.{v}, out)) {
+                    .value => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+                if (r == .Bool and r.Bool) try nx.append(a, v);
+            }
+            return .{ .items = try nx.toOwnedSlice(a) };
+        },
+        .FilterNot => |f| {
+            var nx: std.ArrayList(Value) = .empty;
+            for (items) |v| {
+                const r = switch (try seqCall(host, &f, &.{v}, out)) {
+                    .value => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!(r == .Bool and r.Bool)) try nx.append(a, v);
+            }
+            return .{ .items = try nx.toOwnedSlice(a) };
+        },
+        .Take => |n| {
+            const k: usize = @intCast(n);
+            return .{ .items = if (k < items.len) items[0..k] else items };
+        },
+        .Drop => |n| {
+            const k: usize = @min(@as(usize, @intCast(n)), items.len);
+            return .{ .items = items[k..] };
+        },
+        .TakeWhile => |f| {
+            var cutoff: usize = items.len;
+            for (items, 0..) |v, i| {
+                const r = switch (try seqCall(host, &f, &.{v}, out)) {
+                    .value => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!(r == .Bool and r.Bool)) {
+                    cutoff = i;
+                    break;
+                }
+            }
+            return .{ .items = items[0..cutoff] };
+        },
+        .DropWhile => |f| {
+            var start: usize = 0;
+            while (start < items.len) {
+                const r = switch (try seqCall(host, &f, &.{items[start]}, out)) {
+                    .value => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!(r == .Bool and r.Bool)) break;
+                start += 1;
+            }
+            return .{ .items = items[start..] };
+        },
+        .FlatMap => |f| {
+            var nx: std.ArrayList(Value) = .empty;
+            for (items) |v| {
+                const mapped = switch (try seqCall(host, &f, &.{v}, out)) {
+                    .value => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+                switch (mapped) {
+                    .List => |xs| try nx.appendSlice(a, try snapshotItems(a, xs.items)),
+                    .Set => |xs| try nx.appendSlice(a, try snapshotItems(a, xs.items)),
+                    .Sequence => {
+                        const sub = switch (try materialiseSequence(a, host, out, mapped)) {
+                            .items => |xs| xs,
+                            .err => |e| return .{ .err = e },
+                        };
+                        try nx.appendSlice(a, sub);
+                    },
+                    else => try nx.append(a, mapped),
+                }
+            }
+            return .{ .items = try nx.toOwnedSlice(a) };
+        },
+        .Distinct => {
+            var seen: std.ArrayList(Value) = .empty;
+            var nx: std.ArrayList(Value) = .empty;
+            for (items) |v| {
+                if (!containsBoxed(seen.items, &v)) {
+                    try seen.append(a, v);
+                    try nx.append(a, v);
+                }
+            }
+            return .{ .items = try nx.toOwnedSlice(a) };
+        },
+        .DistinctBy => |f| {
+            var seen: std.ArrayList(Value) = .empty;
+            var nx: std.ArrayList(Value) = .empty;
+            for (items) |v| {
+                const key = switch (try seqCall(host, &f, &.{v}, out)) {
+                    .value => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+                if (!containsBoxed(seen.items, &key)) {
+                    try seen.append(a, key);
+                    try nx.append(a, v);
+                }
+            }
+            return .{ .items = try nx.toOwnedSlice(a) };
+        },
+        .Sorted => |descending| {
+            if (try sortValuesNaturalDescErr(a, items, descending)) |e| return .{ .err = e };
+            return .{ .items = items };
+        },
+        .SortedBy => |sb| {
+            const keyed = try a.alloc(Value, items.len);
+            for (items, 0..) |v, i| {
+                keyed[i] = switch (try seqCall(host, &sb.selector, &.{v}, out)) {
+                    .value => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+            }
+            // Insertion sort keyed pairs, moving items in lockstep.
+            var i: usize = 1;
+            while (i < items.len) : (i += 1) {
+                var j = i;
+                while (j > 0) {
+                    const o = switch (try compareValues(a, keyed[j - 1], keyed[j])) {
+                        .order => |o| o,
+                        .err => |e| return .{ .err = e.err },
+                    };
+                    const flipped = if (sb.descending) reverseOrder(o) else o;
+                    if (flipped == .gt) {
+                        std.mem.swap(Value, &items[j - 1], &items[j]);
+                        std.mem.swap(Value, &keyed[j - 1], &keyed[j]);
+                        j -= 1;
+                    } else break;
+                }
+            }
+            return .{ .items = items };
+        },
+        .SortedWith => |comparator| {
+            var i: usize = 1;
+            while (i < items.len) : (i += 1) {
+                var j = i;
+                while (j > 0) {
+                    const m = try host.invokeMethod(&comparator, "compare", &.{ items[j - 1], items[j] }, out);
+                    const ord_val = if (m) |mr| switch (mr) {
+                        .ok => |v| v,
+                        .err => |e| return .{ .err = e },
+                    } else return .{ .err = .{ .Type = "SortedWith: comparator has no `compare` method" } };
+                    const n = ord_val.asI64() orelse 0;
+                    if (n > 0) {
+                        std.mem.swap(Value, &items[j - 1], &items[j]);
+                        j -= 1;
+                    } else break;
+                }
+            }
+            return .{ .items = items };
+        },
+    }
+}
+
+fn sortValuesNaturalDescErr(a: Allocator, items: []Value, descending: bool) Error!?RuntimeError {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        var j = i;
+        while (j > 0) {
+            const o = switch (try compareValues(a, items[j - 1], items[j])) {
+                .order => |o| o,
+                .err => |e| return e.err,
+            };
+            const flipped = if (descending) reverseOrder(o) else o;
+            if (flipped == .gt) {
+                std.mem.swap(Value, &items[j - 1], &items[j]);
+                j -= 1;
+            } else break;
+        }
+    }
+    return null;
+}
+
+// =====================================================================
+// List sorting / transforms
+// =====================================================================
+
+/// host-aware comparison: defers to a user `compareTo` for Instance items.
+fn compareHostAware(ctx: *CallCtx, x: Value, y: Value) Error!CompareOutcome {
+    if (x == .Instance) {
+        if (try ctx.host.invokeMethod(&x, "compareTo", &.{y}, ctx.out)) |m| {
+            if (m == .ok and m.ok == .Int) return .{ .order = i32ToOrdering(m.ok.Int) };
+        }
+    }
+    return compareValues(ctx.allocator, x, y);
+}
+
+/// Sort with optional host-aware compareTo for Instance items. Stable.
+fn sortListHostAware(ctx: *CallCtx, items: []Value) Error!?EvalResult {
+    const a = ctx.allocator;
+    var needs_host = false;
+    for (items) |v| {
+        if (v == .Instance) {
+            needs_host = true;
+            break;
+        }
+    }
+    if (!needs_host) return sortValuesNatural(a, items);
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        var j = i;
+        while (j > 0) {
+            const o = switch (try compareHostAware(ctx, items[j - 1], items[j])) {
+                .order => |o| o,
+                .err => |e| return e,
+            };
+            if (o == .gt) {
+                std.mem.swap(Value, &items[j - 1], &items[j]);
+                j -= 1;
+            } else break;
+        }
+    }
+    return null;
+}
+
+pub fn coll_list_sorted(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.sorted")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const copy = try snapshotItems(a, it);
+    if (try sortListHostAware(ctx, copy)) |e| return e;
+    return ok(try makeList(a, copy, false));
+}
+
+pub fn coll_list_sorted_descending(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const v = try coll_list_sorted(ctx);
+    if (v == .err) return v;
+    const items = try snapshotItems(a, v.ok.List.items);
+    std.mem.reverse(Value, items);
+    return ok(try makeList(a, items, false));
+}
+
+pub fn coll_list_reversed(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.reversed")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const out = try snapshotItems(a, it);
+    std.mem.reverse(Value, out);
+    return ok(try makeList(a, out, false));
+}
+
+pub fn coll_list_indices(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.indices")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const len: i64 = @intCast(listLen(it));
+    return ok(.{ .Range = .{ .start = 0, .end = len - 1, .step = 1, .kind = .Int } });
+}
+
+pub fn coll_list_last_index(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.lastIndex")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(Value.newInt(@as(i64, @intCast(listLen(it))) - 1));
+}
+
+pub fn coll_list_sum(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.sum")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const g = it.borrow();
+    defer g.deinit();
+    var acc_int: ?i64 = 0;
+    var acc_dbl: ?f64 = null;
+    for (g.get().items) |v| {
+        if (v.isIntegral()) {
+            const n = v.asI64().?;
+            if (acc_int) |*aa| {
+                aa.* +%= n;
+            } else if (acc_dbl) |*aa| {
+                aa.* += @as(f64, @floatFromInt(n));
+            }
+        } else if (v.isFloating()) {
+            const d = v.asF64().?;
+            if (acc_int) |aa| {
+                acc_dbl = @as(f64, @floatFromInt(aa)) + d;
+                acc_int = null;
+            } else if (acc_dbl) |*aa| {
+                aa.* += d;
+            }
+        } else {
+            const vd = try display(a, v);
+            return typeErr(try fmt(a, "List.sum requires numeric elements, got {s}", .{vd}));
+        }
+    }
+    if (acc_dbl) |d| return ok(.{ .Double = d });
+    return ok(Value.newInt(acc_int orelse 0));
+}
+
+pub fn coll_list_average(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.average")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const g = it.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    if (items.len == 0) return ok(.{ .Double = std.math.nan(f64) });
+    var sum: f64 = 0.0;
+    var n: i64 = 0;
+    for (items) |v| {
+        sum += switch (v) {
+            .Int => |x| @floatFromInt(x),
+            .Double => |x| x,
+            else => {
+                const vd = try display(a, v);
+                return typeErr(try fmt(a, "List.average requires numeric elements, got {s}", .{vd}));
+            },
+        };
+        n += 1;
+    }
+    return ok(.{ .Double = sum / @as(f64, @floatFromInt(n)) });
+}
+
+pub fn coll_list_max_or_null(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.maxOrNull")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const items = try snapshotItems(a, it);
+    if (items.len == 0) return ok(Value.Null);
+    var best = items[0];
+    for (items[1..]) |v| {
+        const o = switch (try compareHostAware(ctx, v, best)) {
+            .order => |o| o,
+            .err => |e| return e,
+        };
+        if (o == .gt) best = v;
+    }
+    return ok(best);
+}
+
+pub fn coll_list_min_or_null(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.minOrNull")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const items = try snapshotItems(a, it);
+    if (items.len == 0) return ok(Value.Null);
+    var best = items[0];
+    for (items[1..]) |v| {
+        const o = switch (try compareHostAware(ctx, v, best)) {
+            .order => |o| o,
+            .err => |e| return e,
+        };
+        if (o == .lt) best = v;
+    }
+    return ok(best);
+}
+
+/// Collect (key, value) entries from a slice of Pair values; last write
+/// wins on duplicate keys.
+fn pairsFromValues(a: Allocator, items: []const Value, who: []const u8) Error!union(enum) { entries: std.ArrayList(MapPair), err: EvalResult } {
+    var entries: std.ArrayList(MapPair) = .empty;
+    for (items) |v| {
+        if (v != .Pair) return .{ .err = typeErr(try fmt(a, "{s} requires a collection of Pair<K, V>", .{who})) };
+        const key = v.Pair.first.*;
+        const val = v.Pair.second.*;
+        if (findKeyIndexBoxed(entries.items, &key)) |i| {
+            entries.items[i].value = val;
+        } else {
+            try entries.append(a, .{ .key = key, .value = val });
+        }
+    }
+    return .{ .entries = entries };
+}
+
+pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const items = if (ctx.args.len > 0 and ctx.args[0] == .Array)
+        try snapshotItems(a, ctx.args[0].Array.items)
+    else switch (try recvListItems(a, ctx.args, "toMap")) {
+        .items => |x| try snapshotItems(a, x),
+        .err => |e| return e,
+    };
+    const entries = switch (try pairsFromValues(a, items, "toMap")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeMap(a, entries.items, false));
+}
+
+pub fn coll_list_distinct(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.distinct")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const g = it.borrow();
+    defer g.deinit();
+    var out: std.ArrayList(Value) = .empty;
+    for (g.get().items) |v| {
+        if (!containsBoxed(out.items, &v)) try out.append(a, v);
+    }
+    return ok(try makeListFromArrayList(a, out, false));
+}
+
+fn listTakeCount(ctx: *CallCtx, what: []const u8) Error!union(enum) { n: i64, err: EvalResult } {
+    const a = ctx.allocator;
+    const n = if (ctx.args.len > 1) (ctx.args[1].asI64() orelse return .{ .err = typeErr(try fmt(a, "{s} requires an Int", .{what})) }) else return .{ .err = typeErr(try fmt(a, "{s} requires an Int", .{what})) };
+    if (n < 0) {
+        return .{ .err = try thrown(a, "kotlin.IllegalArgumentException", try fmt(a, "Requested element count {d} is less than zero.", .{n})) };
+    }
+    return .{ .n = n };
+}
+
+pub fn coll_list_take_last(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.takeLast")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const n: usize = @intCast(switch (try listTakeCount(ctx, "takeLast")) {
+        .n => |v| v,
+        .err => |e| return e,
+    });
+    const g = it.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    const start = items.len -| n;
+    return ok(try makeList(a, items[start..], false));
+}
+
+pub fn coll_list_drop_last(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.dropLast")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const n: usize = @intCast(switch (try listTakeCount(ctx, "dropLast")) {
+        .n => |v| v,
+        .err => |e| return e,
+    });
+    const g = it.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    const end = items.len -| n;
+    return ok(try makeList(a, items[0..end], false));
+}
+
+pub fn coll_list_slice(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.slice")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const g = it.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    const len: i64 = @intCast(items.len);
+    var out: std.ArrayList(Value) = .empty;
+    if (ctx.args.len > 1 and ctx.args[1] == .Range) {
+        const r = ctx.args[1].Range;
+        var rit = RangeIter.init(r.start, r.end, r.step);
+        while (rit.next()) |i| {
+            if (i < 0 or i >= len) {
+                return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len }));
+            }
+            try out.append(a, items[@intCast(i)]);
+        }
+    } else if (ctx.args.len > 1 and ctx.args[1] == .List) {
+        const idx_g = ctx.args[1].List.items.borrow();
+        defer idx_g.deinit();
+        for (idx_g.get().items) |idx_val| {
+            const i = idx_val.asI64() orelse return typeErr("slice indices must be Int");
+            if (i < 0 or i >= len) {
+                return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len }));
+            }
+            try out.append(a, items[@intCast(i)]);
+        }
+    } else {
+        return typeErr("slice requires an IntRange or List<Int>");
+    }
+    return ok(try makeListFromArrayList(a, out, false));
+}
+
+pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.subList")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const from = if (ctx.args.len > 1) (ctx.args[1].asI64() orelse return typeErr("subList requires Int fromIndex")) else return typeErr("subList requires Int fromIndex");
+    const to = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse return typeErr("subList requires Int toIndex")) else return typeErr("subList requires Int toIndex");
+    const g = it.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    const len: i64 = @intCast(items.len);
+    if (from < 0 or to > len or from > to) {
+        return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "fromIndex: {d}, toIndex: {d}, size: {d}", .{ from, to, len }));
+    }
+    return ok(try makeList(a, items[@intCast(from)..@intCast(to)], false));
+}
+
+pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.plus")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    var out: std.ArrayList(Value) = .empty;
+    try out.appendSlice(a, try snapshotItems(a, it));
+    if (ctx.args.len < 2) return arityErr("plus requires an argument");
+    const arg = ctx.args[1];
+    switch (arg) {
+        .List => |l| try out.appendSlice(a, try snapshotItems(a, l.items)),
+        .Set => |s| try out.appendSlice(a, try snapshotItems(a, s.items)),
+        .Range, .Sequence, .Array => {
+            const xs = switch (try iterableItems(a, arg, "plus")) {
+                .items => |x| x,
+                .err => |e| return e,
+            };
+            try out.appendSlice(a, xs);
+        },
+        else => try out.append(a, arg),
+    }
+    return ok(try makeListFromArrayList(a, out, false));
+}
+
+pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.minus")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("minus requires an argument");
+    const arg = ctx.args[1];
+    var removals: std.ArrayList(Value) = .empty;
+    switch (arg) {
+        .List => |l| try removals.appendSlice(a, try snapshotItems(a, l.items)),
+        .Set => |s| try removals.appendSlice(a, try snapshotItems(a, s.items)),
+        .Range, .Sequence, .Array => {
+            const xs = switch (try iterableItems(a, arg, "minus")) {
+                .items => |x| x,
+                .err => |e| return e,
+            };
+            try removals.appendSlice(a, xs);
+        },
+        else => try removals.append(a, arg),
+    }
+    var out: std.ArrayList(Value) = .empty;
+    const src = try snapshotItems(a, it);
+    for (src) |v| {
+        if (indexOfBoxed(removals.items, &v)) |pos| {
+            _ = removals.orderedRemove(pos);
+        } else {
+            try out.append(a, v);
+        }
+    }
+    return ok(try makeListFromArrayList(a, out, false));
+}
+
+pub fn coll_list_chunked(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.chunked")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2 or ctx.args[1] != .Int) return typeErr("chunked requires an Int size");
+    const size_i = ctx.args[1].Int;
+    if (size_i <= 0) {
+        return try thrown(a, "kotlin.IllegalArgumentException", try fmt(a, "Size {d} must be greater than zero.", .{size_i}));
+    }
+    const size: usize = @intCast(size_i);
+    const transform: ?Value = if (ctx.args.len > 2 and ctx.args[2] != .Null) ctx.args[2] else null;
+    const items = try snapshotItems(a, it);
+    var groups: std.ArrayList(Value) = .empty;
+    var i: usize = 0;
+    while (i < items.len) {
+        const end = @min(i + size, items.len);
+        const chunk = try makeList(a, items[i..end], false);
+        if (transform) |block| {
+            const r = switch (try invoke(ctx, &block, &.{chunk})) {
+                .value => |v| v,
+                .err => |e| return e,
+            };
+            try groups.append(a, r);
+        } else {
+            try groups.append(a, chunk);
+        }
+        i += size;
+    }
+    return ok(try makeListFromArrayList(a, groups, false));
+}
+
+pub fn coll_list_windowed(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.windowed")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2 or ctx.args[1] != .Int) return typeErr("windowed requires an Int size");
+    const size_i = ctx.args[1].Int;
+    if (size_i <= 0) {
+        return try thrown(a, "kotlin.IllegalArgumentException", try fmt(a, "size {d} must be greater than zero.", .{size_i}));
+    }
+    const step_i: i64 = if (ctx.args.len <= 2) 1 else (if (ctx.args[2].isIntegral()) ctx.args[2].asI64().? else return typeErr("windowed step must be Int"));
+    if (step_i <= 0) {
+        return try thrown(a, "kotlin.IllegalArgumentException", try fmt(a, "step {d} must be greater than zero.", .{step_i}));
+    }
+    const partial_windows: bool = if (ctx.args.len <= 3) false else (if (ctx.args[3] == .Bool) ctx.args[3].Bool else return typeErr("windowed partialWindows must be Bool"));
+    const items = try snapshotItems(a, it);
+    const size: usize = @intCast(size_i);
+    const step: usize = @intCast(step_i);
+    var out: std.ArrayList(Value) = .empty;
+    var i: usize = 0;
+    while (i < items.len) {
+        const end = i + size;
+        if (end <= items.len) {
+            try out.append(a, try makeList(a, items[i..end], false));
+        } else if (partial_windows) {
+            try out.append(a, try makeList(a, items[i..], false));
+        } else break;
+        i += step;
+    }
+    return ok(try makeListFromArrayList(a, out, false));
+}
+
+pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const lhs = switch (try recvListItems(a, ctx.args, "List.zip")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("zip requires a second collection");
+    const rhs_val = ctx.args[1];
+    const transform: ?Value = if (ctx.args.len > 2 and isZipTransform(ctx.args[2])) ctx.args[2] else null;
+    var rhs: std.ArrayList(Value) = .empty;
+    switch (rhs_val) {
+        .List => |l| try rhs.appendSlice(a, try snapshotItems(a, l.items)),
+        .Set => |s| try rhs.appendSlice(a, try snapshotItems(a, s.items)),
+        .Array => |arr| try rhs.appendSlice(a, try snapshotItems(a, arr.items)),
+        .Range => |r| {
+            var rit = RangeIter.init(r.start, r.end, r.step);
+            while (rit.next()) |n| try rhs.append(a, Value.newInt(n));
+        },
+        else => {
+            const rd = try display(a, rhs_val);
+            return typeErr(try fmt(a, "zip requires a collection, got {s}", .{rd}));
+        },
+    }
+    const lhs_items = try snapshotItems(a, lhs);
+    var result: std.ArrayList(Value) = .empty;
+    const n = @min(lhs_items.len, rhs.items.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (transform) |t| {
+            const r = switch (try invoke(ctx, &t, &.{ lhs_items[i], rhs.items[i] })) {
+                .value => |v| v,
+                .err => |e| return e,
+            };
+            try result.append(a, r);
+        } else {
+            try result.append(a, try makePair(a, lhs_items[i], rhs.items[i]));
+        }
+    }
+    return ok(try makeListFromArrayList(a, result, false));
+}
+
+fn isZipTransform(v: Value) bool {
+    return switch (v) {
+        .IrClosure, .Lambda, .BoundMethod, .Instance => true,
+        else => false,
+    };
+}
+
+// =====================================================================
+// Set ops
+// =====================================================================
+
+fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, what)) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    var out: std.ArrayList(Value) = .empty;
+    try out.appendSlice(a, try snapshotItems(a, it));
+    if (ctx.args.len < 2) return arityErr("plus requires an argument");
+    const arg = ctx.args[1];
+    switch (arg) {
+        .List => |l| {
+            const g = l.items.borrow();
+            defer g.deinit();
+            for (g.get().items) |v| {
+                if (!containsBoxed(out.items, &v)) try out.append(a, v);
+            }
+        },
+        .Set => |s| {
+            const g = s.items.borrow();
+            defer g.deinit();
+            for (g.get().items) |v| {
+                if (!containsBoxed(out.items, &v)) try out.append(a, v);
+            }
+        },
+        else => {
+            if (!containsBoxed(out.items, &arg)) try out.append(a, arg);
+        },
+    }
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null } });
+}
+
+pub fn coll_set_plus(ctx: *CallCtx) Error!EvalResult {
+    return setPlusImpl(ctx, "Set.plus");
+}
+pub fn coll_set_union(ctx: *CallCtx) Error!EvalResult {
+    return setPlusImpl(ctx, "Set.plus");
+}
+
+pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "Set.minus")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("minus requires an argument");
+    const arg = ctx.args[1];
+    var removals: std.ArrayList(Value) = .empty;
+    switch (arg) {
+        .List => |l| try removals.appendSlice(a, try snapshotItems(a, l.items)),
+        .Set => |s| try removals.appendSlice(a, try snapshotItems(a, s.items)),
+        else => try removals.append(a, arg),
+    }
+    var out: std.ArrayList(Value) = .empty;
+    const src = try snapshotItems(a, it);
+    for (src) |v| {
+        if (!containsBoxed(removals.items, &v)) try out.append(a, v);
+    }
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null } });
+}
+pub fn coll_set_subtract(ctx: *CallCtx) Error!EvalResult {
+    return coll_set_minus(ctx);
+}
+
+pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "Set.intersect")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("intersect requires an argument");
+    const arg = ctx.args[1];
+    var other: std.ArrayList(Value) = .empty;
+    switch (arg) {
+        .List => |l| try other.appendSlice(a, try snapshotItems(a, l.items)),
+        .Set => |s| try other.appendSlice(a, try snapshotItems(a, s.items)),
+        else => return typeErr("intersect requires a collection"),
+    }
+    var out: std.ArrayList(Value) = .empty;
+    const src = try snapshotItems(a, it);
+    for (src) |v| {
+        if (containsBoxed(other.items, &v)) try out.append(a, v);
+    }
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null } });
+}
+
+pub fn coll_set_size(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvSetItems(ctx.allocator, ctx.args, "Set.size")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(Value.newInt(@intCast(listLen(it))));
+}
+pub fn coll_set_is_empty(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvSetItems(ctx.allocator, ctx.args, "Set.isEmpty")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(.{ .Bool = listLen(it) == 0 });
+}
+pub fn coll_set_is_not_empty(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvSetItems(ctx.allocator, ctx.args, "Set.isNotEmpty")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(.{ .Bool = listLen(it) != 0 });
+}
+pub fn coll_set_contains(ctx: *CallCtx) Error!EvalResult {
+    const it = switch (try recvSetItems(ctx.allocator, ctx.args, "Set.contains")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("contains requires an argument");
+    const needle = ctx.args[1];
+    const g = it.borrow();
+    defer g.deinit();
+    return ok(.{ .Bool = containsBoxed(g.get().items, &needle) });
+}
+
+pub fn coll_set_sorted(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "Set.sorted")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const copy = try snapshotItems(a, it);
+    if (try sortValuesNatural(a, copy)) |e| return e;
+    return ok(try makeList(a, copy, false));
+}
+pub fn coll_set_sorted_descending(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const v = try coll_set_sorted(ctx);
+    if (v == .err) return v;
+    const items = try snapshotItems(a, v.ok.List.items);
+    std.mem.reverse(Value, items);
+    return ok(try makeList(a, items, false));
+}
+pub fn coll_set_to_string(ctx: *CallCtx) Error!EvalResult {
+    return collToString(ctx, "Set.toString");
+}
+
+pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "MutableSet.add")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("add requires an argument");
+    const arg = ctx.args[1];
+    const g = it.borrowMut();
+    defer g.deinit();
+    if (containsBoxed(g.get().items, &arg)) return ok(.{ .Bool = false });
+    try g.get().append(a, arg);
+    return ok(.{ .Bool = true });
+}
+pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "MutableSet.remove")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("remove requires an argument");
+    const arg = ctx.args[1];
+    var removed = false;
+    {
+        const g = it.borrowMut();
+        defer g.deinit();
+        if (indexOfBoxed(g.get().items, &arg)) |pos| {
+            _ = g.get().orderedRemove(pos);
+            removed = true;
+        }
+    }
+    if (removed) syncMapView(a, ctx.args[0]);
+    return ok(.{ .Bool = removed });
+}
+pub fn coll_mut_set_clear(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "MutableSet.clear")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    {
+        const g = it.borrowMut();
+        defer g.deinit();
+        g.get().clearRetainingCapacity();
+    }
+    syncMapView(a, ctx.args[0]);
+    return ok(Value.Unit);
+}
+
+fn collectColl(a: Allocator, v: ?Value) Error!?[]Value {
+    if (v) |val| {
+        switch (val) {
+            .List => |l| return try snapshotItems(a, l.items),
+            .Set => |s| return try snapshotItems(a, s.items),
+            .Array => |arr| return try snapshotItems(a, arr.items),
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []const u8, retain: bool, allow_array: bool) Error!EvalResult {
+    const a = ctx.allocator;
+    const arg = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
+    const other = blk: {
+        switch (arg) {
+            .List => |l| break :blk try snapshotItems(a, l.items),
+            .Set => |s| break :blk try snapshotItems(a, s.items),
+            .Array => |arr| if (allow_array) break :blk try snapshotItems(a, arr.items) else return typeErr(try fmt(a, "{s} requires a collection", .{what})),
+            else => return typeErr(try fmt(a, "{s} requires a collection", .{what})),
+        }
+    };
+    var changed = false;
+    {
+        const g = it_mut: {
+            break :it_mut items.borrowMut();
+        };
+        defer g.deinit();
+        const list = g.get();
+        const before = list.items.len;
+        var w: usize = 0;
+        var r: usize = 0;
+        while (r < list.items.len) : (r += 1) {
+            const v = list.items[r];
+            const present = containsBoxed(other, &v);
+            const keep = if (retain) present else !present;
+            if (keep) {
+                list.items[w] = v;
+                w += 1;
+            }
+        }
+        list.shrinkRetainingCapacity(w);
+        changed = list.items.len != before;
+    }
+    if (changed) syncMapView(a, recv);
+    return ok(.{ .Bool = changed });
+}
+
+pub fn coll_mut_set_remove_all(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "MutableSet.removeAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return mutCollRemoveRetain(ctx, it, ctx.args[0], "removeAll", false, true);
+}
+pub fn coll_mut_set_retain_all(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "MutableSet.retainAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return mutCollRemoveRetain(ctx, it, ctx.args[0], "retainAll", true, true);
+}
+
+// =====================================================================
+// Map ops
+// =====================================================================
+
+pub fn coll_map_to_mutable_map(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Map) return typeErr("toMutableMap requires a Map receiver");
+    return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), true));
+}
+pub fn coll_map_to_map(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Map) return typeErr("toMap requires a Map receiver");
+    return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), false));
+}
+
+pub fn coll_map_plus(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.plus")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    var out: std.ArrayList(MapPair) = .empty;
+    try out.appendSlice(a, try snapshotEntries(a, entries));
+    if (ctx.args.len < 2) return arityErr("plus requires an argument");
+    const arg = ctx.args[1];
+    switch (arg) {
+        .Pair => try out.append(a, .{ .key = arg.Pair.first.*, .value = arg.Pair.second.* }),
+        .Map => |e| try out.appendSlice(a, try snapshotEntries(a, e.entries)),
+        .List => |l| {
+            const g = l.items.borrow();
+            defer g.deinit();
+            for (g.get().items) |p| {
+                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.*, .value = p.Pair.second.* });
+            }
+        },
+        .Set => |s| {
+            const g = s.items.borrow();
+            defer g.deinit();
+            for (g.get().items) |p| {
+                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.*, .value = p.Pair.second.* });
+            }
+        },
+        else => return typeErr("Map.plus expects a Pair, Map, or Iterable<Pair>"),
+    }
+    return ok(try makeMap(a, out.items, false));
+}
+
+pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.minus")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("minus requires an argument");
+    const arg = ctx.args[1];
+    var keys: std.ArrayList(Value) = .empty;
+    switch (arg) {
+        .List => |l| try keys.appendSlice(a, try snapshotItems(a, l.items)),
+        .Set => |s| try keys.appendSlice(a, try snapshotItems(a, s.items)),
+        else => try keys.append(a, arg),
+    }
+    var out: std.ArrayList(MapPair) = .empty;
+    const src = try snapshotEntries(a, entries);
+    for (src) |kv| {
+        if (!containsBoxed(keys.items, &kv.key)) try out.append(a, kv);
+    }
+    return ok(try makeMap(a, out.items, false));
+}
+
+pub fn coll_map_size(ctx: *CallCtx) Error!EvalResult {
+    const entries = switch (try recvMapEntries(ctx.allocator, ctx.args, "Map.size")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    return ok(Value.newInt(@intCast(mapLen(entries))));
+}
+pub fn coll_map_is_empty(ctx: *CallCtx) Error!EvalResult {
+    const entries = switch (try recvMapEntries(ctx.allocator, ctx.args, "Map.isEmpty")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    return ok(.{ .Bool = mapLen(entries) == 0 });
+}
+pub fn coll_map_is_not_empty(ctx: *CallCtx) Error!EvalResult {
+    const entries = switch (try recvMapEntries(ctx.allocator, ctx.args, "Map.isNotEmpty")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    return ok(.{ .Bool = mapLen(entries) != 0 });
+}
+
+/// Index of `key`, honoring a class-instance key's custom `equals`.
+fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!?usize {
+    if (key != .Instance) {
+        const g = entries.borrow();
+        defer g.deinit();
+        return findKeyIndexBoxed(g.get().items, &key);
+    }
+    const keys = blk: {
+        const g = entries.borrow();
+        defer g.deinit();
+        var ks = try ctx.allocator.alloc(Value, g.get().items.len);
+        for (g.get().items, 0..) |kv, i| ks[i] = kv.key;
+        break :blk ks;
+    };
+    for (keys, 0..) |k, i| {
+        if (try ctx.host.invokeMethod(&k, "equals", &.{key}, ctx.out)) |m| {
+            if (m == .ok and m.ok == .Bool) {
+                if (m.ok.Bool) return i;
+                continue;
+            }
+        }
+        if (eqBoxed(&k, &key)) return i;
+    }
+    return null;
+}
+
+pub fn coll_map_get(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.get")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("get requires a key");
+    const key = ctx.args[1];
+    if (try mapKeyIndex(ctx, entries, key)) |i| {
+        const g = entries.borrow();
+        defer g.deinit();
+        if (i < g.get().items.len) return ok(g.get().items[i].value);
+    }
+    return ok(Value.Null);
+}
+pub fn coll_map_contains_key(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.containsKey")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("containsKey requires a key");
+    const key = ctx.args[1];
+    return ok(.{ .Bool = (try mapKeyIndex(ctx, entries, key)) != null });
+}
+pub fn coll_map_contains_value(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.containsValue")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("containsValue requires a value");
+    const value = ctx.args[1];
+    const g = entries.borrow();
+    defer g.deinit();
+    for (g.get().items) |kv| {
+        if (eqBoxed(&kv.value, &value)) return ok(.{ .Bool = true });
+    }
+    return ok(.{ .Bool = false });
+}
+
+pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.keys")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    var keys: std.ArrayList(Value) = .empty;
+    {
+        const g = entries.borrow();
+        defer g.deinit();
+        for (g.get().items) |kv| try keys.append(a, kv.key);
+    }
+    const backing = try a.create(MapBacking);
+    backing.* = .{ .entries = entries, .kind = .Keys };
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, keys), .mutable = true, .backing = backing } });
+}
+pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.values")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    var values: std.ArrayList(Value) = .empty;
+    {
+        const g = entries.borrow();
+        defer g.deinit();
+        for (g.get().items) |kv| try values.append(a, kv.value);
+    }
+    const backing = try a.create(MapBacking);
+    backing.* = .{ .entries = entries, .kind = .Values };
+    return ok(.{ .List = .{ .items = try ValueList.init(a, values), .mutable = true, .enum_class = null, .backing = backing } });
+}
+pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.entries")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    var map_entries: std.ArrayList(Value) = .empty;
+    {
+        const g = entries.borrow();
+        defer g.deinit();
+        for (g.get().items) |kv| {
+            try map_entries.append(a, .{ .MapEntry = .{
+                .key = try box(a, kv.key),
+                .value = try box(a, kv.value),
+                .backing = entries,
+            } });
+        }
+    }
+    const backing = try a.create(MapBacking);
+    backing.* = .{ .entries = entries, .kind = .Entries };
+    return ok(.{ .Set = .{ .items = try ValueList.init(a, map_entries), .mutable = true, .backing = backing } });
+}
+pub fn coll_map_to_string(ctx: *CallCtx) Error!EvalResult {
+    return collToString(ctx, "Map.toString");
+}
+
+pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "MutableMap.put")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("put requires a key");
+    const key = ctx.args[1];
+    if (ctx.args.len < 3) return arityErr("put requires a value");
+    const value = ctx.args[2];
+    if (try mapKeyIndex(ctx, entries, key)) |i| {
+        const g = entries.borrowMut();
+        defer g.deinit();
+        const prev = g.get().items[i].value;
+        g.get().items[i].value = value;
+        return ok(prev);
+    }
+    const g = entries.borrowMut();
+    defer g.deinit();
+    try g.get().append(a, .{ .key = key, .value = value });
+    return ok(Value.Null);
+}
+pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "MutableMap.remove")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("remove requires a key");
+    const key = ctx.args[1];
+    if (try mapKeyIndex(ctx, entries, key)) |pos| {
+        const g = entries.borrowMut();
+        defer g.deinit();
+        const kv = g.get().orderedRemove(pos);
+        return ok(kv.value);
+    }
+    return ok(Value.Null);
+}
+pub fn coll_mut_map_clear(ctx: *CallCtx) Error!EvalResult {
+    const entries = switch (try recvMapEntries(ctx.allocator, ctx.args, "MutableMap.clear")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    const g = entries.borrowMut();
+    defer g.deinit();
+    g.get().clearRetainingCapacity();
+    return ok(Value.Unit);
+}
+
+// ----- Map scope helpers (merge / putIfAbsent / replace / compute*) -----
+
+fn mutMapEntriesRc(a: Allocator, recv: Value, who: []const u8) Error!MapEntriesOutcome {
+    if (recv == .Map) return .{ .entries = recv.Map.entries };
+    return .{ .err = typeErr(try fmt(a, "{s} requires a MutableMap receiver", .{who})) };
+}
+
+fn mapFind(entries: MapEntries, key: Value) ?Value {
+    const g = entries.borrow();
+    defer g.deinit();
+    for (g.get().items) |kv| {
+        if (eqBoxed(&kv.key, &key)) return kv.value;
+    }
+    return null;
+}
+
+fn mapSet(a: Allocator, entries: MapEntries, key: Value, value: Value) Error!void {
+    const g = entries.borrowMut();
+    defer g.deinit();
+    for (g.get().items) |*kv| {
+        if (eqBoxed(&kv.key, &key)) {
+            kv.value = value;
+            return;
+        }
+    }
+    try g.get().append(a, .{ .key = key, .value = value });
+}
+
+fn mapRemoveKey(entries: MapEntries, key: Value) void {
+    const g = entries.borrowMut();
+    defer g.deinit();
+    for (g.get().items, 0..) |kv, i| {
+        if (eqBoxed(&kv.key, &key)) {
+            _ = g.get().orderedRemove(i);
+            return;
+        }
+    }
+}
+
+pub fn map_merge(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try mutMapEntriesRc(a, ctx.args[0], "merge")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("merge requires a key");
+    const key = ctx.args[1];
+    if (ctx.args.len < 3) return arityErr("merge requires a value");
+    const value = ctx.args[2];
+    if (ctx.args.len < 4) return arityErr("merge requires a remapping block");
+    const block = ctx.args[3];
+    const existing = mapFind(entries, key);
+    const new_val = if (existing) |old| switch (try invoke(ctx, &block, &.{ old, value })) {
+        .value => |v| v,
+        .err => |e| return e,
+    } else value;
+    if (new_val == .Null) {
+        mapRemoveKey(entries, key);
+    } else {
+        try mapSet(a, entries, key, new_val);
+    }
+    return ok(new_val);
+}
+
+pub fn map_put_if_absent(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try mutMapEntriesRc(a, ctx.args[0], "putIfAbsent")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("putIfAbsent requires a key");
+    const key = ctx.args[1];
+    if (ctx.args.len < 3) return arityErr("putIfAbsent requires a value");
+    const value = ctx.args[2];
+    if (mapFind(entries, key)) |old| return ok(old);
+    try mapSet(a, entries, key, value);
+    return ok(Value.Null);
+}
+
+pub fn map_replace(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try mutMapEntriesRc(a, ctx.args[0], "replace")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("replace requires a key");
+    const key = ctx.args[1];
+    if (ctx.args.len >= 4) {
+        const old = ctx.args[2];
+        const new = ctx.args[3];
+        if (mapFind(entries, key)) |cur| {
+            if (eqBoxed(&cur, &old)) {
+                try mapSet(a, entries, key, new);
+                return ok(.{ .Bool = true });
+            }
+        }
+        return ok(.{ .Bool = false });
+    }
+    if (ctx.args.len < 3) return arityErr("replace requires a value");
+    const value = ctx.args[2];
+    if (mapFind(entries, key)) |old| {
+        try mapSet(a, entries, key, value);
+        return ok(old);
+    }
+    return ok(Value.Null);
+}
+
+pub fn map_compute_if_absent(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try mutMapEntriesRc(a, ctx.args[0], "computeIfAbsent")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("computeIfAbsent requires a key");
+    const key = ctx.args[1];
+    if (mapFind(entries, key)) |v| return ok(v);
+    if (ctx.args.len < 3) return arityErr("computeIfAbsent requires a block");
+    const block = ctx.args[2];
+    const v = switch (try invoke(ctx, &block, &.{key})) {
+        .value => |x| x,
+        .err => |e| return e,
+    };
+    try mapSet(a, entries, key, v);
+    return ok(v);
+}
+
+pub fn map_compute_if_present(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try mutMapEntriesRc(a, ctx.args[0], "computeIfPresent")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("computeIfPresent requires a key");
+    const key = ctx.args[1];
+    if (ctx.args.len < 3) return arityErr("computeIfPresent requires a block");
+    const block = ctx.args[2];
+    const old = mapFind(entries, key) orelse return ok(Value.Null);
+    const new_val = switch (try invoke(ctx, &block, &.{ key, old })) {
+        .value => |x| x,
+        .err => |e| return e,
+    };
+    if (new_val == .Null) {
+        mapRemoveKey(entries, key);
+    } else {
+        try mapSet(a, entries, key, new_val);
+    }
+    return ok(new_val);
+}
+
+pub fn map_compute(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try mutMapEntriesRc(a, ctx.args[0], "compute")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("compute requires a key");
+    const key = ctx.args[1];
+    if (ctx.args.len < 3) return arityErr("compute requires a block");
+    const block = ctx.args[2];
+    const old = mapFind(entries, key) orelse Value.Null;
+    const new_val = switch (try invoke(ctx, &block, &.{ key, old })) {
+        .value => |x| x,
+        .err => |e| return e,
+    };
+    if (new_val == .Null) {
+        mapRemoveKey(entries, key);
+    } else {
+        try mapSet(a, entries, key, new_val);
+    }
+    return ok(new_val);
+}
+
+// =====================================================================
+// Pair / Triple members
+// =====================================================================
+
+fn recvPair(a: Allocator, args: []const Value, what: []const u8) Error!union(enum) { pair: Value, err: EvalResult } {
+    if (args.len > 0 and args[0] == .Pair) return .{ .pair = args[0] };
+    return .{ .err = typeErr(try fmt(a, "{s} requires a Pair receiver", .{what})) };
+}
+
+pub fn pair_first(ctx: *CallCtx) Error!EvalResult {
+    const p = switch (try recvPair(ctx.allocator, ctx.args, "Pair.first")) {
+        .pair => |v| v,
+        .err => |e| return e,
+    };
+    return ok(p.Pair.first.*);
+}
+pub fn pair_second(ctx: *CallCtx) Error!EvalResult {
+    const p = switch (try recvPair(ctx.allocator, ctx.args, "Pair.second")) {
+        .pair => |v| v,
+        .err => |e| return e,
+    };
+    return ok(p.Pair.second.*);
+}
+pub fn pair_to_string(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const p = switch (try recvPair(a, ctx.args, "Pair.toString")) {
+        .pair => |v| v,
+        .err => |e| return e,
+    };
+    return ok(try makeStringOwned(a, try display(a, p)));
+}
+pub fn pair_to_list(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const p = switch (try recvPair(a, ctx.args, "Pair.toList")) {
+        .pair => |v| v,
+        .err => |e| return e,
+    };
+    return ok(try makeList(a, &.{ p.Pair.first.*, p.Pair.second.* }, false));
+}
+
+fn recvTriple(a: Allocator, args: []const Value, what: []const u8) Error!union(enum) { triple: Value, err: EvalResult } {
+    if (args.len > 0 and args[0] == .Triple) return .{ .triple = args[0] };
+    return .{ .err = typeErr(try fmt(a, "{s} requires a Triple receiver", .{what})) };
+}
+
+pub fn coll_triple_ctor(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len != 3) return arityErr("Triple expects 3 arguments");
+    return ok(try makeTriple(ctx.allocator, ctx.args[0], ctx.args[1], ctx.args[2]));
+}
+pub fn triple_first(ctx: *CallCtx) Error!EvalResult {
+    const t = switch (try recvTriple(ctx.allocator, ctx.args, "Triple.first")) {
+        .triple => |v| v,
+        .err => |e| return e,
+    };
+    return ok(t.Triple.first.*);
+}
+pub fn triple_second(ctx: *CallCtx) Error!EvalResult {
+    const t = switch (try recvTriple(ctx.allocator, ctx.args, "Triple.second")) {
+        .triple => |v| v,
+        .err => |e| return e,
+    };
+    return ok(t.Triple.second.*);
+}
+pub fn triple_third(ctx: *CallCtx) Error!EvalResult {
+    const t = switch (try recvTriple(ctx.allocator, ctx.args, "Triple.third")) {
+        .triple => |v| v,
+        .err => |e| return e,
+    };
+    return ok(t.Triple.third.*);
+}
+pub fn triple_to_string(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const t = switch (try recvTriple(a, ctx.args, "Triple.toString")) {
+        .triple => |v| v,
+        .err => |e| return e,
+    };
+    return ok(try makeStringOwned(a, try display(a, t)));
+}
+pub fn triple_to_list(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const t = switch (try recvTriple(a, ctx.args, "Triple.toList")) {
+        .triple => |v| v,
+        .err => |e| return e,
+    };
+    return ok(try makeList(a, &.{ t.Triple.first.*, t.Triple.second.*, t.Triple.third.* }, false));
+}
+
+// =====================================================================
+// Additional List ops
+// =====================================================================
+
+pub fn coll_list_flatten(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.flatten")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    var out: std.ArrayList(Value) = .empty;
+    const src = try snapshotItems(a, it);
+    for (src) |v| {
+        switch (v) {
+            .List => |l| try out.appendSlice(a, try snapshotItems(a, l.items)),
+            .Set => |s| try out.appendSlice(a, try snapshotItems(a, s.items)),
+            else => {
+                const vd = try display(a, v);
+                return typeErr(try fmt(a, "flatten requires nested collections, got {s}", .{vd}));
+            },
+        }
+    }
+    return ok(try makeListFromArrayList(a, out, false));
+}
+
+pub fn coll_list_unzip(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.unzip")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    var firsts: std.ArrayList(Value) = .empty;
+    var seconds: std.ArrayList(Value) = .empty;
+    const src = try snapshotItems(a, it);
+    for (src) |v| {
+        if (v != .Pair) return typeErr("unzip requires List<Pair<A, B>>");
+        try firsts.append(a, v.Pair.first.*);
+        try seconds.append(a, v.Pair.second.*);
+    }
+    return ok(try makePair(a, try makeListFromArrayList(a, firsts, false), try makeListFromArrayList(a, seconds, false)));
+}
+
+pub fn coll_list_contains_all(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.containsAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const other = (try collectColl(a, if (ctx.args.len > 1) ctx.args[1] else null)) orelse
+        return typeErr("containsAll requires a collection");
+    const g = it.borrow();
+    defer g.deinit();
+    for (other) |o| {
+        if (!containsBoxed(g.get().items, &o)) return ok(.{ .Bool = false });
+    }
+    return ok(.{ .Bool = true });
+}
+
+pub fn coll_list_to_list(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.toList")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeList(a, try snapshotItems(a, it), false));
+}
+pub fn coll_list_to_mutable_list(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.toMutableList")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeList(a, try snapshotItems(a, it), true));
+}
+pub fn coll_list_to_set(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.toSet")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeSet(a, try snapshotItems(a, it), false));
+}
+pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.toMutableSet")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeSet(a, try snapshotItems(a, it), true));
+}
+
+fn withIndexImpl(a: Allocator, items: []const Value) Error!Value {
+    var indexed: std.ArrayList(Value) = .empty;
+    for (items, 0..) |v, i| {
+        try indexed.append(a, try makePair(a, Value.newInt(@intCast(i)), v));
+    }
+    return makeListFromArrayList(a, indexed, false);
+}
+
+pub fn coll_list_with_index(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "List.withIndex")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try withIndexImpl(a, try snapshotItems(a, it)));
+}
+pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("Array.withIndex requires a receiver");
+    const items = switch (try iterableItems(a, ctx.args[0], "Array.withIndex")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try withIndexImpl(a, items));
+}
+
+pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.addAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("addAll requires an argument");
+    const arg = ctx.args[1];
+    var to_add: []Value = undefined;
+    switch (arg) {
+        .List => |l| to_add = try snapshotItems(a, l.items),
+        .Set => |s| to_add = try snapshotItems(a, s.items),
+        else => {
+            const ad = try display(a, arg);
+            return typeErr(try fmt(a, "addAll requires a collection, got {s}", .{ad}));
+        },
+    }
+    const changed = to_add.len != 0;
+    const g = it.borrowMut();
+    defer g.deinit();
+    try g.get().appendSlice(a, to_add);
+    return ok(.{ .Bool = changed });
+}
+
+pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.remove")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("remove requires an argument");
+    const arg = ctx.args[1];
+    var removed = false;
+    {
+        const g = it.borrowMut();
+        defer g.deinit();
+        if (indexOfBoxed(g.get().items, &arg)) |pos| {
+            _ = g.get().orderedRemove(pos);
+            removed = true;
+        }
+    }
+    if (removed) syncMapView(a, ctx.args[0]);
+    return ok(.{ .Bool = removed });
+}
+
+pub fn coll_mut_list_remove_all(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.removeAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return mutCollRemoveRetain(ctx, it, ctx.args[0], "removeAll", false, false);
+}
+pub fn coll_mut_list_retain_all(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.retainAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return mutCollRemoveRetain(ctx, it, ctx.args[0], "retainAll", true, false);
+}
+
+pub fn coll_mut_list_set(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvListItems(a, ctx.args, "MutableList.set")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2 or ctx.args[1] != .Int) return typeErr("set requires an Int index");
+    const i = ctx.args[1].Int;
+    if (ctx.args.len < 3) return arityErr("set requires (index, value)");
+    const value = ctx.args[2];
+    const g = it.borrowMut();
+    defer g.deinit();
+    const len = g.get().items.len;
+    if (i < 0 or @as(usize, @intCast(i)) >= len) {
+        return try thrown(a, "kotlin.IndexOutOfBoundsException", try fmt(a, "Index {d} out of bounds for length {d}", .{ i, len }));
+    }
+    const prev = g.get().items[@intCast(i)];
+    g.get().items[@intCast(i)] = value;
+    return ok(prev);
+}
+
+// =====================================================================
+// Additional Set ops
+// =====================================================================
+
+pub fn coll_set_contains_all(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "Set.containsAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const other = (try collectColl(a, if (ctx.args.len > 1) ctx.args[1] else null)) orelse
+        return typeErr("containsAll requires a collection");
+    const g = it.borrow();
+    defer g.deinit();
+    for (other) |o| {
+        if (!containsBoxed(g.get().items, &o)) return ok(.{ .Bool = false });
+    }
+    return ok(.{ .Bool = true });
+}
+
+pub fn coll_set_to_list(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "Set.toList")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeList(a, try snapshotItems(a, it), false));
+}
+pub fn coll_set_to_mutable_list(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "Set.toMutableList")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeList(a, try snapshotItems(a, it), true));
+}
+pub fn coll_set_to_set_(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "Set.toSet")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeSet(a, try snapshotItems(a, it), false));
+}
+pub fn coll_set_to_mutable_set_(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "Set.toMutableSet")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try makeSet(a, try snapshotItems(a, it), true));
+}
+pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "Set.withIndex")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    return ok(try withIndexImpl(a, try snapshotItems(a, it)));
+}
+pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const it = switch (try recvSetItems(a, ctx.args, "MutableSet.addAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const to_add = (try collectColl(a, if (ctx.args.len > 1) ctx.args[1] else null)) orelse
+        return typeErr("addAll requires a collection");
+    const g = it.borrowMut();
+    defer g.deinit();
+    var changed = false;
+    for (to_add) |v| {
+        if (!containsBoxed(g.get().items, &v)) {
+            try g.get().append(a, v);
+            changed = true;
+        }
+    }
+    return ok(.{ .Bool = changed });
+}
+
+// =====================================================================
+// Additional Map ops
+// =====================================================================
+
+pub fn coll_map_get_or_default(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.getOrDefault")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("getOrDefault requires (key, default)");
+    const key = ctx.args[1];
+    if (ctx.args.len < 3) return arityErr("getOrDefault requires (key, default)");
+    const default = ctx.args[2];
+    const g = entries.borrow();
+    defer g.deinit();
+    if (findKeyIndexBoxed(g.get().items, &key)) |i| return ok(g.get().items[i].value);
+    return ok(default);
+}
+
+pub fn coll_map_get_value(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.getValue")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("getValue requires a key");
+    const key = ctx.args[1];
+    {
+        const g = entries.borrow();
+        defer g.deinit();
+        if (findKeyIndexBoxed(g.get().items, &key)) |i| return ok(g.get().items[i].value);
+    }
+    const kd = try display(a, key);
+    return try thrown(a, "kotlin.NoSuchElementException", try fmt(a, "Key {s} is missing in the map.", .{kd}));
+}
+
+pub fn coll_map_to_list(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.toList")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    var pairs: std.ArrayList(Value) = .empty;
+    {
+        const g = entries.borrow();
+        defer g.deinit();
+        for (g.get().items) |kv| try pairs.append(a, try makePair(a, kv.key, kv.value));
+    }
+    return ok(try makeListFromArrayList(a, pairs, false));
+}
+
+pub fn coll_map_to_sorted_map(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Map) return typeErr("toSortedMap requires a Map receiver");
+    const entries = try snapshotEntries(a, ctx.args[0].Map.entries);
+    var descending = false;
+    if (ctx.args.len > 1) {
+        const cmp = ctx.args[1];
+        if (cmp == .Comparator) {
+            const sg = cmp.Comparator.steps.borrow();
+            defer sg.deinit();
+            if (sg.get().*.len == 0) {
+                descending = cmp.Comparator.descending;
+            } else {
+                return typeErr("toSortedMap with a selector comparator is not yet supported");
+            }
+        } else {
+            return typeErr("toSortedMap expects a Comparator argument");
+        }
+    }
+    if (try sortMapByKey(a, entries, descending)) |e| return e;
+    return ok(try makeMap(a, entries, false));
+}
+
+pub fn coll_map_count_no_pred(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len >= 2) {
+        const items = switch (try iterableItems(a, ctx.args[0], "count")) {
+            .items => |x| x,
+            .err => |e| return e,
+        };
+        const block = ctx.args[1];
+        var n: i64 = 0;
+        for (items) |v| {
+            const r = switch (try invoke(ctx, &block, &.{v})) {
+                .value => |x| x,
+                .err => |e| return e,
+            };
+            if (r == .Bool and r.Bool) n += 1;
+        }
+        return ok(Value.newInt(n));
+    }
+    const entries = switch (try recvMapEntries(a, ctx.args, "Map.count")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    return ok(Value.newInt(@intCast(mapLen(entries))));
+}
+
+pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    const entries = switch (try recvMapEntries(a, ctx.args, "MutableMap.putAll")) {
+        .entries => |x| x,
+        .err => |e| return e,
+    };
+    if (ctx.args.len < 2) return arityErr("putAll requires a Map");
+    const arg = ctx.args[1];
+    var to_add: []MapPair = undefined;
+    switch (arg) {
+        .Map => |m| to_add = try snapshotEntries(a, m.entries),
+        .Array => |arr| to_add = (switch (try pairsFromValues(a, try snapshotItems(a, arr.items), "putAll")) {
+            .entries => |x| x,
+            .err => |e| return e,
+        }).items,
+        .List => |l| to_add = (switch (try pairsFromValues(a, try snapshotItems(a, l.items), "putAll")) {
+            .entries => |x| x,
+            .err => |e| return e,
+        }).items,
+        .Set => |s| to_add = (switch (try pairsFromValues(a, try snapshotItems(a, s.items), "putAll")) {
+            .entries => |x| x,
+            .err => |e| return e,
+        }).items,
+        .Sequence => {
+            const items = switch (try materialiseSequence(a, ctx.host, ctx.out, arg)) {
+                .items => |x| x,
+                .err => |e| return .{ .err = e },
+            };
+            to_add = (switch (try pairsFromValues(a, items, "putAll")) {
+                .entries => |x| x,
+                .err => |e| return e,
+            }).items;
+        },
+        else => return typeErr("putAll requires a Map or a collection of Pairs"),
+    }
+    const g = entries.borrowMut();
+    defer g.deinit();
+    for (to_add) |kv| {
+        var found = false;
+        for (g.get().items) |*slot| {
+            if (eqBoxed(&slot.key, &kv.key)) {
+                slot.value = kv.value;
+                found = true;
+                break;
+            }
+        }
+        if (!found) try g.get().append(a, kv);
+    }
+    return ok(Value.Unit);
+}
+
+pub fn coll_mut_map_set(ctx: *CallCtx) Error!EvalResult {
+    const r = try coll_mut_map_put(ctx);
+    if (r == .err) return r;
+    return ok(Value.Unit);
+}
+
+// =====================================================================
+// Array ops
+// =====================================================================
+
+fn arrayPrimDefault(prim: ?PrimitiveArrayKind) Value {
+    return switch (prim orelse return Value.Null) {
+        .Int => .{ .Int = 0 },
+        .Long => .{ .Long = 0 },
+        .Double => .{ .Double = 0.0 },
+        .Float => .{ .Float = 0.0 },
+        .Short => .{ .Short = 0 },
+        .Byte => .{ .Byte = 0 },
+        .Boolean => .{ .Bool = false },
+        .Char => .{ .Char = 0 },
+        .UInt => .{ .UInt = 0 },
+        .ULong => .{ .ULong = 0 },
+        .UShort => .{ .UShort = 0 },
+        .UByte => .{ .UByte = 0 },
+    };
+}
+
+fn arrayPrimOf(v: Value) ?PrimitiveArrayKind {
+    return switch (v) {
+        .Array => |arr| arr.prim,
+        else => null,
+    };
+}
+
+const IdxOutcome = union(enum) { idx: i64, err: EvalResult };
+
+fn arrayOptIndex(a: Allocator, ctx: *CallCtx, idx: usize, default: i64, what: []const u8) Error!IdxOutcome {
+    if (idx >= ctx.args.len) return .{ .idx = default };
+    if (ctx.args[idx].asI64()) |v| return .{ .idx = v };
+    return .{ .err = typeErr(try fmt(a, "{s}: index argument must be an Int", .{what})) };
+}
+
+fn indexOob(a: Allocator, msg: []const u8) Error!EvalResult {
+    return try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+}
+
+pub fn array_slice_impl(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("sliceArray requires a receiver");
+    const recv = ctx.args[0];
+    if (recv != .Array) return typeErr("sliceArray requires an array receiver");
+    const items = recv.Array.items;
+    const prim = recv.Array.prim;
+    if (ctx.args.len < 2) return arityErr("sliceArray expects (receiver, range)");
+    if (ctx.args[1] != .Range) return typeErr("sliceArray expects an IntRange argument");
+    const start: usize = @intCast(@max(ctx.args[1].Range.start, 0));
+    const end_excl: usize = @intCast(@max(ctx.args[1].Range.end + 1, 0));
+    const g = items.borrow();
+    defer g.deinit();
+    const src = g.get().items;
+    const lo = @min(start, src.len);
+    const hi = @min(end_excl, src.len);
+    const slice: []const Value = if (lo <= hi) src[lo..hi] else &.{};
+    return ok(try makeArray(a, slice, prim));
+}
+
+pub fn array_content_equals(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("contentEquals requires a receiver");
+    const recv = ctx.args[0];
+    if (ctx.args.len < 2) return arityErr("contentEquals expects (other)");
+    const other = ctx.args[1];
+    if (recv == .Null or other == .Null) {
+        return ok(.{ .Bool = recv == .Null and other == .Null });
+    }
+    const xa = switch (try iterableItems(a, recv, "contentEquals")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const xb = switch (try iterableItems(a, other, "contentEquals")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (xa.len != xb.len) return ok(.{ .Bool = false });
+    for (xa, xb) |*x, *y| {
+        if (!eqBoxed(x, y)) return ok(.{ .Bool = false });
+    }
+    return ok(.{ .Bool = true });
+}
+
+pub fn array_content_to_string(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("contentToString requires a receiver");
+    const recv = ctx.args[0];
+    if (recv == .Null) return ok(try makeStringOwned(a, "null"));
+    const items = switch (try iterableItems(a, recv, "contentToString")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '[');
+    for (items, 0..) |v, i| {
+        if (i > 0) try out.appendSlice(a, ", ");
+        try out.appendSlice(a, try display(a, v));
+    }
+    try out.append(a, ']');
+    return ok(try makeStringOwned(a, try out.toOwnedSlice(a)));
+}
+
+fn longHash(bits: i64) i32 {
+    const u: u64 = @bitCast(bits);
+    return @bitCast(@as(u32, @truncate(@as(u64, @bitCast(bits ^ @as(i64, @bitCast(u >> 32)))))));
+}
+
+fn kotlinValueHash(v: Value) i32 {
+    return switch (v) {
+        .Null, .Unit => 0,
+        .Int => |x| x,
+        .Short => |x| @as(i32, x),
+        .Byte => |x| @as(i32, x),
+        .Char => |x| @as(i32, x),
+        .Bool => |b| if (b) @as(i32, 1231) else @as(i32, 1237),
+        .Long => |x| longHash(x),
+        .UInt => |x| @bitCast(x),
+        .UShort => |x| @as(i32, x),
+        .UByte => |x| @as(i32, x),
+        .ULong => |x| longHash(@bitCast(x)),
+        .Float => |f| if (std.math.isNan(f)) @as(i32, @bitCast(@as(u32, 0x7fc0_0000))) else @as(i32, @bitCast(f)),
+        .Double => |d| blk: {
+            const bits: i64 = if (std.math.isNan(d)) @bitCast(@as(u64, 0x7ff8_0000_0000_0000)) else @bitCast(d);
+            break :blk longHash(bits);
+        },
+        .String => |s| blk: {
+            const g = s.borrow();
+            defer g.deinit();
+            var h: i32 = 0;
+            const str = g.get().*;
+            var i: usize = 0;
+            while (i < str.len) {
+                const cp_len = std.unicode.utf8ByteSequenceLength(str[i]) catch {
+                    h = h *% 31 +% @as(i32, str[i]);
+                    i += 1;
+                    continue;
+                };
+                const slice_end = @min(i + cp_len, str.len);
+                const cp = std.unicode.utf8Decode(str[i..slice_end]) catch {
+                    h = h *% 31 +% @as(i32, str[i]);
+                    i += 1;
+                    continue;
+                };
+                if (cp <= 0xFFFF) {
+                    h = h *% 31 +% @as(i32, @intCast(cp));
+                } else {
+                    const cp_v = cp - 0x10000;
+                    const high: u16 = @intCast(0xD800 + (cp_v >> 10));
+                    const low: u16 = @intCast(0xDC00 + (cp_v & 0x3FF));
+                    h = h *% 31 +% @as(i32, high);
+                    h = h *% 31 +% @as(i32, low);
+                }
+                i = slice_end;
+            }
+            break :blk h;
+        },
+        else => 0,
+    };
+}
+
+pub fn array_content_hash_code(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("contentHashCode requires a receiver");
+    const recv = ctx.args[0];
+    if (recv == .Null) return ok(.{ .Int = 0 });
+    const items = switch (try iterableItems(a, recv, "contentHashCode")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    var result: i32 = 1;
+    for (items) |e| {
+        result = result *% 31 +% kotlinValueHash(e);
+    }
+    return ok(.{ .Int = result });
+}
+
+pub fn array_or_empty(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len > 0 and ctx.args[0] == .Array) return ok(ctx.args[0]);
+    return ok(try makeArray(a, &.{}, null));
+}
+
+fn deepToString(a: Allocator, v: Value) Error![]u8 {
+    switch (v) {
+        .Array => |arr| {
+            var out: std.ArrayList(u8) = .empty;
+            try out.append(a, '[');
+            const g = arr.items.borrow();
+            defer g.deinit();
+            for (g.get().items, 0..) |e, i| {
+                if (i > 0) try out.appendSlice(a, ", ");
+                try out.appendSlice(a, try deepToString(a, e));
+            }
+            try out.append(a, ']');
+            return out.toOwnedSlice(a);
+        },
+        .Null => return a.dupe(u8, "null"),
+        else => return display(a, v),
+    }
+}
+
+pub fn array_content_deep_to_string(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("contentDeepToString requires a receiver");
+    const recv = ctx.args[0];
+    if (recv == .Null) return ok(try makeStringOwned(a, "null"));
+    return ok(try makeStringOwned(a, try deepToString(a, recv)));
+}
+
+fn deepEq(x: Value, y: Value) bool {
+    if (x == .Array and y == .Array) {
+        const gx = x.Array.items.borrow();
+        defer gx.deinit();
+        const gy = y.Array.items.borrow();
+        defer gy.deinit();
+        const xs = gx.get().items;
+        const ys = gy.get().items;
+        if (xs.len != ys.len) return false;
+        for (xs, ys) |a, b| {
+            if (!deepEq(a, b)) return false;
+        }
+        return true;
+    }
+    return eqBoxed(&x, &y);
+}
+
+pub fn array_content_deep_equals(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("contentDeepEquals requires a receiver");
+    const recv = ctx.args[0];
+    if (ctx.args.len < 2) return arityErr("contentDeepEquals expects (other)");
+    const other = ctx.args[1];
+    return ok(.{ .Bool = deepEq(recv, other) });
+}
+
+fn deepHashElement(v: Value) i32 {
+    switch (v) {
+        .Array => |arr| {
+            var result: i32 = 1;
+            const g = arr.items.borrow();
+            defer g.deinit();
+            for (g.get().items) |e| {
+                result = result *% 31 +% deepHashElement(e);
+            }
+            return result;
+        },
+        else => return kotlinValueHash(v),
+    }
+}
+
+pub fn array_content_deep_hash_code(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len == 0) return typeErr("contentDeepHashCode requires a receiver");
+    const recv = ctx.args[0];
+    if (recv == .Null) return ok(.{ .Int = 0 });
+    return ok(.{ .Int = deepHashElement(recv) });
+}
+
+pub fn array_element_at(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("elementAt requires a receiver");
+    const items = switch (try iterableItems(a, ctx.args[0], "elementAt")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    const index = switch (try arrayOptIndex(a, ctx, 1, -1, "elementAt")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    if (index < 0 or @as(usize, @intCast(index)) >= items.len) {
+        return indexOob(a, try fmt(a, "index: {d}, size: {d}", .{ index, items.len }));
+    }
+    return ok(items[@intCast(index)]);
+}
+
+pub fn array_plus(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("plus requires a receiver");
+    const recv = ctx.args[0];
+    if (ctx.args.len < 2) return arityErr("plus expects (element|elements)");
+    const other = ctx.args[1];
+    var items: std.ArrayList(Value) = .empty;
+    {
+        const xs = switch (try iterableItems(a, recv, "plus")) {
+            .items => |x| x,
+            .err => |e| return e,
+        };
+        try items.appendSlice(a, xs);
+    }
+    switch (other) {
+        .Array, .List, .Set => {
+            const xs = switch (try iterableItems(a, other, "plus")) {
+                .items => |x| x,
+                .err => |e| return e,
+            };
+            try items.appendSlice(a, xs);
+        },
+        else => try items.append(a, other),
+    }
+    return ok(try makeArrayFromArrayList(a, items, arrayPrimOf(recv)));
+}
+
+pub fn array_plus_element(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("plusElement requires a receiver");
+    const recv = ctx.args[0];
+    if (ctx.args.len < 2) return arityErr("plusElement expects (element)");
+    const other = ctx.args[1];
+    var items: std.ArrayList(Value) = .empty;
+    const xs = switch (try iterableItems(a, recv, "plusElement")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    try items.appendSlice(a, xs);
+    try items.append(a, other);
+    return ok(try makeArrayFromArrayList(a, items, arrayPrimOf(recv)));
+}
+
+pub fn array_copy_into(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("copyInto requires an array receiver");
+    const src = ctx.args[0].Array.items;
+    if (ctx.args.len < 2) return arityErr("copyInto expects (destination, ...)");
+    const dest_val = ctx.args[1];
+    if (dest_val != .Array) return typeErr("copyInto destination must be an array");
+    const dest = dest_val.Array.items;
+    const src_len: i64 = @intCast(listLen(src));
+    const dest_offset = switch (try arrayOptIndex(a, ctx, 2, 0, "copyInto")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    const start = switch (try arrayOptIndex(a, ctx, 3, 0, "copyInto")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    const end = switch (try arrayOptIndex(a, ctx, 4, src_len, "copyInto")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    if (start < 0 or end > src_len or start > end) {
+        return indexOob(a, try fmt(a, "copyInto: source range [{d}, {d}) out of bounds for length {d}", .{ start, end, src_len }));
+    }
+    const count = end - start;
+    const dest_len: i64 = @intCast(listLen(dest));
+    if (dest_offset < 0 or dest_offset + count > dest_len) {
+        return indexOob(a, try fmt(a, "copyInto: destination range [{d}, {d}) out of bounds for length {d}", .{ dest_offset, dest_offset + count, dest_len }));
+    }
+    const slice = blk: {
+        const g = src.borrow();
+        defer g.deinit();
+        break :blk try a.dupe(Value, g.get().items[@intCast(start)..@intCast(end)]);
+    };
+    {
+        const g = dest.borrowMut();
+        defer g.deinit();
+        const base: usize = @intCast(dest_offset);
+        for (slice, 0..) |v, i| g.get().items[base + i] = v;
+    }
+    return ok(dest_val);
+}
+
+pub fn array_copy_of(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("copyOf requires an array receiver");
+    const items = ctx.args[0].Array.items;
+    const prim = ctx.args[0].Array.prim;
+    const cur_len: i64 = @intCast(listLen(items));
+    const new_size = switch (try arrayOptIndex(a, ctx, 1, cur_len, "copyOf")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    if (new_size < 0) return typeErr(try fmt(a, "copyOf: negative new size {d}", .{new_size}));
+    const n: usize = @intCast(new_size);
+    const default = arrayPrimDefault(prim);
+    var out: std.ArrayList(Value) = .empty;
+    const g = items.borrow();
+    defer g.deinit();
+    const cur = g.get().items;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        try out.append(a, if (i < cur.len) cur[i] else default);
+    }
+    return ok(try makeArrayFromArrayList(a, out, prim));
+}
+
+pub fn array_copy_of_range(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("copyOfRange requires an array receiver");
+    const items = ctx.args[0].Array.items;
+    const prim = ctx.args[0].Array.prim;
+    const len: i64 = @intCast(listLen(items));
+    const from = switch (try arrayOptIndex(a, ctx, 1, 0, "copyOfRange")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    const to = switch (try arrayOptIndex(a, ctx, 2, len, "copyOfRange")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    if (from < 0 or to > len or from > to) {
+        return indexOob(a, try fmt(a, "copyOfRange: [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
+    }
+    const g = items.borrow();
+    defer g.deinit();
+    return ok(try makeArray(a, g.get().items[@intCast(from)..@intCast(to)], prim));
+}
+
+pub fn array_fill(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("fill requires an array receiver");
+    const items = ctx.args[0].Array.items;
+    if (ctx.args.len < 2) return arityErr("fill expects (element, ...)");
+    const element = ctx.args[1];
+    const len: i64 = @intCast(listLen(items));
+    const from = switch (try arrayOptIndex(a, ctx, 2, 0, "fill")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    const to = switch (try arrayOptIndex(a, ctx, 3, len, "fill")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    if (from < 0 or to > len or from > to) {
+        return indexOob(a, try fmt(a, "fill: [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
+    }
+    const g = items.borrowMut();
+    defer g.deinit();
+    var i: usize = @intCast(from);
+    while (i < @as(usize, @intCast(to))) : (i += 1) g.get().items[i] = element;
+    return ok(Value.Unit);
+}
+
+pub fn array_sort(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sort requires an array receiver");
+    const items = ctx.args[0].Array.items;
+    const len: i64 = @intCast(listLen(items));
+    const from = switch (try arrayOptIndex(a, ctx, 1, 0, "sort")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    const to = switch (try arrayOptIndex(a, ctx, 2, len, "sort")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    if (from < 0 or to > len or from > to) {
+        return indexOob(a, try fmt(a, "sort: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
+    }
+    const buf = try snapshotItems(a, items);
+    const sub = buf[@intCast(from)..@intCast(to)];
+    if (try sortListHostAware(ctx, sub)) |e| return e;
+    try writeBackItems(items, a, buf);
+    return ok(Value.Unit);
+}
+
+pub fn array_sort_with(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sortWith requires an array receiver");
+    const items = ctx.args[0].Array.items;
+    if (ctx.args.len < 2) return arityErr("sortWith expects (comparator, ...)");
+    const comparator = ctx.args[1];
+    const len: i64 = @intCast(listLen(items));
+    const from = switch (try arrayOptIndex(a, ctx, 2, 0, "sortWith")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    const to = switch (try arrayOptIndex(a, ctx, 3, len, "sortWith")) {
+        .idx => |v| v,
+        .err => |e| return e,
+    };
+    if (from < 0 or to > len or from > to) {
+        return indexOob(a, try fmt(a, "sortWith: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
+    }
+    const buf = try snapshotItems(a, items);
+    const sub = buf[@intCast(from)..@intCast(to)];
+    var i: usize = 1;
+    while (i < sub.len) : (i += 1) {
+        var j = i;
+        while (j > 0) {
+            const n = switch (try invokeComparatorCompare(ctx, comparator, sub[j - 1], sub[j])) {
+                .n => |v| v,
+                .err => |e| return e,
+            };
+            if (n > 0) {
+                std.mem.swap(Value, &sub[j - 1], &sub[j]);
+                j -= 1;
+            } else break;
+        }
+    }
+    try writeBackItems(items, a, buf);
+    return ok(Value.Unit);
+}
+
+fn arraySumImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
+    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    var int_acc: i64 = 0;
+    var dbl_acc: f64 = 0.0;
+    var as_double = false;
+    for (items) |v| {
+        switch (v) {
+            .Int, .Long, .Short, .Byte => int_acc += v.asI64() orelse 0,
+            .Double => |d| {
+                if (!as_double) {
+                    dbl_acc = @floatFromInt(int_acc);
+                    as_double = true;
+                }
+                dbl_acc += d;
+            },
+            .Float => |f| {
+                if (!as_double) {
+                    dbl_acc = @floatFromInt(int_acc);
+                    as_double = true;
+                }
+                dbl_acc += @as(f64, f);
+            },
+            else => return typeErr(try fmt(a, "{s}: non-numeric element", .{what})),
+        }
+    }
+    if (as_double) return ok(.{ .Double = dbl_acc });
+    return ok(Value.newInt(int_acc));
+}
+
+pub fn array_sum_int(ctx: *CallCtx) Error!EvalResult {
+    return arraySumImpl(ctx, "Array.sum");
+}
+
+pub fn array_average_impl(ctx: *CallCtx) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr("Array.average requires a receiver");
+    const items = switch (try iterableItems(a, ctx.args[0], "Array.average")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (items.len == 0) return ok(.{ .Double = std.math.nan(f64) });
+    var acc: f64 = 0.0;
+    for (items) |v| {
+        acc += switch (v) {
+            .Int, .Long, .Short, .Byte => @floatFromInt(v.asI64() orelse 0),
+            .Double => |d| d,
+            .Float => |f| @as(f64, f),
+            else => return typeErr("Array.average: non-numeric element"),
+        };
+    }
+    return ok(.{ .Double = acc / @as(f64, @floatFromInt(items.len)) });
+}
+
+fn arrayMaxMinImpl(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0) return typeErr(try fmt(a, "{s} requires a receiver", .{what}));
+    const items = switch (try iterableItems(a, ctx.args[0], what)) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
+    if (items.len == 0) {
+        return try thrown(a, "kotlin.NoSuchElementException", try fmt(a, "{s}: empty", .{what}));
+    }
+    var best = items[0];
+    for (items[1..]) |v| {
+        const o = switch (try compareValues(a, v, best)) {
+            .order => |o| o,
+            .err => |e| return e,
+        };
+        const take = if (want_max) o == .gt else o == .lt;
+        if (take) best = v;
+    }
+    return ok(best);
+}
+
+pub fn array_max(ctx: *CallCtx) Error!EvalResult {
+    return arrayMaxMinImpl(ctx, true, "Array.max");
+}
+pub fn array_min(ctx: *CallCtx) Error!EvalResult {
+    return arrayMaxMinImpl(ctx, false, "Array.min");
+}
+
+// =====================================================================
+// Public re-exports for the interpreter's higher-order ops
+// =====================================================================
+
+/// Natural-order comparison exposed under the Rust name. Returns an
+/// ordering or a `RuntimeError` (as data) for incomparable values.
+pub fn compare_values(a: Allocator, x: Value, y: Value) Error!OrderResult {
+    return compareValuesPublic(a, x, y);
+}
+
+/// Drive a lazy `Value::Sequence` to completion. Returns the produced
+/// items or a `RuntimeError` (as data).
+pub fn materialise_sequence(a: Allocator, host: IntrinsicHost, out: Output, seq_val: Value) Error!SeqOutcome {
+    return materialiseSequence(a, host, out, seq_val);
+}
+
+/// Bounded sequence materialisation (stops after `max` items on the
+/// streaming fast path).
+pub fn materialise_sequence_bounded(a: Allocator, host: IntrinsicHost, out: Output, seq_val: Value, max: ?usize) Error!SeqOutcome {
+    return materialiseSequenceBounded(a, host, out, seq_val, max);
+}
+
+// =====================================================================
+// Tests
+// =====================================================================
+
+const testing = std.testing;
+
+test {
+    testing.refAllDecls(@This());
+}
+
+/// Minimal host that reports Unimplemented for callable invocations — the
+/// pure (non-HOF) intrinsics under test never reach those paths.
+const TestHarness = struct {
+    arena: std.heap.ArenaAllocator,
+    noop: runtime.NoopHost,
+    sink: runtime.CaptureOutput,
+
+    fn init() TestHarness {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .noop = runtime.NoopHost.init(std.heap.page_allocator),
+            .sink = runtime.CaptureOutput.init(std.heap.page_allocator),
+        };
+    }
+    fn deinit(self: *TestHarness) void {
+        self.arena.deinit();
+        self.noop.deinit();
+        self.sink.deinit();
+    }
+    fn ctx(self: *TestHarness, args: []const Value) CallCtx {
+        return .{
+            .args = args,
+            .out = self.sink.output(),
+            .host = self.noop.host(),
+            .allocator = self.arena.allocator(),
+        };
+    }
+};
+
+test "listOf builds a read-only list" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const args = [_]Value{ Value.newInt(1), Value.newInt(2), Value.newInt(3) };
+    var c = h.ctx(&args);
+    const r = try coll_list_of(&c);
+    try testing.expect(r == .ok);
+    try testing.expect(r.ok == .List);
+    try testing.expect(!r.ok.List.mutable);
+    try testing.expectEqual(@as(usize, 3), listLen(r.ok.List.items));
+}
+
+test "setOf dedupes structurally" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const args = [_]Value{ Value.newInt(1), Value.newInt(1), Value.newInt(2) };
+    var c = h.ctx(&args);
+    const r = try coll_set_of(&c);
+    try testing.expect(r == .ok and r.ok == .Set);
+    try testing.expectEqual(@as(usize, 2), listLen(r.ok.Set.items));
+}
+
+test "list get out of bounds throws IndexOutOfBoundsException" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const list = try makeList(a, &.{ Value.newInt(10), Value.newInt(20) }, false);
+    const args = [_]Value{ list, Value.newInt(5) };
+    var c = h.ctx(&args);
+    const r = try coll_list_get(&c);
+    try testing.expect(r == .err and r.err == .Thrown);
+    try testing.expect(r.err.Thrown == .Exception);
+}
+
+test "list get returns the element" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const list = try makeList(a, &.{ Value.newInt(10), Value.newInt(20) }, false);
+    const args = [_]Value{ list, Value.newInt(1) };
+    var c = h.ctx(&args);
+    const r = try coll_list_get(&c);
+    try testing.expect(r == .ok and r.ok == .Int and r.ok.Int == 20);
+}
+
+test "mapOf builds entries and get finds the value" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const p1 = try makePair(a, try makeStringOwned(a, "a"), Value.newInt(1));
+    const p2 = try makePair(a, try makeStringOwned(a, "b"), Value.newInt(2));
+    {
+        const args = [_]Value{ p1, p2 };
+        var c = h.ctx(&args);
+        const m = try coll_map_of(&c);
+        try testing.expect(m == .ok and m.ok == .Map);
+        try testing.expectEqual(@as(usize, 2), mapLen(m.ok.Map.entries));
+        const get_args = [_]Value{ m.ok, try makeStringOwned(a, "b") };
+        var gc = h.ctx(&get_args);
+        const gv = try coll_map_get(&gc);
+        try testing.expect(gv == .ok and gv.ok == .Int and gv.ok.Int == 2);
+    }
+}
+
+test "list sorted orders ascending" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const list = try makeList(a, &.{ Value.newInt(3), Value.newInt(1), Value.newInt(2) }, false);
+    const args = [_]Value{list};
+    var c = h.ctx(&args);
+    const r = try coll_list_sorted(&c);
+    try testing.expect(r == .ok and r.ok == .List);
+    const g = r.ok.List.items.borrow();
+    defer g.deinit();
+    try testing.expectEqual(@as(i32, 1), g.get().items[0].Int);
+    try testing.expectEqual(@as(i32, 2), g.get().items[1].Int);
+    try testing.expectEqual(@as(i32, 3), g.get().items[2].Int);
+}
+
+test "list reversed reverses" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const list = try makeList(a, &.{ Value.newInt(1), Value.newInt(2), Value.newInt(3) }, false);
+    const args = [_]Value{list};
+    var c = h.ctx(&args);
+    const r = try coll_list_reversed(&c);
+    const g = r.ok.List.items.borrow();
+    defer g.deinit();
+    try testing.expectEqual(@as(i32, 3), g.get().items[0].Int);
+    try testing.expectEqual(@as(i32, 1), g.get().items[2].Int);
+}
+
+test "mutable list add appends" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const list = try makeList(a, &.{Value.newInt(1)}, true);
+    const args = [_]Value{ list, Value.newInt(2) };
+    var c = h.ctx(&args);
+    const r = try coll_mut_list_add(&c);
+    try testing.expect(r == .ok and r.ok == .Bool and r.ok.Bool);
+    try testing.expectEqual(@as(usize, 2), listLen(list.List.items));
+}
+
+test "pair ctor and accessors" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const args = [_]Value{ Value.newInt(7), Value.newInt(8) };
+    var c = h.ctx(&args);
+    const p = try coll_pair_ctor(&c);
+    try testing.expect(p == .ok and p.ok == .Pair);
+    const fa = [_]Value{p.ok};
+    var fc = h.ctx(&fa);
+    const f = try pair_first(&fc);
+    try testing.expect(f == .ok and f.ok.Int == 7);
+    const s = try pair_second(&fc);
+    try testing.expect(s == .ok and s.ok.Int == 8);
+}
+
+test "triple ctor requires three args" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const args = [_]Value{ Value.newInt(1), Value.newInt(2) };
+    var c = h.ctx(&args);
+    const r = try coll_triple_ctor(&c);
+    try testing.expect(r == .err and r.err == .Arity);
+}
+
+test "int array of tags primitive kind" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const args = [_]Value{ Value.newInt(1), Value.newInt(2) };
+    var c = h.ctx(&args);
+    const r = try coll_int_array_of(&c);
+    try testing.expect(r == .ok and r.ok == .Array);
+    try testing.expectEqual(PrimitiveArrayKind.Int, r.ok.Array.prim.?);
+}
+
+test "array content equals" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const x = try makeArray(a, &.{ Value.newInt(1), Value.newInt(2) }, .Int);
+    const y = try makeArray(a, &.{ Value.newInt(1), Value.newInt(2) }, .Int);
+    const args = [_]Value{ x, y };
+    var c = h.ctx(&args);
+    const r = try array_content_equals(&c);
+    try testing.expect(r == .ok and r.ok == .Bool and r.ok.Bool);
+}
+
+test "list sum mixes int and double" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const list = try makeList(a, &.{ Value.newInt(1), .{ .Double = 2.5 } }, false);
+    const args = [_]Value{list};
+    var c = h.ctx(&args);
+    const r = try coll_list_sum(&c);
+    try testing.expect(r == .ok and r.ok == .Double);
+    try testing.expectEqual(@as(f64, 3.5), r.ok.Double);
+}
+
+test "primitive companion const for Int" {
+    const v = primitive_companion_const("Int", "MAX_VALUE").?;
+    try testing.expect(v == .Int and v.Int == std.math.maxInt(i32));
+    try testing.expect(primitive_companion_const("Int", "NOPE") == null);
+}
+
+test "compare values natural order" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = try compare_values(a, Value.newInt(1), Value.newInt(2));
+    try testing.expect(r == .order and r.order == .lt);
+}
