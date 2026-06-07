@@ -976,8 +976,30 @@ fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryToml)
 
     var line_it = std.mem.splitScalar(u8, text, '\n');
     while (line_it.next()) |raw_line| {
-        const line = stripComment(std.mem.trim(u8, raw_line, " \t\r"));
+        var line = stripComment(std.mem.trim(u8, raw_line, " \t\r"));
         if (line.len == 0) continue;
+
+        // Fold a multi-line array/inline-table value (e.g. `include = [`
+        // continued over several lines) into one logical line, matching
+        // the runtime pack loader's manifest reader. A value line that
+        // opens a bracket without closing it on the same line absorbs the
+        // following lines until one carries the closing `]`.
+        if (line[0] != '[' and
+            std.mem.indexOfScalar(u8, line, '=') != null and
+            std.mem.indexOfScalar(u8, line, '[') != null and
+            std.mem.indexOfScalar(u8, line, ']') == null)
+        {
+            var buf: std.ArrayList(u8) = .empty;
+            buf.appendSlice(a, line) catch return .{ .err = fail(a, "out of memory", .{}) };
+            while (line_it.next()) |cont_raw| {
+                const cont = stripComment(std.mem.trim(u8, cont_raw, " \t\r"));
+                if (cont.len == 0) continue;
+                buf.append(a, ' ') catch return .{ .err = fail(a, "out of memory", .{}) };
+                buf.appendSlice(a, cont) catch return .{ .err = fail(a, "out of memory", .{}) };
+                if (std.mem.indexOfScalar(u8, cont, ']') != null) break;
+            }
+            line = buf.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
+        }
 
         if (line[0] == '[') {
             if (std.mem.startsWith(u8, line, "[[")) {
@@ -1027,6 +1049,12 @@ fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryToml)
             .features => {
                 if (std.mem.eql(u8, key, "default")) {
                     cfg.features.default = parseStrArray(a, val) catch return .{ .err = fail(a, "out of memory", .{}) };
+                } else if (std.mem.startsWith(u8, std.mem.trimStart(u8, val, " \t"), "{")) {
+                    // Inline-table feature def, e.g.
+                    //   json = { sources = [...], deps = [...], requires = [...] }
+                    const def = parseInlineFeatureDef(a, key, val) catch
+                        return .{ .err = fail(a, "out of memory", .{}) };
+                    feature_defs.append(a, def) catch return .{ .err = fail(a, "out of memory", .{}) };
                 }
             },
             .feature_def => assignFeatureDef(a, &feature_defs.items[feature_defs.items.len - 1], key, val),
@@ -1142,6 +1170,49 @@ fn assignFeatureDef(a: std.mem.Allocator, f: *FeatureTomlDef, key: []const u8, v
     } else if (std.mem.eql(u8, key, "requires")) {
         f.requires = parseStrArray(a, val) catch &.{};
     }
+}
+
+/// Parse an inline-table feature def under `[features]`, e.g.
+/// `json = { sources = [...], deps = [...], requires = [...] }`. The
+/// array values may themselves contain commas, so each field's array is
+/// sliced by its `[ .. ]` span rather than split on commas.
+fn parseInlineFeatureDef(a: std.mem.Allocator, name: []const u8, val: []const u8) !FeatureTomlDef {
+    var def = FeatureTomlDef{ .name = a.dupe(u8, name) catch "" };
+    const fields = [_][]const u8{ "sources", "deps", "requires" };
+    for (fields) |fk| {
+        const arr = sliceInlineArray(val, fk) orelse continue;
+        if (std.mem.eql(u8, fk, "sources")) {
+            def.sources = try parseStrArray(a, arr);
+        } else if (std.mem.eql(u8, fk, "deps")) {
+            def.deps = try parseStrArray(a, arr);
+        } else if (std.mem.eql(u8, fk, "requires")) {
+            def.requires = try parseStrArray(a, arr);
+        }
+    }
+    return def;
+}
+
+/// Return the `[ ... ]` array text for `field = [ ... ]` inside an inline
+/// table, or null when the field is absent. Includes the brackets so the
+/// result feeds straight into `parseStrArray`.
+fn sliceInlineArray(table: []const u8, field: []const u8) ?[]const u8 {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, table, search_from, field)) |at| {
+        const after = at + field.len;
+        // Require the match to be a whole key: preceded by `{`/`,`/space and
+        // followed (after spaces) by `=`.
+        const before_ok = at == 0 or table[at - 1] == '{' or table[at - 1] == ',' or table[at - 1] == ' ';
+        var i = after;
+        while (i < table.len and (table[i] == ' ' or table[i] == '\t')) : (i += 1) {}
+        if (!before_ok or i >= table.len or table[i] != '=') {
+            search_from = after;
+            continue;
+        }
+        const open = std.mem.indexOfScalarPos(u8, table, i, '[') orelse return null;
+        const close = std.mem.indexOfScalarPos(u8, table, open, ']') orelse return null;
+        return table[open .. close + 1];
+    }
+    return null;
 }
 
 /// One `[bindings]` entry: `"fqn" = "host_symbol"` (the Symbol form) or
@@ -1543,6 +1614,54 @@ test "parseLibraryToml reads header, deps, bindings, source, features" {
     try std.testing.expectEqualStrings("core", cfg.features.default[0]);
     try std.testing.expectEqual(@as(usize, 1), cfg.features.defs.len);
     try std.testing.expectEqualStrings("json", cfg.features.defs[0].name);
+}
+
+test "parseLibraryToml folds multi-line arrays and inline-table features" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text =
+        \\[library]
+        \\id = "io.ktor"
+        \\version = "3.5.0"
+        \\
+        \\[[source]]
+        \\root = "upstream/ktor-http/common/src"
+        \\include = [
+        \\    "io/ktor/http/Url.kt",
+        \\    "io/ktor/http/Headers.kt",
+        \\    "io/ktor/http/HttpMethod.kt",
+        \\]
+        \\
+        \\[features]
+        \\default = []
+        \\json = { sources = ["klioMain/json"] }
+        \\client-upstream = { sources = [
+        \\    "upstream/a.kt",
+        \\    "shim/client-upstream",
+        \\], requires = ["client"] }
+        \\
+    ;
+    const res = parseLibraryToml(a, text);
+    const cfg = switch (res) {
+        .ok => |c| c,
+        .err => return error.TestParseFailed,
+    };
+    // Multi-line include array folded into three entries.
+    try std.testing.expectEqual(@as(usize, 1), cfg.source.len);
+    try std.testing.expectEqual(@as(usize, 3), cfg.source[0].include.len);
+    try std.testing.expectEqualStrings("io/ktor/http/Url.kt", cfg.source[0].include[0]);
+    try std.testing.expectEqualStrings("io/ktor/http/HttpMethod.kt", cfg.source[0].include[2]);
+    // Inline-table feature defs under `[features]` (sorted by name).
+    try std.testing.expectEqual(@as(usize, 2), cfg.features.defs.len);
+    try std.testing.expectEqualStrings("client-upstream", cfg.features.defs[0].name);
+    try std.testing.expectEqual(@as(usize, 2), cfg.features.defs[0].sources.len);
+    try std.testing.expectEqualStrings("upstream/a.kt", cfg.features.defs[0].sources[0]);
+    try std.testing.expectEqual(@as(usize, 1), cfg.features.defs[0].requires.len);
+    try std.testing.expectEqualStrings("client", cfg.features.defs[0].requires[0]);
+    try std.testing.expectEqualStrings("json", cfg.features.defs[1].name);
+    try std.testing.expectEqual(@as(usize, 1), cfg.features.defs[1].sources.len);
+    try std.testing.expectEqualStrings("klioMain/json", cfg.features.defs[1].sources[0]);
 }
 
 test "collectPackBindings: explicit entries sorted, then auto when enabled" {

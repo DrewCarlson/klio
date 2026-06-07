@@ -1,11 +1,11 @@
 [library]
 id = "kotlinx.atomicfu"
-version = "0.32.1"
+version = "0.33.0"
 abi = 1
 implicit_packages = []
 auto_bindings = true
 
-# Upstream kotlinx-atomicfu 0.32.1 commonMain, consumed straight from
+# Upstream kotlinx-atomicfu 0.33.0 commonMain, consumed straight from
 # the in-pack git submodule. `include` curates exactly the `expect`
 # API surface klio can parse + resolve; intrinsic-only files
 # (JS-mangling actuals, native locks) are excluded and re-declared in
