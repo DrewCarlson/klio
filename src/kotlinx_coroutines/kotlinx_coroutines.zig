@@ -1,1 +1,1140 @@
-//kotlinx_coroutines module — port in progress
+//! Layer 2 — the `kotlinx.coroutines` library.
+//!
+//! This module is a *client* of the Layer-1 core suspend engine
+//! (`ir.eval`): the high-level API (Dispatchers, `CoroutineScope`,
+//! Job, Channel, builders) lives in the Kotlin shim, and the few host
+//! hooks here only translate library calls into Layer-1 suspension.
+//! `delay`/`yield` raise a suspension carrying an opaque resume
+//! directive; the default cooperative interceptor (in `interp_ir`)
+//! decides when the parked activation resumes. The host never schedules
+//! from here — that is the interceptor's sole responsibility — and the
+//! core suspend engine never interprets the directive. A
+//! cancellation-token registry is shared between Jobs and their bodies;
+//! the Kotlin shim observes it through `__kxco_tokenIsCancelled`.
+
+const std = @import("std");
+const runtime = @import("runtime");
+const stdlib = @import("stdlib");
+
+const Value = runtime.Value;
+const RuntimeError = runtime.RuntimeError;
+const EvalResult = runtime.EvalResult;
+const CallCtx = runtime.CallCtx;
+const StringRef = runtime.StringRef;
+const InstanceData = runtime.InstanceData;
+const ObjRef = runtime.ObjRef;
+const HostBindings = stdlib.HostBindings;
+
+/// State for a klio-native Channel: a bounded FIFO with optional
+/// suspend-waiters. Stored per-instance keyed on the synthesised
+/// `Instance.identity` so the Zig intrinsic seam can find it from any
+/// binding entry-point. `closed` short-circuits future receives to
+/// throw `ClosedReceiveChannelException` after the buffer drains.
+const ChannelState = struct {
+    buffer: Deque(Value),
+    capacity: usize,
+    closed: bool,
+    /// Slot ids of `receive()` callers currently parked because the
+    /// buffer was empty. The next `send` resumes the head waiter.
+    receive_waiters: Deque(i64),
+    /// Iterator-style waiters: a parked `for (v in ch)` `hasNext()`
+    /// caller plus a handle to its iterator instance, so the next
+    /// send can stash the value in `__pending__` on the iterator
+    /// and resume hasNext with `Bool(true)` (instead of the value).
+    receive_iter_waiters: Deque(IterWaiter),
+    /// Slot ids of `send(v)` callers parked because the buffer was
+    /// full. The next `receive()` resumes the head and admits its
+    /// pending value into the buffer.
+    send_waiters: Deque(SendWaiter),
+
+    const IterWaiter = struct { slot: i64, iter: ObjRef(InstanceData) };
+    const SendWaiter = struct { slot: i64, value: Value };
+
+    fn init(capacity: usize) ChannelState {
+        return .{
+            .buffer = Deque(Value).empty,
+            .capacity = capacity,
+            .closed = false,
+            .receive_waiters = Deque(i64).empty,
+            .receive_iter_waiters = Deque(IterWaiter).empty,
+            .send_waiters = Deque(SendWaiter).empty,
+        };
+    }
+
+    fn deinit(self: *ChannelState, allocator: std.mem.Allocator) void {
+        self.buffer.deinit(allocator);
+        self.receive_waiters.deinit(allocator);
+        self.receive_iter_waiters.deinit(allocator);
+        self.send_waiters.deinit(allocator);
+    }
+};
+
+/// Minimal FIFO deque over an `ArrayList`. `pushBack` appends; `popFront`
+/// removes from the head. Mirrors the subset of `VecDeque` the channel
+/// state uses (push_back / pop_front / drain / len / is_empty).
+fn Deque(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        items: std.ArrayList(T) = .empty,
+
+        pub const empty: Self = .{ .items = .empty };
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.items.deinit(allocator);
+        }
+
+        fn pushBack(self: *Self, allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!void {
+            try self.items.append(allocator, v);
+        }
+
+        fn popFront(self: *Self) ?T {
+            if (self.items.items.len == 0) return null;
+            return self.items.orderedRemove(0);
+        }
+
+        fn len(self: *const Self) usize {
+            return self.items.items.len;
+        }
+
+        fn isEmpty(self: *const Self) bool {
+            return self.items.items.len == 0;
+        }
+
+        /// Drain every element into an owned slice (FIFO order), leaving
+        /// the deque empty. Caller frees the returned slice.
+        fn drain(self: *Self, allocator: std.mem.Allocator) std.mem.Allocator.Error![]T {
+            const out = try self.items.toOwnedSlice(allocator);
+            self.items = .empty;
+            return out;
+        }
+    };
+}
+
+/// Layer-2 coroutine library state for one interpreting thread — the
+/// single owned per-thread context for this module. It sits inside the
+/// publication boundary: cancellation tokens, the scheduler queue, and
+/// the channel registry belong to the thread driving the coroutines and
+/// are never shared across threads directly. One grouped struct (rather
+/// than scattered statics) so each OS thread gets exactly one, and so
+/// the boundary is one named thing.
+const CoroutineRegistry = struct {
+    /// Cancelled cancellation-token ids.
+    cancelled_tokens: std.AutoHashMapUnmanaged(i64, void) = .empty,
+    /// Monotonic cancellation-token id counter.
+    next_token: i64 = 1,
+    /// Opaque scheduler-handle FIFO.
+    sched_queue: std.ArrayList(i64) = .empty,
+    /// klio-native channel registry keyed on the synthesised channel
+    /// `Instance.identity`. Lets the channel send/receive bindings find
+    /// their state from any entry-point without threading a host handle
+    /// through the call stack.
+    channels: std.AutoHashMapUnmanaged(u64, ChannelState) = .empty,
+};
+
+/// Per-thread registry storage. Zig's `threadlocal` gives each OS thread
+/// its own instance; the page allocator backs the heap the registry
+/// holds, mirroring the Rust `thread_local!` that never frees its
+/// process-lifetime maps.
+threadlocal var coro_reg: CoroutineRegistry = .{};
+
+fn regAllocator() std.mem.Allocator {
+    return std.heap.page_allocator;
+}
+
+/// `Channel(capacity)` — klio-native factory. Bypasses upstream
+/// `BufferedChannel`'s CAS-loop allocation (klio's `kotlinx.atomicfu`
+/// shims don't implement real CAS, so the upstream impl spins). Returns
+/// a synthesised `Value.Instance` whose `identity` keys a `ChannelState`
+/// in this thread's registry; every channel member binding finds the
+/// state by that key.
+fn channelCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    // First arg is the capacity (Int / Long). Defaults / overloads ship
+    // `0` (RENDEZVOUS) and `-1` (UNLIMITED) as sentinel ints.
+    const cap_arg: Value = if (ctx.args.len > 0) ctx.args[0] else Value.newInt(0);
+    const capacity: i64 = switch (cap_arg) {
+        .Int => |n| @as(i64, n),
+        .Long => |n| n,
+        else => 0,
+    };
+    const effective_cap: usize = if (capacity < 0)
+        std.math.maxInt(usize) // UNLIMITED / BUFFERED
+    else if (capacity == 0)
+        1 // rendezvous degenerate: one-slot buffer in our model
+    else
+        @intCast(capacity);
+    const id = ctx.host.allocInstanceId();
+    try coro_reg.channels.put(regAllocator(), id, ChannelState.init(effective_cap));
+    const inst = try ctx.host.newSynthInstance("kotlinx.coroutines.channels.KlioChannel", id, &.{});
+    return .{ .ok = inst };
+}
+
+fn channelId(arg0: *const Value) ?u64 {
+    return switch (arg0.*) {
+        .Instance => |i| i.asPtr().identity,
+        else => null,
+    };
+}
+
+const ChannelSendOutcome = union(enum) {
+    HandToReceiver: struct { slot: i64, value: Value },
+    HandToIter: i64,
+    Buffered,
+    ParkOnSlot: i64,
+};
+
+fn channelSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.send expects a receiver" } };
+    const recv = ctx.args[0];
+    const value: Value = if (ctx.args.len > 1) ctx.args[1] else .Unit;
+    const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.send: bad receiver" } };
+    // Direct rendezvous: if a receiver is parked, hand the value
+    // straight to it without buffering. Else if buffer has room, push
+    // and return. Else park this sender and suspend.
+    const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.send: missing state" } };
+    if (state.closed) return .{ .err = .{ .Thrown = try closedSendExc(ctx.allocator) } };
+
+    var outcome: ChannelSendOutcome = undefined;
+    // Iterator waiters take priority — write the value into the iter's
+    // `__pending__` field and resume with Bool(true).
+    if (state.receive_iter_waiters.popFront()) |w| {
+        try w.iter.asPtr().define(regAllocator(), "__pending__", value);
+        outcome = .{ .HandToIter = w.slot };
+    } else if (state.receive_waiters.popFront()) |slot| {
+        outcome = .{ .HandToReceiver = .{ .slot = slot, .value = value } };
+    } else if (state.buffer.len() < state.capacity) {
+        try state.buffer.pushBack(regAllocator(), value);
+        outcome = .Buffered;
+    } else {
+        const slot = allocKxcoSlot();
+        try state.send_waiters.pushBack(regAllocator(), .{ .slot = slot, .value = value });
+        outcome = .{ .ParkOnSlot = slot };
+    }
+
+    switch (outcome) {
+        .HandToReceiver => |h| {
+            ctx.host.coroutineResumeSlotValue(h.slot, h.value);
+            return .{ .ok = .Unit };
+        },
+        .HandToIter => |slot| {
+            ctx.host.coroutineResumeSlotValue(slot, .{ .Bool = true });
+            return .{ .ok = .Unit };
+        },
+        .Buffered => return .{ .ok = .Unit },
+        .ParkOnSlot => |slot| {
+            ctx.host.coroutineArmSlot(slot);
+            return .{ .err = .{ .Suspend = -1 } };
+        },
+    }
+}
+
+const ChannelTrySendOutcome = union(enum) {
+    HandToReceiver: struct { slot: i64, value: Value },
+    Success,
+    Full,
+    Closed,
+};
+
+fn channelTrySend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.trySend expects a receiver" } };
+    const recv = ctx.args[0];
+    const value: Value = if (ctx.args.len > 1) ctx.args[1] else .Unit;
+    const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.trySend: bad receiver" } };
+    const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.trySend: missing state" } };
+
+    var outcome: ChannelTrySendOutcome = undefined;
+    if (state.closed) {
+        outcome = .Closed;
+    } else if (state.receive_waiters.popFront()) |slot| {
+        outcome = .{ .HandToReceiver = .{ .slot = slot, .value = value } };
+    } else if (state.buffer.len() < state.capacity) {
+        try state.buffer.pushBack(regAllocator(), value);
+        outcome = .Success;
+    } else {
+        outcome = .Full;
+    }
+
+    const result: Value = switch (outcome) {
+        .HandToReceiver => |h| blk: {
+            ctx.host.coroutineResumeSlotValue(h.slot, h.value);
+            break :blk .{ .Bool = true };
+        },
+        .Success => .{ .Bool = true },
+        .Full, .Closed => .{ .Bool = false },
+    };
+    return .{ .ok = result };
+}
+
+const ChannelReceiveOutcome = union(enum) {
+    Got: struct { value: Value, resumed: ?i64 },
+    ParkOnSlot: i64,
+};
+
+fn channelReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.receive expects a receiver" } };
+    const recv = ctx.args[0];
+    const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.receive: bad receiver" } };
+    const state = coro_reg.channels.getPtr(id) orelse return .{ .err = .{ .Type = "Channel.receive: missing state" } };
+
+    var outcome: ChannelReceiveOutcome = undefined;
+    if (state.buffer.popFront()) |v| {
+        const resumed_sender = state.send_waiters.popFront();
+        if (resumed_sender) |sw| {
+            try state.buffer.pushBack(regAllocator(), sw.value);
+        }
+        outcome = .{ .Got = .{ .value = v, .resumed = if (resumed_sender) |sw| sw.slot else null } };
+    } else if (state.closed) {
+        return .{ .err = .{ .Thrown = try closedReceiveExc(ctx.allocator) } };
+    } else {
+        const slot = allocKxcoSlot();
+        try state.receive_waiters.pushBack(regAllocator(), slot);
+        outcome = .{ .ParkOnSlot = slot };
+    }
+
+    switch (outcome) {
+        .Got => |g| {
+            if (g.resumed) |slot| ctx.host.coroutineResumeSlot(slot);
+            return .{ .ok = g.value };
+        },
+        .ParkOnSlot => |slot| {
+            ctx.host.coroutineArmSlot(slot);
+            return .{ .err = .{ .Suspend = -1 } };
+        },
+    }
+}
+
+fn channelTryReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.tryReceive expects a receiver" } };
+    const recv = ctx.args[0];
+    const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.tryReceive: bad receiver" } };
+
+    var value: ?Value = null;
+    var resumed_slot: ?i64 = null;
+    if (coro_reg.channels.getPtr(id)) |state| {
+        if (state.buffer.popFront()) |v| {
+            const resumed_sender = state.send_waiters.popFront();
+            if (resumed_sender) |sw| {
+                try state.buffer.pushBack(regAllocator(), sw.value);
+                resumed_slot = sw.slot;
+            }
+            value = v;
+        }
+        // else: closed or empty — value stays null.
+    }
+    if (resumed_slot) |slot| ctx.host.coroutineResumeSlot(slot);
+    return .{ .ok = value orelse .Null };
+}
+
+fn channelClose(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.close expects a receiver" } };
+    const recv = ctx.args[0];
+    const id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.close: bad receiver" } };
+
+    if (coro_reg.channels.getPtr(id)) |state| {
+        state.closed = true;
+        const recvs = try state.receive_waiters.drain(regAllocator());
+        defer regAllocator().free(recvs);
+        const iters = try state.receive_iter_waiters.drain(regAllocator());
+        defer regAllocator().free(iters);
+        const sends = try state.send_waiters.drain(regAllocator());
+        defer regAllocator().free(sends);
+
+        const exc = try closedReceiveExc(ctx.allocator);
+        for (recvs) |slot| {
+            const payload = try ctx.allocator.create(Value);
+            payload.* = exc;
+            const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
+            ctx.host.coroutineResumeSlotValue(slot, failure);
+        }
+        // Iterator-style waiters resume with `Bool(false)` so the
+        // for-loop hasNext() returns false and the loop exits.
+        for (iters) |w| {
+            ctx.host.coroutineResumeSlotValue(w.slot, .{ .Bool = false });
+        }
+        const send_exc = try closedSendExc(ctx.allocator);
+        for (sends) |sw| {
+            const payload = try ctx.allocator.create(Value);
+            payload.* = send_exc;
+            const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
+            ctx.host.coroutineResumeSlotValue(sw.slot, failure);
+        }
+    }
+    return .{ .ok = .{ .Bool = true } };
+}
+
+fn channelIsClosedForSend(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "isClosedForSend expects a receiver" } };
+    const recv = ctx.args[0];
+    const id = channelId(&recv) orelse return .{ .err = .{ .Type = "isClosedForSend: bad receiver" } };
+    const closed = if (coro_reg.channels.getPtr(id)) |s| s.closed else true;
+    return .{ .ok = .{ .Bool = closed } };
+}
+
+fn channelIsClosedForReceive(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "isClosedForReceive expects a receiver" } };
+    const recv = ctx.args[0];
+    const id = channelId(&recv) orelse return .{ .err = .{ .Type = "isClosedForReceive: bad receiver" } };
+    const drained_closed = if (coro_reg.channels.getPtr(id)) |s| (s.closed and s.buffer.isEmpty()) else true;
+    return .{ .ok = .{ .Bool = drained_closed } };
+}
+
+fn channelIterator(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "Channel.iterator expects a receiver" } };
+    const recv = ctx.args[0];
+    const ch_id = channelId(&recv) orelse return .{ .err = .{ .Type = "Channel.iterator: bad receiver" } };
+    const id = ctx.host.allocInstanceId();
+    // The channel id is an opaque u64 stored bit-for-bit in a Long slot.
+    const fields = [_]InstanceData.Field{
+        .{ .name = "__channel_id__", .value = .{ .Long = @bitCast(ch_id) } },
+        .{ .name = "__pending__", .value = .Null },
+    };
+    const inst = try ctx.host.newSynthInstance("kotlinx.coroutines.channels.KlioChannelIterator", id, &fields);
+    return .{ .ok = inst };
+}
+
+fn channelIterHasNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "hasNext expects a receiver" } };
+    const recv = ctx.args[0];
+    const iter_inst: ObjRef(InstanceData), const ch_id: u64 = switch (recv) {
+        .Instance => |i| blk: {
+            // The channel id was stored bit-for-bit; recover the opaque u64.
+            const cid: u64 = if (i.asPtr().get("__channel_id__")) |v| switch (v) {
+                .Long => |n| @bitCast(n),
+                .Int => |n| @as(u64, @bitCast(@as(i64, n))),
+                else => return .{ .err = .{ .Type = "hasNext: missing channel id" } },
+            } else return .{ .err = .{ .Type = "hasNext: missing channel id" } };
+            break :blk .{ i, cid };
+        },
+        else => return .{ .err = .{ .Type = "hasNext: bad receiver" } },
+    };
+    // Already have a cached pending value? Report true without touching
+    // the channel.
+    if (iter_inst.asPtr().get("__pending__")) |c| {
+        if (c != .Null) return .{ .ok = .{ .Bool = true } };
+    }
+    // Try a synchronous pull. If the buffer holds a value, cache it and
+    // return true; if the channel is drained-and-closed, return false;
+    // otherwise queue an iterator-style waiter and suspend.
+    var maybe_v: ?Value = null;
+    var resumed_slot: ?i64 = null;
+    var closed = false;
+    var had_state = false;
+    if (coro_reg.channels.getPtr(ch_id)) |state| {
+        had_state = true;
+        if (state.buffer.popFront()) |v| {
+            const resumed_sender = state.send_waiters.popFront();
+            if (resumed_sender) |sw| {
+                try state.buffer.pushBack(regAllocator(), sw.value);
+                resumed_slot = sw.slot;
+            }
+            maybe_v = v;
+        } else {
+            closed = state.closed;
+        }
+    }
+    if (had_state) {
+        if (resumed_slot) |slot| ctx.host.coroutineResumeSlot(slot);
+        if (maybe_v) |v| {
+            try iter_inst.asPtr().define(regAllocator(), "__pending__", v);
+            return .{ .ok = .{ .Bool = true } };
+        }
+        if (closed) return .{ .ok = .{ .Bool = false } };
+    }
+    const slot = allocKxcoSlot();
+    if (coro_reg.channels.getPtr(ch_id)) |state| {
+        try state.receive_iter_waiters.pushBack(regAllocator(), .{ .slot = slot, .iter = iter_inst });
+    }
+    ctx.host.coroutineArmSlot(slot);
+    return .{ .err = .{ .Suspend = -1 } };
+}
+
+fn channelIterNext(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "next expects a receiver" } };
+    const recv = ctx.args[0];
+    const inst: ObjRef(InstanceData) = switch (recv) {
+        .Instance => |i| i,
+        else => return .{ .err = .{ .Type = "next: bad receiver" } },
+    };
+    if (inst.asPtr().get("__pending__")) |v| {
+        if (v != .Null) {
+            try inst.asPtr().define(regAllocator(), "__pending__", .Null);
+            return .{ .ok = v };
+        }
+    }
+    return .{ .err = .{ .Thrown = .{ .Exception = .{
+        .fqn = try StringRef.init(ctx.allocator, "kotlin.NoSuchElementException"),
+        .message = try StringRef.init(ctx.allocator, "ChannelIterator.next called before hasNext"),
+        .cause = null,
+    } } } };
+}
+
+fn channelIsEmpty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) return .{ .err = .{ .Arity = "isEmpty expects a receiver" } };
+    const recv = ctx.args[0];
+    const id = channelId(&recv) orelse return .{ .err = .{ .Type = "isEmpty: bad receiver" } };
+    const empty = if (coro_reg.channels.getPtr(id)) |s| s.buffer.isEmpty() else true;
+    return .{ .ok = .{ .Bool = empty } };
+}
+
+fn closedReceiveExc(allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
+    return .{ .Exception = .{
+        .fqn = try StringRef.init(allocator, "kotlinx.coroutines.channels.ClosedReceiveChannelException"),
+        .message = try StringRef.init(allocator, "Channel was closed"),
+        .cause = null,
+    } };
+}
+
+fn closedSendExc(allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
+    return .{ .Exception = .{
+        .fqn = try StringRef.init(allocator, "kotlinx.coroutines.channels.ClosedSendChannelException"),
+        .message = try StringRef.init(allocator, "Channel was closed"),
+        .cause = null,
+    } };
+}
+
+/// Job.cancel(...) — wake every parked timed activation (delay /
+/// withTimeout suspension) with a `CancellationException` so user
+/// `try { … } catch (e: CancellationException)` arms fire and
+/// `withTimeoutOrNull` observes the timeout. Indefinite parks (job-join,
+/// channel rendezvous) aren't touched.
+///
+/// args[0] is the Job receiver. args[1], if present, is the
+/// CancellationException cause supplied by the caller (e.g.
+/// `TimeoutCoroutine.run` calls `cancelCoroutine(TimeoutCancellationException(...))`).
+/// Surface that exception to the parked activations so a catch arm typed
+/// on the cause's concrete class (TimeoutCancellationException for
+/// withTimeoutOrNull) fires correctly.
+fn jobCancel(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    var cause: ?Value = null;
+    if (ctx.args.len > 1) {
+        for (ctx.args[1..]) |v| {
+            switch (v) {
+                .Exception, .Instance => {
+                    cause = v;
+                    break;
+                },
+                else => {},
+            }
+        }
+    }
+    ctx.host.coroutineCancelTimedParksWith(cause);
+    return .{ .ok = .{ .Bool = true } };
+}
+
+/// `yield()` — cooperative reschedule: park with a zero-ms wakeup so
+/// every other ready coroutine runs before this one continues.
+fn yieldNow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    _ = ctx;
+    return .{ .err = .{ .Suspend = 0 } };
+}
+
+/// `runBlocking { ... }` — drive the block as the root of a cooperative
+/// coroutine. The interpreter's scheduler interleaves launched children
+/// at suspension points and advances *virtual* time for `delay`, so the
+/// OS thread never sleeps.
+fn runBlocking(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) {
+        return .{ .err = .{ .Type = "runBlocking: expected the block lambda as the trailing arg" } };
+    }
+    const block = ctx.args[ctx.args.len - 1];
+    // Resolve a CoroutineScope receiver so `this.launch { … }` inside the
+    // block dispatches the shim extension. GlobalScope is the singleton
+    // the shim publishes; fall back to Null if the pack hasn't been
+    // registered yet (e.g. unit tests with NoopHost).
+    const scope = ctx.host.lookupGlobal("GlobalScope") orelse Value.Null;
+    return ctx.host.runBlocking(&block, &scope, ctx.out);
+}
+
+/// Top-level `delay(ms)` mirror — satisfies the suspend shim function
+/// directly so the IR doesn't run the placeholder body.
+fn delayTopLevel(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return delayMillis(ctx);
+}
+
+/// `delay(ms)` — suspend the calling coroutine for `ms` of virtual time.
+/// The cooperative driver parks the activation and resumes it once
+/// virtual time advances past the wakeup; sibling coroutines run in the
+/// meantime. No OS sleep.
+fn delayMillis(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const ms: i64 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .err = .{ .Type = "kotlinx.coroutines.delay: argument must be Long" } },
+    };
+    return .{ .err = .{ .Suspend = @max(ms, 0) } };
+}
+
+/// Wall-clock time in milliseconds since the Unix epoch.
+fn currentTimeMillis(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    _ = ctx;
+    var ts: std.os.linux.timespec = undefined;
+    const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
+    const t: i64 = if (std.os.linux.errno(rc) == .SUCCESS)
+        @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms)
+    else
+        0;
+    return .{ .ok = .{ .Long = t } };
+}
+
+fn tokenCreate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    _ = ctx;
+    const id = coro_reg.next_token;
+    coro_reg.next_token = coro_reg.next_token +% 1;
+    return .{ .ok = .{ .Long = id } };
+}
+
+fn tokenCancel(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const id: i64 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .err = .{ .Type = "tokenCancel: argument must be Long" } },
+    };
+    try coro_reg.cancelled_tokens.put(regAllocator(), id, {});
+    return .{ .ok = .Unit };
+}
+
+fn tokenIsCancelled(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const id: i64 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .ok = .{ .Bool = false } },
+    };
+    if (id == 0) return .{ .ok = .{ .Bool = false } };
+    const is_cancelled = coro_reg.cancelled_tokens.contains(id);
+    return .{ .ok = .{ .Bool = is_cancelled } };
+}
+
+fn schedulerEnqueue(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const h: i64 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .err = .{ .Type = "schedulerEnqueue: argument must be Long" } },
+    };
+    try coro_reg.sched_queue.append(regAllocator(), h);
+    return .{ .ok = .Unit };
+}
+
+/// `kotlinx.coroutines.internal.__kxco_systemProp(name): String?` —
+/// reads tuning out of the host environment so kxco honors the
+/// `kotlinx.coroutines.*` knobs JVM callers spell via
+/// `System.getProperty`. Probes the env for the exact property name
+/// first, then a `.` → `_` alias.
+fn kxcoSystemProp(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const key: []const u8 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .String => |s| s.asPtr().*,
+        else => return .{ .ok = .Null },
+    };
+    if (lookupEnv(ctx.allocator, key)) |v| {
+        return .{ .ok = .{ .String = try StringRef.init(ctx.allocator, v) } };
+    }
+    // `.` → `_` alias.
+    var alias_buf = try ctx.allocator.alloc(u8, key.len);
+    defer ctx.allocator.free(alias_buf);
+    var differs = false;
+    for (key, 0..) |c, i| {
+        if (c == '.') {
+            alias_buf[i] = '_';
+            differs = true;
+        } else {
+            alias_buf[i] = c;
+        }
+    }
+    if (differs) {
+        if (lookupEnv(ctx.allocator, alias_buf)) |v| {
+            return .{ .ok = .{ .String = try StringRef.init(ctx.allocator, v) } };
+        }
+    }
+    return .{ .ok = .Null };
+}
+
+/// Read an environment variable into freshly allocated bytes, or null
+/// when unset. The returned slice (when non-null) is owned by `allocator`.
+/// Zig 0.16 has no global env accessor (the environment is handed to
+/// `main` rather than stored in a static), so the process environment is
+/// read from `/proc/self/environ`, the kernel's NUL-delimited
+/// `KEY=VALUE` view. Any read failure is treated as "unset" (null).
+fn lookupEnv(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    const linux = std.os.linux;
+    const fd_raw = linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd_raw) != .SUCCESS) return null;
+    const fd: i32 = @intCast(fd_raw);
+    defer _ = linux.close(fd);
+
+    var contents: std.ArrayList(u8) = .empty;
+    defer contents.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = linux.read(fd, &buf, buf.len);
+        if (linux.errno(n) != .SUCCESS) return null;
+        if (n == 0) break;
+        contents.appendSlice(allocator, buf[0..n]) catch return null;
+    }
+
+    var it = std.mem.splitScalar(u8, contents.items, 0);
+    while (it.next()) |entry| {
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        if (std.mem.eql(u8, entry[0..eq], name)) {
+            return allocator.dupe(u8, entry[eq + 1 ..]) catch return null;
+        }
+    }
+    return null;
+}
+
+/// `kotlinx.coroutines.internal.synchronizedImpl(lock, block)` — klio's
+/// platform actual for the kxco internal monitor primitive. Routes
+/// through the same per-object monitor as `kotlin.synchronized` so
+/// atomicfu locks, kxco internals (`LimitedDispatcher`, `ThreadSafeHeap`,
+/// …), and any user `synchronized(lock) { … }` call that the resolver
+/// lowered to kxco's `synchronized` inline body all share one mutex.
+fn synchronizedImpl(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return stdlib.implementations.concurrent_synchronized(ctx);
+}
+
+fn spawnLaunchBlock(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) {
+        return .{ .err = .{ .Type = "__kxco_spawn: expected the launch block as the first arg" } };
+    }
+    const lam = ctx.args[0];
+    const scope = ctx.host.lookupGlobal("GlobalScope") orelse Value.Null;
+    if (try ctx.host.coroutineLaunch(&lam, &scope, ctx.out)) |e| {
+        return .{ .err = e };
+    }
+    return .{ .ok = .Unit };
+}
+
+/// `__kxco_dispatch { … }` — dispatch a coroutine body onto the real
+/// parallel worker pool (`Dispatchers.Default`). Returns an opaque job
+/// id the caller joins with `__kxco_joinDispatched`. The body, its
+/// captures, and any value it returns cross threads; the host
+/// `publish_deep`'s the escaping graph before the worker starts and again
+/// on completion (mirrors the spawned-thread boundary).
+fn dispatchCoroutine(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) {
+        return .{ .err = .{ .Type = "__kxco_dispatch: expected the coroutine block as the first arg" } };
+    }
+    const block = ctx.args[0];
+    return switch (try ctx.host.dispatchCoroutine(&block, false, ctx.out)) {
+        .ok => |id| .{ .ok = .{ .Long = @bitCast(id) } },
+        .err => |e| .{ .err = e },
+    };
+}
+
+/// `__kxco_dispatchIo { … }` — same as `__kxco_dispatch` but routes to
+/// the elastic (`Dispatchers.IO`) pool for blocking offload.
+fn dispatchCoroutineIo(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) {
+        return .{ .err = .{ .Type = "__kxco_dispatchIo: expected the coroutine block as the first arg" } };
+    }
+    const block = ctx.args[0];
+    return switch (try ctx.host.dispatchCoroutine(&block, true, ctx.out)) {
+        .ok => |id| .{ .ok = .{ .Long = @bitCast(id) } },
+        .err => |e| .{ .err = e },
+    };
+}
+
+/// `__kxco_joinDispatched(id)` — block the calling coroutine's thread
+/// until the dispatched job completes, establishing the completion →
+/// joiner happens-before edge.
+fn joinDispatched(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const id: i64 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .err = .{ .Type = "__kxco_joinDispatched: argument must be Long" } },
+    };
+    // The job id was stored bit-for-bit; recover the opaque u64.
+    const job: u64 = @bitCast(id);
+    if (try ctx.host.joinDispatched(job)) |e| {
+        return .{ .err = e };
+    }
+    return .{ .ok = .Unit };
+}
+
+/// Park the active `suspendCoroutine` continuation on the scheduler's
+/// resume queue. The interpreter fires `cont.resume(Unit)` on each parked
+/// continuation between rounds, advancing the corresponding paused frame.
+fn scheduleResume(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len == 0) {
+        return .{ .err = .{ .Type = "__kxco_scheduleResume: expected the continuation arg" } };
+    }
+    const cont = ctx.args[0];
+    try ctx.host.scheduler().scheduleResume(cont);
+    return .{ .ok = .Unit };
+}
+
+/// Process-global slot-id counter shared by every kxco rendezvous site.
+/// Process-global so cross-thread routing (slot → owning driver mailbox)
+/// cannot alias an id minted on another OS thread. Offset above the
+/// `kotlin.coroutines` layer's range so the two suspension surfaces never
+/// alias in the global slot-owner table.
+var kxco_next_slot: std.atomic.Value(i64) = std.atomic.Value(i64).init(1 << 48);
+
+fn allocKxcoSlot() i64 {
+    return kxco_next_slot.fetchAdd(1, .monotonic);
+}
+
+/// `__kxco_newSlot()` — a fresh unique slot id. Slots back indefinite
+/// parking: a coroutine parks on a slot and an explicit event resumes it
+/// (job completion, channel handoff).
+fn newSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    _ = ctx;
+    return .{ .ok = .{ .Long = allocKxcoSlot() } };
+}
+
+/// `__kxco_parkSlot(slot)` — record that the current coroutine is waiting
+/// on `slot`, then suspend indefinitely. The active interceptor binds the
+/// resulting parked token to the slot so a later `__kxco_resumeSlot(slot)`
+/// can resume exactly this activation.
+fn parkSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const slot: i64 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .err = .{ .Type = "__kxco_parkSlot: argument must be Long" } },
+    };
+    ctx.host.coroutineParkSlot(slot);
+    return .{ .err = .{ .Suspend = -1 } };
+}
+
+/// `__kxco_resumeSlot(slot)` — make the coroutine waiting on `slot` ready.
+/// No-op if nothing is parked on it yet; the Kotlin waiter re-checks its
+/// condition after each park so a missed resume just causes a re-park.
+fn resumeSlot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    const slot: i64 = switch (if (ctx.args.len > 0) ctx.args[0] else Value.Null) {
+        .Long => |l| l,
+        .Int => |i| @as(i64, i),
+        else => return .{ .err = .{ .Type = "__kxco_resumeSlot: argument must be Long" } },
+    };
+    ctx.host.coroutineResumeSlot(slot);
+    return .{ .ok = .Unit };
+}
+
+/// Drain the scheduler queue, returning its length as a Kotlin Int count.
+fn schedulerDrainCount(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    _ = ctx;
+    const n: i32 = @intCast(coro_reg.sched_queue.items.len);
+    coro_reg.sched_queue.clearRetainingCapacity();
+    return .{ .ok = Value.newInt(@as(i64, n)) };
+}
+
+/// The `(fqn, fn)` binding table — the faithful translation of the Rust
+/// `host_bindings!` invocation.
+const BINDINGS = [_]struct { fqn: []const u8, f: runtime.StdlibFn }{
+    .{ .fqn = "kotlinx.coroutines.__kxco_delayMillis", .f = delayMillis },
+    .{ .fqn = "kotlinx.coroutines.__kxco_currentTimeMillis", .f = currentTimeMillis },
+    .{ .fqn = "kotlinx.coroutines.__kxco_tokenCreate", .f = tokenCreate },
+    .{ .fqn = "kotlinx.coroutines.__kxco_tokenCancel", .f = tokenCancel },
+    .{ .fqn = "kotlinx.coroutines.__kxco_tokenIsCancelled", .f = tokenIsCancelled },
+    .{ .fqn = "kotlinx.coroutines.__kxco_schedulerEnqueue", .f = schedulerEnqueue },
+    .{ .fqn = "kotlinx.coroutines.__kxco_schedulerDrainCount", .f = schedulerDrainCount },
+    .{ .fqn = "kotlinx.coroutines.__kxco_spawn", .f = spawnLaunchBlock },
+    .{ .fqn = "kotlinx.coroutines.__kxco_dispatch", .f = dispatchCoroutine },
+    .{ .fqn = "kotlinx.coroutines.internal.synchronizedImpl", .f = synchronizedImpl },
+    .{ .fqn = "kotlinx.coroutines.internal.__kxco_systemProp", .f = kxcoSystemProp },
+    .{ .fqn = "kotlinx.coroutines.__kxco_dispatchIo", .f = dispatchCoroutineIo },
+    .{ .fqn = "kotlinx.coroutines.__kxco_joinDispatched", .f = joinDispatched },
+    .{ .fqn = "kotlinx.coroutines.__kxco_scheduleResume", .f = scheduleResume },
+    .{ .fqn = "kotlinx.coroutines.__kxco_newSlot", .f = newSlot },
+    .{ .fqn = "kotlinx.coroutines.__kxco_parkSlot", .f = parkSlot },
+    .{ .fqn = "kotlinx.coroutines.__kxco_resumeSlot", .f = resumeSlot },
+    .{ .fqn = "kotlinx.coroutines.runBlocking", .f = runBlocking },
+    .{ .fqn = "kotlinx.coroutines.delay", .f = delayTopLevel },
+    .{ .fqn = "kotlinx.coroutines.yield", .f = yieldNow },
+    .{ .fqn = "kotlinx.coroutines.JobSupport.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.Job.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.AbstractCoroutine.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.StandaloneCoroutine.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.LazyStandaloneCoroutine.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.DeferredCoroutine.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.LazyDeferredCoroutine.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.JobImpl.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.SupervisorJobImpl.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.ScopeCoroutine.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.SupervisorCoroutine.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.TimeoutCoroutine.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.CompletableJob.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.Deferred.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.CompletableDeferred.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.CompletableDeferredImpl.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.ReceiveChannel.cancel", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.JobSupport.cancelImpl", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.JobSupport.cancelCoroutine", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.channels.Channel", .f = channelCreate },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.send", .f = channelSend },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.trySend", .f = channelTrySend },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.receive", .f = channelReceive },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.tryReceive", .f = channelTryReceive },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.close", .f = channelClose },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.isClosedForSend", .f = channelIsClosedForSend },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.isClosedForReceive", .f = channelIsClosedForReceive },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.isEmpty", .f = channelIsEmpty },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannel.iterator", .f = channelIterator },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannelIterator.hasNext", .f = channelIterHasNext },
+    .{ .fqn = "kotlinx.coroutines.channels.KlioChannelIterator.next", .f = channelIterNext },
+    .{ .fqn = "kotlinx.coroutines.TimeoutCoroutine.cancelCoroutine", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.AbstractCoroutine.cancelCoroutine", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.StandaloneCoroutine.cancelCoroutine", .f = jobCancel },
+    .{ .fqn = "kotlinx.coroutines.ScopeCoroutine.cancelCoroutine", .f = jobCancel },
+};
+
+/// Build a `HostBindings` registry mapping each kxco host symbol to its
+/// Zig-native intrinsic. The caller owns the returned registry.
+pub fn hostBindings(allocator: std.mem.Allocator) std.mem.Allocator.Error!HostBindings {
+    var b = HostBindings.init(allocator);
+    errdefer b.deinit();
+    for (BINDINGS) |entry| {
+        try b.register(entry.fqn, entry.f);
+    }
+    return b;
+}
+
+// -------------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------------
+
+const testing = std.testing;
+const NoopHost = runtime.NoopHost;
+const CaptureOutput = runtime.CaptureOutput;
+
+fn resetRegistry() void {
+    coro_reg.cancelled_tokens.deinit(regAllocator());
+    coro_reg.sched_queue.deinit(regAllocator());
+    var it = coro_reg.channels.valueIterator();
+    while (it.next()) |state| state.deinit(regAllocator());
+    coro_reg.channels.deinit(regAllocator());
+    coro_reg = .{};
+}
+
+fn makeCtx(host: *NoopHost, cap: *CaptureOutput, args: []const Value) CallCtx {
+    return .{
+        .args = args,
+        .out = cap.output(),
+        .host = host.host(),
+        .allocator = testing.allocator,
+    };
+}
+
+test "host bindings registry populated" {
+    var b = try hostBindings(testing.allocator);
+    defer b.deinit();
+    try testing.expectEqual(@as(usize, BINDINGS.len), b.len());
+    try testing.expect(b.resolve("kotlinx.coroutines.delay") != null);
+    try testing.expect(b.resolve("kotlinx.coroutines.channels.Channel") != null);
+    try testing.expect(b.resolve("kotlinx.coroutines.Job.cancel") != null);
+    try testing.expect(b.resolve("not.a.symbol") == null);
+}
+
+test "delay suspends for the requested millis" {
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    {
+        const args = [_]Value{.{ .Long = 250 }};
+        var ctx = makeCtx(&host, &cap, &args);
+        const r = try delayMillis(&ctx);
+        try testing.expect(r == .err);
+        try testing.expectEqual(@as(i64, 250), r.err.Suspend);
+    }
+    // Negative millis clamp to zero.
+    {
+        const args = [_]Value{.{ .Int = -5 }};
+        var ctx = makeCtx(&host, &cap, &args);
+        const r = try delayMillis(&ctx);
+        try testing.expectEqual(@as(i64, 0), r.err.Suspend);
+    }
+    // Non-numeric argument is a type error.
+    {
+        const args = [_]Value{.Unit};
+        var ctx = makeCtx(&host, &cap, &args);
+        const r = try delayMillis(&ctx);
+        try testing.expect(r == .err and r.err == .Type);
+    }
+}
+
+test "yield suspends with zero wakeup" {
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    var ctx = makeCtx(&host, &cap, &.{});
+    const r = try yieldNow(&ctx);
+    try testing.expect(r == .err);
+    try testing.expectEqual(@as(i64, 0), r.err.Suspend);
+}
+
+test "cancellation token lifecycle" {
+    defer resetRegistry();
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+
+    var ctx = makeCtx(&host, &cap, &.{});
+    const created = try tokenCreate(&ctx);
+    const id = created.ok.Long;
+    try testing.expect(id >= 1);
+
+    // Not cancelled yet.
+    {
+        const args = [_]Value{.{ .Long = id }};
+        var c = makeCtx(&host, &cap, &args);
+        const r = try tokenIsCancelled(&c);
+        try testing.expect(!r.ok.Bool);
+    }
+    // Cancel it.
+    {
+        const args = [_]Value{.{ .Long = id }};
+        var c = makeCtx(&host, &cap, &args);
+        _ = try tokenCancel(&c);
+    }
+    // Now cancelled.
+    {
+        const args = [_]Value{.{ .Long = id }};
+        var c = makeCtx(&host, &cap, &args);
+        const r = try tokenIsCancelled(&c);
+        try testing.expect(r.ok.Bool);
+    }
+    // Token id 0 is never cancelled.
+    {
+        const args = [_]Value{.{ .Long = 0 }};
+        var c = makeCtx(&host, &cap, &args);
+        const r = try tokenIsCancelled(&c);
+        try testing.expect(!r.ok.Bool);
+    }
+}
+
+test "scheduler enqueue and drain count" {
+    defer resetRegistry();
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+
+    inline for ([_]i64{ 10, 20, 30 }) |h| {
+        const args = [_]Value{.{ .Long = h }};
+        var c = makeCtx(&host, &cap, &args);
+        _ = try schedulerEnqueue(&c);
+    }
+    var c = makeCtx(&host, &cap, &.{});
+    const r = try schedulerDrainCount(&c);
+    try testing.expectEqual(@as(i32, 3), r.ok.Int);
+    // Draining again yields zero.
+    const r2 = try schedulerDrainCount(&c);
+    try testing.expectEqual(@as(i32, 0), r2.ok.Int);
+}
+
+test "new slot ids are unique and offset" {
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    var ctx = makeCtx(&host, &cap, &.{});
+    const a = (try newSlot(&ctx)).ok.Long;
+    const b = (try newSlot(&ctx)).ok.Long;
+    try testing.expect(a >= (1 << 48));
+    try testing.expect(b == a + 1);
+}
+
+test "current time millis returns a long" {
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    var ctx = makeCtx(&host, &cap, &.{});
+    const r = try currentTimeMillis(&ctx);
+    try testing.expect(r.ok == .Long);
+    try testing.expect(r.ok.Long > 0);
+}
+
+test "channel iter next without pending throws NoSuchElementException" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+
+    // A bare iterator instance with `__pending__` == Null.
+    const cls = try makeClassDef(a, "kotlinx.coroutines.channels.KlioChannelIterator");
+    var fields: std.ArrayList(InstanceData.Field) = .empty;
+    try fields.append(a, .{ .name = "__pending__", .value = .Null });
+    const inst = try ObjRef(InstanceData).init(a, .{
+        .class = cls,
+        .fields = fields,
+        .outer = null,
+        .identity = 7,
+        .native_state = null,
+    });
+    const args = [_]Value{.{ .Instance = inst }};
+    var ctx: CallCtx = .{ .args = &args, .out = cap.output(), .host = host.host(), .allocator = a };
+    const r = try channelIterNext(&ctx);
+    try testing.expect(r == .err and r.err == .Thrown);
+    try testing.expectEqualStrings("kotlin.NoSuchElementException", r.err.Thrown.Exception.fqn.asPtr().*);
+}
+
+test "bad receiver arities and types" {
+    var host = NoopHost.init(testing.allocator);
+    defer host.deinit();
+    var cap = CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    // Missing receiver -> Arity.
+    {
+        var ctx = makeCtx(&host, &cap, &.{});
+        const r = try channelSend(&ctx);
+        try testing.expect(r == .err and r.err == .Arity);
+    }
+    // Non-instance receiver -> Type.
+    {
+        const args = [_]Value{.{ .Int = 1 }};
+        var ctx = makeCtx(&host, &cap, &args);
+        const r = try channelSend(&ctx);
+        try testing.expect(r == .err and r.err == .Type);
+    }
+}
+
+const ast = @import("ast");
+const span = @import("span");
+const Env = runtime.Env;
+const ClassDef = runtime.ClassDef;
+
+fn makeClassDef(allocator: std.mem.Allocator, name: []const u8) !ObjRef(ClassDef) {
+    const cd: ClassDef = .{
+        .name = name,
+        .fqn = name,
+        .annotation_names = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .body_properties = &.{},
+        .init_blocks = &.{},
+        .init_block_property_positions = &.{},
+        .is_data = false,
+        .is_value = false,
+        .is_object = false,
+        .is_enum = false,
+        .is_sealed = false,
+        .supertype_names = &.{},
+        .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+        .is_interface = false,
+        .is_fun_interface = false,
+        .parent_ctor_args = &.{},
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .is_anonymous = false,
+        .secondary_ctors = &.{},
+        .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(allocator, .empty),
+        .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+        .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(allocator, .empty),
+        .captured_env = try ObjRef(Env).init(allocator, Env.init(allocator)),
+        .supertype_delegates = try ObjRef(std.ArrayList(runtime.SupertypeDelegate)).init(allocator, .empty),
+        .delegate_forwarders = try ObjRef(std.ArrayList(runtime.MethodDef)).init(allocator, .empty),
+        .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+    };
+    return ObjRef(ClassDef).init(allocator, cd);
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}
