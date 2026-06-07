@@ -1,0 +1,11 @@
+length = 6
+[0] code=72 bmp
+[1] code=105 bmp
+[2] code=32 bmp
+[3] code=55357 high-surrogate
+[4] code=56832 low-surrogate
+[5] code=33 bmp
+😀
+MIN=0 MAX=65535
+A
+A

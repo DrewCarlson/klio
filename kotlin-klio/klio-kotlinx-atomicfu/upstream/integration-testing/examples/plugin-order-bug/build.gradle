@@ -1,0 +1,65 @@
+/*
+ * Copyright 2017-2024 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license.
+ */
+
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask
+
+buildscript {
+    repositories {
+        mavenLocal()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:${libs.versions.kotlinVersion.get()}")
+        classpath("org.jetbrains.kotlinx:atomicfu-gradle-plugin:${libs.versions.atomicfuVersion.get()}")
+    }
+}
+// Apply KGP via buildscript to check this issue: #384
+apply plugin: 'org.jetbrains.kotlin.multiplatform'
+apply plugin: 'org.jetbrains.kotlinx.atomicfu'
+
+repositories {
+    mavenCentral()
+    maven{ url = "https://maven.pkg.jetbrains.space/kotlin/p/kotlin/dev" }
+    mavenLocal()
+}
+
+kotlin {
+    jvm()
+
+    js()
+
+    wasmJs {}
+    wasmWasi {}
+
+    macosArm64()
+    macosX64()
+    linuxArm64()
+    linuxX64()
+    mingwX64()
+
+    sourceSets {
+        commonMain {
+            dependencies {
+                implementation(kotlin("stdlib"))
+                implementation(kotlin("test"))
+            }
+        }
+        commonTest {}
+    }
+}
+
+tasks.withType(KotlinCompilationTask).configureEach {
+    compilerOptions {
+        freeCompilerArgs.add("-Xskip-prerelease-check")
+    }
+}
+
+// Workaround for https://youtrack.jetbrains.com/issue/KT-58303:
+// the `clean` task can't delete the expanded.lock file on Windows as it's still held by Gradle, failing the build
+tasks.clean {
+    setDelete(layout.buildDirectory.asFileTree.matching {
+        exclude("tmp/.cache/expanded/expanded.lock")
+    })
+}

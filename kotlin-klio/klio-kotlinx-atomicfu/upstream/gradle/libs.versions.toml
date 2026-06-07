@@ -1,0 +1,61 @@
+[versions]
+kotlin = "2.2.0"
+kotlin-for-gradle-plugin = "2.1.0"
+kotlinx-binaryCompatibilityValidator = "0.17.0"
+asm = "9.9.1"
+slf4j = "1.8.0-alpha2"
+junit = "4.12"
+maven = "3.5.3"
+maven-pluginTools = "3.5"
+node-gradle = "3.1.1"
+gradle-plugin-publish = "2.1.1"
+gradle-develocity = "3.17.6"
+lincheck = "3.1.1"
+
+[libraries]
+
+# Kotlin dependencies
+kotlin-gradlePlugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }
+kotlin-build-tools-api = { group = "org.jetbrains.kotlin", name = "kotlin-build-tools-api", version.ref = "kotlin" }
+kotlin-atomicfu = { group = "org.jetbrains.kotlin", name = "atomicfu", version.ref = "kotlin" }
+kotlin-stdlib = { group = "org.jetbrains.kotlin", name = "kotlin-stdlib", version.ref = "kotlin" }
+kotlin-stdlibJdk8 = { group = "org.jetbrains.kotlin", name = "kotlin-stdlib-jdk8", version.ref = "kotlin" }
+kotlin-test = { group = "org.jetbrains.kotlin", name = "kotlin-test", version.ref = "kotlin" }
+kotlin-testJunit = { group = "org.jetbrains.kotlin", name = "kotlin-test-junit", version.ref = "kotlin" }
+kotlin-scriptRuntime = { group = "org.jetbrains.kotlin", name = "kotlin-script-runtime", version.ref = "kotlin" }
+kotlin-metadataJvm = { group = "org.jetbrains.kotlin", name = "kotlin-metadata-jvm", version.ref = "kotlin" }
+kotlin-stdlib-compat = { group = "org.jetbrains.kotlin", name = "kotlin-stdlib", version.ref = "kotlin-for-gradle-plugin" }
+kotlin-metadataJvm-compat = { group = "org.jetbrains.kotlin", name = "kotlin-metadata-jvm", version.ref = "kotlin-for-gradle-plugin" }
+
+#gradle
+gradle-develocity = {group = "com.gradle", name= "develocity-gradle-plugin", version.ref = "gradle-develocity"}
+
+# ASM dependencies
+asm = { group = "org.ow2.asm", name = "asm", version.ref = "asm" }
+asm-commons = { group = "org.ow2.asm", name = "asm-commons", version.ref = "asm" }
+asm-tree = { group = "org.ow2.asm", name = "asm-tree", version.ref = "asm" }
+asm-util = { group = "org.ow2.asm", name = "asm-util", version.ref = "asm" }
+
+# Logging dependencies
+slf4j-api = { group = "org.slf4j", name = "slf4j-api", version.ref = "slf4j" }
+slf4j-simple = { group = "org.slf4j", name = "slf4j-simple", version.ref = "slf4j" }
+
+# Testing depedencies
+junit-junit = { group = "junit", name = "junit", version.ref = "junit" }
+jetbrains-lincheck = { group = "org.jetbrains.lincheck", name = "lincheck", version.ref = "lincheck" }
+
+# Maven dependencies
+maven-core = { group = "org.apache.maven", name = "maven-core", version.ref = "maven" }
+maven-pluginApi = { group = "org.apache.maven", name = "maven-plugin-api", version.ref = "maven" }
+maven-pluginAnnotations = { group = "org.apache.maven.plugin-tools", name = "maven-plugin-annotations", version.ref = "maven-pluginTools" }
+
+[bundles]
+asm = ["asm", "asm-commons", "asm-tree", "asm-util"]
+maven = ["maven-core", "maven-pluginApi", "maven-pluginAnnotations"]
+
+[plugins]
+gradle-nodePlugin = { id = "com.github.node-gradle.node", version.ref = "node-gradle" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlinx-binaryCompatibilityValidator = { id = "org.jetbrains.kotlinx.binary-compatibility-validator", version.ref = "kotlinx-binaryCompatibilityValidator"}
+gradle-pluginPublish =  { id = "com.gradle.plugin-publish", version.ref = "gradle-plugin-publish" }
+

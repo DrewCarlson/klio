@@ -1,0 +1,71 @@
+name: harness-release
+
+# The full test battery with the program-running harness binaries compiled
+# ReleaseSafe — the configuration local development uses. The optimizing
+# compile of the second module universe is too expensive for every push on a
+# 4-vCPU runner, but it has caught optimizer-visible bugs (e.g. undefined
+# pointer bits in optional decoding), so it runs weekly and on demand.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"
+
+jobs:
+  build-and-test:
+    name: zig build test (ReleaseSafe harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - name: install zig 0.16.0
+        run: |
+          set -euo pipefail
+          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+
+      - name: cache kotlin stdlib sources (kotlin/)
+        id: kotlin-src-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: kotlin
+          key: kotlin-src-2.3.21-libraries-stdlib
+
+      - name: checkout kotlin stdlib sources (if not cached)
+        if: steps.kotlin-src-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --filter=blob:none --no-checkout --depth 1 --branch v2.3.21 \
+            https://github.com/JetBrains/kotlin kotlin
+          git -C kotlin sparse-checkout init --cone
+          git -C kotlin sparse-checkout set libraries/stdlib
+          git -C kotlin checkout v2.3.21
+
+      - name: restore zig build + test state
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-0.16.0-release-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
+          restore-keys: |
+            zig-0.16.0-release-${{ hashFiles('build.zig.zon') }}-
+
+      - name: zig build
+        run: zig build
+
+      # -j3: the ReleaseSafe optimizing compiles and the heaviest harness
+      # steps peak at several GB each; four concurrent jobs can exhaust the
+      # 16GB runner.
+      - name: zig build test
+        run: zig build test -j3 --summary all
+
+      - name: save zig build + test state
+        if: always()
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-0.16.0-release-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}

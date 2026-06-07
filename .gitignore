@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+kotlin-language-spec
+kotlin
+.ideazig-out/
+.zig-cache/
+zig-pkg/

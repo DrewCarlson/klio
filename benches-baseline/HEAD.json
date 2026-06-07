@@ -1,0 +1,461 @@
+{
+  "git_sha": "25c83c8",
+  "host": "macos-aarch64",
+  "records": [
+    {
+      "stage": "lex",
+      "workload": "game/behavior_tree",
+      "median_ns": 7708,
+      "p99_ns": 25292,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "game/behavior_tree",
+      "median_ns": 38458,
+      "p99_ns": 75000,
+      "iters": 6298
+    },
+    {
+      "stage": "resolve",
+      "workload": "game/behavior_tree",
+      "median_ns": 44959,
+      "p99_ns": 84583,
+      "iters": 5401
+    },
+    {
+      "stage": "typeck",
+      "workload": "game/behavior_tree",
+      "median_ns": 82958,
+      "p99_ns": 121416,
+      "iters": 2978
+    },
+    {
+      "stage": "e2e",
+      "workload": "game/behavior_tree",
+      "median_ns": 7698500,
+      "p99_ns": 31101500,
+      "iters": 22
+    },
+    {
+      "stage": "lex",
+      "workload": "game/entity_tick",
+      "median_ns": 5041,
+      "p99_ns": 5292,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "game/entity_tick",
+      "median_ns": 33084,
+      "p99_ns": 40500,
+      "iters": 7414
+    },
+    {
+      "stage": "resolve",
+      "workload": "game/entity_tick",
+      "median_ns": 37958,
+      "p99_ns": 108750,
+      "iters": 6079
+    },
+    {
+      "stage": "typeck",
+      "workload": "game/entity_tick",
+      "median_ns": 60000,
+      "p99_ns": 78208,
+      "iters": 4098
+    },
+    {
+      "stage": "e2e",
+      "workload": "game/entity_tick",
+      "median_ns": 58042,
+      "p99_ns": 83875,
+      "iters": 4223
+    },
+    {
+      "stage": "lex",
+      "workload": "game/event_bus",
+      "median_ns": 4208,
+      "p99_ns": 4584,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "game/event_bus",
+      "median_ns": 23708,
+      "p99_ns": 28542,
+      "iters": 10001
+    },
+    {
+      "stage": "resolve",
+      "workload": "game/event_bus",
+      "median_ns": 27750,
+      "p99_ns": 38375,
+      "iters": 8878
+    },
+    {
+      "stage": "typeck",
+      "workload": "game/event_bus",
+      "median_ns": 48458,
+      "p99_ns": 62792,
+      "iters": 5089
+    },
+    {
+      "stage": "e2e",
+      "workload": "game/event_bus",
+      "median_ns": 15928250,
+      "p99_ns": 16102084,
+      "iters": 16
+    },
+    {
+      "stage": "lex",
+      "workload": "macro/mandelbrot",
+      "median_ns": 3458,
+      "p99_ns": 3750,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "macro/mandelbrot",
+      "median_ns": 30667,
+      "p99_ns": 41958,
+      "iters": 8028
+    },
+    {
+      "stage": "resolve",
+      "workload": "macro/mandelbrot",
+      "median_ns": 35666,
+      "p99_ns": 47666,
+      "iters": 6889
+    },
+    {
+      "stage": "typeck",
+      "workload": "macro/mandelbrot",
+      "median_ns": 49042,
+      "p99_ns": 63750,
+      "iters": 4986
+    },
+    {
+      "stage": "e2e",
+      "workload": "macro/mandelbrot",
+      "median_ns": 70084,
+      "p99_ns": 107750,
+      "iters": 3485
+    },
+    {
+      "stage": "lex",
+      "workload": "macro/nbody",
+      "median_ns": 6292,
+      "p99_ns": 7042,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "macro/nbody",
+      "median_ns": 48875,
+      "p99_ns": 74584,
+      "iters": 4987
+    },
+    {
+      "stage": "resolve",
+      "workload": "macro/nbody",
+      "median_ns": 56958,
+      "p99_ns": 81292,
+      "iters": 4305
+    },
+    {
+      "stage": "typeck",
+      "workload": "macro/nbody",
+      "median_ns": 86042,
+      "p99_ns": 133208,
+      "iters": 2854
+    },
+    {
+      "stage": "e2e",
+      "workload": "macro/nbody",
+      "median_ns": 82250,
+      "p99_ns": 127167,
+      "iters": 2976
+    },
+    {
+      "stage": "lex",
+      "workload": "micro/arith",
+      "median_ns": 1042,
+      "p99_ns": 1167,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "micro/arith",
+      "median_ns": 5541,
+      "p99_ns": 8042,
+      "iters": 10001
+    },
+    {
+      "stage": "resolve",
+      "workload": "micro/arith",
+      "median_ns": 6500,
+      "p99_ns": 8666,
+      "iters": 10001
+    },
+    {
+      "stage": "typeck",
+      "workload": "micro/arith",
+      "median_ns": 9083,
+      "p99_ns": 10084,
+      "iters": 10001
+    },
+    {
+      "stage": "e2e",
+      "workload": "micro/arith",
+      "median_ns": 203370459,
+      "p99_ns": 203529000,
+      "iters": 3
+    },
+    {
+      "stage": "lex",
+      "workload": "micro/dispatch",
+      "median_ns": 2709,
+      "p99_ns": 3000,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "micro/dispatch",
+      "median_ns": 13666,
+      "p99_ns": 15042,
+      "iters": 10001
+    },
+    {
+      "stage": "resolve",
+      "workload": "micro/dispatch",
+      "median_ns": 16458,
+      "p99_ns": 17709,
+      "iters": 10001
+    },
+    {
+      "stage": "typeck",
+      "workload": "micro/dispatch",
+      "median_ns": 28625,
+      "p99_ns": 32791,
+      "iters": 8623
+    },
+    {
+      "stage": "e2e",
+      "workload": "micro/dispatch",
+      "median_ns": 52637750,
+      "p99_ns": 52982750,
+      "iters": 5
+    },
+    {
+      "stage": "lex",
+      "workload": "micro/fib_recursive",
+      "median_ns": 1000,
+      "p99_ns": 1125,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "micro/fib_recursive",
+      "median_ns": 5125,
+      "p99_ns": 5500,
+      "iters": 10001
+    },
+    {
+      "stage": "resolve",
+      "workload": "micro/fib_recursive",
+      "median_ns": 6416,
+      "p99_ns": 6959,
+      "iters": 10001
+    },
+    {
+      "stage": "typeck",
+      "workload": "micro/fib_recursive",
+      "median_ns": 10542,
+      "p99_ns": 11375,
+      "iters": 10001
+    },
+    {
+      "stage": "e2e",
+      "workload": "micro/fib_recursive",
+      "median_ns": 63102458,
+      "p99_ns": 63174584,
+      "iters": 4
+    },
+    {
+      "stage": "lex",
+      "workload": "micro/fib_tailrec",
+      "median_ns": 1208,
+      "p99_ns": 1334,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "micro/fib_tailrec",
+      "median_ns": 6000,
+      "p99_ns": 6375,
+      "iters": 10001
+    },
+    {
+      "stage": "resolve",
+      "workload": "micro/fib_tailrec",
+      "median_ns": 7375,
+      "p99_ns": 8000,
+      "iters": 10001
+    },
+    {
+      "stage": "typeck",
+      "workload": "micro/fib_tailrec",
+      "median_ns": 12333,
+      "p99_ns": 14917,
+      "iters": 10001
+    },
+    {
+      "stage": "e2e",
+      "workload": "micro/fib_tailrec",
+      "median_ns": 53792,
+      "p99_ns": 66583,
+      "iters": 4596
+    },
+    {
+      "stage": "lex",
+      "workload": "micro/string_template",
+      "median_ns": 1291,
+      "p99_ns": 1417,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "micro/string_template",
+      "median_ns": 7583,
+      "p99_ns": 8208,
+      "iters": 10001
+    },
+    {
+      "stage": "resolve",
+      "workload": "micro/string_template",
+      "median_ns": 8916,
+      "p99_ns": 9625,
+      "iters": 10001
+    },
+    {
+      "stage": "typeck",
+      "workload": "micro/string_template",
+      "median_ns": 12125,
+      "p99_ns": 13250,
+      "iters": 10001
+    },
+    {
+      "stage": "e2e",
+      "workload": "micro/string_template",
+      "median_ns": 9249250,
+      "p99_ns": 9630875,
+      "iters": 28
+    },
+    {
+      "stage": "lex",
+      "workload": "stress/alloc_churn",
+      "median_ns": 1916,
+      "p99_ns": 2083,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "stress/alloc_churn",
+      "median_ns": 11500,
+      "p99_ns": 12500,
+      "iters": 10001
+    },
+    {
+      "stage": "resolve",
+      "workload": "stress/alloc_churn",
+      "median_ns": 13417,
+      "p99_ns": 14500,
+      "iters": 10001
+    },
+    {
+      "stage": "typeck",
+      "workload": "stress/alloc_churn",
+      "median_ns": 19041,
+      "p99_ns": 20834,
+      "iters": 10001
+    },
+    {
+      "stage": "e2e",
+      "workload": "stress/alloc_churn",
+      "median_ns": 26791,
+      "p99_ns": 41625,
+      "iters": 9108
+    },
+    {
+      "stage": "lex",
+      "workload": "stress/deep_nesting",
+      "median_ns": 2917,
+      "p99_ns": 3125,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "stress/deep_nesting",
+      "median_ns": 35291,
+      "p99_ns": 39625,
+      "iters": 7004
+    },
+    {
+      "stage": "resolve",
+      "workload": "stress/deep_nesting",
+      "median_ns": 38417,
+      "p99_ns": 44250,
+      "iters": 6433
+    },
+    {
+      "stage": "typeck",
+      "workload": "stress/deep_nesting",
+      "median_ns": 56000,
+      "p99_ns": 64041,
+      "iters": 4415
+    },
+    {
+      "stage": "e2e",
+      "workload": "stress/deep_nesting",
+      "median_ns": 65333,
+      "p99_ns": 97916,
+      "iters": 3746
+    },
+    {
+      "stage": "lex",
+      "workload": "stress/wide_decls",
+      "median_ns": 5333,
+      "p99_ns": 5708,
+      "iters": 10001
+    },
+    {
+      "stage": "parse",
+      "workload": "stress/wide_decls",
+      "median_ns": 31750,
+      "p99_ns": 35083,
+      "iters": 7786
+    },
+    {
+      "stage": "resolve",
+      "workload": "stress/wide_decls",
+      "median_ns": 39875,
+      "p99_ns": 44542,
+      "iters": 6220
+    },
+    {
+      "stage": "typeck",
+      "workload": "stress/wide_decls",
+      "median_ns": 76625,
+      "p99_ns": 93125,
+      "iters": 3228
+    },
+    {
+      "stage": "e2e",
+      "workload": "stress/wide_decls",
+      "median_ns": 81625,
+      "p99_ns": 111166,
+      "iters": 3017
+    }
+  ]
+}

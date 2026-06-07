@@ -1,0 +1,997 @@
+//! Declared Kotlin classes as the interpreter sees them at runtime:
+//! `ClassDef`, its parameter/method/property descriptors, the live
+//! `InstanceData`, and the method/property resolution walks.
+
+const std = @import("std");
+const ast = @import("ast");
+const span = @import("span");
+const objcell = @import("objcell.zig");
+const env_mod = @import("env.zig");
+const value_mod = @import("value.zig");
+
+const ObjRef = objcell.ObjRef;
+const Env = env_mod.Env;
+const Value = value_mod.Value;
+
+/// A declared Kotlin class as the interpreter sees it at runtime.
+pub const ClassDef = struct {
+    name: []const u8,
+    fqn: []const u8,
+    /// Runtime-retained annotation class names applied to this declaration.
+    annotation_names: []const []const u8,
+    primary_params: []ClassParamDef,
+    /// Member functions keyed by simple name.
+    methods: []MethodDef,
+    /// Body `val`/`var` properties (not primary-ctor properties).
+    body_properties: []PropertyDef,
+    init_blocks: []*const ast.Block,
+    /// For each entry in `init_blocks`, the index of `body_properties` it
+    /// runs before — matching Kotlin's source-order init rule.
+    init_block_property_positions: []usize,
+    is_data: bool,
+    /// `true` for a `value class` / `@JvmInline value class`.
+    is_value: bool,
+    is_object: bool,
+    /// `true` for an `enum class`.
+    is_enum: bool,
+    /// `true` when the declaration carried the `sealed` modifier.
+    is_sealed: bool,
+    /// Simple supertype names recorded from `class Foo : Bar(), Baz`.
+    supertype_names: []const []const u8,
+    /// Resolved parent class for method-resolution chain walking.
+    parent: ObjRef(?ObjRef(ClassDef)),
+    /// Resolved interface supertypes (any number).
+    interfaces: ObjRef(std.ArrayList(ObjRef(ClassDef))),
+    /// `true` for a class declared with the `interface` keyword.
+    is_interface: bool,
+    /// `true` for a `fun interface`.
+    is_fun_interface: bool,
+    /// Constructor argument expressions for the parent class.
+    parent_ctor_args: []*const ast.Expr,
+    /// `true` when the declaration carried the `open` modifier.
+    is_open: bool,
+    /// `true` for an `abstract class`.
+    is_abstract: bool,
+    /// `true` for an `inner class`.
+    is_inner: bool,
+    /// `true` for the synthetic `ClassDef` built from an `object { … }`.
+    is_anonymous: bool,
+    /// Secondary constructors in source-declared order.
+    secondary_ctors: []*const ast.SecondaryCtor,
+    /// Eagerly-constructed enum entries in source order.
+    enum_entries: ObjRef(std.ArrayList(EnumEntry)),
+    /// Companion object instance, if any.
+    companion: ObjRef(?ObjRef(InstanceData)),
+    /// For a companion-object class, the enclosing class.
+    enclosing_class: ObjRef(?ObjRef(ClassDef)),
+    /// Nested classes by simple name.
+    nested_classes: ObjRef(std.ArrayList(NestedClass)),
+    /// Captured env in which the class was declared.
+    captured_env: ObjRef(Env),
+    /// Inheritance-delegation table.
+    supertype_delegates: ObjRef(std.ArrayList(SupertypeDelegate)),
+    /// Synthesized forwarder methods for delegated interfaces.
+    delegate_forwarders: ObjRef(std.ArrayList(MethodDef)),
+    /// Lazily-constructed singleton for nested `is_object` classes.
+    object_singleton: ObjRef(?ObjRef(InstanceData)),
+
+    /// One eager enum entry: its name and the `Value::Instance` for it.
+    pub const EnumEntry = struct { name: []const u8, value: Value };
+    /// One nested class binding: simple name -> resolved `ClassDef`.
+    pub const NestedClass = struct { name: []const u8, class: ObjRef(ClassDef) };
+
+    const MAX_WALK = 128;
+
+    /// Walk the class chain (self, then parent, then grandparent, …) and
+    /// return the first method matching `name`, paired with its declaring
+    /// class. Caller owns nothing extra; the returned handles are clones.
+    pub fn findMethod(self: ObjRef(ClassDef), allocator: std.mem.Allocator, name: []const u8) ?MethodHit {
+        var seen: std.ArrayList(*const ClassDef) = .empty;
+        defer seen.deinit(allocator);
+        return findMethodWalk(allocator, self, name, &seen);
+    }
+
+    /// Like `findMethod`, but among overloads with this name, prefers one
+    /// whose first declared parameter type name matches `arg_type_name`.
+    pub fn findMethodForArg(
+        self: ObjRef(ClassDef),
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        arg_type_name: ?[]const u8,
+    ) ?MethodHit {
+        if (arg_type_name) |arg| {
+            var seen: std.ArrayList(*const ClassDef) = .empty;
+            defer seen.deinit(allocator);
+            if (findMethodForArgWalk(allocator, self, name, arg, &seen)) |found| {
+                return found;
+            }
+        }
+        return findMethod(self, allocator, name);
+    }
+
+    /// Walk the class chain searching for a body property of `name`.
+    pub fn findBodyProperty(self: ObjRef(ClassDef), allocator: std.mem.Allocator, name: []const u8) ?PropertyHit {
+        var seen: std.ArrayList(*const ClassDef) = .empty;
+        defer seen.deinit(allocator);
+        return findBodyPropertyWalk(allocator, self, name, &seen);
+    }
+
+    /// The list of declared interface supertypes (resolved). Caller owns
+    /// the returned slice.
+    pub fn interfaceRefs(self: *const ClassDef, allocator: std.mem.Allocator) ![]ObjRef(ClassDef) {
+        const g = self.interfaces.borrow();
+        defer g.deinit();
+        return allocator.dupe(ObjRef(ClassDef), g.get().items);
+    }
+
+    /// Collect companions reachable from this class. Caller owns the slice.
+    pub fn allCompanions(self: ObjRef(ClassDef), allocator: std.mem.Allocator) ![]ObjRef(InstanceData) {
+        var out: std.ArrayList(ObjRef(InstanceData)) = .empty;
+        errdefer out.deinit(allocator);
+        var seen: std.ArrayList(*const ClassDef) = .empty;
+        defer seen.deinit(allocator);
+        try collectCompanionsWalk(allocator, self, &out, &seen);
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// True when this class or any of its named supertypes matches `name`.
+    pub fn isSubtypeOf(self: *const ClassDef, allocator: std.mem.Allocator, name: []const u8) bool {
+        if (std.mem.eql(u8, self.name, name) or std.mem.eql(u8, self.fqn, name)) {
+            return true;
+        }
+        var frontier: std.ArrayList([]const u8) = .empty;
+        defer frontier.deinit(allocator);
+        var seen: std.ArrayList([]const u8) = .empty;
+        defer seen.deinit(allocator);
+        for (self.supertype_names) |n| frontier.append(allocator, n) catch return false;
+        seen.append(allocator, self.name) catch return false;
+        var steps: usize = 0;
+        while (frontier.pop()) |parent_name| {
+            if (steps > 64) return false;
+            steps += 1;
+            if (std.mem.eql(u8, parent_name, name)) return true;
+            if (containsStr(seen.items, parent_name)) continue;
+            seen.append(allocator, parent_name) catch return false;
+            const g = self.captured_env.borrow();
+            defer g.deinit();
+            const v = g.get().lookup(parent_name) orelse continue;
+            switch (v) {
+                .Class => |c| {
+                    const cg = c.borrow();
+                    defer cg.deinit();
+                    const cd = cg.get();
+                    if (std.mem.eql(u8, cd.name, name) or std.mem.eql(u8, cd.fqn, name)) return true;
+                    for (cd.supertype_names) |p| frontier.append(allocator, p) catch return false;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+};
+
+/// A method paired with the class that declared it.
+pub const MethodHit = struct { method: MethodDef, class: ObjRef(ClassDef) };
+/// A property paired with the class that declared it.
+pub const PropertyHit = struct { property: PropertyDef, class: ObjRef(ClassDef) };
+
+pub const SupertypeDelegate = struct {
+    /// Simple name of the delegated interface (written before `by`).
+    interface_name: []const u8,
+    /// Resolved interface class, if it resolves at registration time.
+    interface: ?ObjRef(ClassDef),
+    /// Delegate expression — evaluated in the primary-ctor parameter scope.
+    expr: *const ast.Expr,
+    /// Field key on the instance where the resolved delegate value lives.
+    field_key: []const u8,
+};
+
+pub const ClassParamDef = struct {
+    /// `true` for `var`, `false` for `val`, `null` if not a property.
+    property: ?bool,
+    name: []const u8,
+    default: ?*const ast.Expr,
+    /// Declared type's simple name (e.g. `"Long"`).
+    declared_type: ?[]const u8,
+    /// The full declared-type shape, including generic args and nullability.
+    declared_shape: ?TypeShape,
+};
+
+/// A structural view of a declared type retained for reflection.
+pub const TypeShape = struct {
+    name: []const u8,
+    nullable: bool,
+    args: []TypeShape,
+
+    /// Build a `TypeShape` from a parsed AST type reference, recursing into
+    /// generic arguments and skipping star projections. Caller's allocator
+    /// owns the recursively-built `args` slices.
+    pub fn fromTypeRef(allocator: std.mem.Allocator, t: *const ast.TypeRef) std.mem.Allocator.Error!TypeShape {
+        var args: std.ArrayList(TypeShape) = .empty;
+        errdefer args.deinit(allocator);
+        for (t.type_args) |a| {
+            if (a.is_star) continue;
+            try args.append(allocator, try fromTypeRef(allocator, &a.ty));
+        }
+        return .{
+            .name = t.name.name,
+            .nullable = t.nullable,
+            .args = try args.toOwnedSlice(allocator),
+        };
+    }
+};
+
+pub const MethodDef = struct {
+    name: []const u8,
+    decl: *const ast.Function,
+    is_operator: bool,
+    is_open: bool,
+    is_override: bool,
+    /// `true` when the source carried the `abstract` modifier.
+    is_abstract: bool,
+    /// When non-null, calls dispatch through this SAM-converted lambda.
+    sam_lambda: ?Value,
+    /// When non-null, a synthesized inheritance-delegation forwarder routing
+    /// calls to the delegate instance stored under this field key.
+    delegate_field: ?[]const u8,
+    /// IR `FuncId` of the lowered method body, if lowered.
+    ir_fn_id: ?u32,
+};
+
+pub const PropertyDef = struct {
+    name: []const u8,
+    mutable: bool,
+    init: ?*const ast.Expr,
+    /// Custom getter body, if declared.
+    getter: ?*const ast.Accessor,
+    /// Custom setter body, if declared.
+    setter: ?*const ast.Accessor,
+    /// `val foo by expr` — the delegate expression.
+    delegate: ?*const ast.Expr,
+    /// `true` when the property was declared `abstract`.
+    is_abstract: bool,
+    /// `true` for a `lateinit var`.
+    is_lateinit: bool,
+    /// Declared non-nullable primitive zero value for a property with no
+    /// initializer.
+    primitive_zero: ?Value,
+};
+
+pub const InstanceData = struct {
+    class: ObjRef(ClassDef),
+    /// Field name -> value. Insertion ordered.
+    fields: std.ArrayList(Field),
+    /// For an `inner class` instance, the captured enclosing-class instance.
+    outer: ?Value,
+    /// Per-instance identity, assigned at construction from a monotonic
+    /// counter.
+    identity: u64,
+    /// Opaque per-instance state owned by a native host binding.
+    native_state: ?NativeState,
+
+    pub const Field = struct { name: []const u8, value: Value };
+
+    pub fn get(self: *const InstanceData, name: []const u8) ?Value {
+        for (self.fields.items) |f| {
+            if (std.mem.eql(u8, f.name, name)) return f.value;
+        }
+        return null;
+    }
+
+    pub fn set(self: *InstanceData, name: []const u8, v: Value) bool {
+        for (self.fields.items) |*f| {
+            if (std.mem.eql(u8, f.name, name)) {
+                f.value = v;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn define(self: *InstanceData, allocator: std.mem.Allocator, name: []const u8, v: Value) !void {
+        if (!self.set(name, v)) {
+            try self.fields.append(allocator, .{ .name = name, .value = v });
+        }
+    }
+
+    /// Fetch the instance's native-state cell, creating it via `init` on
+    /// first access. `T` is the host binding's concrete payload type and
+    /// `kind` is its discriminator (convention: the binding's FQN). On a
+    /// repeat call the cached cell is cloned and returned; the boxed
+    /// payload can be reached through `nativeStatePtr`.
+    ///
+    /// Panics when the instance already carries native state under a
+    /// different `kind`, which indicates two host bindings are fighting
+    /// over the same instance.
+    pub fn ensureNativeState(
+        self: *InstanceData,
+        allocator: std.mem.Allocator,
+        comptime T: type,
+        kind: []const u8,
+        init: *const fn () T,
+    ) std.mem.Allocator.Error!ObjRef(NativeBox) {
+        if (self.native_state) |ns| {
+            if (!std.mem.eql(u8, ns.kind, kind)) {
+                @panic("native_state kind mismatch: instance carries one binding's state, another binding asked for a different kind");
+            }
+            return ns.data.clone();
+        }
+        const Boxed = struct {
+            fn destroy(ptr: *anyopaque, a: std.mem.Allocator) void {
+                const typed: *T = @ptrCast(@alignCast(ptr));
+                if (comptime hasDeinit(T)) typed.deinit();
+                a.destroy(typed);
+            }
+        };
+        const payload = try allocator.create(T);
+        payload.* = init();
+        const data = try ObjRef(NativeBox).init(allocator, .{
+            .ptr = payload,
+            .destroy = Boxed.destroy,
+        });
+        self.native_state = .{ .kind = kind, .data = data.clone() };
+        return data;
+    }
+
+    /// Downcast a native-state cell's boxed payload to `*T`. The caller
+    /// must request the same `T` the cell was created with; mismatches
+    /// are guarded by the cell's `kind` at the call site that produced it.
+    pub fn nativeStatePtr(comptime T: type, data: ObjRef(NativeBox)) *T {
+        const g = data.borrow();
+        defer g.deinit();
+        return @ptrCast(@alignCast(g.get().ptr));
+    }
+};
+
+fn hasDeinit(comptime U: type) bool {
+    return switch (@typeInfo(U)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(U, "deinit"),
+        else => false,
+    };
+}
+
+/// Native-side data attached to a `Value::Instance`. The `kind`
+/// discriminator is the FQN of the owning native binding (e.g.
+/// `"kotlinx.io.Buffer"`); the runtime guards downcasts against a kind
+/// mismatch. The payload is an opaque, refcounted, lock-protected handle.
+pub const NativeState = struct {
+    kind: []const u8,
+    data: ObjRef(NativeBox),
+};
+
+/// Opaque, lock-protected native payload. `ptr` is the host binding's
+/// boxed value; the binding alone knows its concrete type and how to
+/// free it via `destroy`, which runs when the last `ObjRef` clone drops.
+pub const NativeBox = struct {
+    ptr: *anyopaque,
+    destroy: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
+
+    pub fn deinit(self: *NativeBox, allocator: std.mem.Allocator) void {
+        self.destroy(self.ptr, allocator);
+    }
+};
+
+fn containsStr(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |s| {
+        if (std.mem.eql(u8, s, needle)) return true;
+    }
+    return false;
+}
+
+fn containsPtr(haystack: []const *const ClassDef, needle: *const ClassDef) bool {
+    for (haystack) |p| {
+        if (p == needle) return true;
+    }
+    return false;
+}
+
+fn collectCompanionsWalk(
+    allocator: std.mem.Allocator,
+    cls: ObjRef(ClassDef),
+    out: *std.ArrayList(ObjRef(InstanceData)),
+    seen: *std.ArrayList(*const ClassDef),
+) !void {
+    const ptr: *const ClassDef = cls.asPtr();
+    if (containsPtr(seen.items, ptr) or seen.items.len > ClassDef.MAX_WALK) return;
+    try seen.append(allocator, ptr);
+    {
+        const g = ptr.companion.borrow();
+        defer g.deinit();
+        if (g.get().*) |c| try out.append(allocator, c.clone());
+    }
+    if (parentClone(ptr)) |parent| {
+        defer parent.deinit();
+        try collectCompanionsWalk(allocator, parent, out, seen);
+    }
+    {
+        const g = ptr.interfaces.borrow();
+        defer g.deinit();
+        for (g.get().items) |iface| {
+            try collectCompanionsWalk(allocator, iface, out, seen);
+        }
+    }
+    if (enclosingClone(ptr)) |encl| {
+        defer encl.deinit();
+        try collectCompanionsWalk(allocator, encl, out, seen);
+    }
+}
+
+fn findMethodWalk(
+    allocator: std.mem.Allocator,
+    cls: ObjRef(ClassDef),
+    name: []const u8,
+    seen: *std.ArrayList(*const ClassDef),
+) ?MethodHit {
+    const ptr: *const ClassDef = cls.asPtr();
+    if (containsPtr(seen.items, ptr) or seen.items.len > ClassDef.MAX_WALK) return null;
+    seen.append(allocator, ptr) catch return null;
+    for (ptr.methods) |m| {
+        if (std.mem.eql(u8, m.name, name) and
+            (m.decl.body != null or m.sam_lambda != null or m.delegate_field != null))
+        {
+            return .{ .method = m, .class = cls.clone() };
+        }
+    }
+    {
+        const g = ptr.delegate_forwarders.borrow();
+        defer g.deinit();
+        for (g.get().items) |m| {
+            if (std.mem.eql(u8, m.name, name)) return .{ .method = m, .class = cls.clone() };
+        }
+    }
+    if (parentClone(ptr)) |parent| {
+        defer parent.deinit();
+        if (findMethodWalk(allocator, parent, name, seen)) |found| return found;
+    }
+    {
+        const g = ptr.interfaces.borrow();
+        defer g.deinit();
+        for (g.get().items) |iface| {
+            if (findMethodWalk(allocator, iface, name, seen)) |found| return found;
+        }
+    }
+    for (ptr.methods) |m| {
+        if (std.mem.eql(u8, m.name, name)) return .{ .method = m, .class = cls.clone() };
+    }
+    return null;
+}
+
+fn findMethodForArgWalk(
+    allocator: std.mem.Allocator,
+    cls: ObjRef(ClassDef),
+    name: []const u8,
+    arg_type_name: []const u8,
+    seen: *std.ArrayList(*const ClassDef),
+) ?MethodHit {
+    const ptr: *const ClassDef = cls.asPtr();
+    if (containsPtr(seen.items, ptr) or seen.items.len > ClassDef.MAX_WALK) return null;
+    seen.append(allocator, ptr) catch return null;
+    for (ptr.methods) |m| {
+        if (std.mem.eql(u8, m.name, name) and m.decl.body != null and firstParamTypeMatches(m, arg_type_name)) {
+            return .{ .method = m, .class = cls.clone() };
+        }
+    }
+    if (parentClone(ptr)) |parent| {
+        defer parent.deinit();
+        if (findMethodForArgWalk(allocator, parent, name, arg_type_name, seen)) |found| return found;
+    }
+    {
+        const g = ptr.interfaces.borrow();
+        defer g.deinit();
+        for (g.get().items) |iface| {
+            if (findMethodForArgWalk(allocator, iface, name, arg_type_name, seen)) |found| return found;
+        }
+    }
+    return null;
+}
+
+fn firstParamTypeMatches(m: MethodDef, arg_type_name: []const u8) bool {
+    if (m.decl.params.len == 0) return false;
+    return std.mem.eql(u8, m.decl.params[0].ty.name.name, arg_type_name);
+}
+
+fn findBodyPropertyWalk(
+    allocator: std.mem.Allocator,
+    cls: ObjRef(ClassDef),
+    name: []const u8,
+    seen: *std.ArrayList(*const ClassDef),
+) ?PropertyHit {
+    const ptr: *const ClassDef = cls.asPtr();
+    if (containsPtr(seen.items, ptr) or seen.items.len > ClassDef.MAX_WALK) return null;
+    seen.append(allocator, ptr) catch return null;
+    for (ptr.body_properties) |p| {
+        if (std.mem.eql(u8, p.name, name)) return .{ .property = p, .class = cls.clone() };
+    }
+    if (parentClone(ptr)) |parent| {
+        defer parent.deinit();
+        if (findBodyPropertyWalk(allocator, parent, name, seen)) |found| return found;
+    }
+    {
+        const g = ptr.interfaces.borrow();
+        defer g.deinit();
+        for (g.get().items) |iface| {
+            if (findBodyPropertyWalk(allocator, iface, name, seen)) |found| return found;
+        }
+    }
+    return null;
+}
+
+/// Return a fresh clone of the resolved parent `ClassDef` handle, or null.
+fn parentClone(cls: *const ClassDef) ?ObjRef(ClassDef) {
+    const g = cls.parent.borrow();
+    defer g.deinit();
+    return if (g.get().*) |p| p.clone() else null;
+}
+
+/// Return a fresh clone of the enclosing `ClassDef` handle, or null.
+fn enclosingClone(cls: *const ClassDef) ?ObjRef(ClassDef) {
+    const g = cls.enclosing_class.borrow();
+    defer g.deinit();
+    return if (g.get().*) |e| e.clone() else null;
+}
+
+// -------------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// A `ClassDef` wrapped in an `ObjRef` plus the inner cells it owns, so a
+/// test can tear everything down with `deinit`. The owned `methods` and
+/// `body_properties` slices are kept here for the same reason — `ClassDef`
+/// has no destructor, mirroring the Rust arena-owned layout.
+const ClassFixture = struct {
+    handle: ObjRef(ClassDef),
+    env: ObjRef(Env),
+    methods: []MethodDef,
+    body_properties: []PropertyDef,
+
+    fn build(
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        supertype_names: []const []const u8,
+        methods: []MethodDef,
+        body_properties: []PropertyDef,
+    ) !ClassFixture {
+        const env = try ObjRef(Env).init(allocator, Env.init(allocator));
+        const cd: ClassDef = .{
+            .name = name,
+            .fqn = name,
+            .annotation_names = &.{},
+            .primary_params = &.{},
+            .methods = methods,
+            .body_properties = body_properties,
+            .init_blocks = &.{},
+            .init_block_property_positions = &.{},
+            .is_data = false,
+            .is_value = false,
+            .is_object = false,
+            .is_enum = false,
+            .is_sealed = false,
+            .supertype_names = supertype_names,
+            .parent = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+            .interfaces = try ObjRef(std.ArrayList(ObjRef(ClassDef))).init(allocator, .empty),
+            .is_interface = false,
+            .is_fun_interface = false,
+            .parent_ctor_args = &.{},
+            .is_open = false,
+            .is_abstract = false,
+            .is_inner = false,
+            .is_anonymous = false,
+            .secondary_ctors = &.{},
+            .enum_entries = try ObjRef(std.ArrayList(ClassDef.EnumEntry)).init(allocator, .empty),
+            .companion = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+            .enclosing_class = try ObjRef(?ObjRef(ClassDef)).init(allocator, null),
+            .nested_classes = try ObjRef(std.ArrayList(ClassDef.NestedClass)).init(allocator, .empty),
+            .captured_env = env.clone(),
+            .supertype_delegates = try ObjRef(std.ArrayList(SupertypeDelegate)).init(allocator, .empty),
+            .delegate_forwarders = try ObjRef(std.ArrayList(MethodDef)).init(allocator, .empty),
+            .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(allocator, null),
+        };
+        return .{
+            .handle = try ObjRef(ClassDef).init(allocator, cd),
+            .env = env,
+            .methods = methods,
+            .body_properties = body_properties,
+        };
+    }
+
+    fn ptr(self: *const ClassFixture) *ClassDef {
+        return self.handle.asPtr();
+    }
+
+    /// Link `parent` as this class's resolved superclass.
+    fn setParent(self: *const ClassFixture, parent: ObjRef(ClassDef)) void {
+        const g = self.ptr().parent.borrowMut();
+        defer g.deinit();
+        g.get().* = parent.clone();
+    }
+
+    fn deinit(self: *ClassFixture, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const cd = self.ptr();
+        {
+            const g = cd.parent.borrow();
+            defer g.deinit();
+            if (g.get().*) |p| p.deinit();
+        }
+        cd.parent.deinit();
+        // The list-holding `ObjRef`s free their backing buffer in their own
+        // `deinit` (the cell runs `ArrayList.deinit(allocator)`); here we
+        // only release the element clones the cell does not own.
+        {
+            const g = cd.interfaces.borrowMut();
+            defer g.deinit();
+            for (g.get().items) |iface| iface.deinit();
+        }
+        cd.interfaces.deinit();
+        cd.enum_entries.deinit();
+        {
+            const g = cd.companion.borrow();
+            defer g.deinit();
+            if (g.get().*) |c| c.deinit();
+        }
+        cd.companion.deinit();
+        cd.enclosing_class.deinit();
+        cd.nested_classes.deinit();
+        cd.captured_env.deinit();
+        cd.supertype_delegates.deinit();
+        cd.delegate_forwarders.deinit();
+        cd.object_singleton.deinit();
+        self.handle.deinit();
+        // The `Env` cell is shared with `captured_env`; its last `deinit`
+        // runs `Env.deinit` automatically.
+        self.env.deinit();
+    }
+};
+
+fn dummySpan() ast.Span {
+    return ast.Span.init(span.FileId.from(0), 0, 0);
+}
+
+fn ident(name: []const u8) ast.Ident {
+    return .{ .name = name, .span = dummySpan() };
+}
+
+fn typeRef(name: []const u8, nullable: bool, args: []ast.TypeArg) ast.TypeRef {
+    return .{
+        .name = ident(name),
+        .nullable = nullable,
+        .span = dummySpan(),
+        .type_args = args,
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+}
+
+/// A `Function` AST node with a body, so `findMethod` treats a `MethodDef`
+/// built over it as concrete.
+fn fnWithBody(name: []const u8, params: []ast.Param, body: *ast.Block) ast.Function {
+    return .{
+        .name = ident(name),
+        .receiver_type = null,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = params,
+        .return_type = null,
+        .body = .{ .Block = body.* },
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .is_operator = false,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+}
+
+fn methodDef(name: []const u8, decl: *const ast.Function) MethodDef {
+    return .{
+        .name = name,
+        .decl = decl,
+        .is_operator = false,
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .sam_lambda = null,
+        .delegate_field = null,
+        .ir_fn_id = null,
+    };
+}
+
+fn propertyDef(name: []const u8) PropertyDef {
+    return .{
+        .name = name,
+        .mutable = false,
+        .init = null,
+        .getter = null,
+        .setter = null,
+        .delegate = null,
+        .is_abstract = false,
+        .is_lateinit = false,
+        .primitive_zero = null,
+    };
+}
+
+test "InstanceData get/set/define round-trip" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+
+    var inst: InstanceData = .{
+        .class = fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 0,
+        .native_state = null,
+    };
+    defer {
+        inst.fields.deinit(allocator);
+        inst.class.deinit();
+    }
+
+    try testing.expect(inst.get("x") == null);
+    try testing.expect(!inst.set("x", .{ .Int = 1 }));
+
+    try inst.define(allocator, "x", .{ .Int = 7 });
+    try testing.expectEqual(@as(i32, 7), inst.get("x").?.Int);
+
+    // define on an existing name overwrites without growing the list.
+    try inst.define(allocator, "x", .{ .Int = 8 });
+    try testing.expectEqual(@as(usize, 1), inst.fields.items.len);
+    try testing.expectEqual(@as(i32, 8), inst.get("x").?.Int);
+
+    try testing.expect(inst.set("x", .{ .Int = 9 }));
+    try testing.expectEqual(@as(i32, 9), inst.get("x").?.Int);
+}
+
+test "findMethod walks the parent chain and prefers concrete bodies" {
+    const allocator = testing.allocator;
+
+    var blk: ast.Block = .{ .stmts = &.{}, .span = dummySpan() };
+    var parent_fn = fnWithBody("greet", &.{}, &blk);
+    var child_fn = fnWithBody("speak", &.{}, &blk);
+
+    var parent_methods = [_]MethodDef{methodDef("greet", &parent_fn)};
+    var parent_fx = try ClassFixture.build(allocator, "Base", &.{}, &parent_methods, &.{});
+    defer parent_fx.deinit(allocator);
+
+    var child_methods = [_]MethodDef{methodDef("speak", &child_fn)};
+    var child_fx = try ClassFixture.build(allocator, "Derived", &.{"Base"}, &child_methods, &.{});
+    defer child_fx.deinit(allocator);
+    child_fx.setParent(parent_fx.handle);
+
+    // Own method resolves to the declaring class.
+    const own = ClassDef.findMethod(child_fx.handle, allocator, "speak").?;
+    var own_hit = own;
+    defer own_hit.class.deinit();
+    try testing.expectEqualStrings("speak", own_hit.method.name);
+    {
+        const g = own_hit.class.borrow();
+        defer g.deinit();
+        try testing.expectEqualStrings("Derived", g.get().name);
+    }
+
+    // Inherited method resolves through the parent link.
+    const inherited = ClassDef.findMethod(child_fx.handle, allocator, "greet").?;
+    var inh_hit = inherited;
+    defer inh_hit.class.deinit();
+    try testing.expectEqualStrings("greet", inh_hit.method.name);
+    {
+        const g = inh_hit.class.borrow();
+        defer g.deinit();
+        try testing.expectEqualStrings("Base", g.get().name);
+    }
+
+    try testing.expect(ClassDef.findMethod(child_fx.handle, allocator, "missing") == null);
+}
+
+test "findMethodForArg prefers the matching first-param overload" {
+    const allocator = testing.allocator;
+
+    var blk: ast.Block = .{ .stmts = &.{}, .span = dummySpan() };
+
+    const int_arg_ty = typeRef("Int", false, &.{});
+    const bag_arg_ty = typeRef("Bag", false, &.{});
+    var int_params = [_]ast.Param{.{ .name = ident("o"), .ty = int_arg_ty, .default = null, .is_vararg = false, .is_crossinline = false, .is_noinline = false, .annotations = &.{}, .span = dummySpan() }};
+    var bag_params = [_]ast.Param{.{ .name = ident("o"), .ty = bag_arg_ty, .default = null, .is_vararg = false, .is_crossinline = false, .is_noinline = false, .annotations = &.{}, .span = dummySpan() }};
+
+    var plus_int = fnWithBody("plus", &int_params, &blk);
+    var plus_bag = fnWithBody("plus", &bag_params, &blk);
+
+    var methods = [_]MethodDef{ methodDef("plus", &plus_int), methodDef("plus", &plus_bag) };
+    var fx = try ClassFixture.build(allocator, "Bag", &.{}, &methods, &.{});
+    defer fx.deinit(allocator);
+
+    const hit = ClassDef.findMethodForArg(fx.handle, allocator, "plus", "Bag").?;
+    var h = hit;
+    defer h.class.deinit();
+    try testing.expectEqualStrings("Bag", h.method.decl.params[0].ty.name.name);
+
+    // Unknown arg type falls back to the first matching name.
+    const fallback = ClassDef.findMethodForArg(fx.handle, allocator, "plus", "Other").?;
+    var fb = fallback;
+    defer fb.class.deinit();
+    try testing.expectEqualStrings("plus", fb.method.name);
+}
+
+test "findBodyProperty walks self then parent" {
+    const allocator = testing.allocator;
+
+    var parent_props = [_]PropertyDef{propertyDef("base")};
+    var parent_fx = try ClassFixture.build(allocator, "Base", &.{}, &.{}, &parent_props);
+    defer parent_fx.deinit(allocator);
+
+    var child_props = [_]PropertyDef{propertyDef("own")};
+    var child_fx = try ClassFixture.build(allocator, "Derived", &.{"Base"}, &.{}, &child_props);
+    defer child_fx.deinit(allocator);
+    child_fx.setParent(parent_fx.handle);
+
+    const own = ClassDef.findBodyProperty(child_fx.handle, allocator, "own").?;
+    own.class.deinit();
+    try testing.expectEqualStrings("own", own.property.name);
+
+    const inherited = ClassDef.findBodyProperty(child_fx.handle, allocator, "base").?;
+    var inh = inherited;
+    defer inh.class.deinit();
+    {
+        const g = inh.class.borrow();
+        defer g.deinit();
+        try testing.expectEqualStrings("Base", g.get().name);
+    }
+
+    try testing.expect(ClassDef.findBodyProperty(child_fx.handle, allocator, "nope") == null);
+}
+
+test "isSubtypeOf matches self, fqn, and named supertypes via captured env" {
+    const allocator = testing.allocator;
+
+    var base_fx = try ClassFixture.build(allocator, "Base", &.{}, &.{}, &.{});
+    defer base_fx.deinit(allocator);
+
+    var derived_fx = try ClassFixture.build(allocator, "Derived", &.{"Base"}, &.{}, &.{});
+    defer derived_fx.deinit(allocator);
+
+    // Bind `Base` in the derived class's captured env so the name walk
+    // can resolve it to a `Value::Class`.
+    {
+        const g = derived_fx.env.borrowMut();
+        defer g.deinit();
+        try g.get().define("Base", .{ .Class = base_fx.handle.clone() });
+    }
+    defer {
+        const g = derived_fx.env.borrow();
+        defer g.deinit();
+        if (g.get().lookup("Base")) |v| v.Class.deinit();
+    }
+
+    try testing.expect(derived_fx.ptr().isSubtypeOf(allocator, "Derived"));
+    try testing.expect(derived_fx.ptr().isSubtypeOf(allocator, "Base"));
+    try testing.expect(!derived_fx.ptr().isSubtypeOf(allocator, "Unrelated"));
+}
+
+test "allCompanions collects self and parent companions" {
+    const allocator = testing.allocator;
+
+    var parent_fx = try ClassFixture.build(allocator, "Base", &.{}, &.{}, &.{});
+    defer parent_fx.deinit(allocator);
+    var child_fx = try ClassFixture.build(allocator, "Derived", &.{"Base"}, &.{}, &.{});
+    defer child_fx.deinit(allocator);
+    child_fx.setParent(parent_fx.handle);
+
+    // Give each class a companion instance.
+    const parent_comp = try ObjRef(InstanceData).init(allocator, .{
+        .class = parent_fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 1,
+        .native_state = null,
+    });
+    // `InstanceData` has no destructor (its `class` handle is an arena-owned
+    // clone in the real runtime); release the field clone explicitly here.
+    defer parent_comp.asPtr().class.deinit();
+    defer parent_comp.deinit();
+    const child_comp = try ObjRef(InstanceData).init(allocator, .{
+        .class = child_fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 2,
+        .native_state = null,
+    });
+    defer child_comp.asPtr().class.deinit();
+    defer child_comp.deinit();
+    {
+        const g = parent_fx.ptr().companion.borrowMut();
+        defer g.deinit();
+        g.get().* = parent_comp.clone();
+    }
+    {
+        const g = child_fx.ptr().companion.borrowMut();
+        defer g.deinit();
+        g.get().* = child_comp.clone();
+    }
+
+    const comps = try ClassDef.allCompanions(child_fx.handle, allocator);
+    defer {
+        for (comps) |c| c.deinit();
+        allocator.free(comps);
+    }
+    try testing.expectEqual(@as(usize, 2), comps.len);
+    // Self first, then parent.
+    try testing.expect(ObjRef(InstanceData).ptrEq(comps[0], child_comp));
+    try testing.expect(ObjRef(InstanceData).ptrEq(comps[1], parent_comp));
+}
+
+test "TypeShape from a generic, nullable type ref" {
+    const allocator = testing.allocator;
+
+    // Build `Map<String, Item?>` with a star-projected arg to verify it is
+    // skipped: `Map<String, *>`-style mixing is collapsed.
+    const string_ty = typeRef("String", false, &.{});
+    const item_ty = typeRef("Item", true, &.{});
+    var args = [_]ast.TypeArg{
+        .{ .variance = .Invariant, .is_star = false, .ty = string_ty, .span = dummySpan() },
+        .{ .variance = .Invariant, .is_star = false, .ty = item_ty, .span = dummySpan() },
+        .{ .variance = .Invariant, .is_star = true, .ty = string_ty, .span = dummySpan() },
+    };
+    const map_ty = typeRef("Map", true, &args);
+
+    const shape = try TypeShape.fromTypeRef(allocator, &map_ty);
+    defer {
+        for (shape.args) |a| allocator.free(a.args);
+        allocator.free(shape.args);
+    }
+
+    try testing.expectEqualStrings("Map", shape.name);
+    try testing.expect(shape.nullable);
+    try testing.expectEqual(@as(usize, 2), shape.args.len); // star arg skipped
+    try testing.expectEqualStrings("String", shape.args[0].name);
+    try testing.expect(!shape.args[0].nullable);
+    try testing.expectEqualStrings("Item", shape.args[1].name);
+    try testing.expect(shape.args[1].nullable);
+}
+
+test "ensureNativeState creates once and returns the same payload" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Buf", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+
+    const Payload = struct { n: u32 };
+    const mk = struct {
+        fn make() Payload {
+            return .{ .n = 42 };
+        }
+    };
+
+    var inst: InstanceData = .{
+        .class = fx.handle.clone(),
+        .fields = .empty,
+        .outer = null,
+        .identity = 0,
+        .native_state = null,
+    };
+    defer {
+        if (inst.native_state) |ns| ns.data.deinit();
+        inst.fields.deinit(allocator);
+        inst.class.deinit();
+    }
+
+    const first = try inst.ensureNativeState(allocator, Payload, "kotlinx.io.Buffer", mk.make);
+    defer first.deinit();
+    try testing.expectEqual(@as(u32, 42), InstanceData.nativeStatePtr(Payload, first).n);
+
+    // Mutate through the boxed payload, then re-ensure: same cell, same data.
+    InstanceData.nativeStatePtr(Payload, first).n = 99;
+    const second = try inst.ensureNativeState(allocator, Payload, "kotlinx.io.Buffer", mk.make);
+    defer second.deinit();
+    try testing.expect(ObjRef(NativeBox).ptrEq(first, second));
+    try testing.expectEqual(@as(u32, 99), InstanceData.nativeStatePtr(Payload, second).n);
+}

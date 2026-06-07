@@ -1,0 +1,7 @@
+{apple=3, cherry=5}
+{alice=100, bob=200, carol=300}
+{x=1, z=2}
+{host=a, port=b}
+[a, b, c]
+6
+a=1, b=2, c=3

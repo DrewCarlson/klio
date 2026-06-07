@@ -1,0 +1,14 @@
+U+0041 letter=true digit=false upper=true lower=false ws=false
+U+007A letter=true digit=false upper=false lower=true ws=false
+U+0030 letter=false digit=true upper=false lower=false ws=false
+U+0020 letter=false digit=false upper=false lower=false ws=true
+U+0009 letter=false digit=false upper=false lower=false ws=true
+U+001F letter=false digit=false upper=false lower=false ws=true
+U+00A0 letter=false digit=false upper=false lower=false ws=true
+U+03B1 letter=true digit=false upper=false lower=true ws=false
+U+044F letter=true digit=false upper=false lower=true ws=false
+U+0665 letter=false digit=true upper=false lower=false ws=false
+U+2164 letter=false digit=false upper=true lower=false ws=false
+U+24D0 letter=false digit=false upper=false lower=true ws=false
+U+1D2C letter=true digit=false upper=false lower=true ws=false
+U+00AA letter=true digit=false upper=false lower=true ws=false

@@ -1,0 +1,13 @@
+all=[a, b, c, d] count=4 count=4 reads=2
+clamped=10
+clamped=0
++ -> 10
+* -> 24
+^ -> 6
+m[1,2]=6 total=21 row0sum=6 row1[0]=4
+2^10=1024
+computed:123
+computed:123
+anyRepo.count=2
+5
+fig

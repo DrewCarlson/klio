@@ -1,0 +1,17 @@
+fun main() {
+    println("ff".toInt(16))
+    println("ff".toLong(16))
+    println("z".toLong(36))
+    println("1011".toLong(2))
+    println("2147483647".toInt())
+    println("2147483648".toIntOrNull())
+    println("-2147483648".toInt())
+    println("99999999999".toIntOrNull())
+    println("99999999999".toLong())
+    println("9223372036854775807".toLong())
+    println("9223372036854775808".toLongOrNull())
+    println("zz".toIntOrNull(36))
+    println("xyz".toIntOrNull())
+    println("100".toLong(16))
+    println("cafe".toLongOrNull(16))
+}

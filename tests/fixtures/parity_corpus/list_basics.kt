@@ -1,0 +1,16 @@
+fun main() {
+    val xs = listOf(1, 2, 3, 4, 5)
+    println(xs)
+    println(xs.size)
+    println(xs.isEmpty())
+    println(xs.isNotEmpty())
+    println(xs.first())
+    println(xs.last())
+    println(xs[0])
+    println(xs.contains(3))
+    println(xs.indexOf(4))
+    println(xs.lastIndexOf(2))
+    println(xs.joinToString(", "))
+    val empty: List<Int> = emptyList()
+    println(empty)
+}

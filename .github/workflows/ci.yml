@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: zig build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # The kotlin-klio/*/upstream vendor trees (kotlinx + ktor sources the
+      # interpreter consumes at runtime) are submodules; without them every
+      # pack-using test fails with unresolved kotlinx/ktor globals.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - name: install zig 0.16.0
+        run: |
+          set -euo pipefail
+          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+
+      - name: zig version
+        run: zig version
+
+      # The interpreter reads upstream Kotlin stdlib sources from kotlin/ at
+      # runtime (the stdlib pack is built from them). A sparse, blobless clone
+      # of libraries/stdlib at the target tag is enough.
+      - name: cache kotlin stdlib sources (kotlin/)
+        id: kotlin-src-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: kotlin
+          key: kotlin-src-2.3.21-libraries-stdlib
+
+      - name: checkout kotlin stdlib sources (if not cached)
+        if: steps.kotlin-src-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --filter=blob:none --no-checkout --depth 1 --branch v2.3.21 \
+            https://github.com/JetBrains/kotlin kotlin
+          git -C kotlin sparse-checkout init --cone
+          git -C kotlin sparse-checkout set libraries/stdlib
+          git -C kotlin checkout v2.3.21
+
+      # Both zig caches: the global cache (package fetches like the vendored
+      # zstd tarball, compiled artifacts) and the project-local .zig-cache
+      # (build artifacts plus the test run-step result manifests, so unchanged
+      # test steps are cache hits in CI exactly as they are locally). Keyed
+      # per-commit with prefix restore so every run starts from the nearest
+      # prior cache. Restore and save are split so the save runs even when
+      # the job fails or times out -- a partial compile still banks progress
+      # for the next run instead of restarting cold forever.
+      - name: restore zig build + test state
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}
+          restore-keys: |
+            zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-
+
+      - name: zig build
+        run: zig build
+
+      # -Dharness-optimize=Debug: locally the program-running harness binaries
+      # compile a second ReleaseSafe module universe so interpreted test
+      # programs run ~5x faster across thousands of iterations. CI runs each
+      # step once, so the slower Debug interpreter costs a couple of minutes
+      # while the second universe's optimizing compiles cost tens of minutes
+      # on a 4-vCPU runner. One universe here; the ReleaseSafe configuration
+      # runs in the harness-release workflow (manual / nightly).
+      - name: zig build test
+        run: zig build test -Dharness-optimize=Debug --summary all
+
+      - name: save zig build + test state
+        if: always()
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-0.16.0-debug-${{ hashFiles('build.zig.zon') }}-${{ github.sha }}

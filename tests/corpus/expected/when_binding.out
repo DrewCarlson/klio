@@ -1,0 +1,4 @@
+int 7 (squared=49)
+str hi (len=2)
+dbl 1.0
+other true

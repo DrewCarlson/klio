@@ -1,0 +1,11 @@
+rectangle area=12.0
+square side=5.0 rectangle area=25.0
+25.0
+12.0
+25.0
+0.0
+3
+[1, 2, 3]
+1
+2
+2

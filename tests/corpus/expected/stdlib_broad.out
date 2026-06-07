@@ -1,0 +1,26 @@
+3
+6
+[3, 1, 4, 5, 9, 2, 6]
+true
+{odd=[3, 1, 1, 5, 9], even=[4, 2, 6]}
+[0:3, 1:1, 2:4, 3:1, 4:5, 5:9, 6:2, 7:6]
+head=3
+[1, 2, 3]
+{alpha=1}
+{alpha=100, beta=200, gamma=300}
+0
+Hello, World!
+**abc
+[Hello, World, Kotlin]
+[first, second, third]
+gz
+65
+5
+A
+[1, 2, 3, 4, 5]
+15
+[10, 7, 4, 1]
+repeat 0
+repeat 1
+repeat 2
+require caught: boom

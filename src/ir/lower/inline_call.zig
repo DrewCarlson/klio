@@ -1,0 +1,669 @@
+//! Inline-call lowering: expanding an `inline fun` body (and splicing its
+//! lambda arguments) at the call site. Free functions over the shared
+//! `FuncBuilder`; filled in alongside the expression dispatch.
+
+const std = @import("std");
+const ast = @import("ast");
+const ir = @import("../ir.zig");
+const build = @import("../build.zig");
+const expr_lower = @import("expr.zig");
+const inline_state = @import("inline_state.zig");
+
+const Allocator = std.mem.Allocator;
+const FuncBuilder = build.FuncBuilder;
+const Expr = ast.Expr;
+const Stmt = ast.Stmt;
+const TypeRef = ast.TypeRef;
+const Function = ast.Function;
+const Reg = ir.Reg;
+const Const = ir.Const;
+const Inst = ir.Inst;
+const Terminator = ir.Terminator;
+const InlineReturn = build.InlineReturn;
+const CallShape = inline_state.CallShape;
+
+const lowerExpr = expr_lower.lowerExpr;
+const lowerBlock = expr_lower.lowerBlock;
+
+/// Best-effort static type of a member call's receiver, used only to
+/// disambiguate same-name reified inline extensions declared on different
+/// receiver types. Handles the cases the ktor client surface needs:
+/// an implicit/explicit `this` (the enclosing extension's receiver type),
+/// and a chained call `recv.foo().bar()` (the inner call's declared return
+/// type, looked up from a same-named non-extension function). Returns
+/// `null` when the type can't be inferred cheaply — the caller then falls
+/// back to shape-based overload resolution.
+fn inferReceiverType(b: *const FuncBuilder, this_arg: ?*const Expr) Allocator.Error!?[]const u8 {
+    const arg = this_arg orelse return b.recvTy();
+    switch (arg.*) {
+        .This, .Super => return b.recvTy(),
+        .Call => |call| {
+            // `recv.method(...)` — use the called function's declared return
+            // type. Resolve by simple name against the lowered module's
+            // functions, preferring a unique return type among candidates.
+            const name = switch (call.callee.*) {
+                .Member => |m| m.name.name,
+                .Path => |p| if (p.segments.len == 1) p.segments[0].name else return null,
+                else => return null,
+            };
+            // Tally concrete return types across the same-name overloads
+            // and pick the most common one. A bare generic type parameter
+            // (`V`/`T`), `Unit`, and the untyped case carry no information
+            // and are ignored, so an operator `kotlin.collections.get(key):
+            // V` neither vetoes nor competes with the ktor `get(...):
+            // HttpResponse` extensions. The dominant concrete return wins;
+            // an exact tie between two different concrete types is left
+            // unresolved (`null`) so the caller keeps shape-based fallback.
+            var tally = std.StringHashMap(usize).init(b.allocator);
+            defer tally.deinit();
+            for (b.module.funcsBySimpleName(name)) |fid| {
+                const idx = fid.int();
+                if (idx >= b.module.funcs.items.len) continue;
+                const f = &b.module.funcs.items[idx];
+                const rt = f.return_ty.name;
+                const is_type_param = rt.len <= 2 and allAsciiUppercase(rt);
+                if (rt.len == 0 or std.mem.eql(u8, rt, "Unit") or is_type_param) {
+                    continue;
+                }
+                const gop = try tally.getOrPut(rt);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += 1;
+            }
+            var best: ?[]const u8 = null;
+            var best_n: usize = 0;
+            var tie = false;
+            var it = tally.iterator();
+            while (it.next()) |entry| {
+                const ty = entry.key_ptr.*;
+                const n = entry.value_ptr.*;
+                if (best == null) {
+                    best = ty;
+                    best_n = n;
+                } else if (n > best_n) {
+                    best = ty;
+                    best_n = n;
+                    tie = false;
+                } else if (n == best_n) {
+                    tie = true;
+                }
+            }
+            if (tie) return null;
+            return best;
+        },
+        else => return null,
+    }
+}
+
+fn allAsciiUppercase(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isUpper(c)) return false;
+    }
+    return true;
+}
+
+/// Does any argument that is a lambda literal contain a non-local
+/// `return` in its own body (not descending into nested lambdas /
+/// local functions, whose returns are their own)?
+pub fn argLambdaHasNonlocalReturn(args: []const Expr) bool {
+    for (args) |*a| {
+        if (a.* == .Lambda) {
+            if (scanStmts(a.Lambda.body.stmts)) return true;
+        }
+    }
+    return false;
+}
+
+fn scanStmts(stmts: []const Stmt) bool {
+    for (stmts) |*s| {
+        const hit = switch (s.*) {
+            .Expr => |*e| scan(e),
+            .Assign => |asg| scan(&asg.target) or scan(&asg.value),
+            .DestructuringDecl => |d| scan(&d.init),
+            .Decl => |decl| switch (decl) {
+                .Property => |p| if (p.init) |*init| scan(init) else false,
+                else => false,
+            },
+        };
+        if (hit) return true;
+    }
+    return false;
+}
+
+// A non-local return inside a nested scope (lambda / anon fun / object
+// expression) is its own and must not count here; those arms return
+// false, kept distinct from the catch-all default.
+fn scan(e: *const Expr) bool {
+    return switch (e.*) {
+        .Return => true,
+        .Lambda, .AnonFun, .ObjectExpr => false,
+        .Member => |m| scan(m.receiver),
+        .Unary => |u| scan(u.expr),
+        .Postfix => |p| scan(p.expr),
+        .Spread => |s| scan(s.expr),
+        .Throw => |t| scan(t.value),
+        .Labeled => |l| scan(l.expr),
+        .As => |a| scan(a.expr),
+        .IsCheck => |c| scan(c.expr),
+        .MemberRef => |r| scan(r.receiver),
+        .Call => |c| scan(c.callee) or scanArgs(c.args),
+        .Index => |i| scan(i.receiver) or scanArgs(i.args),
+        .Binary => |bin| scan(bin.lhs) or scan(bin.rhs),
+        .If => |i| scan(i.cond) or scan(i.then_branch) or
+            (if (i.else_branch) |eb| scan(eb) else false),
+        .While => |w| scan(w.cond) or scan(w.body),
+        .DoWhile => |dw| (if (dw.body) |body| scan(body) else false) or scan(dw.cond),
+        .For => |f| scan(f.iter) or scan(f.body),
+        .Block => |blk| scanStmts(blk.stmts),
+        .When => |w| (if (w.subject) |sub| scan(sub) else false) or scanWhenBranches(w.branches),
+        .Try => |t| scanStmts(t.body.stmts) or scanCatches(t.catches) or
+            (if (t.finally) |fb| scanStmts(fb.stmts) else false),
+        else => false,
+    };
+}
+
+fn scanArgs(args: []const Expr) bool {
+    for (args) |*a| {
+        if (scan(a)) return true;
+    }
+    return false;
+}
+
+fn scanWhenBranches(branches: []const ast.WhenBranch) bool {
+    for (branches) |*br| {
+        if (scan(&br.body)) return true;
+    }
+    return false;
+}
+
+fn scanCatches(catches: []const ast.Catch) bool {
+    for (catches) |*c| {
+        if (scanStmts(c.body.stmts)) return true;
+    }
+    return false;
+}
+
+/// Splice an `inline fun` argument lambda where the inlined body
+/// invokes the corresponding lambda parameter.
+pub fn spliceInlineLambda(b: *FuncBuilder, lam: *const Expr, arg_exprs: []const Expr) Allocator.Error!Reg {
+    if (lam.* != .Lambda) {
+        return lowerExpr(b, lam);
+    }
+    const params = lam.Lambda.params;
+    const body = lam.Lambda.body;
+
+    const arg_regs = try b.allocator.alloc(Reg, arg_exprs.len);
+    defer b.allocator.free(arg_regs);
+    for (arg_exprs, 0..) |*a, i| {
+        arg_regs[i] = try lowerExpr(b, a);
+    }
+    const counted = inline_state.inlineExpandEnter();
+    try b.pushScope();
+    if (params.len == 0) {
+        if (arg_regs.len > 0) {
+            try b.bind("it", arg_regs[0]);
+        }
+    } else {
+        const n = @min(params.len, arg_regs.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            try b.bind(params[i].name, arg_regs[i]);
+        }
+    }
+    // Capture the owner splice's localize target *before* pushing the new
+    // frame, then duplicate it so restoring does not alias the frame's
+    // own snapshot (which the frame frees on pop).
+    const owner_ret: ?[]InlineReturn = if (b.inlineLambdaOwnerReturn()) |o|
+        try b.allocator.dupe(InlineReturn, o)
+    else
+        null;
+    try b.pushInlineLambdaFrame(std.StringHashMap(*const ast.Expr).init(b.allocator));
+    const saved = try b.takeInlineReturn();
+    if (owner_ret) |o| {
+        try b.restoreInlineReturn(o);
+    }
+    const result = b.allocReg();
+    const unit0 = try b.emitConst(Const.Unit);
+    try b.push(.{ .Move = .{ .dst = result, .src = unit0 } });
+    const end = try b.allocBlock();
+    const label = b.currentInlineFn();
+    if (label) |lbl| {
+        try b.pushInlineLambdaRet(lbl, result, end);
+    }
+    const v = try lowerBlock(b, &body);
+    try b.push(.{ .Move = .{ .dst = result, .src = v } });
+    b.terminate(.{ .Goto = end });
+    b.switchTo(end);
+    if (label != null) {
+        b.popInlineLambdaRet();
+    }
+    try b.restoreInlineReturn(saved);
+    b.popInlineLambdaFrame();
+    try b.popScope();
+    if (counted) {
+        inline_state.inlineExpandLeave();
+    }
+    return result;
+}
+
+/// Build the effective per-type-parameter argument list for an inline
+/// call: each explicit `<…>` argument is kept; any reified parameter
+/// left unspecified is inferred by unifying the function's declared
+/// return type with the call's expected (tail-position) type. Non-reified
+/// parameters and parameters that cannot be inferred stay `null`.
+fn inferReifiedTypeArgs(
+    allocator: Allocator,
+    f: *const Function,
+    explicit: []const TypeRef,
+    expected: ?*const TypeRef,
+) Allocator.Error![]?TypeRef {
+    var out = try allocator.alloc(?TypeRef, f.type_params.len);
+    for (f.type_params, 0..) |_, i| {
+        out[i] = if (i < explicit.len) explicit[i] else null;
+    }
+    var needs_infer = false;
+    for (f.type_params, 0..) |tp, i| {
+        if (tp.is_reified and out[i] == null) {
+            needs_infer = true;
+            break;
+        }
+    }
+    if (!needs_infer) return out;
+    const exp = expected orelse return out;
+    const ret = if (f.return_type) |*r| r else return out;
+
+    var tp_names = std.StringHashMap(void).init(allocator);
+    defer tp_names.deinit();
+    for (f.type_params) |tp| {
+        try tp_names.put(tp.name.name, {});
+    }
+    var subst = std.StringHashMap(TypeRef).init(allocator);
+    defer subst.deinit();
+    try unifyTypeParam(ret, exp, &tp_names, &subst);
+    for (f.type_params, 0..) |tp, i| {
+        if (out[i] == null) {
+            if (subst.get(tp.name.name)) |t| {
+                out[i] = t;
+            }
+        }
+    }
+    return out;
+}
+
+/// Unify a declared type (which may mention type parameters) against a
+/// concrete actual type, recording each type parameter's solution. When
+/// the declared type *is* a bare type parameter, it binds to the whole
+/// actual type; otherwise matching heads recurse positionally through
+/// generic arguments (`Box<T>` vs `Box<Int>` solves `T = Int`).
+fn unifyTypeParam(
+    decl: *const TypeRef,
+    actual: *const TypeRef,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+) Allocator.Error!void {
+    if (decl.type_args.len == 0 and tp_names.contains(decl.name.name)) {
+        if (!subst.contains(decl.name.name)) {
+            try subst.put(decl.name.name, actual.*);
+        }
+        return;
+    }
+    const n = @min(decl.type_args.len, actual.type_args.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const d = &decl.type_args[i];
+        const a = &actual.type_args[i];
+        if (!d.is_star and !a.is_star) {
+            try unifyTypeParam(&d.ty, &a.ty, tp_names, subst);
+        }
+    }
+}
+
+/// Expand a call to a `suspend inline fun` by splicing its body into
+/// the caller. `type_args` carries the call-site `<T = SomeType>` for
+/// reified type parameters so the splice can bind each reified
+/// parameter's name to the resolved class value before lowering the
+/// body — `T::class` and `is T` reads inside the spliced body then
+/// resolve to the call site's type. `expected` carries the call's
+/// tail-position type so a reified parameter with no explicit `<…>`
+/// argument can be inferred from context.
+pub fn tryInlineCallWithTypeArgs(
+    b: *FuncBuilder,
+    fname: []const u8,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    this_arg: ?*const Expr,
+    type_args: []const TypeRef,
+    expected: ?*const TypeRef,
+) Allocator.Error!?Reg {
+    // Resolve the inline overload matching this call's shape (so an
+    // overloaded inline fn binds the function-param form for a trailing
+    // lambda); conservative — falls back to the first overload otherwise.
+    const last_is_lambda = args.len > 0 and switch (args[args.len - 1]) {
+        .Lambda, .AnonFun => true,
+        else => false,
+    };
+    const call_shape = CallShape{ .want = args.len, .last_is_lambda = last_is_lambda };
+    const recv_ty = try inferReceiverType(b, this_arg);
+    // A present `this_arg` means a qualified member call (`recv.f(...)`); the
+    // inline target must be a receiver extension, never a same-named top-level
+    // build-only overload.
+    const f = inline_state.inlineFnAstForRecvExt(
+        fname,
+        call_shape,
+        recv_ty,
+        this_arg != null,
+    ) orelse return null;
+    if (b.inlineInProgress(fname)) {
+        return null;
+    }
+    const body = if (f.body) |*body_ref| body_ref else return null;
+
+    var ordered = try b.allocator.alloc(?*const Expr, f.params.len);
+    defer b.allocator.free(ordered);
+    for (ordered) |*slot| slot.* = null;
+    var next_pos: usize = 0;
+    for (args, 0..) |*a, i| {
+        const nm: ?[]const u8 = if (i < arg_names.len) arg_names[i] else null;
+        if (nm) |name| {
+            const idx = paramIndex(f, name) orelse return null;
+            ordered[idx] = a;
+        } else {
+            while (next_pos < ordered.len and ordered[next_pos] != null) {
+                next_pos += 1;
+            }
+            if (next_pos >= ordered.len) {
+                return null;
+            }
+            ordered[next_pos] = a;
+            next_pos += 1;
+        }
+    }
+    for (ordered, 0..) |*slot, i| {
+        if (slot.* == null) {
+            if (f.params[i].default) |*d| {
+                slot.* = d;
+            } else {
+                return null;
+            }
+        }
+    }
+    if (!inline_state.inlineExpandEnter()) {
+        return null;
+    }
+    try b.pushInlineName(fname);
+    try b.pushScope();
+    var lambda_map = std.StringHashMap(*const ast.Expr).init(b.allocator);
+    for (f.params, 0..) |*p, i| {
+        const a = ordered[i].?; // filled above
+        const r = try lowerExpr(b, a);
+        try b.bind(p.name.name, r);
+        // `noinline` parameters opt out of the inline-lambda splicing
+        // path. Their argument value still flows through the binding
+        // above, but a call to that parameter inside the inlined body
+        // lowers as a normal CallValue against the reg instead of
+        // inlining the lambda literal. Without this gate, every inline
+        // call would splice every lambda argument's body — defeating
+        // `noinline`'s point of letting the lambda be passed on or
+        // stored.
+        //
+        // `crossinline` keeps the inline-lambda path, but a bare
+        // `return` in the lambda body is illegal: the inlined body's
+        // return targets the enclosing inline fn's caller, and
+        // `crossinline` promises that the lambda will not perform such a
+        // non-local return. Klio doesn't currently emit a parser-level
+        // diagnostic for the violation; the runtime semantics still
+        // match Kotlin.
+        if (!p.is_noinline and a.* == .Lambda) {
+            try lambda_map.put(p.name.name, a);
+        }
+    }
+    // Mark params whose declared type is one of this inline fn's own
+    // generic type-parameters, so a comparison operator on such an
+    // operand inside the spliced body lowers to `compareTo` (total order
+    // for Double/Float) — matching the reference compiler. The splice
+    // binds the body in the caller's builder, so record which names we
+    // add and remove them once the body is lowered to avoid leaking the
+    // mark onto a same-named caller local.
+    var marked_generic: std.ArrayList([]const u8) = .empty;
+    defer marked_generic.deinit(b.allocator);
+    if (f.type_params.len != 0) {
+        var tp_names = std.StringHashMap(void).init(b.allocator);
+        defer tp_names.deinit();
+        for (f.type_params) |tp| {
+            try tp_names.put(tp.name.name, {});
+        }
+        for (f.params) |*p| {
+            if (p.ty.function == null and
+                !p.ty.nullable and
+                tp_names.contains(p.ty.name.name) and
+                !b.isGenericTypedParam(p.name.name))
+            {
+                try b.markGenericTypedParam(p.name.name);
+                try marked_generic.append(b.allocator, p.name.name);
+            }
+        }
+    }
+    // Mark params whose declared type is a receiver-typed function
+    // (`block: T.() -> R`) so a bare `block(...)` in the spliced body
+    // dispatches `this.block()`. Same record-and-remove discipline as
+    // the generic marks above.
+    var marked_rlp: std.ArrayList([]const u8) = .empty;
+    defer marked_rlp.deinit(b.allocator);
+    for (f.params) |*p| {
+        const has_recv = if (p.ty.function) |ft| ft.receiver != null else false;
+        if (has_recv and !b.isReceiverLambdaParam(p.name.name)) {
+            try b.markReceiverLambdaParam(p.name.name);
+            try marked_rlp.append(b.allocator, p.name.name);
+        }
+    }
+    try b.pushInlineLambdaFrame(lambda_map);
+    if (f.receiver_type != null) {
+        if (this_arg) |recv| {
+            const rr = try lowerExpr(b, recv);
+            try b.bind("this", rr);
+        }
+    }
+    // Bind each reified type parameter to the resolved class value at the
+    // call site. Two bindings are needed:
+    //
+    //   * Local: `T` resolves as a value (the spliced body's `T::class`
+    //     read lowers as a bare `T` Path → MemberRef `.class`, the Path
+    //     resolves through the local bind).
+    //   * Global: `Inst::InstanceOf { ty: TypeRef "T" }` checks the value
+    //     against the global named "T" (mirroring how `call_func_typed`
+    //     binds runtime type-args). Without the global, `x is T` would
+    //     test against a non-existent class `T` and silently fall through
+    //     to `true`.
+    //
+    // The global isn't saved/restored — same shape klio uses for type-arg
+    // binding in non-inline calls. A nested splice overwrites it; a later
+    // restore happens implicitly when the enclosing call returns.
+    // Explicit `<…>` type arguments win; any reified parameter left
+    // unspecified is inferred by unifying the function's declared return
+    // type against the call's expected (tail-position) type, so
+    // `val u: User = resp.body()` binds `T = User` with no `<User>`.
+    const effective_type_args = try inferReifiedTypeArgs(b.allocator, f, type_args, expected);
+    defer b.allocator.free(effective_type_args);
+    for (f.type_params, 0..) |tp, tp_idx| {
+        if (!tp.is_reified) continue;
+        const arg = (if (tp_idx < effective_type_args.len) effective_type_args[tp_idx] else null) orelse continue;
+        const cls_reg = b.allocReg();
+        const arg_name = try b.module.internConst(b.allocator, .{ .String = arg.name.name });
+        try b.push(.{ .LoadGlobal = .{ .dst = cls_reg, .name = arg_name } });
+        try b.bind(tp.name.name, cls_reg);
+        const tp_global = try b.module.internConst(b.allocator, .{ .String = tp.name.name });
+        try b.push(.{ .StoreGlobal = .{ .name = tp_global, .value = cls_reg } });
+    }
+    const result = b.allocReg();
+    const unit0 = try b.emitConst(Const.Unit);
+    try b.push(.{ .Move = .{ .dst = result, .src = unit0 } });
+    const join = try b.allocBlock();
+    try b.pushInlineReturn(result, join);
+    const body_val = switch (body.*) {
+        .Expr => |*e| try lowerExpr(b, e),
+        .Block => |*blk| try lowerBlock(b, blk),
+    };
+    try b.push(.{ .Move = .{ .dst = result, .src = body_val } });
+    b.terminate(.{ .Goto = join });
+    b.switchTo(join);
+    for (marked_rlp.items) |n| {
+        b.unmarkReceiverLambdaParam(n);
+    }
+    b.popInlineReturn();
+    b.popInlineLambdaFrame();
+    try b.popScope();
+    b.popInlineName();
+    inline_state.inlineExpandLeave();
+    return result;
+}
+
+fn paramIndex(f: *const Function, name: []const u8) ?usize {
+    for (f.params, 0..) |p, i| {
+        if (std.mem.eql(u8, p.name.name, name)) return i;
+    }
+    return null;
+}
+
+// -------------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------------
+
+const testing = std.testing;
+const span = @import("span");
+
+test {
+    testing.refAllDecls(@This());
+}
+
+fn dummySpan() span.Span {
+    return span.Span.init(span.FileId.from(0), 0, 0);
+}
+
+fn ident(name: []const u8) ast.Ident {
+    return .{ .name = name, .span = dummySpan() };
+}
+
+test "arg_lambda_has_nonlocal_return detects bare return" {
+    var ret = Expr{ .Return = .{ .value = null, .label = null, .span = dummySpan() } };
+    var stmts = [_]Stmt{.{ .Expr = ret }};
+    const lam = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &stmts, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    const args = [_]Expr{lam};
+    try testing.expect(argLambdaHasNonlocalReturn(&args));
+    _ = &ret;
+}
+
+test "arg_lambda_has_nonlocal_return ignores nested lambda return" {
+    // A `return` inside a nested lambda is local to that lambda.
+    var inner_ret = Expr{ .Return = .{ .value = null, .label = null, .span = dummySpan() } };
+    var inner_stmts = [_]Stmt{.{ .Expr = inner_ret }};
+    const inner_lam = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &inner_stmts, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    var outer_stmts = [_]Stmt{.{ .Expr = inner_lam }};
+    const outer_lam = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &outer_stmts, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    const args = [_]Expr{outer_lam};
+    try testing.expect(!argLambdaHasNonlocalReturn(&args));
+    _ = &inner_ret;
+}
+
+test "arg_lambda_has_nonlocal_return scans nested control flow" {
+    // `if (cond) return` inside a lambda body counts.
+    var cond = Expr{ .BoolLit = .{ .value = true, .span = dummySpan() } };
+    var ret = Expr{ .Return = .{ .value = null, .label = null, .span = dummySpan() } };
+    const if_expr = Expr{ .If = .{
+        .cond = &cond,
+        .then_branch = &ret,
+        .else_branch = null,
+        .span = dummySpan(),
+    } };
+    var stmts = [_]Stmt{.{ .Expr = if_expr }};
+    const lam = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &stmts, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    const args = [_]Expr{lam};
+    try testing.expect(argLambdaHasNonlocalReturn(&args));
+}
+
+test "arg_lambda_has_nonlocal_return false for plain body" {
+    var lit = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } };
+    var stmts = [_]Stmt{.{ .Expr = lit }};
+    const lam = Expr{ .Lambda = .{
+        .params = &.{},
+        .body = .{ .stmts = &stmts, .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    const args = [_]Expr{lam};
+    try testing.expect(!argLambdaHasNonlocalReturn(&args));
+    _ = &lit;
+}
+
+test "arg_lambda_has_nonlocal_return false for non-lambda arg" {
+    const lit = Expr{ .IntLit = .{ .value = 1, .kind = .Int, .span = dummySpan() } };
+    const args = [_]Expr{lit};
+    try testing.expect(!argLambdaHasNonlocalReturn(&args));
+}
+
+fn typeRef(name: []const u8) TypeRef {
+    return .{
+        .name = ident(name),
+        .nullable = false,
+        .span = dummySpan(),
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+}
+
+test "unify_type_param binds a bare type parameter" {
+    var tp_names = std.StringHashMap(void).init(testing.allocator);
+    defer tp_names.deinit();
+    try tp_names.put("T", {});
+    var subst = std.StringHashMap(TypeRef).init(testing.allocator);
+    defer subst.deinit();
+    const decl = typeRef("T");
+    const actual = typeRef("User");
+    try unifyTypeParam(&decl, &actual, &tp_names, &subst);
+    const got = subst.get("T") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("User", got.name.name);
+}
+
+test "unify_type_param recurses through generic args" {
+    var tp_names = std.StringHashMap(void).init(testing.allocator);
+    defer tp_names.deinit();
+    try tp_names.put("T", {});
+    var subst = std.StringHashMap(TypeRef).init(testing.allocator);
+    defer subst.deinit();
+    // decl: Box<T> ; actual: Box<Int> ; solves T = Int.
+    var decl_args = [_]ast.TypeArg{.{
+        .variance = .Invariant,
+        .is_star = false,
+        .ty = typeRef("T"),
+        .span = dummySpan(),
+    }};
+    var actual_args = [_]ast.TypeArg{.{
+        .variance = .Invariant,
+        .is_star = false,
+        .ty = typeRef("Int"),
+        .span = dummySpan(),
+    }};
+    var decl = typeRef("Box");
+    decl.type_args = &decl_args;
+    var actual = typeRef("Box");
+    actual.type_args = &actual_args;
+    try unifyTypeParam(&decl, &actual, &tp_names, &subst);
+    const got = subst.get("T") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("Int", got.name.name);
+}

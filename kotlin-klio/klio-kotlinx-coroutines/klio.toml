@@ -1,0 +1,18 @@
+[library]
+id = "kotlinx.coroutines"
+version = "1.11.0"
+abi = 1
+implicit_packages = []
+auto_bindings = true
+
+[[source]]
+root = "upstream/kotlinx-coroutines-core/common/src"
+
+[[source]]
+root = "klioMain"
+
+[[deps]]
+id = "stdlib"
+
+[[test]]
+root = "upstream/kotlinx-coroutines-core/common/test"

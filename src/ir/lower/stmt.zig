@@ -1,0 +1,1079 @@
+//! Statement lowering. Free functions over the shared `FuncBuilder`;
+//! filled in alongside the expression dispatch.
+
+const std = @import("std");
+const ast = @import("ast");
+const ir = @import("../ir.zig");
+const build = @import("../build.zig");
+
+const expr_mod = @import("expr.zig");
+const helpers = @import("helpers.zig");
+const literals = @import("literals.zig");
+const ast_scan = @import("ast_scan.zig");
+const lambda_body = @import("lambda_body.zig");
+const thunks = @import("thunks.zig");
+
+const Allocator = std.mem.Allocator;
+const FuncBuilder = build.FuncBuilder;
+const Stmt = ast.Stmt;
+const Expr = ast.Expr;
+const Reg = ir.Reg;
+const Inst = ir.Inst;
+const Const = ir.Const;
+const BinOp = ir.BinOp;
+const FuncId = ir.FuncId;
+const Terminator = ir.Terminator;
+const StringSet = std.StringHashMap(void);
+
+const lowerExpr = expr_mod.lowerExpr;
+const lowerReceiver = expr_mod.lowerReceiver;
+const exprSpan = helpers.exprSpan;
+const boxedCellReg = helpers.boxedCellReg;
+const widenNumericLiteral = literals.widenNumericLiteral;
+const collectPathIdentsStmt = ast_scan.collectPathIdentsStmt;
+const lowerLambdaBodyCapturingKindWith = lambda_body.lowerLambdaBodyCapturingKindWith;
+const resolveCapture = lambda_body.resolveCapture;
+const lowerExprAsParamThunk = thunks.lowerExprAsParamThunk;
+
+/// Lower a statement. Returns the register holding the statement's value
+/// when it is an expression statement in tail position, else `null`.
+pub fn lowerStmt(b: *FuncBuilder, stmt: *const Stmt) Allocator.Error!?Reg {
+    switch (stmt.*) {
+        .Expr => |*e| return try lowerExpr(b, e),
+        .Decl => |*d| switch (d.*) {
+            .Property => |*p| return lowerPropertyDecl(b, p),
+            .Function => |*f| return lowerLocalFnDecl(b, f),
+            .Class => |*c| return lowerLocalClassDecl(b, c),
+            else => return null,
+        },
+        .Assign => |a| {
+            if (isSafeIndexTarget(&a.target)) {
+                return lowerSafeIndexAssign(b, &a.target, a.op, &a.value);
+            }
+            if (isSafeMemberTarget(&a.target)) {
+                return lowerSafeMemberAssign(b, &a.target, a.op, &a.value);
+            }
+            return lowerAssign(b, &a.target, a.op, &a.value);
+        },
+        .DestructuringDecl => |dd| return lowerDestructuringDecl(b, dd.names, &dd.init),
+    }
+}
+
+/// `obj?.items[i] = v` — an `Index` target whose receiver chain is a
+/// safe-`Member`.
+fn isSafeIndexTarget(target: *const Expr) bool {
+    return switch (target.*) {
+        .Index => |idx| switch (idx.receiver.*) {
+            .Member => |m| m.safe,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// `obj?.field = v` — a safe-`Member` target.
+fn isSafeMemberTarget(target: *const Expr) bool {
+    return switch (target.*) {
+        .Member => |m| m.safe,
+        else => false,
+    };
+}
+
+fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?Reg {
+    // `val x = expr` / `var x = expr`. The init is lowered
+    // into a fresh register and bound in the current scope;
+    // mutability is enforced by typeck, not the IR.
+    const init: Reg = if (p.delegate) |de| blk: {
+        // `val x by D` — lower the delegate, then invoke its
+        // `getValue(null, ::x)` once at decl time. For a
+        // `lazy { producer }` this drives the producer; for
+        // any custom delegate the dispatched method runs.
+        // Each subsequent path read of `x` returns the bound
+        // value, so this is eager-once semantics (sufficient
+        // for `val`-style use; a `var x by D` mutating
+        // delegate would need a true read-through dispatch
+        // and is tracked separately).
+        const delegate = try lowerExpr(b, &de);
+        const null_arg = try b.emitConst(.Null);
+        const prop_ref = b.allocReg();
+        const pname = try b.module.internConst(b.allocator, .{ .String = p.name.name });
+        try b.push(.{ .PropertyRef = .{ .dst = prop_ref, .name = pname } });
+        const args_start = b.allocReg();
+        try b.push(.{ .Move = .{ .dst = args_start, .src = null_arg } });
+        _ = b.allocReg();
+        try b.push(.{ .Move = .{ .dst = Reg.from(args_start.int() + 1), .src = prop_ref } });
+        const dst = b.allocReg();
+        const name_c = try b.module.internConst(b.allocator, .{ .String = "getValue" });
+        try b.push(.{ .CallMember = .{
+            .dst = dst,
+            .receiver = delegate,
+            .name = name_c,
+            .args = args_start,
+            .n_args = 2,
+            .arg_names = &.{},
+        } });
+        break :blk dst;
+    } else switch (p.init != null) {
+        true => blk: {
+            const e = &p.init.?;
+            const widened: ?Expr = if (p.ty) |*ty| widenNumericLiteral(e, ty) else null;
+            // A type-annotated initializer puts its declared type in
+            // tail position so a reified inline call (`val u: User =
+            // resp.body()`) can infer its type argument.
+            const prev = b.pushExpected(p.ty);
+            const r = try lowerExpr(b, if (widened) |*w| w else e);
+            b.restoreExpected(prev);
+            break :blk r;
+        },
+        false => try b.emitConst(.Unit),
+    };
+    // Allocate a "home" register and Move the init value
+    // into it for `var`, or for `val` declared without an
+    // initializer (deferred init — multiple branches assign
+    // before the first read). This gives reads through the
+    // home reg slot semantics under the flat block IR.
+    // For a `val foo = expr` the binding is fixed at decl
+    // time and can skip the slot.
+    // Track `: Any` annotations so subsequent `==` against
+    // this var routes through the boxed-equality path.
+    if (p.ty) |ty| {
+        if (std.mem.eql(u8, ty.name.name, "Any")) {
+            try b.markAnyTyped(p.name.name);
+        }
+    }
+    if (b.isBoxed(p.name.name)) {
+        // Captured `var` — box into a shared cell so writes
+        // from a nested closure / coroutine are visible
+        // here (Kotlin `Ref` semantics).
+        const home = b.allocReg();
+        try b.push(.{ .MakeCell = .{ .dst = home, .src = init } });
+        try b.setMutableHome(p.name.name, home);
+        try b.markMutable(p.name.name);
+        try b.bind(p.name.name, home);
+    } else if (p.mutable or p.init == null) {
+        const home = b.allocReg();
+        try b.push(.{ .Move = .{ .dst = home, .src = init } });
+        try b.setMutableHome(p.name.name, home);
+        if (p.mutable) {
+            try b.markMutable(p.name.name);
+        }
+        try b.bind(p.name.name, home);
+    } else {
+        try b.bind(p.name.name, init);
+    }
+    return null;
+}
+
+fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Reg {
+    // Local fn: lower as a closure whose body captures the
+    // enclosing scope's visible names. Bound to its
+    // declared name so subsequent calls resolve to the
+    // closure Value. Equivalent to `val name = { ... }`.
+    // Both block-body (`fun foo() { ... }`) and
+    // expression-body (`fun foo() = expr`) forms map to a
+    // synthetic Block carrying the expression as its only
+    // statement.
+    const span_mod = @import("span");
+    const dummy_span = span_mod.Span.init(span_mod.FileId.from(0), 0, 0);
+    const body_block: ?ast.Block = if (f.body) |fb| switch (fb) {
+        .Block => |blk| blk,
+        .Expr => |e| body: {
+            const stmts = try b.allocator.alloc(Stmt, 1);
+            stmts[0] = .{ .Expr = e };
+            break :body ast.Block{ .stmts = stmts, .span = dummy_span };
+        },
+    } else null;
+    if (body_block) |body| {
+        const self_cell = try localFnSelfCell(b, f, &body);
+        const outer_names: StringSet = try b.visibleNames();
+        const inherited_rlp: StringSet = try b.receiverLambdaParamNames();
+        var outer_boxed = try b.boxedVarsSnapshot();
+        defer outer_boxed.deinit();
+        // A local *extension* function (`fun List<T>.mid() =
+        // …`) binds its receiver as the implicit first `this`
+        // param, so the body's bare member refs (`sorted()`,
+        // `size`) resolve. Call sites prepend the receiver.
+        const is_ext = f.receiver_type != null;
+        var param_idents = try b.allocator.alloc(ast.Ident, f.params.len + @intFromBool(is_ext));
+        defer b.allocator.free(param_idents);
+        {
+            const offset = @intFromBool(is_ext);
+            if (is_ext) {
+                param_idents[0] = .{ .name = "this", .span = dummy_span };
+            }
+            for (f.params, 0..) |p, i| param_idents[offset + i] = p.name;
+        }
+        const tailrec_self: ?[]const u8 = if (f.is_tailrec) f.name.name else null;
+        const enclosing_owner: ?lambda_body.EnclosingOwner = if (b.ownerClass()) |o|
+            .{ .class = o, .members = try b.enclosingMembersForChild() }
+        else
+            null;
+        const lowered = try lowerLambdaBodyCapturingKindWith(
+            b.module,
+            param_idents,
+            &body,
+            outer_names,
+            true,
+            &outer_boxed,
+            tailrec_self,
+            true,
+            inherited_rlp,
+            enclosing_owner,
+        );
+        const body_func = lowered.func;
+        const captured_names = lowered.captures;
+        const captures = try b.allocator.alloc(Reg, captured_names.len);
+        for (captured_names, captures) |n, *slot| slot.* = try resolveCapture(b, n);
+        var param_names = try b.allocator.alloc([]const u8, f.params.len + @intFromBool(is_ext));
+        {
+            const offset = @intFromBool(is_ext);
+            if (is_ext) param_names[0] = "this";
+            for (f.params, 0..) |p, i| param_names[offset + i] = p.name.name;
+        }
+        try registerLocalFnDefaults(b, f, is_ext, param_names, body_func);
+        const dst = b.allocReg();
+        try b.push(.{ .AstLambda = .{
+            .dst = dst,
+            .params = param_names,
+            .body_ast = body,
+            .captures = captures,
+            .captured_names = captured_names,
+            .absorb_return = true,
+            .body_func = body_func,
+        } });
+        if (self_cell) |home| {
+            try b.push(.{ .CellSet = .{ .cell = home, .value = dst } });
+        } else {
+            try b.bind(f.name.name, dst);
+        }
+        try b.markLocalFn(f.name.name);
+        if (is_ext) {
+            try b.markLocalExtFn(f.name.name);
+        }
+    }
+    return null;
+}
+
+// A local function that calls itself is desugared like
+// `var name = null; name = { … name(…) … }`: a shared cell is created
+// first so the body can capture it and the closure stores itself into
+// it once built. This is the same boxed-self-reference path a recursive
+// `lateinit var f = { … f(…) … }` already uses. A cell pre-hoisted by
+// `lower_block` (so sibling local fns can capture each other) is reused.
+fn localFnSelfCell(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    body: *const ast.Block,
+) Allocator.Error!?Reg {
+    var self_refs = StringSet.init(b.allocator);
+    defer self_refs.deinit();
+    for (body.stmts) |*s| try collectPathIdentsStmt(s, &self_refs);
+    if (b.mutableHome(f.name.name)) |home| {
+        return home;
+    } else if (self_refs.contains(f.name.name)) {
+        const null_v = try b.emitConst(.Null);
+        const home = b.allocReg();
+        try b.push(.{ .MakeCell = .{ .dst = home, .src = null_v } });
+        try b.setMutableHome(f.name.name, home);
+        try b.markMutable(f.name.name);
+        try b.markBoxed(f.name.name);
+        try b.bind(f.name.name, home);
+        return home;
+    } else {
+        return null;
+    }
+}
+
+// Per-param defaults: lower each default expression as a thunk binding
+// the lowered param prefix (so `b = a + 1` can read an earlier param)
+// and register it under the body FuncId. The Vm pads missing trailing
+// args from these the same way it does for top-level functions.
+fn registerLocalFnDefaults(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    is_ext: bool,
+    param_names: []const []const u8,
+    body_func: FuncId,
+) Allocator.Error!void {
+    var any_default = false;
+    for (f.params) |p| {
+        if (p.default != null) {
+            any_default = true;
+            break;
+        }
+    }
+    if (!any_default) return;
+
+    const offset: usize = @intFromBool(is_ext);
+    var slots: std.ArrayList(?FuncId) = .empty;
+    errdefer slots.deinit(b.module.registry.allocator);
+    const reg_alloc = b.module.registry.allocator;
+    var i: usize = 0;
+    while (i < offset) : (i += 1) try slots.append(reg_alloc, null);
+    for (f.params, 0..) |p, idx| {
+        if (p.default) |default_expr| {
+            const bind_upto = @min(offset + idx, param_names.len);
+            const widened = widenNumericLiteral(&default_expr, &p.ty);
+            const name = try std.fmt.allocPrint(
+                b.allocator,
+                "__default_local_{s}_{s}",
+                .{ f.name.name, p.name.name },
+            );
+            const fid = try lowerExprAsParamThunk(
+                b.module,
+                param_names[0..bind_upto],
+                if (widened) |*w| w else &default_expr,
+                name,
+            );
+            try slots.append(reg_alloc, fid);
+        } else {
+            try slots.append(reg_alloc, null);
+        }
+    }
+    try b.module.registry.local_fn_defaults.put(body_func, slots);
+}
+
+fn lowerSafeIndexAssign(
+    b: *FuncBuilder,
+    target: *const Expr,
+    op: ast.AssignOp,
+    value: *const Expr,
+) Allocator.Error!?Reg {
+    // `obj?.items[i] = v` — null-guard the outer Index
+    // assignment when the receiver chain is a safe-Member.
+    const idx = target.Index;
+    const receiver = idx.receiver;
+    const idx_args = idx.args;
+    const idx_span = idx.span;
+    const member = receiver.Member;
+    const outer = member.receiver;
+    const mname = member.name;
+    const mspan = member.span;
+
+    const outer_r = try lowerExpr(b, outer);
+    const null_r = try b.emitConst(.Null);
+    const is_null = b.allocReg();
+    try b.push(.{ .BinOp = .{
+        .dst = is_null,
+        .op = .Eq,
+        .lhs = outer_r,
+        .rhs = null_r,
+    } });
+    const skip = try b.allocBlock();
+    const do_set = try b.allocBlock();
+    const join = try b.allocBlock();
+    b.terminate(.{ .Branch = .{ .cond = is_null, .t = skip, .f = do_set } });
+    b.switchTo(do_set);
+    // Synthesize the non-safe equivalent and recurse.
+    const inner_recv = try b.allocator.create(Expr);
+    inner_recv.* = .{ .Member = .{
+        .receiver = outer,
+        .name = mname,
+        .safe = false,
+        .span = mspan,
+    } };
+    const inner_target = Expr{ .Index = .{
+        .receiver = inner_recv,
+        .args = idx_args,
+        .span = idx_span,
+    } };
+    const synth = Stmt{ .Assign = .{
+        .target = inner_target,
+        .op = op,
+        .value = value.*,
+        .span = idx_span,
+    } };
+    _ = try lowerStmt(b, &synth);
+    b.terminate(.{ .Goto = join });
+    b.switchTo(skip);
+    b.terminate(.{ .Goto = join });
+    b.switchTo(join);
+    return null;
+}
+
+fn lowerSafeMemberAssign(
+    b: *FuncBuilder,
+    target: *const Expr,
+    op: ast.AssignOp,
+    value: *const Expr,
+) Allocator.Error!?Reg {
+    // `obj?.field = v` (or compound `?.field += v`):
+    //   if obj is null → skip the assignment entirely.
+    //   otherwise → fall through to the regular non-safe
+    //              assign path with the safe flag cleared.
+    const member = target.Member;
+    const receiver = member.receiver;
+    const name = member.name;
+    const member_span = member.span;
+
+    const recv_r = try lowerExpr(b, receiver);
+    const null_r = try b.emitConst(.Null);
+    const is_null = b.allocReg();
+    try b.push(.{ .BinOp = .{
+        .dst = is_null,
+        .op = .Eq,
+        .lhs = recv_r,
+        .rhs = null_r,
+    } });
+    const skip = try b.allocBlock();
+    const do_set = try b.allocBlock();
+    const join = try b.allocBlock();
+    b.terminate(.{ .Branch = .{ .cond = is_null, .t = skip, .f = do_set } });
+    b.switchTo(do_set);
+    // Synthesize an equivalent non-safe assign and recurse
+    // through Stmt::Assign so compound semantics, setters,
+    // and class property setters reuse the existing path.
+    const inner_target = Expr{ .Member = .{
+        .receiver = receiver,
+        .name = name,
+        .safe = false,
+        .span = member_span,
+    } };
+    const synth = Stmt{ .Assign = .{
+        .target = inner_target,
+        .op = op,
+        .value = value.*,
+        .span = member_span,
+    } };
+    _ = try lowerStmt(b, &synth);
+    b.terminate(.{ .Goto = join });
+    b.switchTo(skip);
+    b.terminate(.{ .Goto = join });
+    b.switchTo(join);
+    return null;
+}
+
+fn lowerAssign(
+    b: *FuncBuilder,
+    target: *const Expr,
+    op: ast.AssignOp,
+    value: *const Expr,
+) Allocator.Error!?Reg {
+    const v = try lowerExpr(b, value);
+    // Compound assigns first try `<op>Assign` as a member
+    // call on the target — covers user types declaring
+    // `operator fun plusAssign(...)` and built-in mutable
+    // collections (MutableList += elem). When the call
+    // raises (no method, immutable target), fall through
+    // to the rebind path below. Today this fires only
+    // when the target is a Path-bound local — Member /
+    // Index targets need their own routing.
+    // Only attempt `plusAssign`-style member dispatch when the
+    // target is NOT a mutable local Path. For a `var` local the
+    // primitive rebind path below is what Kotlin actually does
+    // (Int has no plusAssign). For a `val` Path the value's type
+    // declares plusAssign (operator on a class, or built-in
+    // collection mutation), so CallMember is correct.
+    // The plusAssign / minusAssign-style member dispatch only
+    // fires for a Path target naming a `val` LOCAL (e.g.
+    // `val h = Histogram(); h += w` or `val xs = mutableListOf<Int>(); xs += 1`).
+    // A Path target whose name doesn't resolve locally is a
+    // top-level binding; route it through the BinOp +
+    // StoreGlobal path below so top-level `var` compound
+    // assigns + delegated-property setters fire.
+    // A boxed var or a captured outer binding is an
+    // assignable variable, not a `val` whose value type
+    // declares an `<op>Assign` operator. Excluding both
+    // keeps a second compound-assign (after the first
+    // rebinds the name to a plain reg) on the rebind path
+    // instead of mis-dispatching `plusAssign` on the Int.
+    const path_is_val = switch (target.*) {
+        .Path => |p| p.segments.len == 1 and
+            !b.isMutable(p.segments[0].name) and
+            !b.isBoxed(p.segments[0].name) and
+            !b.knowsOuter(p.segments[0].name) and
+            b.resolve(p.segments[0].name) != null,
+        else => false,
+    };
+    if (op != .Assign and path_is_val) {
+        const method_name = switch (op) {
+            .Add => "plusAssign",
+            .Sub => "minusAssign",
+            .Mul => "timesAssign",
+            .Div => "divAssign",
+            .Rem => "remAssign",
+            .Assign => unreachable,
+        };
+        const recv = try lowerExpr(b, target);
+        const args_start = b.allocReg();
+        try b.push(.{ .Move = .{ .dst = args_start, .src = v } });
+        const dst = b.allocReg();
+        const nm = try b.module.internConst(b.allocator, .{ .String = method_name });
+        try b.push(.{ .CallMember = .{
+            .dst = dst,
+            .receiver = recv,
+            .name = nm,
+            .args = args_start,
+            .n_args = 1,
+            .arg_names = &.{},
+        } });
+        return null;
+    }
+    const combined: Reg = switch (op) {
+        .Assign => v,
+        .Add, .Sub, .Mul, .Div, .Rem => blk: {
+            const cur = try lowerExpr(b, target);
+            const bin: BinOp = switch (op) {
+                .Add => .Add,
+                .Sub => .Sub,
+                .Mul => .Mul,
+                .Div => .Div,
+                .Rem => .Mod,
+                .Assign => unreachable,
+            };
+            const dst = b.allocReg();
+            try b.push(.{ .BinOp = .{
+                .dst = dst,
+                .op = bin,
+                .lhs = cur,
+                .rhs = v,
+            } });
+            break :blk dst;
+        },
+    };
+    try storeCombinedToTarget(b, target, combined);
+    return null;
+}
+
+// Route the already-combined value to the assignment target: a single
+// Path name (local / cell / capture / member / global), a Member field,
+// or an Index `set` call.
+fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg) Allocator.Error!void {
+    switch (target.*) {
+        .Path => |p| {
+            if (p.segments.len != 1) {
+                try b.push(.{ .Trace = .{ .span = exprSpan(target) } });
+                return;
+            }
+            const seg = p.segments[0].name;
+            if (b.isBoxed(seg)) {
+                const cell = try boxedCellReg(b, seg);
+                try b.push(.{ .CellSet = .{ .cell = cell, .value = combined } });
+            } else if (b.mutableHome(seg)) |home| {
+                try b.push(.{ .Move = .{ .dst = home, .src = combined } });
+            } else if (b.knowsOuter(seg)) {
+                // Lambda body writing back to an outer-frame
+                // capture: emit StoreGlobal (which lands in
+                // the closure's scoped env) so the enclosing
+                // call site's `WritebackCaptures` syncs the
+                // value to the caller. Also rebind locally
+                // so subsequent reads inside the same body
+                // see the new value.
+                _ = try b.recordCapture(seg);
+                const n = try b.module.internConst(b.allocator, .{ .String = seg });
+                try b.push(.{ .StoreGlobal = .{ .name = n, .value = combined } });
+                try b.rebind(seg, combined);
+            } else if (b.resolve(seg) != null) {
+                try b.rebind(seg, combined);
+            } else if (b.hasOwnMember(seg) and b.resolve("this") != null) {
+                // Method-body `this.field` write — route
+                // SetField on the receiver so the bare-
+                // name assign reaches the instance, not
+                // a synthetic global.
+                const this_reg = b.resolve("this").?;
+                const field = try b.module.internConst(b.allocator, .{ .String = seg });
+                try b.push(.{ .SetField = .{
+                    .receiver = this_reg,
+                    .field = field,
+                    .value = combined,
+                } });
+            } else if (b.isLambdaBody()) {
+                // Unqualified write inside a lambda body whose
+                // name is not a local/param/captured-outer/
+                // own-member. By Kotlin scoping it is either a
+                // property of the lambda's bound receiver
+                // (`Sink.(Int) -> Unit` doing `sum = 99`) or a
+                // genuine top-level binding. Decide at runtime,
+                // symmetric to the read side's
+                // LoadFromThisOrGlobal: capture `this` on
+                // demand so a receiver-binding invoke populates
+                // the slot, then StoreToThisOrGlobal sets the
+                // receiver's member when present, else globals.
+                const this_idx = try b.recordCapture("this");
+                const name_c = try b.module.internConst(b.allocator, .{ .String = seg });
+                try b.push(.{ .StoreToThisOrGlobal = .{
+                    .this_idx = this_idx,
+                    .name = name_c,
+                    .value = combined,
+                } });
+            } else {
+                // Top-level binding: route through StoreGlobal so
+                // the tree-walker setter / delegate fires.
+                const n = try b.module.internConst(b.allocator, .{ .String = seg });
+                try b.push(.{ .StoreGlobal = .{ .name = n, .value = combined } });
+            }
+        },
+        .Member => |m| {
+            const recv = try lowerReceiver(b, m.receiver);
+            const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
+            try b.push(.{ .SetField = .{
+                .receiver = recv,
+                .field = field,
+                .value = combined,
+            } });
+        },
+        .Index => |idx| {
+            // `m[k] = v` lowers to receiver.set(k, v) so
+            // map / mutable-list assignment dispatches
+            // through the same call_member path that
+            // handles built-in collection mutation.
+            const recv = try lowerReceiver(b, idx.receiver);
+            // Reserve a contiguous run of slots for keys +
+            // value BEFORE lowering the key expressions,
+            // since lowering each key may allocate auxiliary
+            // registers (e.g. for Const literals) and we
+            // need the run to stay tight so read_arg_run
+            // picks up the value reg right after the keys.
+            const n_keys = idx.args.len;
+            const key_start = b.allocReg();
+            var key_slots = try b.allocator.alloc(Reg, if (n_keys == 0) 1 else n_keys);
+            defer b.allocator.free(key_slots);
+            key_slots[0] = key_start;
+            var i: usize = 1;
+            while (i < n_keys) : (i += 1) key_slots[i] = b.allocReg();
+            const val_slot = b.allocReg();
+            for (key_slots[0..n_keys], idx.args) |slot, *arg| {
+                const r = try lowerExpr(b, arg);
+                try b.push(.{ .Move = .{ .dst = slot, .src = r } });
+            }
+            try b.push(.{ .Move = .{ .dst = val_slot, .src = combined } });
+            const dst = b.allocReg();
+            const nm = try b.module.internConst(b.allocator, .{ .String = "set" });
+            try b.push(.{ .CallMember = .{
+                .dst = dst,
+                .receiver = recv,
+                .name = nm,
+                .args = key_start,
+                .n_args = @as(u8, @intCast(n_keys)) + 1,
+                .arg_names = &.{},
+            } });
+        },
+        else => {
+            try b.push(.{ .Trace = .{ .span = exprSpan(target) } });
+        },
+    }
+}
+
+fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Reg {
+    // Local class declaration inside a function body. Capture
+    // the visible scope so the class methods can read names
+    // from the enclosing fn (`val factor = 10; class Scaled { … n * factor … }`).
+    var visible = try b.visibleNames();
+    defer visible.deinit();
+    const captured_names = try b.allocator.alloc([]const u8, visible.count());
+    var it = visible.keyIterator();
+    var i: usize = 0;
+    while (it.next()) |k| : (i += 1) captured_names[i] = k.*;
+    const captures = try b.allocator.alloc(Reg, captured_names.len);
+    for (captured_names, captures) |n, *slot| slot.* = try resolveCapture(b, n);
+    try b.push(.{ .RegisterClass = .{
+        .class = @constCast(c),
+        .captured_names = captured_names,
+        .captures = captures,
+    } });
+    return null;
+}
+
+fn lowerDestructuringDecl(
+    b: *FuncBuilder,
+    names: []const ast.Ident,
+    init: *const Expr,
+) Allocator.Error!?Reg {
+    // `val (a, b, ...) = expr` desugars to repeated
+    // `expr.componentN()` calls. `_` placeholders skip the
+    // call entirely. Tree walker handles this via
+    // eval_stmt; the IR's CallMember + Host dispatch covers
+    // the same surface, so we lower it inline.
+    const recv = try lowerExpr(b, init);
+    for (names, 0..) |name, i| {
+        if (std.mem.eql(u8, name.name, "_")) continue;
+        const comp_name = try std.fmt.allocPrint(b.allocator, "component{d}", .{i + 1});
+        const nm = try b.module.internConst(b.allocator, .{ .String = comp_name });
+        const args_start = b.allocReg();
+        const dst = b.allocReg();
+        try b.push(.{ .CallMember = .{
+            .dst = dst,
+            .receiver = recv,
+            .name = nm,
+            .args = args_start,
+            .n_args = 0,
+            .arg_names = &.{},
+        } });
+        try b.bind(name.name, dst);
+    }
+    return null;
+}
+
+// -------------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------------
+
+const testing = std.testing;
+const span = @import("span");
+const Module = ir.Module;
+
+test {
+    testing.refAllDecls(@This());
+}
+
+fn dummySpan() span.Span {
+    return span.Span.init(span.FileId.from(0), 0, 0);
+}
+
+fn intLit(v: i64) Expr {
+    return .{ .IntLit = .{ .value = v, .kind = .Int, .span = dummySpan() } };
+}
+
+fn freeFunc(func: ir.Func) void {
+    for (func.blocks) |blk| {
+        if (blk.insts.len != 0) testing.allocator.free(blk.insts);
+        if (blk.catches.len != 0) testing.allocator.free(blk.catches);
+    }
+    testing.allocator.free(func.blocks);
+    if (func.capture_order.len != 0) testing.allocator.free(func.capture_order);
+}
+
+fn pathExpr(segs: []ast.Ident) Expr {
+    return .{ .Path = .{ .segments = segs, .span = dummySpan() } };
+}
+
+test "expr statement returns its register" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    const s = Stmt{ .Expr = intLit(7) };
+    const r = try lowerStmt(&b, &s);
+    try testing.expect(r != null);
+    b.terminate(.{ .Return = r.? });
+    const func = try b.finish("f", "test.f", build.typeInt());
+    defer freeFunc(func);
+    try testing.expect(func.blocks[0].insts[0] == .Const);
+}
+
+test "val without annotation binds directly" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    const p = ast.Property{
+        .mutable = false,
+        .name = .{ .name = "x", .span = dummySpan() },
+        .receiver_type = null,
+        .ty = null,
+        .init = intLit(3),
+        .delegate = null,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+    const s = Stmt{ .Decl = .{ .Property = p } };
+    const r = try lowerStmt(&b, &s);
+    try testing.expect(r == null);
+    // `val x = 3` binds `x` to the init register without a home slot.
+    try testing.expect(b.resolve("x") != null);
+    try testing.expect(b.mutableHome("x") == null);
+}
+
+test "var declaration gets a mutable home slot" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    const p = ast.Property{
+        .mutable = true,
+        .name = .{ .name = "n", .span = dummySpan() },
+        .receiver_type = null,
+        .ty = null,
+        .init = intLit(0),
+        .delegate = null,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+    const s = Stmt{ .Decl = .{ .Property = p } };
+    _ = try lowerStmt(&b, &s);
+    try testing.expect(b.isMutable("n"));
+    try testing.expect(b.mutableHome("n") != null);
+    b.terminate(.{ .Return = null });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    // const + move into the home slot.
+    try testing.expect(func.blocks[0].insts[1] == .Move);
+}
+
+test "any-typed val is marked" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    const any_ty = ast.TypeRef{
+        .name = .{ .name = "Any", .span = dummySpan() },
+        .nullable = false,
+        .span = dummySpan(),
+        .type_args = &.{},
+        .function = null,
+        .definitely_non_null = false,
+        .annotations = &.{},
+        .qualified_path = null,
+    };
+    const p = ast.Property{
+        .mutable = false,
+        .name = .{ .name = "a", .span = dummySpan() },
+        .receiver_type = null,
+        .ty = any_ty,
+        .init = intLit(1),
+        .delegate = null,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+    const s = Stmt{ .Decl = .{ .Property = p } };
+    _ = try lowerStmt(&b, &s);
+    try testing.expect(b.isAnyTyped("a"));
+}
+
+test "assign to var rebinds through the home slot" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    // Set up `var n = 0` first.
+    const p = ast.Property{
+        .mutable = true,
+        .name = .{ .name = "n", .span = dummySpan() },
+        .receiver_type = null,
+        .ty = null,
+        .init = intLit(0),
+        .delegate = null,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+    const decl = Stmt{ .Decl = .{ .Property = p } };
+    _ = try lowerStmt(&b, &decl);
+    const home = b.mutableHome("n").?;
+    // `n = 5`
+    var segs = [_]ast.Ident{.{ .name = "n", .span = dummySpan() }};
+    const target = pathExpr(&segs);
+    const assign = Stmt{ .Assign = .{
+        .target = target,
+        .op = .Assign,
+        .value = intLit(5),
+        .span = dummySpan(),
+    } };
+    _ = try lowerStmt(&b, &assign);
+    b.terminate(.{ .Return = null });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    // Last instruction is a Move into the home register.
+    const insts = func.blocks[0].insts;
+    const last = insts[insts.len - 1];
+    try testing.expect(last == .Move);
+    try testing.expectEqual(home, last.Move.dst);
+}
+
+test "assign to top-level name emits store global" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    var segs = [_]ast.Ident{.{ .name = "g", .span = dummySpan() }};
+    const target = pathExpr(&segs);
+    const assign = Stmt{ .Assign = .{
+        .target = target,
+        .op = .Assign,
+        .value = intLit(9),
+        .span = dummySpan(),
+    } };
+    _ = try lowerStmt(&b, &assign);
+    b.terminate(.{ .Return = null });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    const insts = func.blocks[0].insts;
+    try testing.expect(insts[insts.len - 1] == .StoreGlobal);
+}
+
+test "compound assign to top-level emits binop then store global" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    var segs = [_]ast.Ident{.{ .name = "g", .span = dummySpan() }};
+    const target = pathExpr(&segs);
+    const assign = Stmt{ .Assign = .{
+        .target = target,
+        .op = .Add,
+        .value = intLit(1),
+        .span = dummySpan(),
+    } };
+    _ = try lowerStmt(&b, &assign);
+    b.terminate(.{ .Return = null });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    const insts = func.blocks[0].insts;
+    var saw_binop = false;
+    for (insts) |inst| {
+        if (inst == .BinOp) saw_binop = true;
+    }
+    try testing.expect(saw_binop);
+    try testing.expect(insts[insts.len - 1] == .StoreGlobal);
+}
+
+test "compound assign to val local dispatches plusAssign" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    // `val xs = <reg>` (immutable local bound directly).
+    const r = b.allocReg();
+    try b.bind("xs", r);
+    var segs = [_]ast.Ident{.{ .name = "xs", .span = dummySpan() }};
+    const target = pathExpr(&segs);
+    const assign = Stmt{ .Assign = .{
+        .target = target,
+        .op = .Add,
+        .value = intLit(1),
+        .span = dummySpan(),
+    } };
+    _ = try lowerStmt(&b, &assign);
+    b.terminate(.{ .Return = null });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    const insts = func.blocks[0].insts;
+    try testing.expect(insts[insts.len - 1] == .CallMember);
+}
+
+test "member assign emits set field" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    const r = b.allocReg();
+    try b.bind("obj", r);
+    var recv_segs = [_]ast.Ident{.{ .name = "obj", .span = dummySpan() }};
+    var recv = pathExpr(&recv_segs);
+    const target = Expr{ .Member = .{
+        .receiver = &recv,
+        .name = .{ .name = "field", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    const assign = Stmt{ .Assign = .{
+        .target = target,
+        .op = .Assign,
+        .value = intLit(2),
+        .span = dummySpan(),
+    } };
+    _ = try lowerStmt(&b, &assign);
+    b.terminate(.{ .Return = null });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    const insts = func.blocks[0].insts;
+    try testing.expect(insts[insts.len - 1] == .SetField);
+}
+
+test "index assign emits set call" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    const r = b.allocReg();
+    try b.bind("xs", r);
+    var recv_segs = [_]ast.Ident{.{ .name = "xs", .span = dummySpan() }};
+    var recv = pathExpr(&recv_segs);
+    var idx_args = [_]Expr{intLit(0)};
+    const target = Expr{ .Index = .{
+        .receiver = &recv,
+        .args = &idx_args,
+        .span = dummySpan(),
+    } };
+    const assign = Stmt{ .Assign = .{
+        .target = target,
+        .op = .Assign,
+        .value = intLit(42),
+        .span = dummySpan(),
+    } };
+    _ = try lowerStmt(&b, &assign);
+    b.terminate(.{ .Return = null });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    const insts = func.blocks[0].insts;
+    const last = insts[insts.len - 1];
+    try testing.expect(last == .CallMember);
+    try testing.expectEqual(@as(u8, 2), last.CallMember.n_args);
+}
+
+test "safe member assign branches on null" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    const r = b.allocReg();
+    try b.bind("obj", r);
+    var recv_segs = [_]ast.Ident{.{ .name = "obj", .span = dummySpan() }};
+    var recv = pathExpr(&recv_segs);
+    const target = Expr{ .Member = .{
+        .receiver = &recv,
+        .name = .{ .name = "field", .span = dummySpan() },
+        .safe = true,
+        .span = dummySpan(),
+    } };
+    const assign = Stmt{ .Assign = .{
+        .target = target,
+        .op = .Assign,
+        .value = intLit(7),
+        .span = dummySpan(),
+    } };
+    const out = try lowerStmt(&b, &assign);
+    try testing.expect(out == null);
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    // Entry block branches; extra blocks were allocated for skip / do / join.
+    try testing.expect(func.blocks.len >= 4);
+    try testing.expect(func.blocks[0].terminator == .Branch);
+}
