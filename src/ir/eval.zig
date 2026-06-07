@@ -259,7 +259,8 @@ const Frame = struct {
 /// exactly as produced.
 fn coerceIntToLongTy(ty: TypeRef, v: *Value) void {
     if (v.* == .Int and !ty.nullable and std.mem.eql(u8, ty.name, "Long")) {
-        v.* = .{ .Long = @as(i64, v.Int) };
+        const n = v.Int;
+        v.* = .{ .Long = @as(i64, n) };
     }
 }
 

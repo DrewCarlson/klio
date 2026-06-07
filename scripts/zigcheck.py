@@ -68,13 +68,17 @@ def main():
         return 2
     root = sys.argv[1]
     build_only = "--build-only" in sys.argv[2:]
+    root_override = None
+    for i, a in enumerate(sys.argv):
+        if a == "--root" and i + 1 < len(sys.argv):
+            root_override = sys.argv[i + 1]
     mods = closure(root)
 
     cmd = ["zig", "build-obj" if build_only else "test"]
     # root module first, named "root"
     for d in GRAPH[root]:
         cmd += ["--dep", d]
-    cmd += [f"-Mroot={path(root)}"]
+    cmd += [f"-Mroot={root_override or path(root)}"]
     # every other reachable module
     for m in mods:
         if m == root:

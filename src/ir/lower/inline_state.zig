@@ -28,25 +28,25 @@ pub const CallShape = struct {
 /// Non-suspend inline fns keep the normal call path and klio's
 /// frame-kind non-local-return mechanism, so the inline blast radius
 /// stays minimal.
-var inline_fn_asts: ?std.StringHashMap([]const *const ast.Function) = null;
+threadlocal var inline_fn_asts: ?std.StringHashMap([]const *const ast.Function) = null;
 
 /// Simple names that a default-imported host binding owns (e.g.
 /// `kotlin.synchronized`, `kotlin.arrayOf`). Any inline fn sharing a
 /// simple name with one of these must NOT shadow Kotlin's default-import
 /// resolution at a bare call site; the lowerer skips inline expansion so
 /// the call falls through to the normal call path.
-var shadowed_inline_names: ?StringSet = null;
+threadlocal var shadowed_inline_names: ?StringSet = null;
 
 /// Hard ceiling on combined inline nesting (fn-body + lambda-arg
 /// splices) so transitive expansion cannot recurse without bound; past
 /// it, callers fall back to a normal call.
-var inline_expand_depth: u32 = 0;
+threadlocal var inline_expand_depth: u32 = 0;
 
 /// Simple names of *top-level* (file-scope) properties — `val`/`var`
 /// declared outside any class. A bare reference to such a name inside a
 /// method/lambda body must resolve as a global property read, not an
 /// implicit `this.<name>` field access.
-var top_level_prop_names: ?StringSet = null;
+threadlocal var top_level_prop_names: ?StringSet = null;
 
 const INLINE_EXPAND_MAX: u32 = 8;
 

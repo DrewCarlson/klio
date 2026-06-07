@@ -16,6 +16,7 @@ const runtime = @import("runtime");
 
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
+const host_call_member = @import("host_call_member.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -624,7 +625,40 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
                 try all.appendSlice(self.allocator, args);
             }
 
+            // The receiver just displaced an enclosing-class `this` (e.g.
+            // `with(sb) { … }` written inside a member). Keep that instance
+            // reachable as an outer implicit receiver so bare members /
+            // `this@Outer` inside the lambda still resolve, matching Kotlin's
+            // nested-receiver rule. Any distinct prior `this` (not only an
+            // Instance) is kept: an extension-receiver lambda such as
+            // `IntRange.asFlow() = flow { … }` captures the range as its
+            // `this`, which the new collector receiver displaces.
+            const pushed_outer = po: {
+                const pt = prior_this orelse break :po false;
+                if (pt == .Null or pt == .Unit) break :po false;
+                if (pt == .Instance and this_value.* == .Instance) {
+                    break :po !ObjRef(InstanceData).ptrEq(pt.Instance, this_value.Instance);
+                }
+                break :po true;
+            };
+            if (pushed_outer) {
+                if (prior_this) |p| host_call_member.pushOuterThis(self.allocator, &p);
+            }
+            // The new receiver is bound to the lambda's captured `this` slot
+            // above. The member-extension visibility filter consults the
+            // runtime enclosing-this stack, not closure captures, so push the
+            // receiver for the duration of the lambda call: a `with(a) { … }`
+            // body that calls a member-extension declared on `a`'s class then
+            // sees that owner as visible.
+            const pushed_receiver = this_value.* == .Instance;
+            if (pushed_receiver) {
+                host_call_member.pushOuterThis(self.allocator, this_value);
+            }
+
             const result = try invokeCallable(self, callable, all.items, out);
+
+            if (pushed_receiver) host_call_member.popOuterThis();
+            if (pushed_outer) host_call_member.popOuterThis();
 
             // Restore the prior `this` so a closure reused with different
             // receivers preserves its captured value between uses.

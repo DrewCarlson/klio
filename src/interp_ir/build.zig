@@ -642,10 +642,25 @@ fn buildModuleWithOverrides(
     }
 
     // Make every `inline fun` body available to the lowerer by simple name.
+    //
+    // The three tables below are installed into the lowerer's
+    // build-scoped thread-locals (`setInlineFnAsts` &c.), each of which
+    // `deinit`s the table left by the *previous* build before storing the
+    // new one. A managed `StringHashMap` captures its allocator, so that
+    // teardown runs through whatever allocator backed the container — and
+    // the previous build's `a` is typically a per-run arena that has
+    // already been torn down by the time the next build installs its
+    // tables. Backing the *containers* with the process-lifetime page
+    // allocator keeps that cross-build teardown sound: the next build's
+    // `deinit` frees a still-valid block. Keys and value slices stay in
+    // the build arena `a` (only their inline slice headers live in the
+    // container; `deinit` never dereferences the freed contents), so the
+    // arena reclaims them and no growing leak accumulates.
+    const tl = std.heap.page_allocator;
     {
         var inline_fns = std.StringHashMap(std.ArrayList(*const ast.Function)).init(a);
         for (all_decls.items) |*d| try collectInline(a, d, &inline_fns);
-        var frozen = std.StringHashMap([]const *const ast.Function).init(a);
+        var frozen = std.StringHashMap([]const *const ast.Function).init(tl);
         var it = inline_fns.iterator();
         while (it.next()) |e| {
             try frozen.put(e.key_ptr.*, try e.value_ptr.toOwnedSlice(a));
@@ -654,7 +669,7 @@ fn buildModuleWithOverrides(
         ir.lower.setInlineFnAsts(frozen);
 
         // Default-import host bindings shadow same-simple-name inline fns.
-        var shadowed = StringSet.init(a);
+        var shadowed = StringSet.init(tl);
         var fqn_it = stdlib.implementations.allFqns();
         while (fqn_it.next()) |fqn| {
             if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
@@ -670,7 +685,7 @@ fn buildModuleWithOverrides(
 
     // Top-level (file-scope) property names.
     {
-        var top_props = StringSet.init(a);
+        var top_props = StringSet.init(tl);
         for (all_decls.items) |*d| {
             if (d.* == .Property and d.Property.receiver_type == null) {
                 try top_props.put(d.Property.name.name, {});

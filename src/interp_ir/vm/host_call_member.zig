@@ -250,6 +250,12 @@ fn isCallable(v: *const Value) bool {
     };
 }
 
+/// A `TypeRef` denoting a Kotlin function type (`FunctionN` or `... -> ...`).
+fn isFunctionTypeRef(ty: *const TypeRef) bool {
+    return std.mem.startsWith(u8, simpleName(ty.name), "Function") or
+        std.mem.indexOf(u8, ty.name, "->") != null;
+}
+
 /// Pack trailing positional args into a single `Value::Array` when the
 /// target's last param is `vararg`. `args` is consumed and freed.
 fn packVarargArgs(self: *VmHost, allocator: Allocator, func: *const Func, args: []Value) Allocator.Error![]Value {
@@ -895,6 +901,20 @@ pub fn popAccessEnclosing(self: *VmHost) void {
     if (s.items.len > 0) _ = s.pop();
 }
 
+/// Push/pop the enclosing-`this` stack without a `VmHost` handle. Used by
+/// the intrinsic-host receiver-lambda dispatch, which displaces a lambda's
+/// captured `this` with an explicit receiver and must keep the displaced
+/// instance reachable as an outer implicit receiver.
+pub fn pushOuterThis(allocator: Allocator, v: *const Value) void {
+    const s = outerThisStack();
+    s.append(allocator, v.*) catch {};
+}
+
+pub fn popOuterThis() void {
+    const s = outerThisStack();
+    if (s.items.len > 0) _ = s.pop();
+}
+
 // -------------------------------------------------------------------------
 // Overload scoring + method/extension selection (ported from `vmhost.rs`).
 // -------------------------------------------------------------------------
@@ -1037,30 +1057,188 @@ fn builtinSupers(nm: []const u8) []const []const u8 {
     return &.{};
 }
 
+/// Default-arg thunk slots recorded for `f` (indexed by lowered-param
+/// position, including the implicit `this` slot), or `null` when none.
+fn funcDefaults(self: *VmHost, f: *const Func) ?[]const ?FuncId {
+    const pg = self.prog.borrow();
+    defer pg.deinit();
+    return pg.get().func_defaults.get(@intFromEnum(f.id));
+}
+
+/// Whether the parameter at lowered position `idx` (with the implicit
+/// `this` offset already folded in) is satisfiable by a defaulted slot.
+fn paramHasDefault(defaults: ?[]const ?FuncId, idx: usize) bool {
+    const d = defaults orelse return false;
+    if (idx >= d.len) return false;
+    return d[idx] != null;
+}
+
+/// Conservative type-incompatibility check for a single instance arg
+/// against a user-class parameter. Returns `true` only when we can
+/// prove the argument's class is not the parameter type nor any of its
+/// supertypes; primitives, builtins, function types, and generics are
+/// never adjudicated here (they are scored elsewhere).
+fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
+    const pn = param_ty.name;
+    if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit") or param_ty.nullable) return false;
+    if (std.mem.startsWith(u8, pn, "Function") or (pn.len <= 2 and allUppercase(pn))) return false;
+    // Only adjudicate when the parameter names a known user class.
+    {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        if (cg.get().get(pn) == null) return false;
+    }
+    const inst = switch (arg.*) {
+        .Instance => |i| i,
+        else => return false,
+    };
+    var start: []const u8 = undefined;
+    {
+        const g = inst.borrow();
+        const cg = g.get().class.borrow();
+        start = cg.get().name;
+        // The arg's own class must be known so its supertype closure is
+        // complete; otherwise we cannot be definite.
+        const known = blk: {
+            const ccg = self.classes.borrow();
+            defer ccg.deinit();
+            break :blk ccg.get().get(start) != null;
+        };
+        cg.deinit();
+        g.deinit();
+        if (!known) return false;
+    }
+    const a = self.allocator;
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(a);
+    var seen: std.StringHashMap(void) = .init(a);
+    defer seen.deinit();
+    queue.append(a, start) catch return false;
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cur = queue.items[head];
+        if (std.mem.eql(u8, cur, pn)) return false; // arg IS-A param type.
+        if (seen.contains(cur)) continue;
+        seen.put(cur, {}) catch {};
+        const cg = self.classes.borrow();
+        if (cg.get().get(cur)) |d| {
+            const dg = d.borrow();
+            for (dg.get().supertype_names) |sn| queue.append(a, sn) catch {};
+            dg.deinit();
+        }
+        cg.deinit();
+    }
+    return true;
+}
+
 /// Pick the best-scoring method overload from `candidates` for `args`.
 /// Each candidate's slot 0 is the implicit `this` receiver, so value
 /// arguments score against params 1..n.
 fn pickMethodOverload(self: *VmHost, candidates: []const Func, args: []const Value) ?Func {
     if (candidates.len == 0) return null;
-    if (candidates.len == 1) return candidates[0];
+    if (candidates.len == 1) {
+        // Even a lone same-named member must be *applicable*. By arity:
+        // when fewer args are supplied than it declares and an unsupplied
+        // parameter is neither defaulted nor a vararg, it can't bind
+        // (dispatch would pad the slot with Unit). Decline so an
+        // applicable extension overload wins — e.g. `buffer.readTo(bytes)`
+        // falls through the member `Buffer.readTo(RawSink, byteCount: Long)`
+        // to the extension `Source.readTo(ByteArray, startIndex = 0,
+        // endIndex = size)`.
+        const f = candidates[0];
+        const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        const effective = f.params[skip..];
+        if (args.len < effective.len) {
+            const defaults = funcDefaults(self, &f);
+            var k: usize = args.len;
+            while (k < effective.len) : (k += 1) {
+                if (!(effective[k].is_vararg or paramHasDefault(defaults, skip + k))) return null;
+            }
+        }
+        // By type: a definite argument-type mismatch must fall through so
+        // the hierarchy walk continues to the real target.
+        var i: usize = 0;
+        while (i < args.len and i < effective.len) : (i += 1) {
+            if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i])) return null;
+        }
+        return f;
+    }
     var best: ?Func = null;
     var best_score: i32 = std.math.minInt(i32);
     for (candidates) |f| {
-        var score: i32 = 0;
-        var ok = true;
         const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-        for (args, 0..) |*a, i| {
-            if (f.params.len > i + skip) {
-                if (overloadScoreArg(self, &f.params[i + skip].ty, a)) |s| {
-                    score += s;
-                } else {
-                    ok = false;
+        const effective = f.params[skip..];
+        // Trailing-lambda rule: a `recv.f(a, …) { lambda }` call binds the
+        // trailing lambda to the LAST function-typed param, with the
+        // intermediate gap defaulted.
+        if (args.len < effective.len and args.len > 0 and
+            effective.len > 0 and isFunctionTypeRef(&effective[effective.len - 1].ty) and
+            isCallable(&args[args.len - 1]))
+        {
+            const lead = args.len - 1;
+            const last_param = effective.len - 1;
+            const defaults = funcDefaults(self, &f);
+            var gap_defaulted = true;
+            var k: usize = lead;
+            while (k < last_param) : (k += 1) {
+                if (!paramHasDefault(defaults, skip + k)) {
+                    gap_defaulted = false;
                     break;
                 }
             }
+            if (gap_defaulted) {
+                var total: i32 = 0;
+                var ok = true;
+                var j: usize = 0;
+                while (j < lead) : (j += 1) {
+                    if (overloadScoreArg(self, &effective[j].ty, &args[j])) |s| {
+                        total += s;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    if (overloadScoreArg(self, &effective[last_param].ty, &args[lead])) |s| {
+                        total += s;
+                    } else ok = false;
+                }
+                if (ok and total > best_score) {
+                    best_score = total;
+                    best = f;
+                }
+                continue;
+            }
+        }
+        // Accept an exact-arity match, or a call supplying fewer args when
+        // every unsupplied trailing parameter has a default.
+        if (args.len > effective.len) continue;
+        if (args.len < effective.len) {
+            const defaults = funcDefaults(self, &f);
+            var all_defaulted = true;
+            var k: usize = args.len;
+            while (k < effective.len) : (k += 1) {
+                if (!paramHasDefault(defaults, skip + k)) {
+                    all_defaulted = false;
+                    break;
+                }
+            }
+            if (!all_defaulted) continue;
+        }
+        var score: i32 = 0;
+        var ok = true;
+        var i: usize = 0;
+        while (i < args.len and i < effective.len) : (i += 1) {
+            if (overloadScoreArg(self, &effective[i].ty, &args[i])) |s| {
+                score += s;
+            } else {
+                ok = false;
+                break;
+            }
         }
         if (!ok) continue;
-        if (f.params.len == args.len + skip) score += 5;
+        // Prefer an exact-arity overload over one relying on defaults.
+        if (args.len == effective.len) score += 5;
         if (score > best_score) {
             best_score = score;
             best = f;
