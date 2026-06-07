@@ -47,11 +47,11 @@ CI; the default is `plain`.
 `klio run` walked your source through:
 
 1. **Lexer** — UTF-8 source → token stream.
-2. **Parser** — tokens → AST (`klio_ast::KotlinFile`).
+2. **Parser** — tokens → AST (`ast.KotlinFile`).
 3. **Pack loading** — the embedded stdlib (and any installed packs
    your file imports) merge into the module.
-4. **Lowering** — `klio-ir` lowers the AST to register IR.
-5. **Vm** — `klio-interp-ir` builds the IR module and runs it.
+4. **Lowering** — `ir` lowers the AST to register IR.
+5. **Vm** — `interp_ir` builds the IR module and runs it.
 
 `klio check` takes a different path after parsing: it runs the
 resolver and type checker to produce diagnostics. Type-checking is

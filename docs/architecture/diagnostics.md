@@ -1,6 +1,6 @@
 # Diagnostics
 
-Every pass emits diagnostics through `klio_diagnostics::DiagnosticSink`,
+Every pass emits diagnostics through `diagnostics.DiagnosticSink`,
 which renders to plain text, JSON, or SARIF.
 
 ## Codes

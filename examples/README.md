@@ -9,7 +9,7 @@ feature lands with at least one example demonstrating it end-to-end.
 Run any program with:
 
 ```sh
-cargo run -p klio-cli -- run examples/<name>.kt
+./zig-out/bin/klio run examples/<name>.kt
 ```
 
 ## Language basics

@@ -24,14 +24,14 @@ next read.
 
 Each `SectionEntry` is
 
-```rust
-pub struct SectionEntry {
-    pub name: String,
-    pub offset: u64,          // into the payload area
-    pub stored_len: u64,
-    pub uncompressed_len: u64,
-    pub compression: Compression, // None | Zstd
-}
+```zig
+pub const SectionEntry = struct {
+    name: []const u8,
+    offset: u64,            // into the payload area
+    stored_len: u64,
+    uncompressed_len: u64,
+    compression: Compression, // None | Zstd | ZstdDict
+};
 ```
 
 Names are case-sensitive. Readers may encounter unknown names and
@@ -51,7 +51,7 @@ work.
 | `debug`     | no       | Source bytes + line tables for go-to-definition.               |
 
 All section payloads are `postcard`-encoded against the schemas in
-`klio_pack::schema` and pinned to `FORMAT_VERSION`. Bump the version
+`pack.schema` and pinned to `FORMAT_VERSION`. Bump the version
 when a schema changes incompatibly.
 
 ## Compression
@@ -74,15 +74,15 @@ Suggested defaults:
 
 ## Determinism
 
-`PackWriter::finish` sorts every section by name and writes
+`PackWriter.finish` sorts every section by name and writes
 deterministically, so the same input tree always produces a
 byte-identical pack. CI can re-pack every shipped library and `diff`
 against the committed bytes to catch accidental drift.
 
 ## ABI versioning
 
-`PackManifest::abi_version` declares the runtime ABI the pack was
-built against. `klio_pack::SUPPORTED_ABI_VERSION` is the highest
+`PackManifest.abi_version` declares the runtime ABI the pack was
+built against. `pack.SUPPORTED_ABI_VERSION` is the highest
 ABI this build of klio understands. The interpreter rejects any
-pack whose `abi_version` is higher with `PackError::AbiMismatch`,
+pack whose `abi_version` is higher with `PackError.AbiMismatch`,
 prompting the author to rebuild against a matching klio release.

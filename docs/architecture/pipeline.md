@@ -9,48 +9,48 @@ lexer and parser; they diverge after the AST.
 ```
 .kt bytes
    │
-   ▼  klio-lexer       UTF-8 source → tokens
-   ▼  klio-parser      tokens → klio_ast::KotlinFile
+   ▼  lexer            UTF-8 source → tokens
+   ▼  parser           tokens → ast.KotlinFile
    ▼  (pack loading)   merge installed pack ASTs into the module
-   ▼  klio-ir          AST → register IR (lowering)
-   ▼  klio-interp-ir   build the IR module, then Vm::run
+   ▼  ir               AST → register IR (lowering)
+   ▼  interp_ir        build the IR module, then Vm.run
    ▼
 program output
 ```
 
 The Vm executes the lowered IR directly. There is no AST evaluator
-and no bytecode VM — `klio-ir` lowers every supported construct
+and no bytecode VM — `ir` lowers every supported construct
 (classes, lambdas, suspend state machines, reflection, delegates) to
 structured IR instructions, and the Vm dispatches on them.
 
-| Crate            | Responsibility                                                              |
-|------------------|------------------------------------------------------------------------------|
-| `klio-span`      | Source map, file ids, byte and (line, column) positions.                     |
-| `klio-lexer`     | UTF-8 source → tokens. Raw strings, templates, escapes; `L00xx` diagnostics. |
-| `klio-parser`    | Tokens → `klio_ast::KotlinFile`. Error recovery; `P00xx` diagnostics.        |
-| `klio-ir`        | Lowers the AST to the register IR (`Module`, `Func`, `Inst`).                |
-| `klio-interp-ir` | Builds the IR module from one or more files and runs it on the Vm.           |
-| `klio-runtime`   | Runtime `Value`, instance data, and the `Output` sink.                       |
+| Module       | Responsibility                                                              |
+|--------------|------------------------------------------------------------------------------|
+| `span`       | Source map, file ids, byte and (line, column) positions.                     |
+| `lexer`      | UTF-8 source → tokens. Raw strings, templates, escapes; `L00xx` diagnostics. |
+| `parser`     | Tokens → `ast.KotlinFile`. Error recovery; `P00xx` diagnostics.              |
+| `ir`         | Lowers the AST to the register IR (`Module`, `Func`, `Inst`).                |
+| `interp_ir`  | Builds the IR module from one or more files and runs it on the Vm.           |
+| `runtime`    | Runtime `Value`, instance data, and the `Output` sink.                       |
 
 ## Diagnostics path (`klio check`)
 
 ```
-.kt bytes → klio-lexer → klio-parser → klio-resolver → klio-typeck
-                                                           │
-                                                           ▼
-                                         plain / json / sarif diagnostics
+.kt bytes → lexer → parser → resolver → typeck
+                                          │
+                                          ▼
+                        plain / json / sarif diagnostics
 ```
 
 `klio check` does not run the program. It resolves names and
 type-checks for diagnostics only, then renders them and exits
 non-zero on any error.
 
-| Crate           | Responsibility                                                                |
-|-----------------|-------------------------------------------------------------------------------|
-| `klio-resolver` | Name binding, import expansion, package recognition; `R00xx` diagnostics.     |
-| `klio-typeck`   | Type system, smart casts, intersection types, inference; `T00xx` / `W00xx`.   |
-| `klio-cfa`      | Control- and data-flow analyses (definite assignment, reachability) used by type checking. |
-| `klio-types`    | Kotlin `Type` model, variance, inference constraint kinds.                    |
+| Module      | Responsibility                                                                |
+|-------------|-------------------------------------------------------------------------------|
+| `resolver`  | Name binding, import expansion, package recognition; `R00xx` diagnostics.     |
+| `typeck`    | Type system, smart casts, intersection types, inference; `T00xx` / `W00xx`.   |
+| `cfa`       | Control- and data-flow analyses (definite assignment, reachability) used by type checking. |
+| `types`     | Kotlin `Type` model, variance, inference constraint kinds.                    |
 
 Type-checking is not on the execution path today: a program that
 type-checks clean and a program that merely parses both run through
@@ -59,10 +59,10 @@ the same Vm.
 ## Stdlib and packs
 
 The standard library ships as `stdlib.klio-pack`, embedded into the
-binary by `klio-stdlib-pack` as `&[u8]`. At startup the loader:
+binary by `stdlib_pack` as a byte slice. At startup the loader:
 
 1. Decodes the embedded stdlib pack and registers its native
-   bindings against `klio-stdlib`'s `HostBindings`.
+   bindings against `stdlib`'s `HostBindings`.
 2. Enumerates `~/.klio/packs/` and `$KLIO_PACKS`, topologically
    sorts packs by their declared dependencies, and merges each
    pack's parsed AST into the IR module so its top-level
@@ -74,17 +74,16 @@ See [Pack Format](../packs/format.md) for the on-disk layout.
 
 ## Diagnostics model
 
-Every front-end pass emits through `klio_diagnostics::DiagnosticSink`,
+Every front-end pass emits through `diagnostics.DiagnosticSink`,
 which renders to plain text, JSON, or SARIF. Codes are prefixed by
 the originating pass — `L0001`, `P0044`, `R0003`, `T0050`. See
 [Diagnostics](diagnostics.md).
 
 ## Testing
 
-- Unit tests live alongside each crate.
-- `crates/klio-parity/` runs every `.kt` under
-  `crates/klio-parity/tests/corpus/` and `examples/` through both
-  `kotlinc` and klio and diffs stdout. A green parity sweep is the
-  primary correctness gate.
-- Negative tests under `crates/klio-typeck/tests/` lock diagnostic
+- Unit tests live alongside each module as `test {}` blocks.
+- The `parity` module runs every `.kt` under `tests/corpus/` and
+  `examples/` through both `kotlinc` and klio and diffs stdout. A
+  green parity sweep is the primary correctness gate.
+- Negative tests in `src/itests/typeck_negative.zig` lock diagnostic
   wording and codes.

@@ -89,7 +89,7 @@ bindings: 18 entries
 ## Troubleshooting
 
 - **`abi mismatch`** — rebuild the pack against the current
-  `klio_pack::SUPPORTED_ABI_VERSION`.
+  `pack.SUPPORTED_ABI_VERSION`.
 - **`unbound identifier: <Type>`** — the pack failed to register its
   source files at install time. Run `klio pack inspect` to verify
   the source/ast section is non-empty and the file ordering does
@@ -97,6 +97,6 @@ bindings: 18 entries
 - **`pack hash mismatch`** — the file was modified after writing.
   Reinstall from a freshly built pack.
 - **A native binding is missing** — the pack declares a binding
-  whose `host_symbol` no host registers. Check the matching Rust
-  crate is included in the build (`klio-cli`'s
-  `merged_host_bindings`).
+  whose `host_symbol` no host registers. Check the matching Zig
+  module is included in the build (the CLI's
+  `mergedHostBindings`).

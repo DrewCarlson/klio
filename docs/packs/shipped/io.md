@@ -1,9 +1,10 @@
 # kotlinx.io
 
 The `kotlinx.io` pack provides a `Buffer` modelled after
-upstream's FIFO byte queue. Bytes are stored in a `VecDeque<u8>`
-attached to each `Buffer` instance through `InstanceData::native_state`,
-which keeps both `pushBack` and `popFront` amortised O(1).
+upstream's FIFO byte queue. Bytes are stored in a byte
+`std.ArrayList(u8)` attached to each `Buffer` instance through
+`InstanceData.native_state`, which keeps both `pushBack` and
+`popFront` amortised O(1).
 
 ## Surface
 
@@ -46,8 +47,8 @@ Top-level:
 ## Install
 
 ```sh
-cargo run -q -p klio-cli -- pack build crates/klio-kotlinx-io
-cargo run -q -p klio-cli -- pack install target/packs/kotlinx.io.klio-pack
+./zig-out/bin/klio pack build kotlin-klio/klio-kotlinx-io
+./zig-out/bin/klio pack install target/packs/kotlinx.io.klio-pack
 ```
 
 ## Out of scope (for now)

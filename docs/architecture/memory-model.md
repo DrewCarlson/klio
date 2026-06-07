@@ -4,8 +4,8 @@ This is the normative reference for klio's memory model. The
 [concurrency architecture](concurrency.md) explains *why*; this
 document states *what* is guaranteed, as numbered rules with a
 conformance litmus program for each. Litmus programs live in
-`crates/klio-parity/tests/conformance/` and run via
-`crates/klio-parity/tests/conformance.rs`.
+`tests/fixtures/conformance/` and run via
+`src/itests/parity_conformance.zig`.
 
 klio promises a model **at least as strong as the Java Memory
 Model**. Every correctly-synchronized Kotlin program behaves
@@ -68,6 +68,7 @@ never invokes it; the interceptor does, through the same operation
 ## Conformance
 
 The litmus suite is the executable form of this document: each rule
-maps to one program (`mm1`–`mm10`), and `conformance_runnable`
-asserts every program's exact stdout. The suite is the contract a
-parallel value-model backing must continue to satisfy.
+maps to one program (`mm1`–`mm10`), and the matching `test "mmN_..."`
+block in `parity_conformance.zig` asserts every program's exact
+stdout. The suite is the contract a parallel value-model backing must
+continue to satisfy.
