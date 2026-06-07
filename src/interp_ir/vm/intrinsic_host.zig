@@ -343,25 +343,54 @@ pub fn scheduler(self: *VmIntrinsicHost) Scheduler {
     return self.scheduler.scheduler();
 }
 
-/// Drive `block` as the root of a cooperative coroutine. The cooperative
-/// interceptor / virtual-time driver is not yet in place, so the block
-/// runs straight through against its scope, matching the trait default.
+// The cooperative coroutine driver (the engine behind `runBlocking` /
+// `coroutineRunRoot` and the park / resume / launch / drain seams) lives
+// with its `CooperativeInterceptor` machinery in `coroutines.zig`. The
+// `runtime.IntrinsicHost` entry points below delegate straight to it.
+const coroutines = @import("coroutines.zig");
+
 pub fn runBlocking(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
-    const r = try evalClosureRaw(self, block, &.{}, scope, out);
-    return flattenEval(r);
+    return coroutines.runBlocking(self, block, scope, out);
 }
 
 pub fn coroutineRunRoot(self: *VmIntrinsicHost, scope: ?*const Value, block: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
-    const r = try evalClosureRaw(self, block, &.{}, scope, out);
-    return flattenEval(r);
+    return coroutines.coroutineRunRoot(self, scope, block, out);
 }
 
 pub fn coroutineLaunch(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
-    const r = try evalClosureRaw(self, block, &.{}, scope, out);
-    return switch (r) {
-        .ok => null,
-        .err => |e| runtimeErrorFromEval(e),
-    };
+    return coroutines.coroutineLaunch(self, block, scope, out);
+}
+
+pub fn coroutineParkSlot(self: *VmIntrinsicHost, slot: i64) void {
+    coroutines.coroutineParkSlot(self, slot);
+}
+
+pub fn coroutineArmSlot(self: *VmIntrinsicHost, slot: i64) void {
+    coroutines.coroutineArmSlot(self, slot);
+}
+
+pub fn coroutineDisarmSlot(self: *VmIntrinsicHost) void {
+    coroutines.coroutineDisarmSlot(self);
+}
+
+pub fn coroutineResumeSlot(self: *VmIntrinsicHost, slot: i64) void {
+    coroutines.coroutineResumeSlot(self, slot);
+}
+
+pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value) void {
+    coroutines.coroutineResumeSlotValue(self, slot, value);
+}
+
+pub fn coroutineCancelTimedParksWith(self: *VmIntrinsicHost, cause: ?Value) void {
+    coroutines.coroutineCancelTimedParksWith(self, cause) catch {};
+}
+
+pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) void {
+    coroutines.coroutineResumeExternal(self, slot, value, out) catch {};
+}
+
+pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error!?RuntimeError {
+    return coroutines.coroutineDrainToIdle(self, out);
 }
 
 /// Single callable-dispatch flow over the value variants.

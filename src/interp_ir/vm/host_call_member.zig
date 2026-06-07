@@ -1009,8 +1009,10 @@ fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const u8)
 
 fn builtinSupers(nm: []const u8) []const []const u8 {
     const s = simpleName(nm);
-    if (std.mem.eql(u8, s, "MutableList") or std.mem.eql(u8, s, "List")) {
+    if (std.mem.eql(u8, s, "List")) {
         return &.{ "Collection", "Iterable", "MutableList", "MutableCollection", "MutableIterable" };
+    } else if (std.mem.eql(u8, s, "MutableList")) {
+        return &.{ "List", "Collection", "Iterable", "MutableCollection", "MutableIterable" };
     } else if (std.mem.eql(u8, s, "Collection")) {
         return &.{ "Iterable", "MutableCollection", "MutableIterable" };
     } else if (std.mem.eql(u8, s, "Set")) {
@@ -1588,11 +1590,49 @@ pub fn callMember(self: *VmHost, allocator: Allocator, receiver: *const Value, n
 
     // Extension-function-typed member invoked with an explicit receiver.
     if (try enclosingCallableProperty(self, allocator, name)) |v| {
+        // `invoke_callable_with_this` overrides the callable's captured
+        // `this` slot with `receiver` for the duration of the body. The
+        // displaced prior capture (the lexically-enclosing receiver the
+        // body closed over) must stay reachable as an outer implicit
+        // receiver, or a bare member call in the body that targets it
+        // (e.g. an `unsafeFlow { collect { … } }` operator block whose
+        // `collect` runs on the captured upstream flow, not on the
+        // collector receiver) re-resolves against the dynamic enclosing
+        // `this` and recurses. Push that prior `this` (when distinct from
+        // the receiver) so the body sees it, mirroring the value-call path.
+        const prior_this: ?Value = blk: {
+            if (v != .IrClosure) break :blk null;
+            const info = self.closures.get(@intCast(v.IrClosure.id)) orelse break :blk null;
+            var this_idx: ?usize = null;
+            for (info.capture_names, 0..) |n, idx| {
+                if (std.mem.eql(u8, n, "this")) {
+                    this_idx = idx;
+                    break;
+                }
+            }
+            const idx = this_idx orelse break :blk null;
+            const cg = info.captures.borrow();
+            defer cg.deinit();
+            if (idx < cg.get().items.len) break :blk cg.get().items[idx];
+            break :blk null;
+        };
+        const pushed_outer = po: {
+            const pt = prior_this orelse break :po false;
+            if (pt == .Null or pt == .Unit) break :po false;
+            if (pt == .Instance and receiver.* == .Instance) {
+                break :po !ObjRef(InstanceData).ptrEq(pt.Instance, receiver.Instance);
+            }
+            break :po true;
+        };
+        if (pushed_outer) {
+            if (prior_this) |p| pushAccessEnclosing(self, &p);
+        }
         var sink = self.out_sink;
         var intrinsic = makeIntrinsicHost(self);
         defer deinitIntrinsicHost(&intrinsic);
         var ihost = intrinsic.intrinsicHost();
         const r = try ihost.invokeCallableWithThis(&v, args, receiver, sink.output());
+        if (pushed_outer) popAccessEnclosing(self);
         return mapRuntimeResult(allocator, r);
     }
 

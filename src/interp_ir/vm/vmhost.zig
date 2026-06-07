@@ -329,6 +329,30 @@ fn ivCoroutineRunRoot(ctx: *anyopaque, scope: ?*const Value, block: *const Value
 fn ivCoroutineLaunch(ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
     return intrinsic_host.coroutineLaunch(ip(ctx), block, scope, out);
 }
+fn ivCoroutineParkSlot(ctx: *anyopaque, slot: i64) void {
+    intrinsic_host.coroutineParkSlot(ip(ctx), slot);
+}
+fn ivCoroutineArmSlot(ctx: *anyopaque, slot: i64) void {
+    intrinsic_host.coroutineArmSlot(ip(ctx), slot);
+}
+fn ivCoroutineDisarmSlot(ctx: *anyopaque) void {
+    intrinsic_host.coroutineDisarmSlot(ip(ctx));
+}
+fn ivCoroutineResumeSlot(ctx: *anyopaque, slot: i64) void {
+    intrinsic_host.coroutineResumeSlot(ip(ctx), slot);
+}
+fn ivCoroutineResumeSlotValue(ctx: *anyopaque, slot: i64, value: Value) void {
+    intrinsic_host.coroutineResumeSlotValue(ip(ctx), slot, value);
+}
+fn ivCoroutineCancelTimedParksWith(ctx: *anyopaque, cause: ?Value) void {
+    intrinsic_host.coroutineCancelTimedParksWith(ip(ctx), cause);
+}
+fn ivCoroutineResumeExternal(ctx: *anyopaque, slot: i64, value: Value, out: Output) void {
+    intrinsic_host.coroutineResumeExternal(ip(ctx), slot, value, out);
+}
+fn ivCoroutineDrainToIdle(ctx: *anyopaque, out: Output) Allocator.Error!?RuntimeError {
+    return intrinsic_host.coroutineDrainToIdle(ip(ctx), out);
+}
 fn ivSpawnOsThread(ctx: *anyopaque, block: *const Value, out: Output) Allocator.Error!HostResultU64 {
     return intrinsic_host.spawnOsThread(ip(ctx), block, out);
 }
@@ -356,6 +380,14 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .run_blocking = ivRunBlocking,
     .coroutine_run_root = ivCoroutineRunRoot,
     .coroutine_launch = ivCoroutineLaunch,
+    .coroutine_park_slot = ivCoroutineParkSlot,
+    .coroutine_arm_slot = ivCoroutineArmSlot,
+    .coroutine_disarm_slot = ivCoroutineDisarmSlot,
+    .coroutine_resume_slot = ivCoroutineResumeSlot,
+    .coroutine_resume_slot_value = ivCoroutineResumeSlotValue,
+    .coroutine_cancel_timed_parks_with = ivCoroutineCancelTimedParksWith,
+    .coroutine_resume_external = ivCoroutineResumeExternal,
+    .coroutine_drain_to_idle = ivCoroutineDrainToIdle,
     .spawn_os_thread = ivSpawnOsThread,
     .join_os_thread = ivJoinOsThread,
     .os_thread_alive = ivOsThreadAlive,

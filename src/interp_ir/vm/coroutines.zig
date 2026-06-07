@@ -504,6 +504,484 @@ pub const CooperativeInterceptor = struct {
     };
 };
 
+// -------------------------------------------------------------------------
+// Layer 2 — the default interceptor's dispatch loop (the engine behind
+// `runBlocking`). Drives Layer-1 activations: it never inspects the
+// suspend mechanism, only parks / resumes through the interceptor seam.
+//
+// The Rust crate keeps this loop in `vm/intrinsic_host.rs` with the
+// `CooperativeInterceptor` stack, active-scope stack, and persisted-park
+// table living in `lib.rs`'s thread-locals. The Zig port co-locates the
+// whole driver with its machinery here.
+// -------------------------------------------------------------------------
+
+const vmhost = @import("vmhost.zig");
+const intrinsic_host = @import("intrinsic_host.zig");
+const VmIntrinsicHost = vmhost.VmIntrinsicHost;
+const Output = runtime.Output;
+const RuntimeError = runtime.RuntimeError;
+const RuntimeEvalResult = runtime.EvalResult;
+const EvalError = ir.eval.EvalError;
+
+/// This thread's coroutine interceptor stack — one entry per nested
+/// `runBlocking` / driven root (`with_coro` over the Rust `EXEC.coro`).
+/// Backed by the page allocator: the stack itself is thread-lifetime and
+/// holds at most a handful of entries; each interceptor's own maps use
+/// the run allocator passed to `CooperativeInterceptor.new`.
+threadlocal var coro_stack: std.ArrayList(CooperativeInterceptor) = .empty;
+
+/// Stack of the active coroutine's `CoroutineScope` value (the driven
+/// root scope). The suspend-implicit `coroutineContext` read redirects to
+/// the active scope's context via this stack (the Rust
+/// `ACTIVE_CORO_SCOPE`). Page-allocator backed for the same reason.
+threadlocal var active_scope_stack: std.ArrayList(Value) = .empty;
+
+/// Coroutines that parked indefinitely inside a driven root and are
+/// awaiting an external `Continuation.resume`. Keyed by rendezvous slot;
+/// the resume drives the saved state to completion. Program/thread
+/// lifetime — the held continuation outlives the driver that started it
+/// (the Rust `PERSISTED_PARKED`).
+threadlocal var persisted_parked: ?std.AutoHashMap(i64, SuspendState) = null;
+
+fn coroStackAllocator() Allocator {
+    return std.heap.page_allocator;
+}
+
+/// The active interceptor (top of this thread's stack), or `null`.
+fn coroTop() ?*CooperativeInterceptor {
+    if (coro_stack.items.len == 0) return null;
+    return &coro_stack.items[coro_stack.items.len - 1];
+}
+
+/// Push a fresh interceptor for a newly-entered driven root.
+fn coroPush(allocator: Allocator) Allocator.Error!void {
+    try coro_stack.append(coroStackAllocator(), try CooperativeInterceptor.new(allocator));
+}
+
+/// Pop and deinit the top interceptor, returning its `wakeup` handle so
+/// the caller can release any global slot-owner entries that still point
+/// at it. The returned handle is owned by the caller (must `deinit`).
+fn coroPop() ?ObjRef(DriverWakeup) {
+    if (coro_stack.items.len == 0) return null;
+    var ci = coro_stack.pop().?;
+    const wakeup = ci.wakeup.clone();
+    ci.deinit();
+    return wakeup;
+}
+
+/// The active coroutine scope (top of the driver stack), if any. Mirrors
+/// the Rust `active_coro_scope`. Public so the field-read path
+/// (`coroutineContext` redirect) can consult the real stack.
+pub fn activeCoroScope() ?Value {
+    if (active_scope_stack.items.len == 0) return null;
+    return active_scope_stack.items[active_scope_stack.items.len - 1];
+}
+
+/// RAII-style scope guard: pushes the driven coroutine's scope for the
+/// lifetime of a `driveRoot` activation so the `coroutineContext`
+/// intrinsic resolves to it. Only `Instance` scopes are pushed, matching
+/// the Rust `ActiveScopeGuard::enter`.
+const ActiveScopeGuard = struct {
+    pushed: bool,
+
+    fn enter(scope: *const Value) ActiveScopeGuard {
+        if (scope.* == .Instance) {
+            active_scope_stack.append(coroStackAllocator(), scope.*) catch return .{ .pushed = false };
+            return .{ .pushed = true };
+        }
+        return .{ .pushed = false };
+    }
+
+    fn leave(self: ActiveScopeGuard) void {
+        if (self.pushed and active_scope_stack.items.len != 0) {
+            _ = active_scope_stack.pop();
+        }
+    }
+};
+
+/// Map an `EvalError` onto the runtime's `RuntimeError`, mirroring the
+/// Rust `map_err` closure in `drive_root` (`Throw -> Thrown`,
+/// `NonLocalReturn -> Return`, every other variant rendered as `Type`).
+fn mapDriverErr(allocator: Allocator, e: EvalError) RuntimeError {
+    return switch (e) {
+        .Throw => |v| .{ .Thrown = v },
+        .NonLocalReturn => |v| .{ .Return = v },
+        .LabeledReturn => |lr| .{ .LabeledReturn = .{ .label = lr.label, .value = lr.value } },
+        .Type => |s| .{ .Type = s },
+        .Unsupported => |s| .{ .Type = s },
+        .Unbound => |s| .{ .Unbound = s },
+        .Unimplemented => |s| .{ .Unimplemented = s },
+        .Arity => |s| .{ .Arity = s },
+        .Suspended => .{ .Type = std.fmt.allocPrint(allocator, "coroutine suspended outside a driver", .{}) catch "coroutine suspended outside a driver" },
+    };
+}
+
+/// Hand a freshly-suspended Layer-1 activation to the active interceptor
+/// (Layer 2). Returns the token so the driver can recognise the root's
+/// completion. The `*SuspendState` box is consumed: its value is copied
+/// into the interceptor and the box freed (the inner `frames` ArrayList /
+/// dup'd slices are now owned by the copied value).
+fn park(allocator: Allocator, st: *SuspendState) Allocator.Error!u64 {
+    const top = coroTop() orelse return error.OutOfMemory; // "park outside runBlocking"
+    const value = st.*;
+    allocator.destroy(st);
+    return top.interceptSuspend(value);
+}
+
+/// Layer 2 — the default interceptor's dispatch loop (`drive_run_blocking`).
+pub fn driveRunBlocking(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
+    return driveRoot(self, block, scope, out, false);
+}
+
+/// `driveRunBlocking` with control over whether a coroutine that parks
+/// indefinitely (awaiting an external resume) is preserved into
+/// program-lifetime storage on driver exit (`persist = true`, the
+/// `startCoroutine` boundary) or simply abandoned (`persist = false`,
+/// `runBlocking`). One tightly-coupled coroutine state machine.
+pub fn driveRoot(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output, persist: bool) Allocator.Error!RuntimeEvalResult {
+    const a = self.allocator;
+    try coroPush(a);
+    const guard = ActiveScopeGuard.enter(scope);
+    defer guard.leave();
+
+    // Root coroutine.
+    var root_value: ?Value = null;
+    var root_token: ?u64 = null;
+    switch (try intrinsic_host.evalClosureRaw(self, block, &.{}, scope, out)) {
+        .ok => |v| root_value = v,
+        .err => |e| switch (e) {
+            .Suspended => |st| root_token = try park(a, st),
+            else => {
+                if (coroPop()) |w| {
+                    var ww = w;
+                    ww.deinit();
+                }
+                return .{ .err = mapDriverErr(a, e) };
+            },
+        },
+    }
+
+    while (true) {
+        // 1. Start any queued child launches.
+        const launched = try (coroTop().?).drainLaunched(a);
+        defer a.free(launched);
+        const progressed = launched.len != 0;
+        for (launched) |child| {
+            switch (try intrinsic_host.evalClosureRaw(self, &child, &.{}, scope, out)) {
+                .ok => {},
+                .err => |e| switch (e) {
+                    .Suspended => |st| _ = try park(a, st),
+                    else => {
+                        if (coroPop()) |w| {
+                            var ww = w;
+                            ww.deinit();
+                        }
+                        return .{ .err = mapDriverErr(a, e) };
+                    },
+                },
+            }
+        }
+
+        // 2. Resume a ready coroutine, if any.
+        if ((coroTop().?).nextReady()) |tok| {
+            if ((coroTop().?).takeParked(tok)) |entry_in| {
+                var entry = entry_in;
+                const resume_with = (coroTop().?).takeResumeValue(tok) orelse Value.Unit;
+                switch (try intrinsic_host.resumeRaw(self, &entry.state, resume_with, out)) {
+                    .ok => |v| {
+                        if (root_token != null and root_token.? == tok) {
+                            root_value = v;
+                            root_token = null;
+                        }
+                    },
+                    .err => |e| switch (e) {
+                        .Suspended => |st2| {
+                            const new_tok = try park(a, st2);
+                            if (root_token != null and root_token.? == tok) {
+                                root_token = new_tok;
+                            }
+                        },
+                        // A launched child observing a CancellationException
+                        // (Job.cancel / withTimeout cooperative cancel) is
+                        // swallowed, matching a real Kotlin runtime; the root
+                        // keeps its throw semantics.
+                        .Throw => |v| {
+                            if ((root_token == null or root_token.? != tok) and root.isCancellationException(&v)) {
+                                // swallow
+                            } else {
+                                if (coroPop()) |w| {
+                                    var ww = w;
+                                    ww.deinit();
+                                }
+                                return .{ .err = mapDriverErr(a, e) };
+                            }
+                        },
+                        else => {
+                            if (coroPop()) |w| {
+                                var ww = w;
+                                ww.deinit();
+                            }
+                            return .{ .err = mapDriverErr(a, e) };
+                        },
+                    },
+                }
+            }
+            continue;
+        }
+
+        // 3. No ready coroutine — advance virtual time to the nearest timer
+        //    and arm every coroutine due then.
+        if (try (coroTop().?).advanceTime()) continue;
+
+        // 3b. Cross-thread bridge: drain any resumes posted by worker
+        //     threads (e.g. `Dispatchers.Default`) into the interceptor; if
+        //     a worker is still in flight, wait briefly for it to post.
+        const wakeup = (coroTop().?).wakeup.clone();
+        defer {
+            var w = wakeup;
+            w.deinit();
+        }
+        const had_resume = try drainWakeupInto(a, &wakeup, coroTop().?);
+        if (had_resume) continue;
+        var pending: usize = 0;
+        {
+            const w = wakeup.borrowMut();
+            pending = w.get().pending();
+            w.deinit();
+        }
+        if (pending > 0) {
+            sleepMillis(1);
+            _ = try drainWakeupInto(a, &wakeup, coroTop().?);
+            continue;
+        }
+
+        // 4. Nothing ready, no timers: done (or deadlocked on an
+        //    indefinitely-parked coroutine with no resumer).
+        if (!progressed) break;
+    }
+
+    if (persist) {
+        // A coroutine that parked indefinitely is alive, waiting on a
+        // continuation held outside this driver. Preserve it so a later
+        // external resume can drive it to completion.
+        const saved = try (coroTop().?).drainIndefiniteParked(a);
+        defer a.free(saved);
+        if (saved.len != 0) {
+            const m = try persistedParkedMap();
+            for (saved) |s| try m.put(s.slot, s.state);
+        }
+    }
+
+    // Release any global slot-owner entries still pointing at this driver's
+    // wakeup so cross-thread routing doesn't leak.
+    if (coroPop()) |w| {
+        var ww = w;
+        {
+            const g = ww.borrowMut();
+            g.get().releaseOwnedSlots();
+            g.deinit();
+        }
+        ww.deinit();
+    }
+    return .{ .ok = root_value orelse Value.Unit };
+}
+
+/// Drain everything the worker-thread mailbox posted into the interceptor
+/// as slot resumes. Returns whether any entry was routed.
+fn drainWakeupInto(allocator: Allocator, wakeup: *const ObjRef(DriverWakeup), top: *CooperativeInterceptor) Allocator.Error!bool {
+    const drained = blk: {
+        const g = wakeup.borrowMut();
+        defer g.deinit();
+        break :blk try g.get().drainMailbox(allocator);
+    };
+    defer allocator.free(drained);
+    for (drained) |entry| {
+        _ = try top.resumeSlotValue(entry.slot, entry.value);
+    }
+    return drained.len != 0;
+}
+
+/// The persisted-parked map, created on first use.
+fn persistedParkedMap() Allocator.Error!*std.AutoHashMap(i64, SuspendState) {
+    if (persisted_parked == null) {
+        persisted_parked = std.AutoHashMap(i64, SuspendState).init(coroStackAllocator());
+    }
+    return &persisted_parked.?;
+}
+
+// -------------------------------------------------------------------------
+// `runtime.IntrinsicHost` coroutine vtable entry points.
+// -------------------------------------------------------------------------
+
+pub fn runBlocking(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
+    return driveRunBlocking(self, block, scope, out);
+}
+
+pub fn coroutineRunRoot(self: *VmIntrinsicHost, scope: ?*const Value, block: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
+    // Already inside a cooperative driver (a child started by `launch`
+    // while a `runBlocking` loop runs): join the enclosing interceptor
+    // rather than spinning an isolated root. The block runs on the shared
+    // virtual clock; if it suspends, its activation is parked on the
+    // active interceptor and the start completes normally (the enclosing
+    // driver resumes it when its slot/timer is due).
+    if (coroTop() != null) {
+        const a = self.allocator;
+        // Make the coroutine's own scope active while the block runs so a
+        // suspend-implicit `coroutineContext` read resolves to its `Job`.
+        var guard = ActiveScopeGuard{ .pushed = false };
+        if (scope) |s| guard = ActiveScopeGuard.enter(s);
+        defer guard.leave();
+        switch (try intrinsic_host.evalClosureRaw(self, block, &.{}, null, out)) {
+            .ok => |v| return .{ .ok = v },
+            .err => |e| switch (e) {
+                .Suspended => |st| {
+                    _ = try park(a, st);
+                    return .{ .ok = Value.Unit };
+                },
+                .Throw => |v| return .{ .err = .{ .Thrown = v } },
+                .NonLocalReturn => |v| return .{ .err = .{ .Return = v } },
+                else => return .{ .err = mapDriverErr(a, e) },
+            },
+        }
+    }
+    const unit: Value = .Unit;
+    return driveRoot(self, block, if (scope) |s| s else &unit, out, true);
+}
+
+pub fn coroutineLaunch(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output) Allocator.Error!?RuntimeError {
+    _ = scope;
+    if (coroTop()) |top| {
+        try top.enqueueLaunch(block.*);
+        return null;
+    }
+    // No active runBlocking — run the child eagerly.
+    const r = try intrinsic_host.invokeCallable(self, block, &.{}, out);
+    return switch (r) {
+        .ok => null,
+        .err => |e| e,
+    };
+}
+
+pub fn coroutineParkSlot(self: *VmIntrinsicHost, slot: i64) void {
+    _ = self;
+    if (coroTop()) |top| top.setPendingSlot(slot) catch {};
+}
+
+pub fn coroutineArmSlot(self: *VmIntrinsicHost, slot: i64) void {
+    _ = self;
+    if (coroTop()) |top| top.setPendingSlot(slot) catch {};
+}
+
+pub fn coroutineDisarmSlot(self: *VmIntrinsicHost) void {
+    _ = self;
+    if (coroTop()) |top| top.clearPendingSlot();
+}
+
+pub fn coroutineResumeSlot(self: *VmIntrinsicHost, slot: i64) void {
+    _ = self;
+    var i: usize = coro_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (coro_stack.items[i].resumeSlot(slot) catch false) break;
+    }
+}
+
+pub fn coroutineResumeSlotValue(self: *VmIntrinsicHost, slot: i64, value: Value) void {
+    _ = self;
+    var i: usize = coro_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (coro_stack.items[i].resumeSlotValue(slot, value) catch false) break;
+    }
+}
+
+pub fn coroutineCancelTimedParksWith(self: *VmIntrinsicHost, cause: ?Value) Allocator.Error!void {
+    const a = self.allocator;
+    const exc = cause orelse Value{ .Exception = .{
+        .fqn = try runtime.StringRef.init(a, "kotlin.coroutines.cancellation.CancellationException"),
+        .message = try runtime.StringRef.init(a, "StandaloneCoroutine was cancelled"),
+        .cause = null,
+    } };
+    const payload = try a.create(Value);
+    payload.* = exc;
+    const failure = Value{ .Result = .{ .ok = false, .payload = payload } };
+    if (coroTop()) |top| try top.cancelTimedParks(failure);
+}
+
+pub fn coroutineResumeExternal(self: *VmIntrinsicHost, slot: i64, value: Value, out: Output) Allocator.Error!void {
+    // A live cooperative driver still holding this slot? Enqueue there —
+    // its drive loop runs the activation.
+    {
+        var i: usize = coro_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (coro_stack.items[i].resumeSlotValue(slot, value) catch false) return;
+        }
+    }
+    // Cross-thread: the slot is owned by a driver on another OS thread
+    // (e.g. a `Dispatchers.Default` worker resuming `await` back on the
+    // main `runBlocking` pump). Route through the driver's mailbox.
+    if (lookupSlotOwner(slot)) |w| {
+        var ww = w;
+        defer ww.deinit();
+        const g = ww.borrowMut();
+        defer g.deinit();
+        try g.get().postResume(slot, value);
+        return;
+    }
+    // Otherwise the coroutine parked inside a driven root that already
+    // returned; its state was preserved. Drive it to completion now.
+    if (persisted_parked) |*m| {
+        if (m.fetchRemove(slot)) |kv| {
+            var st = kv.value;
+            _ = try intrinsic_host.resumeRaw(self, &st, value, out);
+        }
+    }
+}
+
+pub fn coroutineDrainToIdle(self: *VmIntrinsicHost, out: Output) Allocator.Error!?RuntimeError {
+    const a = self.allocator;
+    while (true) {
+        const top = coroTop() orelse break;
+        const launched = try top.drainLaunched(a);
+        defer a.free(launched);
+        const progressed = launched.len != 0;
+        const scope = activeCoroScope() orelse Value.Unit;
+        for (launched) |child| {
+            switch (try intrinsic_host.evalClosureRaw(self, &child, &.{}, &scope, out)) {
+                .ok => {},
+                .err => |e| switch (e) {
+                    .Suspended => |st| _ = try park(a, st),
+                    .Throw => |v| {
+                        if (!root.isCancellationException(&v)) return mapDriverErr(a, e);
+                    },
+                    else => return mapDriverErr(a, e),
+                },
+            }
+        }
+        if ((coroTop().?).nextReady()) |tok| {
+            if ((coroTop().?).takeParked(tok)) |entry_in| {
+                var entry = entry_in;
+                const resume_with = (coroTop().?).takeResumeValue(tok) orelse Value.Unit;
+                switch (try intrinsic_host.resumeRaw(self, &entry.state, resume_with, out)) {
+                    .ok => {},
+                    .err => |e| switch (e) {
+                        .Suspended => |st2| _ = try park(a, st2),
+                        .Throw => |v| {
+                            if (!root.isCancellationException(&v)) return mapDriverErr(a, e);
+                        },
+                        else => return mapDriverErr(a, e),
+                    },
+                }
+            }
+            continue;
+        }
+        if (try (coroTop().?).advanceTime()) continue;
+        if (!progressed) break;
+    }
+    return null;
+}
+
 const testing = std.testing;
 
 test {

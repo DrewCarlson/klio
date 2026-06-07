@@ -72,18 +72,20 @@ threadlocal var field_outer_active: bool = false;
 const ResolvePair = struct { id: usize, name: []const u8 };
 
 /// The active coroutine scope (top of the driver stack), if any. The
-/// driver stack lives with the coroutine machinery (not yet ported), so
-/// this reports `null` until a `drive_root` activation pushes a scope.
+/// driver stack lives with the coroutine machinery in `coroutines.zig`;
+/// a `driveRoot` activation pushes its scope there.
 fn activeCoroScope() ?Value {
-    return null;
+    return vmhost.coroutines.activeCoroScope();
 }
 
 /// The lexically enclosing `this` displaced by a receiver lambda, or
-/// `null`. The populating push/pop hooks are stubs, so the stack is
-/// empty and this reports `null` — matching `with_outer_this(|s|
-/// s.borrow().last().cloned())` over an empty stack.
-fn outerThisLast() ?Value {
-    return null;
+/// `null`. Reports the top of the shared enclosing-`this` stack
+/// (`with_outer_this(|s| s.borrow().last().cloned())`), which member
+/// dispatch and the access-enclosing machinery push onto — so a bare
+/// member-property read inside a member-extension / receiver-lambda body
+/// can resolve against the lexically enclosing class instance.
+fn outerThisLast(self: *VmHost) ?Value {
+    return vmhost.host_call_member.enclosingThis(self);
 }
 
 /// Run `f` only if `(id, name)` is not already being resolved through
@@ -716,7 +718,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         };
     };
     if (global_is_callable) {
-        if (outerThisLast()) |outer| {
+        if (outerThisLast(self)) |outer| {
             const skip = outer == .Null or outer == .Unit or
                 (outer == .Instance and receiver.* == .Instance and ObjRef(InstanceData).ptrEq(outer.Instance, receiver.Instance));
             if (!skip) {
@@ -749,7 +751,7 @@ pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
     // Enclosing-receiver fallback: a bare member property read inside a
     // member-extension / receiver-lambda body may name a member of the
     // lexically enclosing class instance.
-    if (outerThisLast()) |outer| {
+    if (outerThisLast(self)) |outer| {
         const same = outer == .Instance and receiver.* == .Instance and ObjRef(InstanceData).ptrEq(outer.Instance, receiver.Instance);
         if (!same and outer != .Null and outer != .Unit) {
             const oid: usize = if (outer == .Instance) outer.Instance.identity() else 0;
