@@ -659,7 +659,7 @@ fn buildModuleWithOverrides(
     const tl = std.heap.page_allocator;
     {
         var inline_fns = std.StringHashMap(std.ArrayList(*const ast.Function)).init(a);
-        for (all_decls.items) |*d| try collectInline(a, d, &inline_fns);
+        for (decls) |*d| try collectInline(a, d, &inline_fns);
         var frozen = std.StringHashMap([]const *const ast.Function).init(tl);
         var it = inline_fns.iterator();
         while (it.next()) |e| {
@@ -686,7 +686,7 @@ fn buildModuleWithOverrides(
     // Top-level (file-scope) property names.
     {
         var top_props = StringSet.init(tl);
-        for (all_decls.items) |*d| {
+        for (decls) |*d| {
             if (d.* == .Property and d.Property.receiver_type == null) {
                 try top_props.put(d.Property.name.name, {});
             }
