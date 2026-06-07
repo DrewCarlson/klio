@@ -40,7 +40,7 @@ klio runs single-threaded, so:
 
 - `launch` and `async` execute the block to completion on the
   caller's stack before returning the `Job` / `Deferred`.
-- `delay(millis)` calls `std::thread::sleep` — wall time passes,
+- `delay(millis)` calls `std.Thread.sleep` — wall time passes,
   no scheduler involvement.
 - `Dispatchers.X` are placeholders for source compatibility; every
   dispatcher folds into the current thread.
@@ -54,6 +54,6 @@ yet implemented.
 ## Install
 
 ```sh
-cargo run -q -p klio-cli -- pack build crates/klio-kotlinx-coroutines
-cargo run -q -p klio-cli -- pack install target/packs/kotlinx.coroutines.klio-pack
+./zig-out/bin/klio pack build kotlin-klio/klio-kotlinx-coroutines
+./zig-out/bin/klio pack install target/packs/kotlinx.coroutines.klio-pack
 ```

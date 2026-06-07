@@ -1,10 +1,10 @@
 # klio
 
-An experimental Kotlin interpreter written in Rust.
+An experimental Kotlin interpreter written in Zig.
 
 klio reads Kotlin source, lowers it to a register-based intermediate
 representation, and executes that IR directly. There is no JVM, no
-Kotlin/Native, and no separate compile step — the same Rust pipeline
+Kotlin/Native, and no separate compile step — the same Zig pipeline
 that parses your code also runs it.
 
 It targets Kotlin **2.3.21**. Coverage is broad enough to run
@@ -14,14 +14,8 @@ replacement for `kotlinc`.
 ## Quick start
 
 ```sh
-cargo build --release -p klio-cli
-target/release/klio run examples/showcase.kt
-```
-
-Or run straight out of the workspace:
-
-```sh
-cargo run -p klio-cli -- run examples/showcase.kt
+zig build
+./zig-out/bin/klio run examples/showcase.kt
 ```
 
 A first program:
@@ -59,18 +53,18 @@ executes; type-checking is not on the run path today.
 
 ```
 .kt source
-   │ klio-lexer      UTF-8 → tokens
-   │ klio-parser     tokens → AST
-   │ klio-ir         AST → register IR (lowering)
-   │ klio-interp-ir  IR → result (the Vm)
+   │ lexer       UTF-8 → tokens
+   │ parser      tokens → AST
+   │ ir          AST → register IR (lowering)
+   │ interp_ir   IR → result (the Vm)
    ▼
 program output
 ```
 
-`klio check` additionally runs `klio-resolver` (name binding,
-imports) and `klio-typeck` (type system, smart casts, inference) over
-the AST to produce diagnostics. The execution path is IR-only: the
-Vm never walks an AST.
+`klio check` additionally runs the `resolver` module (name binding,
+imports) and the `typeck` module (type system, smart casts, inference)
+over the AST to produce diagnostics. The execution path is IR-only:
+the Vm never walks an AST.
 
 ## What works
 
@@ -110,9 +104,9 @@ embedded into the `klio` binary, so every `klio run` starts with the
 stdlib already loaded.
 
 ```sh
-cargo run -p klio-cli -- pack build crates/klio-kotlinx-atomicfu
-cargo run -p klio-cli -- pack install target/packs/kotlinx.atomicfu.klio-pack
-cargo run -p klio-cli -- run examples/atomic_counter.kt
+./zig-out/bin/klio pack build src/kotlinx_atomicfu
+./zig-out/bin/klio pack install zig-out/packs/kotlinx.atomicfu.klio-pack
+./zig-out/bin/klio run examples/atomic_counter.kt
 ```
 
 Installed packs live in `~/.klio/packs/` and load automatically. The
@@ -140,55 +134,59 @@ Vendored as git submodules under `third-party/kotlinx/`:
 git submodule update --init --recursive
 ```
 
-`atomicfu` and `io` ship Kotlin shims plus working Rust
+`atomicfu` and `io` ship Kotlin shims plus working Zig
 implementations of the platform-specific operations. `datetime` and
-`coroutines` have crate scaffolds and submodule pins but empty
+`coroutines` have module scaffolds and submodule pins but empty
 binding tables. `io.ktor.client` ships as an opt-in pack and is not
 loaded by default.
 
-## Workspace layout
+## Source layout
+
+The interpreter is built from Zig modules under `src/`, wired
+together in `build.zig`:
 
 ```
-crates/
-  klio-span             Source files, byte spans, line/column mapping
-  klio-diagnostics      Error/warning model, plain/json/sarif renderers
-  klio-diagnostics-gen  Generator for diagnostic-factory tables
-  klio-lexer            Kotlin tokenizer
-  klio-ast              AST node definitions
-  klio-parser           Recursive-descent parser
-  klio-resolver         Name resolution (klio check)
-  klio-typeck           Type checker (klio check)
-  klio-cfa              Control- and data-flow analyses
-  klio-types            Type system + constraint solver
-  klio-ir               AST → register IR lowering
-  klio-interp-ir        IR Vm: the execution engine
-  klio-runtime          Runtime Value, instance data, Output trait
-  klio-stdlib           Native Rust intrinsics + symbol index
-  klio-stdlib-gen       Mines upstream Kotlin into the symbol index
-  klio-stdlib-pack      Embeds the stdlib .klio-pack via include_bytes!
-  klio-pack             Pack format: writer, reader, schema
-  klio-kotlinx-*        Per-library binding crates
-  klio-ktor-client      Opt-in HTTP client pack + bindings
-  klio-cli              The `klio` binary
-  klio-parity           Cross-checks every program against kotlinc
-  klio-bench            Criterion benchmarks
+src/
+  span             Source files, byte spans, line/column mapping
+  diagnostics      Error/warning model, plain/json/sarif renderers
+  diagnostics_gen  Generator for diagnostic-factory tables
+  lexer            Kotlin tokenizer
+  ast              AST node definitions
+  parser           Recursive-descent parser
+  resolver         Name resolution (klio check)
+  typeck           Type checker (klio check)
+  cfa              Control- and data-flow analyses
+  types            Type system + constraint solver
+  ir               AST → register IR lowering
+  interp_ir        IR Vm: the execution engine
+  runtime          Runtime Value, instance data, output sink
+  stdlib           Native Zig intrinsics + symbol index
+  stdlib_gen       Mines upstream Kotlin into the symbol index
+  stdlib_pack      Embeds the stdlib .klio-pack
+  pack             Pack format: writer, reader, schema
+  kotlinx_*        Per-library binding modules
+  ktor_client      Opt-in HTTP client pack + bindings
+  cli              The `klio` binary
+  parity           Cross-checks every program against kotlinc
+  bench            Benchmarks
+  main.zig         Binary entry point
 ```
 
 ## Building from source
 
 ```sh
-cargo build --workspace
-cargo test --workspace
-cargo run -p klio-cli -- run examples/showcase.kt
+zig build
+zig build test
+./zig-out/bin/klio run examples/showcase.kt
 ```
 
-Rust 1.95+ is required (pinned in `rust-toolchain.toml`).
+Zig 0.16.0+ is required (pinned in `build.zig.zon`).
 
-`klio-parity` needs a `kotlinc` on `PATH`; without one the parity
-tests skip. `klio-stdlib-gen` needs a checkout of
+The `parity` module needs a `kotlinc` on `PATH`; without one the
+parity tests skip. The `stdlib_gen` module needs a checkout of
 [JetBrains/kotlin](https://github.com/JetBrains/kotlin) at the target
 tag; without it the registry uses the symbol index already committed
-at `crates/klio-stdlib/src/generated/`.
+under `src/stdlib/`.
 
 ## Reference sources
 

@@ -5,8 +5,8 @@ The `kotlinx.datetime` pack covers `Instant`, `LocalDateTime`,
 surface. The Kotlin shim implements arithmetic and accessors in
 pure Kotlin against a small set of native helpers:
 
-- System clock (`chrono::Utc::now`)
-- IANA tz conversion via `chrono` + `chrono-tz`
+- System clock over the platform time source
+- IANA tz conversion and host tz detection
 - ISO-8601 rendering and parsing of `Instant`
 - tz id validation
 
@@ -52,8 +52,8 @@ Available types:
 ## Install
 
 ```sh
-cargo run -q -p klio-cli -- pack build crates/klio-kotlinx-datetime
-cargo run -q -p klio-cli -- pack install target/packs/kotlinx.datetime.klio-pack
+./zig-out/bin/klio pack build kotlin-klio/klio-kotlinx-datetime
+./zig-out/bin/klio pack install target/packs/kotlinx.datetime.klio-pack
 ```
 
 ## Notes

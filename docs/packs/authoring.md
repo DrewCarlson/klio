@@ -51,7 +51,7 @@ The fields that matter:
 
 ## 3. Write the Kotlin source
 
-Pure Kotlin libraries are easiest — no Rust crate required. Edit
+Pure Kotlin libraries are easiest — no Zig module required. Edit
 `src/main/kotlin/Sample.kt`:
 
 ```kotlin
@@ -87,10 +87,10 @@ klio run /tmp/use.kt
 ## Adding a native binding
 
 When pure Kotlin is too slow or needs host capabilities (clock, HTTP,
-threads), pair the library with a Rust crate.
+threads), pair the library with a Zig module.
 
-1. Create a sibling crate (`crates/klio-com-example-greetings/`)
-   exposing a `pub fn host_bindings() -> HostBindings`.
+1. Create a sibling module (`src/com_example_greetings/`)
+   exposing a `pub fn hostBindings(allocator) HostBindings`.
 2. Declare the binding in `klio.toml`:
 
 ```toml
@@ -109,8 +109,9 @@ The loader, on installing the pack, will replace `now` with the
 intrinsic at dispatch time. See [Native Bindings](native-bindings.md)
 for the full pattern.
 
-4. Wire the new crate into `klio-cli`'s `merged_host_bindings()` so
-   the registry contains its function pointers at startup.
+4. Wire the new module into the CLI's `mergedHostBindings()` and
+   `build.zig` so the registry contains its function pointers at
+   startup.
 
 ## Tips
 
@@ -121,9 +122,9 @@ for the full pattern.
   initialisers of later files must be defined in an alphabetically
   earlier file path. Use `_` prefixes (`_types.kt`) when ordering
   matters.
-- **Determinism is enforced.** `cargo run -p klio-cli -- pack build`
-  twice on the same source produces byte-identical output. If your
-  build flakes, suspect non-deterministic `HashMap` traversal in the
-  builder; report it.
-- **Smoke test inside the workspace.** `klio pack verify <path>
+- **Determinism is enforced.** `klio pack build` twice on the same
+  source produces byte-identical output. If your build flakes,
+  suspect non-deterministic hash-map traversal in the builder;
+  report it.
+- **Smoke test from the project.** `klio pack verify <path>
   --smoke <file.kt>` is the fastest feedback loop.

@@ -39,12 +39,12 @@ Available types:
 ## Install
 
 ```sh
-cargo run -q -p klio-cli -- pack build crates/klio-kotlinx-atomicfu
-cargo run -q -p klio-cli -- pack install target/packs/kotlinx.atomicfu.klio-pack
+./zig-out/bin/klio pack build kotlin-klio/klio-kotlinx-atomicfu
+./zig-out/bin/klio pack install target/packs/kotlinx.atomicfu.klio-pack
 ```
 
 ## Layout
 
-- Kotlin shim: `crates/klio-kotlinx-atomicfu/shim/kotlinx/atomicfu/AtomicFU.kt`
-- Native impl: `crates/klio-kotlinx-atomicfu/src/lib.rs`
-- Manifest:    `crates/klio-kotlinx-atomicfu/klio.toml`
+- Kotlin shim: `kotlin-klio/klio-kotlinx-atomicfu/klioMain/kotlinx/atomicfu/`
+- Native impl: `src/kotlinx_atomicfu/kotlinx_atomicfu.zig`
+- Manifest:    `kotlin-klio/klio-kotlinx-atomicfu/klio.toml`

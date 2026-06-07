@@ -1,5 +1,5 @@
 site_name: klio
-site_description: An experimental Kotlin interpreter written in Rust.
+site_description: An experimental Kotlin interpreter written in Zig.
 site_url: https://klio.dev/
 repo_url: https://github.com/DrewCarlson/kt-exp
 remote_branch: gh-pages

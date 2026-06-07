@@ -2,59 +2,59 @@
 
 The Kotlin standard library is delivered as a pack
 (`stdlib.klio-pack`) that's embedded into the `klio` binary at build
-time. Three crates collaborate to produce it:
+time. Three modules collaborate to produce it:
 
-| Crate                 | Role                                                                                            |
-|-----------------------|-------------------------------------------------------------------------------------------------|
-| `klio-stdlib`         | Hand-written Rust intrinsics keyed by FQN, plus the `HostBindings` registry.                    |
-| `klio-stdlib-gen`     | Mines upstream Kotlin's `kotlin/libraries/stdlib/` to produce the symbol index.                 |
-| `klio-stdlib-pack`    | Build-script crate that calls `klio_stdlib::build_stdlib_pack(...)` and `include_bytes!`s it.   |
+| Module          | Role                                                                                            |
+|-----------------|-------------------------------------------------------------------------------------------------|
+| `stdlib`        | Hand-written Zig intrinsics keyed by FQN, plus the `HostBindings` registry.                     |
+| `stdlib_gen`    | Mines upstream Kotlin's `kotlin/libraries/stdlib/` to produce the symbol index.                 |
+| `stdlib_pack`   | Calls `stdlib.build_stdlib_pack(...)` to produce the pack bytes the interpreter loads at startup. |
 
 ## Symbol registry
 
 Every public symbol mined from upstream becomes a `SymbolEntry`:
 
-```rust
-pub struct SymbolEntry {
-    pub fqn: &'static str,         // "kotlin.collections.listOf"
-    pub package: &'static str,
-    pub name: &'static str,
-    pub kind: SymbolKind,
-    pub receiver: Option<&'static str>,
-    pub signature: &'static str,
-    pub param_names: &'static [&'static str],
-    pub modifiers: Modifiers,
-    pub source: SourceLoc,
-    pub impl_fn: Option<StdlibFn>,
-}
+```zig
+pub const SymbolEntry = struct {
+    fqn: []const u8,         // "kotlin.collections.listOf"
+    package: []const u8,
+    name: []const u8,
+    kind: SymbolKind,
+    receiver: ?[]const u8,
+    signature: []const u8,
+    param_names: []const []const u8,
+    modifiers: Modifiers,
+    source: SourceLoc,
+    impl_fn: ?StdlibFn,
+};
 ```
 
 The registry serves two consumers:
 
 1. **Resolver** — `is_known_package` and the symbol index validate
    imports during `klio check`.
-2. **Vm** — `klio_stdlib::implementation(fqn)` looks up the runtime
+2. **Vm** — `stdlib.implementation(fqn)` looks up the runtime
    function pointer at dispatch.
 
-Coverage is reported via `klio_stdlib::coverage()` (`implemented`
+Coverage is reported via `stdlib.coverage()` (`implemented`
 over `total`).
 
 ## Implicit imports
 
 Spec §10.1 lists the packages every Kotlin file imports
-implicitly. `klio_stdlib::IMPLICITLY_IMPORTED_PACKAGES` is the exact
+implicitly. `stdlib.IMPLICITLY_IMPORTED_PACKAGES` is the exact
 list. Loaded packs may extend it through `register_known_package`,
 which is what kotlinx packs use to declare their packages visible.
 
 ## Adding a new intrinsic
 
-1. Add the function to `crates/klio-stdlib/src/implementations.rs`
-   keyed by its Kotlin FQN.
-2. Add a sibling entry in `crates/klio-stdlib-gen` if the FQN is
+1. Add the function under `src/stdlib/implementations/` (or
+   `src/stdlib/implementations.zig`) keyed by its Kotlin FQN.
+2. Add a sibling entry in `src/stdlib_gen/` if the FQN is
    not already mined.
 3. Update or add a corpus program covering it.
-4. Re-run `cargo test --workspace` and `klio pack verify`.
+4. Re-run `zig build test` and `klio pack verify`.
 
 For library-shaped surface area, prefer a pack over a stdlib
 intrinsic: the pack carries documentation, ships with a binding
-manifest, and stays out of `klio-stdlib`'s static slab.
+manifest, and stays out of `stdlib`'s static surface.

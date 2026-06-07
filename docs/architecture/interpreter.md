@@ -1,13 +1,13 @@
 # The Vm
 
 klio executes a register-based intermediate representation. The
-front end lowers each source file to IR; the Vm in `klio-interp-ir`
+front end lowers each source file to IR; the Vm in `interp_ir`
 runs that IR to completion. There is no AST evaluator on the
 execution path.
 
 ## Lowering
 
-`klio-ir` turns a `klio_ast::KotlinFile` into a `Module`:
+`ir` turns an `ast.KotlinFile` into a `Module`:
 
 - **`Func`** — a lowered function body: a list of basic blocks, each
   a sequence of `Inst` ending in a `Terminator` (branch, return,
@@ -29,10 +29,10 @@ class-lowering time.
 
 ## The Vm
 
-`klio_interp_ir::Vm` holds the module, the mutable globals, the
-coroutine scheduler, and the call stacks. `Vm::from_built` consumes
-a `BuiltModule` (produced by `klio_interp_ir::build`) and returns the
-Vm plus the entry `FuncId`; `Vm::run(main, out)` executes it.
+`interp_ir.Vm` holds the module, the mutable globals, the
+coroutine scheduler, and the call stacks. `Vm.fromBuilt` consumes
+a `BuiltModule` (produced by `interp_ir.build`) and returns the
+Vm plus the entry `FuncId`; `Vm.run(main, out)` executes it.
 
 Execution is a switch over `Inst`:
 
@@ -46,22 +46,23 @@ Execution is a switch over `Inst`:
 
 ## Values
 
-Runtime values are `klio_runtime::Value`: the Kotlin primitives
+Runtime values are `runtime.Value`: the Kotlin primitives
 (`Int`, `Long`, `Double`, `Float` stored as `f32` for byte-identical
-parity, `Bool`, `Char`, `String` as `Rc<String>`, the unsigned
-siblings), `Unit` / `Null`, integer `Range`, collections (`List`,
-`Set`, `Map`, `Array`), user `Instance` data, closures, bound method
-references, exceptions, and the `CoroutineSuspended` sentinel.
+parity, `Bool`, `Char`, `String` as a reference-counted `StringRef`,
+the unsigned siblings), `Unit` / `Null`, integer `Range`, collections
+(`List`, `Set`, `Map`, `Array`), user `Instance` data, closures,
+bound method references, exceptions, and the `CoroutineSuspended`
+sentinel.
 
 `InstanceData` carries each instance's fields plus an opaque
-`native_state` slot that host bindings use for per-instance Rust
-state (for example `kotlinx.io.Buffer` stashes a `VecDeque<u8>`
-there).
+`native_state` slot that host bindings use for per-instance native
+state (for example `kotlinx.io.Buffer` stashes a byte
+`std.ArrayList(u8)` there).
 
 ## Dispatch and intrinsics
 
 Stdlib and pack functionality is host-bound. The Vm does not special
--case specific FQNs: `klio_stdlib::implementation(fqn)` is the single
+-case specific FQNs: `stdlib.implementation(fqn)` is the single
 resolution path, and higher-order stdlib functions (`map`, `fold`,
 `forEach`, `apply`, `let`, …) receive a callback to invoke a closure
 argument back through the Vm.
@@ -92,6 +93,6 @@ the `kotlinx.coroutines` pack.
 
 ## Output
 
-All program output flows through the `klio_runtime::Output` trait so
+All program output flows through the `runtime.Output` interface so
 the parity sweep and pack smoke harness can capture stdout without
-intercepting `println!` directly.
+intercepting writes to the real stdout directly.
