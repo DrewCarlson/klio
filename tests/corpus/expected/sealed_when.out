@@ -1,0 +1,8 @@
+[1,"two",true,[3]]
+0 -> zero
+2 -> small
+7 -> mid
+42 -> big
+-5 -> out-of-range
+true
+true

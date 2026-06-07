@@ -1,0 +1,8 @@
+2.0
+shape:circle
+12.56
+[1.0, 2.0, 3.0]
+[circle, circle, circle]
+[shape:circle, shape:circle, shape:circle]
+[3.14, 12.56, 28.259999999999998]
+[circle=3.14, circle=12.56, circle=28.259999999999998]

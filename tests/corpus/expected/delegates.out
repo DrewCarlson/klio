@@ -1,0 +1,15 @@
+Ada Lovelace
+3
+3
+computeCalls before: 0
+42
+42
+computeCalls after: 1
+watched: initial -> second
+watched: second -> third
+third
+caught: Property required should be initialized before get.
+ready
+logged set = 1
+logged set = 99
+99

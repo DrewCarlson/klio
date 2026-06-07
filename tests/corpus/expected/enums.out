@@ -1,0 +1,15 @@
+--- Direction ---
+NORTH@0
+EAST@1
+SOUTH@2
+WEST@3
+--- HttpStatus ---
+OK: 200 OK error=false
+NOT_FOUND: 404 Not Found error=true
+INTERNAL_ERROR: 500 Internal Server Error error=true
+--- valueOf + compare ---
+OK
+true
+--- Op overrides ---
+ADD(2,3)=5
+SUB(2,3)=-1

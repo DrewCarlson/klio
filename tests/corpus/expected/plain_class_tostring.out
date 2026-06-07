@@ -1,0 +1,5 @@
+startsWithName=true
+hasAt=true
+tailNonEmpty=true
+tailAllHex=true
+identityDiffers=true
