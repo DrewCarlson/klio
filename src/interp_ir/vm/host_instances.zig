@@ -1729,7 +1729,8 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                     if (pp[k].property != null) {
                         var fv = cls_args[k];
                         if (pp[k].declared_type != null and std.mem.eql(u8, pp[k].declared_type.?, "Long") and fv == .Int) {
-                            fv = .{ .Long = @as(i64, fv.Int) };
+                            const n: i64 = fv.Int;
+                            fv = .{ .Long = n };
                         }
                         retainFieldList(&fields, allocator, pp[k].name);
                         try fields.append(allocator, .{ .name = pp[k].name, .value = fv });

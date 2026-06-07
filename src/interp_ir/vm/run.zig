@@ -83,14 +83,101 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
     const taken = built.classes;
     built.classes = ClassTable.init(allocator);
     vm.classes = try ObjRef(ClassTable).init(allocator, taken);
+
+    // Move the enum-entry ctor-arg thunks into the Vm; the startup pass
+    // patches each entry's instance fields with their evaluated values.
+    vm.enum_entry_arg_inits.deinit(allocator);
+    vm.enum_entry_arg_inits = built.enum_entry_arg_inits;
+    built.enum_entry_arg_inits = .empty;
+
     // Top-level property initialiser order is preserved.
     vm.top_level_props.deinit(allocator);
     vm.top_level_props = .empty;
-    for (built.top_level_props.items) |nf| {
-        try vm.top_level_props.append(allocator, .{ .name = nf.name, .func = nf.func });
-        try vm.prog.borrowMut().get().top_level_prop_inits.put(nf.name, nf.func);
+    {
+        const pg = vm.prog.borrowMut();
+        defer pg.deinit();
+        const prog = pg.get();
+        for (built.top_level_props.items) |nf| {
+            try vm.top_level_props.append(allocator, .{ .name = nf.name, .func = nf.func });
+            try prog.top_level_prop_inits.put(nf.name, nf.func);
+        }
+
+        // Move every dispatch-time side table into the program image. Each
+        // map is swapped with a fresh empty so the `BuiltModule`'s own
+        // `deinit` is a no-op for the moved table (matching Rust's
+        // by-value move in `from_built`).
+        prog.body_prop_inits.deinit();
+        prog.body_prop_inits = built.body_prop_inits;
+        built.body_prop_inits = build.PairFuncMap.init(allocator);
+
+        prog.instance_prop_getters.deinit();
+        prog.instance_prop_getters = built.instance_prop_getters;
+        built.instance_prop_getters = build.PairFuncMap.init(allocator);
+
+        prog.instance_prop_setters.deinit();
+        prog.instance_prop_setters = built.instance_prop_setters;
+        built.instance_prop_setters = build.PairFuncMap.init(allocator);
+
+        prog.parent_ctor_args.deinit();
+        prog.parent_ctor_args = built.parent_ctor_args;
+        built.parent_ctor_args = std.StringHashMap([]FuncId).init(allocator);
+
+        prog.init_blocks.deinit();
+        prog.init_blocks = built.init_blocks;
+        built.init_blocks = std.StringHashMap([]FuncId).init(allocator);
+
+        prog.extension_props.deinit();
+        prog.extension_props = built.extension_props;
+        built.extension_props = build.PairFuncMap.init(allocator);
+
+        prog.extension_prop_setters.deinit();
+        prog.extension_prop_setters = built.extension_prop_setters;
+        built.extension_prop_setters = build.PairFuncMap.init(allocator);
+
+        prog.secondary_ctors.deinit();
+        prog.secondary_ctors = built.secondary_ctors;
+        built.secondary_ctors = std.StringHashMap([]build.SecondaryCtorEntry).init(allocator);
+
+        prog.primary_ctor_default_thunks.deinit();
+        prog.primary_ctor_default_thunks = built.primary_ctor_default_thunks;
+        built.primary_ctor_default_thunks = std.StringHashMap([]?FuncId).init(allocator);
+
+        prog.class_delegates.deinit();
+        prog.class_delegates = built.class_delegates;
+        built.class_delegates = std.StringHashMap([]build.StrFunc).init(allocator);
+
+        prog.func_defaults.deinit();
+        prog.func_defaults = built.func_defaults;
+        built.func_defaults = std.AutoHashMap(u32, []?FuncId).init(allocator);
+
+        // `object_names` is a set in the program image; copy the names in.
+        for (built.object_names.items) |n| try prog.object_names.put(n, {});
     }
+
+    // Pre-populated enum-entry override methods land in the same
+    // `anon_methods` side-table the Vm consults for anon-object +
+    // local-class methods.
+    {
+        const ag = vm.anon_methods.borrowMut();
+        defer ag.deinit();
+        var it = built.enum_entry_methods.iterator();
+        while (it.next()) |e| {
+            const key = try anonMethodKey(allocator, e.key_ptr.a, e.key_ptr.b);
+            try ag.get().put(key, .{
+                .module = e.value_ptr.module.clone(),
+                .func = e.value_ptr.func,
+                .captures = &.{},
+            });
+        }
+    }
+
     return .{ .vm = vm, .main = built.main };
+}
+
+/// `(class, method)` key for the `anon_methods` table, matching the
+/// `\u{1f}`-joined key the rest of the Vm uses.
+fn anonMethodKey(allocator: Allocator, class: []const u8, method: []const u8) Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ class, method });
 }
 
 /// Install pack-provided host bindings. Probed before
@@ -194,6 +281,77 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     const module = mg.get();
     const sink = self.out_sink.output();
 
+    // Top-level `const val`s are compile-time constants; bind them in
+    // globals up front — before the object / companion initializers
+    // below, which run ahead of the top-level property inits and may read
+    // a top-level const.
+    {
+        var it = module.registry.class_const_inits.iterator();
+        while (it.next()) |e| {
+            if (e.key_ptr.a.len != 0) continue;
+            const v = try ir.eval.constToValue(self.allocator, e.value_ptr);
+            const g = self.globals.borrowMut();
+            g.get().define(e.key_ptr.b, v) catch {};
+            g.deinit();
+        }
+    }
+
+    // Allocate every `object Foo { … }` singleton FIRST, so a top-level
+    // property initialiser that captures the object observes the same
+    // instance the main body will (preserving `===` identity across init
+    // contexts). Non-companion objects first, then synth companions: a
+    // companion's `val` initializer may reference a top-level singleton.
+    {
+        var object_names: std.ArrayList([]const u8) = .empty;
+        defer object_names.deinit(self.allocator);
+        for (module.registry.object_names.items) |n| try object_names.append(self.allocator, n);
+        // Stable sort: preserve source order within each rank, matching
+        // Rust's `sort_by_key`.
+        std.sort.insertion([]const u8, object_names.items, {}, lessByCompanionRank);
+        for (object_names.items) |obj_name| {
+            // Skip an object/companion already initialized on demand.
+            {
+                const gg = self.globals.borrow();
+                const existing = gg.get().lookup(obj_name);
+                gg.deinit();
+                if (existing) |ev| {
+                    if (ev == .Instance) continue;
+                }
+            }
+            const class_id = module.classId(obj_name) orelse continue;
+            const inst = blk: {
+                var host = vmMakeHost(self, sink);
+                defer hostDeinit(&host);
+                var iface = host.hostInterface();
+                switch (try iface.newInstance(self.allocator, class_id, &.{})) {
+                    .ok => |v| break :blk v,
+                    // Defer an object whose eager initializer throws — it is
+                    // initialized on first access in `lookupGlobal` instead.
+                    .err => continue,
+                }
+            };
+            if (inst == .Instance) {
+                if (std.mem.indexOf(u8, obj_name, "$Companion$")) |sep| {
+                    const outer_name = obj_name[0..sep];
+                    const outer_def: ?runtime.ObjRef(runtime.ClassDef) = blk: {
+                        const cg = self.classes.borrow();
+                        defer cg.deinit();
+                        if (cg.get().get(outer_name)) |d| break :blk d.clone();
+                        break :blk null;
+                    };
+                    if (outer_def) |od| {
+                        const ig = inst.Instance.borrowMut();
+                        ig.get().outer = .{ .Class = od };
+                        ig.deinit();
+                    }
+                }
+            }
+            const g = self.globals.borrowMut();
+            g.get().define(obj_name, inst) catch {};
+            g.deinit();
+        }
+    }
+
     // Run top-level property initialisers before main so global reads
     // against the env see the initial values.
     for (self.top_level_props.items) |nf| {
@@ -219,6 +377,55 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
         }
     }
 
+    // Patch enum-entry instance fields with evaluated ctor args.
+    for (self.enum_entry_arg_inits.items) |entry| {
+        const class_def: ?runtime.ObjRef(runtime.ClassDef) = blk: {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            if (cg.get().get(entry.class_name)) |d| break :blk d.clone();
+            break :blk null;
+        };
+        const cdef = class_def orelse continue;
+        defer cdef.deinit();
+        // Entry instance + primary-param names off the runtime ClassDef.
+        var param_names: std.ArrayList([]const u8) = .empty;
+        defer param_names.deinit(self.allocator);
+        var entry_inst: ?runtime.ObjRef(runtime.InstanceData) = null;
+        {
+            const dg = cdef.borrow();
+            defer dg.deinit();
+            for (dg.get().primary_params) |p| try param_names.append(self.allocator, p.name);
+            const eg = dg.get().enum_entries.borrow();
+            defer eg.deinit();
+            for (eg.get().items) |e| {
+                if (std.mem.eql(u8, e.name, entry.entry_name)) {
+                    if (e.value == .Instance) entry_inst = e.value.Instance.clone();
+                    break;
+                }
+            }
+        }
+        const inst = entry_inst orelse continue;
+        defer inst.deinit();
+        for (entry.funcs, 0..) |fid, idx| {
+            if (fid.int() >= module.funcs.items.len) continue;
+            const init_func = &module.funcs.items[fid.int()];
+            const v = blk: {
+                var host = vmMakeHost(self, sink);
+                defer hostDeinit(&host);
+                var iface = host.hostInterface();
+                switch (try ir.eval.evalWith(self.allocator, module, init_func, .empty, &iface)) {
+                    .ok => |val| break :blk val,
+                    .err => |e| return .{ .err = vmErrorFromEval(self.allocator, e) },
+                }
+            };
+            if (idx < param_names.items.len) {
+                const g = inst.borrowMut();
+                g.get().define(self.allocator, param_names.items[idx], v) catch {};
+                g.deinit();
+            }
+        }
+    }
+
     if (main.int() >= module.funcs.items.len) return .{ .err = .InvalidMain };
     const func = &module.funcs.items[main.int()];
     var host = vmMakeHost(self, sink);
@@ -229,6 +436,15 @@ pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = vmErrorFromEval(self.allocator, e) },
     };
+}
+
+/// Sort key for object-singleton initialisation order: non-companion
+/// objects (`false`) precede synth companion objects (`true`), matching
+/// Rust's `sort_by_key(|n| n.contains("$Companion$"))`.
+fn lessByCompanionRank(_: void, a: []const u8, b: []const u8) bool {
+    const ra = std.mem.indexOf(u8, a, "$Companion$") != null;
+    const rb = std.mem.indexOf(u8, b, "$Companion$") != null;
+    return @intFromBool(ra) < @intFromBool(rb);
 }
 
 /// Format an `EvalError` into a `VmError`, mirroring the Rust

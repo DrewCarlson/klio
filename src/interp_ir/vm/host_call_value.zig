@@ -480,15 +480,22 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
 }
 
 pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, params: []const []const u8, body: *const ast.Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
-    _ = self;
-    _ = allocator;
-    _ = params;
     _ = body;
-    _ = captured_names;
-    _ = captures;
     _ = absorb_return;
-    _ = body_func;
-    return unsupported("VmHost.build_ast_lambda");
+    const fid = body_func orelse return .{ .err = .{ .Unimplemented = "Vm: lambda lower did not provide body_func" } };
+    // Live capture cell shared with the lambda body so its `StoreGlobal`
+    // writes propagate back to the closure's captures.
+    var cell_list: std.ArrayList(Value) = .empty;
+    try cell_list.appendSlice(allocator, captures);
+    const cell = try ObjRef(std.ArrayList(Value)).init(allocator, cell_list);
+    const id = try self.closures.push(.{
+        .body_func = fid,
+        .n_params = params.len,
+        .capture_names = try allocator.dupe([]const u8, captured_names),
+        .captures = cell,
+    });
+    const caps_ref = try ValueSlice.init(allocator, try allocator.dupe(Value, captures));
+    return .{ .ok = .{ .IrClosure = .{ .id = id, .captures = caps_ref } } };
 }
 
 pub fn callableReceiverShape(self: *VmHost, v: *const Value) ?ReceiverShape {

@@ -3743,7 +3743,16 @@ fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: *con
     return null;
 }
 
+/// Re-entrancy flag for the inner-class outer-chain member fallback,
+/// mirroring `CALL_OUTER_ACTIVE` / `with_call_outer_guard` in Rust: a
+/// nested outer-chain walk is a no-op so a companion whose `outer` is its
+/// class (whose member lookup forwards back to the companion) cannot loop.
+threadlocal var call_outer_active: bool = false;
+
 fn outerChainFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    if (call_outer_active) return null;
+    call_outer_active = true;
+    defer call_outer_active = false;
     var cur: ?Value = switch (receiver.*) {
         .Instance => |i| blk: {
             const g = i.borrow();

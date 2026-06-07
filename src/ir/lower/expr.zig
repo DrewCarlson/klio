@@ -868,8 +868,10 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         b.resolve(segments[0].name) == null and
         b.module.classId(segments[0].name) == null)
     {
+        // The const pool stores the slice by reference, so the joined FQN
+        // must live for the module's lifetime — let the module allocator
+        // own it rather than freeing it here.
         const fqn = try joinSegments(b.allocator, segments);
-        defer b.allocator.free(fqn);
         const dst = b.allocReg();
         const n = try b.module.internConst(b.allocator, .{ .String = fqn });
         try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
@@ -897,12 +899,15 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     return cur;
 }
 
-/// Intern the scope-qualified getter field name `$sgetter<owner>\u{1f}<name>`
+/// Intern the scope-qualified getter field name `$sgetter$<owner>\u{1f}<name>`
 /// when an enclosing class is known, else the plain name.
 fn sgetterName(b: *FuncBuilder, name: []const u8) Allocator.Error!ConstId {
     if (b.ownerClass()) |owner| {
-        const qual = try std.fmt.allocPrint(b.allocator, "$sgetter{s}\u{1f}{s}", .{ owner, name });
-        defer b.allocator.free(qual);
+        // The const pool stores the slice by reference, so the buffer must
+        // live for the module's lifetime — let the module allocator own it
+        // rather than freeing it here (which would leave a dangling field
+        // name read back at dispatch time).
+        const qual = try std.fmt.allocPrint(b.allocator, "$sgetter${s}\u{1f}{s}", .{ owner, name });
         return b.module.internConst(b.allocator, .{ .String = qual });
     }
     return b.module.internConst(b.allocator, .{ .String = name });
