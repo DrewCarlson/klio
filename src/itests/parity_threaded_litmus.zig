@@ -127,15 +127,6 @@ test "tl_thread_sleep" {
     try check("tl_thread_sleep");
 }
 
-// Pending litmus: un-ignore as real thread spawn lands. Mirrors the Rust
-// `#[ignore]`d test — skipped today (PENDING is empty).
-test "threaded_litmus_pending" {
-    if (PENDING.len == 0) return error.SkipZigTest;
-    for (PENDING) |p| {
-        try check(p.stem);
-    }
-}
-
 // Every litmus file on disk is classified exactly once. Guards against an
 // orphaned or unlisted program slipping in.
 test "threaded_litmus_suite_is_complete" {
