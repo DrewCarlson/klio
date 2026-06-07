@@ -11,8 +11,8 @@ const Mod = struct {
 
 const mod_list = [_]Mod{
     .{ .name = "span", .tested = true },
-    .{ .name = "diagnostics", .deps = &.{"span"} },
-    .{ .name = "ast", .deps = &.{"span"} },
+    .{ .name = "diagnostics", .deps = &.{"span"}, .tested = true },
+    .{ .name = "ast", .deps = &.{"span"}, .tested = true },
     .{ .name = "runtime", .deps = &.{ "ast", "span" } },
     .{ .name = "types", .deps = &.{ "ast", "diagnostics", "span" } },
     .{ .name = "lexer", .deps = &.{ "diagnostics", "span" } },
