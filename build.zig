@@ -39,6 +39,8 @@ const mod_list = [_]Mod{
     // End-to-end corpus test: runs every examples/*.kt in-process via the
     // parity pipeline and asserts against tests/corpus/expected/.
     .{ .name = "e2e", .deps = &.{"parity"}, .tested = true },
+    // Integration suites ported from crates/*/tests.
+    .{ .name = "itests", .deps = &.{ "parity", "typeck", "resolver", "parser", "lexer", "cfa", "runtime", "ast", "span", "diagnostics", "types", "pack", "ir", "interp_ir" }, .tested = true },
 };
 
 pub fn build(b: *std.Build) void {
@@ -87,7 +89,7 @@ pub fn build(b: *std.Build) void {
         const run_t = b.addRunArtifact(t);
         // The e2e test reads examples/ and tests/corpus/expected/ by relative
         // path, so run it from the project root.
-        if (std.mem.eql(u8, m.name, "e2e")) run_t.setCwd(b.path("."));
+        if (std.mem.eql(u8, m.name, "e2e") or std.mem.eql(u8, m.name, "itests")) run_t.setCwd(b.path("."));
         test_step.dependOn(&run_t.step);
     }
 }
