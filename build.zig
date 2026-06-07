@@ -81,22 +81,15 @@ pub fn build(b: *std.Build) void {
         for (m.deps) |d| mod.addImport(d, mods.get(d).?);
     }
 
-    // The pack format compresses sections with the system zstd library.
-    // Zig std ships only a zstd decoder, so the encoder is linked from
-    // libzstd directly (no dev header needed — the symbols are declared
-    // extern in src/pack/zstd.zig). The library is linked as an object
-    // file because distros ship the versioned `libzstd.so.1` without a
-    // `-dev` `libzstd.so` symlink; `-Dzstd-lib=` overrides the path. Link
-    // inputs attached to the pack module flow into every artifact that
-    // imports it.
-    const zstd_lib = b.option(
-        []const u8,
-        "zstd-lib",
-        "Path to the shared zstd library to link (default: /usr/lib/x86_64-linux-gnu/libzstd.so.1)",
-    ) orelse "/usr/lib/x86_64-linux-gnu/libzstd.so.1";
+    // The pack format compresses sections with zstd. Zig std ships only a
+    // zstd decoder, so the encoder is linked from the vendored zstd C
+    // sources, compiled here into a static library. The symbols are
+    // declared extern in src/pack/zstd.zig (no header needed). Link inputs
+    // attached to the pack module flow into every artifact that imports it.
+    const zstd = buildZstd(b, target, optimize);
     const pack_mod = mods.get("pack").?;
     pack_mod.link_libc = true;
-    pack_mod.addObjectFile(.{ .cwd_relative = zstd_lib });
+    pack_mod.linkLibrary(zstd);
 
     const exe = b.addExecutable(.{
         .name = "klio",
@@ -143,4 +136,80 @@ pub fn build(b: *std.Build) void {
         if (std.mem.eql(u8, m.name, "e2e")) run_t.setCwd(b.path("."));
         test_step.dependOn(&run_t.step);
     }
+}
+
+/// zstd C sources, relative to the dependency's `lib/` directory. The x86-64
+/// BMI2 assembly fast path (`huf_decompress_amd64.S`) is omitted and disabled
+/// via `-DZSTD_DISABLE_ASM` so the same C-only build works on every target.
+const zstd_sources = [_][]const u8{
+    // common
+    "common/debug.c",
+    "common/entropy_common.c",
+    "common/error_private.c",
+    "common/fse_decompress.c",
+    "common/pool.c",
+    "common/threading.c",
+    "common/xxhash.c",
+    "common/zstd_common.c",
+    // compress
+    "compress/fse_compress.c",
+    "compress/hist.c",
+    "compress/huf_compress.c",
+    "compress/zstd_compress.c",
+    "compress/zstd_compress_literals.c",
+    "compress/zstd_compress_sequences.c",
+    "compress/zstd_compress_superblock.c",
+    "compress/zstd_double_fast.c",
+    "compress/zstd_fast.c",
+    "compress/zstd_lazy.c",
+    "compress/zstd_ldm.c",
+    "compress/zstdmt_compress.c",
+    "compress/zstd_opt.c",
+    // decompress
+    "decompress/huf_decompress.c",
+    "decompress/zstd_ddict.c",
+    "decompress/zstd_decompress_block.c",
+    "decompress/zstd_decompress.c",
+    // dictBuilder (ZSTD_*_usingDict live in the core, but link the builder so
+    // the dictionary trainer APIs are available if pack ever needs them).
+    "dictBuilder/cover.c",
+    "dictBuilder/divsufsort.c",
+    "dictBuilder/fastcover.c",
+    "dictBuilder/zdict.c",
+};
+
+/// Build the vendored zstd C library as a static library statically linked
+/// into the binary and test artifacts. No system zstd is referenced.
+fn buildZstd(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const dep = b.dependency("zstd", .{});
+
+    const lib = b.addLibrary(.{
+        .name = "zstd",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    lib.root_module.addIncludePath(dep.path("lib"));
+    lib.root_module.addIncludePath(dep.path("lib/common"));
+    lib.root_module.addCSourceFiles(.{
+        .root = dep.path("lib"),
+        .files = &zstd_sources,
+        .flags = &.{
+            "-DZSTD_DISABLE_ASM",
+            "-DXXH_NAMESPACE=ZSTD_",
+            "-fvisibility=hidden",
+            "-std=c11",
+        },
+    });
+    lib.installHeader(dep.path("lib/zstd.h"), "zstd.h");
+
+    return lib;
 }

@@ -1,6 +1,6 @@
-//! Thin binding over the system zstd library. Only the entry points the
-//! pack format needs are declared; the C header is not required because
-//! the symbols are linked directly from `libzstd`.
+//! Thin binding over the vendored zstd library. Only the entry points the
+//! pack format needs are declared; the C header is not required because the
+//! symbols are linked directly from the statically-compiled zstd sources.
 //!
 //! `dst`/`uncompressed_len` capacities come from the pack directory, so
 //! the decoder never has to trust the frame's embedded content size.
@@ -142,7 +142,7 @@ pub fn decompressDict(
     return dst;
 }
 
-test "round trips bytes through the system zstd" {
+test "round trips bytes through the vendored zstd" {
     const a = std.testing.allocator;
     const src = "klio pack zstd round trip " ** 16;
     const packed_bytes = try compress(a, src, 3);
